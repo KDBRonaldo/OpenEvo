@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from dataclasses import replace
+from dataclasses import fields, replace
 import hashlib
 import io
 import secrets
@@ -1714,6 +1714,8 @@ REVISION_1 = core_v1.RevisionRefV1(
 def _replace_finalize_revision_authority(
     persistence: FakePersistence,
     revision: core_v1.RevisionRefV1,
+    *,
+    bind_outcome: bool = True,
 ) -> None:
     operation = persistence.operation
     assert operation is not None
@@ -1731,12 +1733,42 @@ def _replace_finalize_revision_authority(
         ).model_dump(),
         strict=True,
     )
-    persistence.operation = replace(
+    if bind_outcome:
+        persistence.operation = replace(
+            operation,
+            workspace_upload_finalize=replace(
+                authority,
+                outcome=outcome,
+                outcome_sha256=bridge_module._model_digest(outcome),
+            ),
+        )
+    else:
+        _replace_finalize_outcome_authority(persistence, outcome)
+
+
+def _unsafe_dataclass_replace(value: object, **changes: object) -> object:
+    altered = object.__new__(type(value))
+    for field in fields(value):
+        object.__setattr__(
+            altered,
+            field.name,
+            changes.get(field.name, getattr(value, field.name)),
+        )
+    return altered
+
+
+def _replace_finalize_outcome_authority(
+    persistence: FakePersistence,
+    outcome: core_v1.WorkspaceUploadFinalizeResponseV1,
+) -> None:
+    operation = persistence.operation
+    assert operation is not None
+    authority = operation.workspace_upload_finalize
+    assert authority is not None
+    altered_authority = _unsafe_dataclass_replace(authority, outcome=outcome)
+    persistence.operation = _unsafe_dataclass_replace(
         operation,
-        workspace_upload_finalize=replace(
-            authority,
-            outcome=outcome,
-        ),
+        workspace_upload_finalize=altered_authority,
     )
 
 
@@ -1778,6 +1810,9 @@ def _prepare_initial_import_finalize_mapping_crash() -> tuple[
     finalize_authority = persistence.operation.workspace_upload_finalize
     assert finalize_authority is not None
     assert finalize_authority.outcome.project.active_revision == REVISION
+    assert finalize_authority.outcome_sha256 == bridge_module._model_digest(
+        finalize_authority.outcome
+    )
     return project, archive, persistence, fake_core
 
 
@@ -1974,10 +2009,7 @@ def test_initial_finalize_recovery_rejects_tampered_finalize_outcome() -> None:
         authority.outcome.model_copy(update={"project": tampered_project}).model_dump(),
         strict=True,
     )
-    persistence.operation = replace(
-        operation,
-        workspace_upload_finalize=replace(authority, outcome=tampered_outcome),
-    )
+    _replace_finalize_outcome_authority(persistence, tampered_outcome)
     patch_count = len(fake_core.patch_requests)
     workspace_mutations = _workspace_mutation_count(fake_core)
     commit_count = persistence.events.count("commit_mapping")
@@ -1994,7 +2026,151 @@ def test_initial_finalize_recovery_rejects_tampered_finalize_outcome() -> None:
             idempotency_key="initial-finalize-tampered-0002",
         )
 
-    assert exc_info.value.error.code == "core_project_initial_publication_mismatch"
+    assert exc_info.value.error.code == "workspace_finalize_authority_mismatch"
+    assert persistence.mapping is None
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+    assert persistence.events.count("commit_mapping") == commit_count
+
+
+def test_initial_finalize_recovery_rejects_outcome_revision_substitution_matching_core() -> None:
+    project, archive, persistence, fake_core = (
+        _prepare_initial_import_finalize_mapping_crash()
+    )
+    jumped_revision = core_v1.RevisionRefV1(
+        id="revision-2",
+        project_id=CORE_PROJECT_ID,
+        generation=2,
+        manifest_sha256="2" * 64,
+    )
+    _replace_finalize_revision_authority(
+        persistence,
+        jumped_revision,
+        bind_outcome=False,
+    )
+    jumped_etag = '"' + "2" * 64 + '"'
+    _set_current_revision(fake_core, jumped_revision, etag=jumped_etag)
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    commit_count = persistence.events.count("commit_mapping")
+    recovered, _, _, _ = _bridge(
+        project,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            project,
+            idempotency_key="initial-finalize-outcome-substitution-0002",
+        )
+
+    assert exc_info.value.error.code == "workspace_finalize_authority_mismatch"
+    assert persistence.mapping is None
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+    assert persistence.events.count("commit_mapping") == commit_count
+
+
+def test_workspace_finalize_authority_binds_request_and_outcome_independently() -> None:
+    _, _, persistence, _ = _prepare_initial_import_finalize_mapping_crash()
+    operation = persistence.operation
+    assert operation is not None
+    authority = operation.workspace_upload_finalize
+    assert authority is not None
+    substituted_request = core_v1.WorkspaceUploadFinalizeV1(content_sha256="9" * 64)
+    substituted_project = core_v1.ProjectV1.model_validate(
+        authority.outcome.project.model_copy(
+            update={"active_revision": REVISION_1}
+        ).model_dump(),
+        strict=True,
+    )
+    substituted_outcome = core_v1.WorkspaceUploadFinalizeResponseV1.model_validate(
+        authority.outcome.model_copy(update={"project": substituted_project}).model_dump(),
+        strict=True,
+    )
+
+    with pytest.raises(ValueError, match="finalize request digest"):
+        replace(authority, request=substituted_request)
+    with pytest.raises(ValueError, match="finalize outcome digest"):
+        replace(authority, outcome=substituted_outcome)
+    with pytest.raises(ValueError, match="finalize request digest"):
+        replace(authority, request_sha256=authority.outcome_sha256)
+    with pytest.raises(ValueError, match="finalize outcome digest"):
+        replace(authority, outcome_sha256=authority.request_sha256)
+
+
+def test_initial_finalize_recovery_rejects_request_substitution() -> None:
+    project, archive, persistence, fake_core = (
+        _prepare_initial_import_finalize_mapping_crash()
+    )
+    operation = persistence.operation
+    assert operation is not None
+    authority = operation.workspace_upload_finalize
+    assert authority is not None
+    substituted_request = core_v1.WorkspaceUploadFinalizeV1(content_sha256="9" * 64)
+    substituted_authority = _unsafe_dataclass_replace(
+        authority,
+        request=substituted_request,
+    )
+    persistence.operation = _unsafe_dataclass_replace(
+        operation,
+        workspace_upload_finalize=substituted_authority,
+    )
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    commit_count = persistence.events.count("commit_mapping")
+    recovered, _, _, _ = _bridge(
+        project,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            project,
+            idempotency_key="initial-finalize-request-substitution-0002",
+        )
+
+    assert exc_info.value.error.code == "workspace_finalize_authority_mismatch"
+    assert persistence.mapping is None
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+    assert persistence.events.count("commit_mapping") == commit_count
+
+
+def test_initial_finalize_recovery_rejects_record_without_outcome_binding() -> None:
+    project, archive, persistence, fake_core = (
+        _prepare_initial_import_finalize_mapping_crash()
+    )
+    operation = persistence.operation
+    assert operation is not None
+    authority = operation.workspace_upload_finalize
+    assert authority is not None
+    unbound_authority = _unsafe_dataclass_replace(authority, outcome_sha256=None)
+    persistence.operation = _unsafe_dataclass_replace(
+        operation,
+        workspace_upload_finalize=unbound_authority,
+    )
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    commit_count = persistence.events.count("commit_mapping")
+    recovered, _, _, _ = _bridge(
+        project,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            project,
+            idempotency_key="initial-finalize-unbound-record-0002",
+        )
+
+    assert exc_info.value.error.code == "workspace_finalize_authority_mismatch"
     assert persistence.mapping is None
     assert len(fake_core.patch_requests) == patch_count
     assert _workspace_mutation_count(fake_core) == workspace_mutations
@@ -2347,10 +2523,7 @@ def test_durable_revision_chain_rejects_tampered_finalize_outcome() -> None:
         authority.outcome.model_copy(update={"project": tampered_project}).model_dump(),
         strict=True,
     )
-    persistence.operation = replace(
-        operation,
-        workspace_upload_finalize=replace(authority, outcome=tampered_outcome),
-    )
+    _replace_finalize_outcome_authority(persistence, tampered_outcome)
     successor = core_v1.RevisionRefV1(
         id="revision-2",
         project_id=CORE_PROJECT_ID,
@@ -2377,7 +2550,7 @@ def test_durable_revision_chain_rejects_tampered_finalize_outcome() -> None:
             idempotency_key="finalize-tampered-outcome-0003",
         )
 
-    assert exc_info.value.error.code == "core_project_patch_outcome_mismatch"
+    assert exc_info.value.error.code == "workspace_finalize_authority_mismatch"
     assert persistence.mapping == mapping_o
     assert persistence.mapping.project_etag != successor_etag
     assert len(persistence.mapping_history) == history_count

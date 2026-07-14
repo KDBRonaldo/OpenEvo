@@ -328,11 +328,17 @@ class CoreWorkspaceUploadFinalizeAuthorityV1:
     request: core_v1.WorkspaceUploadFinalizeV1
     idempotency_key: str
     outcome: core_v1.WorkspaceUploadFinalizeResponseV1
+    outcome_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        self.verify()
+
+    def verify(self) -> None:
         finalized = self.outcome.upload
         if _model_digest(self.request) != self.request_sha256:
             raise ValueError("workspace finalize request digest does not match canonical request")
+        if self.outcome_sha256 is None or _model_digest(self.outcome) != self.outcome_sha256:
+            raise ValueError("workspace finalize outcome digest does not match canonical outcome")
         if self.upload.status is not core_v1.WorkspaceUploadStatus.OPEN or (
             self.upload.accepted_offset != self.upload.archive.byte_size
             or self.request.content_sha256 != self.upload.archive.content_sha256
@@ -401,6 +407,8 @@ class CoreProjectCreateOperationV1:
             )
         ):
             raise ValueError("workspace finalize authority must match the bound upload")
+        if self.workspace_upload_finalize is not None:
+            self.workspace_upload_finalize.verify()
         if self.workspace_upload_abort is not None and self.workspace_upload_finalize is not None:
             raise ValueError("one workspace upload cannot have abort and finalize authority")
 
@@ -2103,6 +2111,7 @@ class DesktopCoreBridgeV1:
             request=finalize_request,
             idempotency_key=_derived_key(upload_key_seed, "finalize"),
             outcome=finalized,
+            outcome_sha256=_model_digest(finalized),
         )
         finalized_operation = replace(
             operation,
@@ -2527,6 +2536,19 @@ def _model_digest(model: core_v1.ContractModel) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _ensure_workspace_finalize_authority_binding(
+    authority: CoreWorkspaceUploadFinalizeAuthorityV1,
+) -> None:
+    try:
+        authority.verify()
+    except (AttributeError, TypeError, ValueError):
+        raise _bridge_error(
+            "workspace_finalize_authority_mismatch",
+            "The durable workspace finalize authority is incomplete or corrupted.",
+            status=409,
+        ) from None
+
+
 def _derived_key(base: str, purpose: str) -> str:
     digest = hashlib.sha256(f"{base}\0{purpose}".encode()).hexdigest()
     return f"desktop-core-{digest}"
@@ -2563,6 +2585,8 @@ def _ensure_create_operation(
     idempotency_key: str,
     core_host_identity: str,
 ) -> None:
+    if operation.workspace_upload_finalize is not None:
+        _ensure_workspace_finalize_authority_binding(operation.workspace_upload_finalize)
     bound = operation.state is CoreProjectCreateStateV1.BOUND
     if (
         operation.local_project_id != project.project_id
@@ -2758,6 +2782,8 @@ def _ensure_workspace_finalize_proof(
 ) -> core_v1.RevisionRefV1 | None:
     assert operation.outcome_mutable is not None
     assert operation.outcome_immutable is not None
+    if authority is not None:
+        _ensure_workspace_finalize_authority_binding(authority)
     requested_workspace = operation.new_project_create.workspace
     upload = authority.upload if authority is not None else None
     finalized_project = authority.outcome.project if authority is not None else None
@@ -2893,6 +2919,8 @@ def _ensure_bound_operation(
             "The durable project create binding does not match the Core mapping.",
             status=409,
         )
+    if operation.workspace_upload_finalize is not None:
+        _ensure_workspace_finalize_authority_binding(operation.workspace_upload_finalize)
     return operation
 
 
@@ -2941,6 +2969,7 @@ def _ensure_initial_publication_authority(
     finalize = operation.workspace_upload_finalize
     finalized_project: core_v1.ProjectV1 | None = None
     if finalize is not None:
+        _ensure_workspace_finalize_authority_binding(finalize)
         candidate = finalize.outcome.project
         if _project_identity_matches(candidate, operation.project_create):
             finalized_project = candidate

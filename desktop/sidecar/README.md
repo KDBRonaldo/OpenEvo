@@ -156,8 +156,11 @@ base, applied outcome, and finalize outcome form a complete ordered chain of
 same-revision or direct-successor edges through the current revision. Missing
 intermediates do not authorize a generation jump.
 Recovery performs both checks before another workspace mutation, mapping commit,
-or current ETag adoption. Finalize authority is CAS-persisted before mapping
-commit. Mapping CAS and matching
+or current ETag adoption. Finalize authority CAS-persists both the canonical
+request digest and the complete validated canonical outcome digest before mapping
+commit, and recovery recomputes both bindings before reading outcome authority.
+An older record without the outcome binding fails closed; live Core state cannot
+upgrade or repair it. Mapping CAS and matching
 applied-operation cleanup are atomic. After an O-to-A patch whose
 mapping commit failed, a same-A retry commits the finalized A mapping; a later
 Local B edit first commits that proven A generation, then issues one distinct
