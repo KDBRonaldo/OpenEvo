@@ -90,6 +90,11 @@ struct FileIdentity {
     changed_nanoseconds: i64,
 }
 
+const FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+const DIRECTORY_FILE_TYPE: u32 = libc::S_IFDIR as u32;
+const REGULAR_FILE_TYPE: u32 = libc::S_IFREG as u32;
+const SYMLINK_FILE_TYPE: u32 = libc::S_IFLNK as u32;
+
 #[derive(Debug)]
 struct VerifiedExecutableFile {
     file: File,
@@ -579,7 +584,7 @@ fn trusted_app_executable_owner() -> HostResult<u32> {
         .map_err(|_| packaged_owner_error())?;
     let identity = file_identity(&executable).map_err(|_| packaged_owner_error())?;
     let effective_user = unsafe { libc::geteuid() };
-    if identity.mode & libc::S_IFMT != libc::S_IFREG {
+    if identity.mode & FILE_TYPE_MASK != REGULAR_FILE_TYPE {
         return Err(packaged_owner_error());
     }
     validate_app_owner(identity.owner, effective_user)?;
@@ -646,7 +651,7 @@ fn validate_trusted_directory_for_user(
     identity: &FileIdentity,
     effective_user: u32,
 ) -> HostResult<()> {
-    let is_directory = identity.mode & libc::S_IFMT == libc::S_IFDIR;
+    let is_directory = identity.mode & FILE_TYPE_MASK == DIRECTORY_FILE_TYPE;
     let trusted_owner = identity.owner == 0 || identity.owner == effective_user;
     if !is_directory || !trusted_owner {
         return Err(packaged_path_error());
@@ -655,14 +660,14 @@ fn validate_trusted_directory_for_user(
 }
 
 fn validate_packaged_source_identity(identity: &FileIdentity, app_owner: u32) -> HostResult<()> {
-    let kind = identity.mode & libc::S_IFMT;
-    if kind == libc::S_IFLNK {
+    let kind = identity.mode & FILE_TYPE_MASK;
+    if kind == SYMLINK_FILE_TYPE {
         return Err(NativeHostError::new(
             "bundled_sidecar_symlink",
             "The packaged OpenEvo Desktop bundled sidecar is an unsupported symbolic link.",
         ));
     }
-    if kind != libc::S_IFREG {
+    if kind != REGULAR_FILE_TYPE {
         return Err(NativeHostError::new(
             "bundled_sidecar_not_regular",
             "The packaged OpenEvo Desktop bundled sidecar is not a regular file.",
@@ -762,10 +767,10 @@ fn file_identity_from_stat(stat: &libc::stat) -> FileIdentity {
         links: stat.st_nlink as u64,
         owner: stat.st_uid,
         size: stat.st_size as u64,
-        modified_seconds: stat.st_mtimespec.tv_sec,
-        modified_nanoseconds: stat.st_mtimespec.tv_nsec,
-        changed_seconds: stat.st_ctimespec.tv_sec,
-        changed_nanoseconds: stat.st_ctimespec.tv_nsec,
+        modified_seconds: stat.st_mtime,
+        modified_nanoseconds: stat.st_mtime_nsec,
+        changed_seconds: stat.st_ctime,
+        changed_nanoseconds: stat.st_ctime_nsec,
     }
 }
 
@@ -1930,7 +1935,7 @@ mod tests {
         let mut identity = mock_directory_identity(0);
         assert!(validate_trusted_directory_for_user(&identity, 501).is_ok());
         identity.owner = 501;
-        identity.mode = libc::S_IFDIR | 0o777;
+        identity.mode = DIRECTORY_FILE_TYPE | 0o777;
         assert!(validate_trusted_directory_for_user(&identity, 501).is_ok());
         identity.owner = 502;
         assert_eq!(
@@ -2498,7 +2503,7 @@ mod tests {
         FileIdentity {
             device: 1,
             inode: 2,
-            mode: libc::S_IFDIR | 0o755,
+            mode: DIRECTORY_FILE_TYPE | 0o755,
             links: 1,
             owner,
             size: 0,
