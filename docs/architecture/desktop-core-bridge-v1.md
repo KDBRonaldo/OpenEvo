@@ -67,6 +67,14 @@ fields implicitly classified. Its states are `pre_patch`, `unknown`, and
 5. atomically append the mapping version and remove that exact applied
    operation.
 
+The bound create operation first persists the create response's complete
+immutable projection: Core project ID, canonical `ProjectCreateV1`, task
+snapshot, and `created_at`. The initial project GET and every initial workspace
+finalize must match it exactly. A Desktop-authorized patch may replace canonical
+project intent and task snapshot according to its signed-snapshot rules, but it
+must preserve the Core project ID and `created_at`; this check runs before the
+response can become an applied durable outcome.
+
 The last transaction compares the complete previous mapping. A rollback leaves
 the old mapping and applied operation intact. If Local intent advanced from A
 to B after Core applied A, recovery proves the persisted A outcome, commits A
@@ -81,20 +89,28 @@ and publication observed now. If the applied imported-draft outcome has no activ
 revision, its pre-patch base revision remains the effective predecessor authority.
 If both are absent, the finalize/current authority may remain absent or first
 appear only as a same-project generation-zero revision. Later successor-only
-mutable authority must be ETag-visible and monotonic. Recovery rejects rollback,
-same-generation ID or manifest rewrites, and generation jumps before another
-workspace mutation, mapping commit, or current ETag adoption. Only after this
-proof may Desktop commit mapping A;
+mutable authority uses the same transition validator as mapping and patch
+recovery. The same revision requires an exact complete mutable projection;
+a direct successor requires a new ETag, strictly newer `updated_at`, and no
+change outside active revision, registry digest, ETag, and timestamp. Recovery
+rejects rollback, same-generation ID or manifest rewrites, generation jumps,
+reused successor ETags, time rollback, and mutable publication drift before
+another workspace mutation, mapping commit, or current ETag adoption. Only
+after this proof may Desktop commit mapping A;
 a requested B then starts from A's current ETag and gets a separate mapping
 generation.
 
 The completed mapping also stores the canonical mapped request, exact
-project/task/workspace content snapshots, project ETag, active revision,
-project `updated_at`, registry digest, monotonic mapping generation, and
-predecessor request digest. Mapping commit receives the complete expected prior
+project/task/workspace content snapshots, a complete immutable authority
+projection (Core project ID, canonical project intent, task snapshot, and
+`created_at`), a complete mutable authority projection (status,
+project/workspace snapshots, publication, revision, registry, model preparation,
+timestamp, and ETag), monotonic mapping generation, and predecessor request
+digest. The scalar snapshot/revision/registry/ETag/time indexes must exactly
+mirror those projections. Mapping commit receives the complete expected prior
 mapping; a durable adapter must retain the ordered audit history and reject lost
-updates. Every load recomputes the canonical request digest before Core
-transport.
+updates. Every load recomputes the canonical request digest and validates both
+projection bindings before Core transport.
 
 ## Session Ownership
 
@@ -105,6 +121,48 @@ host/tunnel/archive/persistence callback enters the token's external-call gate,
 checks generation and deadline before and after the call, and cannot overlap
 successful retirement. The strict client supplies the inner HTTP/SSE response
 and cache delivery barrier.
+
+The published session and `CoreActivationV1` retain a non-secret Local binding:
+the Local project ID, profile ID, saved Local ETag, and SHA-256 of the canonical
+mapped `ProjectCreateV1` intent. Bridge capabilities, project validation, and
+run creation accept the complete saved Local `ProjectV1`, not a project ID.
+They recompute and compare that binding after acquiring the active generation's
+external lease. Every following Core transport re-enters the same token gate,
+so cancellation between the comparison and transport fails with
+`active_project_session_superseded` without sending the request. A different
+project ID fails with `active_project_mismatch`; profile, ETag, or mapped-intent
+drift fails with `active_local_project_version_mismatch`. Both are typed 409
+errors raised before Core transport.
+
+The Local provider publishes activation state in a separate durable
+transaction, so the resulting `ProjectV1` has a new Local ETag and a
+`RemoteProjectStateV1`. It must then call `commit_local_activation()` with that
+exact object. The bridge verifies the Local ID, profile, mapped intent, active
+state, Core project ID, active revision, registry digest, model preparation,
+and Core ETag before advancing the session's Local ETag under the generation
+lease. This is a post-commit acknowledgement, not a general ETag bypass.
+
+The inexpensive project/profile/Local-ETag comparison precedes canonical
+mapping. If an otherwise valid Local model cannot satisfy the narrower Core
+mapping contract, including archive declaration invariants, the mapper and all
+public bridge methods return a closed `invalid_local_project` 422 instead of a
+Pydantic exception.
+
+Every config-dependent capability, validation, and run call also rereads the
+Core project before using it. The active session retains the completed durable
+mapping: its complete immutable projection and project/task/workspace content
+snapshots remain fixed. The refresh compares Core project intent through the
+same canonical project-identity helper used by activation and compares Core
+project ID, canonical intent, task snapshot, and `created_at` through the shared
+immutable authority validator. The last validated session project is
+the mutable predecessor. It may remain byte-for-byte equal or advance by one
+revision generation with a new ETag and strictly newer `updated_at`; only the
+active revision, matching registry digest, ETag, and timestamp may differ.
+Status, model preparation, publication, and content snapshots cannot drift.
+The accepted successor becomes the next in-session predecessor, allowing a
+fully observed direct-successor chain. Config changes cannot be legitimized by
+an otherwise valid successor revision, and same-revision mutable changes fail
+closed before Core validation or run mutation.
 
 Activation, switch, and close are serialized. A switch first cancels and fully
 retires the previous candidate or active token; no new host/Core work starts
@@ -120,6 +178,12 @@ while only an actual callback exception clears the future for a new callback
 attempt. Deadline expiry while computing the wait immediately after submission
 also retains that future; retry waits for the same callback instead of invoking
 it twice.
+
+An active project config edit uses `deactivate_project()` rather than closing
+the bridge permanently. The transition rejects a different Local project and
+an in-flight candidate, retires all generation resources through the same
+bounded path, and leaves the bridge available for later activation of the new
+draft intent.
 
 The forward activation path uses one finite wall-clock deadline across host
 attach, tunnel open, version negotiation, capabilities, project create/read,
@@ -158,21 +222,26 @@ archive declaration, and base workspace snapshot. A changed imported workspace
 therefore gets a new upload instead of reusing the prior version's session.
 
 For an existing mapping, Desktop first rereads the exact Core project. Unchanged
-intent must match the stored canonical request and immutable content snapshots.
-Project ETag, active revision, `updated_at`, and registry digest are mutable Core
-authority: cross-session successor activation may legitimately update them
-without changing Local intent or content snapshots. Desktop accepts and CAS
-versions that authority only after capabilities, project readiness,
-revision-head agreement, and Core validation all succeed.
+intent must match the stored canonical request, content snapshots, and complete
+immutable projection, including exact `created_at`. The mapping's complete
+mutable authority must be identical when the active revision is unchanged.
+Cross-session activation may accept one direct revision successor without
+changing Local intent: it must issue a new project ETag, strictly increase
+`updated_at`, preserve status, snapshots, publication, model preparation, and
+the complete immutable projection, and may update only active revision and
+registry alongside that ETag/time pair. Desktop accepts and CAS versions that
+authority only after capabilities, project readiness, revision-head agreement,
+and Core validation all succeed.
 
 Changed name, task, model/execution, evolution config, or workspace is sent
 through frozen Core `patch_project` with the freshly read Core ETag and a
 deterministic key derived from old and new canonical request digests. Core must
 return a new project snapshot and ETag, plus a new task/workspace snapshot state
-when those inputs changed. Replacing one unpublished imported draft with another
-may legally keep the workspace snapshot `null`; the new project snapshot and
-ETag version that draft transition. A Core reread validates ownership but is never proof
-of which request produced observed content. Every unknown patch replays the
+when those inputs changed, while retaining the exact Core project ID and
+`created_at`. Replacing one unpublished imported draft with another may legally
+keep the workspace snapshot `null`; the new project snapshot and ETag version
+that draft transition. A Core reread validates ownership but is never proof of
+which request produced observed content. Every unknown patch replays the
 durable canonical request with its original ETag and key until the exact response
 is persisted. Mapping CAS occurs only after workspace publication, readiness,
 revision-head agreement, and Core validation, preserving the prior mapping as
@@ -182,19 +251,27 @@ even though their predecessor request digest equals the current request digest.
 
 ## Run And Resource Proxy
 
-Local run creation supplies only the active local project ID and idempotency
-key. The bridge rereads the Core project, pinned capabilities, validation, and
-revision head. A reachable successor whose transition is not failed, cancelled,
-or unavailable is required; otherwise the active head is required. The bridge
-then constructs Core `RunCreateV1` from the authoritative project/task/workspace
-snapshot refs and registry digest.
+The renderer-facing run route still supplies only the active local project ID
+and idempotency key. Its future release-routing adapter must atomically load the
+saved `ProjectV1` selected by the route's Local ETag and pass that complete
+object to the bridge. The bridge verifies its activation binding, then rereads
+the Core project, pinned capabilities, validation, and revision head. A
+reachable successor whose transition is not failed, cancelled, or unavailable
+is required; otherwise the active head is required. The bridge then constructs
+Core `RunCreateV1` from the authoritative project/task/workspace snapshot refs
+and registry digest. A Core-only direct revision successor may change Core ETag
+and revision authority without requiring a new Local ETag because it does not
+change the saved Local binding.
 
 Run list/get/cancel/retry/timeline/log/context, artifacts, services, Core
 operations and referenced logs, diagnostics, maintenance, and events delegate
 to `CoreControlClientV1`. Core DTOs are returned unchanged. The strict client
 continues to enforce project membership, private-value scanning, bounded
-responses, ETags, idempotency, and release contract pins. Core HTTP 503 errors
-remain the exact typed Core error; the bridge does not synthesize readiness.
+responses, ETags, idempotency, and release contract pins. No public bridge
+method exposes `CoreClientErrorV1`: an exact Core `ApiErrorV1`, including HTTP
+503, is retained inside `DesktopCoreBridgeErrorV1`, while a strict-client local
+error is converted to a closed user-safe `ApiErrorV1`. The same rule covers
+deferred SSE iteration. The bridge does not synthesize readiness.
 
 ## Release Wiring Status
 
