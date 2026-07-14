@@ -877,6 +877,9 @@ def test_activate_then_create_run_uses_real_strict_clients_and_core_authority() 
     assert validation.valid is True
     assert persistence.events[0] == "reserve_create"
     assert persistence.mapping is not None
+    assert persistence.mapping.mutable_authority == bridge_module._patch_mutable_authority(
+        activation.core_project
+    )
     assert fake_core.created is True
     assert run.id == "run-1"
     assert fake_core.run_requests == [
@@ -985,6 +988,113 @@ def test_reactivation_versions_mutable_successor_authority_and_patches_current_e
     third.activate_project(modified, idempotency_key="successor-authority-edit-0003")
 
     assert fake_core.patch_requests[-1][1] == successor_etag
+
+
+def test_mapping_recovery_rejects_same_revision_etag_rewrite_before_mutation() -> None:
+    local_project = _local_project()
+    first, persistence, fake_core, _ = _bridge(local_project)
+    first.activate_project(local_project, idempotency_key="mapped-etag-base-0001")
+    first.close()
+    mapping = persistence.mapping
+    assert mapping is not None
+
+    rewritten_etag = '"' + "6" * 64 + '"'
+    fake_core.project_etag = rewritten_etag
+    fake_core.head = _head(active_revision=mapping.active_revision, etag=rewritten_etag)
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    history_count = len(persistence.mapping_history)
+    recovered, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            local_project,
+            idempotency_key="mapped-etag-recovery-0002",
+        )
+
+    assert exc_info.value.error.code == "core_project_mapping_mismatch"
+    assert exc_info.value.error.http_status == 409
+    assert persistence.mapping == mapping
+    assert len(persistence.mapping_history) == history_count
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+
+
+def test_mapping_recovery_rejects_successor_reusing_project_etag_before_mutation() -> None:
+    local_project = _local_project()
+    first, persistence, fake_core, _ = _bridge(local_project)
+    first.activate_project(local_project, idempotency_key="mapped-reused-etag-base-0001")
+    first.close()
+    mapping = persistence.mapping
+    assert mapping is not None
+
+    successor = core_v1.RevisionRefV1(
+        id="revision-1",
+        project_id=CORE_PROJECT_ID,
+        generation=1,
+        manifest_sha256="7" * 64,
+    )
+    fake_core.active_revision = successor
+    fake_core.project_etag = mapping.project_etag
+    fake_core.project_updated_at = "2026-07-14T12:10:00Z"
+    fake_core.head = _head(active_revision=successor, etag=mapping.project_etag)
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    history_count = len(persistence.mapping_history)
+    recovered, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            local_project,
+            idempotency_key="mapped-reused-etag-recovery-0002",
+        )
+
+    assert exc_info.value.error.code == "core_project_mapping_mismatch"
+    assert exc_info.value.error.http_status == 409
+    assert persistence.mapping == mapping
+    assert len(persistence.mapping_history) == history_count
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+
+
+def test_mapping_recovery_rejects_same_revision_updated_at_rollback_before_mutation() -> None:
+    local_project = _local_project()
+    first, persistence, fake_core, _ = _bridge(local_project)
+    first.activate_project(local_project, idempotency_key="mapped-time-base-0001")
+    first.close()
+    mapping = persistence.mapping
+    assert mapping is not None
+
+    fake_core.project_updated_at = "2026-07-14T11:59:59Z"
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    history_count = len(persistence.mapping_history)
+    recovered, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            local_project,
+            idempotency_key="mapped-time-recovery-0002",
+        )
+
+    assert exc_info.value.error.code == "core_project_mapping_mismatch"
+    assert exc_info.value.error.http_status == 409
+    assert persistence.mapping == mapping
+    assert len(persistence.mapping_history) == history_count
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
 
 
 @pytest.mark.parametrize(
@@ -2010,7 +2120,13 @@ def _prepare_finalized_import_patch_crash(
     assert mapping_o is not None
 
     fake_core.active_revision = finalize_revision
-    fake_core.head = _head(active_revision=finalize_revision)
+    if finalize_revision != mapping_o.active_revision:
+        fake_core.project_etag = '"' + "7" * 64 + '"'
+        fake_core.project_updated_at = "2026-07-14T12:42:00Z"
+    fake_core.head = _head(
+        active_revision=finalize_revision,
+        etag=fake_core.project_etag,
+    )
     archive = b"\1" * 1024
     edited = original.model_copy(
         update={
@@ -2809,6 +2925,48 @@ def test_finalize_after_crash_accepts_direct_revision_successor() -> None:
     assert persistence.mapping.active_revision == successor
     assert persistence.mapping.mapping_generation == mapping_o.mapping_generation + 1
     assert persistence.patch_operation is None
+
+
+def test_finalize_recovery_rejects_same_timestamp_etag_rewrite_before_mutation() -> None:
+    edited, archive, persistence, fake_core, mapping_o = _prepare_finalized_import_patch_crash(
+        finalize_revision=REVISION
+    )
+    operation = persistence.operation
+    assert operation is not None
+    finalize_authority = operation.workspace_upload_finalize
+    assert finalize_authority is not None
+    finalized_project = finalize_authority.outcome.project
+    rewritten_etag = '"' + "6" * 64 + '"'
+    assert rewritten_etag != finalized_project.etag
+    fake_core.active_revision = finalized_project.active_revision
+    fake_core.project_etag = rewritten_etag
+    fake_core.project_updated_at = finalized_project.updated_at
+    fake_core.head = _head(
+        active_revision=finalized_project.active_revision,
+        etag=rewritten_etag,
+    )
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    history_count = len(persistence.mapping_history)
+    recovered, _, _, _ = _bridge(
+        edited,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            edited,
+            idempotency_key="finalize-same-time-recovery-0003",
+        )
+
+    assert exc_info.value.error.code == "core_project_patch_outcome_mismatch"
+    assert exc_info.value.error.http_status == 409
+    assert persistence.mapping == mapping_o
+    assert len(persistence.mapping_history) == history_count
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
 
 
 def test_finalize_after_crash_accepts_durable_two_edge_revision_chain() -> None:

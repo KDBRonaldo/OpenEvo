@@ -81,20 +81,26 @@ and publication observed now. If the applied imported-draft outcome has no activ
 revision, its pre-patch base revision remains the effective predecessor authority.
 If both are absent, the finalize/current authority may remain absent or first
 appear only as a same-project generation-zero revision. Later successor-only
-mutable authority must be ETag-visible and monotonic. Recovery rejects rollback,
-same-generation ID or manifest rewrites, and generation jumps before another
-workspace mutation, mapping commit, or current ETag adoption. Only after this
-proof may Desktop commit mapping A;
+mutable authority uses the same transition validator as mapping and patch
+recovery. The same revision requires an exact complete mutable projection;
+a direct successor requires a new ETag, strictly newer `updated_at`, and no
+change outside active revision, registry digest, ETag, and timestamp. Recovery
+rejects rollback, same-generation ID or manifest rewrites, generation jumps,
+reused successor ETags, time rollback, and mutable publication drift before
+another workspace mutation, mapping commit, or current ETag adoption. Only
+after this proof may Desktop commit mapping A;
 a requested B then starts from A's current ETag and gets a separate mapping
 generation.
 
 The completed mapping also stores the canonical mapped request, exact
-project/task/workspace content snapshots, project ETag, active revision,
-project `updated_at`, registry digest, monotonic mapping generation, and
-predecessor request digest. Mapping commit receives the complete expected prior
-mapping; a durable adapter must retain the ordered audit history and reject lost
-updates. Every load recomputes the canonical request digest before Core
-transport.
+project/task/workspace content snapshots, a complete mutable authority
+projection (status, project/workspace snapshots, publication, revision,
+registry, model preparation, timestamp, and ETag), monotonic mapping generation,
+and predecessor request digest. The scalar snapshot/revision/registry/ETag/time
+indexes must exactly mirror that projection. Mapping commit receives the
+complete expected prior mapping; a durable adapter must retain the ordered audit
+history and reject lost updates. Every load recomputes the canonical request
+digest and validates the projection binding before Core transport.
 
 ## Session Ownership
 
@@ -192,11 +198,14 @@ therefore gets a new upload instead of reusing the prior version's session.
 
 For an existing mapping, Desktop first rereads the exact Core project. Unchanged
 intent must match the stored canonical request and immutable content snapshots.
-Project ETag, active revision, `updated_at`, and registry digest are mutable Core
-authority: cross-session successor activation may legitimately update them
-without changing Local intent or content snapshots. Desktop accepts and CAS
-versions that authority only after capabilities, project readiness,
-revision-head agreement, and Core validation all succeed.
+The mapping's complete mutable authority must be identical when the active
+revision is unchanged. Cross-session activation may accept one direct revision
+successor without changing Local intent: it must issue a new project ETag,
+strictly increase `updated_at`, preserve status, snapshots, publication, and
+model preparation, and may update only active revision and registry alongside
+that ETag/time pair. Desktop accepts and CAS versions that authority only after
+capabilities, project readiness, revision-head agreement, and Core validation
+all succeed.
 
 Changed name, task, model/execution, evolution config, or workspace is sent
 through frozen Core `patch_project` with the freshly read Core ETag and a

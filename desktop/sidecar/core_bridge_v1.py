@@ -519,6 +519,7 @@ class CoreProjectMappingV1:
     project_etag: str
     active_revision: core_v1.RevisionRefV1
     project_updated_at: str
+    mutable_authority: CoreProjectPatchMutableAuthorityV1
     mapping_generation: int
     predecessor_request_sha256: str | None
 
@@ -1754,11 +1755,15 @@ class DesktopCoreBridgeV1:
         request_sha256: str,
         core_host_identity: str,
     ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1 | None]:
-        _ensure_revision_authority_successor(
-            mapping.active_revision,
-            current.active_revision,
+        _ensure_mutable_authority_transition(
+            _mapping_mutable_authority(mapping),
+            _patch_mutable_authority(current),
             project_id=mapping.core_project_id,
             label="durable project mapping",
+            mismatch_code="core_project_mapping_mismatch",
+            mismatch_message=(
+                "Core mutable authority does not descend from the durable project mapping."
+            ),
         )
         if mapping.request_sha256 == request_sha256:
             _ensure_project_identity(current, requested)
@@ -2396,34 +2401,16 @@ class DesktopCoreBridgeV1:
                 status=409,
             )
         _ensure_mapping_content_snapshots(mapping, project)
-        _ensure_revision_authority_successor(
-            previous.active_revision,
-            project.active_revision,
+        _ensure_mutable_authority_transition(
+            _patch_mutable_authority(previous),
+            _patch_mutable_authority(project),
             project_id=mapping.core_project_id,
             label="active project session",
+            mismatch_code="core_project_refresh_authority_mismatch",
+            mismatch_message=(
+                "The refreshed Core project changed outside successor publication authority."
+            ),
         )
-        previous_mutable = _patch_mutable_authority(previous)
-        current_mutable = _patch_mutable_authority(project)
-        if current_mutable == previous_mutable:
-            return
-        expected_successor = replace(
-            previous_mutable,
-            active_revision=current_mutable.active_revision,
-            registry_digest=current_mutable.registry_digest,
-            updated_at=current_mutable.updated_at,
-            etag=current_mutable.etag,
-        )
-        if (
-            project.active_revision == previous.active_revision
-            or current_mutable != expected_successor
-            or _utc_timestamp(project.updated_at) <= _utc_timestamp(previous.updated_at)
-            or project.etag == previous.etag
-        ):
-            raise _bridge_error(
-                "core_project_refresh_authority_mismatch",
-                "The refreshed Core project changed outside successor publication authority.",
-                status=409,
-            )
 
     def _validate_current(
         self,
@@ -2806,11 +2793,15 @@ def _ensure_patch_operation_authority(
             and patch.old_project_create == operation.project_create
         )
     else:
-        _ensure_revision_authority_successor(
-            mapping.active_revision,
-            patch.base_project.active_revision,
+        _ensure_mutable_authority_transition(
+            _mapping_mutable_authority(mapping),
+            _patch_mutable_authority(patch.base_project),
             project_id=patch.core_project_id,
             label="durable project patch base",
+            mismatch_code="core_project_patch_replay_mismatch",
+            mismatch_message=(
+                "The durable Core project patch base does not descend from the mapping."
+            ),
         )
         base_matches = (
             patch.old_request_sha256 == mapping.request_sha256
@@ -2862,39 +2853,21 @@ def _ensure_persisted_patch_outcome(
         effective_authority,
     )
     current_mutable = _patch_mutable_authority(current)
-    if current_mutable == operation.outcome_mutable:
-        _ensure_revision_authority_successor(
-            effective_authority,
-            current.active_revision,
-            project_id=operation.core_project_id,
-            label="durable applied patch outcome",
-        )
-        return revision_authorities
-    if _utc_timestamp(current.updated_at) < _utc_timestamp(
-        operation.outcome_mutable.updated_at
-    ):
-        raise _bridge_error(
-            "core_project_patch_outcome_mismatch",
-            "Core project mutable authority moved backward after the applied patch.",
-            status=409,
-        )
-    if current.etag == operation.outcome_mutable.etag:
-        raise _bridge_error(
-            "core_project_patch_outcome_mismatch",
-            "Core changed project authority without issuing a new ETag.",
-            status=409,
-        )
     same_content_authority = (
         current.current_project_snapshot == operation.outcome_mutable.project_snapshot
         and current.current_workspace_snapshot == operation.outcome_mutable.workspace_snapshot
         and current.workspace_publication == operation.outcome_mutable.workspace_publication
     )
     if same_content_authority:
-        _ensure_revision_authority_successor(
-            effective_authority,
-            current.active_revision,
+        _ensure_mutable_authority_transition(
+            operation.outcome_mutable,
+            current_mutable,
             project_id=operation.core_project_id,
             label="durable applied patch outcome",
+            mismatch_code="core_project_patch_outcome_mismatch",
+            mismatch_message=(
+                "Core mutable authority does not descend from the applied project patch."
+            ),
         )
         return revision_authorities
     finalized_revision = _ensure_workspace_finalize_proof(
@@ -2955,27 +2928,24 @@ def _ensure_workspace_finalize_proof(
         )
     finalized_mutable = _patch_mutable_authority(finalized_project)
     current_mutable = _patch_mutable_authority(current)
-    _ensure_revision_authority_chain(
-        (
-            _effective_applied_revision_authority(operation),
-            finalized_mutable.active_revision,
-            current_mutable.active_revision,
-        ),
+    _ensure_revision_authority_successor(
+        _effective_applied_revision_authority(operation),
+        finalized_mutable.active_revision,
         project_id=operation.core_project_id,
-        labels=(
-            "durable applied patch outcome (durable workspace finalize predecessor)",
-            "durable workspace finalize",
+        label=(
+            "durable applied patch outcome (durable workspace finalize predecessor)"
         ),
     )
-    if current_mutable != finalized_mutable and (
-        _utc_timestamp(current.updated_at) < _utc_timestamp(finalized_project.updated_at)
-        or current.etag == finalized_project.etag
-    ):
-        raise _bridge_error(
-            "core_project_patch_outcome_mismatch",
-            "Core mutable authority does not descend from the durable workspace finalize.",
-            status=409,
-        )
+    _ensure_mutable_authority_transition(
+        finalized_mutable,
+        current_mutable,
+        project_id=operation.core_project_id,
+        label="durable workspace finalize",
+        mismatch_code="core_project_patch_outcome_mismatch",
+        mismatch_message=(
+            "Core mutable authority does not descend from the durable workspace finalize."
+        ),
+    )
     return finalized_mutable.active_revision
 
 
@@ -3027,12 +2997,35 @@ def _utc_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
 
 
+def _mapping_mutable_authority(
+    mapping: CoreProjectMappingV1,
+) -> CoreProjectPatchMutableAuthorityV1:
+    authority = mapping.mutable_authority
+    if (
+        authority.project_snapshot != mapping.project_snapshot
+        or authority.workspace_snapshot != mapping.workspace_snapshot
+        or authority.registry_digest != mapping.registry_digest
+        or authority.etag != mapping.project_etag
+        or authority.active_revision != mapping.active_revision
+        or authority.updated_at != mapping.project_updated_at
+        or authority.active_revision is None
+        or authority.active_revision.project_id != mapping.core_project_id
+    ):
+        raise _bridge_error(
+            "core_project_mapping_mismatch",
+            "The durable Core project mapping has inconsistent mutable authority.",
+            status=409,
+        )
+    return authority
+
+
 def _ensure_mapping_authority(
     mapping: CoreProjectMappingV1,
     project: local_v1.ProjectV1,
     *,
     core_host_identity: str,
 ) -> None:
+    _mapping_mutable_authority(mapping)
     if (
         mapping.local_project_id != project.project_id
         or mapping.profile_id != project.profile_id
@@ -3140,25 +3133,29 @@ def _ensure_initial_publication_authority(
             == finalized_project.current_workspace_snapshot
             and descendant.workspace_publication == finalized_project.workspace_publication
         )
-        descendant_mutable = _patch_mutable_authority(descendant)
-        finalized_mutable = _patch_mutable_authority(finalized_project)
-        valid_mutable_descent = descendant_mutable == finalized_mutable or (
-            _utc_timestamp(descendant.updated_at) >= _utc_timestamp(finalized_project.updated_at)
-            and descendant.etag != finalized_project.etag
-        )
-        if not same_content_authority or not valid_mutable_descent:
+        if not same_content_authority:
             raise _bridge_error(
                 "core_project_initial_publication_mismatch",
                 "Core no longer descends from the durable initial workspace publication.",
                 status=409,
             )
-
-    _ensure_revision_authority_successor(
-        authority,
-        descendant.active_revision,
-        project_id=operation.core_project_id,
-        label="durable initial workspace publication",
-    )
+        _ensure_mutable_authority_transition(
+            _patch_mutable_authority(finalized_project),
+            _patch_mutable_authority(descendant),
+            project_id=operation.core_project_id,
+            label="durable initial workspace publication",
+            mismatch_code="core_project_initial_publication_mismatch",
+            mismatch_message=(
+                "Core no longer descends from the durable initial workspace publication."
+            ),
+        )
+    else:
+        _ensure_revision_authority_successor(
+            authority,
+            descendant.active_revision,
+            project_id=operation.core_project_id,
+            label="durable initial workspace publication",
+        )
     return authority
 
 
@@ -3259,6 +3256,44 @@ def _ensure_revision_authority_successor(
         )
 
 
+def _ensure_mutable_authority_transition(
+    authority: CoreProjectPatchMutableAuthorityV1,
+    current: CoreProjectPatchMutableAuthorityV1,
+    *,
+    project_id: str,
+    label: str,
+    mismatch_code: str,
+    mismatch_message: str,
+) -> None:
+    _ensure_revision_authority_successor(
+        authority.active_revision,
+        current.active_revision,
+        project_id=project_id,
+        label=label,
+    )
+    if current.active_revision == authority.active_revision:
+        valid_transition = current == authority
+    else:
+        expected_successor = replace(
+            authority,
+            active_revision=current.active_revision,
+            registry_digest=current.registry_digest,
+            updated_at=current.updated_at,
+            etag=current.etag,
+        )
+        valid_transition = (
+            current == expected_successor
+            and current.etag != authority.etag
+            and _utc_timestamp(current.updated_at) > _utc_timestamp(authority.updated_at)
+        )
+    if not valid_transition:
+        raise _bridge_error(
+            mismatch_code,
+            mismatch_message,
+            status=409,
+        )
+
+
 def _ensure_revision_authority_chain(
     authorities: tuple[core_v1.RevisionRefV1 | None, ...],
     *,
@@ -3341,6 +3376,9 @@ def _mapping_from_request(
             "core_project_not_ready",
             "Core has not published the project workspace snapshot and active revision.",
         )
+    mutable_authority = _patch_mutable_authority(project)
+    if previous_mapping is not None:
+        _mapping_mutable_authority(previous_mapping)
     chain_start = (
         previous_mapping.active_revision
         if previous_mapping is not None
@@ -3366,9 +3404,7 @@ def _mapping_from_request(
         and previous_mapping.task_snapshot == project.current_task_snapshot
         and previous_mapping.workspace_snapshot == workspace_snapshot
         and previous_mapping.registry_digest == capabilities.registry_digest
-        and previous_mapping.project_etag == project.etag
-        and previous_mapping.active_revision == active_revision
-        and previous_mapping.project_updated_at == project.updated_at
+        and previous_mapping.mutable_authority == mutable_authority
     ):
         mapping_generation = previous_mapping.mapping_generation
         predecessor_request_sha256 = previous_mapping.predecessor_request_sha256
@@ -3389,6 +3425,7 @@ def _mapping_from_request(
         project_etag=project.etag,
         active_revision=active_revision,
         project_updated_at=project.updated_at,
+        mutable_authority=mutable_authority,
         mapping_generation=mapping_generation,
         predecessor_request_sha256=predecessor_request_sha256,
     )

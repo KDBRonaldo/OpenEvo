@@ -327,15 +327,18 @@ current ETag, issuing a patch or upload, or committing the first mapping.
 Mapped Local edits use Core `patch_project`, the freshly read project ETag, and
 a deterministic old/new request key. The mapping records canonical mapped
 intent and immutable project/task/workspace content snapshots separately from
-mutable Core authority: project ETag, active revision, project `updated_at`, and
-registry digest. A legitimate cross-session successor may change only that
-mutable authority. Every initial-publication, mapped, patch-recovery, and
-finalize-recovery read validates active revision authority monotonically before
-using the current ETag:
-the same generation must preserve the complete revision ref, while a changed ref
-must be the same-project direct successor on every proven authority edge.
-Generation rollback, identity rewrite, and unproven generation skips fail closed
-without committing a mapping. An
+the complete mutable Core authority projection: status, project/workspace
+snapshots, workspace publication, active revision, registry digest, model
+preparation, project `updated_at`, and project ETag. Every
+initial-publication, mapped, patch-recovery, and finalize-recovery read uses the
+same transition validator before using the current ETag. An unchanged revision
+requires that complete projection, including ETag, timestamp, and registry, to
+remain exactly equal. A changed revision must be the same-project direct
+successor, issue a new ETag, strictly increase `updated_at`, and leave status,
+snapshots, publication, and model preparation fixed; only revision, registry,
+ETag, and timestamp may advance. Generation rollback, same-generation identity
+rewrite, unproven generation skips, reused successor ETags, and time rollback
+fail closed without workspace mutation or mapping commit. An
 applied imported draft may have no outcome revision; recovery then retains its
 pre-patch base revision as the effective lower bound. If both are absent, only
 no revision or a same-project generation-zero revision is valid. After
@@ -365,7 +368,10 @@ patch's effective lower bound and is then durable authority for later reads. A
 recovered mapping may cross multiple generations only when the durable patch
 base, applied outcome, and finalize outcome form a complete ordered chain of
 same-revision or direct-successor edges through the current revision. Missing
-intermediates do not authorize a generation jump.
+intermediates do not authorize a generation jump. After an applied or finalized
+outcome becomes the predecessor, a same-revision reread must equal its complete
+mutable projection; a later direct successor must satisfy the same new-ETag,
+strict-time, and fixed-publication constraints as mapping recovery.
 Recovery performs both checks before another workspace mutation, mapping commit,
 or current ETag adoption. Finalize authority CAS-persists both the canonical
 request digest and the complete validated canonical outcome digest before mapping
