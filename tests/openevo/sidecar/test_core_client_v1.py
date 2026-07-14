@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import queue
 import secrets
 import threading
 import time
@@ -616,6 +615,121 @@ def test_client_disables_environment_transport_and_redirects() -> None:
         client.close()
 
 
+@pytest.mark.parametrize(
+    "timeout",
+    [None, float("inf"), 0.0, 301.0, httpx.Timeout(None), httpx.Timeout(5.0, read=None)],
+)
+def test_client_rejects_unbounded_or_invalid_total_deadlines(timeout: object) -> None:
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        CoreControlClientV1(
+            _connection(),
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json=_health_payload())
+            ),
+            timeout=timeout,  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_CONNECTION
+
+
+def test_total_deadline_interrupts_blocking_send() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        entered.set()
+        release.wait(1)
+        return httpx.Response(200, json=_health_payload())
+
+    client = CoreControlClientV1(
+        _connection(), transport=httpx.MockTransport(handler), timeout=0.05
+    )
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.health()
+        elapsed = time.monotonic() - started_at
+    finally:
+        release.set()
+        client.close()
+
+    assert entered.is_set()
+    assert elapsed < 0.25
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.CONNECTION_FAILED
+
+
+def test_total_deadline_stops_trickle_body_without_replaying_mutation() -> None:
+    class TrickleStream(httpx.SyncByteStream):
+        def __iter__(self):
+            for chunk in (b"{", b'"schema_version":"1"}'):
+                time.sleep(0.04)
+                yield chunk
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=TrickleStream(),
+        )
+
+    client = CoreControlClientV1(
+        _connection(), transport=httpx.MockTransport(handler), timeout=0.06
+    )
+    request = v1.EnvironmentDoctorRequestV1(
+        execution_mode=v1.ExecutionMode.SELF_DEPLOYED,
+        checks=[v1.EnvironmentCheckKind.PYTHON],
+    )
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.environment_doctor(request, idempotency_key="doctor-deadline-1")
+        elapsed = time.monotonic() - started_at
+    finally:
+        client.close()
+
+    assert calls == 1
+    assert elapsed < 0.25
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.CONNECTION_FAILED
+
+
+def test_redirect_is_rejected_without_reading_a_trickle_body() -> None:
+    class UnreadRedirectBody(httpx.SyncByteStream):
+        read = False
+
+        def __iter__(self):
+            self.read = True
+            time.sleep(1)
+            yield b"redirect"
+
+    body = UnreadRedirectBody()
+    client = CoreControlClientV1(
+        _connection(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                307,
+                headers={"Location": "http://127.0.0.1:48765/other"},
+                stream=body,
+            )
+        ),
+        timeout=0.05,
+    )
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.status()
+        elapsed = time.monotonic() - started_at
+    finally:
+        client.close()
+
+    assert body.read is False
+    assert elapsed < 0.25
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.REDIRECT_REJECTED
+
+
 def test_success_body_is_bounded_by_declared_content_length_before_streaming() -> None:
     class UnreadStream(httpx.SyncByteStream):
         read = False
@@ -1171,6 +1285,60 @@ def test_get_pagination_uses_only_closed_query_and_active_project_filter() -> No
     assert len(seen) == 1
 
 
+def test_private_values_are_rejected_from_path_query_header_and_body_before_transport() -> None:
+    called = False
+    token = _token()
+    connection = _connection(token=token)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    client = _client(handler, connection=connection)
+    project = _project()
+    create_request = v1.ProjectCreateV1(
+        name=connection.session_id,
+        spec=project.spec,
+        task=project.task,
+        workspace=project.workspace,
+    )
+    doctor_request = v1.EnvironmentDoctorRequestV1(
+        execution_mode=v1.ExecutionMode.SELF_DEPLOYED,
+        checks=[v1.EnvironmentCheckKind.PYTHON],
+    )
+
+    def open_private_cursor() -> None:
+        with client.events(last_event_id=connection.session_id):
+            pass
+
+    operations = (
+        lambda: client.get_service(connection.endpoint),
+        lambda: client.list_services(after=connection.origin),
+        lambda: client.environment_doctor(doctor_request, idempotency_key=token),
+        lambda: client.create_project(create_request, idempotency_key="create-private-body-1"),
+        open_private_cursor,
+    )
+    for operation in operations:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            operation()
+        assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+
+    assert called is False
+
+
+def test_connection_rejects_private_session_identity_as_project_id() -> None:
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        CoreTunnelConnectionV1(
+            endpoint="http://127.0.0.1:48765",
+            bearer_token=_token(),
+            project_id=SESSION_ID,
+            session_id=SESSION_ID,
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_CONNECTION
+
+
 def test_run_admission_for_another_project_is_rejected_before_transport() -> None:
     called = False
 
@@ -1623,9 +1791,7 @@ def test_nested_artifact_diff_cannot_hold_close_past_deadline(monkeypatch) -> No
     assert "artifact-previous" not in client._artifacts
 
 
-def test_bounded_closer_start_failure_uses_prestarted_owner_for_blocking_action(
-    monkeypatch,
-) -> None:
+def test_blocking_closers_share_one_process_fixed_thread_budget(monkeypatch) -> None:
     import desktop.sidecar.core_client_v1 as core_client_module
 
     monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
@@ -1642,73 +1808,41 @@ def test_bounded_closer_start_failure_uses_prestarted_owner_for_blocking_action(
             self.close_started.set()
             self.release_close.wait(1)
 
-    original_start = threading.Thread.start
-    fail_starts = True
-
-    def fail_closer_start(thread: threading.Thread) -> None:
-        if fail_starts and thread.name.startswith("openevo-core-resource-closer-"):
-            raise RuntimeError("injected start failure")
-        original_start(thread)
-
-    transport = CloseTrackingTransport()
-    client = CoreControlClientV1(_connection(), transport=transport)
-    monkeypatch.setattr(threading.Thread, "start", fail_closer_start)
-
-    started_at = time.monotonic()
-    client.close()
-    elapsed = time.monotonic() - started_at
-
+    transports = [CloseTrackingTransport() for _ in range(12)]
+    clients = [CoreControlClientV1(_connection(), transport=transport) for transport in transports]
+    worker_ids_before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("openevo-core-resource-closer-")
+    }
+    closers = [threading.Thread(target=client.close) for client in clients]
+    for closer in closers:
+        closer.start()
     try:
-        assert elapsed < 0.25
-        assert transport.close_started.is_set() is True
-        assert client._close_tasks_pending == 1
-        assert client._resource_closer._workers == 0
-        assert client._close_failed is False
+        for closer in closers:
+            closer.join(0.25)
+        assert all(not closer.is_alive() for closer in closers)
+        assert sum(transport.close_started.is_set() for transport in transports) == (
+            core_client_module.CORE_CLOSE_WORKER_COUNT
+        )
+        worker_ids_after = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name.startswith("openevo-core-resource-closer-")
+        }
+        assert worker_ids_after == worker_ids_before
+        assert len(worker_ids_after) == core_client_module.CORE_CLOSE_WORKER_COUNT
+        assert not any(
+            thread.name == "openevo-core-resource-owner" for thread in threading.enumerate()
+        )
     finally:
-        fail_starts = False
-        transport.release_close.set()
+        for transport in transports:
+            transport.release_close.set()
 
     deadline = time.monotonic() + 1
-    while client._close_tasks_pending and time.monotonic() < deadline:
+    while any(client._close_tasks_pending for client in clients) and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert client._close_tasks_pending == 0
-
-
-def test_bounded_closer_idle_submit_race_keeps_worker_for_accepted_action(
-    monkeypatch,
-) -> None:
-    import desktop.sidecar.core_client_v1 as core_client_module
-
-    class CoordinatedQueue(queue.Queue):
-        def __init__(self) -> None:
-            super().__init__(maxsize=4)
-            self.idle_observed = threading.Event()
-            self.release_idle = threading.Event()
-
-        def get(self, block: bool = True, timeout: float | None = None):
-            if timeout is not None:
-                try:
-                    return super().get(block=False)
-                except queue.Empty:
-                    self.idle_observed.set()
-                    self.release_idle.wait(1)
-                    raise
-            return super().get(block=block, timeout=timeout)
-
-    monkeypatch.setattr(core_client_module, "CORE_CLOSE_WORKER_COUNT", 1)
-    closer = core_client_module._BoundedResourceCloser()
-    coordinated_queue = CoordinatedQueue()
-    closer._queue = coordinated_queue
-    first_done = threading.Event()
-    second_done = threading.Event()
-
-    assert closer.submit(first_done.set) is True
-    assert first_done.wait(1)
-    assert coordinated_queue.idle_observed.wait(1)
-    assert closer.submit(second_done.set) is True
-    coordinated_queue.release_idle.set()
-
-    assert second_done.wait(1)
+    assert all(client._close_tasks_pending == 0 for client in clients)
 
 
 def test_late_response_close_is_handed_to_bounded_closer_without_state_lock(
@@ -1940,7 +2074,7 @@ def test_sse_seal_before_delivery_linearization_rejects_frame(monkeypatch) -> No
     assert "event-1" not in client._sse_event_digests
 
 
-def test_sse_delivery_linearized_before_seal_may_yield_after_close(monkeypatch) -> None:
+def test_sse_delivery_linearized_before_seal_is_not_yielded_after_close(monkeypatch) -> None:
     payload = {
         "schema_version": "1",
         "id": "event-1",
@@ -1989,9 +2123,8 @@ def test_sse_delivery_linearized_before_seal_may_yield_after_close(monkeypatch) 
 
     assert not reader.is_alive()
     assert close_elapsed < 0.25
-    assert errors == []
-    assert [frame.id for frame in frames] == ["event-1"]
-    assert "event-1" in client._sse_event_digests
+    assert frames == []
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
 
 
 def test_sse_event_id_is_bound_to_canonical_payload_across_reconnects() -> None:
@@ -2169,6 +2302,46 @@ def test_sse_declared_stream_limit_is_checked_before_reading() -> None:
 
     assert stream.read is False
     assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.RESPONSE_TOO_LARGE
+
+
+def test_sse_trickle_cannot_extend_total_deadline() -> None:
+    first = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    second = {**first, "id": "event-2", "sequence": 2}
+
+    class TrickleSse(httpx.SyncByteStream):
+        def __iter__(self):
+            for payload in (first, second):
+                time.sleep(0.04)
+                yield _sse_bytes(payload)
+
+    client = CoreControlClientV1(
+        _connection(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=TrickleSse(),
+            )
+        ),
+        timeout=0.06,
+    )
+    try:
+        with client.events() as stream:
+            iterator = iter(stream)
+            assert next(iterator).id == "event-1"
+            with pytest.raises(CoreClientErrorV1) as exc_info:
+                next(iterator)
+    finally:
+        client.close()
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.CONNECTION_FAILED
 
 
 @pytest.mark.parametrize("private_kind", ["bearer", "origin", "session"])

@@ -31,43 +31,50 @@ digest. Malformed, oversized,
 redirected, cross-project, or connection failures become closed local errors
 without raw bodies, headers, URLs, paths, or credentials.
 
+Every client requires a finite positive timeout, and every component of an
+`httpx.Timeout` must be finite. The timeout is also the hard wall-clock budget
+for the complete public operation, capped at 300 seconds. The same deadline
+covers transport send, redirects, bounded JSON/error reads, nested client calls,
+and the full SSE stream window; trickle traffic cannot renew it. Synchronous
+transport calls run on one process-wide, fixed eight-thread daemon executor, so
+a transport that ignores cancellation cannot create unbounded owner threads.
+Queued work is cancelled at deadline when possible, and a late response is
+closed through the bounded resource closer. Mutations are submitted exactly
+once and are never replayed automatically after timeout or connection failure.
+
 The shared HTTP client is safe for concurrent calls; `close()` is idempotent and
 immediately seals the client against new leases. Every response and transport
 close, including ordinary response-context exit and a response that arrives
-after sealing, is submitted outside the state lock to that client's
-fixed-capacity daemon closer. Each client prestarts a dedicated ownership worker;
-additional bounded workers may be started on submission. An uninterruptible
-synchronous close therefore cannot exceed the caller's total wait bound. On
-timeout the client remains permanently closed while the bounded closer retains
-accepted old resources until their close calls return. Enqueue and worker
-retirement share one lock, so an idle worker rechecks the queue before exiting.
-If an additional worker fails to start, the action remains queued and the
-prestarted owner executes it; the caller never runs the close action. The owner
-is sealed after the closed client has no remaining leases. A closed connection
+after sealing, is submitted outside the state lock to one process-wide bounded
+queue served by exactly four prestarted daemon workers. Creating more clients
+does not create closer or ownership threads. An uninterruptible synchronous
+close cannot exceed the caller's wait bound; accepted old resources remain on
+the bounded queue until a worker can close them. A full queue fails closed and
+the caller never executes a potentially blocking close. A closed connection
 cannot send its bearer after Desktop switches to another project session or tunnel.
 
 The close seal increments a client session generation. Each public JSON call owns
 one generation token and a copy-on-write authority/cache transaction. Network
 I/O, bounded body reads, response-model validation, nested public calls, and
 cache validation do not hold the close state lock. After all validation succeeds,
-the call takes that lock only long enough to linearize its cache transaction and
-normal return against close. If the seal linearizes first, the transaction rolls
-back and the call returns `core_client_closed`; if the result linearizes first,
-close may subsequently seal while the calling thread is rescheduled after the
-return point.
+the call crosses a dedicated delivery barrier shared with `close()`. If the seal
+starts first, the transaction rolls back and the call returns
+`core_client_closed`. After `close()` returns, no result from the sealed
+generation may be delivered.
 
 SSE parsing and cache validation likewise happen outside the close state lock.
-The replay-ledger/cache transaction and frame delivery share one final, short
-generation linearization point. A seal that wins that point rejects the frame
-without cache or replay authority. If delivery wins first, `close()` may return
-before Python resumes the generator at `yield`; the consumer may then observe
-that already-linearized frame, which is defined as pre-seal delivery. No frame
-whose delivery linearization occurs after the seal is yielded.
+The replay-ledger/cache transaction and frame delivery use the same delivery
+barrier and repeat the generation check immediately before `yield`. A seal that
+wins rejects the frame. `close()` returning is a hard boundary: no old frame may
+be yielded afterward.
 
-After JSON decoding, every nested string key and value is checked for the
-bearer, fixed Core tunnel URL/origin, and private Desktop session identity. The
-same check applies to decoded SSE data, so JSON Unicode escapes cannot bypass
-credential sanitization. Release providers currently generate
+Before URL/request construction, path segments (including their decoded form),
+query values, cursors, caller-provided headers, and decoded request bodies are
+recursively checked for the bearer, fixed Core tunnel URL/origin, and private
+Desktop session identity. The active project identity is checked when the
+connection is created. The same recursive check applies after JSON/error/SSE
+decoding, so percent or JSON Unicode escapes cannot bypass credential
+sanitization or place private values in a request URL/access log. Release providers currently generate
 `Idempotency-Key`, `Last-Event-ID`, and SSE `id` values as visible ASCII. The
 client rejects non-ASCII or control characters instead of percent-encoding
 them; this is a temporary release implementation constraint, not a broader Core

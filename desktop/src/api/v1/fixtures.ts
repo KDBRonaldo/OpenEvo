@@ -4,7 +4,7 @@ const C = "c".repeat(64);
 const ETAG_A = `"${A}"`;
 const ETAG_B = `"${B}"`;
 const NOW = "2026-07-14T12:00:00Z";
-const OPENAPI_DIGEST = "c9f2fa2cdcc2ff5cde40b9bbd007430ac0ccfdf6452844315d8e29d913f0b7a0";
+const OPENAPI_DIGEST = "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36";
 
 const supportedAxis = {
   state: "supported",
