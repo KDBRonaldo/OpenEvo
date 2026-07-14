@@ -87,6 +87,8 @@ def _provider(
         event_broker=event_broker,
         clock=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
     )
+    if bridge is not None:
+        provider._active_project_for_runtime = lambda: project  # type: ignore[method-assign]
     return provider, store, project
 
 
@@ -99,9 +101,38 @@ def _page_arguments() -> dict[str, object]:
     }
 
 
+def _bind_app_project(app: object) -> local_v1.ProjectV1:
+    provider = app.state.desktop_release_provider  # type: ignore[attr-defined]
+    store = provider._store
+    profile = store.create_profile(
+        local_v1.RemoteProfileCreateV1(
+            name="App research server",
+            host="compute.example.org",
+            user="researcher",
+        ),
+        idempotency_key="app-profile-create-routing-0001",
+    )
+    project = store.create_project(
+        local_v1.ProjectCreateV1(
+            name="App protein design",
+            profile_id=profile.profile_id,
+            task=local_v1.ProjectTaskV1(title="Design", objective="Improve stability."),
+            source=local_v1.ProjectSourceV1(kind="scratch", display_name="New workspace"),
+            execution=local_v1.ExecutionSettingsV1(
+                mode="codex_subscription_transcript",
+                codex_model="gpt-5.5",
+            ),
+            evolution=local_v1.EvolutionConfigV1(targets={}),
+        ),
+        idempotency_key="app-project-create-routing-0001",
+    )
+    provider._active_project_for_runtime = lambda: project
+    return project
+
+
 def test_release_provider_forwards_core_owned_read_routes(tmp_path: Path) -> None:
     bridge = Mock(spec=DesktopCoreBridgeV1)
-    provider, _, _ = _provider(tmp_path, bridge)
+    provider, _, project = _provider(tmp_path, bridge)
     sentinel = object()
     cases = (
         ("listRuns", "list_runs", _page_arguments()),
@@ -135,25 +166,28 @@ def test_release_provider_forwards_core_owned_read_routes(tmp_path: Path) -> Non
             method.return_value = sentinel
             assert provider.invoke(operation_id, arguments) is sentinel
 
-        bridge.list_runs.assert_called_once_with(**_page_arguments())
-        bridge.get_run.assert_called_once_with("run-1")
-        bridge.run_timeline.assert_called_once_with("run-1", **_page_arguments())
-        bridge.run_logs.assert_called_once_with("run-1", **_page_arguments())
-        bridge.run_context.assert_called_once_with("run-1")
-        bridge.run_artifacts.assert_called_once_with("run-1", **_page_arguments())
-        bridge.get_artifact.assert_called_once_with("artifact-1")
-        bridge.artifact_content.assert_called_once_with("artifact-1")
-        bridge.artifact_diff.assert_called_once_with("artifact-1")
+        bridge.list_runs.assert_called_once_with(project, **_page_arguments())
+        bridge.get_run.assert_called_once_with(project, "run-1")
+        bridge.run_timeline.assert_called_once_with(project, "run-1", **_page_arguments())
+        bridge.run_logs.assert_called_once_with(project, "run-1", **_page_arguments())
+        bridge.run_context.assert_called_once_with(project, "run-1")
+        bridge.run_artifacts.assert_called_once_with(project, "run-1", **_page_arguments())
+        bridge.get_artifact.assert_called_once_with(project, "artifact-1")
+        bridge.artifact_content.assert_called_once_with(project, "artifact-1")
+        bridge.artifact_diff.assert_called_once_with(project, "artifact-1")
         bridge.list_services.assert_called_once_with(
+            project,
             limit=17,
             after="cursor-1",
             sort="kind",
             direction="asc",
         )
-        bridge.service_logs.assert_called_once_with("service-1", **_page_arguments())
-        bridge.get_operation.assert_called_once_with("core-operation-1")
-        bridge.logs_by_ref.assert_called_once_with("logs-1", **_page_arguments())
-        bridge.get_diagnostic.assert_called_once_with("diagnostic-1")
+        bridge.service_logs.assert_called_once_with(
+            project, "service-1", **_page_arguments()
+        )
+        bridge.get_operation.assert_called_once_with(project, "core-operation-1")
+        bridge.logs_by_ref.assert_called_once_with(project, "logs-1", **_page_arguments())
+        bridge.get_diagnostic.assert_called_once_with(project, "diagnostic-1")
     finally:
         provider.close()
     bridge.close.assert_called_once_with()
@@ -259,24 +293,36 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
             project, idempotency_key="run-create-routing-0001"
         )
         bridge.cancel_run.assert_called_once_with(
-            "run-1", if_match=ETAG_A, idempotency_key="run-cancel-routing-0001"
+            project,
+            "run-1",
+            if_match=ETAG_A,
+            idempotency_key="run-cancel-routing-0001",
         )
         bridge.retry_run.assert_called_once_with(
-            "run-1", if_match=ETAG_A, idempotency_key="run-retry-routing-0001"
+            project,
+            "run-1",
+            if_match=ETAG_A,
+            idempotency_key="run-retry-routing-0001",
         )
         bridge.restart_service.assert_called_once_with(
+            project,
             "service-1",
             if_match=ETAG_A,
             idempotency_key="service-restart-routing-0001",
         )
         bridge.create_diagnostic.assert_called_once_with(
-            diagnostic_request, idempotency_key="diagnostic-create-routing-0001"
+            project,
+            diagnostic_request,
+            idempotency_key="diagnostic-create-routing-0001",
         )
         bridge.cache_cleanup.assert_called_once_with(
-            cache_request, idempotency_key="cache-cleanup-routing-0001"
+            project,
+            cache_request,
+            idempotency_key="cache-cleanup-routing-0001",
         )
-        bridge.delete_run.assert_called_once_with("run-1", if_match=ETAG_A)
+        bridge.delete_run.assert_called_once_with(project, "run-1", if_match=ETAG_A)
         bridge.delete_diagnostic.assert_called_once_with(
+            project,
             "diagnostic-1",
             if_match=ETAG_A,
             idempotency_key="diagnostic-delete-routing-0001",
@@ -459,12 +505,16 @@ def test_release_app_serves_bridge_results_and_preserves_typed_errors(tmp_path: 
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,
     )
+    project = _bind_app_project(app)
     headers = {"X-OpenEvo-Desktop-Session": "desktop-session-token-0000000000000001"}
     with TestClient(app) as client:
         response = client.get("/desktop/v1/runs", headers=headers)
         assert response.status_code == 200
         assert response.json()["items"] == []
     bridge.close.assert_called_once_with()
+    bridge.list_runs.assert_called_once_with(
+        project, limit=50, after=None, sort="created_at", direction="desc"
+    )
 
     error = core_v1.ApiErrorV1(
         request_id="core-request-1",
@@ -489,6 +539,7 @@ def test_release_app_serves_bridge_results_and_preserves_typed_errors(tmp_path: 
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=failing_bridge,
     )
+    _bind_app_project(failing_app)
     with TestClient(failing_app) as client:
         response = client.get(
             "/desktop/v1/runs",
@@ -509,6 +560,7 @@ def test_release_app_serves_bridge_results_and_preserves_typed_errors(tmp_path: 
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=client_failing_bridge,
     )
+    _bind_app_project(client_failing_app)
     with TestClient(client_failing_app) as client:
         response = client.get(
             "/desktop/v1/runs",

@@ -338,10 +338,10 @@ even though their predecessor request digest equals the current request digest.
 
 ## Run And Resource Proxy
 
-The renderer-facing run route still supplies only the active local project ID
-and idempotency key. Its future release-routing adapter must atomically load the
-saved `ProjectV1` selected by the route's Local ETag and pass that complete
-object to the bridge. The bridge verifies its activation binding, then rereads
+The renderer-facing run route supplies only the active local project ID and
+idempotency key. The release provider atomically loads the saved `ProjectV1`
+selected by the route's Local ETag and passes that complete object to the
+bridge. The bridge verifies its activation binding, then rereads
 the Core project, pinned capabilities, validation, and revision head. A
 reachable successor whose transition is not failed, cancelled, or unavailable
 is required; otherwise the active head is required. The bridge then constructs
@@ -352,7 +352,12 @@ change the saved Local binding.
 
 Run list/get/cancel/retry/timeline/log/context, artifacts, services, Core
 operations and referenced logs, diagnostics, maintenance, and events delegate
-to `CoreControlClientV1`. Core DTOs are returned unchanged. The strict client
+to `CoreControlClientV1`. Every one of these bridge methods now also accepts the
+complete saved Local `ProjectV1` and verifies it against the active generation
+before transport. The provider holds its project-session transition lock from
+that Local lookup through result delivery, so an active-project edit cannot
+retire and replace the session while an old request is being returned. Core DTOs
+are returned unchanged. The strict client
 continues to enforce project membership, private-value scanning, bounded
 responses, ETags, idempotency, and release contract pins. No public bridge
 method exposes `CoreClientErrorV1`: an exact Core `ApiErrorV1`, including HTTP
@@ -362,11 +367,24 @@ deferred SSE iteration. The bridge does not synthesize readiness.
 
 ## Release Wiring Status
 
-The bridge is tested with `DesktopCoreBridgeStoreV1` across process restart,
-scratch/imported workspace activation, finalize recovery, and unknown abort
-replay. Host, tunnel, archive, and Core transport conformance still use fake
-adapters and `httpx.MockTransport`. `DesktopReleaseProvider` does not yet compose
-those production adapters or allocate the dedicated bridge-state root. No
-release feature flag is enabled by these modules. Until that Local API wiring is
-implemented and tested, the corresponding release provider routes continue to
-return typed HTTP 503.
+Packaged startup composes `DesktopCoreSshBridgeAdapterV1`,
+`DesktopCoreBridgeStoreV1`, `DesktopCoreBridgeV1`,
+`DesktopEventBrokerV1`, and the Core event relay through the single owner in
+`release_runtime.py`. The exact embedded wheel/framework-lock pair is verified
+before construction, and the dedicated bridge state is rooted under the private
+Desktop provider state. The provider advertises all frozen release feature flags
+only when both the owned bridge and broker are present. A missing or invalid
+asset pair, bridge, broker, or active project fails closed; there is no reduced
+release composition or direct-backend fallback.
+
+The relay opens Core SSE with the complete active Local project binding. It
+advances the Core cursor but drops heartbeat frames and publishes one complete
+Desktop state invalidation for every other validated frame. Core remains the
+authority for event payload and resource state; Desktop neither projects those
+payloads into a second event model nor persists a second Core event log.
+
+The bridge remains covered across process restart, scratch/imported workspace
+activation, finalize recovery, unknown abort replay, production runtime
+composition, and provider routing. Adapter protocol tests use controlled SSH and
+HTTP transports; real remote GPU/Codex subscription evidence is a separate
+release E2E gate rather than an excuse for a runtime fallback.

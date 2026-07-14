@@ -26,6 +26,7 @@ from desktop.sidecar.native_workspace import (
 )
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import NATIVE_SIDECAR_PROTOCOL
+from desktop.sidecar.release_runtime import bundled_core_asset_root
 from desktop.sidecar.workspace_identity import (
     native_import_id_for_action,
     ownership_for_native_import,
@@ -208,6 +209,7 @@ def create_app(
     native_frame: _NativeLauncherFrame,
     source_commit: str,
     build_channel: Literal["release", "development", "test"],
+    core_assets_root: Path | str | None = None,
 ) -> FastAPI:
     _validate_source_commit(source_commit, build_channel=build_channel)
     config_root = (
@@ -215,6 +217,8 @@ def create_app(
         if desktop_config_root is not None
         else DEFAULT_DESKTOP_CONFIG_ROOT.expanduser()
     )
+    if build_channel == "release" and core_assets_root is None:
+        core_assets_root = bundled_core_asset_root()
     app = create_release_desktop_local_api_app(
         state_root=config_root / LOCAL_API_STATE_DIRECTORY,
         session_token=native_frame.session_token,
@@ -222,6 +226,7 @@ def create_app(
         readiness_key=native_frame.readiness_key,
         source_commit=source_commit,
         build_channel=build_channel,
+        core_assets_root=core_assets_root,
     )
     expected_session_token = native_frame.session_token.encode("ascii")
     expected_handoff_token = native_frame.handoff_token.encode("ascii")

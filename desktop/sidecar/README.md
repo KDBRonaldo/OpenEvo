@@ -346,18 +346,33 @@ Core URL or bearer. Without an injected bridge these routes remain fail-closed.
 When release composition also supplies `DesktopEventBrokerV1`, the provider
 serves its bounded SSE subscription directly and maps expired cursors to the
 frozen 410 reset response. Project activation now uses the durable bounded
-executor and project-bound bridge described above. Release adapter composition,
-Local doctor/repair/workspace-sync operations, Local operation logs/cancellation,
-and the Core-to-Desktop event relay remain unavailable in this provider slice.
-The advertised feature set therefore remains
-`remote_profiles` only; direct route and broker wiring are not sufficient to
-claim a complete release feature. Unavailable routes return a closed
-`ApiErrorV1` with HTTP 503 and never fixture data or a synthetic ready/success
-state. A successful SSH check reports Core as `offline` with
-`core_not_started`; it does not claim a live tunnel.
+executor and project-bound bridge described above. Packaged startup now creates
+the production SSH adapter, bridge store, bridge, event broker, and Core event
+relay from the exact embedded Core wheel/framework-lock pair. It advertises the
+complete frozen release feature set: `remote_profiles`, `project_validation`,
+`operation_events`, `run_observability`, `artifact_inspection`,
+`service_control`, and `diagnostics`. A composition failure aborts startup; it
+never falls back to a local method table, direct backend URL, fixture data, or a
+synthetic ready/success state.
 
-`core_bridge_adapters_v1.py` supplies the production adapters for later
-composition without changing that release-app state. `CoreBootstrapConfigV1`
+Every direct Core request first loads the one durable active Local
+`ProjectV1` while holding the provider's project-session transition lock and
+keeps that lock through bridge delivery. Editing or retiring that project must
+therefore wait for the in-flight result, after which the bridge generation is
+retired before another project can use the provider. The event relay separately
+passes the same complete active project to the bridge SSE boundary. It ignores
+Core heartbeats and translates every other validated Core frame into a Desktop
+state invalidation; it does not copy, reinterpret, or persist Core event
+payloads. The renderer reloads authoritative resources through the frozen Local
+API after each invalidation.
+
+Local doctor/repair/workspace-sync operations and Local operation
+logs/cancellation remain outside this composition slice. A successful SSH check
+alone still reports Core as `offline` with `core_not_started`; only project
+activation can publish an online project-bound tunnel.
+
+`core_bridge_adapters_v1.py` supplies the production adapters used by packaged
+release composition. `CoreBootstrapConfigV1`
 accepts composition-sealed local wheel and framework-lock paths together with
 their exact byte sizes and SHA-256 digests, plus the source commit, requested
 port, and replacement policy. Local paths are private in representations; no
@@ -415,12 +430,23 @@ with the bound ownership. The yielded object must remain the store's unlinked,
 regular, read-only descriptor-backed stream; the adapter never accepts or
 returns a host path, URI, or archive bytes object.
 
-These adapters are injectable building blocks, not release composition. This
-change does not instantiate `DesktopCoreBridgeV1` in `release_app` or
-`release_provider`, does not add a fallback, and does not make unavailable
-provider routes report ready. Release startup remains fail closed until a later
-change injects the adapters, bridge persistence, and exact adopted-import
-bindings together.
+`release_runtime.py` is the single production composition owner. It derives
+`openevo/wheels` from the absolute PyInstaller extraction root, opens that
+directory without following its final component, and requires an owner-controlled
+non-writable directory containing exactly one wheel and one canonical
+`framework-lock.json`. Both files must be owner-controlled, link-count-one
+regular files within their byte limits. Their bytes are read through pinned
+descriptors, rechecked against their directory names, hashed, and required to
+form the exact lock-to-wheel binding before any remote connection can start.
+The runtime allocates `core-bridge-v1` under the private provider state root and
+owns shutdown of bridge, relay, broker, and persistence.
+
+The production workspace archive source is deliberately dynamic rather than a
+startup snapshot. Under the provider reference guard, every upload read finds
+the exact durable native import binding for the supplied opaque reference,
+requires exactly one owning project, derives its private ownership, and only
+then delegates to the verified import store. A source edit therefore cannot
+leave a stale adopted-import table available to a later activation.
 
 `core_bridge_v1.py` now provides the strict active-project bridge needed by the
 next provider slice. It injects a host-global `CoreHostService`, a tunnel

@@ -9,8 +9,8 @@ import hmac
 import logging
 import re
 import sqlite3
-from threading import BoundedSemaphore, Lock
-from typing import Literal, NoReturn, cast
+from threading import BoundedSemaphore, Lock, RLock
+from typing import Literal, NoReturn, Protocol, cast
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
@@ -101,6 +101,22 @@ class _ConnectionOutcome:
 ConnectionAction = Callable[[RemoteProfileV1], _ConnectionOutcome]
 
 
+class DesktopCoreRuntimeOwnerV1(Protocol):
+    core_bridge: DesktopCoreBridgeV1
+    event_broker: DesktopEventBrokerV1
+
+    def start(
+        self,
+        *,
+        active_project: Callable[[], ProjectV1 | None],
+        publish: Callable[[], None],
+    ) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
 @dataclass
 class _ConnectionActionGate:
     lock: Lock
@@ -170,6 +186,7 @@ class DesktopReleaseProvider:
         instance_id: str,
         readiness_key: bytes,
         remote_lifecycle: DesktopRemoteLifecycle,
+        core_runtime: DesktopCoreRuntimeOwnerV1 | None = None,
         core_bridge: DesktopCoreBridgeV1 | None = None,
         event_broker: DesktopEventBrokerV1 | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -178,11 +195,17 @@ class DesktopReleaseProvider:
             raise ValueError("native instance id must be 32 lowercase hex characters")
         if type(readiness_key) is not bytes or len(readiness_key) != 32:
             raise ValueError("native readiness key must contain exactly 32 bytes")
+        if core_runtime is not None and (core_bridge is not None or event_broker is not None):
+            raise ValueError("core_runtime cannot be combined with injected Core resources")
         self._store = store
         self._workspace_import_store = workspace_import_store
         self._remote_lifecycle = remote_lifecycle
-        self._core_bridge = core_bridge
-        self._event_broker = event_broker
+        self._core_runtime = core_runtime
+        self._core_bridge = core_runtime.core_bridge if core_runtime is not None else core_bridge
+        self._event_broker = (
+            core_runtime.event_broker if core_runtime is not None else event_broker
+        )
+        self._project_session_lock = RLock()
         self._connection_state_lock = Lock()
         self._connection_generation = 0
         self._connection_owner: str | None = None
@@ -197,13 +220,24 @@ class DesktopReleaseProvider:
         self._readiness_key = readiness_key
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._reconcile_workspace_imports()
+        feature_flags: tuple[local_v1.FeatureFlagV1, ...] = ("remote_profiles",)
+        if self._core_bridge is not None and self._event_broker is not None:
+            feature_flags = (
+                "remote_profiles",
+                "project_validation",
+                "operation_events",
+                "run_observability",
+                "artifact_inspection",
+                "service_control",
+                "diagnostics",
+            )
         self._version = VersionV1(
             openapi_sha256=DESKTOP_OPENAPI_SHA256,
             build_version=build_version,
             source_commit=source_commit,
             build_channel=build_channel,
             provider_kind="desktop_sidecar",
-            feature_flags=("remote_profiles",),
+            feature_flags=feature_flags,
         )
         self._handlers: dict[str, OperationHandler] = {
             "getDesktopContractVersion": self._get_version,
@@ -250,6 +284,11 @@ class DesktopReleaseProvider:
             "cleanupCaches": self._cleanup_caches,
             "subscribeDesktopEvents": self._subscribe_events,
         }
+        if self._core_runtime is not None:
+            self._core_runtime.start(
+                active_project=self._active_project_for_runtime,
+                publish=self.publish_state_changed,
+            )
 
     def close(self) -> None:
         with self._close_lock:
@@ -257,14 +296,19 @@ class DesktopReleaseProvider:
                 return
             self._closed = True
         try:
-            if self._core_bridge is not None:
-                self._core_bridge.close()
+            if self._core_runtime is not None:
+                self._core_runtime.stop()
+            else:
+                if self._core_bridge is not None:
+                    self._core_bridge.close()
         finally:
             try:
                 self._project_executor.close()
             finally:
                 try:
-                    if self._event_broker is not None:
+                    if self._core_runtime is not None:
+                        self._core_runtime.close()
+                    elif self._event_broker is not None:
                         self._event_broker.close()
                 finally:
                     try:
@@ -902,31 +946,33 @@ class DesktopReleaseProvider:
     def _update_project(self, arguments: Mapping[str, object]) -> Response:
         project_id = cast(str, arguments["project_id"])
         request = cast(ProjectPatchV1, arguments["request"])
-        with self._store.workspace_import_reference_guard():
-            previous = self._store.get_project(project_id)
-            if request.source is not None:
-                self._verify_project_source(request.source, project_id=project_id)
-            project = self._store.patch_project(
-                project_id,
-                request,
-                if_match=cast(str, arguments["if_match"]),
-            )
-            self._adopt_project_source(project.source, project_id=project_id)
+        with self._project_session_lock:
+            with self._store.workspace_import_reference_guard():
+                previous = self._store.get_project(project_id)
+                if request.source is not None:
+                    self._verify_project_source(request.source, project_id=project_id)
+                project = self._store.patch_project(
+                    project_id,
+                    request,
+                    if_match=cast(str, arguments["if_match"]),
+                )
+                self._adopt_project_source(project.source, project_id=project_id)
+            if previous.state == "active" and project.state != "active":
+                self._retire_edited_project(project_id, project.profile_id)
         if previous.source.import_ref != project.source.import_ref:
             self._release_project_source(previous.source, project_id=project_id)
-        if previous.state == "active" and project.state != "active":
-            self._retire_edited_project(project_id, project.profile_id)
         self.publish_state_changed()
         return self._resource_response(project)
 
     def _delete_project(self, arguments: Mapping[str, object]) -> Response:
         project_id = cast(str, arguments["project_id"])
-        with self._store.workspace_import_reference_guard():
-            project = self._store.get_project(project_id)
-            self._store.delete_project(
-                project_id,
-                if_match=cast(str, arguments["if_match"]),
-            )
+        with self._project_session_lock:
+            with self._store.workspace_import_reference_guard():
+                project = self._store.get_project(project_id)
+                self._store.delete_project(
+                    project_id,
+                    if_match=cast(str, arguments["if_match"]),
+                )
         self._release_project_source(project.source, project_id=project_id)
         self.publish_state_changed()
         return Response(status_code=204)
@@ -1000,36 +1046,40 @@ class DesktopReleaseProvider:
             bridge = self._require_bridge("activateProject")
             activation = bridge.activate_project(project, idempotency_key=work.key)
             self._validate_activation_identity(project, activation)
-            operation = self._store.complete_project_runtime_action(
-                reservation=reservation,
-                route=work.route,
-                operation_kind="project_activate",
-                project_id=work.project_id,
-                key=work.key,
-                body={},
-                if_match=work.if_match,
-                remote_state=self._remote_project_state(activation),
-            )
-            if operation.state != "succeeded":
-                raise ProviderStoreError("project activation did not reach succeeded state")
-            active_project = self._store.get_project(work.project_id)
-            bridge.commit_local_activation(active_project, activation=activation)
-            with self._connection_state_lock:
-                self._core_state = CoreConnectionStateV1(
-                    state="online",
-                    profile_id=active_project.profile_id,
-                    active_tunnel=True,
-                    core=local_v1.CoreCompatibilityV1(
-                        contract_digest=CORE_OPENAPI_SHA256,
-                        core_version=activation.capabilities.core_version,
-                    ),
+            with self._project_session_lock:
+                operation = self._store.complete_project_runtime_action(
+                    reservation=reservation,
+                    route=work.route,
+                    operation_kind="project_activate",
+                    project_id=work.project_id,
+                    key=work.key,
+                    body={},
+                    if_match=work.if_match,
+                    remote_state=self._remote_project_state(activation),
                 )
+                if operation.state != "succeeded":
+                    raise ProviderStoreError("project activation did not reach succeeded state")
+                active_project = self._store.get_project(work.project_id)
+                bridge.commit_local_activation(active_project, activation=activation)
+                with self._connection_state_lock:
+                    self._core_state = CoreConnectionStateV1(
+                        state="online",
+                        profile_id=active_project.profile_id,
+                        active_tunnel=True,
+                        core=local_v1.CoreCompatibilityV1(
+                            contract_digest=CORE_OPENAPI_SHA256,
+                            core_version=activation.capabilities.core_version,
+                        ),
+                    )
         except Exception as exc:
             error = self._project_activation_error(reservation, exc)
             operation = self._finalize_project_runtime_failure(work, error)
             if activation is not None:
                 try:
-                    self._require_bridge("activateProject").deactivate_project(work.project_id)
+                    with self._project_session_lock:
+                        self._require_bridge("activateProject").deactivate_project(
+                            work.project_id
+                        )
                 except Exception:
                     _LOGGER.warning(
                         "could not retire Core session after failed activation commit",
@@ -1197,8 +1247,9 @@ class DesktopReleaseProvider:
         self, arguments: Mapping[str, object]
     ) -> local_v1.CapabilitiesEnvelopeV1:
         project_id = cast(str, arguments["project_id"])
-        project = self._store.get_project(project_id)
-        capabilities = self._require_bridge("getProjectCapabilities").capabilities(project)
+        with self._project_session_lock:
+            project = self._store.get_project(project_id)
+            capabilities = self._require_bridge("getProjectCapabilities").capabilities(project)
         return local_v1.CapabilitiesEnvelopeV1(
             project_id=project.project_id,
             project_etag=project.etag,
@@ -1208,14 +1259,15 @@ class DesktopReleaseProvider:
 
     def _validate_project(self, arguments: Mapping[str, object]) -> local_v1.ProjectValidationV1:
         project_id = cast(str, arguments["project_id"])
-        project = self._require_project_match(
-            project_id,
-            cast(str, arguments["if_match"]),
-        )
-        validation = self._require_bridge("validateProject").validate_project(
-            project,
-            idempotency_key=cast(str, arguments["idempotency_key"]),
-        )
+        with self._project_session_lock:
+            project = self._require_project_match(
+                project_id,
+                cast(str, arguments["if_match"]),
+            )
+            validation = self._require_bridge("validateProject").validate_project(
+                project,
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
         return local_v1.ProjectValidationV1(
             project_id=project.project_id,
             project_etag=project.etag,
@@ -1229,132 +1281,212 @@ class DesktopReleaseProvider:
         return self._store.get_local_operation(cast(str, arguments["operation_id"]))
 
     def _list_runs(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("listRuns").list_runs(**self._page_arguments(arguments))
+        return self._invoke_active_core(
+            "listRuns",
+            lambda bridge, project: bridge.list_runs(
+                project, **self._page_arguments(arguments)
+            ),
+        )
 
     def _create_run(self, arguments: Mapping[str, object]) -> object:
         request = cast(local_v1.RunCreateV1, arguments["request"])
-        project = self._require_project_match(
-            request.project_id,
-            cast(str, arguments["if_match"]),
-        )
-        return self._require_bridge("createRun").create_run(
-            project,
-            idempotency_key=cast(str, arguments["idempotency_key"]),
-        )
+        with self._project_session_lock:
+            project = self._require_project_match(
+                request.project_id,
+                cast(str, arguments["if_match"]),
+            )
+            return self._require_bridge("createRun").create_run(
+                project,
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
 
     def _get_run(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("getRun").get_run(cast(str, arguments["run_id"]))
+        return self._invoke_active_core(
+            "getRun",
+            lambda bridge, project: bridge.get_run(project, cast(str, arguments["run_id"])),
+        )
 
     def _delete_run(self, arguments: Mapping[str, object]) -> Response:
-        self._require_bridge("deleteRun").delete_run(
-            cast(str, arguments["run_id"]),
-            if_match=cast(str, arguments["if_match"]),
+        self._invoke_active_core(
+            "deleteRun",
+            lambda bridge, project: bridge.delete_run(
+                project,
+                cast(str, arguments["run_id"]),
+                if_match=cast(str, arguments["if_match"]),
+            ),
         )
         return Response(status_code=204)
 
     def _cancel_run(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("cancelRun").cancel_run(
-            cast(str, arguments["run_id"]),
-            if_match=cast(str, arguments["if_match"]),
-            idempotency_key=cast(str, arguments["idempotency_key"]),
+        return self._invoke_active_core(
+            "cancelRun",
+            lambda bridge, project: bridge.cancel_run(
+                project,
+                cast(str, arguments["run_id"]),
+                if_match=cast(str, arguments["if_match"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            ),
         )
 
     def _retry_run(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("retryRun").retry_run(
-            cast(str, arguments["run_id"]),
-            if_match=cast(str, arguments["if_match"]),
-            idempotency_key=cast(str, arguments["idempotency_key"]),
+        return self._invoke_active_core(
+            "retryRun",
+            lambda bridge, project: bridge.retry_run(
+                project,
+                cast(str, arguments["run_id"]),
+                if_match=cast(str, arguments["if_match"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            ),
         )
 
     def _list_run_timeline(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("listRunTimeline").run_timeline(
-            cast(str, arguments["run_id"]),
-            **self._page_arguments(arguments),
+        return self._invoke_active_core(
+            "listRunTimeline",
+            lambda bridge, project: bridge.run_timeline(
+                project,
+                cast(str, arguments["run_id"]),
+                **self._page_arguments(arguments),
+            ),
         )
 
     def _list_run_logs(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("listRunLogs").run_logs(
-            cast(str, arguments["run_id"]),
-            **self._page_arguments(arguments),
+        return self._invoke_active_core(
+            "listRunLogs",
+            lambda bridge, project: bridge.run_logs(
+                project,
+                cast(str, arguments["run_id"]),
+                **self._page_arguments(arguments),
+            ),
         )
 
     def _get_run_context(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("getRunContext").run_context(cast(str, arguments["run_id"]))
+        return self._invoke_active_core(
+            "getRunContext",
+            lambda bridge, project: bridge.run_context(
+                project, cast(str, arguments["run_id"])
+            ),
+        )
 
     def _list_run_artifacts(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("listRunArtifacts").run_artifacts(
-            cast(str, arguments["run_id"]),
-            **self._page_arguments(arguments),
+        return self._invoke_active_core(
+            "listRunArtifacts",
+            lambda bridge, project: bridge.run_artifacts(
+                project,
+                cast(str, arguments["run_id"]),
+                **self._page_arguments(arguments),
+            ),
         )
 
     def _get_artifact(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("getArtifact").get_artifact(
-            cast(str, arguments["artifact_id"])
+        return self._invoke_active_core(
+            "getArtifact",
+            lambda bridge, project: bridge.get_artifact(
+                project, cast(str, arguments["artifact_id"])
+            ),
         )
 
     def _get_artifact_content(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("getArtifactContent").artifact_content(
-            cast(str, arguments["artifact_id"])
+        return self._invoke_active_core(
+            "getArtifactContent",
+            lambda bridge, project: bridge.artifact_content(
+                project, cast(str, arguments["artifact_id"])
+            ),
         )
 
     def _get_artifact_diff(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("getArtifactDiff").artifact_diff(
-            cast(str, arguments["artifact_id"])
+        return self._invoke_active_core(
+            "getArtifactDiff",
+            lambda bridge, project: bridge.artifact_diff(
+                project, cast(str, arguments["artifact_id"])
+            ),
         )
 
     def _list_services(self, arguments: Mapping[str, object]) -> object:
         page = self._page_arguments(arguments)
         if page["sort"] == "display_name":
             page["sort"] = "kind"
-        return self._require_bridge("listServices").list_services(**page)
+        return self._invoke_active_core(
+            "listServices",
+            lambda bridge, project: bridge.list_services(project, **page),
+        )
 
     def _restart_service(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("restartService").restart_service(
-            cast(str, arguments["service_id"]),
-            if_match=cast(str, arguments["if_match"]),
-            idempotency_key=cast(str, arguments["idempotency_key"]),
+        return self._invoke_active_core(
+            "restartService",
+            lambda bridge, project: bridge.restart_service(
+                project,
+                cast(str, arguments["service_id"]),
+                if_match=cast(str, arguments["if_match"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            ),
         )
 
     def _get_core_operation(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("getCoreOperation").get_operation(
-            cast(str, arguments["operation_id"])
+        return self._invoke_active_core(
+            "getCoreOperation",
+            lambda bridge, project: bridge.get_operation(
+                project, cast(str, arguments["operation_id"])
+            ),
         )
 
     def _get_core_logs_by_ref(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("getCoreLogsByRef").logs_by_ref(
-            cast(str, arguments["logs_ref"]),
-            **self._page_arguments(arguments),
+        return self._invoke_active_core(
+            "getCoreLogsByRef",
+            lambda bridge, project: bridge.logs_by_ref(
+                project,
+                cast(str, arguments["logs_ref"]),
+                **self._page_arguments(arguments),
+            ),
         )
 
     def _list_service_logs(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("listServiceLogs").service_logs(
-            cast(str, arguments["service_id"]),
-            **self._page_arguments(arguments),
+        return self._invoke_active_core(
+            "listServiceLogs",
+            lambda bridge, project: bridge.service_logs(
+                project,
+                cast(str, arguments["service_id"]),
+                **self._page_arguments(arguments),
+            ),
         )
 
     def _create_diagnostic(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("createDiagnostic").create_diagnostic(
-            cast(local_v1.DiagnosticRequestV1, arguments["request"]),
-            idempotency_key=cast(str, arguments["idempotency_key"]),
+        return self._invoke_active_core(
+            "createDiagnostic",
+            lambda bridge, project: bridge.create_diagnostic(
+                project,
+                cast(local_v1.DiagnosticRequestV1, arguments["request"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            ),
         )
 
     def _get_diagnostic(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("getDiagnostic").get_diagnostic(
-            cast(str, arguments["diagnostic_id"])
+        return self._invoke_active_core(
+            "getDiagnostic",
+            lambda bridge, project: bridge.get_diagnostic(
+                project, cast(str, arguments["diagnostic_id"])
+            ),
         )
 
     def _delete_diagnostic(self, arguments: Mapping[str, object]) -> Response:
-        self._require_bridge("deleteDiagnostic").delete_diagnostic(
-            cast(str, arguments["diagnostic_id"]),
-            if_match=cast(str, arguments["if_match"]),
-            idempotency_key=cast(str, arguments["idempotency_key"]),
+        self._invoke_active_core(
+            "deleteDiagnostic",
+            lambda bridge, project: bridge.delete_diagnostic(
+                project,
+                cast(str, arguments["diagnostic_id"]),
+                if_match=cast(str, arguments["if_match"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            ),
         )
         return Response(status_code=204)
 
     def _cleanup_caches(self, arguments: Mapping[str, object]) -> object:
-        return self._require_bridge("cleanupCaches").cache_cleanup(
-            cast(local_v1.CacheCleanupRequestV1, arguments["request"]),
-            idempotency_key=cast(str, arguments["idempotency_key"]),
+        return self._invoke_active_core(
+            "cleanupCaches",
+            lambda bridge, project: bridge.cache_cleanup(
+                project,
+                cast(local_v1.CacheCleanupRequestV1, arguments["request"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            ),
         )
 
     def _subscribe_events(self, arguments: Mapping[str, object]) -> StreamingResponse:
@@ -1378,6 +1510,13 @@ class DesktopReleaseProvider:
             except DesktopEventBrokerError:
                 _LOGGER.warning("Desktop state event could not be published")
 
+    def _active_project_for_runtime(self) -> ProjectV1 | None:
+        with self._project_session_lock:
+            projects = self._store.list_projects(limit=2, filters={"state": "active"}).items
+            if len(projects) > 1:
+                raise ProviderStoreError("multiple active projects violate Desktop authority")
+            return projects[0] if projects else None
+
     def _require_bridge(self, operation_id: str) -> DesktopCoreBridgeV1:
         if self._core_bridge is None:
             self._unavailable(operation_id)
@@ -1387,6 +1526,18 @@ class DesktopReleaseProvider:
         if self._event_broker is None:
             self._unavailable(operation_id)
         return self._event_broker
+
+    def _invoke_active_core(
+        self,
+        operation_id: str,
+        call: Callable[[DesktopCoreBridgeV1, ProjectV1], object],
+    ) -> object:
+        bridge = self._require_bridge(operation_id)
+        with self._project_session_lock:
+            project = self._active_project_for_runtime()
+            if project is None:
+                raise ProviderStoreError("Desktop has no active project for this Core request")
+            return call(bridge, project)
 
     def _require_project_match(self, project_id: str, if_match: str) -> ProjectV1:
         project = self._store.get_project(project_id)

@@ -500,6 +500,26 @@ does not infer it from environment variables or Git, and release startup rejects
 an all-zero placeholder. Development and test apps must inject their source
 commit and non-release channel explicitly. There is no direct-backend fallback.
 
+Packaged release startup resolves `openevo/wheels` only beneath the absolute
+PyInstaller extraction root. The sidecar requires that directory to contain
+exactly one Core wheel and one canonical `framework-lock.json`; it verifies
+owner/mode/link identity, bounded byte size, SHA-256, directory binding, and the
+exact lock-to-wheel relationship through no-follow descriptors. The release
+source commit used for remote bootstrap must be the full 40-character commit
+identity. Any failure aborts sidecar startup rather than advertising a reduced
+provider.
+
+After verification, the sidecar constructs one owned release runtime containing
+the production SSH adapter, dynamic durable workspace source, bridge store,
+project-bound Core bridge, bounded Desktop event broker, and Core SSE relay. It
+therefore exposes the full frozen Desktop feature inventory required by the
+renderer. All Core resource routes are bound to the exact active Local project;
+project edits wait for in-flight route delivery and then retire that bridge
+generation. The relay converts non-heartbeat Core activity only into a Desktop
+state invalidation, after which the renderer reloads authoritative Core-owned
+resources. It never copies algorithm state or interprets evolution method
+events in the Desktop process.
+
 The release sidecar now owns the initial SSH lifecycle behind the frozen Local
 API profile routes. A connect action atomically validates its idempotency
 envelope and profile ETag, reserves live idempotency capacity plus fixed-size

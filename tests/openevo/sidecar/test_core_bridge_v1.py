@@ -3695,7 +3695,7 @@ def test_active_proxy_preserves_exact_core_api_error(
     monkeypatch.setattr(bridge._active.client, "list_runs", fail_list_runs)
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
-        bridge.list_runs()
+        bridge.list_runs(local_project)
 
     assert exc_info.value.error is api_error
 
@@ -3730,7 +3730,7 @@ def test_event_iteration_translates_core_client_error(
         lambda **_kwargs: FailingEventContext(),
     )
 
-    with bridge.events() as events:
+    with bridge.events(local_project) as events:
         with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
             next(events)
 
@@ -3757,7 +3757,7 @@ def test_switch_and_close_seal_old_client_before_new_delivery(
 
     def read_runs() -> None:
         try:
-            result.append(bridge.list_runs())
+            result.append(bridge.list_runs(local_project))
         except BaseException as exc:
             result.append(exc)
 
@@ -3913,7 +3913,7 @@ def test_private_identity_is_rejected_before_proxy_transport() -> None:
     bearer = bridge._active.attachment.bearer_token
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
-        bridge.get_run(bearer)
+        bridge.get_run(local_project, bearer)
 
     assert exc_info.value.error.code == "invalid_core_request"
     assert len(fake_core.calls) == calls_before
@@ -3965,7 +3965,12 @@ def test_bodyless_local_actions_derive_closed_core_requests(
         return object()  # type: ignore[return-value]
 
     monkeypatch.setattr(client, "cancel_run", cancel)
-    bridge.cancel_run("run-1", if_match=ETAG_A, idempotency_key="cancel-run-0000001")
+    bridge.cancel_run(
+        local_project,
+        "run-1",
+        if_match=ETAG_A,
+        idempotency_key="cancel-run-0000001",
+    )
     monkeypatch.setattr(
         client,
         "get_run",
@@ -3974,9 +3979,15 @@ def test_bodyless_local_actions_derive_closed_core_requests(
         ),
     )
     monkeypatch.setattr(client, "retry_run", retry)
-    bridge.retry_run("run-1", if_match=ETAG_A, idempotency_key="retry-run-00000001")
+    bridge.retry_run(
+        local_project,
+        "run-1",
+        if_match=ETAG_A,
+        idempotency_key="retry-run-00000001",
+    )
     monkeypatch.setattr(client, "restart_service", restart)
     bridge.restart_service(
+        local_project,
         "service-1",
         if_match=ETAG_A,
         idempotency_key="restart-service-0001",

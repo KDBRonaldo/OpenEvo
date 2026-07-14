@@ -44,6 +44,10 @@ from desktop.sidecar.release_provider import (
     InvalidNativeChallengeError,
     ProviderCapabilityUnavailableError,
 )
+from desktop.sidecar.release_runtime import (
+    DesktopReleaseCoreRuntimeV1,
+    create_release_core_runtime,
+)
 from desktop.sidecar.remote_lifecycle import (
     DesktopRemoteLifecycle,
     RemoteCredentialUnavailableError,
@@ -267,6 +271,7 @@ def create_release_desktop_local_api_app(
     build_channel: Literal["release", "development", "test"] = "release",
     clock: Callable[[], datetime] | None = None,
     remote_lifecycle: DesktopRemoteLifecycle | None = None,
+    core_assets_root: Path | str | None = None,
     core_bridge: DesktopCoreBridgeV1 | None = None,
     event_broker: DesktopEventBrokerV1 | None = None,
 ) -> FastAPI:
@@ -278,10 +283,13 @@ def create_release_desktop_local_api_app(
         or re.search(r"[\x00-\x1f\x7f]", session_token) is not None
     ):
         raise ValueError("Desktop session token must be 32-4096 characters without controls")
+    if core_assets_root is not None and (core_bridge is not None or event_broker is not None):
+        raise ValueError("packaged Core assets cannot be combined with injected Core resources")
     encoded_session_token = session_token.encode("utf-8")
     store = DesktopProviderStore(state_root, clock=clock)
     lifecycle = remote_lifecycle
     workspace_import_store: WorkspaceImportStore | None = None
+    core_runtime: DesktopReleaseCoreRuntimeV1 | None = None
     try:
         if lifecycle is None:
             lifecycle = DesktopRemoteLifecycle(
@@ -294,6 +302,14 @@ def create_release_desktop_local_api_app(
             store.state_root / "workspace-imports",
             reconcile_on_open=False,
         )
+        if core_assets_root is not None:
+            core_runtime = create_release_core_runtime(
+                provider_store=store,
+                workspace_store=workspace_import_store,
+                remote_lifecycle=lifecycle,
+                asset_root=core_assets_root,
+                source_commit=source_commit,
+            )
         provider = DesktopReleaseProvider(
             store,
             workspace_import_store,
@@ -303,6 +319,7 @@ def create_release_desktop_local_api_app(
             instance_id=instance_id,
             readiness_key=readiness_key,
             remote_lifecycle=lifecycle,
+            core_runtime=core_runtime,
             core_bridge=core_bridge,
             event_broker=event_broker,
             clock=clock,
@@ -310,11 +327,13 @@ def create_release_desktop_local_api_app(
         app = create_contract_app(provider)
     except BaseException:
         try:
-            if event_broker is not None:
+            if core_runtime is not None:
+                core_runtime.close()
+            elif event_broker is not None:
                 event_broker.close()
         finally:
             try:
-                if core_bridge is not None:
+                if core_runtime is None and core_bridge is not None:
                     core_bridge.close()
             finally:
                 try:

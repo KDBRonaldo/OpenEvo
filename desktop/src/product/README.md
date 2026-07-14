@@ -15,6 +15,13 @@ features. The contract simulator is test-only and is not a release fallback.
 bounded cursor pages, reloads exact run details, and marks artifacts complete
 only when every run artifact page succeeds. Capabilities and validation are
 read only for the authoritative active project over its ready tunnel. Native
+state, profiles, and projects are loaded before project-bound Core collections;
+runs and services are requested only when that same active project reports a
+ready, compatible tunnel. A fresh install, draft project, offline server, or
+activation in progress therefore remains a usable Local UI with empty remote
+collections instead of turning the expected Core 503 into a failed whole-app
+refresh. Once the tunnel becomes ready, the next authoritative refresh loads
+those collections normally. Native
 folder and credential operations remain native-host calls whose results are
 strictly parsed as `ProjectSourceV1` and `RemoteProfileV1`; renderer file inputs,
 raw paths, and secret values are not accepted.

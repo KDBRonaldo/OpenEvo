@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -260,4 +260,102 @@ def test_activation_persists_typed_bridge_failure(tmp_path: Path) -> None:
         assert state.pending_operation_ids == ()
         bridge.commit_local_activation.assert_not_called()
     finally:
+        provider.close()
+
+
+def test_active_core_request_blocks_project_edit_until_session_is_retired(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    bridge.activate_project.return_value = _activation(project)
+    entered = Event()
+    release = Event()
+    edit_started = Event()
+    edit_finished = Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+
+    def list_runs(*_args: object, **_kwargs: object) -> object:
+        order.append("request-started")
+        entered.set()
+        assert release.wait(timeout=5)
+        order.append("request-finished")
+        return object()
+
+    def retire(*_args: object, **_kwargs: object) -> None:
+        order.append("session-retired")
+
+    def invoke_runs() -> None:
+        try:
+            provider.invoke(
+                "listRuns",
+                {
+                    "limit": 50,
+                    "after": None,
+                    "sort": "created_at",
+                    "direction": "desc",
+                },
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def edit_project(active: local_v1.ProjectV1) -> None:
+        edit_started.set()
+        try:
+            provider.invoke(
+                "updateProject",
+                {
+                    "project_id": active.project_id,
+                    "request": local_v1.ProjectPatchV1(name="Edited project"),
+                    "if_match": active.etag,
+                },
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            edit_finished.set()
+
+    bridge.list_runs.side_effect = list_runs
+    bridge.deactivate_project.side_effect = retire
+    request_thread: Thread | None = None
+    edit_thread: Thread | None = None
+    try:
+        response = provider.invoke("activateProject", _activate_arguments(project))
+        operation = local_v1.LocalOperationV1.model_validate_json(response.body)
+        _wait_for_operation(store, operation.operation_id, "succeeded")
+        active = store.get_project(project.project_id)
+
+        request_thread = Thread(target=invoke_runs)
+        request_thread.start()
+        assert entered.wait(timeout=5)
+
+        edit_thread = Thread(target=edit_project, args=(active,))
+        edit_thread.start()
+        assert edit_started.wait(timeout=5)
+        assert not edit_finished.wait(timeout=0.1)
+
+        release.set()
+        request_thread.join(timeout=5)
+        edit_thread.join(timeout=5)
+
+        assert not request_thread.is_alive()
+        assert not edit_thread.is_alive()
+        assert errors == []
+        assert order == ["request-started", "request-finished", "session-retired"]
+        assert store.get_project(active.project_id).state == "draft"
+        bridge.list_runs.assert_called_once_with(
+            active,
+            limit=50,
+            after=None,
+            sort="created_at",
+            direction="desc",
+        )
+        bridge.deactivate_project.assert_called_once_with(active.project_id)
+    finally:
+        release.set()
+        if request_thread is not None:
+            request_thread.join(timeout=5)
+        if edit_thread is not None:
+            edit_thread.join(timeout=5)
         provider.close()

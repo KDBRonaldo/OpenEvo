@@ -1314,17 +1314,27 @@ class DesktopCoreBridgeV1:
 
         return self._invoke_project(project, call)
 
-    def list_runs(self, **kwargs: Any) -> core_v1.RunPageV1:
-        return self._invoke_active(lambda session: session.client.list_runs(**kwargs))
-
-    def get_run(self, run_id: str) -> core_v1.RunV1:
-        return self._invoke_active(
-            lambda session: session.client.get_run(run_id, project_id=session.project.id)
+    def list_runs(
+        self, project: local_v1.ProjectV1, **kwargs: Any
+    ) -> core_v1.RunPageV1:
+        return self._invoke_project(
+            project, lambda session, _deadline: session.client.list_runs(**kwargs)
         )
 
-    def delete_run(self, run_id: str, *, if_match: str) -> None:
-        return self._invoke_active(
-            lambda session: session.client.delete_run(
+    def get_run(self, project: local_v1.ProjectV1, run_id: str) -> core_v1.RunV1:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.get_run(
+                run_id, project_id=session.project.id
+            ),
+        )
+
+    def delete_run(
+        self, project: local_v1.ProjectV1, run_id: str, *, if_match: str
+    ) -> None:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.delete_run(
                 run_id,
                 project_id=session.project.id,
                 if_match=if_match,
@@ -1332,9 +1342,15 @@ class DesktopCoreBridgeV1:
             )
         )
 
-    def cancel_run(self, run_id: str, *, if_match: str, idempotency_key: str) -> core_v1.RunV1:
-        def call(session: DesktopCoreActiveSessionV1) -> core_v1.RunV1:
-            deadline = time.monotonic() + self._timeout
+    def cancel_run(
+        self,
+        project: local_v1.ProjectV1,
+        run_id: str,
+        *,
+        if_match: str,
+        idempotency_key: str,
+    ) -> core_v1.RunV1:
+        def call(session: DesktopCoreActiveSessionV1, deadline: float) -> core_v1.RunV1:
             self._core_external(
                 session.token,
                 deadline,
@@ -1352,11 +1368,17 @@ class DesktopCoreBridgeV1:
                 ),
             )
 
-        return self._invoke_active(call)
+        return self._invoke_project(project, call)
 
-    def retry_run(self, run_id: str, *, if_match: str, idempotency_key: str) -> core_v1.RunV1:
-        def call(session: DesktopCoreActiveSessionV1) -> core_v1.RunV1:
-            deadline = time.monotonic() + self._timeout
+    def retry_run(
+        self,
+        project: local_v1.ProjectV1,
+        run_id: str,
+        *,
+        if_match: str,
+        idempotency_key: str,
+    ) -> core_v1.RunV1:
+        def call(session: DesktopCoreActiveSessionV1, deadline: float) -> core_v1.RunV1:
             run = self._core_external(
                 session.token,
                 deadline,
@@ -1380,72 +1402,109 @@ class DesktopCoreBridgeV1:
                 ),
             )
 
-        return self._invoke_active(call)
+        return self._invoke_project(project, call)
 
-    def run_timeline(self, run_id: str, **kwargs: Any) -> core_v1.RunTimelinePageV1:
-        return self._invoke_active(
-            lambda session: session.client.run_timeline(
+    def run_timeline(
+        self, project: local_v1.ProjectV1, run_id: str, **kwargs: Any
+    ) -> core_v1.RunTimelinePageV1:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.run_timeline(
                 run_id, project_id=session.project.id, **kwargs
             )
         )
 
-    def run_logs(self, run_id: str, **kwargs: Any) -> core_v1.LogPageV1:
-        return self._invoke_active(
-            lambda session: session.client.run_logs(
+    def run_logs(
+        self, project: local_v1.ProjectV1, run_id: str, **kwargs: Any
+    ) -> core_v1.LogPageV1:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.run_logs(
                 run_id, project_id=session.project.id, **kwargs
             )
         )
 
-    def run_context(self, run_id: str) -> core_v1.RunContextV1:
-        return self._invoke_active(
-            lambda session: session.client.run_context(run_id, project_id=session.project.id)
+    def run_context(
+        self, project: local_v1.ProjectV1, run_id: str
+    ) -> core_v1.RunContextV1:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.run_context(
+                run_id, project_id=session.project.id
+            ),
         )
 
-    def run_artifacts(self, run_id: str, **kwargs: Any) -> core_v1.ArtifactPageV1:
-        return self._invoke_active(
-            lambda session: session.client.run_artifacts(
+    def run_artifacts(
+        self, project: local_v1.ProjectV1, run_id: str, **kwargs: Any
+    ) -> core_v1.ArtifactPageV1:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.run_artifacts(
                 run_id, project_id=session.project.id, **kwargs
             )
         )
 
-    def get_artifact(self, artifact_id: str) -> core_v1.ArtifactSummaryV1:
-        return self._invoke_active(
-            lambda session: session.client.get_artifact(artifact_id, project_id=session.project.id)
+    def get_artifact(
+        self, project: local_v1.ProjectV1, artifact_id: str
+    ) -> core_v1.ArtifactSummaryV1:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.get_artifact(
+                artifact_id, project_id=session.project.id
+            ),
         )
 
-    def artifact_content(self, artifact_id: str) -> core_v1.ArtifactContentV1:
-        return self._invoke_active(
-            lambda session: session.client.artifact_content(
+    def artifact_content(
+        self, project: local_v1.ProjectV1, artifact_id: str
+    ) -> core_v1.ArtifactContentV1:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.artifact_content(
                 artifact_id, project_id=session.project.id
             )
         )
 
     def artifact_diff(
-        self, artifact_id: str, *, previous_artifact_id: str | None = None
+        self,
+        project: local_v1.ProjectV1,
+        artifact_id: str,
+        *,
+        previous_artifact_id: str | None = None,
     ) -> core_v1.ArtifactDiffV1:
-        return self._invoke_active(
-            lambda session: session.client.artifact_diff(
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.artifact_diff(
                 artifact_id,
                 project_id=session.project.id,
                 previous_artifact_id=previous_artifact_id,
             )
         )
 
-    def list_services(self, **kwargs: Any) -> core_v1.ServicePageV1:
-        return self._invoke_active(lambda session: session.client.list_services(**kwargs))
+    def list_services(
+        self, project: local_v1.ProjectV1, **kwargs: Any
+    ) -> core_v1.ServicePageV1:
+        return self._invoke_project(
+            project, lambda session, _deadline: session.client.list_services(**kwargs)
+        )
 
-    def get_service(self, service_id: str) -> core_v1.ServiceSummaryV1:
-        return self._invoke_active(lambda session: session.client.get_service(service_id))
+    def get_service(
+        self, project: local_v1.ProjectV1, service_id: str
+    ) -> core_v1.ServiceSummaryV1:
+        return self._invoke_project(
+            project, lambda session, _deadline: session.client.get_service(service_id)
+        )
 
     def restart_service(
         self,
+        project: local_v1.ProjectV1,
         service_id: str,
         *,
         if_match: str,
         idempotency_key: str,
     ) -> core_v1.OperationV1:
-        return self._invoke_active(
-            lambda session: session.client.restart_service(
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.restart_service(
                 service_id,
                 core_v1.ServiceRestartRequestV1(reason="Requested from OpenEvo Desktop."),
                 if_match=if_match,
@@ -1453,24 +1512,33 @@ class DesktopCoreBridgeV1:
             )
         )
 
-    def service_logs(self, service_id: str, **kwargs: Any) -> core_v1.LogPageV1:
-        return self._invoke_active(
-            lambda session: session.client.service_logs(service_id, **kwargs)
+    def service_logs(
+        self, project: local_v1.ProjectV1, service_id: str, **kwargs: Any
+    ) -> core_v1.LogPageV1:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.service_logs(service_id, **kwargs),
         )
 
-    def get_operation(self, operation_id: str) -> core_v1.OperationV1:
-        return self._invoke_active(lambda session: session.client.get_operation(operation_id))
+    def get_operation(
+        self, project: local_v1.ProjectV1, operation_id: str
+    ) -> core_v1.OperationV1:
+        return self._invoke_project(
+            project, lambda session, _deadline: session.client.get_operation(operation_id)
+        )
 
     def cancel_operation(
         self,
+        project: local_v1.ProjectV1,
         operation_id: str,
         request: core_v1.OperationCancelRequestV1,
         *,
         if_match: str,
         idempotency_key: str,
     ) -> core_v1.OperationV1:
-        return self._invoke_active(
-            lambda session: session.client.cancel_operation(
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.cancel_operation(
                 operation_id,
                 request,
                 if_match=if_match,
@@ -1478,26 +1546,46 @@ class DesktopCoreBridgeV1:
             )
         )
 
-    def logs_by_ref(self, logs_ref: str, **kwargs: Any) -> core_v1.ReferencedLogPageV1:
-        return self._invoke_active(lambda session: session.client.logs_by_ref(logs_ref, **kwargs))
+    def logs_by_ref(
+        self, project: local_v1.ProjectV1, logs_ref: str, **kwargs: Any
+    ) -> core_v1.ReferencedLogPageV1:
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.logs_by_ref(logs_ref, **kwargs),
+        )
 
     def create_diagnostic(
-        self, request: core_v1.DiagnosticsRequestV1, *, idempotency_key: str
+        self,
+        project: local_v1.ProjectV1,
+        request: core_v1.DiagnosticsRequestV1,
+        *,
+        idempotency_key: str,
     ) -> core_v1.DiagnosticV1:
-        return self._invoke_active(
-            lambda session: session.client.create_diagnostic(
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.create_diagnostic(
                 request, idempotency_key=idempotency_key
             )
         )
 
-    def get_diagnostic(self, diagnostic_id: str) -> core_v1.DiagnosticV1:
-        return self._invoke_active(lambda session: session.client.get_diagnostic(diagnostic_id))
+    def get_diagnostic(
+        self, project: local_v1.ProjectV1, diagnostic_id: str
+    ) -> core_v1.DiagnosticV1:
+        return self._invoke_project(
+            project, lambda session, _deadline: session.client.get_diagnostic(diagnostic_id)
+        )
 
     def delete_diagnostic(
-        self, diagnostic_id: str, *, if_match: str, idempotency_key: str
+        self,
+        project: local_v1.ProjectV1,
+        diagnostic_id: str,
+        *,
+        if_match: str,
+        idempotency_key: str,
     ) -> None:
-        return self._invoke_active(
-            lambda session: session.client.delete_diagnostic(
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.delete_diagnostic(
                 diagnostic_id,
                 if_match=if_match,
                 idempotency_key=idempotency_key,
@@ -1505,15 +1593,27 @@ class DesktopCoreBridgeV1:
         )
 
     def cache_cleanup(
-        self, request: core_v1.CacheCleanupRequestV1, *, idempotency_key: str
+        self,
+        project: local_v1.ProjectV1,
+        request: core_v1.CacheCleanupRequestV1,
+        *,
+        idempotency_key: str,
     ) -> core_v1.OperationV1:
-        return self._invoke_active(
-            lambda session: session.client.cache_cleanup(request, idempotency_key=idempotency_key)
+        return self._invoke_project(
+            project,
+            lambda session, _deadline: session.client.cache_cleanup(
+                request, idempotency_key=idempotency_key
+            ),
         )
 
-    def events(self, *, last_event_id: str | None = None):
+    def events(
+        self,
+        project: local_v1.ProjectV1,
+        *,
+        last_event_id: str | None = None,
+    ):
         session, generation = self._session()
-        return _BridgeEventContext(self, session, generation, last_event_id)
+        return _BridgeEventContext(self, session, generation, project, last_event_id)
 
     def _begin_activation(self, deadline: float) -> _GenerationToken:
         self._acquire_transition(deadline)
@@ -2779,17 +2879,6 @@ class DesktopCoreBridgeV1:
 
         return self._core_external(session.token, deadline, bound_call)
 
-    def _invoke_active(
-        self, call: Callable[[DesktopCoreActiveSessionV1], _ResponseT]
-    ) -> _ResponseT:
-        session, _generation = self._session()
-        deadline = time.monotonic() + self._timeout
-        return self._core_external(
-            session.token,
-            deadline,
-            lambda: call(session),
-        )
-
     @staticmethod
     def _ensure_local_project_binding(
         session: DesktopCoreActiveSessionV1,
@@ -2886,11 +2975,13 @@ class _BridgeEventContext:
         bridge: DesktopCoreBridgeV1,
         session: DesktopCoreActiveSessionV1,
         generation: int,
+        project: local_v1.ProjectV1,
         last_event_id: str | None,
     ) -> None:
         self._bridge = bridge
         self._session = session
         self._generation = generation
+        self._project = project
         self._last_event_id = last_event_id
         self._context = None
 
@@ -2899,6 +2990,7 @@ class _BridgeEventContext:
 
         def enter():
             self._bridge._ensure_generation(self._session, self._generation)
+            self._bridge._ensure_local_project_binding(self._session, self._project)
             self._context = self._session.client.events(last_event_id=self._last_event_id)
             return self._context.__enter__()
 
