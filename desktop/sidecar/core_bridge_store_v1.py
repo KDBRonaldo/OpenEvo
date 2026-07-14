@@ -5,13 +5,15 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime
 import fcntl
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import stat
 import threading
@@ -31,16 +33,19 @@ from desktop.sidecar.core_bridge_v1 import (
     CoreWorkspaceUploadAbortOperationV1,
     CoreWorkspaceUploadAbortStateV1,
     CoreWorkspaceUploadFinalizeAuthorityV1,
+    CoreWorkspaceUploadFinalizeStateV1,
 )
 from openevo.backend.contracts.v1 import models as core_v1
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DATABASE_FILENAME = "core-bridge-v1.sqlite3"
 JOURNAL_FILENAME = f"{DATABASE_FILENAME}-journal"
 WAL_FILENAME = f"{DATABASE_FILENAME}-wal"
 SHM_FILENAME = f"{DATABASE_FILENAME}-shm"
 OWNER_LOCK_FILENAME = "core-bridge-v1.lock"
+IDENTITY_MARKER_FILENAME = "core-bridge-v1.identity"
+ROOT_ANCHOR_PREFIX = ".openevo-core-bridge-v1-root-"
 
 MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
 MAX_DATABASE_BYTES = 1024 * 1024 * 1024
@@ -51,9 +56,11 @@ MAX_SCHEMA_OBJECTS = 16
 MAX_SCHEMA_BYTES = 64 * 1024
 DEFAULT_MAX_MAPPING_HISTORY_ROWS = 100_000
 MAX_IDENTITY_BYTES = 512
+MARKER_SLOT_BYTES = 4096
+MARKER_FILE_BYTES = MARKER_SLOT_BYTES * 2
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-_MANAGED_FILES = (DATABASE_FILENAME, OWNER_LOCK_FILENAME)
+_MANAGED_FILES = (DATABASE_FILENAME, OWNER_LOCK_FILENAME, IDENTITY_MARKER_FILENAME)
 _SQLITE_SIDE_FILES = (JOURNAL_FILENAME, WAL_FILENAME, SHM_FILENAME)
 _ModelT = TypeVar("_ModelT", bound=core_v1.ContractModel)
 
@@ -67,7 +74,7 @@ class CoreBridgeStoreStateRootError(CoreBridgeStoreError):
 
 
 class CoreBridgeStoreSchemaError(CoreBridgeStoreError):
-    """The SQLite schema does not match the frozen v1 fingerprint."""
+    """The SQLite schema does not match the frozen private schema fingerprint."""
 
 
 class CoreBridgeStoreDataCorruptionError(CoreBridgeStoreError):
@@ -90,8 +97,28 @@ _SCHEMA = (
     """
     CREATE TABLE schema_metadata (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 2),
         schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE store_identity (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        store_id TEXT NOT NULL CHECK (length(store_id) = 64),
+        root_device INTEGER NOT NULL CHECK (root_device >= 0),
+        root_inode INTEGER NOT NULL CHECK (root_inode > 0),
+        database_device INTEGER NOT NULL CHECK (database_device >= 0),
+        database_inode INTEGER NOT NULL CHECK (database_inode > 0),
+        marker_device INTEGER NOT NULL CHECK (marker_device >= 0),
+        marker_inode INTEGER NOT NULL CHECK (marker_inode > 0),
+        anchor_device INTEGER NOT NULL CHECK (anchor_device >= 0),
+        anchor_inode INTEGER NOT NULL CHECK (anchor_inode > 0),
+        lock_device INTEGER NOT NULL CHECK (lock_device >= 0),
+        lock_inode INTEGER NOT NULL CHECK (lock_inode > 0),
+        marker_generation INTEGER NOT NULL CHECK (marker_generation >= 0),
+        authority_digest TEXT NOT NULL CHECK (length(authority_digest) = 64),
+        previous_marker_generation INTEGER NOT NULL CHECK (previous_marker_generation >= 0),
+        previous_authority_digest TEXT NOT NULL CHECK (length(previous_authority_digest) = 64)
     ) STRICT
     """,
     f"""
@@ -303,11 +330,17 @@ def _finalize_value(value: CoreWorkspaceUploadFinalizeAuthorityV1) -> dict[str, 
     value.verify()
     return {
         "idempotency_key": _bounded_text(value.idempotency_key, label="finalize key"),
-        "outcome": _model_value(value.outcome),
-        "outcome_sha256": _digest(value.outcome_sha256, label="finalize outcome digest"),
+        "outcome": None if value.outcome is None else _model_value(value.outcome),
+        "outcome_sha256": _optional(
+            value.outcome_sha256,
+            lambda item: _digest(item, label="finalize outcome digest"),
+        ),
+        "project_etag": _bounded_text(value.project_etag, label="finalize project ETag"),
         "request": _model_value(value.request),
         "request_sha256": _digest(value.request_sha256, label="finalize request digest"),
+        "state": value.state.value,
         "upload": _model_value(value.upload),
+        "upload_etag": _bounded_text(value.upload_etag, label="finalize upload ETag"),
     }
 
 
@@ -320,12 +353,21 @@ def _finalize_from_value(value: object) -> CoreWorkspaceUploadFinalizeAuthorityV
                 "request_sha256",
                 "request",
                 "idempotency_key",
+                "upload_etag",
+                "project_etag",
+                "state",
                 "outcome",
                 "outcome_sha256",
             }
         ),
         label="workspace finalize",
     )
+    try:
+        state = CoreWorkspaceUploadFinalizeStateV1(data["state"])
+    except (TypeError, ValueError) as exc:
+        raise CoreBridgeStoreDataCorruptionError(
+            "stored workspace finalize state is invalid"
+        ) from exc
     try:
         return CoreWorkspaceUploadFinalizeAuthorityV1(
             upload=_model(
@@ -340,12 +382,23 @@ def _finalize_from_value(value: object) -> CoreWorkspaceUploadFinalizeAuthorityV
                 label="workspace finalize request",
             ),
             idempotency_key=_bounded_text(data["idempotency_key"], label="finalize key"),
-            outcome=_model(
-                core_v1.WorkspaceUploadFinalizeResponseV1,
-                data["outcome"],
-                label="workspace finalize outcome",
+            upload_etag=_bounded_text(data["upload_etag"], label="finalize upload ETag"),
+            project_etag=_bounded_text(
+                data["project_etag"], label="finalize project ETag"
             ),
-            outcome_sha256=_digest(data["outcome_sha256"], label="finalize outcome digest"),
+            state=state,
+            outcome=_optional(
+                data["outcome"],
+                lambda item: _model(
+                    core_v1.WorkspaceUploadFinalizeResponseV1,
+                    item,
+                    label="workspace finalize outcome",
+                ),
+            ),
+            outcome_sha256=_optional(
+                data["outcome_sha256"],
+                lambda item: _digest(item, label="finalize outcome digest"),
+            ),
         )
     except (ValueError, CoreBridgeStoreContractError) as exc:
         raise CoreBridgeStoreDataCorruptionError("stored workspace finalize is invalid") from exc
@@ -797,6 +850,51 @@ def _mapping_from_value(value: object) -> CoreProjectMappingV1:
         raise CoreBridgeStoreDataCorruptionError("stored project mapping is invalid") from exc
 
 
+@dataclass(frozen=True, slots=True)
+class _MappingHistoryEntry:
+    mapping: CoreProjectMappingV1
+    create_operation: CoreProjectCreateOperationV1
+    completed_patch: CoreProjectPatchOperationV1 | None
+
+
+def _history_value(value: _MappingHistoryEntry) -> dict[str, Any]:
+    return {
+        "completed_patch": (
+            None if value.completed_patch is None else _patch_value(value.completed_patch)
+        ),
+        "create_operation": _create_value(value.create_operation),
+        "mapping": _mapping_value(value.mapping),
+        "record_type": "CoreProjectMappingTransitionV1",
+        "schema_version": "1",
+    }
+
+
+def _history_from_value(value: object) -> _MappingHistoryEntry:
+    data = _exact_object(
+        value,
+        frozenset(
+            {
+                "schema_version",
+                "record_type",
+                "mapping",
+                "create_operation",
+                "completed_patch",
+            }
+        ),
+        label="mapping transition history",
+    )
+    if (
+        data["schema_version"] != "1"
+        or data["record_type"] != "CoreProjectMappingTransitionV1"
+    ):
+        raise CoreBridgeStoreDataCorruptionError("stored mapping transition type is invalid")
+    return _MappingHistoryEntry(
+        mapping=_mapping_from_value(data["mapping"]),
+        create_operation=_create_from_value(data["create_operation"]),
+        completed_patch=_optional(data["completed_patch"], _patch_from_value),
+    )
+
+
 def _encoded(value: dict[str, Any]) -> tuple[bytes, str]:
     raw = _canonical_json_bytes(value)
     if not 1 <= len(raw) <= MAX_DOCUMENT_BYTES:
@@ -860,9 +958,13 @@ class DesktopCoreBridgeStoreV1:
         self._transaction_lock = threading.RLock()
         self._closed = False
         self._owner_pid = os.getpid()
+        self._identity_ready = False
         root = Path(os.path.abspath(os.fspath(Path(state_root).expanduser())))
         self._create_or_validate_root(root)
         self._state_root = root
+        self._anchor_name = (
+            ROOT_ANCHOR_PREFIX + sha256(os.fsencode(os.fspath(root))).hexdigest() + ".identity"
+        )
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
         try:
             self._root_fd = os.open(root, flags)
@@ -873,18 +975,41 @@ class DesktopCoreBridgeStoreV1:
         root_stat = os.fstat(self._root_fd)
         self._root_identity = (root_stat.st_dev, root_stat.st_ino)
         try:
+            self._open_anchor_parent(root.parent)
             self._ensure_empty_private_file(OWNER_LOCK_FILENAME)
             self._acquire_owner_lock()
             self._ensure_empty_private_file(DATABASE_FILENAME)
+            database_stat = self._verify_private_file(DATABASE_FILENAME)
+            marker_stat = self._optional_private_file(IDENTITY_MARKER_FILENAME)
+            fresh_database = database_stat.st_size == 0
+            if fresh_database and marker_stat is None:
+                self._ensure_empty_private_file(IDENTITY_MARKER_FILENAME)
+                marker_stat = self._verify_private_file(IDENTITY_MARKER_FILENAME)
+            if marker_stat is None:
+                raise CoreBridgeStoreStateRootError(
+                    "nonempty or legacy bridge store has no durable identity marker"
+                )
+            anchor_stat = self._optional_anchor_file()
+            if fresh_database and anchor_stat is None:
+                self._ensure_empty_anchor_file()
+                anchor_stat = self._verify_anchor_file()
+            if anchor_stat is None:
+                raise CoreBridgeStoreStateRootError(
+                    "nonempty or legacy bridge store has no durable root identity anchor"
+                )
+            if fresh_database and anchor_stat.st_size not in (0, MARKER_FILE_BYTES):
+                raise CoreBridgeStoreStateRootError(
+                    "fresh bridge root identity anchor is invalid"
+                )
             self._managed_identities = {
                 OWNER_LOCK_FILENAME: self._owner_lock_identity,
-                DATABASE_FILENAME: self._file_identity(
-                    self._verify_private_file(DATABASE_FILENAME)
-                ),
+                DATABASE_FILENAME: self._file_identity(database_stat),
+                IDENTITY_MARKER_FILENAME: self._file_identity(marker_stat),
             }
+            self._anchor_identity = self._file_identity(anchor_stat)
             self._verify_storage_files()
             self._connection = self._open_database_connection()
-            self._initialize_schema()
+            self._initialize_schema(fresh_database=fresh_database)
             self._recover_and_validate()
             self._verify_storage_files()
         except BaseException:
@@ -911,10 +1036,11 @@ class DesktopCoreBridgeStoreV1:
         if getattr(self, "_closed", True) is False:
             try:
                 self.close()
-            except OSError:
+            except (CoreBridgeStoreError, OSError):
                 pass
 
     def close(self) -> None:
+        self._check_owner_pid()
         with self._transaction_lock:
             if not self._closed:
                 self._close_resources()
@@ -939,13 +1065,22 @@ class DesktopCoreBridgeStoreV1:
         if root_fd is not None:
             os.close(root_fd)
             del self._root_fd
+        parent_fd = getattr(self, "_anchor_parent_fd", None)
+        if parent_fd is not None:
+            os.close(parent_fd)
+            del self._anchor_parent_fd
         self._closed = True
+
+    def _check_owner_pid(self) -> None:
+        if os.getpid() != getattr(self, "_owner_pid", None):
+            raise CoreBridgeStoreStateRootError("bridge store cannot be inherited across fork")
 
     @staticmethod
     def _require_secure_platform() -> None:
         if (
             not hasattr(os, "O_NOFOLLOW")
             or not hasattr(os, "O_DIRECTORY")
+            or not hasattr(os, "pwrite")
             or os.open not in os.supports_dir_fd
             or os.stat not in os.supports_dir_fd
             or os.stat not in os.supports_follow_symlinks
@@ -977,8 +1112,7 @@ class DesktopCoreBridgeStoreV1:
     def _verify_root(self) -> None:
         if self._closed:
             raise CoreBridgeStoreStateRootError("bridge store is closed")
-        if os.getpid() != self._owner_pid:
-            raise CoreBridgeStoreStateRootError("bridge store cannot be inherited across fork")
+        self._check_owner_pid()
         try:
             path_stat = os.lstat(self._state_root)
             fd_stat = os.fstat(self._root_fd)
@@ -999,6 +1133,49 @@ class DesktopCoreBridgeStoreV1:
     @staticmethod
     def _file_identity(value: os.stat_result) -> tuple[int, int]:
         return value.st_dev, value.st_ino
+
+    def _open_anchor_parent(self, parent: Path) -> None:
+        try:
+            path_stat = os.lstat(parent)
+            descriptor = os.open(
+                parent,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            fd_stat = os.fstat(descriptor)
+        except OSError as exc:
+            raise CoreBridgeStoreStateRootError(
+                "bridge root anchor parent could not be securely opened"
+            ) from exc
+        if (
+            not stat.S_ISDIR(path_stat.st_mode)
+            or stat.S_ISLNK(path_stat.st_mode)
+            or self._file_identity(path_stat) != self._file_identity(fd_stat)
+            or (hasattr(os, "getuid") and path_stat.st_uid != os.getuid())
+            or stat.S_IMODE(path_stat.st_mode) & 0o022
+        ):
+            os.close(descriptor)
+            raise CoreBridgeStoreStateRootError(
+                "bridge root anchor parent must be owner-controlled"
+            )
+        self._anchor_parent = parent
+        self._anchor_parent_fd = descriptor
+        self._anchor_parent_identity = self._file_identity(fd_stat)
+
+    def _verify_anchor_parent(self) -> None:
+        self._check_owner_pid()
+        try:
+            path_stat = os.lstat(self._anchor_parent)
+            fd_stat = os.fstat(self._anchor_parent_fd)
+        except OSError as exc:
+            raise CoreBridgeStoreStateRootError(
+                "bridge root anchor parent is unavailable"
+            ) from exc
+        if (
+            self._file_identity(path_stat) != self._anchor_parent_identity
+            or self._file_identity(fd_stat) != self._anchor_parent_identity
+            or stat.S_IMODE(path_stat.st_mode) & 0o022
+        ):
+            raise CoreBridgeStoreStateRootError("bridge root anchor parent identity changed")
 
     @staticmethod
     def _validate_private_file_stat(name: str, value: os.stat_result) -> os.stat_result:
@@ -1032,6 +1209,30 @@ class DesktopCoreBridgeStoreV1:
             raise CoreBridgeStoreStateRootError(f"SQLite side file {name} is unavailable") from exc
         return self._validate_private_file_stat(name, value)
 
+    def _optional_anchor_file(self) -> os.stat_result | None:
+        self._verify_anchor_parent()
+        try:
+            value = os.stat(
+                self._anchor_name,
+                dir_fd=self._anchor_parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CoreBridgeStoreStateRootError(
+                "bridge durable root identity anchor is unavailable"
+            ) from exc
+        return self._validate_private_file_stat(self._anchor_name, value)
+
+    def _verify_anchor_file(self) -> os.stat_result:
+        value = self._optional_anchor_file()
+        if value is None:
+            raise CoreBridgeStoreStateRootError(
+                "bridge durable root identity anchor is unavailable"
+            )
+        return value
+
     def _ensure_empty_private_file(self, name: str) -> None:
         self._verify_root()
         flags = os.O_RDWR | os.O_CLOEXEC | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
@@ -1050,6 +1251,30 @@ class DesktopCoreBridgeStoreV1:
         finally:
             os.close(descriptor)
         os.fsync(self._root_fd)
+
+    def _ensure_empty_anchor_file(self) -> None:
+        self._verify_anchor_parent()
+        flags = os.O_RDWR | os.O_CLOEXEC | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                self._anchor_name,
+                flags,
+                0o600,
+                dir_fd=self._anchor_parent_fd,
+            )
+        except FileExistsError:
+            self._verify_anchor_file()
+            return
+        except OSError as exc:
+            raise CoreBridgeStoreStateRootError(
+                "could not create bridge durable root identity anchor"
+            ) from exc
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(self._anchor_parent_fd)
 
     def _acquire_owner_lock(self) -> None:
         expected = self._verify_private_file(OWNER_LOCK_FILENAME)
@@ -1077,11 +1302,31 @@ class DesktopCoreBridgeStoreV1:
 
     def _verify_storage_files(self) -> None:
         self._verify_root()
+        self._verify_anchor_parent()
         identities = getattr(self, "_managed_identities", None)
         for name in _MANAGED_FILES:
             value = self._verify_private_file(name)
             if identities is not None and self._file_identity(value) != identities[name]:
                 raise CoreBridgeStoreStateRootError(f"private bridge file {name} identity changed")
+        marker_size = self._verify_private_file(IDENTITY_MARKER_FILENAME).st_size
+        if marker_size != MARKER_FILE_BYTES and not (
+            not self._identity_ready and marker_size == 0
+        ):
+            raise CoreBridgeStoreStateRootError(
+                "bridge durable identity marker has an invalid byte size"
+            )
+        anchor = self._verify_anchor_file()
+        anchor_identity = getattr(self, "_anchor_identity", None)
+        if anchor_identity is not None and self._file_identity(anchor) != anchor_identity:
+            raise CoreBridgeStoreStateRootError(
+                "bridge durable root identity anchor identity changed"
+            )
+        if anchor.st_size != MARKER_FILE_BYTES and not (
+            not self._identity_ready and anchor.st_size == 0
+        ):
+            raise CoreBridgeStoreStateRootError(
+                "bridge durable root identity anchor has an invalid byte size"
+            )
         journal = self._optional_private_file(JOURNAL_FILENAME)
         if journal is not None and journal.st_size > MAX_JOURNAL_BYTES:
             raise CoreBridgeStoreStateRootError("bridge SQLite journal exceeds its byte bound")
@@ -1153,22 +1398,334 @@ class DesktopCoreBridgeStoreV1:
             raise CoreBridgeStoreSchemaError("bridge schema could not be read") from exc
         if rows != _EXPECTED_SCHEMA_ROWS or digest != _EXPECTED_SCHEMA_DIGEST:
             raise CoreBridgeStoreSchemaError(
-                "bridge schema fingerprint does not match canonical v1"
+                "bridge schema fingerprint does not match canonical private v2"
             )
         metadata = connection.execute(
             "SELECT singleton, schema_version, schema_fingerprint FROM schema_metadata"
         ).fetchall()
         if [tuple(row) for row in metadata] != [(1, SCHEMA_VERSION, _EXPECTED_SCHEMA_DIGEST)]:
-            raise CoreBridgeStoreSchemaError("bridge schema metadata does not match v1")
+            raise CoreBridgeStoreSchemaError("bridge schema metadata does not match private v2")
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
-            raise CoreBridgeStoreSchemaError("bridge SQLite user_version does not match v1")
+            raise CoreBridgeStoreSchemaError(
+                "bridge SQLite user_version does not match private v2"
+            )
 
-    def _initialize_schema(self) -> None:
+    @staticmethod
+    def _authority_digest(connection: sqlite3.Connection) -> str:
+        authority: list[tuple[object, ...]] = []
+        for table, order in (
+            ("create_operations", "local_project_id"),
+            ("patch_operations", "local_project_id"),
+            ("mappings", "local_project_id"),
+            ("mapping_history", "local_project_id, mapping_generation"),
+        ):
+            authority.extend(
+                (table, *tuple(row))
+                for row in connection.execute(
+                    f"SELECT local_project_id, document_sha256 FROM {table} ORDER BY {order}"
+                )
+            )
+        return sha256(_canonical_json_bytes(authority)).hexdigest()
+
+    @staticmethod
+    def _identity_row(connection: sqlite3.Connection) -> dict[str, object]:
+        rows = connection.execute("SELECT * FROM store_identity").fetchall()
+        if len(rows) != 1:
+            raise CoreBridgeStoreStateRootError(
+                "bridge database store identity row is missing or duplicated"
+            )
+        row = dict(rows[0])
+        text_fields = ("store_id", "authority_digest", "previous_authority_digest")
+        integer_fields = (
+            "root_device",
+            "root_inode",
+            "database_device",
+            "database_inode",
+            "marker_device",
+            "marker_inode",
+            "anchor_device",
+            "anchor_inode",
+            "lock_device",
+            "lock_inode",
+            "marker_generation",
+            "previous_marker_generation",
+        )
+        if (
+            row.get("singleton") != 1
+            or any(type(row.get(field)) is not str for field in text_fields)
+            or any(type(row.get(field)) is not int for field in integer_fields)
+        ):
+            raise CoreBridgeStoreStateRootError("bridge database store identity is invalid")
+        for field in text_fields:
+            _digest(row[field], label=f"store identity {field}")
+        return row
+
+    @staticmethod
+    def _marker_payload(identity: dict[str, object]) -> dict[str, object]:
+        return {
+            key: identity[key]
+            for key in (
+                "store_id",
+                "root_device",
+                "root_inode",
+                "database_device",
+                "database_inode",
+                "marker_device",
+                "marker_inode",
+                "anchor_device",
+                "anchor_inode",
+                "lock_device",
+                "lock_inode",
+                "marker_generation",
+                "authority_digest",
+            )
+        }
+
+    def _read_marker_file(
+        self,
+        *,
+        name: str,
+        dir_fd: int,
+        expected: os.stat_result,
+        label: str,
+    ) -> dict[str, object] | None:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(name, flags, dir_fd=dir_fd)
+        except OSError as exc:
+            raise CoreBridgeStoreStateRootError(
+                f"bridge durable {label} could not be opened"
+            ) from exc
+        try:
+            if self._file_identity(os.fstat(descriptor)) != self._file_identity(expected):
+                raise CoreBridgeStoreStateRootError(
+                    f"bridge durable {label} identity changed"
+                )
+            raw = os.read(descriptor, MARKER_FILE_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if raw == b"":
+            return None
+        if len(raw) != MARKER_FILE_BYTES:
+            raise CoreBridgeStoreStateRootError(
+                f"bridge durable {label} has an invalid byte size"
+            )
+        records: list[dict[str, object]] = []
+        payload_keys = frozenset(
+            {
+                "store_id",
+                "root_device",
+                "root_inode",
+                "database_device",
+                "database_inode",
+                "marker_device",
+                "marker_inode",
+                "anchor_device",
+                "anchor_inode",
+                "lock_device",
+                "lock_inode",
+                "marker_generation",
+                "authority_digest",
+            }
+        )
+        for offset in (0, MARKER_SLOT_BYTES):
+            slot = raw[offset : offset + MARKER_SLOT_BYTES].rstrip(b" \0")
+            if not slot:
+                continue
+            try:
+                envelope = json.loads(slot)
+                data = _exact_object(
+                    envelope,
+                    frozenset({"payload", "payload_sha256"}),
+                    label="identity marker envelope",
+                )
+                payload = _exact_object(
+                    data["payload"], payload_keys, label="identity marker payload"
+                )
+                if _canonical_json_bytes(envelope) != slot:
+                    raise ValueError("marker is not canonical")
+                if sha256(_canonical_json_bytes(payload)).hexdigest() != _digest(
+                    data["payload_sha256"], label="identity marker digest"
+                ):
+                    raise ValueError("marker digest differs")
+                marker_integer_fields = payload_keys - {
+                    "store_id",
+                    "authority_digest",
+                }
+                if any(
+                    type(payload[field]) is not int or cast(int, payload[field]) < 0
+                    for field in marker_integer_fields
+                ):
+                    raise ValueError("marker integer identity is invalid")
+                _digest(payload["store_id"], label="identity marker store ID")
+                _digest(payload["authority_digest"], label="identity marker authority")
+                records.append(payload)
+            except (CoreBridgeStoreError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if not records:
+            raise CoreBridgeStoreStateRootError(
+                f"bridge durable {label} has no valid slot"
+            )
+        records.sort(key=lambda item: cast(int, item["marker_generation"]))
+        if len(records) == 2 and (
+            records[0]["marker_generation"] == records[1]["marker_generation"]
+            and records[0] != records[1]
+        ):
+            raise CoreBridgeStoreStateRootError(
+                f"bridge durable {label} slots conflict"
+            )
+        return records[-1]
+
+    def _read_identity_marker(self) -> dict[str, object] | None:
+        return self._read_marker_file(
+            name=IDENTITY_MARKER_FILENAME,
+            dir_fd=self._root_fd,
+            expected=self._verify_private_file(IDENTITY_MARKER_FILENAME),
+            label="identity marker",
+        )
+
+    def _read_root_anchor(self) -> dict[str, object] | None:
+        return self._read_marker_file(
+            name=self._anchor_name,
+            dir_fd=self._anchor_parent_fd,
+            expected=self._verify_anchor_file(),
+            label="root identity anchor",
+        )
+
+    def _write_marker_file(
+        self,
+        identity: dict[str, object],
+        *,
+        name: str,
+        dir_fd: int,
+        expected: os.stat_result,
+        sync_dir_fd: int,
+        label: str,
+    ) -> None:
+        payload = self._marker_payload(identity)
+        envelope = {
+            "payload": payload,
+            "payload_sha256": sha256(_canonical_json_bytes(payload)).hexdigest(),
+        }
+        encoded = _canonical_json_bytes(envelope)
+        if len(encoded) > MARKER_SLOT_BYTES:
+            raise CoreBridgeStoreCapacityError("bridge identity marker exceeds its slot bound")
+        slot = encoded + b" " * (MARKER_SLOT_BYTES - len(encoded))
+        flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+        descriptor = os.open(name, flags, dir_fd=dir_fd)
+        try:
+            if self._file_identity(os.fstat(descriptor)) != self._file_identity(expected):
+                raise CoreBridgeStoreStateRootError(
+                    f"bridge durable {label} identity changed"
+                )
+            if os.fstat(descriptor).st_size == 0:
+                os.ftruncate(descriptor, MARKER_FILE_BYTES)
+            offset = cast(int, identity["marker_generation"]) % 2 * MARKER_SLOT_BYTES
+            if os.pwrite(descriptor, slot, offset) != len(slot):
+                raise CoreBridgeStoreStateRootError(
+                    f"bridge durable {label} write was incomplete"
+                )
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(sync_dir_fd)
+
+    def _write_identity_marker(self, identity: dict[str, object]) -> None:
+        self._write_marker_file(
+            identity,
+            name=IDENTITY_MARKER_FILENAME,
+            dir_fd=self._root_fd,
+            expected=self._verify_private_file(IDENTITY_MARKER_FILENAME),
+            sync_dir_fd=self._root_fd,
+            label="identity marker",
+        )
+
+    def _write_root_anchor(self, identity: dict[str, object]) -> None:
+        self._write_marker_file(
+            identity,
+            name=self._anchor_name,
+            dir_fd=self._anchor_parent_fd,
+            expected=self._verify_anchor_file(),
+            sync_dir_fd=self._anchor_parent_fd,
+            label="root identity anchor",
+        )
+
+    def _validate_store_binding(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        recover_forward: bool,
+    ) -> None:
+        identity = self._identity_row(connection)
+        physical = {
+            "root_device": self._root_identity[0],
+            "root_inode": self._root_identity[1],
+            "database_device": self._managed_identities[DATABASE_FILENAME][0],
+            "database_inode": self._managed_identities[DATABASE_FILENAME][1],
+            "marker_device": self._managed_identities[IDENTITY_MARKER_FILENAME][0],
+            "marker_inode": self._managed_identities[IDENTITY_MARKER_FILENAME][1],
+            "anchor_device": self._anchor_identity[0],
+            "anchor_inode": self._anchor_identity[1],
+            "lock_device": self._managed_identities[OWNER_LOCK_FILENAME][0],
+            "lock_inode": self._managed_identities[OWNER_LOCK_FILENAME][1],
+        }
+        if any(identity[key] != value for key, value in physical.items()):
+            raise CoreBridgeStoreStateRootError(
+                "bridge database and durable marker physical identity binding differs"
+            )
+        database_generation = cast(int, identity["marker_generation"])
+        records = (
+            ("identity marker", self._read_identity_marker(), self._write_identity_marker),
+            ("root identity anchor", self._read_root_anchor(), self._write_root_anchor),
+        )
+        for label, marker, writer in records:
+            if marker is None:
+                raise CoreBridgeStoreStateRootError(f"bridge durable {label} is empty")
+            for key, value in physical.items():
+                if marker[key] != value:
+                    raise CoreBridgeStoreStateRootError(
+                        f"bridge durable {label} physical root identity differs"
+                    )
+            if marker["store_id"] != identity["store_id"]:
+                raise CoreBridgeStoreStateRootError(
+                    f"bridge durable {label} belongs to a different store identity"
+                )
+            marker_generation = cast(int, marker["marker_generation"])
+            if database_generation == marker_generation and (
+                marker["authority_digest"] == identity["authority_digest"]
+            ):
+                continue
+            if database_generation < marker_generation:
+                raise CoreBridgeStoreStateRootError(
+                    "bridge database durable rollback detected"
+                )
+            if (
+                recover_forward
+                and database_generation == marker_generation + 1
+                and identity["previous_marker_generation"] == marker_generation
+                and identity["previous_authority_digest"] == marker["authority_digest"]
+            ):
+                writer(identity)
+                continue
+            raise CoreBridgeStoreStateRootError(
+                f"bridge database and durable {label} authority differ"
+            )
+
+    def _initialize_schema(self, *, fresh_database: bool) -> None:
         connection = self._connection
+        fresh_identity: dict[str, object] | None = None
         try:
             connection.execute("BEGIN EXCLUSIVE")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
+                if (
+                    not fresh_database
+                    or self._read_identity_marker() is not None
+                    or self._read_root_anchor() is not None
+                ):
+                    raise CoreBridgeStoreSchemaError(
+                        "unversioned or partial bridge state is not eligible for fresh creation"
+                    )
                 existing = {
                     row[0]
                     for row in connection.execute(
@@ -1180,6 +1737,39 @@ class DesktopCoreBridgeStoreV1:
                     raise CoreBridgeStoreSchemaError("unversioned bridge database is not empty")
                 for statement in _SCHEMA:
                     connection.execute(statement)
+                authority_digest = self._authority_digest(connection)
+                marker_identity = self._managed_identities[IDENTITY_MARKER_FILENAME]
+                database_identity = self._managed_identities[DATABASE_FILENAME]
+                fresh_identity = {
+                    "singleton": 1,
+                    "store_id": secrets.token_hex(32),
+                    "root_device": self._root_identity[0],
+                    "root_inode": self._root_identity[1],
+                    "database_device": database_identity[0],
+                    "database_inode": database_identity[1],
+                    "marker_device": marker_identity[0],
+                    "marker_inode": marker_identity[1],
+                    "anchor_device": self._anchor_identity[0],
+                    "anchor_inode": self._anchor_identity[1],
+                    "lock_device": self._owner_lock_identity[0],
+                    "lock_inode": self._owner_lock_identity[1],
+                    "marker_generation": 0,
+                    "authority_digest": authority_digest,
+                    "previous_marker_generation": 0,
+                    "previous_authority_digest": authority_digest,
+                }
+                connection.execute(
+                    """
+                    INSERT INTO store_identity VALUES (
+                        :singleton, :store_id, :root_device, :root_inode,
+                        :database_device, :database_inode, :marker_device, :marker_inode,
+                        :anchor_device, :anchor_inode, :lock_device, :lock_inode,
+                        :marker_generation, :authority_digest,
+                        :previous_marker_generation, :previous_authority_digest
+                    )
+                    """,
+                    fresh_identity,
+                )
                 connection.execute(
                     """
                     INSERT INTO schema_metadata(singleton, schema_version, schema_fingerprint)
@@ -1204,6 +1794,12 @@ class DesktopCoreBridgeStoreV1:
         except BaseException:
             connection.rollback()
             raise
+        if fresh_identity is not None:
+            self._write_identity_marker(fresh_identity)
+            self._write_root_anchor(fresh_identity)
+        self._identity_ready = True
+        self._verify_storage_files()
+        self._validate_store_binding(connection, recover_forward=True)
         os.fsync(self._root_fd)
 
     @staticmethod
@@ -1320,6 +1916,7 @@ class DesktopCoreBridgeStoreV1:
         try:
             connection.execute("BEGIN EXCLUSIVE")
             self._validate_schema(connection)
+            self._validate_store_binding(connection, recover_forward=True)
             integrity = connection.execute("PRAGMA integrity_check(1)").fetchall()
             if [tuple(row) for row in integrity] != [("ok",)]:
                 raise CoreBridgeStoreDataCorruptionError("bridge SQLite integrity check failed")
@@ -1359,15 +1956,20 @@ class DesktopCoreBridgeStoreV1:
                     )
                 )
             }
-            history: defaultdict[str, list[CoreProjectMappingV1]] = defaultdict(list)
+            history: defaultdict[str, list[_MappingHistoryEntry]] = defaultdict(list)
             for row in self._bounded_table_rows(
                 connection,
                 "mapping_history",
                 scalar_columns=("local_project_id", "core_project_id", "request_sha256"),
             ):
-                mapping = self._mapping_from_row(row, history=True)
-                history[mapping.local_project_id].append(mapping)
+                entry = self._history_from_row(row)
+                history[entry.mapping.local_project_id].append(entry)
             self._validate_authority_graph(creates, patches, mappings, history)
+            identity = self._identity_row(connection)
+            if self._authority_digest(connection) != identity["authority_digest"]:
+                raise CoreBridgeStoreDataCorruptionError(
+                    "bridge durable authority digest does not match canonical rows"
+                )
             self._verify_storage_files()
             connection.commit()
         except CoreBridgeStoreError:
@@ -1417,7 +2019,7 @@ class DesktopCoreBridgeStoreV1:
         creates: dict[str, CoreProjectCreateOperationV1],
         patches: dict[str, CoreProjectPatchOperationV1],
         mappings: dict[str, CoreProjectMappingV1],
-        history: dict[str, list[CoreProjectMappingV1]],
+        history: dict[str, list[_MappingHistoryEntry]],
     ) -> None:
         if set(history) != set(mappings):
             raise CoreBridgeStoreDataCorruptionError(
@@ -1427,12 +2029,19 @@ class DesktopCoreBridgeStoreV1:
             for project_id, mapping in mappings.items():
                 operation = creates[project_id]
                 cls._validate_mapping_owner(operation, mapping)
-                ordered = sorted(history[project_id], key=lambda item: item.mapping_generation)
-                if not ordered or ordered[-1] != mapping:
+                ordered = sorted(
+                    history[project_id], key=lambda item: item.mapping.mapping_generation
+                )
+                if not ordered or ordered[-1].mapping != mapping:
                     raise CoreBridgeStoreDataCorruptionError(
                         "current mapping is not the latest exact history row"
                     )
-                for index, item in enumerate(ordered, start=1):
+                cls._validate_history_authority_reuse(
+                    tuple(entry.mapping for entry in ordered)
+                )
+                previous: CoreProjectMappingV1 | None = None
+                for index, entry in enumerate(ordered, start=1):
+                    item = entry.mapping
                     if item.mapping_generation != index or not cls._same_owner(item, mapping):
                         raise CoreBridgeStoreDataCorruptionError(
                             "mapping history is not a contiguous owner-bound sequence"
@@ -1442,10 +2051,20 @@ class DesktopCoreBridgeStoreV1:
                             raise CoreBridgeStoreDataCorruptionError(
                                 "first mapping history row has a predecessor"
                             )
-                    elif item.predecessor_request_sha256 != ordered[index - 2].request_sha256:
+                    elif (
+                        item.predecessor_request_sha256
+                        != ordered[index - 2].mapping.request_sha256
+                    ):
                         raise CoreBridgeStoreDataCorruptionError(
                             "mapping history predecessor digest is not exact"
                         )
+                    cls._validate_mapping_transition(
+                        entry.create_operation,
+                        item,
+                        previous,
+                        entry.completed_patch,
+                    )
+                    previous = item
             for project_id, patch in patches.items():
                 operation = creates[project_id]
                 if (
@@ -1465,6 +2084,8 @@ class DesktopCoreBridgeStoreV1:
                     raise CoreBridgeStoreDataCorruptionError(
                         "pending patch old intent does not match durable authority"
                     )
+                if patch.state is CoreProjectPatchStateV1.APPLIED:
+                    cls._validate_applied_patch_snapshots(patch)
         except (KeyError, CoreBridgeStoreContractError) as exc:
             raise CoreBridgeStoreDataCorruptionError(
                 "bridge authority graph references missing or inconsistent state"
@@ -1472,16 +2093,43 @@ class DesktopCoreBridgeStoreV1:
 
     @contextmanager
     def _transaction(self, *, write: bool) -> Iterator[sqlite3.Connection]:
+        self._check_owner_pid()
         with self._transaction_lock:
             self._verify_storage_files()
             connection = self._connection
             committed = False
+            changed = False
+            next_identity: dict[str, object] | None = None
             try:
                 connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
                 self._validate_schema(connection)
+                self._validate_store_binding(connection, recover_forward=False)
+                changes_before = connection.total_changes
                 yield connection
                 if write:
                     self._validate_capacity(connection)
+                    changed = connection.total_changes != changes_before
+                    if changed:
+                        current_identity = self._identity_row(connection)
+                        next_generation = cast(int, current_identity["marker_generation"]) + 1
+                        next_digest = self._authority_digest(connection)
+                        connection.execute(
+                            """
+                            UPDATE store_identity
+                            SET previous_marker_generation = marker_generation,
+                                previous_authority_digest = authority_digest,
+                                marker_generation = ?, authority_digest = ?
+                            WHERE singleton = 1 AND marker_generation = ?
+                              AND authority_digest = ?
+                            """,
+                            (
+                                next_generation,
+                                next_digest,
+                                current_identity["marker_generation"],
+                                current_identity["authority_digest"],
+                            ),
+                        )
+                        next_identity = self._identity_row(connection)
                 self._verify_storage_files()
                 connection.commit()
                 committed = True
@@ -1499,7 +2147,12 @@ class DesktopCoreBridgeStoreV1:
                 if not committed:
                     connection.rollback()
                 raise
+            if changed:
+                assert next_identity is not None
+                self._write_identity_marker(next_identity)
+                self._write_root_anchor(next_identity)
             self._verify_storage_files()
+            self._validate_store_binding(connection, recover_forward=False)
 
     @staticmethod
     def _validate_project_id(value: str) -> str:
@@ -1542,11 +2195,11 @@ class DesktopCoreBridgeStoreV1:
         return cast(CoreProjectPatchOperationV1, operation)
 
     @staticmethod
-    def _mapping_from_row(row: sqlite3.Row, *, history: bool = False) -> CoreProjectMappingV1:
+    def _mapping_from_row(row: sqlite3.Row) -> CoreProjectMappingV1:
         mapping = _decode_document(
             row["guarded_document"],
             row["guarded_digest"],
-            label="mapping history" if history else "project mapping",
+            label="project mapping",
             decoder=_mapping_from_value,
             encoder=_mapping_value,
         )
@@ -1560,6 +2213,27 @@ class DesktopCoreBridgeStoreV1:
                 "mapping indexed fields differ from its document"
             )
         return cast(CoreProjectMappingV1, mapping)
+
+    @staticmethod
+    def _history_from_row(row: sqlite3.Row) -> _MappingHistoryEntry:
+        entry = _decode_document(
+            row["guarded_document"],
+            row["guarded_digest"],
+            label="mapping transition history",
+            decoder=_history_from_value,
+            encoder=_history_value,
+        )
+        mapping = entry.mapping
+        if (
+            mapping.local_project_id != row["local_project_id"]
+            or mapping.core_project_id != row["core_project_id"]
+            or mapping.request_sha256 != row["request_sha256"]
+            or mapping.mapping_generation != row["mapping_generation"]
+        ):
+            raise CoreBridgeStoreDataCorruptionError(
+                "mapping history indexed fields differ from its transition proof"
+            )
+        return cast(_MappingHistoryEntry, entry)
 
     @staticmethod
     def _single_document_row(
@@ -1650,7 +2324,7 @@ class DesktopCoreBridgeStoreV1:
                 ),
             )
             selected = tuple(
-                self._mapping_from_row(row, history=True)
+                self._history_from_row(row).mapping
                 for row in rows
                 if row["local_project_id"] == local_project_id
             )
@@ -1866,6 +2540,7 @@ class DesktopCoreBridgeStoreV1:
             outcome_mutable=outcome_mutable,
         )
         _patch_value(updated)
+        self._validate_applied_patch_snapshots(updated)
         with self._transaction(write=True) as connection:
             self._write_patch(connection, updated, expected=operation)
         return updated
@@ -1924,6 +2599,226 @@ class DesktopCoreBridgeStoreV1:
             raise CoreBridgeStoreContractError(
                 "completed patch does not authorize the mapping successor"
             )
+        if completed_patch is not None:
+            cls._validate_applied_patch_snapshots(completed_patch)
+        finalize = operation.workspace_upload_finalize
+        if (
+            expected_previous is None
+            and finalize is not None
+            and (
+                finalize.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
+                or finalize.outcome is None
+                or not cls._project_authorizes_mapping(finalize.outcome.project, mapping)
+            )
+        ):
+            raise CoreBridgeStoreContractError(
+                "first imported mapping is not bound to the applied finalize outcome"
+            )
+        if expected_previous is not None:
+            cls._validate_mapping_monotonicity(
+                expected_previous,
+                mapping,
+                completed_patch=completed_patch,
+                finalize=operation.workspace_upload_finalize,
+            )
+        if completed_patch is not None:
+            assert completed_patch.outcome is not None
+            authorities = [completed_patch.outcome]
+            if (
+                finalize is not None
+                and finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED
+                and finalize.outcome is not None
+            ):
+                authorities.append(finalize.outcome.project)
+            if not any(
+                cls._project_authorizes_mapping(authority, mapping)
+                for authority in authorities
+            ):
+                raise CoreBridgeStoreContractError(
+                    "mapping successor is not bound to the applied patch outcome"
+                )
+
+    @staticmethod
+    def _revision_is_same_or_successor(
+        previous: core_v1.RevisionRefV1,
+        current: core_v1.RevisionRefV1,
+    ) -> bool:
+        return current == previous or (
+            current.project_id == previous.project_id
+            and current.generation == previous.generation + 1
+            and current.id != previous.id
+        )
+
+    @staticmethod
+    def _snapshot_digest(value: core_v1.ImmutableSnapshotRefV1) -> str:
+        return sha256(_canonical_json_bytes(_model_value(value))).hexdigest()
+
+    @classmethod
+    def _validate_history_authority_reuse(
+        cls,
+        history: tuple[CoreProjectMappingV1, ...],
+    ) -> None:
+        seen_etags: set[str] = set()
+        seen_snapshots: dict[str, set[str]] = {
+            "project_snapshot": set(),
+            "task_snapshot": set(),
+            "workspace_snapshot": set(),
+        }
+        previous: CoreProjectMappingV1 | None = None
+        for mapping in history:
+            if previous is not None:
+                if (
+                    mapping.project_etag != previous.project_etag
+                    and mapping.project_etag in seen_etags
+                ):
+                    raise CoreBridgeStoreContractError(
+                        "mapping project ETag reuses older authority"
+                    )
+                for field, seen in seen_snapshots.items():
+                    current_snapshot = cast(
+                        core_v1.ImmutableSnapshotRefV1, getattr(mapping, field)
+                    )
+                    previous_snapshot = cast(
+                        core_v1.ImmutableSnapshotRefV1, getattr(previous, field)
+                    )
+                    digest = cls._snapshot_digest(current_snapshot)
+                    if current_snapshot != previous_snapshot and digest in seen:
+                        raise CoreBridgeStoreContractError(
+                            f"mapping {field} reuses older authority"
+                        )
+            seen_etags.add(mapping.project_etag)
+            for field, seen in seen_snapshots.items():
+                snapshot = cast(core_v1.ImmutableSnapshotRefV1, getattr(mapping, field))
+                seen.add(cls._snapshot_digest(snapshot))
+            previous = mapping
+
+    @staticmethod
+    def _validate_applied_patch_snapshots(
+        operation: CoreProjectPatchOperationV1,
+    ) -> None:
+        outcome = operation.outcome
+        if outcome is None or outcome.current_project_snapshot == (
+            operation.base_project.current_project_snapshot
+        ):
+            raise CoreBridgeStoreContractError(
+                "applied patch did not sign a new project snapshot"
+            )
+        task_changed = operation.base_project.task != operation.new_project_create.task
+        if task_changed == (
+            outcome.current_task_snapshot == operation.base_project.current_task_snapshot
+        ):
+            raise CoreBridgeStoreContractError(
+                "applied patch task snapshot transition is inconsistent"
+            )
+        workspace_changed = (
+            operation.base_project.workspace != operation.new_project_create.workspace
+        )
+        workspace_same = outcome.current_workspace_snapshot == (
+            operation.base_project.current_workspace_snapshot
+        )
+        imported_pending = (
+            workspace_changed
+            and outcome.current_workspace_snapshot is None
+            and isinstance(operation.base_project.workspace, core_v1.ImportedWorkspaceSpecV1)
+            and isinstance(
+                operation.new_project_create.workspace,
+                core_v1.ImportedWorkspaceSpecV1,
+            )
+        )
+        if (workspace_changed and workspace_same and not imported_pending) or (
+            not workspace_changed and not workspace_same
+        ):
+            raise CoreBridgeStoreContractError(
+                "applied patch workspace snapshot transition is inconsistent"
+            )
+
+    @classmethod
+    def _project_authorizes_mapping(
+        cls,
+        project: core_v1.ProjectV1,
+        mapping: CoreProjectMappingV1,
+    ) -> bool:
+        project_revision = project.active_revision
+        return bool(
+            project.id == mapping.core_project_id
+            and project.current_project_snapshot == mapping.project_snapshot
+            and project.current_task_snapshot == mapping.task_snapshot
+            and project.current_workspace_snapshot == mapping.workspace_snapshot
+            and project.registry_digest == mapping.registry_digest
+            and project_revision is not None
+            and cls._revision_is_same_or_successor(project_revision, mapping.active_revision)
+            and (
+                (
+                    project_revision == mapping.active_revision
+                    and project.etag == mapping.project_etag
+                    and project.updated_at == mapping.project_updated_at
+                )
+                or (
+                    project.etag != mapping.project_etag
+                    and cls._timestamp(mapping.project_updated_at)
+                    >= cls._timestamp(project.updated_at)
+                )
+            )
+        )
+
+    @staticmethod
+    def _timestamp(value: str) -> datetime:
+        try:
+            return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+        except ValueError as exc:
+            raise CoreBridgeStoreContractError(
+                "mapping authority timestamp is invalid"
+            ) from exc
+
+    @classmethod
+    def _validate_mapping_monotonicity(
+        cls,
+        previous: CoreProjectMappingV1,
+        current: CoreProjectMappingV1,
+        *,
+        completed_patch: CoreProjectPatchOperationV1 | None,
+        finalize: CoreWorkspaceUploadFinalizeAuthorityV1 | None,
+    ) -> None:
+        if not cls._revision_is_same_or_successor(
+            previous.active_revision, current.active_revision
+        ):
+            raise CoreBridgeStoreContractError(
+                "mapping active revision is not monotonic"
+            )
+        if cls._timestamp(current.project_updated_at) < cls._timestamp(
+            previous.project_updated_at
+        ):
+            raise CoreBridgeStoreContractError("mapping project timestamp rolled back")
+        project_authority_changed = any(
+            (
+                previous.project_snapshot != current.project_snapshot,
+                previous.task_snapshot != current.task_snapshot,
+                previous.workspace_snapshot != current.workspace_snapshot,
+                previous.active_revision != current.active_revision,
+                previous.project_updated_at != current.project_updated_at,
+            )
+        )
+        if project_authority_changed and previous.project_etag == current.project_etag:
+            raise CoreBridgeStoreContractError(
+                "mapping project authority changed without a new ETag"
+            )
+        content_changed = any(
+            (
+                previous.project_snapshot != current.project_snapshot,
+                previous.task_snapshot != current.task_snapshot,
+                previous.workspace_snapshot != current.workspace_snapshot,
+            )
+        )
+        finalize_applied = (
+            finalize is not None
+            and finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED
+            and finalize.outcome is not None
+            and cls._project_authorizes_mapping(finalize.outcome.project, current)
+        )
+        if content_changed and completed_patch is None and not finalize_applied:
+            raise CoreBridgeStoreContractError(
+                "mapping snapshots changed without an applied outcome"
+            )
 
     def commit_mapping(
         self,
@@ -1940,6 +2835,12 @@ class DesktopCoreBridgeStoreV1:
         if completed_patch is not None:
             _patch_value(completed_patch)
         self._validate_mapping_transition(operation, mapping, expected_previous, completed_patch)
+        history_entry = _MappingHistoryEntry(
+            mapping=mapping,
+            create_operation=operation,
+            completed_patch=completed_patch,
+        )
+        history_raw, history_digest = _encoded(_history_value(history_entry))
         with self._transaction(write=True) as connection:
             current_create = self._load_create_conn(connection, operation.local_project_id)
             current_mapping = self._load_mapping_conn(connection, operation.local_project_id)
@@ -1958,7 +2859,7 @@ class DesktopCoreBridgeStoreV1:
                 ).fetchone()
                 if (
                     history is not None
-                    and history["document_json"] == mapping_raw
+                    and history["document_json"] == history_raw
                     and current_patch is None
                 ):
                     return
@@ -1974,6 +2875,20 @@ class DesktopCoreBridgeStoreV1:
                     )
             elif current_patch != completed_patch:
                 raise CoreBridgeStoreConflictError("completed patch compare-and-swap failed")
+            existing_history = tuple(
+                self._history_from_row(row).mapping
+                for row in self._bounded_table_rows(
+                    connection,
+                    "mapping_history",
+                    scalar_columns=(
+                        "local_project_id",
+                        "core_project_id",
+                        "request_sha256",
+                    ),
+                )
+                if row["local_project_id"] == mapping.local_project_id
+            )
+            self._validate_history_authority_reuse((*existing_history, mapping))
             history_count = connection.execute("SELECT count(*) FROM mapping_history").fetchone()[
                 0
             ]
@@ -1991,8 +2906,8 @@ class DesktopCoreBridgeStoreV1:
                     mapping.mapping_generation,
                     mapping.core_project_id,
                     mapping.request_sha256,
-                    mapping_raw,
-                    mapping_digest,
+                    history_raw,
+                    history_digest,
                 ),
             )
             if expected_previous is None:
@@ -2058,4 +2973,5 @@ __all__ = [
     "DATABASE_FILENAME",
     "DEFAULT_MAX_MAPPING_HISTORY_ROWS",
     "DesktopCoreBridgeStoreV1",
+    "IDENTITY_MARKER_FILENAME",
 ]

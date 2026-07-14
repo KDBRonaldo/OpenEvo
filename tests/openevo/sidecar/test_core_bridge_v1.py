@@ -424,11 +424,18 @@ class FakeCore:
         self.lose_patch_before_apply_once = False
         self.lose_patch_after_apply_once = False
         self.lose_finalize_before_apply_once = False
+        self.lose_finalize_after_apply_once = False
         self.lose_abort_after_apply_once = False
         self.upload: core_v1.WorkspaceUploadSessionV1 | None = None
         self.uploads: dict[str, core_v1.WorkspaceUploadSessionV1] = {}
         self.abort_requests: list[tuple[str, core_v1.WorkspaceUploadAbortV1, str, str]] = []
         self.abort_replays: dict[str, core_v1.WorkspaceUploadSessionV1] = {}
+        self.finalize_requests: list[
+            tuple[str, core_v1.WorkspaceUploadFinalizeV1, str, str, str]
+        ] = []
+        self.finalize_replays: dict[
+            str, core_v1.WorkspaceUploadFinalizeResponseV1
+        ] = {}
         self.head = _head()
         self.block_method: str | None = None
         self.block_path: str | None = None
@@ -598,6 +605,22 @@ class FakeCore:
         if path.endswith("/finalize") and "/workspace-uploads/" in path:
             assert self.upload is not None
             assert path.endswith(f"/workspace-uploads/{self.upload.id}/finalize")
+            finalize_request = core_v1.WorkspaceUploadFinalizeV1.model_validate_json(
+                request.content, strict=True
+            )
+            finalize_key = request.headers["Idempotency-Key"]
+            self.finalize_requests.append(
+                (
+                    self.upload.id,
+                    finalize_request,
+                    request.headers["If-Match"],
+                    request.headers["If-Project-Match"],
+                    finalize_key,
+                )
+            )
+            replay = self.finalize_replays.get(finalize_key)
+            if replay is not None:
+                return httpx.Response(201, json=replay.model_dump(mode="json"))
             if self.lose_finalize_before_apply_once:
                 self.lose_finalize_before_apply_once = False
                 raise httpx.ReadError("finalize response lost", request=request)
@@ -636,15 +659,17 @@ class FakeCore:
             )
             self.upload = finalized_upload
             self.uploads[finalized_upload.id] = finalized_upload
-            return httpx.Response(
-                201,
-                json=core_v1.WorkspaceUploadFinalizeResponseV1(
-                    project_id=CORE_PROJECT_ID,
-                    upload=finalized_upload,
-                    publication=published.workspace_publication,
-                    project=published,
-                ).model_dump(mode="json"),
+            outcome = core_v1.WorkspaceUploadFinalizeResponseV1(
+                project_id=CORE_PROJECT_ID,
+                upload=finalized_upload,
+                publication=published.workspace_publication,
+                project=published,
             )
+            self.finalize_replays[finalize_key] = outcome
+            if self.lose_finalize_after_apply_once:
+                self.lose_finalize_after_apply_once = False
+                raise httpx.ReadError("finalize response lost", request=request)
+            return httpx.Response(201, json=outcome.model_dump(mode="json"))
         if path.endswith("/abort") and "/workspace-uploads/" in path:
             upload_id = path.rsplit("/", 2)[-2]
             abort_request = core_v1.WorkspaceUploadAbortV1.model_validate_json(

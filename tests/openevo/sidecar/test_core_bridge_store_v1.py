@@ -18,6 +18,7 @@ from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.core_bridge_store_v1 import (
     CoreBridgeStoreCapacityError,
     CoreBridgeStoreConflictError,
+    CoreBridgeStoreContractError,
     CoreBridgeStoreDataCorruptionError,
     CoreBridgeStoreSchemaError,
     CoreBridgeStoreStateRootError,
@@ -384,6 +385,54 @@ def test_unknown_workspace_abort_replays_exactly_after_store_restart(tmp_path: P
     reopened.close()
 
 
+def test_unknown_workspace_finalize_replays_exact_request_after_store_restart(
+    tmp_path: Path,
+) -> None:
+    from tests.openevo.sidecar import test_core_bridge_v1 as bridge_tests
+
+    root = tmp_path / "state"
+    project = bridge_tests._local_project(imported=True)
+    archive = b"\0" * 1024
+    fake_core = bridge_tests.FakeCore(project)
+    fake_core.lose_finalize_after_apply_once = True
+    store = DesktopCoreBridgeStoreV1(root)
+    first, _, _, _ = bridge_tests._bridge(
+        project,
+        persistence=store,
+        fake_core=fake_core,
+        archive_source=bridge_tests.FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(bridge_tests.CoreClientErrorV1):
+        first.activate_project(project, idempotency_key="finalize-loss-0001")
+    first.close()
+    unknown = store.load_create(LOCAL_PROJECT_ID)
+    assert unknown is not None and unknown.workspace_upload_finalize is not None
+    assert unknown.workspace_upload_finalize.state.value == "unknown"
+    assert unknown.workspace_upload_finalize.outcome is None
+    first_request = fake_core.finalize_requests[0]
+    assert first_request[2] == unknown.workspace_upload_finalize.upload_etag
+    assert first_request[3] == unknown.workspace_upload_finalize.project_etag
+    store.close()
+
+    reopened = DesktopCoreBridgeStoreV1(root)
+    second, _, _, _ = bridge_tests._bridge(
+        project,
+        persistence=reopened,
+        fake_core=fake_core,
+        archive_source=bridge_tests.FakeArchiveSource(archive),
+    )
+    second.activate_project(project, idempotency_key="finalize-loss-retry-0002")
+    second.close()
+
+    assert fake_core.finalize_requests == [first_request, first_request]
+    applied = reopened.load_create(LOCAL_PROJECT_ID)
+    assert applied is not None and applied.workspace_upload_finalize is not None
+    assert applied.workspace_upload_finalize.state.value == "applied"
+    assert applied.workspace_upload_finalize.outcome is not None
+    reopened.close()
+
+
 def test_create_reservation_and_every_transition_are_exact_full_row_cas(tmp_path: Path) -> None:
     store = DesktopCoreBridgeStoreV1(tmp_path / "state")
     first = store.reserve_create(_create_operation(key="activate-project-0001"))
@@ -520,6 +569,257 @@ def test_mapping_history_is_ordered_and_capacity_is_fail_closed(tmp_path: Path) 
 
     assert store.load_mapping(LOCAL_PROJECT_ID) == mapping_a
     assert store.load_mapping_history(LOCAL_PROJECT_ID) == (mapping_a,)
+
+
+def test_mapping_commit_rejects_same_revision_generation_rewrite(tmp_path: Path) -> None:
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    operation = _bound_create(store)
+    mapping_a = _mapping(
+        operation.project_create,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    rewritten_revision = REVISION.model_copy(update={"id": "revision-0-rewritten"})
+    mapping_b = replace(
+        mapping_a,
+        active_revision=rewritten_revision,
+        project_etag=ETAG_B,
+        mapping_generation=2,
+        predecessor_request_sha256=mapping_a.request_sha256,
+    )
+
+    with pytest.raises(CoreBridgeStoreContractError, match="revision"):
+        store.commit_mapping(
+            operation, mapping_b, expected_previous=mapping_a, completed_patch=None
+        )
+
+
+def test_mapping_history_rejects_nonadjacent_etag_reuse(tmp_path: Path) -> None:
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    operation = _bound_create(store)
+    mapping_a = _mapping(
+        operation.project_create,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    mapping_b = replace(
+        mapping_a,
+        project_etag=ETAG_B,
+        mapping_generation=2,
+        predecessor_request_sha256=mapping_a.request_sha256,
+    )
+    store.commit_mapping(
+        operation,
+        mapping_b,
+        expected_previous=mapping_a,
+        completed_patch=None,
+    )
+    mapping_rollback = replace(
+        mapping_b,
+        project_etag=ETAG_A,
+        mapping_generation=3,
+        predecessor_request_sha256=mapping_b.request_sha256,
+    )
+
+    with pytest.raises(CoreBridgeStoreContractError, match="ETag reuses"):
+        store.commit_mapping(
+            operation,
+            mapping_rollback,
+            expected_previous=mapping_b,
+            completed_patch=None,
+        )
+
+
+def test_mapping_commit_binds_successor_to_applied_patch_outcome(tmp_path: Path) -> None:
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    operation = _bound_create(store)
+    request_a = operation.project_create
+    mapping_a = _mapping(
+        request_a,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    request_b = _request(title="Changed task")
+    pending, outcome = _patch_operation(request_a, request_b)
+    pending = store.mark_patch_unknown(store.reserve_patch(pending))
+    applied = store.record_patch_applied(
+        pending,
+        outcome,
+        outcome_immutable=bridge_module._patch_immutable_authority(outcome),
+        outcome_mutable=bridge_module._patch_mutable_authority(outcome),
+    )
+    unbound = _mapping(
+        request_b,
+        generation=2,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_B,
+        etag=ETAG_B,
+        predecessor=mapping_a.request_sha256,
+    )
+
+    with pytest.raises(CoreBridgeStoreContractError, match="applied patch"):
+        store.commit_mapping(
+            operation,
+            unbound,
+            expected_previous=mapping_a,
+            completed_patch=applied,
+        )
+
+
+def test_mapping_commit_rejects_revision_successor_reusing_applied_etag(
+    tmp_path: Path,
+) -> None:
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    operation = _bound_create(store)
+    request_a = operation.project_create
+    mapping_a = _mapping(
+        request_a,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    request_b = _request(title="Changed task")
+    pending, outcome = _patch_operation(request_a, request_b)
+    pending = store.mark_patch_unknown(store.reserve_patch(pending))
+    applied = store.record_patch_applied(
+        pending,
+        outcome,
+        outcome_immutable=bridge_module._patch_immutable_authority(outcome),
+        outcome_mutable=bridge_module._patch_mutable_authority(outcome),
+    )
+    successor = REVISION.model_copy(
+        update={
+            "id": "revision-1",
+            "generation": 1,
+            "manifest_sha256": "7" * 64,
+        }
+    )
+    mapping_b = replace(
+        _mapping(
+            request_b,
+            generation=2,
+            project_snapshot=PROJECT_SNAPSHOT_B,
+            task_snapshot=TASK_SNAPSHOT_B,
+            etag=ETAG_B,
+            predecessor=mapping_a.request_sha256,
+        ),
+        active_revision=successor,
+    )
+
+    with pytest.raises(CoreBridgeStoreContractError, match="applied patch"):
+        store.commit_mapping(
+            operation,
+            mapping_b,
+            expected_previous=mapping_a,
+            completed_patch=applied,
+        )
+
+
+def test_first_imported_mapping_is_bound_to_finalize_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.openevo.sidecar import test_core_bridge_v1 as bridge_tests
+
+    root = tmp_path / "state"
+    project = bridge_tests._local_project(imported=True)
+    store = DesktopCoreBridgeStoreV1(root)
+    bridge, _, fake_core, _ = bridge_tests._bridge(project, persistence=store)
+    monkeypatch.setattr(
+        store_module,
+        "_before_mapping_commit",
+        lambda: (_ for _ in ()).throw(RuntimeError("injected mapping failure")),
+    )
+    with pytest.raises(bridge_module.DesktopCoreBridgeErrorV1):
+        bridge.activate_project(project, idempotency_key="initial-finalize-proof-0001")
+    bridge.close()
+    operation = store.load_create(LOCAL_PROJECT_ID)
+    assert operation is not None and operation.workspace_upload_finalize is not None
+    assert operation.workspace_upload_finalize.outcome is not None
+    finalized = operation.workspace_upload_finalize.outcome.project
+    request = map_project_create_v1(project)
+    mapping = bridge_module._mapping_from_project(
+        project,
+        bridge_module._model_digest(request),
+        finalized,
+        bridge_tests._capabilities(),
+        core_host_identity=HOST_IDENTITY,
+        previous_mapping=None,
+    )
+    unbound = replace(mapping, project_snapshot=PROJECT_SNAPSHOT_A)
+
+    with pytest.raises(CoreBridgeStoreContractError, match="finalize outcome"):
+        store.commit_mapping(
+            operation,
+            unbound,
+            expected_previous=None,
+            completed_patch=None,
+        )
+    assert fake_core.finalize_requests
+    store.close()
+
+
+def test_mapping_history_retains_applied_transition_proof(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopCoreBridgeStoreV1(root)
+    operation = _bound_create(store)
+    request_a = operation.project_create
+    mapping_a = _mapping(
+        request_a,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    request_b = _request(title="Changed task")
+    pending, outcome = _patch_operation(request_a, request_b)
+    pending = store.mark_patch_unknown(store.reserve_patch(pending))
+    applied = store.record_patch_applied(
+        pending,
+        outcome,
+        outcome_immutable=bridge_module._patch_immutable_authority(outcome),
+        outcome_mutable=bridge_module._patch_mutable_authority(outcome),
+    )
+    mapping_b = _mapping(
+        request_b,
+        generation=2,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        task_snapshot=TASK_SNAPSHOT_B,
+        etag=ETAG_B,
+        predecessor=mapping_a.request_sha256,
+    )
+    store.commit_mapping(
+        operation,
+        mapping_b,
+        expected_previous=mapping_a,
+        completed_patch=applied,
+    )
+    store.close()
+
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        raw = connection.execute(
+            "SELECT document_json FROM mapping_history WHERE mapping_generation = 2"
+        ).fetchone()[0]
+    assert b'"completed_patch"' in raw
+    assert b'"outcome"' in raw
+    DesktopCoreBridgeStoreV1(root).close()
 
 
 def test_process_owner_lock_rejects_second_instance(tmp_path: Path) -> None:
@@ -680,6 +980,131 @@ def test_startup_rejects_database_byte_tamper(tmp_path: Path) -> None:
         DesktopCoreBridgeStoreV1(root)
 
 
+def test_startup_rejects_foreign_valid_database_at_managed_path(tmp_path: Path) -> None:
+    root_a = tmp_path / "state-a"
+    store_a = DesktopCoreBridgeStoreV1(root_a)
+    _bound_create(store_a)
+    store_a.close()
+    foreign_database = (root_a / store_module.DATABASE_FILENAME).read_bytes()
+
+    root_b = tmp_path / "state-b"
+    DesktopCoreBridgeStoreV1(root_b).close()
+    database_b = root_b / store_module.DATABASE_FILENAME
+    database_b.write_bytes(foreign_database)
+    os.chmod(database_b, 0o600)
+
+    with pytest.raises(CoreBridgeStoreStateRootError, match="identity"):
+        DesktopCoreBridgeStoreV1(root_b)
+
+
+def test_startup_rejects_foreign_valid_root_at_managed_path(tmp_path: Path) -> None:
+    root_a = tmp_path / "state-a"
+    store_a = DesktopCoreBridgeStoreV1(root_a)
+    _bound_create(store_a)
+    store_a.close()
+
+    root_b = tmp_path / "state-b"
+    DesktopCoreBridgeStoreV1(root_b).close()
+    root_b.rename(tmp_path / "displaced-state-b")
+    root_a.rename(root_b)
+
+    with pytest.raises(CoreBridgeStoreStateRootError, match="identity"):
+        DesktopCoreBridgeStoreV1(root_b)
+
+
+def test_startup_rejects_durable_database_rollback(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopCoreBridgeStoreV1(root)
+    operation = _bound_create(store)
+    request_a = operation.project_create
+    mapping_a = _mapping(
+        request_a,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    store.close()
+    old_database = (root / store_module.DATABASE_FILENAME).read_bytes()
+
+    store = DesktopCoreBridgeStoreV1(root)
+    request_b = _request(title="Changed task")
+    pending, outcome = _patch_operation(request_a, request_b)
+    pending = store.mark_patch_unknown(store.reserve_patch(pending))
+    applied = store.record_patch_applied(
+        pending,
+        outcome,
+        outcome_immutable=bridge_module._patch_immutable_authority(outcome),
+        outcome_mutable=bridge_module._patch_mutable_authority(outcome),
+    )
+    mapping_b = _mapping(
+        request_b,
+        generation=2,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        task_snapshot=TASK_SNAPSHOT_B,
+        etag=ETAG_B,
+        predecessor=mapping_a.request_sha256,
+    )
+    store.commit_mapping(
+        operation,
+        mapping_b,
+        expected_previous=mapping_a,
+        completed_patch=applied,
+    )
+    store.close()
+
+    database = root / store_module.DATABASE_FILENAME
+    database.write_bytes(old_database)
+    os.chmod(database, 0o600)
+    with pytest.raises(CoreBridgeStoreStateRootError, match="rollback"):
+        DesktopCoreBridgeStoreV1(root)
+
+
+def test_nonempty_store_without_identity_marker_fails_closed(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopCoreBridgeStoreV1(root)
+    _bound_create(store)
+    store.close()
+    (root / store_module.IDENTITY_MARKER_FILENAME).unlink()
+
+    with pytest.raises(CoreBridgeStoreStateRootError, match="identity marker"):
+        DesktopCoreBridgeStoreV1(root)
+
+
+@pytest.mark.parametrize("failed_stage", ["inner-marker", "root-anchor"])
+def test_startup_recovers_only_one_adjacent_committed_marker_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_stage: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopCoreBridgeStoreV1(root)
+    operation = _create_operation()
+    attribute = (
+        "_write_identity_marker" if failed_stage == "inner-marker" else "_write_root_anchor"
+    )
+    original = getattr(store, attribute)
+    failed = False
+
+    def fail_once(identity: dict[str, object]) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected durable marker write failure")
+        original(identity)
+
+    monkeypatch.setattr(store, attribute, fail_once)
+    with pytest.raises(OSError, match="injected"):
+        store.reserve_create(operation)
+    store.close()
+
+    reopened = DesktopCoreBridgeStoreV1(root)
+    assert reopened.load_create(LOCAL_PROJECT_ID) == operation
+    reopened.close()
+
+
 @pytest.mark.parametrize("unsafe", ["root_symlink", "database_symlink", "database_hardlink"])
 def test_rejects_unsafe_state_files(tmp_path: Path, unsafe: str) -> None:
     root = tmp_path / "state"
@@ -714,6 +1139,47 @@ def test_closed_serialization_contains_no_pickle_secret_or_host_path(tmp_path: P
     assert b"core-host-key-1" in raw
 
 
+@pytest.mark.parametrize("action", ["read", "write", "close"])
+def test_forked_store_checks_pid_before_inherited_thread_lock(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    if not hasattr(os, "fork"):
+        pytest.skip("fork is unavailable")
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_transaction_lock() -> None:
+        with store._transaction_lock:
+            locked.set()
+            release.wait(timeout=10)
+
+    holder = threading.Thread(target=hold_transaction_lock)
+    holder.start()
+    assert locked.wait(timeout=2)
+    pid = os.fork()
+    if pid == 0:
+        import signal
+
+        signal.alarm(2)
+        try:
+            if action == "read":
+                store.load_mapping(LOCAL_PROJECT_ID)
+            elif action == "write":
+                store.reserve_create(_create_operation())
+            else:
+                store.close()
+        except CoreBridgeStoreStateRootError:
+            os._exit(0)
+        os._exit(1)
+    release.set()
+    holder.join(timeout=2)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    store.close()
+
+
 def test_forked_inherited_store_is_rejected(tmp_path: Path) -> None:
     if not hasattr(os, "fork"):
         pytest.skip("fork is unavailable")
@@ -723,10 +1189,10 @@ def test_forked_inherited_store_is_rejected(tmp_path: Path) -> None:
         try:
             store.load_mapping(LOCAL_PROJECT_ID)
         except CoreBridgeStoreStateRootError:
-            store.close()
             os._exit(0)
         os._exit(1)
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
     with pytest.raises(CoreBridgeStoreStateRootError, match="already owned"):
         DesktopCoreBridgeStoreV1(store.state_root)
+    store.close()

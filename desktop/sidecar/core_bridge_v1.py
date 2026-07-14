@@ -306,6 +306,12 @@ class CoreWorkspaceUploadAbortStateV1(StrEnum):
     UNKNOWN = "unknown"
 
 
+class CoreWorkspaceUploadFinalizeStateV1(StrEnum):
+    PRE_FINALIZE = "pre_finalize"
+    UNKNOWN = "unknown"
+    APPLIED = "applied"
+
+
 @dataclass(frozen=True, slots=True)
 class CoreWorkspaceUploadAbortOperationV1:
     upload: core_v1.WorkspaceUploadSessionV1
@@ -327,22 +333,39 @@ class CoreWorkspaceUploadFinalizeAuthorityV1:
     request_sha256: str
     request: core_v1.WorkspaceUploadFinalizeV1
     idempotency_key: str
-    outcome: core_v1.WorkspaceUploadFinalizeResponseV1
+    upload_etag: str
+    project_etag: str
+    state: CoreWorkspaceUploadFinalizeStateV1 = (
+        CoreWorkspaceUploadFinalizeStateV1.PRE_FINALIZE
+    )
+    outcome: core_v1.WorkspaceUploadFinalizeResponseV1 | None = None
     outcome_sha256: str | None = None
 
     def __post_init__(self) -> None:
         self.verify()
 
     def verify(self) -> None:
-        finalized = self.outcome.upload
         if _model_digest(self.request) != self.request_sha256:
             raise ValueError("workspace finalize request digest does not match canonical request")
-        if self.outcome_sha256 is None or _model_digest(self.outcome) != self.outcome_sha256:
-            raise ValueError("workspace finalize outcome digest does not match canonical outcome")
         if self.upload.status is not core_v1.WorkspaceUploadStatus.OPEN or (
             self.upload.accepted_offset != self.upload.archive.byte_size
             or self.request.content_sha256 != self.upload.archive.content_sha256
-            or self.outcome.project_id != self.upload.project_id
+            or self.upload_etag != self.upload.etag
+            or self.project_etag != self.upload.project_etag
+        ):
+            raise ValueError("workspace finalize authority is not an exact open upload request")
+        has_outcome = self.outcome is not None and self.outcome_sha256 is not None
+        if (self.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED) != has_outcome:
+            raise ValueError("only applied workspace finalize authority has an outcome")
+        if self.outcome is None:
+            if self.outcome_sha256 is not None:
+                raise ValueError("workspace finalize outcome binding is incomplete")
+            return
+        if _model_digest(self.outcome) != self.outcome_sha256:
+            raise ValueError("workspace finalize outcome digest does not match canonical outcome")
+        finalized = self.outcome.upload
+        if (
+            self.outcome.project_id != self.upload.project_id
             or finalized.id != self.upload.id
             or finalized.project_id != self.upload.project_id
             or finalized.status is not core_v1.WorkspaceUploadStatus.FINALIZED
@@ -968,8 +991,14 @@ class DesktopCoreBridgeV1:
                 completed_patch = new_patch or completed_patch
             else:
                 _ensure_project_identity(core_project, create_request)
+            pending_finalize = operation.workspace_upload_finalize
             if isinstance(create_request.workspace, core_v1.ImportedWorkspaceSpecV1) and (
                 core_project.workspace_publication is None
+                or (
+                    pending_finalize is not None
+                    and pending_finalize.state
+                    is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
+                )
             ):
                 core_project, operation = self._publish_imported_workspace(
                     token=token,
@@ -1938,6 +1967,40 @@ class DesktopCoreBridgeV1:
                 "The imported workspace does not have an adopted archive reference.",
                 status=422,
             )
+        finalize = operation.workspace_upload_finalize
+        if finalize is not None:
+            _ensure_workspace_finalize_authority_binding(finalize)
+            matches_current_request = not (
+                finalize.request.content_sha256 != import_ref.content_sha256
+                or finalize.upload.archive != core_project.workspace.archive
+                or finalize.upload.project_id != operation.core_project_id
+                or finalize.upload.id != operation.workspace_upload_id
+            )
+            if (
+                finalize.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
+                and not matches_current_request
+            ):
+                raise _bridge_error(
+                    "workspace_finalize_authority_mismatch",
+                    "The durable workspace finalize request does not match Local authority.",
+                    status=409,
+                )
+            if (
+                finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED
+                and matches_current_request
+            ):
+                raise _bridge_error(
+                    "workspace_finalize_authority_mismatch",
+                    "Core lost the durable finalized workspace publication.",
+                    status=409,
+                )
+            if finalize.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED:
+                return self._resume_workspace_finalize(
+                    token=token,
+                    deadline=deadline,
+                    client=client,
+                    operation=operation,
+                )
         if (
             operation.workspace_upload_id is not None
             and operation.workspace_upload_project_snapshot
@@ -2094,28 +2157,100 @@ class DesktopCoreBridgeV1:
         finalize_request = core_v1.WorkspaceUploadFinalizeV1(
             content_sha256=import_ref.content_sha256
         )
-        finalized = self._core_external(
-            token,
-            deadline,
-            lambda: client.finalize_workspace_upload(
-                upload.id,
-                finalize_request,
-                if_match=upload.etag,
-                if_project_match=upload.project_etag,
-                idempotency_key=_derived_key(upload_key_seed, "finalize"),
-            ),
-        )
         finalize_authority = CoreWorkspaceUploadFinalizeAuthorityV1(
             upload=upload,
             request_sha256=_model_digest(finalize_request),
             request=finalize_request,
             idempotency_key=_derived_key(upload_key_seed, "finalize"),
+            upload_etag=upload.etag,
+            project_etag=upload.project_etag,
+        )
+        prepared_operation = replace(
+            operation,
+            workspace_upload_finalize=finalize_authority,
+        )
+        stored_operation = self._adapter_external(
+            token,
+            deadline,
+            lambda: self._persistence.update_create(
+                prepared_operation,
+                expected_previous=operation,
+            ),
+            label="workspace finalize request reservation",
+        )
+        operation = _ensure_create_transition(
+            stored_operation,
+            prepared_operation,
+            label="workspace-finalize-reserved",
+        )
+        return self._resume_workspace_finalize(
+            token=token,
+            deadline=deadline,
+            client=client,
+            operation=operation,
+        )
+
+    def _resume_workspace_finalize(
+        self,
+        *,
+        token: _GenerationToken,
+        deadline: float,
+        client: CoreControlClientV1,
+        operation: CoreProjectCreateOperationV1,
+    ) -> tuple[core_v1.ProjectV1, CoreProjectCreateOperationV1]:
+        authority = operation.workspace_upload_finalize
+        if authority is None:
+            raise ValueError("workspace finalize resume requires durable authority")
+        _ensure_workspace_finalize_authority_binding(authority)
+        if authority.state is CoreWorkspaceUploadFinalizeStateV1.PRE_FINALIZE:
+            unknown_authority = replace(
+                authority,
+                state=CoreWorkspaceUploadFinalizeStateV1.UNKNOWN,
+            )
+            unknown_operation = replace(
+                operation,
+                workspace_upload_finalize=unknown_authority,
+            )
+            stored_operation = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.update_create(
+                    unknown_operation,
+                    expected_previous=operation,
+                ),
+                label="workspace finalize outcome transition",
+            )
+            operation = _ensure_create_transition(
+                stored_operation,
+                unknown_operation,
+                label="workspace-finalize-unknown",
+            )
+            authority = unknown_authority
+        if authority.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED:
+            assert authority.outcome is not None
+            return authority.outcome.project, operation
+        # Re-establish only the persisted open-upload membership needed for an exact replay.
+        client._register_workspace_upload(authority.upload, exact_replay=True)
+        finalized = self._core_external(
+            token,
+            deadline,
+            lambda: client.finalize_workspace_upload(
+                authority.upload.id,
+                authority.request,
+                if_match=authority.upload_etag,
+                if_project_match=authority.project_etag,
+                idempotency_key=authority.idempotency_key,
+            ),
+        )
+        applied_authority = replace(
+            authority,
+            state=CoreWorkspaceUploadFinalizeStateV1.APPLIED,
             outcome=finalized,
             outcome_sha256=_model_digest(finalized),
         )
         finalized_operation = replace(
             operation,
-            workspace_upload_finalize=finalize_authority,
+            workspace_upload_finalize=applied_authority,
         )
         stored_operation = self._adapter_external(
             token,
@@ -2538,9 +2673,16 @@ def _model_digest(model: core_v1.ContractModel) -> str:
 
 def _ensure_workspace_finalize_authority_binding(
     authority: CoreWorkspaceUploadFinalizeAuthorityV1,
+    *,
+    require_applied: bool = False,
 ) -> None:
     try:
         authority.verify()
+        if require_applied and (
+            authority.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
+            or authority.outcome is None
+        ):
+            raise ValueError("workspace finalize outcome is not applied")
     except (AttributeError, TypeError, ValueError):
         raise _bridge_error(
             "workspace_finalize_authority_mismatch",
@@ -2783,7 +2925,7 @@ def _ensure_workspace_finalize_proof(
     assert operation.outcome_mutable is not None
     assert operation.outcome_immutable is not None
     if authority is not None:
-        _ensure_workspace_finalize_authority_binding(authority)
+        _ensure_workspace_finalize_authority_binding(authority, require_applied=True)
     requested_workspace = operation.new_project_create.workspace
     upload = authority.upload if authority is not None else None
     finalized_project = authority.outcome.project if authority is not None else None
@@ -2970,19 +3112,21 @@ def _ensure_initial_publication_authority(
     finalized_project: core_v1.ProjectV1 | None = None
     if finalize is not None:
         _ensure_workspace_finalize_authority_binding(finalize)
-        candidate = finalize.outcome.project
-        if _project_identity_matches(candidate, operation.project_create):
-            finalized_project = candidate
-        elif not (
-            pending_patch is not None
-            and pending_patch.state is CoreProjectPatchStateV1.APPLIED
-            and _project_identity_matches(candidate, pending_patch.new_project_create)
-        ):
-            raise _bridge_error(
-                "core_project_initial_publication_mismatch",
-                "The durable workspace publication does not match a proven project intent.",
-                status=409,
-            )
+        if finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED:
+            assert finalize.outcome is not None
+            candidate = finalize.outcome.project
+            if _project_identity_matches(candidate, operation.project_create):
+                finalized_project = candidate
+            elif not (
+                pending_patch is not None
+                and pending_patch.state is CoreProjectPatchStateV1.APPLIED
+                and _project_identity_matches(candidate, pending_patch.new_project_create)
+            ):
+                raise _bridge_error(
+                    "core_project_initial_publication_mismatch",
+                    "The durable workspace publication does not match a proven project intent.",
+                    status=409,
+                )
 
     authority = finalized_project.active_revision if finalized_project is not None else None
     if finalized_project is not None:

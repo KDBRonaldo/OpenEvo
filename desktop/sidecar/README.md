@@ -346,10 +346,14 @@ base, applied outcome, and finalize outcome form a complete ordered chain of
 same-revision or direct-successor edges through the current revision. Missing
 intermediates do not authorize a generation jump.
 Recovery performs both checks before another workspace mutation, mapping commit,
-or current ETag adoption. Finalize authority CAS-persists both the canonical
-request digest and the complete validated canonical outcome digest before mapping
-commit, and recovery recomputes both bindings before reading outcome authority.
-An older record without the outcome binding fails closed; live Core state cannot
+or current ETag adoption. Finalize authority CAS-persists the canonical request,
+request digest, upload/project ETags, idempotency key, and complete open upload
+authority before sending the mutation. Its `pre_finalize` state advances to
+`unknown` before transport; response loss or restart can therefore only replay
+that exact mutation. `applied` then CAS-binds the complete validated canonical
+outcome and outcome digest. Reads never infer finalize success, and recovery
+recomputes both bindings before reading outcome authority. An older record
+without this request/outcome state machine fails closed; live Core state cannot
 upgrade or repair it. Mapping CAS and matching
 applied-operation cleanup are atomic. After an O-to-A patch whose
 mapping commit failed, a same-A retry commits the finalized A mapping; a later
@@ -362,17 +366,34 @@ than extending the public provider database. The directory must remain a real,
 owner-held mode-`0700` inode. Its database and owner-lock files are no-follow,
 link-count-one mode-`0600` regular files whose device/inode identities are pinned
 for the store lifetime. A nonblocking `flock` permits one process owner, a
-process-local reentrant lock serializes SQLite use, and an inherited post-fork
-instance fails closed without unlocking its parent owner.
+process-local reentrant lock serializes SQLite use. Every public read, write, and
+close checks the creator PID before it can acquire an inherited lock, so a
+post-fork child fails closed without deadlocking or unlocking its parent owner.
 
 The store uses SQLite's rollback journal with `synchronous=FULL`, forbids WAL/SHM,
-caps the database at 1 GiB and journal at 2 GiB, and validates an exact v1 schema
-fingerprint and metadata row in every transaction. Startup performs SQLite and
+caps the database at 1 GiB and journal at 2 GiB, and validates an exact private
+schema fingerprint and metadata row in every transaction. Private persistence
+schema v2 is independent of the public Core/Desktop API version. Only a genuinely
+empty database with empty fresh marker files may initialize v2. A nonempty,
+unversioned, v1, markerless, or partially initialized legacy store fails closed;
+there is no inference-based migration. Startup performs SQLite and
 foreign-key integrity checks before decoding authority. Recovery is bounded to
 120,000 rows and 512 MiB of indexed/document bytes; each closed document is at
 most 4 MiB. SQL length probes and exact-length guarded reads run before a
 document BLOB enters Python. Mapping history is contiguous per project and
 bounded to 100,000 rows by default.
+
+The database has a random non-secret store identity bound to the exact root,
+database, owner lock, root marker, and external pathname anchor identities. The
+mode-`0600` anchor lives in the owner-controlled parent directory and prevents a
+self-consistent foreign or old root from being moved onto the managed pathname.
+Both marker files use two fixed-size bounded canonical-JSON slots and retain the
+latest authority generation/digest outside SQLite. Each write commits the next
+database generation first, then fsyncs the root marker and external anchor. On
+startup only an exact one-generation marker lag whose previous digest matches the
+database proof may be completed forward. A database behind either marker, a
+same-generation digest rewrite, a foreign store ID, or any physical identity
+substitution is durable rollback/cross-store corruption and fails closed.
 
 Create, patch, mapping, abort, and finalize authority use explicit closed
 canonical JSON records with a per-row SHA-256 binding. Decode strictly rebuilds
@@ -381,8 +402,12 @@ byte-identical reserialization. The store does not use pickle or accept generic
 environment, credential, secret, URI, command, or host-path fields. Create and
 patch transitions compare the complete previous canonical row. Mapping commit
 compares the complete create and prior mapping authority, appends the exact next
-history generation, and removes only the supplied matching `applied` patch in
-one transaction. Exact committed-state retries resolve a lost commit response;
+history generation with the historical create/finalize and completed-patch
+transition proof, and removes only the supplied matching `applied` patch in one
+transaction. Commit and startup independently require exact generation
+succession, immutable same-generation revisions, direct revision successors,
+monotonic timestamps/ETags, and snapshot changes authorized by a persisted
+applied outcome. Exact committed-state retries resolve a lost commit response;
 rollback retains the old mapping and pending patch.
 
 Host, tunnel, archive open/read/close, and persistence callbacks run through a
