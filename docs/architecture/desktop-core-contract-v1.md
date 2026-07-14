@@ -106,6 +106,14 @@ synchronous crash-recovery path; there is no custom VFS, `/dev/fd` database
 opening, journal inode pin, or claim that Python's `sqlite3` provides those
 properties.
 
+The cursor signing key is fully written to an owner-only temporary file,
+fsynced, atomically published with no-replace semantics, and followed by a
+state-root directory fsync. Concurrent first initialization cannot replace the
+winning key. An invalid-size final key left by an interrupted first
+initialization may be recovered only while the database is still the
+never-initialized empty file and no SQLite side file exists; an initialized or
+ambiguous store fails closed.
+
 This filesystem boundary protects against accidental sharing, symlink or
 hard-link setup present at a validation point, and concurrent cooperating
 sidecars. It does not isolate the store from a malicious process running as the
@@ -130,7 +138,10 @@ revision pins cleared, and interrupted or now-stale local operations are
 cancelled against that authoritative resource state. Action idempotency stores
 the exact `LocalOperationV1`; replay resolves its current authoritative
 operation row and cannot return an obsolete connected/active result. Resource,
-operation, and idempotency writes commit in one transaction.
+operation, and idempotency writes commit in one transaction. Local-operation
+reconciliation uses bounded keyset batches and fetches each bounded document
+row individually; startup never materializes the complete operation BLOB set in
+memory.
 
 The store persists only closed Local API fields. Unknown evolution method
 config is recursively checked with case- and separator-normalized denylisted
@@ -158,11 +169,14 @@ which the store can consume the same exported bound rather than define one.
 
 List routes use `limit` (maximum 100), `after`, `sort`, and `direction`, and
 return `{items, next_cursor, has_more}`. A cursor is bound to the filters and
-sort order. Its signed boundary contains the typed sort value and resource ID;
-continuation never re-reads a mutable anchor row, so deleting or editing that
-row does not change the next-page boundary. `has_more` is true if and only if
-`next_cursor` is non-null. Invalid cursors return 400; expired cursors return
-410.
+sort order. Its server-side boundary contains the typed sort value and resource
+ID; continuation never re-reads a mutable anchor row, so deleting or editing
+that row does not change the next-page boundary. `has_more` is true if and only
+if `next_cursor` is non-null. Invalid cursors return 400; expired cursors return
+410. The bounded HMAC token carries its version, issued and expiry times, and
+query binding. Providers verify the signature, structure, and binding before
+expiry, so TTL cleanup of the server-side boundary cannot turn a valid expired
+cursor into an unknown-cursor 400.
 
 Core SSE uses closed `SseFrameV1` objects whose wire `id` and versioned `event`
 must exactly match `data.id` and `data.event` in the typed `EventEnvelopeV1`.

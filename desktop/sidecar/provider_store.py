@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import fcntl
 from hashlib import sha256
 import hmac
@@ -15,6 +17,8 @@ import re
 import secrets
 import sqlite3
 import stat
+import struct
+import sys
 import threading
 from typing import Any, Literal, TypeVar, cast
 import unicodedata
@@ -63,6 +67,8 @@ MAX_RECOVERY_ROWS = 100_000
 MAX_RECOVERY_BYTES = 402_653_184
 MAX_SCHEMA_OBJECTS = 40
 MAX_SCHEMA_BYTES = 98_304
+STARTUP_OPERATION_BATCH_ROWS = 128
+MAX_STARTUP_OPERATION_ROW_BYTES = MAX_DOCUMENT_BYTES + 16_384
 DEFAULT_IDEMPOTENCY_RECORD_LIMIT = 10_000
 DEFAULT_CURSOR_RECORD_LIMIT = 10_000
 DEFAULT_IDEMPOTENCY_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -70,6 +76,12 @@ DEFAULT_CURSOR_TTL_SECONDS = 15 * 60
 
 _RESOURCE_ID_BYTES = 32
 _CURSOR_KEY_BYTES = 32
+_CURSOR_NONCE_BYTES = 16
+_CURSOR_TOKEN_VERSION = 1
+_CURSOR_TOKEN = struct.Struct(">BQQ32s16s")
+_CURSOR_KEY_TEMP_PREFIX = f".{CURSOR_KEY_FILENAME}.tmp-"
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 0x00000004
 _ETAG_RE = re.compile(r'^"[0-9a-f]{64}"$')
 _B64_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -144,6 +156,39 @@ _SECRET_KEY_SUFFIXES = (
 )
 _PROFILE_OPERATION_KINDS = {"profile_connect", "profile_disconnect", "host_key_accept"}
 _PROJECT_OPERATION_KINDS = {"project_activate", "project_doctor", "project_repair"}
+
+
+def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "linux":
+        rename = getattr(libc, "renameat2", None)
+        flags = _RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        rename = getattr(libc, "renameatx_np", None)
+        flags = _RENAME_EXCL
+    else:
+        rename = None
+        flags = 0
+    if rename is None:
+        raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable")
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    result = rename(
+        directory_fd,
+        os.fsencode(source),
+        directory_fd,
+        os.fsencode(destination),
+        flags,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
 
 
 class ProviderStoreError(Exception):
@@ -967,24 +1012,114 @@ class DesktopProviderStore:
 
     def _load_or_create_cursor_key(self) -> bytes:
         self._verify_root()
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        key = secrets.token_bytes(_CURSOR_KEY_BYTES)
         try:
-            fd = os.open(CURSOR_KEY_FILENAME, flags, 0o600, dir_fd=self._root_fd)
-        except FileExistsError:
-            return self._read_cursor_key()
+            key_stat = os.stat(
+                CURSOR_KEY_FILENAME,
+                dir_fd=self._root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if not self._database_is_never_initialized():
+                raise ProviderStateRootError(
+                    "cursor signing key is missing from an initialized provider store"
+                )
         except OSError as exc:
-            raise ProviderStateRootError("could not create cursor signing key") from exc
+            raise ProviderStateRootError("could not inspect cursor signing key") from exc
+        else:
+            self._validate_private_file_stat(CURSOR_KEY_FILENAME, key_stat)
+            if key_stat.st_size == _CURSOR_KEY_BYTES:
+                return self._read_cursor_key()
+            if not self._database_is_never_initialized():
+                raise ProviderStateRootError("cursor signing key has an invalid size")
+            self._unlink_invalid_cursor_key(key_stat)
+        return self._create_cursor_key()
+
+    def _database_is_never_initialized(self) -> bool:
+        database_stat = self._verify_private_file(DATABASE_FILENAME)
+        if database_stat.st_size != 0:
+            return False
+        return all(
+            self._optional_private_file(name) is None
+            for name in (JOURNAL_FILENAME, WAL_FILENAME, SHM_FILENAME)
+        )
+
+    def _unlink_invalid_cursor_key(self, expected_stat: os.stat_result) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
-            os.fchmod(fd, 0o600)
-            if os.write(fd, key) != len(key):
-                raise ProviderStateRootError("cursor signing key write was incomplete")
-            os.fsync(fd)
+            descriptor = os.open(CURSOR_KEY_FILENAME, flags, dir_fd=self._root_fd)
+        except OSError as exc:
+            raise ProviderStateRootError("could not open invalid cursor signing key") from exc
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (
+                expected_stat.st_dev,
+                expected_stat.st_ino,
+            ):
+                raise ProviderStateRootError("cursor signing key identity changed")
+            os.unlink(CURSOR_KEY_FILENAME, dir_fd=self._root_fd)
         finally:
-            os.close(fd)
-        os.fsync(self._root_fd)
-        self._verify_private_file(CURSOR_KEY_FILENAME)
-        return key
+            os.close(descriptor)
+
+    def _create_cursor_key(self) -> bytes:
+        key = secrets.token_bytes(_CURSOR_KEY_BYTES)
+        temporary_name = f"{_CURSOR_KEY_TEMP_PREFIX}{secrets.token_hex(16)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=self._root_fd)
+            os.fchmod(descriptor, 0o600)
+            remaining = memoryview(key)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError(errno.EIO, "cursor signing key write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            try:
+                _rename_noreplace(
+                    temporary_name,
+                    CURSOR_KEY_FILENAME,
+                    directory_fd=self._root_fd,
+                )
+            except FileExistsError:
+                return self._read_cursor_key()
+            os.fsync(self._root_fd)
+            self._verify_private_file(CURSOR_KEY_FILENAME)
+            return key
+        except ProviderStoreError:
+            raise
+        except OSError as exc:
+            action = "publish" if descriptor is None else "create"
+            raise ProviderStateRootError(
+                f"could not {action} cursor signing key"
+            ) from exc
+        finally:
+            cleanup_error: OSError | None = None
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    cleanup_error = exc
+            removed_temporary = False
+            try:
+                os.unlink(temporary_name, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
+            else:
+                removed_temporary = True
+            if removed_temporary:
+                try:
+                    os.fsync(self._root_fd)
+                except OSError as exc:
+                    cleanup_error = cleanup_error or exc
+            if cleanup_error is not None:
+                raise ProviderStateRootError(
+                    "could not clean up cursor signing key temporary file"
+                ) from cleanup_error
 
     def _read_cursor_key(self) -> bytes:
         self._verify_private_file(CURSOR_KEY_FILENAME)
@@ -2179,15 +2314,64 @@ class DesktopProviderStore:
         return reconciled
 
     def _reconcile_operations_at_startup(self, connection: sqlite3.Connection) -> None:
-        rows = connection.execute(
-            "SELECT * FROM local_operations ORDER BY operation_id"
-        ).fetchall()
-        for row in rows:
-            self._reconcile_operation_with_authority(
-                connection,
-                cast(sqlite3.Row, row),
-                force_cancel_nonterminal=True,
-            )
+        after_operation_id = ""
+        while True:
+            metadata_rows = connection.execute(
+                """
+                SELECT operation_id,
+                       length(CAST(document_json AS BLOB)) AS document_bytes,
+                       length(CAST(operation_id AS BLOB))
+                         + length(CAST(operation_kind AS BLOB))
+                         + length(CAST(state AS BLOB))
+                         + length(CAST(resource_type AS BLOB))
+                         + length(CAST(resource_id AS BLOB))
+                         + length(CAST(document_json AS BLOB))
+                         + length(CAST(created_at AS BLOB))
+                         + coalesce(length(CAST(finished_at AS BLOB)), 0)
+                         + 16 AS row_bytes
+                FROM local_operations
+                WHERE operation_id > ?
+                ORDER BY operation_id
+                LIMIT ?
+                """,
+                (after_operation_id, STARTUP_OPERATION_BATCH_ROWS),
+            ).fetchmany(STARTUP_OPERATION_BATCH_ROWS)
+            if not metadata_rows:
+                return
+            for metadata in metadata_rows:
+                operation_id = cast(str, metadata["operation_id"])
+                document_bytes = metadata["document_bytes"]
+                row_bytes = metadata["row_bytes"]
+                if (
+                    type(document_bytes) is not int
+                    or document_bytes < 1
+                    or document_bytes > MAX_DOCUMENT_BYTES
+                    or type(row_bytes) is not int
+                    or row_bytes > MAX_STARTUP_OPERATION_ROW_BYTES
+                ):
+                    raise ProviderDataCorruptionError(
+                        "startup operation row exceeds its recovery bound"
+                    )
+                row = connection.execute(
+                    """
+                    SELECT * FROM local_operations
+                    WHERE operation_id = ?
+                      AND length(CAST(document_json AS BLOB)) = ?
+                    """,
+                    (operation_id, document_bytes),
+                ).fetchone()
+                if row is None:
+                    raise ProviderDataCorruptionError(
+                        "startup operation row changed during recovery"
+                    )
+                self._reconcile_operation_with_authority(
+                    connection,
+                    cast(sqlite3.Row, row),
+                    force_cancel_nonterminal=True,
+                )
+                after_operation_id = operation_id
+            if len(metadata_rows) < STARTUP_OPERATION_BATCH_ROWS:
+                return
 
     def _require_etag(
         self,
@@ -2307,14 +2491,24 @@ class DesktopProviderStore:
         self._validate_resource_id(anchor_id)
         if len(sort_value.encode("utf-8")) > 4096:
             raise ProviderStoreError("provider cursor sort boundary exceeds its byte bound")
-        nonce = secrets.token_bytes(_CURSOR_KEY_BYTES)
+        now_epoch = int(self._now().timestamp())
+        expires_at_epoch = now_epoch + self._cursor_ttl_seconds
+        try:
+            token = _CURSOR_TOKEN.pack(
+                _CURSOR_TOKEN_VERSION,
+                now_epoch,
+                expires_at_epoch,
+                bytes.fromhex(query_digest),
+                secrets.token_bytes(_CURSOR_NONCE_BYTES),
+            )
+        except (OverflowError, struct.error, ValueError) as exc:
+            raise ProviderStoreError("provider cursor timestamps are outside token bounds") from exc
         cursor = (
-            f"{self._b64encode(nonce)}."
-            f"{self._b64encode(hmac.digest(self._cursor_key, nonce, 'sha256'))}"
+            f"{self._b64encode(token)}."
+            f"{self._b64encode(hmac.digest(self._cursor_key, token, 'sha256'))}"
         )
         if len(cursor.encode("ascii")) > MAX_RENDERED_CURSOR_BYTES:
             raise ProviderStoreError("provider cursor exceeds its byte limit")
-        now_epoch = int(self._now().timestamp())
         with self._transaction(write=True) as connection:
             connection.execute(
                 "DELETE FROM pagination_cursors WHERE expires_at_epoch <= ?",
@@ -2339,7 +2533,7 @@ class DesktopProviderStore:
                     anchor_id,
                     sort_value,
                     now_epoch,
-                    now_epoch + self._cursor_ttl_seconds,
+                    expires_at_epoch,
                 ),
             )
         return cursor
@@ -2359,14 +2553,22 @@ class DesktopProviderStore:
         if len(parts) != 2:
             raise CursorInvalidError("provider cursor has an invalid envelope")
         try:
-            decoded = self._b64decode(parts[0])
+            token = self._b64decode(parts[0])
             signature = self._b64decode(parts[1])
         except ValueError as exc:
             raise CursorInvalidError("provider cursor encoding is invalid") from exc
-        if len(decoded) != _CURSOR_KEY_BYTES:
+        if len(token) != _CURSOR_TOKEN.size or len(signature) != sha256().digest_size:
             raise CursorInvalidError("provider cursor has an invalid token size")
-        if not hmac.compare_digest(signature, hmac.digest(self._cursor_key, decoded, "sha256")):
+        if not hmac.compare_digest(signature, hmac.digest(self._cursor_key, token, "sha256")):
             raise CursorInvalidError("provider cursor signature is invalid")
+        try:
+            version, issued_at_epoch, expires_at_epoch, bound_query_digest, _nonce = (
+                _CURSOR_TOKEN.unpack(token)
+            )
+        except struct.error as exc:
+            raise CursorInvalidError("provider cursor token is malformed") from exc
+        if version != _CURSOR_TOKEN_VERSION or expires_at_epoch <= issued_at_epoch:
+            raise CursorInvalidError("provider cursor token structure is invalid")
         query_digest = sha256(
             _canonical_json_bytes(
                 {
@@ -2377,26 +2579,33 @@ class DesktopProviderStore:
                 }
             )
         ).hexdigest()
+        if not hmac.compare_digest(bound_query_digest, bytes.fromhex(query_digest)):
+            raise CursorInvalidError("provider cursor is bound to another query")
+        if expires_at_epoch <= int(self._now().timestamp()):
+            raise CursorExpiredError("provider cursor has expired")
         with self._transaction(write=False) as connection:
             row = connection.execute(
                 """
-                SELECT query_digest, anchor_id, anchor_value, expires_at_epoch
+                SELECT query_digest, anchor_id, anchor_value,
+                       created_at_epoch, expires_at_epoch
                 FROM pagination_cursors WHERE cursor_digest = ?
                 """,
                 (sha256(cursor.encode("ascii")).hexdigest(),),
             ).fetchone()
         if row is None:
             raise CursorInvalidError("provider cursor is unknown")
-        if row["query_digest"] != query_digest:
-            raise CursorInvalidError("provider cursor is bound to another query")
+        if (
+            row["query_digest"] != query_digest
+            or row["created_at_epoch"] != issued_at_epoch
+            or row["expires_at_epoch"] != expires_at_epoch
+        ):
+            raise CursorInvalidError("provider cursor record differs from its signed token")
         try:
             self._validate_resource_id(cast(str, row["anchor_id"]))
         except ContractValidationError as exc:
             raise CursorInvalidError("provider cursor resource boundary is invalid") from exc
         if len(cast(str, row["anchor_value"]).encode("utf-8")) > 4096:
             raise CursorInvalidError("provider cursor sort boundary exceeds its byte bound")
-        if row["expires_at_epoch"] <= int(self._now().timestamp()):
-            raise CursorExpiredError("provider cursor has expired")
         return cast(str, row["anchor_value"]), cast(str, row["anchor_id"])
 
     @staticmethod

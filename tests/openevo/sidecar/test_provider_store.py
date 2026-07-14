@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import errno
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -138,6 +140,178 @@ def test_process_lifecycle_owner_lock_rejects_a_second_store(tmp_path: Path) -> 
 
     store.close()
     DesktopProviderStore(root).close()
+
+
+def test_cursor_key_creation_retries_short_writes_and_leaves_no_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_write = os.write
+    write_calls = 0
+
+    def short_write(fd: int, value: bytes) -> int:
+        nonlocal write_calls
+        write_calls += 1
+        return original_write(fd, value[:3])
+
+    monkeypatch.setattr(provider_store_module.os, "write", short_write)
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+
+    assert write_calls > 1
+    assert len((root / "cursor-signing.key").read_bytes()) == 32
+    assert not tuple(root.glob(".cursor-signing.key.tmp-*"))
+    store.close()
+
+
+def test_cursor_key_publication_failure_cleans_private_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_publication(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EIO, "injected publication failure")
+
+    monkeypatch.setattr(provider_store_module, "_rename_noreplace", fail_publication)
+    root = tmp_path / "state"
+
+    with pytest.raises(ProviderStateRootError, match="publish cursor signing key"):
+        DesktopProviderStore(root)
+
+    assert not (root / "cursor-signing.key").exists()
+    assert not tuple(root.glob(".cursor-signing.key.tmp-*"))
+
+
+def test_cursor_key_fsync_failure_cleans_private_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    (root / "provider.sqlite3").touch(mode=0o600)
+    original_fsync = os.fsync
+    calls = 0
+
+    def fail_first_fsync(fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EIO, "injected key fsync failure")
+        original_fsync(fd)
+
+    monkeypatch.setattr(provider_store_module.os, "fsync", fail_first_fsync)
+    with pytest.raises(ProviderStateRootError, match="cursor signing key"):
+        DesktopProviderStore(root)
+
+    assert not (root / "cursor-signing.key").exists()
+    assert not tuple(root.glob(".cursor-signing.key.tmp-*"))
+
+
+def test_cursor_key_is_fsynced_before_no_replace_publication_and_directory_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    (root / "provider.sqlite3").touch(mode=0o600)
+    root_stat = root.stat()
+    original_fsync = os.fsync
+    original_rename = provider_store_module._rename_noreplace
+    events: list[str] = []
+
+    def tracked_fsync(fd: int) -> None:
+        descriptor_stat = os.fstat(fd)
+        events.append(
+            "directory_fsync"
+            if (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            == (root_stat.st_dev, root_stat.st_ino)
+            else "file_fsync"
+        )
+        original_fsync(fd)
+
+    def tracked_rename(source: str, destination: str, *, directory_fd: int) -> None:
+        source_stat = os.stat(source, dir_fd=directory_fd, follow_symlinks=False)
+        assert stat.S_IMODE(source_stat.st_mode) == 0o600
+        assert source_stat.st_size == 32
+        events.append("publish")
+        original_rename(source, destination, directory_fd=directory_fd)
+
+    monkeypatch.setattr(provider_store_module.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(provider_store_module, "_rename_noreplace", tracked_rename)
+    store = DesktopProviderStore(root)
+
+    assert events[:3] == ["file_fsync", "publish", "directory_fsync"]
+    store.close()
+
+
+def test_concurrent_cursor_key_publication_keeps_exactly_one_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.sqlite3").touch(mode=0o600)
+
+    barrier = threading.Barrier(2)
+    publication_results: list[str] = []
+    publication_lock = threading.Lock()
+    original_rename = provider_store_module._rename_noreplace
+
+    def tracked_rename(source: str, destination: str, *, directory_fd: int) -> None:
+        try:
+            original_rename(source, destination, directory_fd=directory_fd)
+        except FileExistsError:
+            with publication_lock:
+                publication_results.append("lost")
+            raise
+        with publication_lock:
+            publication_results.append("won")
+
+    monkeypatch.setattr(provider_store_module, "_rename_noreplace", tracked_rename)
+
+    def initialize_key() -> bytes:
+        store = DesktopProviderStore.__new__(DesktopProviderStore)
+        store._closed = False
+        store._state_root = root
+        store._root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root_stat = os.fstat(store._root_fd)
+        store._root_identity = (root_stat.st_dev, root_stat.st_ino)
+        try:
+            barrier.wait(timeout=5)
+            return store._load_or_create_cursor_key()
+        finally:
+            os.close(store._root_fd)
+            store._closed = True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        keys = tuple(executor.map(lambda _index: initialize_key(), range(2)))
+
+    assert keys[0] == keys[1] == (root / "cursor-signing.key").read_bytes()
+    assert len(keys[0]) == 32
+    assert sorted(publication_results) == ["lost", "won"]
+    assert not tuple(root.glob(".cursor-signing.key.tmp-*"))
+
+
+def test_invalid_cursor_key_is_recovered_only_for_never_initialized_store(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "cursor-signing.key").write_bytes(b"partial")
+    os.chmod(root / "cursor-signing.key", 0o600)
+
+    store = DesktopProviderStore(root)
+    assert len((root / "cursor-signing.key").read_bytes()) == 32
+    store.close()
+
+    (root / "cursor-signing.key").write_bytes(b"partial")
+    with pytest.raises(ProviderStateRootError, match="invalid size"):
+        DesktopProviderStore(root)
+    assert (root / "cursor-signing.key").read_bytes() == b"partial"
+
+    (root / "cursor-signing.key").unlink()
+    with pytest.raises(ProviderStateRootError, match="missing from an initialized"):
+        DesktopProviderStore(root)
 
 
 def test_sqlite_connection_uses_the_canonical_database_path(tmp_path: Path) -> None:
@@ -873,6 +1047,8 @@ def test_cursor_is_stable_tamper_evident_and_expiry_is_distinct(tmp_path: Path) 
         )
 
     clock.now += timedelta(seconds=31)
+    cleanup_page = reopened.list_profiles(limit=1, sort="name", direction="asc")
+    assert cleanup_page.next_cursor is not None
     with pytest.raises(CursorExpiredError):
         reopened.list_profiles(
             limit=1,
@@ -880,6 +1056,8 @@ def test_cursor_is_stable_tamper_evident_and_expiry_is_distinct(tmp_path: Path) 
             sort="name",
             direction="asc",
         )
+    with pytest.raises(CursorInvalidError):
+        reopened.list_profiles(limit=1, after=tampered, sort="name", direction="asc")
 
 
 def test_cursor_covers_the_contract_maximum_utf8_name(tmp_path: Path) -> None:
@@ -1189,6 +1367,97 @@ def test_startup_atomically_converges_interrupted_operations_and_resources(
         profile_id=profile.profile_id,
         connection_state="disconnected",
     )
+
+
+def test_startup_reconciliation_streams_large_operation_sets_in_bounded_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    operation_count = provider_store_module.STARTUP_OPERATION_BATCH_ROWS * 2 + 3
+    with store._transaction(write=True) as connection:
+        transaction = ProviderMutation(store, connection)
+        for _index in range(operation_count):
+            transaction.create_local_operation(
+                operation_kind="profile_connect",
+                resource=ResourceRefV1(
+                    resource_type="profile", resource_id=profile.profile_id
+                ),
+                state="running",
+            )
+    store.close()
+
+    original_connect = sqlite3.connect
+    batch_limits: list[int] = []
+
+    class CursorProbe:
+        def __init__(self, cursor: sqlite3.Cursor, sql: str) -> None:
+            self._cursor = cursor
+            self._sql = " ".join(sql.lower().split())
+
+        def fetchall(self):
+            if "from local_operations" in self._sql:
+                raise AssertionError("startup operation recovery must not call fetchall")
+            return self._cursor.fetchall()
+
+        def fetchone(self):
+            return self._cursor.fetchone()
+
+        def fetchmany(self, size: int | None = None):
+            if size is not None:
+                assert size <= provider_store_module.STARTUP_OPERATION_BATCH_ROWS
+            return self._cursor.fetchmany() if size is None else self._cursor.fetchmany(size)
+
+        def __iter__(self):
+            return iter(self._cursor)
+
+    class ConnectionProbe:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        @property
+        def row_factory(self):
+            return self._connection.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value) -> None:
+            self._connection.row_factory = value
+
+        def execute(self, sql: str, parameters=()):
+            normalized = " ".join(sql.lower().split())
+            if (
+                "from local_operations" in normalized
+                and "order by operation_id" in normalized
+                and "limit ?" in normalized
+            ):
+                batch_limits.append(int(parameters[-1]))
+            return CursorProbe(self._connection.execute(sql, parameters), sql)
+
+        def executemany(self, sql: str, parameters):
+            return self._connection.executemany(sql, parameters)
+
+        def commit(self) -> None:
+            self._connection.commit()
+
+        def rollback(self) -> None:
+            self._connection.rollback()
+
+        def close(self) -> None:
+            self._connection.close()
+
+    def connect(*args, **kwargs):
+        return ConnectionProbe(original_connect(*args, **kwargs))
+
+    monkeypatch.setattr(provider_store_module.sqlite3, "connect", connect)
+    reopened = DesktopProviderStore(root)
+
+    assert len(batch_limits) >= 3
+    assert max(batch_limits) <= provider_store_module.STARTUP_OPERATION_BATCH_ROWS
+    assert reopened._connection.execute(
+        "SELECT count(*) FROM local_operations WHERE state = 'cancelled'"
+    ).fetchone()[0] == operation_count
+    reopened.close()
 
 
 def test_storage_budgets_reject_oversized_database_and_journal_before_open(
