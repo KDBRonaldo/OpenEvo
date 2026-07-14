@@ -45,7 +45,10 @@ The repository currently provides:
   extracted pair through the Core lock loader. Raw CArchive TOC multiplicity is
   verified before accepting PyInstaller's parsed inventory, and
   `--core-wheel-output-dir` exports the pair only to an empty path with no
-  symbolic-link component;
+  symbolic-link component. The builder pins that
+  directory by an open no-follow descriptor and inode for the complete build,
+  writes through the descriptor, and rolls back every file it created if either
+  member or the final path binding cannot be verified;
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;

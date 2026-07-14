@@ -134,6 +134,12 @@ the separate remote-profile/SSH/active-project gate validates their production
 forwarding composition. A source `TestClient` or local fake capability catalog
 does not satisfy either gate.
 
+The exact Core wheel/lock export keeps the initially empty output directory open
+for the whole sidecar build and verifies its pathname/inode binding before and
+after writes. Failure injection must show that a replaced path receives no
+files, a partial copy is removed, and failure of the second member removes the
+first so the release job can retry from an empty directory.
+
 ## Release Identity
 
 ```bash

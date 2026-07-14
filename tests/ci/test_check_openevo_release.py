@@ -9,6 +9,7 @@ from pathlib import Path
 import plistlib
 import signal
 import stat
+import subprocess
 from types import SimpleNamespace
 import time
 from zipfile import ZipFile
@@ -155,6 +156,16 @@ def _write_fake_native_with_independent_sidecar(
     )
     executable.chmod(0o755)
     return executable
+
+
+def _load_remote_capability_smoke_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_remote_capabilities.py"
+    spec = importlib.util.spec_from_file_location("smoke_openevo_remote_capabilities", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_desktop_wheel_smoke_exercises_config_backed_lifecycle(
@@ -1323,6 +1334,74 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert text.index("name: Smoke exact remote Core wheel") < text.index(
         "name: Smoke installed Core with source Desktop harness"
     )
+
+
+def test_remote_capability_smoke_stops_core_when_ensure_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_remote_capability_smoke_module()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    framework_lock = tmp_path / "framework-lock.json"
+    sidecar = tmp_path / "openevo-desktop-sidecar"
+    for path in (wheel, framework_lock, sidecar):
+        path.write_bytes(path.name.encode("ascii"))
+    imported = tmp_path / "installed/openevo/__init__.py"
+    imported.parent.mkdir(parents=True)
+    imported.write_text("", encoding="utf-8")
+    executable = tmp_path / "bin/python"
+    executable.parent.mkdir()
+    executable.write_text("", encoding="utf-8")
+    executable.with_name("openevo-core-service").write_text("", encoding="utf-8")
+    digest = "a" * 64
+
+    class LockedIdentity:
+        distribution_version = "0.1.0"
+        distribution_digest = digest
+        wheel_filename = wheel.name
+
+    class SidecarSmoke:
+        @staticmethod
+        def smoke_sidecar(path: Path, *, timeout_seconds: float) -> None:
+            assert path == sidecar
+            assert timeout_seconds == 1.0
+
+    calls: list[tuple[str, ...]] = []
+
+    def run_core_service(_executable, *arguments, **kwargs):
+        del kwargs
+        calls.append(arguments)
+        if arguments[0] == "ensure":
+            raise RuntimeError("injected ensure failure")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    import openevo.backend.runtime_identity as runtime_identity
+    import openevo.evolution.framework as framework
+
+    monkeypatch.setattr(smoke.openevo, "__file__", str(imported))
+    monkeypatch.setattr(smoke.metadata, "version", lambda _: "0.1.0")
+    monkeypatch.setattr(smoke, "_sha256", lambda _: digest)
+    monkeypatch.setattr(
+        framework,
+        "load_framework_distribution_lock",
+        lambda _: (LockedIdentity(), wheel.resolve()),
+    )
+    monkeypatch.setattr(smoke, "_load_sidecar_smoke", lambda: SidecarSmoke())
+    monkeypatch.setattr(runtime_identity, "default_core_service_root", lambda: tmp_path / "core")
+    monkeypatch.setattr(smoke.sys, "executable", str(executable))
+    monkeypatch.setattr(smoke, "_run_core_service", run_core_service)
+
+    with pytest.raises(RuntimeError, match="injected ensure failure"):
+        smoke.smoke(
+            wheel,
+            framework_lock,
+            sidecar,
+            source_commit="b" * 40,
+            timeout_seconds=1.0,
+        )
+
+    assert calls[0][0] == "ensure"
+    assert calls[-1][0] == "stop"
 
 
 def test_pre_external_beta_release_artifact_workflow_is_disabled() -> None:

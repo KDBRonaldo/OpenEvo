@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from email.parser import Parser
 import hashlib
 from io import BytesIO
@@ -13,6 +15,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -838,9 +841,6 @@ def _prepare_core_wheel_output_dir(output_dir: Path) -> None:
     if output_dir.exists() and not output_dir.is_dir():
         raise RuntimeError(f"Core wheel output is not a directory: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    existing = list(output_dir.iterdir())
-    if existing:
-        raise RuntimeError(f"Core wheel output directory must be empty: {output_dir}")
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -855,13 +855,202 @@ def _reject_symlink_path(path: Path) -> None:
             )
 
 
-def _copy_exclusive(source: Path, destination: Path) -> None:
+class _CoreReleaseOutput:
+    __slots__ = (
+        "path",
+        "resolved_path",
+        "directory_fd",
+        "device",
+        "inode",
+        "exported",
+    )
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        resolved_path: Path,
+        directory_fd: int,
+        device: int,
+        inode: int,
+    ) -> None:
+        self.path = path
+        self.resolved_path = resolved_path
+        self.directory_fd = directory_fd
+        self.device = device
+        self.inode = inode
+        self.exported: list[tuple[str, tuple[int, int]]] = []
+
+    def require_bound_path(self) -> None:
+        try:
+            _reject_symlink_path(self.path)
+            current_path = self.path.resolve(strict=True)
+            current = os.stat(self.path, follow_symlinks=False)
+            pinned = os.fstat(self.directory_fd)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(
+                "Core wheel output path changed during the sidecar build"
+            ) from exc
+        expected_identity = (self.device, self.inode)
+        if (
+            current_path != self.resolved_path
+            or (current.st_dev, current.st_ino) != expected_identity
+            or (pinned.st_dev, pinned.st_ino) != expected_identity
+            or not stat.S_ISDIR(current.st_mode)
+            or not stat.S_ISDIR(pinned.st_mode)
+        ):
+            raise RuntimeError("Core wheel output path changed during the sidecar build")
+
+
+@contextmanager
+def _open_core_release_output(output_dir: Path) -> Iterator[_CoreReleaseOutput]:
+    _reject_symlink_path(output_dir)
+    _prepare_core_wheel_output_dir(output_dir)
+    _reject_symlink_path(output_dir)
+    resolved_path = output_dir.resolve(strict=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("Core wheel output requires no-follow file support")
+    flags |= os.O_NOFOLLOW
     try:
-        with source.open("rb") as source_file, destination.open("xb") as destination_file:
+        directory_fd = os.open(output_dir, flags)
+    except OSError as exc:
+        raise RuntimeError(f"Core wheel output cannot be opened safely: {output_dir}") from exc
+    try:
+        descriptor = os.fstat(directory_fd)
+        if not stat.S_ISDIR(descriptor.st_mode):
+            raise RuntimeError(f"Core wheel output is not a directory: {output_dir}")
+        authority = _CoreReleaseOutput(
+            path=output_dir,
+            resolved_path=resolved_path,
+            directory_fd=directory_fd,
+            device=descriptor.st_dev,
+            inode=descriptor.st_ino,
+        )
+        authority.require_bound_path()
+        if os.listdir(directory_fd):
+            raise RuntimeError(f"Core wheel output directory must be empty: {output_dir}")
+        try:
+            yield authority
+            authority.require_bound_path()
+        except BaseException as exc:
+            try:
+                _rollback_core_release_inputs(authority)
+            except BaseException:
+                raise RuntimeError(
+                    "Core release export rollback could not be verified"
+                ) from exc
+            raise
+    finally:
+        os.close(directory_fd)
+
+
+def _unlink_exported_member(
+    authority: _CoreReleaseOutput,
+    name: str,
+    identity: tuple[int, int],
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=authority.directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) != identity or not stat.S_ISREG(current.st_mode):
+        raise RuntimeError(f"Core release export changed before cleanup: {name}")
+    os.unlink(name, dir_fd=authority.directory_fd)
+
+
+def _rollback_core_release_inputs(authority: _CoreReleaseOutput) -> None:
+    cleanup_error: BaseException | None = None
+    for name, identity in reversed(authority.exported):
+        try:
+            _unlink_exported_member(authority, name, identity)
+        except BaseException as error:
+            cleanup_error = cleanup_error or error
+    try:
+        os.fsync(authority.directory_fd)
+    except OSError as error:
+        cleanup_error = cleanup_error or error
+    if cleanup_error is not None:
+        raise cleanup_error
+    authority.exported.clear()
+
+
+def _copy_exclusive(
+    source: Path,
+    authority: _CoreReleaseOutput,
+    name: str,
+) -> tuple[int, int]:
+    if Path(name).name != name or name in {"", ".", ".."}:
+        raise RuntimeError("Core release export filename is invalid")
+    authority.require_bound_path()
+    source_fd = -1
+    destination_fd = -1
+    destination_identity: tuple[int, int] | None = None
+    try:
+        source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_nlink != 1:
+            raise RuntimeError(f"Core release input is not a private regular file: {source}")
+        destination_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=authority.directory_fd,
+        )
+        created = os.fstat(destination_fd)
+        destination_identity = (created.st_dev, created.st_ino)
+        with os.fdopen(source_fd, "rb", closefd=False) as source_file, os.fdopen(
+            destination_fd, "wb", closefd=False
+        ) as destination_file:
             shutil.copyfileobj(source_file, destination_file)
+            destination_file.flush()
+            os.fsync(destination_fd)
+        os.fchmod(destination_fd, 0o644)
+        os.fsync(destination_fd)
+        authority.require_bound_path()
+        return destination_identity
     except FileExistsError as exc:
-        raise RuntimeError(f"refusing to replace existing Core wheel: {destination}") from exc
-    shutil.copystat(source, destination)
+        raise RuntimeError(f"refusing to replace existing Core release input: {name}") from exc
+    except BaseException:
+        if destination_identity is not None:
+            _unlink_exported_member(authority, name, destination_identity)
+        raise
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+
+
+def _export_core_release_inputs(
+    authority: _CoreReleaseOutput,
+    wheel: Path,
+    framework_lock: Path,
+) -> None:
+    if authority.exported:
+        raise RuntimeError("Core release inputs were already exported")
+    try:
+        authority.exported.append(
+            (wheel.name, _copy_exclusive(wheel, authority, wheel.name))
+        )
+        authority.exported.append(
+            (
+                CORE_FRAMEWORK_LOCK_BASENAME,
+                _copy_exclusive(
+                    framework_lock,
+                    authority,
+                    CORE_FRAMEWORK_LOCK_BASENAME,
+                ),
+            )
+        )
+        authority.require_bound_path()
+        os.fsync(authority.directory_fd)
+    except BaseException as exc:
+        try:
+            _rollback_core_release_inputs(authority)
+        except BaseException:
+            raise RuntimeError("Core release export rollback could not be verified") from exc
+        raise
 
 
 def _locked_pyinstaller_sdist(repo: Path) -> tuple[str, str, str, int]:
@@ -1262,10 +1451,7 @@ def build_sidecar(
             for path in (dist_dir, build_dir, binary_dir)
         ):
             raise RuntimeError("Core wheel output directory overlaps generated paths")
-        _prepare_core_wheel_output_dir(requested_output)
-        if requested_output.resolve(strict=True) != resolved_output:
-            raise RuntimeError("Core wheel output path changed during validation")
-        core_wheel_output_dir = resolved_output
+        core_wheel_output_dir = requested_output
     if clean:
         shutil.rmtree(dist_dir, ignore_errors=True)
         shutil.rmtree(build_dir, ignore_errors=True)
@@ -1273,7 +1459,15 @@ def build_sidecar(
     target = binary_dir / f"{SIDECAR_NAME}-{_target_triple()}{_platform_extension()}"
     target.unlink(missing_ok=True)
 
-    with TemporaryDirectory(prefix="openevo-sidecar-build-") as temporary_dir:
+    output_context = (
+        _open_core_release_output(core_wheel_output_dir)
+        if core_wheel_output_dir is not None
+        else nullcontext(None)
+    )
+    with (
+        TemporaryDirectory(prefix="openevo-sidecar-build-") as temporary_dir,
+        output_context as core_release_output,
+    ):
         temporary_root = Path(temporary_dir)
         core_wheel = _build_core_wheel(repo, temporary_root / "core")
         _, core_version = _project_identity(repo)
@@ -1366,11 +1560,11 @@ def build_sidecar(
         )
         _validate_embedded_product_web(built, desktop_root, product_web_digest)
 
-        if core_wheel_output_dir is not None:
-            _copy_exclusive(core_wheel, core_wheel_output_dir / core_wheel.name)
-            _copy_exclusive(
+        if core_release_output is not None:
+            _export_core_release_inputs(
+                core_release_output,
+                core_wheel,
                 core_framework_lock,
-                core_wheel_output_dir / CORE_FRAMEWORK_LOCK_BASENAME,
             )
 
         shutil.copy2(built, target)

@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 from types import ModuleType
 from zipfile import ZipFile
@@ -610,6 +611,122 @@ def test_build_sidecar_rejects_symlink_wheel_output_directory(
     assert list(real_output.iterdir()) == []
 
 
+def test_core_release_export_stays_bound_to_original_output_directory(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    lock = tmp_path / "framework-lock.json"
+    wheel.write_bytes(b"wheel")
+    lock.write_bytes(b"lock")
+
+    original = tmp_path / "original-output"
+    with pytest.raises(RuntimeError, match="changed during the sidecar build"):
+        with builder._open_core_release_output(output) as authority:
+            output.rename(original)
+            output.symlink_to(redirected, target_is_directory=True)
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert list(original.iterdir()) == []
+    assert list(redirected.iterdir()) == []
+
+
+def test_core_release_export_removes_partial_file_after_copy_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    lock = tmp_path / "framework-lock.json"
+    wheel.write_bytes(b"wheel")
+    lock.write_bytes(b"lock")
+
+    def fail_after_partial_copy(source, destination) -> None:
+        del source
+        destination.write(b"partial")
+        destination.flush()
+        raise OSError("injected copy failure")
+
+    monkeypatch.setattr(builder.shutil, "copyfileobj", fail_after_partial_copy)
+
+    with builder._open_core_release_output(output) as authority:
+        with pytest.raises(OSError, match="injected copy failure"):
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert list(output.iterdir()) == []
+
+
+def test_core_release_export_rolls_back_wheel_when_lock_copy_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    lock = tmp_path / "framework-lock.json"
+    wheel.write_bytes(b"wheel")
+    lock.write_bytes(b"lock")
+    original_copy = builder._copy_exclusive
+
+    def fail_lock(source, authority, name):
+        if name == builder.CORE_FRAMEWORK_LOCK_BASENAME:
+            raise OSError("injected lock copy failure")
+        return original_copy(source, authority, name)
+
+    monkeypatch.setattr(builder, "_copy_exclusive", fail_lock)
+
+    with builder._open_core_release_output(output) as authority:
+        with pytest.raises(OSError, match="injected lock copy failure"):
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert list(output.iterdir()) == []
+
+
+def test_core_release_output_rolls_back_pair_when_later_build_step_fails(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    lock = tmp_path / "framework-lock.json"
+    wheel.write_bytes(b"wheel")
+    lock.write_bytes(b"lock")
+
+    with pytest.raises(OSError, match="injected later build failure"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+            raise OSError("injected later build failure")
+
+    assert list(output.iterdir()) == []
+
+
+def test_core_release_output_rolls_back_pair_when_path_changes_after_export(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    lock = tmp_path / "framework-lock.json"
+    wheel.write_bytes(b"wheel")
+    lock.write_bytes(b"lock")
+    original = tmp_path / "original-output"
+
+    with pytest.raises(RuntimeError, match="changed during the sidecar build"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+            output.rename(original)
+            output.symlink_to(redirected, target_is_directory=True)
+
+    assert list(original.iterdir()) == []
+    assert list(redirected.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     "relative_output",
     [
@@ -915,3 +1032,54 @@ def test_sidecar_archive_rejects_duplicate_core_release_input(
             framework_lock,
             version="0.1.0",
         )
+
+
+def test_raw_carchive_parser_rejects_duplicate_toc_members(tmp_path: Path) -> None:
+    builder = _load_builder()
+    name = "openevo/wheels/framework-lock.json"
+    toc_entry_format = "!IIIIBc"
+    toc_entry_length = struct.calcsize(toc_entry_format)
+
+    def entry() -> bytes:
+        encoded = name.encode("utf-8") + b"\0"
+        return struct.pack(
+            toc_entry_format,
+            toc_entry_length + len(encoded),
+            0,
+            0,
+            0,
+            0,
+            b"x",
+        ) + encoded
+
+    toc = entry() + entry()
+    cookie_format = "!8sIIII64s"
+    cookie_magic = b"MEI\x0c\x0b\n\x0b\x0e"
+    cookie_length = struct.calcsize(cookie_format)
+    cookie = struct.pack(
+        cookie_format,
+        cookie_magic,
+        len(toc) + cookie_length,
+        0,
+        len(toc),
+        311,
+        b"python".ljust(64, b"\0"),
+    )
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(toc + cookie)
+
+    class FakeArchive:
+        _COOKIE_LENGTH = cookie_length
+        _COOKIE_FORMAT = cookie_format
+        _TOC_ENTRY_LENGTH = toc_entry_length
+        _TOC_ENTRY_FORMAT = toc_entry_format
+        _COOKIE_MAGIC_PATTERN = cookie_magic
+        toc = {name: object()}
+
+        @staticmethod
+        def _find_magic_pattern(stream, pattern) -> int:
+            del stream, pattern
+            return len(toc)
+
+    with pytest.raises(RuntimeError, match="duplicate members"):
+        builder._raw_carchive_member_names(FakeArchive(), executable)
