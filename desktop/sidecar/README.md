@@ -261,14 +261,24 @@ to submit work. Starting and terminal publication update the operation and its
 idempotency replay atomically. While a project reservation is queued, running,
 or cancelling, project patch/delete and a second project action fail closed so
 the immutable project snapshot consumed by Core cannot change underneath the
-worker. Activation success atomically records the active project, the Core
+worker. Because activation also demotes the previous active project and changes
+its ETag, its reservation covers the target project and that implicit
+cross-project write. A queued, running, or cancelling operation on the current
+active project excludes another project's activation; once the activation is
+reserved, it symmetrically excludes new work on the active project and any
+competing activation. The store checks the same exclusion again in the atomic
+activation completion transaction, excluding only that activation's own
+reservation, so an authority conflict cannot be hidden by an earlier start-time
+ETag check. Activation success atomically records the active project, the Core
 revision identity, and the matching project result; other project operations do
 not invent a project result. A typed failure keeps the project draft and is
 replayable without repeating remote work. Startup cancels every nonterminal
 reservation exactly once and updates the replay in the same recovery
-transaction. The release provider/controller is responsible for putting these
-reservations on its bounded executor and for translating Core outcomes; it must
-not perform external SSH/Core work while a SQLite transaction is open.
+transaction, releasing all direct and implicit activation exclusions before
+new work is accepted. The release provider/controller is responsible for
+putting these reservations on its bounded executor and for translating Core
+outcomes; it must not perform external SSH/Core work while a SQLite transaction
+is open.
 
 The production credential resolver currently supports `ssh_agent`. Profiles
 that select native private-key or password authentication fail closed with

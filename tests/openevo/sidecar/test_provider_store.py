@@ -1518,6 +1518,304 @@ def test_project_runtime_action_is_durable_idempotent_and_completes_atomically(
     assert store.begin_project_runtime_action(**action).operation == finished
 
 
+@pytest.mark.parametrize(
+    ("operation_kind", "route_suffix"),
+    [
+        ("project_doctor", "doctor"),
+        ("project_repair", "repair"),
+        ("bootstrap", "bootstrap"),
+        ("workspace_sync", "workspace-sync"),
+    ],
+)
+@pytest.mark.parametrize("start_operation", [False, True], ids=["queued", "running"])
+def test_cross_project_activation_rejects_busy_active_project(
+    tmp_path: Path,
+    operation_kind: str,
+    route_suffix: str,
+    start_operation: bool,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-busy-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-busy-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    first_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/{route_suffix}",
+        "operation_kind": operation_kind,
+        "project_id": first.project_id,
+        "key": f"activation-busy-{operation_kind}-{start_operation}",
+        "body": {},
+        "if_match": first.etag,
+    }
+    first_reservation = store.begin_project_runtime_action(**first_action)
+    if start_operation:
+        store.start_project_runtime_action(reservation=first_reservation, **first_action)
+    second_action = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": f"activation-busy-second-{operation_kind}-{start_operation}",
+        "body": {},
+        "if_match": second.etag,
+    }
+
+    with pytest.raises(ResourceInUseError) as raised:
+        store.begin_project_runtime_action(**second_action)
+
+    assert raised.value.resource_id == first.project_id
+    assert store.get_project(first.project_id) == first
+    assert store.get_project(second.project_id) == second
+
+
+@pytest.mark.parametrize(
+    ("operation_kind", "route_suffix"),
+    [
+        ("project_doctor", "doctor"),
+        ("project_repair", "repair"),
+        ("bootstrap", "bootstrap"),
+        ("workspace_sync", "workspace-sync"),
+    ],
+)
+def test_activation_reservation_excludes_new_work_on_active_project(
+    tmp_path: Path,
+    operation_kind: str,
+    route_suffix: str,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-reverse-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-reverse-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    activation = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": f"activation-reverse-{operation_kind}",
+        "body": {},
+        "if_match": second.etag,
+    }
+    reservation = store.begin_project_runtime_action(**activation)
+    active_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/{route_suffix}",
+        "operation_kind": operation_kind,
+        "project_id": first.project_id,
+        "key": f"activation-reverse-active-{operation_kind}",
+        "body": {},
+        "if_match": first.etag,
+    }
+
+    with pytest.raises(ResourceInUseError) as raised:
+        store.begin_project_runtime_action(**active_action)
+
+    assert raised.value.resource_id == first.project_id
+    store.start_project_runtime_action(reservation=reservation, **activation)
+    store.complete_project_runtime_action(
+        reservation=reservation,
+        current_revision_id="second-revision",
+        **activation,
+    )
+    assert store.get_project(first.project_id).state == "draft"
+    assert store.get_project(second.project_id).state == "active"
+
+
+def test_activation_completion_rechecks_late_cross_project_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-late-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-late-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    activation = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": "activation-late-second-action",
+        "body": {},
+        "if_match": second.etag,
+    }
+    reservation = store.begin_project_runtime_action(**activation)
+    store.start_project_runtime_action(reservation=reservation, **activation)
+    active_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/doctor",
+        "operation_kind": "project_doctor",
+        "project_id": first.project_id,
+        "key": "activation-late-first-doctor",
+        "body": {},
+        "if_match": first.etag,
+    }
+    with monkeypatch.context() as bypass:
+        bypass.setattr(
+            DesktopProviderStore,
+            "_require_project_operation_reservation_available",
+            classmethod(lambda _cls, *_args, **_kwargs: None),
+        )
+        store.begin_project_runtime_action(**active_action)
+
+    with pytest.raises(ResourceInUseError) as raised:
+        store.complete_project_runtime_action(
+            reservation=reservation,
+            current_revision_id="second-revision",
+            **activation,
+        )
+
+    assert raised.value.resource_id == first.project_id
+    assert store.get_local_operation(reservation.operation.operation_id).state == "running"
+    assert store.get_project(first.project_id) == first
+    assert store.get_project(second.project_id) == second
+
+
+def test_project_activation_and_active_work_reservations_are_serialized(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-race-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-race-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    actions = (
+        {
+            "route": f"/desktop/v1/projects/{first.project_id}/workspace-sync",
+            "operation_kind": "workspace_sync",
+            "project_id": first.project_id,
+            "key": "activation-race-first-sync",
+            "body": {},
+            "if_match": first.etag,
+        },
+        {
+            "route": f"/desktop/v1/projects/{second.project_id}/activate",
+            "operation_kind": "project_activate",
+            "project_id": second.project_id,
+            "key": "activation-race-second-activate",
+            "body": {},
+            "if_match": second.etag,
+        },
+    )
+    barrier = threading.Barrier(2)
+
+    def reserve(action: dict[str, object]) -> str:
+        barrier.wait(timeout=5)
+        try:
+            store.begin_project_runtime_action(**action)
+        except ResourceInUseError:
+            return "busy"
+        return "reserved"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(reserve, actions))
+
+    assert sorted(outcomes) == ["busy", "reserved"]
+    assert (
+        store._connection.execute(
+            "SELECT count(*) FROM local_operations "
+            "WHERE state IN ('queued', 'running', 'cancelling')"
+        ).fetchone()[0]
+        == 1
+    )
+    assert store.get_project(first.project_id) == first
+    assert store.get_project(second.project_id) == second
+
+
+def test_restart_cancels_activation_exclusion_before_accepting_active_project_work(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-restart-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-restart-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    activation = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": "activation-restart-second-action",
+        "body": {},
+        "if_match": second.etag,
+    }
+    reservation = store.begin_project_runtime_action(**activation)
+    store.close()
+
+    reopened = DesktopProviderStore(root)
+    replay = reopened.begin_project_runtime_action(**activation)
+    recovered_first = reopened.get_project(first.project_id)
+    assert replay.operation.operation_id == reservation.operation.operation_id
+    assert replay.operation.state == "cancelled"
+    assert recovered_first.state == "draft"
+    assert recovered_first.etag != first.etag
+
+    doctor = reopened.begin_project_runtime_action(
+        route=f"/desktop/v1/projects/{first.project_id}/doctor",
+        operation_kind="project_doctor",
+        project_id=first.project_id,
+        key="activation-restart-first-doctor",
+        body={},
+        if_match=recovered_first.etag,
+    )
+    assert doctor.operation.state == "queued"
+
+
 def test_expired_live_project_action_survives_cleanup_and_can_finish(
     tmp_path: Path,
 ) -> None:
@@ -1996,7 +2294,7 @@ def test_project_runtime_action_failure_is_replayable_and_keeps_project_draft(
     assert store.begin_project_runtime_action(**action).operation == failed
 
 
-def test_project_runtime_failure_rebinds_result_after_another_activation(
+def test_project_runtime_reservation_prevents_superseding_activation(
     tmp_path: Path,
 ) -> None:
     store = DesktopProviderStore(tmp_path / "state")
@@ -2027,18 +2325,18 @@ def test_project_runtime_failure_rebinds_result_after_another_activation(
     reservation = store.begin_project_runtime_action(**action)
     store.start_project_runtime_action(reservation=reservation, **action)
     with store._transaction(write=True) as connection:
-        ProviderMutation(store, connection).set_project_state(
-            second.project_id,
-            if_match=second.etag,
-            state="active",
-            current_revision_id="second-revision",
-        )
-    current_first = store.get_project(first.project_id)
+        with pytest.raises(ResourceInUseError):
+            ProviderMutation(store, connection).set_project_state(
+                second.project_id,
+                if_match=second.etag,
+                state="active",
+                current_revision_id="second-revision",
+            )
     error = ApiErrorV1(
         request_id=reservation.operation.operation_id,
-        code="activation_superseded",
+        code="activation_failed",
         http_status=409,
-        message="A newer activation superseded this project.",
+        message="Project activation failed.",
         severity=ErrorSeverity.BLOCKING,
         category=ErrorCategory.PROJECT,
         retryable=True,
@@ -2055,9 +2353,11 @@ def test_project_runtime_failure_rebinds_result_after_another_activation(
     assert failed.state == "failed"
     assert failed.result == ProjectOperationResultV1(
         project_id=first.project_id,
-        project_etag=current_first.etag,
-        active=False,
+        project_etag=first.etag,
+        active=True,
     )
+    assert store.get_project(first.project_id) == first
+    assert store.get_project(second.project_id) == second
 
 
 def test_project_runtime_action_restart_cancels_once_and_updates_replay(

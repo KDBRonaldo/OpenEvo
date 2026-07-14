@@ -611,6 +611,7 @@ class ProviderMutation:
         if_match: str,
         state: Literal["draft", "active", "archived", "blocked"],
         current_revision_id: str | None = None,
+        _reservation_operation_id: str | None = None,
     ) -> ProjectV1:
         self._store._validate_resource_id(project_id)
         self._store._validate_if_match(if_match)
@@ -622,6 +623,12 @@ class ProviderMutation:
         row = self._store._require_project_row(self._connection, project_id)
         self._store._require_etag("project", project_id, row, if_match)
         if state == "active":
+            self._store._require_project_operation_reservation_available(
+                self._connection,
+                project_id,
+                operation_kind="project_activate",
+                excluded_operation_id=_reservation_operation_id,
+            )
             self._connection.execute(
                 """
                 UPDATE projects
@@ -796,6 +803,12 @@ class ProviderMutation:
         self._store._validate_operation_authority(self._connection, operation)
         document = _canonical_json_bytes(operation.model_dump(mode="json"))
         if not terminal:
+            if operation_kind in _PROJECT_OPERATION_KINDS:
+                self._store._require_project_operation_reservation_available(
+                    self._connection,
+                    resource.resource_id,
+                    operation_kind=operation_kind,
+                )
             self._store._validate_nonterminal_operation_terminal_capacity(
                 self._connection,
                 operation,
@@ -2585,6 +2598,7 @@ class DesktopProviderStore:
                     if_match=current.etag,
                     state="active",
                     current_revision_id=current_revision_id,
+                    _reservation_operation_id=operation.operation_id,
                 )
                 result = ProjectOperationResultV1(
                     project_id=project_id,
@@ -3383,6 +3397,8 @@ class DesktopProviderStore:
     def _require_project_not_busy(
         connection: sqlite3.Connection,
         project_id: str,
+        *,
+        excluded_operation_id: str | None = None,
     ) -> None:
         row = connection.execute(
             """
@@ -3390,13 +3406,97 @@ class DesktopProviderStore:
             FROM local_operations
             WHERE resource_type = 'project' AND resource_id = ?
               AND state IN ('queued', 'running', 'cancelling')
+              AND operation_id != ?
             ORDER BY operation_id
             LIMIT 1
             """,
-            (project_id,),
+            (project_id, excluded_operation_id or ""),
         ).fetchone()
         if row is not None:
             raise ResourceInUseError("project", project_id)
+
+    @classmethod
+    def _require_project_operation_reservation_available(
+        cls,
+        connection: sqlite3.Connection,
+        project_id: str,
+        *,
+        operation_kind: str,
+        excluded_operation_id: str | None = None,
+    ) -> None:
+        """Reserve every project row a nonterminal operation can mutate."""
+
+        if operation_kind not in _PROJECT_OPERATION_KINDS:
+            raise ContractValidationError("project runtime operation kind is invalid")
+        if excluded_operation_id is not None:
+            excluded = cls._require_operation_row(connection, excluded_operation_id)
+            if (
+                excluded["operation_kind"] != operation_kind
+                or excluded["resource_type"] != "project"
+                or excluded["resource_id"] != project_id
+                or excluded["state"] not in {"queued", "running", "cancelling"}
+            ):
+                raise ContractValidationError(
+                    "project reservation exclusion differs from its operation authority"
+                )
+        cls._require_project_not_busy(
+            connection,
+            project_id,
+            excluded_operation_id=excluded_operation_id,
+        )
+        project = cls._require_project_row(connection, project_id)
+        if operation_kind == "project_activate":
+            competing_activation = connection.execute(
+                """
+                SELECT resource_id
+                FROM local_operations
+                WHERE operation_kind = 'project_activate'
+                  AND resource_type = 'project'
+                  AND state IN ('queued', 'running', 'cancelling')
+                  AND operation_id != ?
+                ORDER BY operation_id
+                LIMIT 1
+                """,
+                (excluded_operation_id or "",),
+            ).fetchone()
+            if competing_activation is not None:
+                raise ResourceInUseError("project", cast(str, competing_activation["resource_id"]))
+
+            active = connection.execute(
+                """
+                SELECT project_id
+                FROM projects
+                WHERE state = 'active' AND project_id != ?
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            if active is not None:
+                active_project_id = cast(str, active["project_id"])
+                cls._require_project_not_busy(
+                    connection,
+                    active_project_id,
+                    excluded_operation_id=excluded_operation_id,
+                )
+            return
+
+        if project["state"] == "active":
+            displacing_activation = connection.execute(
+                """
+                SELECT operation_id
+                FROM local_operations
+                WHERE operation_kind = 'project_activate'
+                  AND resource_type = 'project'
+                  AND resource_id != ?
+                  AND state IN ('queued', 'running', 'cancelling')
+                  AND operation_id != ?
+                ORDER BY operation_id
+                LIMIT 1
+                """,
+                (project_id, excluded_operation_id or ""),
+            ).fetchone()
+            if displacing_activation is not None:
+                raise ResourceInUseError("project", project_id)
 
     @staticmethod
     def _require_operation_row(connection: sqlite3.Connection, operation_id: str) -> sqlite3.Row:
