@@ -89,12 +89,17 @@ path.
 Docker gives every create attempt a node-scoped Core-private authority root that
 is outside both the agent session bind and its nested evaluator bind. Each
 runtime has a unique `0600` lock/cidfile pair; the lock is created exclusively
-and held with a process-exclusive lock. Normal return, cancellation, timeout,
-and command exceptions all reconcile the private cidfile after the Docker CLI
-has stopped. An explicit create failure with no cidfile establishes no
-ownership, so stop and cancel perform no operation against the diagnostic
-container name. If a full 64-character container ID was written, Core retains
-it as a candidate and requires
+and held with a process-exclusive lock. Docker may initially create the cidfile
+with a non-executable `0666 & ~umask` mode. Core opens that inode no-follow
+relative to the held authority root, verifies its owner, link count, type, and
+identity, tightens it through the open descriptor to `0600`, and revalidates
+the descriptor and directory entry before reading any bytes. Unexpected mode
+bits, a replacement, or a final mode other than exact `0600` fail closed.
+Normal return, cancellation, timeout, and command exceptions all reconcile the
+private cidfile after the Docker CLI has stopped. An explicit create failure
+with no cidfile establishes no ownership, so stop and cancel perform no
+operation against the diagnostic container name. If a full 64-character
+container ID was written, Core retains it as a candidate and requires
 `docker container inspect --format {{.Id}} <id>` to agree before any operation.
 Unreadable or unverified creates retain their ownership files without using
 stdout, a name, or a partial ID as fallback.

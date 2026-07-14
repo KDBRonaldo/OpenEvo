@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -30,9 +31,173 @@ def _isolate_default_ownership_root(
     )
 
 
-def _write_mock_cidfile(args: tuple[str, ...], container_id: str) -> None:
+def _write_mock_cidfile(
+    args: tuple[str, ...],
+    container_id: str,
+    *,
+    mode: int = 0o644,
+) -> None:
     cidfile = Path(args[args.index("--cidfile") + 1])
     cidfile.write_text(container_id + "\n", encoding="ascii")
+    cidfile.chmod(mode)
+
+
+@pytest.mark.asyncio
+async def test_create_normalizes_umask_cidfile_to_private_mode_before_inspect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "cidfile-mode-session",
+        tmp_path,
+    )
+    container_id = "0" * 64
+    container_present = True
+    mode_seen_by_inspect: int | None = None
+
+    async def run_command_impl(*args, **kwargs):
+        nonlocal container_present, mode_seen_by_inspect
+        del kwargs
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id, mode=0o644)
+            assert stat.S_IMODE(runtime._cidfile.stat().st_mode) == 0o644
+            return 0, container_id + "\n", None
+        if args[1:3] == ("container", "inspect"):
+            mode_seen_by_inspect = stat.S_IMODE(runtime._cidfile.stat().st_mode)
+            if container_present:
+                return 0, container_id + "\n", None
+            return 1, None, f"Error: No such object: {container_id}"
+        if args[1] == "rm":
+            container_present = False
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    await runtime.start()
+
+    assert mode_seen_by_inspect == 0o600
+    assert stat.S_IMODE(runtime._cidfile.stat().st_mode) == 0o600
+    assert stat.S_IMODE(runtime._ownership_lock.stat().st_mode) == 0o600
+
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_executable_cidfile_mode_without_docker_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "hostile-cidfile-mode-session",
+        tmp_path,
+    )
+    container_id = "1" * 64
+
+    async def run_command_impl(*args, **kwargs):
+        del kwargs
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id, mode=0o755)
+            return 0, container_id + "\n", None
+        raise AssertionError(f"untrusted cidfile must not authorize Docker: {args}")
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    with pytest.raises(RuntimeError, match="ownership could not be verified"):
+        await runtime.start()
+
+    assert runtime.container_id is None
+    assert stat.S_IMODE(runtime._cidfile.stat().st_mode) == 0o755
+    assert [call.args[1] for call in run_command.await_args_list] == ["create"]
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_cidfile_replacement_during_fd_mode_tightening(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "replaced-cidfile-mode-session",
+        tmp_path,
+    )
+    container_id = "2" * 64
+    replacement_id = "3" * 64
+    real_fchmod = os.fchmod
+    replaced = False
+
+    def replace_cidfile_after_fchmod(descriptor: int, mode: int) -> None:
+        nonlocal replaced
+        real_fchmod(descriptor, mode)
+        if os.fstat(descriptor).st_size and not replaced:
+            replaced = True
+            runtime._cidfile.unlink()
+            runtime._cidfile.write_text(replacement_id + "\n", encoding="ascii")
+            runtime._cidfile.chmod(0o600)
+
+    async def run_command_impl(*args, **kwargs):
+        del kwargs
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id, mode=0o644)
+            return 0, container_id + "\n", None
+        raise AssertionError(f"replaced cidfile must not authorize Docker: {args}")
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+    monkeypatch.setattr(os, "fchmod", replace_cidfile_after_fchmod)
+
+    with pytest.raises(RuntimeError, match="ownership could not be verified"):
+        await runtime.start()
+
+    assert replaced is True
+    assert runtime.container_id is None
+    assert runtime._cidfile.read_text(encoding="ascii") == replacement_id + "\n"
+    assert [call.args[1] for call in run_command.await_args_list] == ["create"]
+
+
+@pytest.mark.asyncio
+async def test_failed_create_retains_authority_if_opened_cidfile_is_unlinked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "unlinked-cidfile-mode-session",
+        tmp_path,
+    )
+    container_id = "4" * 64
+    real_fchmod = os.fchmod
+    unlinked = False
+
+    def unlink_cidfile_after_fchmod(descriptor: int, mode: int) -> None:
+        nonlocal unlinked
+        real_fchmod(descriptor, mode)
+        if os.fstat(descriptor).st_size and not unlinked:
+            unlinked = True
+            runtime._cidfile.unlink()
+
+    async def run_command_impl(*args, **kwargs):
+        del kwargs
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id, mode=0o644)
+            return 1, None, "create interrupted after writing cidfile"
+        raise AssertionError(f"unlinked cidfile must not authorize Docker: {args}")
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+    monkeypatch.setattr(os, "fchmod", unlink_cidfile_after_fchmod)
+
+    with pytest.raises(RuntimeError, match="ownership could not be verified"):
+        await runtime.start()
+
+    assert unlinked is True
+    assert runtime.container_id is None
+    assert runtime._destroyed is False
+    assert runtime._ownership_lock.exists()
+    assert [call.args[1] for call in run_command.await_args_list] == ["create"]
 
 
 @pytest.mark.asyncio
@@ -911,9 +1076,14 @@ async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
         return result
 
     monkeypatch.setattr(runtime, "_run_local_command", delayed_create_return)
+    previous_umask = os.umask(0o022)
+    umask_restored = False
     start_task = asyncio.create_task(runtime.start())
     try:
         await asyncio.wait_for(cidfile_written.wait(), timeout=30)
+        assert stat.S_IMODE(runtime._cidfile.stat().st_mode) == 0o644
+        os.umask(previous_umask)
+        umask_restored = True
         start_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await start_task
@@ -921,6 +1091,7 @@ async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
         container_id = runtime.container_id
         assert container_id is not None
         assert len(container_id) == 64
+        assert stat.S_IMODE(runtime._cidfile.stat().st_mode) == 0o600
         await runtime.stop()
 
         inspected = subprocess.run(
@@ -931,6 +1102,8 @@ async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
         )
         assert inspected.returncode != 0
     finally:
+        if not umask_restored:
+            os.umask(previous_umask)
         if not start_task.done():
             start_task.cancel()
             await asyncio.gather(start_task, return_exceptions=True)

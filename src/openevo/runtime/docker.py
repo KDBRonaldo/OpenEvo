@@ -20,6 +20,7 @@ from openevo.runtime.models import ExecResult, RuntimeSpec
 logger = logging.getLogger(__name__)
 
 _CIDFILE_MAX_BYTES: Final[int] = 128
+_CIDFILE_CREATE_PERMISSIONS: Final[int] = 0o666
 _DIRECTORY_FLAGS: Final[int] = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 _DEFAULT_OWNERSHIP_ROOT: Path = Path("/tmp") / f".openevo-core-docker-ownership-{os.geteuid()}"
 _CONTAINER_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
@@ -481,6 +482,7 @@ class DockerRuntime(BaseRuntime):
     def _read_created_container_id(self) -> str:
         directory_fd = _open_private_ownership_directory(self._ownership_dir)
         descriptor = -1
+        cidfile_observed = False
         try:
             if (
                 self._ownership_root_identity is None
@@ -493,12 +495,14 @@ class DockerRuntime(BaseRuntime):
                 dir_fd=directory_fd,
                 follow_symlinks=False,
             )
+            cidfile_observed = True
             descriptor = os.open(
                 self._cidfile.name,
                 os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
                 dir_fd=directory_fd,
             )
             opened = os.fstat(descriptor)
+            opened_mode = stat.S_IMODE(opened.st_mode)
             if (
                 not stat.S_ISREG(opened.st_mode)
                 or opened.st_uid != os.geteuid()
@@ -506,10 +510,29 @@ class DockerRuntime(BaseRuntime):
                 or opened.st_size <= 0
                 or opened.st_size > _CIDFILE_MAX_BYTES
                 or _object_identity(before) != _object_identity(opened)
+                or opened_mode & ~_CIDFILE_CREATE_PERMISSIONS
             ):
                 raise RuntimeError("docker ownership cidfile is invalid")
+            if opened_mode != 0o600:
+                os.fchmod(descriptor, 0o600)
+            trusted = os.fstat(descriptor)
+            named_trusted = os.stat(
+                self._cidfile.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(trusted.st_mode)
+                or trusted.st_uid != os.geteuid()
+                or trusted.st_nlink != 1
+                or stat.S_IMODE(trusted.st_mode) != 0o600
+                or trusted.st_size != opened.st_size
+                or _object_identity(opened) != _object_identity(trusted)
+                or _full_file_identity(trusted) != _full_file_identity(named_trusted)
+            ):
+                raise RuntimeError("docker ownership cidfile mode or identity is invalid")
             chunks: list[bytes] = []
-            remaining = opened.st_size
+            remaining = trusted.st_size
             while remaining:
                 chunk = os.read(descriptor, remaining)
                 if not chunk:
@@ -526,8 +549,8 @@ class DockerRuntime(BaseRuntime):
             if (
                 remaining
                 or os.read(descriptor, 1)
-                or _full_file_identity(opened) != _full_file_identity(after)
-                or _full_file_identity(opened) != _full_file_identity(named_after)
+                or _full_file_identity(trusted) != _full_file_identity(after)
+                or _full_file_identity(trusted) != _full_file_identity(named_after)
             ):
                 raise RuntimeError("docker ownership cidfile changed during read")
             try:
@@ -538,10 +561,14 @@ class DockerRuntime(BaseRuntime):
                 raw_container_id[:-1] if raw_container_id.endswith("\n") else raw_container_id
             )
             _require_container_id(container_id)
-            self._cidfile_identity = _object_identity(opened)
+            self._cidfile_identity = _object_identity(trusted)
             return container_id
-        except FileNotFoundError:
-            raise
+        except FileNotFoundError as exc:
+            if not cidfile_observed:
+                raise
+            raise RuntimeError(
+                "docker ownership cidfile disappeared during verification"
+            ) from exc
         except OSError as exc:
             raise RuntimeError("docker ownership cidfile is invalid") from exc
         finally:
