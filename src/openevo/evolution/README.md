@@ -150,8 +150,9 @@ group/other-writable mode 只在显式 startup migration 中接受，用于原 i
 该内部 projection/materializer 尚未替换公开 legacy `/v1/contexts/resolve` 和 Gateway staging；
 公开 runtime 路径保持原行为，直到严格 v2 client、opaque blob transport 和 Gateway generic
 staging 可以原子切换。
-Store 已实现 cross-session revision/admission 的内部持久化 primitive：immutable generation-zero
-manifest 绑定 content-addressed project/workspace refs、canonical materialized context 及 artifact set、
+Store 已实现 cross-session revision/admission 的内部持久化 primitive：immutable generation-zero 与
+严格相邻 successor manifest 绑定 content-addressed project/workspace refs、canonical materialized
+context 及 artifact set、
 registered execution snapshot 和 ordered adapters。Execution snapshot 是 closed typed
 model/runtime/serving data；Store 只接受 verified producer sealed、普通调用方不可构造的
 `VerifiedExecutionSnapshot`，再从 typed canonical bytes 计算 ID/digest 并记录 producer ID。Revision 同时引用并内嵌 exact
@@ -163,8 +164,11 @@ Task admission 通过同一 `BEGIN IMMEDIATE` exact 匹配 project/stream、proj
 execution/capture mode、execution snapshot、materialized context 和 context artifact set，再对当前 generation
 固定 revision；且只把下一 generation 持久化为 `required_revision_uncommitted`，不回退到旧 revision。
 Activation 后重启允许 required generation 已等于 active generation 的 queued row 保持未 pin，exact retry
-重新验证后再原子 pin。Envelope 只含 allowlisted non-secret identity fields、content-addressed refs 和 opaque
-IDs；schema 不接受 raw instruction、credential、env、setup command 或开放 task/runtime/model dict，
+重新验证后再原子 pin。Activation 必须在同一写事务内证明所有下一代 queued request 与候选 revision
+identity 一致；已经处于 active generation 但仍未 pin 的 queued row 会阻止继续推进 head，直到 exact retry
+完成 pin 或该 row 被取消。Store 不会为 activation 静默改写 queued request。Envelope 只含 allowlisted
+non-secret identity fields、content-addressed refs 和 opaque IDs；schema 不接受 raw instruction、credential、
+env、setup command 或开放 task/runtime/model dict，
 非闭集字段在输入边界直接拒绝。Admission request 保存完整 closed envelope identity 字段并自行重算
 digest；Task/幂等键不能复用到不同 canonical request，调用方不能直接提交 envelope digest。
 
@@ -185,10 +189,9 @@ legacy job/artifact recovery。
 这仍不是完整 B3 生命周期。Execution snapshot persistence 只是内部 canonical identity primitive，不是
 B2 verified deployment、serving readiness 或 attestation。当前没有 production issuer，repo-private
 testkit seal 只用于测试；#160/B1 verified deployment producer 接入前 release genesis/admission 必须 fail
-closed。未来 Core run owner 仍需从 immutable
-project/workspace snapshots 构造 admission envelope；当前只允许显式 genesis，不提供任意 successor
-commit/activation；
-dataset seal、transition、readiness、serving prepare、atomic N+1 commit、Core HTTP、Gateway/run admission
+closed。未来 Core run owner 仍需从 immutable project/workspace snapshots 构造 admission envelope；
+Store 已提供严格相邻 successor 的 atomic ledger commit primitive，但 dataset seal、transition、readiness、
+serving prepare、调用该 primitive 的 run-owner orchestration、Core HTTP、Gateway/run admission
 和 Desktop 状态接线均未实现。因而内部 ledger 或 materializer 的存在都不能被描述为已经完成
 端到端 cross-session activation。
 其中也包括 public v1 原有的 subscription auth alias 判定；更通用的 `*_subscription` 识别只

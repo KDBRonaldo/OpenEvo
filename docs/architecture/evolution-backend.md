@@ -232,7 +232,16 @@ identity，不接受 instruction、credential、env、setup command 或开放 ta
 字段并重算 envelope digest，调用方不能自报该 digest。未来 Core run owner 应从
 immutable project/workspace snapshots 构造 envelope；本 primitive 尚未接该 owner。当前 self-deployed 与 subscription 的
 genesis/admission contract 均有回归覆盖。
-当前 API 只允许创建 generation-zero head，不能绕过 transition/readiness 任意发布 successor。
+Store 还提供内部 `activate_successor_revision` 原子提交 primitive：只接受当前 head 的严格相邻
+successor，在同一 `BEGIN IMMEDIATE` 中重验 predecessor、materialized context、registered execution
+snapshot 和 ledger capacity，再同时写入 immutable revision 与推进 stream head。相同 successor 的并发或
+历史重试幂等返回；竞争 fork、generation gap 和 stale predecessor 拒绝；已经 admitted 的 task 继续固定在
+原 revision。事务还逐项验证下一代 queued request 与候选 revision identity；不匹配时拒绝 activation，
+不会改写 request。已经推进到当前代但尚未经 retry pin 的 queued row 会阻止下一代 activation，直到它被
+pin 或取消，避免提交一个 startup recovery 必然拒绝的 ledger。该 primitive 只负责最终 ledger commit，
+不签发 readiness 证明，也不允许 Desktop 或 HTTP
+调用方直接发布 successor；Core run/transition owner 仍必须先完成 dataset seal、全部 enabled target、
+materialization、serving preparation 和 health checks。
 
 Admission 在 `BEGIN IMMEDIATE` 中读取 stream head：请求当前 generation 时写入 `admitted` 和 exact
 `pinned_revision_id`，并在同一事务 exact 匹配 project/stream、project/workspace refs、execution/capture
@@ -264,8 +273,9 @@ identity、execution snapshot、predecessor chain、active head、admission requ
 不能制造下一次 startup 必然拒绝的 B3 数据库。B3 ledger recovery 只保留 chain/head/pin 所需 compact identities，不保留全部 manifest
 或 execution snapshot model；context snapshot 文件 reconciliation 仍在独立 256 MiB aggregate budget 内持有
 canonical bytes。这里不宣称尚未迁移的 legacy job/artifact startup 路径具有同一预算。
-该内部 contract 尚未暴露 HTTP，也未接 Gateway/run/transition/Desktop。B3.2-B3.4 完成 dataset seal、
-readiness 和 atomic successor activation 前，不得把它描述成完整 cross-session evolution。Execution
+该内部 contract 尚未暴露 HTTP，也未接 Gateway/run/transition/Desktop。虽然相邻 successor 的最终 ledger
+commit 已具备原子、幂等和 restart-safe 语义，B3.2-B3.4 在完成 dataset seal、readiness 证明以及 run owner
+编排前，仍不得把它描述成完整 cross-session evolution。Execution
 snapshot persistence 也不构成 B2 verified deployment、serving readiness 或 attestation。当前仓库没有
 production `VerifiedExecutionSnapshot` issuer；只有 repo-private testkit 能构造测试 seal。#160/B1 managed
 deployment 提供 verified producer 前，release genesis/admission 没有可用的 snapshot registration 路径，

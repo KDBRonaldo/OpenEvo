@@ -4774,6 +4774,50 @@ class EvolutionStore:
             )
         return active, active_generation
 
+    def _validate_successor_admission_barrier(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        active: _AuthoritativeRevisionClosure,
+        active_generation: int,
+        successor_revision_id: str,
+        successor_manifest: RevisionManifestV1,
+    ) -> None:
+        successor = self._revision_recovery_identity(
+            successor_revision_id,
+            successor_manifest,
+        )
+        rows = conn.execute(
+            """
+            SELECT * FROM task_admissions
+            WHERE stream_id = ? AND status = 'queued'
+            ORDER BY admission_id
+            """,
+            (successor_manifest.stream_id,),
+        )
+        for row in rows:
+            record = self._task_admission_from_row(row)
+            self._validate_admission_request_sources(conn, record.request)
+            self._validate_unpinned_admission_authority(
+                record,
+                active_generation=active_generation,
+                active_revision=active.identity,
+            )
+            if record.request.required_generation == active_generation:
+                raise RevisionConflictError(
+                    "active-generation queued admissions must be pinned or cancelled "
+                    "before successor activation"
+                )
+            try:
+                self._validate_admission_request_against_revision(
+                    record.request,
+                    successor,
+                )
+            except TaskAdmissionConflictError as exc:
+                raise RevisionConflictError(
+                    "successor revision does not match a queued task admission"
+                ) from exc
+
     def create_genesis_revision(self, manifest: RevisionManifestV1) -> RevisionRecord:
         """Create one explicit generation-zero stream head, or return its exact retry."""
 
@@ -4910,6 +4954,243 @@ class EvolutionStore:
                 ).fetchone()
                 if row is None:
                     raise RevisionIntegrityError("created revision could not be read back")
+                record = self._revision_record_from_row(row, active=True)
+                self._verify_bound_store_identity(conn)
+                conn.commit()
+                return record
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def activate_successor_revision(self, manifest: RevisionManifestV1) -> RevisionRecord:
+        """Atomically advance one stream to its exact, fully bound successor."""
+
+        manifest = RevisionManifestV1.model_validate(manifest.model_dump(mode="python"))
+        if manifest.generation == 0 or manifest.predecessor_revision_id is None:
+            raise RevisionConflictError("successor revision must follow an existing revision")
+        manifest_json = canonical_json(manifest)
+        manifest_digest = canonical_digest(manifest)
+        revision_id = revision_id_for_manifest(manifest)
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._verify_bound_store_identity(conn)
+                active, active_generation = self._validate_stream_authority(
+                    conn,
+                    manifest.stream_id,
+                )
+
+                existing = conn.execute(
+                    "SELECT * FROM revisions WHERE revision_id = ?",
+                    (revision_id,),
+                ).fetchone()
+                if existing is not None:
+                    persisted = self._validate_revision_authority(
+                        conn,
+                        revision_id,
+                        expected_stream_id=manifest.stream_id,
+                        expected_generation=manifest.generation,
+                    )
+                    if persisted.manifest != manifest:
+                        raise RevisionConflictError("revision identity is already bound")
+                    if manifest.generation > active_generation:
+                        raise RevisionIntegrityError(
+                            "persisted revision is ahead of the authoritative stream"
+                        )
+                    cursor = active
+                    cursor_generation = active_generation
+                    while cursor_generation > manifest.generation:
+                        predecessor_id = cursor.manifest.predecessor_revision_id
+                        if predecessor_id is None:
+                            raise RevisionIntegrityError(
+                                "authoritative revision chain is incomplete"
+                            )
+                        cursor_generation -= 1
+                        cursor = self._validate_revision_authority(
+                            conn,
+                            predecessor_id,
+                            expected_stream_id=manifest.stream_id,
+                            expected_generation=cursor_generation,
+                        )
+                    if cursor.revision_id != revision_id:
+                        raise RevisionConflictError(
+                            "revision is not part of the authoritative stream"
+                        )
+                    record = self._revision_record_from_row(
+                        existing,
+                        active=revision_id == active.revision_id,
+                    )
+                    self._verify_bound_store_identity(conn)
+                    conn.commit()
+                    return record
+
+                if manifest.generation != active_generation + 1:
+                    raise RevisionConflictError(
+                        "successor generation must immediately follow the active revision"
+                    )
+                if manifest.predecessor_revision_id != active.revision_id:
+                    raise RevisionConflictError(
+                        "successor predecessor must be the active revision"
+                    )
+                self._validate_revision_materialization(conn, manifest)
+                self._validate_revision_execution_snapshot(conn, manifest)
+                self._validate_successor_admission_barrier(
+                    conn,
+                    active=active,
+                    active_generation=active_generation,
+                    successor_revision_id=revision_id,
+                    successor_manifest=manifest,
+                )
+                collision = conn.execute(
+                    "SELECT 1 FROM revisions WHERE manifest_digest = ?",
+                    (manifest_digest,),
+                ).fetchone()
+                if collision is not None:
+                    raise RevisionConflictError("revision identity is already bound")
+
+                stream_row = conn.execute(
+                    "SELECT stream_id, active_revision_id, active_generation, created_at, "
+                    "updated_at FROM revision_streams WHERE stream_id = ?",
+                    (manifest.stream_id,),
+                ).fetchone()
+                if stream_row is None:
+                    raise RevisionIntegrityError("revision stream disappeared during activation")
+                stream_created_at = stream_row["created_at"]
+                stream_updated_at = stream_row["updated_at"]
+                if not isinstance(stream_created_at, str) or not isinstance(
+                    stream_updated_at,
+                    str,
+                ):
+                    raise RevisionIntegrityError("revision stream timestamps are invalid")
+                now = utc_now_iso()
+                if _parse_canonical_utc_iso(
+                    now,
+                    label="successor activation timestamp",
+                ) < _parse_canonical_utc_iso(
+                    stream_updated_at,
+                    label="revision stream updated_at",
+                ):
+                    now = stream_updated_at
+
+                revision_columns = (
+                    "revision_id",
+                    "stream_id",
+                    "predecessor_revision_id",
+                    "created_at",
+                    "manifest_digest",
+                    "manifest_json",
+                    "context_id",
+                    "context_manifest_digest",
+                    "registry_digest",
+                    "execution_snapshot_id",
+                    "execution_snapshot_digest",
+                    "adapter_set_digest",
+                )
+                revision_values = (
+                    revision_id,
+                    manifest.stream_id,
+                    manifest.predecessor_revision_id,
+                    now,
+                    manifest_digest,
+                    manifest_json,
+                    manifest.context.context_id,
+                    manifest.context.manifest_digest,
+                    manifest.context.registry_digest,
+                    manifest.execution_snapshot_id,
+                    manifest.execution_snapshot_digest,
+                    canonical_digest(manifest.adapters),
+                )
+                _enforce_ledger_capacity(
+                    conn,
+                    table="revisions",
+                    text_blob_columns=revision_columns,
+                    new_text_blob_values=revision_values,
+                    max_rows=MAX_REVISION_RECOVERY_ROWS,
+                    max_bytes=MAX_REVISION_RECOVERY_BYTES,
+                    max_row_bytes=MAX_REVISION_ROW_BYTES,
+                    label="revision ledger",
+                )
+                _enforce_ledger_update_capacity(
+                    conn,
+                    table="revision_streams",
+                    key_column="stream_id",
+                    key_value=manifest.stream_id,
+                    text_blob_columns=(
+                        "stream_id",
+                        "active_revision_id",
+                        "created_at",
+                        "updated_at",
+                    ),
+                    new_text_blob_values=(
+                        manifest.stream_id,
+                        revision_id,
+                        stream_created_at,
+                        now,
+                    ),
+                    max_bytes=MAX_REVISION_STREAM_RECOVERY_BYTES,
+                    max_row_bytes=MAX_REVISION_STREAM_ROW_BYTES,
+                    label="revision stream ledger",
+                )
+                conn.execute(
+                    """
+                    INSERT INTO revisions (
+                        revision_id, stream_id, generation, predecessor_revision_id,
+                        created_at, manifest_digest, manifest_json, context_id,
+                        context_manifest_digest, registry_digest, execution_snapshot_id,
+                        execution_snapshot_digest, adapter_set_digest
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        manifest.stream_id,
+                        manifest.generation,
+                        manifest.predecessor_revision_id,
+                        now,
+                        manifest_digest,
+                        manifest_json,
+                        manifest.context.context_id,
+                        manifest.context.manifest_digest,
+                        manifest.context.registry_digest,
+                        manifest.execution_snapshot_id,
+                        manifest.execution_snapshot_digest,
+                        canonical_digest(manifest.adapters),
+                    ),
+                )
+                updated = conn.execute(
+                    """
+                    UPDATE revision_streams
+                    SET active_revision_id = ?, active_generation = ?, updated_at = ?
+                    WHERE stream_id = ? AND active_revision_id = ? AND active_generation = ?
+                    """,
+                    (
+                        revision_id,
+                        manifest.generation,
+                        now,
+                        manifest.stream_id,
+                        active.revision_id,
+                        active_generation,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RevisionIntegrityError(
+                        "revision stream changed during successor activation"
+                    )
+                new_active, new_generation = self._validate_stream_authority(
+                    conn,
+                    manifest.stream_id,
+                )
+                if new_active.revision_id != revision_id or new_generation != manifest.generation:
+                    raise RevisionIntegrityError("successor activation readback is inconsistent")
+                row = conn.execute(
+                    "SELECT * FROM revisions WHERE revision_id = ?",
+                    (revision_id,),
+                ).fetchone()
+                if row is None:
+                    raise RevisionIntegrityError("activated revision could not be read back")
                 record = self._revision_record_from_row(row, active=True)
                 self._verify_bound_store_identity(conn)
                 conn.commit()
