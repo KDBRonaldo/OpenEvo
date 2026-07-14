@@ -74,16 +74,29 @@ global known-host lookup for every SSH subprocess.
 
 ## Provider-Owned Host-Key Trust
 
-`ProviderKnownHostStore` owns enrollment and persistence. Its root must be an
-owner-controlled, non-symlink directory with mode `0700`. Each profile is mapped
-to an opaque SHA-256 filename, and each known-host file must be a link-count-one,
+`ProviderKnownHostStore` owns enrollment and persistence. Its root must be a
+direct child of a sidecar-owned secure ancestor. The ancestor must be an
+owner-controlled, non-symlink directory that is not group/world writable; the
+store root must be an owner-controlled, non-symlink directory with mode `0700`.
+The store holds no-follow ancestor/root descriptors and a stable lock inode for
+the binding lifetime. Every operation rechecks pathname-to-descriptor identity
+and uses a shared/exclusive cross-process `flock`. Each profile is mapped to an
+opaque SHA-256 filename, and each known-host file must be a link-count-one,
 owner-controlled regular file with mode `0600`. Reads are descriptor-relative
 and no-follow. Publication writes and fsyncs a private temporary file, publishes
 it with an atomic no-replace hard link, removes the temporary name, and fsyncs
-the directory. Existing records are immutable: a different key is rejected
-rather than replaced. Store paths reject whitespace, quoting, backslashes, and
-OpenSSH `%` token expansion so `UserKnownHostsFile` always names exactly one
-provider file.
+the directory. Existing records are immutable unless an explicit compare-and-
+swap rotation succeeds. Store paths reject whitespace, quoting, backslashes,
+and OpenSSH `%` token expansion.
+
+OpenSSH accepts a pathname rather than an already-verified file descriptor. For
+each command, rsync, or tunnel spawn, Core therefore copies the validated record
+to a random `0700` lease directory directly under the held secure ancestor. The
+lease file is `0600`, is independent of the mutable trust-store root, and is
+created while the shared store lock is held. Synchronous command/rsync leases
+remain present through subprocess completion; tunnel leases remain present
+until the tunnel closes. Replacing or renaming the trust-store root after
+validation cannot redirect that in-flight pathname to a different key.
 
 A stored record contains both canonical metadata and an OpenSSH known-host line.
 The metadata binds all of:
@@ -104,14 +117,31 @@ Enrollment is explicitly two phase:
    of Ed25519, NIST P-256 ECDSA, and RSA keys. It accepts only exact host/port
    lines and rejects markers, hashed hosts, host lists, duplicate algorithms,
    comments, extra fields, malformed key blobs, and unsupported algorithms.
-2. The caller submits an exact algorithm and fingerprint from the pending result.
-   `confirm(...)` requires the current profile ID/host/port to match, repeats the
-   probe, and requires the complete candidate set to be unchanged before it
-   persists the selected full key.
+2. The caller independently verifies and submits an exact algorithm and
+   fingerprint from the pending result. `confirm(...)` requires the current
+   profile ID/host/port to match, repeats the probe, and requires the complete
+   candidate set to be unchanged before it persists the selected full key.
+
+The second `ssh-keyscan` only detects a change between the two observations. It
+does not authenticate the server, because an active attacker can answer both
+probes consistently. A TOFU enrollment must display the fingerprint for
+independent verification through an administrator, provider console, or another
+authenticated channel before confirmation.
 
 RSA known-host records use the OpenSSH public-key type `ssh-rsa`; the transport
 pins `rsa-sha2-512` as the corresponding host-key signature algorithm. Probe
-results never mutate trust state, so first contact is not silent TOFU.
+results reject RSA moduli smaller than 2048 bits and never mutate trust state,
+so first contact is not silent TOFU.
+
+Persisted trust is loaded only with an expected fingerprint retained by the
+profile owner. Recreating the same profile ID/host/port without that expected
+fingerprint does not inherit the old binding. `revoke(profile,
+expected_fingerprint=...)` and `rotate(profile,
+expected_old_fingerprint=..., confirmed_pending=...)` are atomic compare-and-
+swap operations. Before either operation, the caller must close every existing
+tunnel and invalidate every transport built from the old binding. An already
+running process intentionally retains its lease; revoking the store record is
+not a remote-session termination mechanism.
 
 `SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
 it before building every command. A release call without a binding fails closed.
@@ -123,8 +153,11 @@ SSH actions can proceed.
 
 Supported:
 
-- `ssh_agent`: uses the local OpenSSH agent or default OpenSSH identity lookup.
-- `private_key`: passes `-i <private_key_path>` as a subprocess argv element.
+- `ssh_agent`: uses OpenSSH agent/default identity lookup without loading user
+  SSH configuration.
+- `private_key`: passes `-i <private_key_path>` as a subprocess argv element,
+  clears default identities with `IdentityFile=none`, sets `IdentitiesOnly=yes`,
+  and disables agent use with `IdentityAgent=none`.
 
 Unsupported in this slice:
 
@@ -150,9 +183,11 @@ the SSH transport.
 `run(command, env=..., cwd=...)` builds:
 
 ```text
-ssh -p <port> [-i <key>] \
+ssh -F /dev/null -p <port> \
+  [-o IdentityFile=none -i <key> \
+   -o IdentitiesOnly=yes -o IdentityAgent=none] \
   -o StrictHostKeyChecking=yes \
-  -o UserKnownHostsFile=<provider-file> \
+  -o UserKnownHostsFile=<private-lease-file> \
   -o GlobalKnownHostsFile=/dev/null \
   -o UpdateHostKeys=no \
   -o CheckHostIP=no \
@@ -163,8 +198,16 @@ ssh -p <port> [-i <key>] \
   -o BatchMode=yes -l <user> -- <host> <remote-command>
 ```
 
-The same base argv is used for remote commands, the rsync remote shell, and SSH
-tunnels. Neither keyscan nor transport subprocesses use `shell=True`.
+`-F /dev/null` prevents `IdentityFile`, `Match`, or `Include` entries in user SSH
+configuration from extending private-key authentication. The same base argv is
+used for remote commands, the rsync remote shell, and SSH tunnels. Neither
+keyscan nor transport subprocesses use `shell=True`.
+
+OpenSSH transport exit `255`, host-key mismatch, process-start, and rsync
+failures are converted to typed renderer-safe errors. Raw local SSH/rsync stderr
+is only emitted through the controlled deployment logger and is never placed in
+the execution result or raised error text; known trust paths are redacted from
+non-transport remote-command stderr as a defense in depth.
 
 `env` is injected into the remote command as POSIX assignments:
 

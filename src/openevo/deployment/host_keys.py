@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -12,8 +13,10 @@ import secrets
 import stat
 import struct
 import subprocess
+import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -72,6 +75,16 @@ class PendingHostKeyProbe:
 
 
 @dataclass(frozen=True)
+class ConfirmedPendingHostKey:
+    """A user-selected pending key whose complete observation was re-probed."""
+
+    profile_id: str
+    host: str
+    port: int
+    candidate: HostKeyCandidate
+
+
+@dataclass(frozen=True)
 class TrustedKnownHostsBinding:
     """A provider-owned known-host file bound to one remote profile identity."""
 
@@ -82,6 +95,7 @@ class TrustedKnownHostsBinding:
     public_key: str
     fingerprint: str
     known_hosts_file: Path
+    _anchor: _StoreAnchor = field(repr=False, compare=False)
 
     def validate_for(self, profile: RemoteProfileConfig) -> None:
         """Revalidate the file and require an exact profile/host/port binding."""
@@ -94,13 +108,23 @@ class TrustedKnownHostsBinding:
         _validate_path_text(path)
         if not path.is_absolute() or path.name != expected_name:
             raise ValueError("trusted known-host file is not provider-owned")
-        with _opened_store_root(path.parent, create=False) as root_fd:
+        with self._anchor.locked_root(create=False, exclusive=False) as root_fd:
+            if root_fd is None:
+                raise ValueError("trusted known-host file is missing")
             content = _read_secure_file(root_fd, path.name)
         if content is None:
             raise ValueError("trusted known-host file is missing")
-        binding = _binding_from_content(path, content, profile)
+        binding = _binding_from_content(path, content, profile, self._anchor)
         if binding != self:
             raise ValueError("trusted known-host file content does not match binding")
+
+    def open_for_spawn(
+        self,
+        profile: RemoteProfileConfig,
+    ) -> AbstractContextManager[Path]:
+        """Publish a stable private copy for one SSH subprocess lifecycle."""
+
+        return _KnownHostsSpawnLease(self, profile)
 
 
 class ProviderKnownHostStore:
@@ -115,12 +139,26 @@ class ProviderKnownHostStore:
         self,
         root: Path | str,
         *,
+        secure_ancestor: Path | str | None = None,
         runner: KeyscanRunner | None = None,
     ) -> None:
         self._root = Path(root).expanduser()
         if not self._root.is_absolute():
             raise ValueError("provider known-host store root must be absolute")
         _validate_path_text(self._root)
+        ancestor = (
+            Path(secure_ancestor).expanduser()
+            if secure_ancestor is not None
+            else self._root.parent
+        )
+        if not ancestor.is_absolute():
+            raise ValueError("provider known-host secure ancestor must be absolute")
+        _validate_path_text(ancestor)
+        if self._root.parent != ancestor:
+            raise ValueError(
+                "provider known-host store root must be a direct child of its secure ancestor"
+            )
+        self._anchor = _StoreAnchor(self._root, ancestor)
         self._runner = runner or _run_keyscan
 
     def probe(
@@ -173,6 +211,26 @@ class ProviderKnownHostStore:
     ) -> TrustedKnownHostsBinding:
         """Persist one exact pending key after an unchanged second probe."""
 
+        confirmed = self.confirm_pending(
+            pending,
+            profile=profile,
+            algorithm=algorithm,
+            fingerprint=fingerprint,
+            timeout_seconds=timeout_seconds,
+        )
+        return self._persist(profile, confirmed.candidate)
+
+    def confirm_pending(
+        self,
+        pending: PendingHostKeyProbe,
+        *,
+        profile: RemoteProfileConfig,
+        algorithm: HostKeyAlgorithm,
+        fingerprint: str,
+        timeout_seconds: float = 10.0,
+    ) -> ConfirmedPendingHostKey:
+        """Re-probe and seal one exact user-confirmed pending candidate."""
+
         _validate_profile_identity(profile)
         if (profile.id, profile.host, profile.port) != (
             pending.profile_id,
@@ -193,22 +251,88 @@ class ProviderKnownHostStore:
         current = self.probe(profile, timeout_seconds=timeout_seconds)
         if current != pending:
             raise ValueError("SSH host keys changed before confirmation")
-        return self._persist(profile, selected)
+        return ConfirmedPendingHostKey(
+            profile_id=profile.id,
+            host=profile.host,
+            port=profile.port,
+            candidate=selected,
+        )
 
-    def load(self, profile: RemoteProfileConfig) -> TrustedKnownHostsBinding | None:
-        """Load and revalidate an existing binding for a profile, if present."""
+    def load(
+        self,
+        profile: RemoteProfileConfig,
+        *,
+        expected_fingerprint: str,
+    ) -> TrustedKnownHostsBinding | None:
+        """Compare-and-load a binding already attached to the caller's profile."""
 
         _validate_profile_identity(profile)
-        try:
-            self._root.lstat()
-        except FileNotFoundError:
-            return None
         path = self._root / _binding_filename(profile.id)
-        with _opened_store_root(self._root, create=False) as root_fd:
+        with self._anchor.locked_root(create=False, exclusive=False) as root_fd:
+            if root_fd is None:
+                return None
             content = _read_secure_file(root_fd, path.name)
         if content is None:
             return None
-        return _binding_from_content(path, content, profile)
+        binding = _binding_from_content(path, content, profile, self._anchor)
+        if binding.fingerprint != expected_fingerprint:
+            raise ValueError("trusted host-key fingerprint does not match expected fingerprint")
+        return binding
+
+    def revoke(
+        self,
+        profile: RemoteProfileConfig,
+        *,
+        expected_fingerprint: str,
+    ) -> None:
+        """Atomically remove exact trust after callers close tunnels/transports."""
+
+        _validate_profile_identity(profile)
+        path = self._root / _binding_filename(profile.id)
+        with self._anchor.locked_root(create=False, exclusive=True) as root_fd:
+            if root_fd is None:
+                raise ValueError("trusted host key is missing")
+            content = _read_secure_file(root_fd, path.name)
+            if content is None:
+                raise ValueError("trusted host key is missing")
+            current = _binding_from_content(path, content, profile, self._anchor)
+            if current.fingerprint != expected_fingerprint:
+                raise ValueError("trusted host key does not match expected fingerprint")
+            os.unlink(path.name, dir_fd=root_fd)
+            os.fsync(root_fd)
+
+    def rotate(
+        self,
+        profile: RemoteProfileConfig,
+        *,
+        expected_old_fingerprint: str,
+        confirmed_pending: ConfirmedPendingHostKey,
+    ) -> TrustedKnownHostsBinding:
+        """Atomically replace exact old trust with an independently confirmed key."""
+
+        _validate_profile_identity(profile)
+        if (profile.id, profile.host, profile.port) != (
+            confirmed_pending.profile_id,
+            confirmed_pending.host,
+            confirmed_pending.port,
+        ):
+            raise ValueError("remote profile does not match confirmed pending host key")
+        path = self._root / _binding_filename(profile.id)
+        expected = _render_binding_content(profile, confirmed_pending.candidate)
+        with self._anchor.locked_root(create=False, exclusive=True) as root_fd:
+            if root_fd is None:
+                raise ValueError("trusted host key is missing")
+            content = _read_secure_file(root_fd, path.name)
+            if content is None:
+                raise ValueError("trusted host key is missing")
+            current = _binding_from_content(path, content, profile, self._anchor)
+            if current.fingerprint != expected_old_fingerprint:
+                raise ValueError("trusted host key does not match expected fingerprint")
+            _replace_secure_file(root_fd, path.name, expected)
+            published = _read_secure_file(root_fd, path.name)
+            if published != expected:
+                raise ValueError("known-host rotation content changed")
+            return _binding_from_content(path, published, profile, self._anchor)
 
     def _persist(
         self,
@@ -217,10 +341,11 @@ class ProviderKnownHostStore:
     ) -> TrustedKnownHostsBinding:
         path = self._root / _binding_filename(profile.id)
         expected = _render_binding_content(profile, selected)
-        with _opened_store_root(self._root, create=True) as root_fd:
+        with self._anchor.locked_root(create=True, exclusive=True) as root_fd:
+            assert root_fd is not None
             existing = _read_secure_file(root_fd, path.name)
             if existing is not None:
-                binding = _binding_from_content(path, existing, profile)
+                binding = _binding_from_content(path, existing, profile, self._anchor)
                 if existing != expected:
                     raise ValueError("confirmed host key conflicts with existing trust")
                 return binding
@@ -263,7 +388,7 @@ class ProviderKnownHostStore:
                 published = _read_secure_file(root_fd, path.name)
                 if published != expected:
                     raise ValueError("known-host publication content changed")
-                return _binding_from_content(path, published, profile)
+                return _binding_from_content(path, published, profile, self._anchor)
             finally:
                 if temp_created:
                     try:
@@ -272,45 +397,227 @@ class ProviderKnownHostStore:
                         pass
 
 
-class _OpenedStoreRoot:
-    def __init__(self, path: Path, *, create: bool) -> None:
-        self._path = path
-        self._create = create
-        self._fd: int | None = None
+class _StoreAnchor:
+    """Held secure ancestor/root descriptors plus the cross-process lock namespace."""
 
-    def __enter__(self) -> int:
-        if self._create:
-            try:
-                os.mkdir(self._path, 0o700)
-            except FileExistsError:
-                pass
-        before = _validate_root_path(self._path)
+    def __init__(self, root: Path, secure_ancestor: Path) -> None:
+        self.root = root
+        self.secure_ancestor = secure_ancestor
+        self._ancestor_fd = _open_secure_ancestor(secure_ancestor)
+        self._root_fd: int | None = None
+        self._lock_anchor_fd: int | None = None
+        self._guard = threading.Lock()
+        token = hashlib.sha256(root.name.encode("utf-8")).hexdigest()[:24]
+        self._lock_name = f".openevo-known-hosts-{token}.lock"
+
+    @contextmanager
+    def locked_root(self, *, create: bool, exclusive: bool):
+        lock_fd = self._open_lock()
         try:
-            root_fd = os.open(
-                self._path,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            self._validate_ancestor_binding()
+            root_fd = self._get_root_fd(create=create)
+            yield root_fd
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+    def _open_lock(self) -> int:
+        with self._guard:
+            try:
+                fd = os.open(
+                    self._lock_name,
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=self._ancestor_fd,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "provider known-host store lock could not be opened safely"
+                ) from exc
+            try:
+                opened = os.fstat(fd)
+                _validate_file_stat(opened, require_single_link=True)
+                if self._lock_anchor_fd is None:
+                    self._lock_anchor_fd = os.dup(fd)
+                anchored = os.fstat(self._lock_anchor_fd)
+                _validate_file_stat(anchored, require_single_link=True)
+                if (opened.st_dev, opened.st_ino) != (
+                    anchored.st_dev,
+                    anchored.st_ino,
+                ):
+                    raise ValueError("provider known-host store lock binding changed")
+            except Exception:
+                os.close(fd)
+                raise
+            return fd
+
+    def _get_root_fd(self, *, create: bool) -> int | None:
+        with self._guard:
+            if self._root_fd is None:
+                try:
+                    before = os.stat(
+                        self.root.name,
+                        dir_fd=self._ancestor_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        return None
+                    try:
+                        os.mkdir(self.root.name, 0o700, dir_fd=self._ancestor_fd)
+                    except FileExistsError:
+                        pass
+                    before = os.stat(
+                        self.root.name,
+                        dir_fd=self._ancestor_fd,
+                        follow_symlinks=False,
+                    )
+                _validate_root_stat(before)
+                try:
+                    fd = os.open(
+                        self.root.name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=self._ancestor_fd,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        "provider known-host store root could not be opened safely"
+                    ) from exc
+                opened = os.fstat(fd)
+                _validate_root_stat(opened)
+                if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                    os.close(fd)
+                    raise ValueError("provider known-host store root changed during open")
+                self._root_fd = fd
+            self._validate_root_binding()
+            return self._root_fd
+
+    def _validate_ancestor_binding(self) -> None:
+        reopened_fd = _open_secure_ancestor(self.secure_ancestor)
+        try:
+            reopened = os.fstat(reopened_fd)
+            opened = os.fstat(self._ancestor_fd)
+            _validate_secure_ancestor_stat(opened)
+            if (reopened.st_dev, reopened.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ValueError("provider known-host secure ancestor binding changed")
+        finally:
+            os.close(reopened_fd)
+
+    def _validate_root_binding(self) -> None:
+        assert self._root_fd is not None
+        try:
+            current = os.stat(
+                self.root.name,
+                dir_fd=self._ancestor_fd,
+                follow_symlinks=False,
             )
         except OSError as exc:
-            raise ValueError("provider known-host store root could not be opened safely") from exc
+            raise ValueError("provider known-host store root binding changed") from exc
+        opened = os.fstat(self._root_fd)
+        _validate_root_stat(current)
+        _validate_root_stat(opened)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("provider known-host store root binding changed")
+
+    def __del__(self) -> None:
+        root_fd = getattr(self, "_root_fd", None)
+        lock_anchor_fd = getattr(self, "_lock_anchor_fd", None)
+        ancestor_fd = getattr(self, "_ancestor_fd", None)
         try:
-            after = os.fstat(root_fd)
-            _validate_root_stat(after)
-            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                raise ValueError("provider known-host store root changed during open")
+            if root_fd is not None:
+                os.close(root_fd)
+            if lock_anchor_fd is not None:
+                os.close(lock_anchor_fd)
+            if ancestor_fd is not None:
+                os.close(ancestor_fd)
+        except OSError:
+            pass
+
+
+class _KnownHostsSpawnLease(AbstractContextManager[Path]):
+    def __init__(
+        self,
+        binding: TrustedKnownHostsBinding,
+        profile: RemoteProfileConfig,
+    ) -> None:
+        self._binding = binding
+        self._profile = profile
+        self._locked = None
+        self._directory_fd: int | None = None
+        self._directory_name: str | None = None
+
+    def __enter__(self) -> Path:
+        self._binding.validate_for(self._profile)
+        anchor = self._binding._anchor
+        self._locked = anchor.locked_root(create=False, exclusive=False)
+        root_fd = self._locked.__enter__()
+        try:
+            if root_fd is None:
+                raise ValueError("trusted known-host file is missing")
+            content = _read_secure_file(root_fd, self._binding.known_hosts_file.name)
+            if content is None:
+                raise ValueError("trusted known-host file is missing")
+            current = _binding_from_content(
+                self._binding.known_hosts_file,
+                content,
+                self._profile,
+                anchor,
+            )
+            if current != self._binding:
+                raise ValueError("trusted known-host file content does not match binding")
+            self._directory_name = f".openevo-ssh-lease-{secrets.token_hex(16)}"
+            os.mkdir(self._directory_name, 0o700, dir_fd=anchor._ancestor_fd)
+            self._directory_fd = os.open(
+                self._directory_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=anchor._ancestor_fd,
+            )
+            _validate_root_stat(os.fstat(self._directory_fd))
+            _write_new_secure_file(self._directory_fd, "known_hosts", content)
+            os.fsync(self._directory_fd)
+            return anchor.secure_ancestor / self._directory_name / "known_hosts"
         except Exception:
-            os.close(root_fd)
+            self.__exit__(None, None, None)
             raise
-        self._fd = root_fd
-        return self._fd
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
-
-
-def _opened_store_root(path: Path, *, create: bool) -> _OpenedStoreRoot:
-    return _OpenedStoreRoot(path, create=create)
+        anchor = self._binding._anchor
+        remove_directory_name = False
+        try:
+            if self._directory_fd is not None:
+                try:
+                    if self._directory_name is not None:
+                        current = os.stat(
+                            self._directory_name,
+                            dir_fd=anchor._ancestor_fd,
+                            follow_symlinks=False,
+                        )
+                        opened = os.fstat(self._directory_fd)
+                        _validate_root_stat(current)
+                        _validate_root_stat(opened)
+                        remove_directory_name = (current.st_dev, current.st_ino) == (
+                            opened.st_dev,
+                            opened.st_ino,
+                        )
+                    try:
+                        os.unlink("known_hosts", dir_fd=self._directory_fd)
+                        os.fsync(self._directory_fd)
+                    except FileNotFoundError:
+                        pass
+                finally:
+                    os.close(self._directory_fd)
+                    self._directory_fd = None
+            if self._directory_name is not None and remove_directory_name:
+                try:
+                    os.rmdir(self._directory_name, dir_fd=anchor._ancestor_fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            self._directory_name = None
+            if self._locked is not None:
+                self._locked.__exit__(exc_type, exc, traceback)
+                self._locked = None
 
 
 def _run_keyscan(argv: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
@@ -390,8 +697,10 @@ def _validate_public_key(key_type: str, encoded_key: str) -> tuple[str, str]:
         _validate_positive_mpint(modulus, "RSA modulus")
         exponent_value = int.from_bytes(exponent, "big", signed=False)
         modulus_value = int.from_bytes(modulus, "big", signed=False)
-        if exponent_value < 3 or exponent_value % 2 == 0 or modulus_value.bit_length() < 1024:
+        if exponent_value < 3 or exponent_value % 2 == 0:
             raise ValueError("ssh-keyscan returned malformed RSA public-key parameters")
+        if modulus_value.bit_length() < 2048:
+            raise ValueError("ssh-keyscan returned an RSA host key smaller than 2048 bits")
     else:  # pragma: no cover - guarded by the closed key-type map
         raise ValueError("ssh-keyscan returned an unsupported public-key type")
     if offset != len(blob):
@@ -451,6 +760,7 @@ def _binding_from_content(
     path: Path,
     content: bytes,
     profile: RemoteProfileConfig,
+    anchor: _StoreAnchor,
 ) -> TrustedKnownHostsBinding:
     if len(content) > _MAX_TRUST_FILE_BYTES:
         raise ValueError("trusted known-host file exceeds the allowed size")
@@ -516,6 +826,7 @@ def _binding_from_content(
         public_key=public_key,
         fingerprint=fingerprint,
         known_hosts_file=path,
+        _anchor=anchor,
     )
 
 
@@ -564,13 +875,74 @@ def _read_secure_file(root_fd: int, name: str) -> bytes | None:
     return b"".join(chunks)
 
 
-def _validate_root_path(path: Path) -> os.stat_result:
+def _open_secure_ancestor(path: Path) -> int:
+    parts = path.parts
+    if not parts or parts[0] != os.sep or any(part in {".", ".."} for part in parts[1:]):
+        raise ValueError("provider known-host secure ancestor path is not canonical")
     try:
-        result = path.lstat()
-    except FileNotFoundError as exc:
-        raise ValueError("provider known-host store root does not exist") from exc
-    _validate_root_stat(result)
-    return result
+        current_fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ValueError(
+            "provider known-host secure ancestor could not be opened safely"
+        ) from exc
+    try:
+        for index, part in enumerate(parts[1:], start=1):
+            try:
+                before = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=current_fd,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "provider known-host secure ancestor could not be opened safely"
+                ) from exc
+            try:
+                opened = os.fstat(next_fd)
+                is_final = index == len(parts) - 1
+                if is_final:
+                    _validate_secure_ancestor_stat(before)
+                    _validate_secure_ancestor_stat(opened)
+                else:
+                    _validate_secure_path_component_stat(before)
+                    _validate_secure_path_component_stat(opened)
+                if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise ValueError(
+                        "provider known-host secure ancestor changed during open"
+                    )
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+    return current_fd
+
+
+def _validate_secure_path_component_stat(result: os.stat_result) -> None:
+    if not stat.S_ISDIR(result.st_mode):
+        raise ValueError("provider known-host secure ancestor path contains a symlink")
+    if result.st_uid not in {0, os.geteuid()}:
+        raise ValueError("provider known-host secure ancestor path is not owner-controlled")
+    mode = stat.S_IMODE(result.st_mode)
+    if mode & 0o022 and not (result.st_uid == 0 and mode & stat.S_ISVTX):
+        raise ValueError(
+            "provider known-host secure ancestor path contains a writable component"
+        )
+
+
+def _validate_secure_ancestor_stat(result: os.stat_result) -> None:
+    if not stat.S_ISDIR(result.st_mode):
+        raise ValueError("provider known-host secure ancestor must be a directory")
+    if result.st_uid != os.geteuid():
+        raise ValueError("provider known-host secure ancestor must be owner-controlled")
+    if stat.S_IMODE(result.st_mode) & 0o022:
+        raise ValueError(
+            "provider known-host secure ancestor must not be group/world writable"
+        )
 
 
 def _validate_root_stat(result: os.stat_result) -> None:
@@ -580,6 +952,42 @@ def _validate_root_stat(result: os.stat_result) -> None:
         raise ValueError("provider known-host store root must be owner-controlled")
     if stat.S_IMODE(result.st_mode) != 0o700:
         raise ValueError("provider known-host store root must have mode 0700")
+
+
+def _write_new_secure_file(root_fd: int, name: str, content: bytes) -> None:
+    try:
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_fd,
+        )
+    except OSError as exc:
+        raise ValueError("trusted known-host file could not be created safely") from exc
+    try:
+        os.fchmod(fd, 0o600)
+        _write_all(fd, content)
+        os.fsync(fd)
+        _validate_file_stat(os.fstat(fd), require_single_link=True)
+    finally:
+        os.close(fd)
+
+
+def _replace_secure_file(root_fd: int, name: str, content: bytes) -> None:
+    temp_name = f".{name}.{secrets.token_hex(12)}.rotate"
+    created = False
+    try:
+        _write_new_secure_file(root_fd, temp_name, content)
+        created = True
+        os.replace(temp_name, name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        created = False
+        os.fsync(root_fd)
+    finally:
+        if created:
+            try:
+                os.unlink(temp_name, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
 
 
 def _validate_file_stat(result: os.stat_result, *, require_single_link: bool) -> None:
@@ -673,6 +1081,7 @@ def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 __all__ = [
+    "ConfirmedPendingHostKey",
     "HostKeyAlgorithm",
     "HostKeyCandidate",
     "PendingHostKeyProbe",

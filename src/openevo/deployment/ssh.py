@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 import shlex
 import socket
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
@@ -18,6 +21,31 @@ from openevo.deployment.profile import RemoteProfileConfig
 CompletedRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 PortAllocator = Callable[[], int]
 TunnelStarter = Callable[[list[str]], "TunnelProcess"]
+
+logger = logging.getLogger(__name__)
+
+
+class SshTransportErrorCode(str, Enum):
+    HOST_KEY_VERIFICATION_FAILED = "host_key_verification_failed"
+    CONNECTION_FAILED = "connection_failed"
+    START_FAILED = "start_failed"
+    RSYNC_FAILED = "rsync_failed"
+
+
+class SshTransportError(RuntimeError):
+    """A renderer-safe typed SSH transport failure."""
+
+    def __init__(self, code: SshTransportErrorCode) -> None:
+        self.code = code
+        messages = {
+            SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED: (
+                "SSH host-key verification failed. Re-verify the server fingerprint."
+            ),
+            SshTransportErrorCode.CONNECTION_FAILED: "SSH connection failed.",
+            SshTransportErrorCode.START_FAILED: "SSH process could not be started.",
+            SshTransportErrorCode.RSYNC_FAILED: "rsync failed over SSH.",
+        }
+        super().__init__(messages[code])
 
 
 class TunnelProcess(Protocol):
@@ -43,20 +71,23 @@ class SshTunnel:
     local_host: str
     remote_host: str
     process: TunnelProcess
+    _trust_lease: AbstractContextManager[Path] = field(repr=False, compare=False)
 
     @property
     def base_url(self) -> str:
         return f"http://{self.local_host}:{self.local_port}"
 
     def close(self) -> None:
-        if self.process.poll() is not None:
-            return
-        self.process.terminate()
         try:
-            self.process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5.0)
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5.0)
+        finally:
+            self._trust_lease.__exit__(None, None, None)
 
 
 class SshRemoteExecutorTransport:
@@ -93,16 +124,29 @@ class SshRemoteExecutorTransport:
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
         remote_command = _remote_command(command, cwd=cwd, env=env)
-        try:
-            completed = self._runner(self._ssh_argv(remote_command), timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"SSH command timed out after {timeout_seconds}s") from exc
-        return RemoteCommandResult(
-            command=command,
-            return_code=int(completed.returncode),
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
-        )
+        with self._trusted_host.open_for_spawn(self._profile) as known_hosts_file:
+            try:
+                completed = self._runner(
+                    self._ssh_argv(remote_command, known_hosts_file), timeout_seconds
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(f"SSH command timed out after {timeout_seconds}s") from exc
+            except OSError as exc:
+                logger.warning("SSH process start failed: %r", exc)
+                raise SshTransportError(SshTransportErrorCode.START_FAILED) from exc
+            if completed.returncode == 255:
+                _raise_ssh_failure(completed.stderr or "")
+            stderr = _redact_trust_paths(
+                completed.stderr or "",
+                known_hosts_file,
+                self._trusted_host.known_hosts_file,
+            )
+            return RemoteCommandResult(
+                command=command,
+                return_code=int(completed.returncode),
+                stdout=completed.stdout or "",
+                stderr=stderr,
+            )
 
     def upload_dir(self, local_path: str, remote_path: str) -> None:
         local = Path(local_path).expanduser()
@@ -116,10 +160,22 @@ class SshRemoteExecutorTransport:
         if not mkdir_result.ok:
             raise RuntimeError(f"remote mkdir failed: {mkdir_result.stderr}")
 
-        completed = self._runner(self._rsync_argv(local, remote_path), 300.0)
-        if completed.returncode != 0:
-            message = completed.stderr or completed.stdout or "unknown rsync error"
-            raise RuntimeError(f"rsync failed: {message}")
+        with self._trusted_host.open_for_spawn(self._profile) as known_hosts_file:
+            try:
+                completed = self._runner(
+                    self._rsync_argv(local, remote_path, known_hosts_file), 300.0
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.warning("rsync SSH process failed to run: %r", exc)
+                raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED) from exc
+            if completed.returncode != 0:
+                logger.warning(
+                    "rsync SSH failure (return code %s): stderr=%r stdout=%r",
+                    completed.returncode,
+                    completed.stderr or "",
+                    completed.stdout or "",
+                )
+                raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
 
     def open_tunnel(
         self,
@@ -138,22 +194,33 @@ class SshRemoteExecutorTransport:
         _validate_remote_identity(remote_host, "remote_host", _REMOTE_HOST_RE)
         _validate_remote_identity(local_host, "local_host", _REMOTE_HOST_RE)
         forward_spec = f"{local_host}:{local_port}:{remote_host}:{remote_port}"
-        process = self._tunnel_starter(
-            [
-                *self._ssh_base_argv(),
-                "-N",
-                "-L",
-                forward_spec,
-                "--",
-                self._profile.host,
-            ]
-        )
+        trust_lease = self._trusted_host.open_for_spawn(self._profile)
+        known_hosts_file = trust_lease.__enter__()
+        try:
+            process = self._tunnel_starter(
+                [
+                    *self._ssh_base_argv(known_hosts_file),
+                    "-N",
+                    "-L",
+                    forward_spec,
+                    "--",
+                    self._profile.host,
+                ]
+            )
+        except OSError as exc:
+            trust_lease.__exit__(type(exc), exc, exc.__traceback__)
+            logger.warning("SSH tunnel process start failed: %r", exc)
+            raise SshTransportError(SshTransportErrorCode.START_FAILED) from exc
+        except Exception:
+            trust_lease.__exit__(None, None, None)
+            raise
         tunnel = SshTunnel(
             local_port=local_port,
             remote_port=remote_port,
             local_host=local_host,
             remote_host=remote_host,
             process=process,
+            _trust_lease=trust_lease,
         )
         if wait_for_ready:
             try:
@@ -167,28 +234,38 @@ class SshRemoteExecutorTransport:
                 raise
         return tunnel
 
-    def _ssh_argv(self, remote_command: str) -> list[str]:
+    def _ssh_argv(self, remote_command: str, known_hosts_file: Path) -> list[str]:
         return [
-            *self._ssh_base_argv(),
+            *self._ssh_base_argv(known_hosts_file),
             "--",
             self._profile.host,
             remote_command,
         ]
 
-    def _ssh_base_argv(self) -> list[str]:
+    def _ssh_base_argv(self, known_hosts_file: Path) -> list[str]:
         profile = self._profile
         trusted_host = self._trusted_host
-        trusted_host.validate_for(profile)
-        argv = ["ssh", "-p", str(profile.port)]
+        argv = ["ssh", "-F", "/dev/null", "-p", str(profile.port)]
         if profile.auth.method == "private_key":
             key_path = Path(str(profile.auth.private_key_path)).expanduser()
-            argv.extend(["-i", str(key_path)])
+            argv.extend(
+                [
+                    "-o",
+                    "IdentityFile=none",
+                    "-i",
+                    str(key_path),
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "IdentityAgent=none",
+                ]
+            )
         argv.extend(
             [
                 "-o",
                 "StrictHostKeyChecking=yes",
                 "-o",
-                f"UserKnownHostsFile={trusted_host.known_hosts_file}",
+                f"UserKnownHostsFile={known_hosts_file}",
                 "-o",
                 "GlobalKnownHostsFile=/dev/null",
                 "-o",
@@ -211,8 +288,15 @@ class SshRemoteExecutorTransport:
         )
         return argv
 
-    def _rsync_argv(self, local: Path, remote_path: str) -> list[str]:
-        ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv())
+    def _rsync_argv(
+        self,
+        local: Path,
+        remote_path: str,
+        known_hosts_file: Path,
+    ) -> list[str]:
+        ssh_command = " ".join(
+            shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file)
+        )
         return [
             "rsync",
             "-az",
@@ -242,6 +326,29 @@ def _start_tunnel_subprocess(argv: list[str]) -> subprocess.Popen[str]:
         stderr=subprocess.DEVNULL,
         text=True,
     )
+
+
+def _raise_ssh_failure(stderr: str) -> None:
+    logger.warning("SSH transport failure: stderr=%r", stderr)
+    normalized = stderr.lower()
+    if any(
+        marker in normalized
+        for marker in (
+            "host key verification failed",
+            "remote host identification has changed",
+            "offending key in",
+            "known_hosts",
+        )
+    ):
+        raise SshTransportError(SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED)
+    raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+
+
+def _redact_trust_paths(stderr: str, *paths: Path) -> str:
+    redacted = stderr
+    for path in paths:
+        redacted = redacted.replace(str(path), "[SSH_TRUST_STORE]")
+    return redacted
 
 
 def _allocate_local_port() -> int:

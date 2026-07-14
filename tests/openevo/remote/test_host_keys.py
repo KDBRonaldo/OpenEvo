@@ -7,6 +7,8 @@ import os
 import stat
 import struct
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -37,7 +39,7 @@ def _public_key(key_type: str, marker: bytes = b"key-material") -> str:
         point = b"\x04" + hashlib.sha512(marker).digest()
         fields = (key_type.encode("ascii"), b"nistp256", point)
     elif key_type == "ssh-rsa":
-        modulus = b"\x00\x80" + hashlib.shake_256(marker).digest(127)
+        modulus = b"\x00\x80" + hashlib.shake_256(marker).digest(255)
         fields = (key_type.encode("ascii"), b"\x01\x00\x01", modulus)
     else:
         fields = (key_type.encode("ascii"), marker)
@@ -210,6 +212,22 @@ def test_probe_rejects_key_blob_with_valid_type_but_invalid_algorithm_shape(
         store.probe(profile)
 
 
+def test_probe_rejects_rsa_host_key_smaller_than_2048_bits(tmp_path: Path) -> None:
+    profile = _profile()
+    key_type = b"ssh-rsa"
+    modulus = b"\x00\x80" + hashlib.shake_256(b"weak-rsa").digest(127)
+    fields = (key_type, b"\x01\x00\x01", modulus)
+    blob = b"".join(struct.pack(">I", len(field)) + field for field in fields)
+    public_key = f"ssh-rsa {base64.b64encode(blob).decode('ascii')}"
+    store = ProviderKnownHostStore(
+        tmp_path / "known-hosts",
+        runner=KeyscanRunner(_line(profile.host, profile.port, public_key) + "\n"),
+    )
+
+    with pytest.raises(ValueError, match="2048"):
+        store.probe(profile)
+
+
 def test_probe_rejects_host_option_injection_before_spawning(tmp_path: Path) -> None:
     runner = KeyscanRunner("")
     store = ProviderKnownHostStore(tmp_path / "known-hosts", runner=runner)
@@ -338,18 +356,24 @@ def test_store_rejects_symlink_non_regular_and_insecure_existing_file(tmp_path: 
     path.unlink()
     path.symlink_to(tmp_path / "outside")
     with pytest.raises(ValueError, match="symlink|regular"):
-        ProviderKnownHostStore(path.parent, runner=KeyscanRunner("")).load(profile)
+        ProviderKnownHostStore(path.parent, runner=KeyscanRunner("")).load(
+            profile, expected_fingerprint=binding.fingerprint
+        )
 
     path.unlink()
     path.mkdir()
     with pytest.raises(ValueError, match="regular"):
-        ProviderKnownHostStore(path.parent, runner=KeyscanRunner("")).load(profile)
+        ProviderKnownHostStore(path.parent, runner=KeyscanRunner("")).load(
+            profile, expected_fingerprint=binding.fingerprint
+        )
 
     path.rmdir()
     path.write_bytes(original)
     path.chmod(0o644)
     with pytest.raises(ValueError, match="0600"):
-        ProviderKnownHostStore(path.parent, runner=KeyscanRunner("")).load(profile)
+        ProviderKnownHostStore(path.parent, runner=KeyscanRunner("")).load(
+            profile, expected_fingerprint=binding.fingerprint
+        )
 
 
 def test_store_rejects_non_owner_file(
@@ -372,7 +396,7 @@ def test_store_rejects_non_owner_file(
 
     with pytest.raises(ValueError, match="owner-controlled"):
         ProviderKnownHostStore(binding.known_hosts_file.parent, runner=KeyscanRunner("")).load(
-            profile
+            profile, expected_fingerprint=binding.fingerprint
         )
 
 
@@ -384,7 +408,158 @@ def test_store_rejects_symlink_root_even_when_target_is_private(tmp_path: Path) 
     store = ProviderKnownHostStore(root, runner=KeyscanRunner(""))
 
     with pytest.raises(ValueError, match="root"):
-        store.load(_profile())
+        store.load(_profile(), expected_fingerprint="SHA256:unused")
+
+
+def test_store_rejects_insecure_or_symlinked_secure_ancestor(tmp_path: Path) -> None:
+    insecure = tmp_path / "insecure"
+    insecure.mkdir(mode=0o700)
+    insecure.chmod(0o770)
+
+    with pytest.raises(ValueError, match="secure ancestor.*writable"):
+        ProviderKnownHostStore(insecure / "known-hosts", runner=KeyscanRunner(""))
+
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(private, target_is_directory=True)
+    with pytest.raises(ValueError, match="secure ancestor"):
+        ProviderKnownHostStore(linked / "known-hosts", runner=KeyscanRunner(""))
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir(mode=0o700)
+    nested_ancestor = real_parent / "ancestor"
+    nested_ancestor.mkdir(mode=0o700)
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(ValueError, match="secure ancestor"):
+        ProviderKnownHostStore(
+            parent_link / "ancestor" / "known-hosts",
+            secure_ancestor=parent_link / "ancestor",
+            runner=KeyscanRunner(""),
+        )
+
+
+def test_load_requires_explicit_matching_fingerprint(tmp_path: Path) -> None:
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    store = ProviderKnownHostStore(binding.known_hosts_file.parent, runner=KeyscanRunner(""))
+
+    with pytest.raises(TypeError):
+        store.load(profile)  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="fingerprint"):
+        store.load(profile, expected_fingerprint="SHA256:not-the-stored-key")
+    assert (
+        store.load(profile, expected_fingerprint=binding.fingerprint).fingerprint
+        == binding.fingerprint
+    )
+
+
+def test_revoke_and_rotate_are_fingerprint_compare_and_swap(tmp_path: Path) -> None:
+    profile = _profile()
+    old = _confirmed_binding(tmp_path, profile)
+    replacement_output = _valid_output(profile, marker=b"replacement")
+    store = ProviderKnownHostStore(
+        old.known_hosts_file.parent,
+        runner=KeyscanRunner(replacement_output),
+    )
+    pending = store.probe(profile)
+    replacement = pending.candidates[0]
+    confirmed_pending = store.confirm_pending(
+        pending,
+        profile=profile,
+        algorithm=replacement.algorithm,
+        fingerprint=replacement.fingerprint,
+    )
+
+    with pytest.raises(ValueError, match="expected fingerprint"):
+        store.rotate(
+            profile,
+            expected_old_fingerprint="SHA256:not-current",
+            confirmed_pending=confirmed_pending,
+        )
+    rotated = store.rotate(
+        profile,
+        expected_old_fingerprint=old.fingerprint,
+        confirmed_pending=confirmed_pending,
+    )
+    assert rotated.fingerprint == replacement.fingerprint
+
+    with pytest.raises(ValueError, match="expected fingerprint"):
+        store.revoke(profile, expected_fingerprint=old.fingerprint)
+    store.revoke(profile, expected_fingerprint=rotated.fingerprint)
+    assert store.load(profile, expected_fingerprint=rotated.fingerprint) is None
+
+
+def test_concurrent_rotate_allows_only_one_first_writer(tmp_path: Path) -> None:
+    profile = _profile()
+    old = _confirmed_binding(tmp_path, profile)
+    stores: list[ProviderKnownHostStore] = []
+    confirmed = []
+    for marker in (b"first-writer-a", b"first-writer-b"):
+        store = ProviderKnownHostStore(
+            old.known_hosts_file.parent,
+            runner=KeyscanRunner(_valid_output(profile, marker=marker)),
+        )
+        pending = store.probe(profile)
+        candidate = pending.candidates[0]
+        stores.append(store)
+        confirmed.append(
+            store.confirm_pending(
+                pending,
+                profile=profile,
+                algorithm=candidate.algorithm,
+                fingerprint=candidate.fingerprint,
+            )
+        )
+
+    def rotate(index: int) -> str:
+        return stores[index].rotate(
+            profile,
+            expected_old_fingerprint=old.fingerprint,
+            confirmed_pending=confirmed[index],
+        ).fingerprint
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(rotate, index) for index in range(2)]
+    successes = [future.result() for future in futures if future.exception() is None]
+    failures = [future.exception() for future in futures if future.exception() is not None]
+
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], ValueError)
+    assert "expected fingerprint" in str(failures[0])
+
+
+def test_spawn_lease_holds_shared_lock_until_process_lifecycle_ends(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    revoker = ProviderKnownHostStore(
+        binding.known_hosts_file.parent,
+        runner=KeyscanRunner(""),
+    )
+    started = threading.Event()
+
+    def revoke() -> None:
+        started.set()
+        revoker.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        with binding.open_for_spawn(profile) as lease_path:
+            assert lease_path.exists()
+            future = executor.submit(revoke)
+            assert started.wait(timeout=1.0)
+            with pytest.raises(TimeoutError):
+                future.result(timeout=0.05)
+            assert not future.done()
+
+        future.result(timeout=1.0)
+    finally:
+        executor.shutdown(wait=True)
+    assert not binding.known_hosts_file.exists()
 
 
 def test_confirmation_fsyncs_file_and_store_directory(

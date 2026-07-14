@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import shlex
+import shutil
 import subprocess
 import struct
 from pathlib import Path
@@ -14,7 +15,11 @@ from openevo.deployment.host_keys import (
     ProviderKnownHostStore,
     TrustedKnownHostsBinding,
 )
-from openevo.deployment.ssh import SshRemoteExecutorTransport
+from openevo.deployment.ssh import (
+    SshRemoteExecutorTransport,
+    SshTransportError,
+    SshTransportErrorCode,
+)
 from openevo.deployment import RemoteProfileConfig
 
 
@@ -154,9 +159,20 @@ def _expected_ssh_base(
     *,
     key_path: Path | None = None,
 ) -> list[str]:
-    argv = ["ssh", "-p", str(profile.port)]
+    argv = ["ssh", "-F", "/dev/null", "-p", str(profile.port)]
     if key_path is not None:
-        argv.extend(["-i", str(key_path)])
+        argv.extend(
+            [
+                "-o",
+                "IdentityFile=none",
+                "-i",
+                str(key_path),
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "IdentityAgent=none",
+            ]
+        )
     argv.extend(
         [
             "-o",
@@ -203,8 +219,20 @@ def test_run_forces_provider_known_hosts_options(tmp_path: Path) -> None:
 
     transport.run("true")
 
-    assert runner.calls[0][0] == [
-        *_expected_ssh_base(profile, binding),
+    argv = runner.calls[0][0]
+    known_hosts = next(
+        value.removeprefix("UserKnownHostsFile=")
+        for value in argv
+        if value.startswith("UserKnownHostsFile=")
+    )
+    assert known_hosts != str(binding.known_hosts_file)
+    assert not Path(known_hosts).exists()
+    expected = _expected_ssh_base(profile, binding)
+    expected[expected.index(f"UserKnownHostsFile={binding.known_hosts_file}")] = (
+        f"UserKnownHostsFile={known_hosts}"
+    )
+    assert argv == [
+        *expected,
         "--",
         "gpu.example.edu",
         "true",
@@ -252,10 +280,12 @@ def test_ipv6_rsync_and_tunnel_keep_exact_trust_binding(tmp_path: Path) -> None:
     rsync_argv = runner.calls[1][0]
     assert rsync_argv[-1] == "[2001:db8::8]:/remote/workspace/"
     assert "StrictHostKeyChecking=yes" in rsync_argv[4]
-    assert f"UserKnownHostsFile={binding.known_hosts_file}" in rsync_argv[4]
+    assert "UserKnownHostsFile=" in rsync_argv[4]
+    assert str(binding.known_hosts_file) not in rsync_argv[4]
     assert starter.calls[0][-2:] == ["--", "2001:db8::8"]
     assert "StrictHostKeyChecking=yes" in starter.calls[0]
-    assert f"UserKnownHostsFile={binding.known_hosts_file}" in starter.calls[0]
+    assert any(value.startswith("UserKnownHostsFile=") for value in starter.calls[0])
+    assert f"UserKnownHostsFile={binding.known_hosts_file}" not in starter.calls[0]
 
 
 def test_ssh_transport_satisfies_executor_protocol(tmp_path: Path) -> None:
@@ -284,7 +314,7 @@ def test_run_invokes_ssh_with_batch_mode_and_maps_result(tmp_path: Path) -> None
     assert runner.calls[0][1] == 12.5
 
 
-def test_run_maps_nonzero_exit_without_throwing(tmp_path: Path) -> None:
+def test_run_maps_remote_nonzero_exit_without_throwing(tmp_path: Path) -> None:
     runner = RecordingRunner(fail=True)
     transport = _transport(tmp_path, runner=runner)
 
@@ -314,9 +344,202 @@ def test_private_key_auth_adds_identity_file_as_argv(tmp_path: Path) -> None:
     transport.run("true")
 
     argv = runner.calls[0][0]
-    assert argv[0:6] == ["ssh", "-p", "2222", "-i", str(key), "-o"]
+    assert argv[0:10] == [
+        "ssh",
+        "-F",
+        "/dev/null",
+        "-p",
+        "2222",
+        "-o",
+        "IdentityFile=none",
+        "-i",
+        str(key),
+        "-o",
+    ]
+    assert "IdentitiesOnly=yes" in argv
+    assert "IdentityAgent=none" in argv
     assert "BatchMode=yes" in argv
     assert argv[-5:] == ["-l", "alice", "--", "gpu.example.edu", "true"]
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="OpenSSH is unavailable")
+def test_private_key_final_openssh_config_contains_only_explicit_identity(
+    tmp_path: Path,
+) -> None:
+    key = tmp_path / "id_ed25519"
+    key.write_text("key", encoding="utf-8")
+    effective: dict[str, list[str]] = {}
+
+    class EffectiveConfigRunner(RecordingRunner):
+        def __call__(
+            self, argv: list[str], timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append((argv, timeout_seconds))
+            config_argv = [argv[0], "-G", *argv[1:-3], argv[-2]]
+            inspected = subprocess.run(
+                config_argv,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            for line in inspected.stdout.splitlines():
+                name, _, value = line.partition(" ")
+                effective.setdefault(name, []).append(value)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    profile = _profile(
+        auth={"method": "private_key", "private_key_path": str(key)}
+    )
+    transport = _transport(tmp_path, profile=profile, runner=EffectiveConfigRunner())
+
+    transport.run("true")
+
+    assert effective["identitiesonly"] == ["yes"]
+    assert effective["identityagent"] == ["none"]
+    assert effective["identityfile"] == ["none", str(key)]
+
+
+def test_private_key_isolation_is_identical_for_command_rsync_and_tunnel(
+    tmp_path: Path,
+) -> None:
+    key = tmp_path / "id_ed25519"
+    key.write_text("key", encoding="utf-8")
+    local = tmp_path / "workspace"
+    local.mkdir()
+    profile = _profile(
+        auth={"method": "private_key", "private_key_path": str(key)}
+    )
+    runner = RecordingRunner()
+    starter = RecordingTunnelStarter()
+    transport = _transport(
+        tmp_path,
+        profile=profile,
+        runner=runner,
+        tunnel_starter=starter,
+    )
+
+    transport.run("true")
+    transport.upload_dir(str(local), "/remote/workspace")
+    tunnel = transport.open_tunnel(
+        remote_port=8765, local_port=49155, wait_for_ready=False
+    )
+
+    command_argv = runner.calls[0][0]
+    rsync_shell = runner.calls[2][0][4]
+    tunnel_argv = starter.calls[0]
+    for required in (
+        "-F",
+        "/dev/null",
+        "IdentitiesOnly=yes",
+        "IdentityAgent=none",
+        "IdentityFile=none",
+    ):
+        assert required in command_argv
+        assert shlex.quote(required) in rsync_shell
+        assert required in tunnel_argv
+    assert command_argv.count(str(key)) == 1
+    assert shlex.split(rsync_shell).count(str(key)) == 1
+    assert tunnel_argv.count(str(key)) == 1
+    tunnel.close()
+
+
+def test_spawn_lease_survives_trust_root_rename_and_replacement(tmp_path: Path) -> None:
+    profile = _profile()
+    binding = _trusted_binding(tmp_path, profile)
+    original_root = binding.known_hosts_file.parent
+    moved_root = tmp_path / "moved-known-hosts"
+    canary = "TRUST_PATH_CANARY"
+
+    class RacingRunner(RecordingRunner):
+        def __call__(
+            self, argv: list[str], timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append((argv, timeout_seconds))
+            lease_path = Path(
+                next(
+                    value.removeprefix("UserKnownHostsFile=")
+                    for value in argv
+                    if value.startswith("UserKnownHostsFile=")
+                )
+            )
+            original_root.rename(moved_root)
+            original_root.mkdir(mode=0o700)
+            (original_root / binding.known_hosts_file.name).write_text(
+                canary, encoding="utf-8"
+            )
+            assert binding.public_key in lease_path.read_text(encoding="utf-8")
+            assert canary not in lease_path.read_text(encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner = RacingRunner()
+    transport = SshRemoteExecutorTransport(profile, trusted_host=binding, runner=runner)
+
+    assert transport.run("true").ok
+    with pytest.raises(ValueError, match="root binding changed"):
+        binding.validate_for(profile)
+
+
+def test_ssh_host_key_error_does_not_leak_known_hosts_path(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    canary = "TRUST_PATH_CANARY"
+
+    class HostMismatchRunner(RecordingRunner):
+        def __call__(
+            self, argv: list[str], timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append((argv, timeout_seconds))
+            return subprocess.CompletedProcess(
+                argv,
+                255,
+                stdout="",
+                stderr=(
+                    "REMOTE HOST IDENTIFICATION HAS CHANGED; offending key in "
+                    f"/private/{canary}/known_hosts"
+                ),
+            )
+
+    transport = _transport(tmp_path, runner=HostMismatchRunner())
+
+    with pytest.raises(SshTransportError) as exc_info:
+        transport.run("true")
+
+    assert exc_info.value.code is SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+    assert canary not in str(exc_info.value)
+    assert canary in caplog.text
+
+
+def test_rsync_error_does_not_leak_known_hosts_path(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    local = tmp_path / "workspace"
+    local.mkdir()
+    canary = "TRUST_PATH_CANARY"
+
+    class CanaryRsyncRunner(RecordingRunner):
+        def __call__(
+            self, argv: list[str], timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append((argv, timeout_seconds))
+            if len(self.calls) == 1:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                argv,
+                255,
+                stdout="",
+                stderr=f"failed to open /private/{canary}/known_hosts",
+            )
+
+    transport = _transport(tmp_path, runner=CanaryRsyncRunner())
+
+    with pytest.raises(SshTransportError) as exc_info:
+        transport.upload_dir(str(local), "/remote/workspace")
+
+    assert exc_info.value.code is SshTransportErrorCode.RSYNC_FAILED
+    assert canary not in str(exc_info.value)
+    assert canary in caplog.text
 
 
 def test_run_quotes_remote_env_values_and_cwd(tmp_path: Path) -> None:
@@ -452,12 +675,21 @@ def test_upload_dir_creates_remote_parent_and_runs_rsync(tmp_path: Path) -> None
     transport.upload_dir(str(local), "/home/alice/.openevo/workspaces/task")
 
     assert runner.calls[0][0][-1] == "mkdir -p /home/alice/.openevo/workspaces/task"
+    actual_shell = shlex.split(runner.calls[1][0][4])
+    lease_option = next(
+        value for value in actual_shell if value.startswith("UserKnownHostsFile=")
+    )
+    assert str(binding.known_hosts_file) not in lease_option
+    expected_shell = _expected_ssh_base(profile, binding)
+    expected_shell[
+        expected_shell.index(f"UserKnownHostsFile={binding.known_hosts_file}")
+    ] = lease_option
     assert runner.calls[1][0] == [
         "rsync",
         "-az",
         "--delete",
         "-e",
-        shlex.join(_expected_ssh_base(profile, binding)),
+        shlex.join(expected_shell),
         f"{local}/",
         "gpu.example.edu:/home/alice/.openevo/workspaces/task/",
     ]
@@ -482,9 +714,20 @@ def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process(
     assert tunnel.local_port == 49155
     assert tunnel.remote_port == 8765
     assert tunnel.base_url == "http://127.0.0.1:49155"
+    lease_option = next(
+        value
+        for value in starter.calls[0]
+        if value.startswith("UserKnownHostsFile=")
+    )
+    lease_path = Path(lease_option.removeprefix("UserKnownHostsFile="))
+    assert lease_path.exists()
+    expected_base = _expected_ssh_base(profile, binding)
+    expected_base[
+        expected_base.index(f"UserKnownHostsFile={binding.known_hosts_file}")
+    ] = lease_option
     assert starter.calls == [
         [
-            *_expected_ssh_base(profile, binding),
+            *expected_base,
             "-N",
             "-L",
             "127.0.0.1:49155:127.0.0.1:8765",
@@ -498,6 +741,7 @@ def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process(
     assert starter.processes[0].terminated is True
     assert starter.processes[0].waited is True
     assert starter.processes[0].killed is False
+    assert not lease_path.exists()
 
 
 def test_upload_dir_rejects_missing_local_path(tmp_path: Path) -> None:
