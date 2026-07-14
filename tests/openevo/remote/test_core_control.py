@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import errno
 import json
 import hashlib
 import os
 from pathlib import Path
+import signal
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -178,7 +181,7 @@ def test_generation_bootstrap_keeps_proxy_only_in_install_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    install_root = tmp_path / "core" / "releases" / "generation"
+    install_root = tmp_path / "core" / "releases" / ("1" * 32)
     wheel = tmp_path / "openevo.whl"
     wheel.write_bytes(b"wheel")
     captured_install: dict[str, str] = {}
@@ -192,6 +195,7 @@ def test_generation_bootstrap_keeps_proxy_only_in_install_environment(
             interpreter = Path(root) / "bin" / "python"
             interpreter.parent.mkdir(parents=True)
             interpreter.write_bytes(b"python")
+            interpreter.chmod(0o700)
 
     def fake_run(*_args: object, **kwargs: object) -> SimpleNamespace:
         captured_install.update(kwargs["env"])
@@ -216,7 +220,7 @@ def test_generation_bootstrap_keeps_proxy_only_in_install_environment(
             "generation-bootstrap",
             str(install_root),
             str(wheel),
-            "/verified/python3.11",
+            sys.executable,
             "bootstrap",
         ],
     )
@@ -242,6 +246,267 @@ def test_generation_bootstrap_keeps_proxy_only_in_install_environment(
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     }.intersection(captured_service)
+    assert install_root.is_dir()
+    assert list((tmp_path / "core" / "release-staging").iterdir()) == []
+
+
+@pytest.mark.parametrize("failure_phase", ["venv", "pip", "enospc"])
+def test_generation_bootstrap_cleans_failed_private_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    generation = "2" * 32
+    install_root = tmp_path / "core" / "releases" / generation
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+
+    class FakeEnvBuilder:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def create(self, root: Path) -> None:
+            partial = Path(root) / "partial"
+            partial.write_bytes(b"partial generation")
+            if failure_phase == "venv":
+                raise RuntimeError("private venv failure")
+            if failure_phase == "enospc":
+                raise OSError(errno.ENOSPC, "private path")
+            interpreter = Path(root) / "bin" / "python"
+            interpreter.parent.mkdir()
+            interpreter.write_bytes(b"python")
+            interpreter.chmod(0o700)
+
+    def fake_run(*args: object, **_kwargs: object) -> SimpleNamespace:
+        command = args[0]
+        is_pip = isinstance(command, list) and "pip" in command
+        return SimpleNamespace(returncode=1 if failure_phase == "pip" and is_pip else 0)
+
+    monkeypatch.setattr(venv, "EnvBuilder", FakeEnvBuilder)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generation-bootstrap",
+            str(install_root),
+            str(wheel),
+            sys.executable,
+            "bootstrap",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as failed:
+        exec(compile(core_control._GENERATION_BOOTSTRAP, "<bootstrap>", "exec"), {})
+
+    assert failed.value.code == 73
+    assert not install_root.exists()
+    assert list((tmp_path / "core" / "release-staging").iterdir()) == []
+
+
+def test_generation_bootstrap_retains_unsafe_cleanup_authority_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = "3" * 32
+    install_root = tmp_path / "core" / "releases" / generation
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+
+    class UnsafeEnvBuilder:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def create(self, root: Path) -> None:
+            os.mkfifo(Path(root) / "unsafe", 0o600)
+            raise OSError(errno.ENOSPC, "private path")
+
+    monkeypatch.setattr(venv, "EnvBuilder", UnsafeEnvBuilder)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generation-bootstrap",
+            str(install_root),
+            str(wheel),
+            sys.executable,
+            "bootstrap",
+        ],
+    )
+
+    for _attempt in range(2):
+        with pytest.raises(SystemExit) as failed:
+            exec(compile(core_control._GENERATION_BOOTSTRAP, "<bootstrap>", "exec"), {})
+        assert failed.value.code == 73
+
+    stage = tmp_path / "core" / "release-staging" / f"staged-{generation}"
+    assert (stage / ".openevo-generation-authority").is_file()
+    assert stat.S_ISFIFO(os.lstat(stage / "unsafe").st_mode)
+    assert not install_root.exists()
+
+
+def _generation_subprocess_source(
+    *,
+    install_root: Path,
+    wheel: Path,
+    kill_during_install: bool = False,
+) -> str:
+    run_body = (
+        "os.kill(os.getpid(), signal.SIGKILL)"
+        if kill_during_install
+        else "return types.SimpleNamespace(returncode=0)"
+    )
+    return f"""
+import os, pathlib, signal, subprocess, sys, types, venv
+class FakeEnvBuilder:
+    def __init__(self, **kwargs):
+        pass
+    def create(self, root):
+        interpreter = pathlib.Path(root) / 'bin' / 'python'
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_bytes(b'python')
+        interpreter.chmod(0o700)
+def fake_run(*args, **kwargs):
+    {run_body}
+venv.EnvBuilder = FakeEnvBuilder
+subprocess.run = fake_run
+os.execve = lambda *args: (_ for _ in ()).throw(SystemExit(0))
+sys.argv = ['generation-bootstrap', {str(install_root)!r}, {str(wheel)!r}, sys.executable, 'bootstrap']
+exec(compile({core_control._GENERATION_BOOTSTRAP!r}, '<bootstrap>', 'exec'), {{}})
+"""
+
+
+def test_generation_bootstrap_recovers_sigkill_residue_and_retries_successfully(
+    tmp_path: Path,
+) -> None:
+    service_root = tmp_path / "core"
+    crashed_generation = "4" * 32
+    recovered_generation = "5" * 32
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    crashed_root = service_root / "releases" / crashed_generation
+    crashed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=crashed_root,
+                wheel=wheel,
+                kill_during_install=True,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert crashed.returncode == -signal.SIGKILL
+    stale_stage = service_root / "release-staging" / f"staged-{crashed_generation}"
+    assert (stale_stage / ".openevo-generation-authority").is_file()
+
+    recovered_root = service_root / "releases" / recovered_generation
+    recovered = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(install_root=recovered_root, wheel=wheel),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert recovered_root.is_dir()
+    assert not stale_stage.exists()
+    assert list((service_root / "release-staging").iterdir()) == []
+
+
+def test_generation_bootstrap_serializes_concurrent_publications(tmp_path: Path) -> None:
+    service_root = tmp_path / "core"
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    generations = ("6" * 32, "7" * 32)
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                _generation_subprocess_source(
+                    install_root=service_root / "releases" / generation,
+                    wheel=wheel,
+                ),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for generation in generations
+    ]
+
+    results = [process.communicate(timeout=20) for process in processes]
+
+    assert [process.returncode for process in processes] == [0, 0], results
+    assert {path.name for path in (service_root / "releases").iterdir()} == set(
+        generations
+    )
+    assert list((service_root / "release-staging").iterdir()) == []
+
+
+def test_generation_bootstrap_rejects_service_root_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = "8" * 32
+    service_root = tmp_path / "core"
+    displaced = tmp_path / "displaced-core"
+    install_root = service_root / "releases" / generation
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+
+    class FakeEnvBuilder:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def create(self, root: Path) -> None:
+            interpreter = Path(root) / "bin" / "python"
+            interpreter.parent.mkdir(parents=True)
+            interpreter.write_bytes(b"python")
+            interpreter.chmod(0o700)
+
+    replaced = False
+
+    def replace_root(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            service_root.rename(displaced)
+            service_root.mkdir(mode=0o700)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(venv, "EnvBuilder", FakeEnvBuilder)
+    monkeypatch.setattr(subprocess, "run", replace_root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generation-bootstrap",
+            str(install_root),
+            str(wheel),
+            sys.executable,
+            "bootstrap",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as failed:
+        exec(compile(core_control._GENERATION_BOOTSTRAP, "<bootstrap>", "exec"), {})
+
+    assert failed.value.code == 73
+    assert replaced is True
+    assert not install_root.exists()
+    assert list((displaced / "release-staging").iterdir()) == []
 
 
 def test_core_bootstrap_rejects_pathsep_and_non_closed_remote_paths() -> None:
@@ -289,6 +554,27 @@ def test_core_bootstrap_preserves_ssh_timeout_as_retryable_deadline(
 
     assert exc_info.value.code is CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED
     assert exc_info.value.retryable is True
+
+
+def test_core_bootstrap_maps_generation_install_exit_without_private_output() -> None:
+    plan = build_core_control_bootstrap_plan(
+        runtime=_runtime(),
+        wheel_path="/secret/upload/openevo.whl",
+        framework_lock="/secret/upload/framework-lock.json",
+        service_root="/home/user/.openevo/core",
+        source_commit="1" * 40,
+    )
+    transport = FakeTransport("private proxy credential", return_codes=[73])
+
+    with pytest.raises(CoreControlBootstrapError) as failed:
+        execute_core_control_bootstrap(plan, transport)
+
+    assert failed.value.code is CoreControlBootstrapErrorCode.INSTALL_FAILED
+    assert failed.value.retryable is True
+    assert "installed" in str(failed.value)
+    assert "secret" not in str(failed.value)
+    assert "proxy" not in str(failed.value)
+    assert transport.secret_commands == []
 
 
 def test_bootstrap_does_not_expose_bearer_in_normal_command_result() -> None:

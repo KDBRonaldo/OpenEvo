@@ -73,6 +73,21 @@ missing Python, uv provisioning/network failure, unsupported kernel syscalls,
 and invalid selection responses. This internal change does not alter frozen
 Desktop/Core OpenAPI or event contracts.
 
+The generation installer serializes recovery and installation under a verified
+owner-only lock. It creates venvs only under bounded `release-staging`, keeps an
+inode-bound child-inherited authority lease through ensurepip, wheel install, and
+staged import verification, and atomically publishes to
+`releases/<generation>` only after success. Failed cleanup leaves its authority
+for a typed fail-closed retry. Exit 73 maps to
+`core_bootstrap_install_failed`, whose Desktop projection contains no command,
+path, proxy value, output, or secret.
+
+Remote asset finalize owns incoming only after it acquires the exact rsync lease.
+A busy lease leaves the directory, marker, lease path, and files unchanged. Once
+acquired, the lease FD remains held through verification, publication, and
+retirement. Prepare may create another bounded transfer while the first lease is
+active, and stale recovery skips held leases.
+
 Network proxy and bootstrap TLS variables are scoped to uv/Python provisioning
 and isolated wheel installation. Before the generation interpreter becomes the
 long-running Core service, the launcher builds a separate environment containing

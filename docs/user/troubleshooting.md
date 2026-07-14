@@ -52,6 +52,13 @@ The following activation failures have different repairs:
   supported Linux server/kernel.
 - `core_supervisor_runtime_unsupported`: Linux boot/process identity could not
   be verified. Check that `/proc` and the kernel boot ID are available.
+- `core_bootstrap_install_failed`: the isolated Core generation could not finish
+  venv creation, pip bootstrapping, wheel installation, staged import
+  verification, or safe recovery of an interrupted generation. Check available
+  home-directory space and inode capacity, plus the configured proxy/network/TLS
+  settings, then use the Desktop retry action. A retry safely recovers a bounded
+  OpenEvo-owned partial generation; do not manually replace files under
+  `~/.openevo/core`.
 
 OpenEvo probes kernel syscalls directly. A uv Python that lacks the convenience
 attributes `os.pidfd_open` or `signal.pidfd_send_signal` is still supported and

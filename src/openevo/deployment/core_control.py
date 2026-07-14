@@ -34,9 +34,13 @@ _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _MAX_BOOTSTRAP_JSON_BYTES = 4096
 _REMOTE_PATH_PATTERN = re.compile(r"/(?:[A-Za-z0-9._@%+=,-]+/)*[A-Za-z0-9._@%+=,-]+\Z")
-_GENERATION_BOOTSTRAP = """
+_GENERATION_BOOTSTRAP = r"""
+import ctypes
+import errno
+import fcntl
 import os
 from pathlib import Path
+import re
 import subprocess
 import stat
 import sys
@@ -46,31 +50,325 @@ install_root = Path(sys.argv[1])
 wheel_path = Path(sys.argv[2])
 base_executable = sys.argv[3]
 service_argv = sys.argv[4:]
+uid = os.geteuid()
+generation = install_root.name
+service_root = install_root.parent.parent
+staging_name = "staged-" + generation
+authority_name = ".openevo-generation-authority"
+max_staged_generations = 8
+max_cleanup_nodes = 200000
+max_cleanup_bytes = 2 * 1024 * 1024 * 1024
+max_cleanup_depth = 64
+dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+class InstallFailure(Exception):
+    pass
+
+
+def fail():
+    raise InstallFailure
+
+
+def open_absolute_dir(path):
+    parts = str(path).split("/")[1:]
+    if not parts or any(not part or part in {".", ".."} for part in parts):
+        fail()
+    fd = os.open("/", dir_flags)
+    try:
+        for part in parts:
+            child = os.open(part, dir_flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def require_owned_dir(fd):
+    metadata = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != uid
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail()
+    return metadata
+
+
+def require_binding(path, fd):
+    rebound = open_absolute_dir(path)
+    try:
+        expected = os.fstat(fd)
+        current = os.fstat(rebound)
+        if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+            fail()
+    finally:
+        os.close(rebound)
+
+
+def ensure_private_dir(parent, name):
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent)
+        os.fsync(parent)
+    except FileExistsError:
+        pass
+    fd = os.open(name, dir_flags, dir_fd=parent)
+    try:
+        opened = require_owned_dir(fd)
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            fail()
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def open_lock(parent, name):
+    fd = os.open(
+        name,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=parent,
+    )
+    try:
+        opened = os.fstat(fd)
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != uid
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            fail()
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            fail()
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def create_authority(stage_fd, stage_metadata):
+    fd = os.open(
+        authority_name,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=stage_fd,
+    )
+    try:
+        payload = (
+            "openevo-core-generation-stage-v1\n"
+            + generation
+            + "\n"
+            + str(stage_metadata.st_dev)
+            + ":"
+            + str(stage_metadata.st_ino)
+            + "\n"
+        ).encode("ascii")
+        if os.write(fd, payload) != len(payload):
+            fail()
+        os.fsync(fd)
+        opened = os.fstat(fd)
+        current = os.stat(authority_name, dir_fd=stage_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != uid
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size != len(payload)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            fail()
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.fsync(stage_fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def verify_authority(stage_fd, stage_name, *, lock):
+    authority_fd = os.open(
+        authority_name,
+        os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=stage_fd,
+    )
+    try:
+        stage_metadata = require_owned_dir(stage_fd)
+        authority = os.fstat(authority_fd)
+        current = os.stat(authority_name, dir_fd=stage_fd, follow_symlinks=False)
+        expected = (
+            "openevo-core-generation-stage-v1\n"
+            + stage_name[len("staged-"):]
+            + "\n"
+            + str(stage_metadata.st_dev)
+            + ":"
+            + str(stage_metadata.st_ino)
+            + "\n"
+        ).encode("ascii")
+        if (
+            not stat.S_ISREG(authority.st_mode)
+            or authority.st_uid != uid
+            or authority.st_nlink != 1
+            or stat.S_IMODE(authority.st_mode) != 0o600
+            or authority.st_size != len(expected)
+            or authority.st_size > 256
+            or (authority.st_dev, authority.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            fail()
+        content = os.pread(authority_fd, 257, 0)
+        if content != expected:
+            fail()
+        if lock:
+            try:
+                fcntl.flock(authority_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fail()
+        return authority_fd
+    except BaseException:
+        os.close(authority_fd)
+        raise
+
+
+def cleanup_stage(staging_fd, stage_name):
+    stage_fd = os.open(stage_name, dir_flags, dir_fd=staging_fd)
+    authority_fd = -1
+    budget = {"nodes": 0, "bytes": 0}
+    try:
+        opened = require_owned_dir(stage_fd)
+        current = os.stat(stage_name, dir_fd=staging_fd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            fail()
+        authority_fd = verify_authority(stage_fd, stage_name, lock=True)
+
+        def clear_directory(fd, depth):
+            if depth > max_cleanup_depth:
+                fail()
+            names = []
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    budget["nodes"] += 1
+                    if budget["nodes"] > max_cleanup_nodes:
+                        fail()
+                    names.append(entry.name)
+            for name in names:
+                if depth == 0 and name == authority_name:
+                    continue
+                metadata = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                budget["bytes"] += max(0, metadata.st_size)
+                if budget["bytes"] > max_cleanup_bytes or metadata.st_uid != uid:
+                    fail()
+                if stat.S_ISDIR(metadata.st_mode):
+                    child_fd = os.open(name, dir_flags, dir_fd=fd)
+                    try:
+                        child = os.fstat(child_fd)
+                        current_child = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                        if (child.st_dev, child.st_ino) != (
+                            current_child.st_dev,
+                            current_child.st_ino,
+                        ):
+                            fail()
+                        clear_directory(child_fd, depth + 1)
+                    finally:
+                        os.close(child_fd)
+                    os.rmdir(name, dir_fd=fd)
+                elif stat.S_ISREG(metadata.st_mode):
+                    child_fd = os.open(name, file_flags, dir_fd=fd)
+                    try:
+                        child = os.fstat(child_fd)
+                        current_child = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                        if (
+                            child.st_uid != uid
+                            or child.st_nlink != 1
+                            or (child.st_dev, child.st_ino)
+                            != (current_child.st_dev, current_child.st_ino)
+                        ):
+                            fail()
+                        os.unlink(name, dir_fd=fd)
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISLNK(metadata.st_mode):
+                    os.unlink(name, dir_fd=fd)
+                else:
+                    fail()
+            os.fsync(fd)
+
+        clear_directory(stage_fd, 0)
+        current_authority = os.stat(
+            authority_name, dir_fd=stage_fd, follow_symlinks=False
+        )
+        opened_authority = os.fstat(authority_fd)
+        if (opened_authority.st_dev, opened_authority.st_ino) != (
+            current_authority.st_dev,
+            current_authority.st_ino,
+        ):
+            fail()
+        os.unlink(authority_name, dir_fd=stage_fd)
+        os.fsync(stage_fd)
+        current = os.stat(stage_name, dir_fd=staging_fd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            fail()
+    finally:
+        if authority_fd >= 0:
+            os.close(authority_fd)
+        os.close(stage_fd)
+    os.rmdir(stage_name, dir_fd=staging_fd)
+    os.fsync(staging_fd)
+
+
+def reconcile_staging(staging_fd):
+    names = []
+    with os.scandir(staging_fd) as entries:
+        for entry in entries:
+            if len(names) >= max_staged_generations:
+                fail()
+            names.append(entry.name)
+    for name in names:
+        if re.fullmatch(r"staged-[0-9a-f]{32}", name) is None:
+            fail()
+        cleanup_stage(staging_fd, name)
+
+
+def rename_noreplace(source_parent, source_name, destination_parent, destination_name):
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        fail()
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_parent,
+        os.fsencode(source_name),
+        destination_parent,
+        os.fsencode(destination_name),
+        1,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        fail()
+    raise OSError(error, "Core generation publication failed")
+
+
+if (
+    not install_root.is_absolute()
+    or re.fullmatch(r"[0-9a-f]{32}", generation) is None
+    or install_root != service_root / "releases" / generation
+):
+    raise SystemExit(73)
+
 # FD-bound invocation deliberately reports /proc/self/fd/N. Restore the verified
 # canonical base path so venv copies and pyvenv.cfg bind the selected runtime.
 sys.executable = base_executable
 sys._base_executable = base_executable
-parent = install_root.parent
-service_root = parent.parent
-service_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-service_metadata = service_root.lstat()
-if (
-    not stat.S_ISDIR(service_metadata.st_mode)
-    or service_metadata.st_uid != os.geteuid()
-    or service_metadata.st_mode & 0o777 != 0o700
-):
-    raise SystemExit(71)
-parent.mkdir(mode=0o700, exist_ok=True)
-parent_metadata = parent.lstat()
-if (
-    not stat.S_ISDIR(parent_metadata.st_mode)
-    or parent_metadata.st_uid != os.geteuid()
-    or parent_metadata.st_mode & 0o777 != 0o700
-):
-    raise SystemExit(72)
-install_root.mkdir(mode=0o700)
-venv.EnvBuilder(with_pip=True, symlinks=False).create(install_root)
-interpreter = install_root / "bin" / "python"
 install_environment = {
     key: value
     for key, value in os.environ.items()
@@ -90,37 +388,164 @@ install_environment = {
         "no_proxy",
     }
 }
-completed = subprocess.run(
-    [
-        str(interpreter),
-        "-I",
-        "-m",
-        "pip",
-        "install",
-        "--isolated",
-        "--disable-pip-version-check",
-        "--only-binary=:all:",
-        "--no-compile",
-        str(wheel_path),
-    ],
-    env=install_environment,
-    stdin=subprocess.DEVNULL,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    check=False,
-)
-if completed.returncode != 0:
-    raise SystemExit(73)
 service_environment = {
     key: value
     for key, value in os.environ.items()
     if key in {"HOME", "LANG", "LC_ALL", "PATH"}
 }
-os.execve(
-    interpreter,
-    [str(interpreter), "-I", "-m", "openevo.backend.service", *service_argv],
-    service_environment,
-)
+
+service_root_fd = -1
+lock_fd = -1
+staging_fd = -1
+releases_fd = -1
+stage_fd = -1
+authority_fd = -1
+published = False
+try:
+    try:
+        service_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        service_root_fd = open_absolute_dir(service_root)
+        require_owned_dir(service_root_fd)
+        require_binding(service_root, service_root_fd)
+        lock_fd = open_lock(service_root_fd, "generation-install.lock")
+        require_binding(service_root, service_root_fd)
+        staging_fd = ensure_private_dir(service_root_fd, "release-staging")
+        releases_fd = ensure_private_dir(service_root_fd, "releases")
+        reconcile_staging(staging_fd)
+        require_binding(service_root, service_root_fd)
+        os.mkdir(staging_name, 0o700, dir_fd=staging_fd)
+        os.fsync(staging_fd)
+        stage_fd = os.open(staging_name, dir_flags, dir_fd=staging_fd)
+        stage_metadata = require_owned_dir(stage_fd)
+        current_stage = os.stat(staging_name, dir_fd=staging_fd, follow_symlinks=False)
+        if (stage_metadata.st_dev, stage_metadata.st_ino) != (
+            current_stage.st_dev,
+            current_stage.st_ino,
+        ):
+            fail()
+        authority_fd = create_authority(stage_fd, stage_metadata)
+        staged_root = Path("/proc/self/fd") / str(staging_fd) / staging_name
+        venv.EnvBuilder(with_pip=False, symlinks=False).create(staged_root)
+        staged_interpreter = staged_root / "bin" / "python"
+        module_runner = (
+            "import os,runpy,sys;"
+            "stage_fd=sys.argv[1];"
+            "module=sys.argv[2];"
+            "sys.executable=f'/proc/{os.getpid()}/fd/{stage_fd}/bin/python';"
+            "sys.argv=[module,*sys.argv[3:]];"
+            "runpy.run_module(module,run_name='__main__')"
+        )
+        for arguments in (
+            [
+                str(staged_interpreter),
+                "-I",
+                "-c",
+                module_runner,
+                str(stage_fd),
+                "ensurepip",
+                "--upgrade",
+            ],
+            [
+                str(staged_interpreter),
+                "-I",
+                "-c",
+                module_runner,
+                str(stage_fd),
+                "pip",
+                "install",
+                "--isolated",
+                "--disable-pip-version-check",
+                "--only-binary=:all:",
+                "--no-compile",
+                str(wheel_path),
+            ],
+            [
+                str(staged_interpreter),
+                "-I",
+                "-c",
+                "import openevo.backend.service",
+            ],
+        ):
+            completed = subprocess.run(
+                arguments,
+                env=install_environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                close_fds=True,
+                pass_fds=(authority_fd, stage_fd, staging_fd),
+            )
+            if completed.returncode != 0:
+                fail()
+        interpreter_metadata = os.stat(
+            "bin/python", dir_fd=stage_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(interpreter_metadata.st_mode)
+            or interpreter_metadata.st_uid != uid
+            or interpreter_metadata.st_nlink != 1
+            or interpreter_metadata.st_mode & 0o111 == 0
+        ):
+            fail()
+        require_binding(service_root, service_root_fd)
+        current_stage = os.stat(staging_name, dir_fd=staging_fd, follow_symlinks=False)
+        if (stage_metadata.st_dev, stage_metadata.st_ino) != (
+            current_stage.st_dev,
+            current_stage.st_ino,
+        ):
+            fail()
+        os.fsync(stage_fd)
+        rename_noreplace(staging_fd, staging_name, releases_fd, generation)
+        published = True
+        os.fsync(releases_fd)
+        os.fsync(staging_fd)
+        published_metadata = os.stat(
+            generation, dir_fd=releases_fd, follow_symlinks=False
+        )
+        if (stage_metadata.st_dev, stage_metadata.st_ino) != (
+            published_metadata.st_dev,
+            published_metadata.st_ino,
+        ):
+            fail()
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        if not published and staging_fd >= 0:
+            try:
+                if authority_fd >= 0:
+                    os.close(authority_fd)
+                    authority_fd = -1
+                if stage_fd >= 0:
+                    os.close(stage_fd)
+                    stage_fd = -1
+                cleanup_stage(staging_fd, staging_name)
+            except BaseException:
+                pass
+        raise SystemExit(73) from None
+finally:
+    if authority_fd >= 0:
+        os.close(authority_fd)
+    if stage_fd >= 0:
+        os.close(stage_fd)
+    if releases_fd >= 0:
+        os.close(releases_fd)
+    if staging_fd >= 0:
+        os.close(staging_fd)
+    if lock_fd >= 0:
+        os.close(lock_fd)
+    if service_root_fd >= 0:
+        os.close(service_root_fd)
+
+final_interpreter = install_root / "bin" / "python"
+try:
+    os.execve(
+        final_interpreter,
+        [str(final_interpreter), "-I", "-m", "openevo.backend.service", *service_argv],
+        service_environment,
+    )
+except OSError:
+    raise SystemExit(74) from None
 """.strip()
 
 
@@ -355,9 +780,19 @@ def execute_core_control_bootstrap(
         message="Core Control could not be attached or started.",
     )
     if not service.ok:
+        code = (
+            CoreControlBootstrapErrorCode.INSTALL_FAILED
+            if service.return_code == 73
+            else CoreControlBootstrapErrorCode.SERVICE_FAILED
+        )
+        message = (
+            "The isolated OpenEvo Core generation could not be installed."
+            if code is CoreControlBootstrapErrorCode.INSTALL_FAILED
+            else "Core Control could not be attached or started."
+        )
         raise CoreControlBootstrapError(
-            CoreControlBootstrapErrorCode.SERVICE_FAILED,
-            "Core Control could not be attached or started.",
+            code,
+            message,
             retryable=True,
         )
     consume_command = (

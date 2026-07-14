@@ -491,6 +491,15 @@ that exact path without following symlinks, rechecks its metadata and SHA-256,
 and executes the held FD. A pathname replacement therefore fails closed across
 separate SSH processes instead of selecting another PATH interpreter.
 
+Core generations are built under owner-only `release-staging`, not at their
+final release name. A verified install lock serializes bounded recovery and
+publication, while a per-stage authority lease remains inherited by ensurepip
+and pip. Staged import verification is followed by an atomic no-replace rename
+into `releases/<generation>`. Install failure, ENOSPC, or interruption cleans
+only that inode-bound authority; unsafe cleanup leaves it for a typed
+`core_bootstrap_install_failed` retry. The sidecar projects only the closed
+actionable message and never remote output, paths, proxy values, or secrets.
+
 Runtime failures distinguish no supported Python, failed uv provisioning,
 unsupported kernel syscalls, and malformed/failed selection. The first two give
 actionable Python or network/proxy guidance; they no longer claim Python pidfd
@@ -502,6 +511,11 @@ owner-only `~/.openevo/core/asset-staging` directory, and remotely rechecks file
 identity, mode, size, digest, and the closed lock-to-wheel binding. Only an
 atomic no-replace rename publishes the deterministic asset bundle; retries
 re-verify an existing exact bundle and partial uploads remain non-authoritative.
+Finalize owns an incoming transfer only after it nonblocking-locks the exact
+rsync lease. A busy lease preserves the complete incoming directory and marker
+for retry. Once acquired, the lease FD remains held through publication and
+retirement; prepare and stale recovery count or skip active incoming slots
+without consuming another process's authority.
 The remaining deadline then runs the real isolated Core bootstrap/attach flow.
 The returned bearer is bound to the profile plus complete remote release,
 registry, generation, port, and status-proof identity with a one-way host

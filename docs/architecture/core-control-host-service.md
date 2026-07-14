@@ -58,16 +58,30 @@ The release identity covers:
 - every verified distribution artifact digest and installed inventory digest;
 - the release source commit.
 
-Each Desktop bootstrap creates a new random generation under the canonical
-owner-only `~/.openevo/core/releases/` root. A system interpreter running with
-`-I` creates that generation's venv with copied interpreter binaries and installs
-the uploaded wheel only into that new root. It never imports the wheel through
-`PYTHONPATH`, never writes the user site, and never reuses or force-reinstalls an
-existing generation. The installed generation interpreter then takes the host
+Each Desktop bootstrap creates a new random generation. The installer first
+creates an inode-bound authority under the owner-only
+`~/.openevo/core/release-staging/` root; it does not create the final release
+path. A system interpreter running with `-I` creates the venv there with copied
+interpreter binaries, bootstraps pip, installs the uploaded wheel, and imports
+the Core service from that staged interpreter. It never imports through
+`PYTHONPATH`, writes the user site, or reuses or force-reinstalls an existing
+generation. Only then does an atomic no-replace rename publish the same inode as
+`~/.openevo/core/releases/<generation>`. The installed generation interpreter then takes the host
 bootstrap lock, proves its prefix/import origin/executable metadata, requires the
 explicit wheel to be the framework lock's sibling artifact, and verifies the
 complete lock-declared Core distribution inventory before entering lifecycle work. A verification
 failure leaves the live generation and daemon untouched.
+
+Generation installation is serialized by an owner/inode-verified no-follow
+lock. Each stage also retains a `0600` authority lease through venv, ensurepip,
+pip, and import verification; installer children inherit that lease. Recovery
+scans at most eight closed-name stage roots and removes only owner-bound regular
+files, directories, and symlinks through held directory FDs, with fixed node,
+byte, and depth budgets. The authority is removed last. `SIGKILL`, ENOSPC, or an
+ordinary install failure is therefore either cleaned immediately or left as the
+same retryable authority. A busy, malformed, over-budget, replaced, or otherwise
+unsafe stage fails closed as `core_bootstrap_install_failed`; it is never a
+release and is not deleted by pathname guesswork.
 
 Concurrent verified generation interpreters serialize daemon attachment and
 replacement with the same host bootstrap lock. Direct service ensure calls
@@ -186,8 +200,9 @@ sizes, and digests. `openevo.deployment.core_assets` copies those files into a
 private no-follow local snapshot, while `SshRemoteExecutorTransport` prepares
 the canonical owner-only `~/.openevo/core` subdirectories and performs the
 rsync on the same authenticated transport. A remote standard-library verifier
-requires an exact two-file payload, owner/mode/link identity, both digests, the
-closed lock-to-wheel binding, and an internal transfer lease. Every transfer
+requires the exact two release files plus the owner-bound rsync lease,
+owner/mode/link identity, both digests, and the closed lock-to-wheel binding.
+Every transfer
 uses a unique random incoming authority. Before prepare, the local transport
 publishes one of 16 ownership tokens. The same token owns pending receipt,
 active upload, and inactive cleanup/reconciliation state until confirmed
@@ -197,7 +212,10 @@ inode-revalidated `0600` transfer marker before returning its receipt. A
 recognized empty `0700` incoming inode left before marker creation is recovered
 immediately; any markerless nonempty or otherwise noncanonical shape fails
 closed, so repeated interruption cannot strand all 16 remote slots.
-Finalize copies verified bytes into an owner-only private
+Finalize must acquire and retain the exact lease FD before it owns that incoming directory. A
+busy lease leaves the incoming directory, marker, lease, and files unchanged so
+a later finalize can retry. After ownership is acquired, finalize copies verified
+bytes into an owner-only private
 candidate whose inode and pathname were never exposed to rsync. Members are
 created as `0400` and populated only through publisher-held writer FDs that are
 closed before publication. The candidate directory remains `0700` only while it
@@ -209,7 +227,8 @@ bundle ID. Startup removes bounded, recognized private candidates left in either
 parent by a crash. Finalize keeps the verified candidate FD pinned across both
 atomic no-replace renames and every pathname verification. Finalize returns a
 receipt binding the directory and both member inodes, then retires the incoming
-authority. The SSH transport holds that receipt for bootstrap: under the
+authority while still holding the lease. Only this owner may rename incoming to
+its retired name and remove the lease marker. The SSH transport holds that receipt for bootstrap: under the
 publication lock it revalidates modes, identities, and digests, then substitutes a
 `/proc/<wrapper-pid>/fd/<pinned-bundle-fd>` root while the generation installer
 and its nested pip child run. Same-name replacement cannot redirect consumer

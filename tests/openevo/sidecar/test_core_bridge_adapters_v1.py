@@ -15,6 +15,7 @@ import httpx
 from pydantic import SecretStr
 import pytest
 
+from desktop.sidecar import core_bridge_adapters_v1 as adapters
 from desktop.sidecar.contracts.v1.models import WorkspaceImportRefV1
 from desktop.sidecar.core_bridge_adapters_v1 import (
     AdoptedWorkspaceArchiveSourceV1,
@@ -34,6 +35,10 @@ from desktop.sidecar.workspace_imports import (
     WorkspaceImportStore,
 )
 from openevo.deployment import core_control
+from openevo.deployment.core_control import (
+    CoreControlBootstrapError,
+    CoreControlBootstrapErrorCode,
+)
 from openevo.deployment.core_assets import (
     CoreBootstrapAssetSnapshotError,
     snapshot_core_bootstrap_assets,
@@ -430,6 +435,25 @@ def test_core_host_reports_typed_remote_runtime_failures_before_upload(
     assert transport.stage_calls == []
     assert transport.commands == []
     assert str(tmp_path) not in str(unsupported.value)
+
+
+def test_core_install_failure_is_actionable_and_redacts_remote_details() -> None:
+    private = "http://proxy-user:proxy-secret@127.0.0.1 private/install/path"
+
+    mapped = adapters._bootstrap_error(
+        CoreControlBootstrapError(
+            CoreControlBootstrapErrorCode.INSTALL_FAILED,
+            private,
+            retryable=True,
+        )
+    )
+
+    assert mapped.error.code == "core_bootstrap_install_failed"
+    assert mapped.error.http_status == 503
+    assert mapped.error.retryable is True
+    assert "isolated OpenEvo Core generation" in mapped.error.message
+    assert "proxy-secret" not in str(mapped)
+    assert "private/install/path" not in str(mapped)
 
 
 def test_core_host_normalizes_runtime_and_upload_errors_without_private_values(

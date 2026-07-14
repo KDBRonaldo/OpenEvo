@@ -1252,6 +1252,114 @@ def test_remote_rsync_wrapper_holds_transfer_lease_through_exec(
     os.close(lease_fd)
 
 
+def test_remote_asset_finalize_preserves_busy_incoming_until_lease_owner_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    assets = _assets(tmp_path)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    service_root = home / ".openevo" / "core"
+    incoming = Path(prepared["incoming_root"])
+    for source, target in (
+        (assets[0], incoming / WHEEL_NAME),
+        (assets[2], incoming / "framework-lock.json"),
+    ):
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o600)
+    lease_path = incoming / core_assets.CORE_ASSET_TRANSFER_LEASE
+    lease_fd = os.open(lease_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+    finalize_argv = [
+        str(service_root),
+        BUNDLE_ID,
+        prepared["transfer_id"],
+        WHEEL_NAME,
+        assets[1],
+        str(assets[0].stat().st_size),
+        assets[3],
+        str(assets[2].stat().st_size),
+    ]
+    try:
+        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(SystemExit) as busy:
+            _execute_remote_script(
+                core_assets._REMOTE_FINALIZE_SCRIPT,
+                finalize_argv,
+                home=home,
+                monkeypatch=monkeypatch,
+            )
+
+        assert busy.value.code == 74
+        assert incoming.is_dir()
+        assert lease_path.is_file()
+        assert {path.name for path in incoming.iterdir()} == {
+            core_assets.CORE_ASSET_TRANSFER_LEASE,
+            WHEEL_NAME,
+            "framework-lock.json",
+        }
+        assert len(list((service_root / "asset-staging").iterdir())) == 1
+        assert list((service_root / "assets").iterdir()) == []
+    finally:
+        os.close(lease_fd)
+
+    _execute_remote_script(
+        core_assets._REMOTE_FINALIZE_SCRIPT,
+        finalize_argv,
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    finalized = json.loads(capsys.readouterr().out)
+
+    assert finalized["wheel_path"] == str(
+        service_root / "assets" / BUNDLE_ID / WHEEL_NAME
+    )
+    assert not incoming.exists()
+    assert list((service_root / "asset-staging").iterdir()) == []
+
+
+def test_remote_asset_prepare_can_run_while_other_transfer_lease_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    first = json.loads(capsys.readouterr().out)
+    first_root = Path(first["incoming_root"])
+    first_lease = first_root / core_assets.CORE_ASSET_TRANSFER_LEASE
+    lease_fd = os.open(first_lease, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _execute_remote_script(
+            core_assets._REMOTE_PREPARE_SCRIPT,
+            [BUNDLE_ID],
+            home=home,
+            monkeypatch=monkeypatch,
+        )
+        second = json.loads(capsys.readouterr().out)
+    finally:
+        os.close(lease_fd)
+
+    staging = home / ".openevo" / "core" / "asset-staging"
+    assert first_root.is_dir()
+    assert Path(second["incoming_root"]).is_dir()
+    assert len(list(staging.iterdir())) == 2
+
+
 def stat_mode(path: Path) -> int:
     return os.stat(path, follow_symlinks=False).st_mode & 0o777
 
