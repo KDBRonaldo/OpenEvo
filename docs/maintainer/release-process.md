@@ -67,12 +67,15 @@ have an inherited ACL normalized once; any later ACL addition fails closed.
 The packaged `openevo/wheels` inventory must be exactly the Core wheel plus its
 canonical `framework-lock.json`, both verified through Core's lock loader. After
 an interrupted build, rerun the same builder with the same wheel inputs so its
-durable transaction recovery can complete. Successful and failed cleanup may
-leave an inode-bound `.openevo-core-release-tombstone-*` beside the export
-directory; it is conservative audit evidence and is not part of the exact
-wheel/lock pair. Do not manually remove a tombstone, preserved unknown path,
-hardlink, symlink, or inode-mismatched replacement without first investigating
-the release workspace.
+durable transaction recovery can complete. The builder takes a non-blocking
+exclusive lock on the held output-directory inode before inventory or recovery;
+an active same-output build therefore fails explicitly instead of being treated
+as crash residue. Recoverable cleanup uses one output-identity-bound sibling
+tombstone/purge state and removes it before success. A successful export and the
+candidate workflow must leave exactly the wheel/lock pair with no sibling cleanup
+state. Do not manually remove a preserved unknown path, hardlink, symlink,
+identity-mismatched replacement, or failed-cleanup tombstone without first
+investigating the release workspace.
 
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the

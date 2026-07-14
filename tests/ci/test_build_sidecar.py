@@ -10,6 +10,7 @@ import stat
 import struct
 import subprocess
 import sys
+import time
 from types import ModuleType
 from zipfile import ZipFile
 
@@ -92,17 +93,23 @@ def crash_during_marker(authority, payload, window):
     ):
         os._exit(76)
 
+def crash_during_tombstone(authority, window):
+    del authority
+    if mode == "tombstone" and window == stage_window:
+        os._exit(77)
+
 module._after_core_release_member_published = crash_after_publish
 module._after_core_release_member_cleaned = crash_during_cleanup
 module._after_core_release_stage_window = crash_during_stage
 module._after_core_release_marker_window = crash_during_marker
+module._after_core_release_tombstone_window = crash_during_tombstone
 with module._open_core_release_output(Path({str(output)!r})) as authority:
     module._export_core_release_inputs(
         authority,
         Path({str(wheel)!r}),
         Path({str(lock)!r}),
     )
-    if mode == "rollback":
+    if mode in {{"rollback", "tombstone"}}:
         raise OSError("trigger rollback")
 """
     return subprocess.run(
@@ -747,6 +754,72 @@ def test_core_release_output_is_created_private_and_stays_pinned(tmp_path: Path)
             output.chmod(0o777)
 
     assert list(output.iterdir()) == []
+
+
+def test_concurrent_builder_cannot_recover_a_live_transaction(tmp_path: Path) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    ready = tmp_path / "builder-a-ready"
+    release = tmp_path / "release-builder-a"
+    script = f"""
+import importlib.util
+import os
+from pathlib import Path
+import time
+
+spec = importlib.util.spec_from_file_location("concurrent_build_sidecar", {str(builder_path)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+ready = Path({str(ready)!r})
+release = Path({str(release)!r})
+
+def pause_live_transaction(authority, member):
+    del authority
+    if member.source.name != {wheel.name!r} or ready.exists():
+        return
+    ready.write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 20
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("concurrency test release timed out")
+        time.sleep(0.02)
+
+module._after_core_release_member_published = pause_live_transaction
+with module._open_core_release_output(Path({str(output)!r})) as authority:
+    module._export_core_release_inputs(
+        authority,
+        Path({str(wheel)!r}),
+        Path({str(lock)!r}),
+    )
+"""
+    first = subprocess.Popen([sys.executable, "-c", script])
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and first.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.is_file()
+        assert first.poll() is None
+        transactions = list(output.glob(".openevo-core-release-*"))
+        assert len(transactions) == 1
+
+        with pytest.raises(RuntimeError, match="locked by another active sidecar builder"):
+            with builder._open_core_release_output(output):
+                raise AssertionError("contending builder entered the output context")
+
+        assert first.poll() is None
+        assert list(output.glob(".openevo-core-release-*")) == transactions
+        release.write_text("release", encoding="utf-8")
+        assert first.wait(timeout=10) == 0
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.wait(timeout=5)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+    assert not list(tmp_path.glob(".openevo-core-release-tombstone-*"))
+    assert not list(tmp_path.glob(".openevo-core-release-purge-*"))
 
 
 @pytest.mark.parametrize("mode", [0o720, 0o702, 0o777])
@@ -1452,7 +1525,119 @@ def test_marker_name_race_preserves_checked_and_replacement_inodes(
     ]
 
 
-def test_retired_transaction_tombstone_does_not_change_exact_pair_retry(tmp_path: Path) -> None:
+def test_tombstone_entry_replacement_is_preserved_without_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    replacement = b"replacement cleanup entry"
+    injected = False
+
+    def replace_quarantined_entry(authority, window: str) -> None:
+        nonlocal injected
+        if injected or window != "entry-quarantined":
+            return
+        injected = True
+        purge_names = [
+            name
+            for name in os.listdir(authority.transaction_fd)
+            if builder._core_release_entry_purge_identity(name) is not None
+        ]
+        assert len(purge_names) == 1
+        purge_name = purge_names[0]
+        os.rename(
+            purge_name,
+            "preserved-cleanup-entry",
+            src_dir_fd=authority.transaction_fd,
+            dst_dir_fd=authority.transaction_fd,
+        )
+        replacement_fd = os.open(
+            purge_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=authority.transaction_fd,
+        )
+        try:
+            os.write(replacement_fd, replacement)
+            os.fsync(replacement_fd)
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(
+        builder,
+        "_after_core_release_tombstone_window",
+        replace_quarantined_entry,
+    )
+
+    with pytest.raises(RuntimeError, match="rollback could not be verified"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+            raise OSError("trigger cleanup")
+
+    tombstones = list(tmp_path.glob(".openevo-core-release-tombstone-*"))
+    assert len(tombstones) == 1
+    assert (tombstones[0] / "preserved-cleanup-entry").is_file()
+    assert replacement in [path.read_bytes() for path in tombstones[0].iterdir() if path.is_file()]
+
+
+def test_tombstone_directory_replacement_is_preserved_without_rmdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    injected = False
+
+    def replace_quarantined_directory(authority, window: str) -> None:
+        nonlocal injected
+        if injected or window != "directory-quarantined":
+            return
+        injected = True
+        purge_name = builder._core_release_directory_purge_name(authority)
+        os.rename(
+            purge_name,
+            ".preserved-cleanup-directory",
+            src_dir_fd=authority.parent_fd,
+            dst_dir_fd=authority.parent_fd,
+        )
+        os.mkdir(purge_name, 0o700, dir_fd=authority.parent_fd)
+        replacement_directory_fd = os.open(
+            purge_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=authority.parent_fd,
+        )
+        try:
+            replacement_fd = os.open(
+                "replacement",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=replacement_directory_fd,
+            )
+            os.close(replacement_fd)
+        finally:
+            os.close(replacement_directory_fd)
+
+    monkeypatch.setattr(
+        builder,
+        "_after_core_release_tombstone_window",
+        replace_quarantined_directory,
+    )
+
+    with pytest.raises(RuntimeError, match="rollback could not be verified"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+            raise OSError("trigger cleanup")
+
+    assert (tmp_path / ".preserved-cleanup-directory").is_dir()
+    purge_directories = list(tmp_path.glob(".openevo-core-release-purge-*"))
+    assert len(purge_directories) == 1
+    assert (purge_directories[0] / "replacement").is_file()
+
+
+def test_successful_transaction_removes_tombstone_state(tmp_path: Path) -> None:
     builder = _load_builder()
     output = tmp_path / "output"
     wheel, lock = _write_export_inputs(builder, tmp_path)
@@ -1462,9 +1647,69 @@ def test_retired_transaction_tombstone_does_not_change_exact_pair_retry(tmp_path
             builder._export_core_release_inputs(authority, wheel, lock)
 
     assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
-    tombstones = list(tmp_path.glob(".openevo-core-release-tombstone-*"))
-    assert len(tombstones) == 1
-    assert (tombstones[0] / builder.CORE_RELEASE_TRANSACTION_MARKER).is_file()
+    assert not list(tmp_path.glob(".openevo-core-release-tombstone-*"))
+    assert not list(tmp_path.glob(".openevo-core-release-purge-*"))
+
+
+def test_twenty_successful_retries_do_not_accumulate_release_state(tmp_path: Path) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    expected_names = sorted((wheel.name, lock.name))
+    expected_bytes = wheel.stat().st_size + lock.stat().st_size
+
+    for _ in range(20):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+        exported = list(output.iterdir())
+        assert sorted(path.name for path in exported) == expected_names
+        assert sum(path.stat().st_size for path in exported) == expected_bytes
+        assert not list(tmp_path.glob(".openevo-core-release-tombstone-*"))
+        assert not list(tmp_path.glob(".openevo-core-release-purge-*"))
+
+
+@pytest.mark.parametrize(
+    "tombstone_window",
+    [
+        "transaction-retired",
+        "entry-quarantined",
+        "entry-cleared",
+        "entry-removed",
+        "tombstone-empty",
+        "directory-quarantined",
+    ],
+)
+def test_repeated_tombstone_crashes_recover_without_growth(
+    tmp_path: Path,
+    tombstone_window: str,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    for _ in range(3):
+        crashed = _run_crashing_core_export(
+            builder_path=builder_path,
+            output=output,
+            wheel=wheel,
+            lock=lock,
+            mode="tombstone",
+            stage_window=tombstone_window,
+        )
+        assert crashed.returncode == 77
+        sibling_state = [
+            *tmp_path.glob(".openevo-core-release-tombstone-*"),
+            *tmp_path.glob(".openevo-core-release-purge-*"),
+        ]
+        assert len(sibling_state) == 1
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+    assert not list(tmp_path.glob(".openevo-core-release-tombstone-*"))
+    assert not list(tmp_path.glob(".openevo-core-release-purge-*"))
 
 
 def test_core_release_crash_between_names_is_reconciled_on_retry(tmp_path: Path) -> None:

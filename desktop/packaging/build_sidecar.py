@@ -8,6 +8,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 import ctypes
 from email.parser import Parser
+import errno
+import fcntl
 import hashlib
 from io import BytesIO
 from importlib.metadata import version as distribution_version
@@ -40,6 +42,7 @@ CORE_RELEASE_TRANSACTION_READY = "transaction.ready"
 _CORE_RELEASE_TRANSACTION_PATTERN = re.compile(r"\.openevo-core-release-([0-9a-f]{32})")
 _CORE_RELEASE_STAGING_PATTERN = re.compile(r"\.member-([0-9a-f]{32})")
 _CORE_RELEASE_RETIRED_MARKER_PATTERN = re.compile(r"\.marker-retired-([0-9a-f]+)-([0-9a-f]+)")
+_CORE_RELEASE_PURGE_PATTERN = re.compile(r"\.purge-([0-9a-f]+)-([0-9a-f]+)")
 _MAX_CORE_RELEASE_ROOT_MEMBERS = 4
 _MAX_CORE_RELEASE_TRANSACTION_MEMBERS = 16
 _MAX_CORE_RELEASE_MARKER_BYTES = 4096
@@ -987,6 +990,37 @@ def _require_private_directory(descriptor: os.stat_result, *, name: str) -> None
         raise RuntimeError(f"Core release {name} owner or private permissions are invalid")
 
 
+def _acquire_core_release_output_lock(
+    parent_fd: int,
+    directory_fd: int,
+    output_name: str,
+) -> os.stat_result:
+    before = os.fstat(directory_fd)
+    _require_private_directory(before, name="output lock")
+    _require_fd_acl_free(directory_fd, name="Core wheel output lock")
+    current = os.stat(output_name, dir_fd=parent_fd, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+        raise RuntimeError("Core wheel output changed before lock acquisition")
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            raise RuntimeError(
+                "Core wheel output is locked by another active sidecar builder"
+            ) from exc
+        raise RuntimeError("Core wheel output lock cannot be acquired") from exc
+    after = os.fstat(directory_fd)
+    _require_private_directory(after, name="output lock")
+    _require_fd_acl_free(directory_fd, name="Core wheel output lock")
+    current = os.stat(output_name, dir_fd=parent_fd, follow_symlinks=False)
+    if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) or (
+        current.st_dev,
+        current.st_ino,
+    ) != (before.st_dev, before.st_ino):
+        raise RuntimeError("Core wheel output changed during lock acquisition")
+    return after
+
+
 def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left.is_relative_to(right) or right.is_relative_to(left)
 
@@ -1455,7 +1489,11 @@ def _open_core_release_output(output_dir: Path) -> Iterator[_CoreReleaseOutput]:
             _clear_and_verify_fd_acl(directory_fd, name="Core wheel output")
         else:
             _require_fd_acl_free(directory_fd, name="Core wheel output")
-        descriptor = os.fstat(directory_fd)
+        descriptor = _acquire_core_release_output_lock(
+            parent_fd,
+            directory_fd,
+            output_dir.name,
+        )
         authority = _CoreReleaseOutput(
             path=output_dir,
             resolved_path=resolved_path,
@@ -1643,6 +1681,32 @@ def _retired_marker_identity(name: str) -> tuple[int, int] | None:
     return int(match.group(1), 16), int(match.group(2), 16)
 
 
+def _core_release_tombstone_name(authority: _CoreReleaseOutput) -> str:
+    return f".openevo-core-release-tombstone-{authority.device:x}-{authority.inode:x}"
+
+
+def _core_release_directory_purge_name(authority: _CoreReleaseOutput) -> str:
+    return f".openevo-core-release-purge-{authority.device:x}-{authority.inode:x}"
+
+
+def _core_release_entry_purge_name(identity: tuple[int, int]) -> str:
+    return f".purge-{identity[0]:x}-{identity[1]:x}"
+
+
+def _core_release_entry_purge_identity(name: str) -> tuple[int, int] | None:
+    match = _CORE_RELEASE_PURGE_PATTERN.fullmatch(name)
+    if match is None:
+        return None
+    return int(match.group(1), 16), int(match.group(2), 16)
+
+
+def _after_core_release_tombstone_window(
+    authority: _CoreReleaseOutput,
+    window: str,
+) -> None:
+    del authority, window
+
+
 def _after_core_release_cleanup_identity_verified(
     source_fd: int,
     source_name: str,
@@ -1694,13 +1758,304 @@ def _quarantine_regular_path(
         os.close(file_fd)
 
 
+def _open_core_release_tombstone(
+    authority: _CoreReleaseOutput,
+    name: str,
+) -> tuple[int, os.stat_result]:
+    directory_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=authority.parent_fd,
+    )
+    try:
+        descriptor = os.fstat(directory_fd)
+        _require_private_directory(descriptor, name="transaction tombstone")
+        if stat.S_IMODE(descriptor.st_mode) != 0o700:
+            raise RuntimeError("Core release transaction tombstone mode changed")
+        _require_fd_acl_free(directory_fd, name="Core release transaction tombstone")
+        current = os.stat(name, dir_fd=authority.parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (descriptor.st_dev, descriptor.st_ino):
+            raise RuntimeError("Core release transaction tombstone pathname changed")
+        return directory_fd, descriptor
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _purge_core_release_regular_entry(
+    authority: _CoreReleaseOutput,
+    directory_fd: int,
+    name: str,
+    *,
+    identity: tuple[int, int],
+    modes: frozenset[int],
+    clear_payload: bool,
+) -> None:
+    purge_name = _core_release_entry_purge_name(identity)
+    source_name = name
+    if name != purge_name:
+        file_fd = os.open(
+            name,
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        try:
+            descriptor = os.fstat(file_fd)
+            _require_member_attributes(
+                descriptor,
+                name=name,
+                mode=stat.S_IMODE(descriptor.st_mode),
+                identity=identity,
+            )
+            if stat.S_IMODE(descriptor.st_mode) not in modes:
+                raise RuntimeError(f"Core release tombstone entry mode changed: {name}")
+            _require_fd_acl_free(file_fd, name=name)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != identity:
+                raise RuntimeError(f"Core release tombstone entry pathname changed: {name}")
+            _rename_noreplace(directory_fd, name, directory_fd, purge_name)
+            os.fsync(directory_fd)
+            _after_core_release_tombstone_window(authority, "entry-quarantined")
+        except BaseException:
+            os.close(file_fd)
+            raise
+    else:
+        file_fd = os.open(
+            purge_name,
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+    try:
+        descriptor = os.fstat(file_fd)
+        _require_member_attributes(
+            descriptor,
+            name=source_name,
+            mode=stat.S_IMODE(descriptor.st_mode),
+            identity=identity,
+        )
+        if stat.S_IMODE(descriptor.st_mode) not in modes:
+            raise RuntimeError(f"Core release tombstone entry mode changed: {source_name}")
+        _require_fd_acl_free(file_fd, name=source_name)
+        current = os.stat(purge_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != identity:
+            raise RuntimeError(
+                f"Core release tombstone entry replacement was preserved: {source_name}"
+            )
+        if clear_payload and descriptor.st_size:
+            os.ftruncate(file_fd, 0)
+            os.fsync(file_fd)
+        _after_core_release_tombstone_window(authority, "entry-cleared")
+        current = os.stat(purge_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != identity:
+            raise RuntimeError(
+                f"Core release tombstone entry replacement was preserved: {source_name}"
+            )
+        os.unlink(purge_name, dir_fd=directory_fd)
+        if os.fstat(file_fd).st_nlink != 0:
+            raise RuntimeError(f"Core release tombstone entry remained linked: {source_name}")
+        os.fsync(directory_fd)
+        _after_core_release_tombstone_window(authority, "entry-removed")
+    finally:
+        os.close(file_fd)
+
+
+def _remove_empty_core_release_tombstone(
+    authority: _CoreReleaseOutput,
+    directory_fd: int,
+    name: str,
+    *,
+    identity: tuple[int, int],
+    already_quarantined: bool,
+) -> None:
+    if _bounded_listdir(
+        directory_fd,
+        limit=_MAX_CORE_RELEASE_TRANSACTION_MEMBERS,
+        container="Core release transaction tombstone",
+    ):
+        raise RuntimeError("Core release transaction tombstone is not empty")
+    purge_name = _core_release_directory_purge_name(authority)
+    if not already_quarantined:
+        current = os.stat(name, dir_fd=authority.parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != identity:
+            raise RuntimeError("Core release transaction tombstone identity changed")
+        _rename_noreplace(authority.parent_fd, name, authority.parent_fd, purge_name)
+        os.fsync(authority.parent_fd)
+        _after_core_release_tombstone_window(authority, "directory-quarantined")
+    current = os.stat(purge_name, dir_fd=authority.parent_fd, follow_symlinks=False)
+    held = os.fstat(directory_fd)
+    if (
+        (current.st_dev, current.st_ino) != identity
+        or (held.st_dev, held.st_ino) != identity
+        or not stat.S_ISDIR(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or stat.S_IMODE(current.st_mode) != 0o700
+    ):
+        raise RuntimeError("Core release transaction purge replacement was preserved")
+    _require_fd_acl_free(directory_fd, name="Core release transaction purge")
+    if _bounded_listdir(
+        directory_fd,
+        limit=0,
+        container="Core release transaction purge",
+    ):
+        raise RuntimeError("Core release transaction purge changed before removal")
+    os.rmdir(purge_name, dir_fd=authority.parent_fd)
+    if os.fstat(directory_fd).st_nlink != 0:
+        raise RuntimeError("Core release transaction purge remained linked")
+    os.fsync(authority.parent_fd)
+    _after_core_release_tombstone_window(authority, "directory-removed")
+
+
+def _purge_core_release_tombstone(
+    authority: _CoreReleaseOutput,
+    directory_fd: int,
+    name: str,
+    *,
+    identity: tuple[int, int],
+) -> None:
+    names = _bounded_listdir(
+        directory_fd,
+        limit=_MAX_CORE_RELEASE_TRANSACTION_MEMBERS,
+        container="Core release transaction tombstone",
+    )
+    if not names:
+        _remove_empty_core_release_tombstone(
+            authority,
+            directory_fd,
+            name,
+            identity=identity,
+            already_quarantined=False,
+        )
+        return
+    purge_names = [item for item in names if _core_release_entry_purge_identity(item) is not None]
+    if CORE_RELEASE_TRANSACTION_MARKER not in names:
+        if len(names) != 1 or len(purge_names) != 1:
+            raise RuntimeError("Core release tombstone lost its authoritative marker")
+        purge_identity = _core_release_entry_purge_identity(purge_names[0])
+        assert purge_identity is not None
+        _purge_core_release_regular_entry(
+            authority,
+            directory_fd,
+            purge_names[0],
+            identity=purge_identity,
+            modes=frozenset({0o600, 0o644}),
+            clear_payload=True,
+        )
+    else:
+        marker_payload, marker_identity = _read_marker(
+            directory_fd,
+            CORE_RELEASE_TRANSACTION_MARKER,
+        )
+        try:
+            _adopt_marker_intents(authority, marker_payload)
+            phase, identities, cleanup_index = _validate_marker_payload(
+                authority,
+                marker_payload,
+                transaction_identity=identity,
+            )
+        except RuntimeError:
+            if names != (CORE_RELEASE_TRANSACTION_MARKER,):
+                raise
+            _purge_core_release_regular_entry(
+                authority,
+                directory_fd,
+                CORE_RELEASE_TRANSACTION_MARKER,
+                identity=marker_identity,
+                modes=frozenset({0o600}),
+                clear_payload=False,
+            )
+        else:
+            if phase == "cleaning" and cleanup_index != len(authority.sources):
+                raise RuntimeError("Core release tombstone cleanup is incomplete")
+            if phase not in {"ready", "cleaning"}:
+                raise RuntimeError("Core release tombstone phase is invalid")
+            _verify_retired_markers(authority, directory_fd, identity, names)
+            allowed_member_names: dict[str, _CoreReleaseSource] = {}
+            for source in authority.sources:
+                staging_name = authority.member_intents[source.name]
+                allowed_member_names[staging_name] = source
+                allowed_member_names[staging_name.replace(".member-", ".root-", 1)] = source
+            retired_names = {item for item in names if _retired_marker_identity(item) is not None}
+            ordinary_names = [
+                item
+                for item in names
+                if item != CORE_RELEASE_TRANSACTION_MARKER
+                and item not in retired_names
+                and item not in purge_names
+            ]
+            if any(item not in allowed_member_names for item in ordinary_names):
+                raise RuntimeError("Core release tombstone contains an unknown entry")
+            seen_sources: set[str] = set()
+            for item in ordinary_names:
+                source = allowed_member_names[item]
+                if source.name in seen_sources:
+                    raise RuntimeError("Core release tombstone duplicates a member")
+                seen_sources.add(source.name)
+                descriptor = os.stat(item, dir_fd=directory_fd, follow_symlinks=False)
+                observed_identity = (descriptor.st_dev, descriptor.st_ino)
+                expected_identity = identities.get(source.name)
+                if expected_identity is not None and observed_identity != expected_identity:
+                    raise RuntimeError("Core release tombstone member identity changed")
+            if len(purge_names) > 1:
+                raise RuntimeError("Core release tombstone has ambiguous purge state")
+            for item in purge_names:
+                purge_identity = _core_release_entry_purge_identity(item)
+                assert purge_identity is not None
+                _purge_core_release_regular_entry(
+                    authority,
+                    directory_fd,
+                    item,
+                    identity=purge_identity,
+                    modes=frozenset({0o600, 0o644}),
+                    clear_payload=True,
+                )
+            for item in ordinary_names:
+                source = allowed_member_names[item]
+                descriptor = os.stat(item, dir_fd=directory_fd, follow_symlinks=False)
+                _purge_core_release_regular_entry(
+                    authority,
+                    directory_fd,
+                    item,
+                    identity=(descriptor.st_dev, descriptor.st_ino),
+                    modes=frozenset({0o600, 0o644}),
+                    clear_payload=True,
+                )
+            for item in sorted(retired_names):
+                retired_identity = _retired_marker_identity(item)
+                assert retired_identity is not None
+                _purge_core_release_regular_entry(
+                    authority,
+                    directory_fd,
+                    item,
+                    identity=retired_identity,
+                    modes=frozenset({0o600}),
+                    clear_payload=False,
+                )
+            _purge_core_release_regular_entry(
+                authority,
+                directory_fd,
+                CORE_RELEASE_TRANSACTION_MARKER,
+                identity=marker_identity,
+                modes=frozenset({0o600}),
+                clear_payload=False,
+            )
+    os.fsync(directory_fd)
+    _after_core_release_tombstone_window(authority, "tombstone-empty")
+    _remove_empty_core_release_tombstone(
+        authority,
+        directory_fd,
+        name,
+        identity=identity,
+        already_quarantined=False,
+    )
+
+
 def _retire_transaction_directory(
     authority: _CoreReleaseOutput,
     transaction_fd: int,
     name: str,
     *,
     identity: tuple[int, int],
-) -> str:
+) -> None:
     held = os.fstat(transaction_fd)
     _require_fd_acl_free(transaction_fd, name="Core release transaction")
     current = os.stat(name, dir_fd=authority.directory_fd, follow_symlinks=False)
@@ -1713,15 +2068,11 @@ def _retire_transaction_directory(
     ):
         raise RuntimeError("Core release transaction directory changed before cleanup")
     _after_core_release_cleanup_identity_verified(authority.directory_fd, name)
-    for _ in range(8):
-        tombstone = f".openevo-core-release-tombstone-{secrets.token_hex(16)}"
-        try:
-            _rename_noreplace(authority.directory_fd, name, authority.parent_fd, tombstone)
-            break
-        except FileExistsError:
-            continue
-    else:
-        raise RuntimeError("Could not allocate a Core release cleanup tombstone")
+    tombstone = _core_release_tombstone_name(authority)
+    try:
+        _rename_noreplace(authority.directory_fd, name, authority.parent_fd, tombstone)
+    except FileExistsError as exc:
+        raise RuntimeError("Core release cleanup has an unrecovered tombstone") from exc
     moved = os.stat(tombstone, dir_fd=authority.parent_fd, follow_symlinks=False)
     if (moved.st_dev, moved.st_ino) != identity:
         raise RuntimeError("Core release transaction replacement was preserved as a tombstone")
@@ -1735,7 +2086,51 @@ def _retire_transaction_directory(
         )
     os.fsync(authority.parent_fd)
     os.fsync(authority.directory_fd)
-    return tombstone
+    _after_core_release_tombstone_window(authority, "transaction-retired")
+    _purge_core_release_tombstone(
+        authority,
+        transaction_fd,
+        tombstone,
+        identity=identity,
+    )
+
+
+def _recover_core_release_tombstone(authority: _CoreReleaseOutput) -> None:
+    tombstone = _core_release_tombstone_name(authority)
+    purge = _core_release_directory_purge_name(authority)
+    present: list[str] = []
+    for name in (tombstone, purge):
+        try:
+            os.stat(name, dir_fd=authority.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        present.append(name)
+    if not present:
+        return
+    if len(present) != 1:
+        raise RuntimeError("Core release cleanup has ambiguous sibling state")
+    name = present[0]
+    directory_fd, descriptor = _open_core_release_tombstone(authority, name)
+    identity = (descriptor.st_dev, descriptor.st_ino)
+    try:
+        if name == purge:
+            _remove_empty_core_release_tombstone(
+                authority,
+                directory_fd,
+                name,
+                identity=identity,
+                already_quarantined=True,
+            )
+        else:
+            _purge_core_release_tombstone(
+                authority,
+                directory_fd,
+                name,
+                identity=identity,
+            )
+    finally:
+        os.close(directory_fd)
+    authority.require_bound_path()
 
 
 def _decode_marker(payload: bytes) -> dict[str, object]:
@@ -2813,6 +3208,7 @@ def _export_core_release_inputs(
     _open_release_sources(authority, wheel, framework_lock)
     for source in authority.sources:
         _verify_source(source, require_path=True)
+    _recover_core_release_tombstone(authority)
     transactions = [
         name
         for name in authority.initial_inventory

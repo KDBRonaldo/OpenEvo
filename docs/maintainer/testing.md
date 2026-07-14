@@ -140,6 +140,13 @@ Before creating the output, it holds and validates the immediate parent's owner,
 group/world write bits, and macOS ACL. A newly created child may clear a valid
 inherited ACL once; an ACL added to an existing output, transaction, marker, or
 member must be rejected without mutation.
+After opening and validating the child, but before its first inventory or any
+recovery, the builder takes a non-blocking exclusive `flock` on that same held
+output-directory descriptor. Contention fails closed with an explicit
+active-builder error. The lock remains held until the complete output context,
+including commit or rollback and all transaction/source descriptor cleanup, has
+exited. A paused real subprocess test proves a second builder cannot classify or
+recover the first builder's live transaction.
 It stages under a private transaction directory, publishes without replacement,
 keeps every source/export descriptor open, and exits the output context last so
 a `TemporaryDirectory` cleanup failure rolls the pair back. Before success, the
@@ -187,6 +194,20 @@ cleanup points are exercised through live rollback.
 The same preservation rule applies to a `preparing` transaction containing a
 staged entry whose inode has not yet reached the ready marker; only empty and
 marker-only bootstrap remnants are automatically reclaimed before readiness.
+
+After root members are quarantined, the held transaction inode moves by atomic
+no-replace rename to one deterministic sibling tombstone bound to the output
+device/inode. Cleanup moves each authorized regular entry to an identity-named
+quarantine, clears member payloads through the held descriptor, rechecks the
+quarantine binding, unlinks it, and removes the marker last. The empty held
+tombstone is then moved no-replace to one deterministic purge name, revalidated,
+and removed. Recovery accepts at most one of those two exact sibling states and
+resumes the bounded sequence before inspecting output transactions. Replacement
+tests at both final entry unlink and directory removal windows require the checked
+inode and replacement to be preserved and the build to fail closed. Repeated
+`os._exit` tests cover every tombstone/purge boundary, and twenty successful
+exports prove that normal and recovered operation leaves no sibling cleanup state
+or wheel/lock byte growth. Candidate builds have the same zero-residue requirement.
 
 ## Release Identity
 

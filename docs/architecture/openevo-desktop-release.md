@@ -50,6 +50,10 @@ The repository currently provides:
   principal. Newly created output directories use `0700`. The
   builder pins that directory by an open no-follow descriptor and revalidates
   its inode, owner, private permissions, and ACL-free state through final return.
+  After those checks and before the first inventory or recovery, it takes a
+  non-blocking exclusive `flock` on the same held output-directory inode. A
+  contending builder fails closed, and the lock remains held through the complete
+  commit/rollback context and descriptor cleanup.
   On macOS only a newly created output, transaction, marker, wheel, or lock may
   normalize a valid inherited extended ACL with `acl_delete_fd_np`, followed by
   readback through `acl_get_fd_np`. Every later open requires the ACL to remain
@@ -90,11 +94,17 @@ The repository currently provides:
   marker-less transaction directory beside an exact complete pair is a bounded
   bootstrap crash state. Cleanup never uses a final stat-then-unlink/rmdir step:
   authorized root members move under deterministic transaction quarantine names,
-  then the held transaction inode moves with atomic no-replace rename to a random
-  sibling tombstone. A replacement observed in either rename window is retained
-  at its original name or in the tombstone and the build fails closed. Tombstones
-  are conservative audit evidence outside the exact output pair, not a claim of
-  immediate deletion;
+  then the held transaction inode moves with atomic no-replace rename to one
+  deterministic sibling tombstone bound to the output device/inode. Each
+  authorized tombstone member moves no-replace to an inode-named quarantine,
+  member bytes are cleared through the held descriptor, and the binding is
+  rechecked before unlink. Markers are removed last. The empty held directory
+  then moves no-replace to one deterministic purge name and is rechecked before
+  `rmdir`. A retry accepts at most one exact tombstone/purge state and resumes this
+  bounded cleanup before output transaction recovery. Crashes at every boundary
+  therefore consume no additional sibling names or payload copies, while normal
+  success and candidate builds leave no cleanup sibling. A replacement observed
+  in an entry or directory removal window is retained, and the build fails closed;
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;
