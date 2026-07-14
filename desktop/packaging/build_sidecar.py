@@ -62,6 +62,9 @@ _DARWIN_ACL_EXTENDED_ALLOW = 1
 _DARWIN_ACL_EXTENDED_DENY = 2
 _DARWIN_ACL_KNOWN_PERMISSIONS = sum(1 << bit for bit in (*range(1, 14), 20))
 _DARWIN_ACL_MUTATING_PERMISSIONS = sum(1 << bit for bit in (2, 4, 5, 6, 8, 10, 12, 13))
+_DARWIN_CARBON_CORE = (
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/CarbonCore.framework/CarbonCore"
+)
 FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
     {
         "openevo/evolution/terminal_bench_bridge.py",
@@ -1796,6 +1799,136 @@ def _rename_noreplace(
         raise OSError(error, os.strerror(error), source_name, destination_name)
 
 
+class _DarwinFileSystemReference(ctypes.Structure):
+    _fields_ = [("hidden", ctypes.c_uint8 * 80)]
+
+
+def _core_release_fd_removal_supported() -> bool:
+    return sys.platform == "darwin"
+
+
+def _prepare_core_release_fd_removal(
+    object_fd: int,
+    *,
+    is_directory: bool,
+) -> tuple[ctypes.CDLL, _DarwinFileSystemReference]:
+    if not _core_release_fd_removal_supported():
+        raise RuntimeError(
+            "Core release cleanup cannot safely remove an inode on this platform; "
+            "the quarantined object was preserved"
+        )
+    try:
+        carbon_core = ctypes.CDLL(_DARWIN_CARBON_CORE)
+    except OSError as exc:
+        raise RuntimeError(
+            "Core release cleanup cannot load the identity-bound macOS removal API; "
+            "the quarantined object was preserved"
+        ) from exc
+    carbon_core.FSPathMakeRef.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(_DarwinFileSystemReference),
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    carbon_core.FSPathMakeRef.restype = ctypes.c_int32
+    carbon_core.FSUnlinkObject.argtypes = [ctypes.POINTER(_DarwinFileSystemReference)]
+    carbon_core.FSUnlinkObject.restype = ctypes.c_int16
+    reference = _DarwinFileSystemReference()
+    reference_is_directory = ctypes.c_uint8()
+    # This descriptor path cannot be rebound by another process; FSUnlinkObject
+    # later consumes only the resulting opaque reference, never the cleanup name.
+    result = carbon_core.FSPathMakeRef(
+        os.fsencode(f"/dev/fd/{object_fd}"),
+        ctypes.byref(reference),
+        ctypes.byref(reference_is_directory),
+    )
+    if result != 0 or bool(reference_is_directory.value) != is_directory:
+        raise RuntimeError(
+            "Core release cleanup could not bind the held inode to a macOS file-system "
+            f"reference (status {result}); the quarantined object was preserved"
+        )
+    return carbon_core, reference
+
+
+def _execute_core_release_fd_removal(
+    token: tuple[ctypes.CDLL, _DarwinFileSystemReference],
+    parent_fd: int,
+    name: str,
+    object_fd: int,
+    *,
+    is_directory: bool,
+) -> None:
+    del parent_fd, name, object_fd, is_directory
+    carbon_core, reference = token
+    result = carbon_core.FSUnlinkObject(ctypes.byref(reference))
+    if result != 0:
+        raise RuntimeError(
+            "Core release cleanup identity-bound removal failed "
+            f"with macOS status {result}; the quarantined object was preserved"
+        )
+
+
+def _before_core_release_fd_removal(
+    parent_fd: int,
+    name: str,
+    object_fd: int,
+    *,
+    is_directory: bool,
+) -> None:
+    del parent_fd, name, object_fd, is_directory
+
+
+def _remove_core_release_fd_bound_entry(
+    parent_fd: int,
+    name: str,
+    object_fd: int,
+    *,
+    identity: tuple[int, int],
+    is_directory: bool,
+    subject: str,
+) -> None:
+    held = os.fstat(object_fd)
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{subject} pathname disappeared before removal") from exc
+    if (
+        (held.st_dev, held.st_ino) != identity
+        or (current.st_dev, current.st_ino) != identity
+        or stat.S_ISDIR(held.st_mode) != is_directory
+        or held.st_nlink <= 0
+    ):
+        raise RuntimeError(f"{subject} replacement was preserved before removal")
+    token = _prepare_core_release_fd_removal(object_fd, is_directory=is_directory)
+    held = os.fstat(object_fd)
+    if (held.st_dev, held.st_ino) != identity or held.st_nlink <= 0:
+        raise RuntimeError(f"{subject} held identity changed before removal")
+    _before_core_release_fd_removal(
+        parent_fd,
+        name,
+        object_fd,
+        is_directory=is_directory,
+    )
+    try:
+        _execute_core_release_fd_removal(
+            token,
+            parent_fd,
+            name,
+            object_fd,
+            is_directory=is_directory,
+        )
+    except BaseException as exc:
+        raise RuntimeError(
+            f"{subject} identity-bound removal failed; the object was preserved"
+        ) from exc
+    if os.fstat(object_fd).st_nlink != 0:
+        raise RuntimeError(f"{subject} remained linked after identity-bound removal")
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise RuntimeError(f"{subject} pathname replacement was preserved")
+
+
 def _retired_marker_name(identity: tuple[int, int]) -> str:
     return f".marker-retired-{identity[0]:x}-{identity[1]:x}"
 
@@ -1945,9 +2078,14 @@ def _discard_core_release_cleanup_authority(
         current = os.stat(purge_name, dir_fd=authority.directory_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != file_identity:
             raise RuntimeError("Core release cleanup authority replacement was preserved")
-        os.unlink(purge_name, dir_fd=authority.directory_fd)
-        if os.fstat(file_fd).st_nlink != 0:
-            raise RuntimeError("Core release cleanup authority remained linked")
+        _remove_core_release_fd_bound_entry(
+            authority.directory_fd,
+            purge_name,
+            file_fd,
+            identity=file_identity,
+            is_directory=False,
+            subject="Core release cleanup authority",
+        )
         os.fsync(authority.directory_fd)
         _after_core_release_tombstone_window(authority, "cleanup-authority-removed")
     finally:
@@ -2125,9 +2263,14 @@ def _purge_core_release_regular_entry(
             raise RuntimeError(
                 f"Core release tombstone entry replacement was preserved: {source_name}"
             )
-        os.unlink(purge_name, dir_fd=directory_fd)
-        if os.fstat(file_fd).st_nlink != 0:
-            raise RuntimeError(f"Core release tombstone entry remained linked: {source_name}")
+        _remove_core_release_fd_bound_entry(
+            directory_fd,
+            purge_name,
+            file_fd,
+            identity=identity,
+            is_directory=False,
+            subject=f"Core release tombstone entry {source_name}",
+        )
         os.fsync(directory_fd)
         _after_core_release_tombstone_window(authority, "entry-removed")
     finally:
@@ -2173,9 +2316,14 @@ def _remove_empty_core_release_tombstone(
         container="Core release transaction purge",
     ):
         raise RuntimeError("Core release transaction purge changed before removal")
-    os.rmdir(purge_name, dir_fd=authority.parent_fd)
-    if os.fstat(directory_fd).st_nlink != 0:
-        raise RuntimeError("Core release transaction purge remained linked")
+    _remove_core_release_fd_bound_entry(
+        authority.parent_fd,
+        purge_name,
+        directory_fd,
+        identity=identity,
+        is_directory=True,
+        subject="Core release transaction purge",
+    )
     os.fsync(authority.parent_fd)
     _after_core_release_tombstone_window(authority, "directory-removed")
 
@@ -3950,6 +4098,11 @@ def build_sidecar(
             for path in (dist_dir, build_dir, binary_dir)
         ):
             raise RuntimeError("Core wheel output directory overlaps generated paths")
+        if not _core_release_fd_removal_supported():
+            raise RuntimeError(
+                "Core wheel export requires an identity-bound cleanup primitive; "
+                "this platform is unsupported and the output was not modified"
+            )
         core_wheel_output_dir = requested_output
     if clean:
         shutil.rmtree(dist_dir, ignore_errors=True)

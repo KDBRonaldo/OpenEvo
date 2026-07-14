@@ -1232,6 +1232,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     desktop_smoke_text = desktop_smoke.read_text(encoding="utf-8")
 
     assert text.startswith("name: OpenEvo packaged sidecar + installed Core release smoke")
+    assert "runs-on: macos-14" in text
     assert 'node-version: "22"' in text
     assert "npm test -- --run" in text
     assert "npm run typecheck" in text

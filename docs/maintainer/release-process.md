@@ -75,9 +75,14 @@ tombstone/purge state plus one durable receipt that binds its exact inode and
 inputs. Recovery never adopts the current same-name inode; a mismatch or renamed
 authorized inode is preserved and fails closed. A successful export and the
 candidate workflow must leave exactly the wheel/lock pair with no receipt or
-sibling cleanup state. Do not manually remove a preserved unknown path, hardlink,
-symlink, identity-mismatched replacement, or failed-cleanup tombstone without
-first investigating the release workspace.
+sibling cleanup state. Final macOS cleanup uses an `FSRef` prepared from the held
+object FD and `FSUnlinkObject`; the removal call does not resolve the quarantine,
+purge, or receipt name. A same-name replacement at that syscall boundary is
+therefore preserved and causes an explicit failure. If the platform or filesystem
+does not provide that identity-bound operation, the builder preserves the durable
+cleanup state and fails closed. Do not manually remove a preserved unknown path,
+hardlink, symlink, identity-mismatched replacement, or failed-cleanup tombstone
+without first investigating the release workspace.
 
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the

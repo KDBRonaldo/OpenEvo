@@ -165,21 +165,21 @@ replacement, exported-member unlink/rename/same-name replacement, and extra
 members. A real child-process crash after the wheel name is published but before
 the lock name is published must leave a bounded marker-authorized state that the
 next run reconciles and replaces with one complete pair. Recovery and rollback
-move the canonical marker to a monotonic `cleaning` phase before unlinking any
+move the canonical marker to a monotonic `cleaning` phase before removing any
 member. Its identity prefix records every cleanup-owned inode and its
 `cleanup_index` durably authorizes only an ordered prefix to have zero remaining
 links. Each progress update is file-fsynced, directory-fsynced, atomically
 installed through `transaction.ready`, and directory-fsynced again before the
-authorized unlink. Restart may adopt that temporary marker only when both files
-are closed, canonical, identity-bound markers and they describe the exact next
-phase or cleanup index.
+identity-bound removal. Restart may adopt that temporary marker only when both
+files are closed, canonical, identity-bound markers and they describe the exact
+next phase or cleanup index.
 Marker replacement tests also interrupt after the prior marker has moved to its
 inode-named retired entry and race the source pathname after identity validation.
 Both the checked inode and a same-name replacement must remain preserved; marker
 publication never uses an overwrite-capable rename.
 
 An unauthorized member must retain at least one canonical binding. An authorized
-member may be absent or may still have names after an interrupted unlink, but
+member may be absent or may still have names after an interrupted removal, but
 every remaining name must resolve no-follow to the recorded inode and must still
 pass owner, mode, aggregate link-count, byte-size, and SHA-256 checks. Rollback
 may remove only an inode it recorded; its held descriptor is the only additional
@@ -203,9 +203,15 @@ also binds the receipt inode; and directory-fsyncs again. Only then does the hel
 transaction inode move by atomic no-replace rename to one deterministic sibling
 tombstone bound to the output device/inode. Cleanup moves each authorized entry
 to an identity-named quarantine, clears member payloads through the held descriptor,
-rechecks the quarantine binding, unlinks it, and removes the transaction marker
-last. The empty held tombstone is then moved no-replace to one deterministic purge
-name, checked against the receipt, and removed.
+and removes the transaction marker last. The empty held tombstone is then moved
+no-replace to one deterministic purge name and checked against the receipt.
+For final member, marker, directory, and receipt removal, macOS prepares an opaque
+`FSRef` from the held FD before entering the syscall boundary and calls
+`FSUnlinkObject`; the final call does not receive the mutable cleanup name.
+Unsupported platforms and rejected filesystems preserve the object and fail
+closed. Linux unit and subprocess tests install a test-only conditional-removal
+model so portable transaction and crash cases remain executable; macOS CI uses
+the production primitive.
 
 Recovery accepts at most one receipt and one of those two exact sibling states; it
 must not adopt the inode currently found at a known name. Real `os._exit` tests at
@@ -218,6 +224,12 @@ publication while the transaction remains marker-authorized in the output,
 directory removal, and receipt quarantine. Twenty successful exports prove that
 normal and recovered operation leaves no receipt/sibling state or wheel/lock byte
 growth. Candidate builds have the same zero-residue requirement.
+Three syscall-boundary races run after the native removal token is prepared and
+immediately before execution: one replaces a tombstone regular member, one
+replaces the empty purge directory, and one replaces the cleanup receipt. Every
+replacement must remain present and the export must fail explicitly. On macOS
+these cases exercise the real `FSRef` operation; on a platform without it, the
+test-only conditional model refuses the mismatched binding before any delete.
 
 ## Release Identity
 

@@ -17,12 +17,78 @@ from zipfile import ZipFile
 import pytest
 
 
-def _load_builder() -> ModuleType:
+_FD_BOUND_REMOVAL_TESTKIT_SOURCE = """
+if not module._core_release_fd_removal_supported():
+    def prepare_test_fd_bound_removal(object_fd, *, is_directory):
+        del object_fd, is_directory
+        return None
+
+    def execute_test_fd_bound_removal(
+        token,
+        parent_fd,
+        name,
+        object_fd,
+        *,
+        is_directory,
+    ):
+        del token
+        held = os.fstat(object_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+            raise RuntimeError("test conditional removal preserved a replacement")
+        if is_directory:
+            os.rmdir(name, dir_fd=parent_fd)
+        else:
+            os.unlink(name, dir_fd=parent_fd)
+
+    module._prepare_core_release_fd_removal = prepare_test_fd_bound_removal
+    module._execute_core_release_fd_removal = execute_test_fd_bound_removal
+    module._core_release_fd_removal_supported = lambda: True
+"""
+
+
+def _install_fd_bound_removal_testkit(module: ModuleType) -> None:
+    if module._core_release_fd_removal_supported():
+        return
+
+    def prepare_test_fd_bound_removal(
+        object_fd: int,
+        *,
+        is_directory: bool,
+    ) -> None:
+        del object_fd, is_directory
+
+    def execute_test_fd_bound_removal(
+        token: object,
+        parent_fd: int,
+        name: str,
+        object_fd: int,
+        *,
+        is_directory: bool,
+    ) -> None:
+        del token
+        held = os.fstat(object_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+            raise RuntimeError("test conditional removal preserved a replacement")
+        if is_directory:
+            os.rmdir(name, dir_fd=parent_fd)
+        else:
+            os.unlink(name, dir_fd=parent_fd)
+
+    module._prepare_core_release_fd_removal = prepare_test_fd_bound_removal
+    module._execute_core_release_fd_removal = execute_test_fd_bound_removal
+    module._core_release_fd_removal_supported = lambda: True
+
+
+def _load_builder(*, install_fd_removal_testkit: bool = True) -> ModuleType:
     path = Path("desktop/packaging/build_sidecar.py").resolve()
     spec = importlib.util.spec_from_file_location("openevo_build_sidecar", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if install_fd_removal_testkit:
+        _install_fd_bound_removal_testkit(module)
     return module
 
 
@@ -61,6 +127,7 @@ import sys
 spec = importlib.util.spec_from_file_location("crash_build_sidecar", {str(builder_path)!r})
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+{_FD_BOUND_REMOVAL_TESTKIT_SOURCE}
 
 mode = sys.argv[1]
 cleanup_name = sys.argv[2]
@@ -772,6 +839,7 @@ import time
 spec = importlib.util.spec_from_file_location("concurrent_build_sidecar", {str(builder_path)!r})
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+{_FD_BOUND_REMOVAL_TESTKIT_SOURCE}
 ready = Path({str(ready)!r})
 release = Path({str(release)!r})
 
@@ -1635,6 +1703,210 @@ def test_tombstone_directory_replacement_is_preserved_without_rmdir(
     purge_directories = list(tmp_path.glob(".openevo-core-release-purge-*"))
     assert len(purge_directories) == 1
     assert (purge_directories[0] / "replacement").is_file()
+
+
+def test_tombstone_entry_syscall_boundary_preserves_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    replacement = b"entry replacement at the removal syscall"
+    preserved_name = "preserved-syscall-entry"
+    injected = False
+
+    def replace_at_removal_boundary(
+        parent_fd: int,
+        name: str,
+        object_fd: int,
+        *,
+        is_directory: bool,
+    ) -> None:
+        nonlocal injected
+        del object_fd
+        if injected or builder._core_release_entry_purge_identity(name) is None:
+            return
+        assert not is_directory
+        injected = True
+        os.rename(name, preserved_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        replacement_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.write(replacement_fd, replacement)
+            os.fsync(replacement_fd)
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(
+        builder,
+        "_before_core_release_fd_removal",
+        replace_at_removal_boundary,
+    )
+
+    with pytest.raises(RuntimeError, match="preserved|rollback could not be verified"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert injected
+    tombstone = next(tmp_path.glob(".openevo-core-release-tombstone-*"))
+    replacement_names = [
+        name
+        for name in os.listdir(tombstone)
+        if builder._core_release_entry_purge_identity(name) is not None
+    ]
+    assert len(replacement_names) == 1
+    assert (tombstone / replacement_names[0]).read_bytes() == replacement
+
+
+def test_tombstone_directory_syscall_boundary_preserves_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    preserved_name = ".preserved-syscall-directory"
+    injected = False
+
+    def replace_at_removal_boundary(
+        parent_fd: int,
+        name: str,
+        object_fd: int,
+        *,
+        is_directory: bool,
+    ) -> None:
+        nonlocal injected
+        del object_fd
+        if injected or not name.startswith(".openevo-core-release-purge-"):
+            return
+        assert is_directory
+        injected = True
+        os.rename(name, preserved_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+
+    monkeypatch.setattr(
+        builder,
+        "_before_core_release_fd_removal",
+        replace_at_removal_boundary,
+    )
+
+    with pytest.raises(RuntimeError, match="preserved|rollback could not be verified"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert injected
+    replacements = list(tmp_path.glob(".openevo-core-release-purge-*"))
+    assert len(replacements) == 1
+    assert replacements[0].is_dir()
+    assert list(replacements[0].iterdir()) == []
+
+
+def test_cleanup_receipt_syscall_boundary_preserves_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    replacement = b"receipt replacement at the removal syscall"
+    preserved_name = ".preserved-syscall-receipt"
+    injected = False
+
+    def replace_at_removal_boundary(
+        parent_fd: int,
+        name: str,
+        object_fd: int,
+        *,
+        is_directory: bool,
+    ) -> None:
+        nonlocal injected
+        del object_fd
+        if (
+            injected
+            or builder._CORE_RELEASE_CLEANUP_AUTHORITY_PURGE_PATTERN.fullmatch(name) is None
+        ):
+            return
+        assert not is_directory
+        injected = True
+        os.rename(name, preserved_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        replacement_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.write(replacement_fd, replacement)
+            os.fsync(replacement_fd)
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(
+        builder,
+        "_before_core_release_fd_removal",
+        replace_at_removal_boundary,
+    )
+
+    with pytest.raises(RuntimeError, match="preserved|rollback could not be verified"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert injected
+    replacement_names = [
+        name
+        for name in os.listdir(output)
+        if builder._CORE_RELEASE_CLEANUP_AUTHORITY_PURGE_PATTERN.fullmatch(name) is not None
+    ]
+    assert len(replacement_names) == 1
+    assert (output / replacement_names[0]).read_bytes() == replacement
+
+
+def test_native_fd_removal_is_fail_closed_when_platform_has_no_safe_primitive(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder(install_fd_removal_testkit=False)
+    if builder._core_release_fd_removal_supported():
+        pytest.skip("platform provides the native identity-bound remover")
+    target = tmp_path / "preserved"
+    target.write_bytes(b"preserve on unsupported platform")
+    target.chmod(0o600)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    target_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    descriptor = os.fstat(target_fd)
+    try:
+        with pytest.raises(RuntimeError, match="cannot safely remove an inode"):
+            builder._remove_core_release_fd_bound_entry(
+                parent_fd,
+                target.name,
+                target_fd,
+                identity=(descriptor.st_dev, descriptor.st_ino),
+                is_directory=False,
+                subject="test cleanup object",
+            )
+    finally:
+        os.close(target_fd)
+        os.close(parent_fd)
+
+    assert target.read_bytes() == b"preserve on unsupported platform"
+
+
+def test_core_wheel_export_rejects_unsupported_platform_before_output_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder(install_fd_removal_testkit=False)
+    output = tmp_path / "output"
+    monkeypatch.setattr(builder, "_core_release_fd_removal_supported", lambda: False)
+
+    with pytest.raises(RuntimeError, match="platform is unsupported"):
+        builder.build_sidecar(clean=True, core_wheel_output_dir=output)
+
+    assert not output.exists()
 
 
 def test_successful_transaction_removes_tombstone_state(tmp_path: Path) -> None:

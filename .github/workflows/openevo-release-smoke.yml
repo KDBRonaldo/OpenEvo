@@ -24,7 +24,7 @@ on:
 jobs:
   wheel-smoke:
     name: packaged sidecar + installed Core + source outer harness
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 

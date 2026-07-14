@@ -92,8 +92,8 @@ The repository currently provides:
   each scan rejects on `limit + 1`, and changing consecutive snapshots fail
   closed without first materializing or sorting an unbounded directory. An empty
   marker-less transaction directory beside an exact complete pair is a bounded
-  bootstrap crash state. Cleanup never authorizes unlink or `rmdir` from a newly
-  observed pathname identity. Authorized root members move under deterministic
+  bootstrap crash state. Cleanup never authorizes removal from a newly observed
+  pathname identity. Authorized root members move under deterministic
   transaction quarantine names. Before the held transaction leaves the locked
   output, a canonical cleanup-authority receipt binds the parent, output, exact
   wheel/lock inputs, and transaction inode. Its candidate is file-fsynced and
@@ -102,17 +102,27 @@ The repository currently provides:
   transaction inode move with atomic no-replace rename to the deterministic
   sibling tombstone or any tombstone marker be removed. Each
   authorized tombstone member then moves no-replace to an inode-named quarantine;
-  member bytes are cleared through the held descriptor and the binding is
-  rechecked before unlink. Markers are removed last. The empty held directory
-  moves no-replace to one deterministic purge name and is rechecked against the
-  durable receipt before `rmdir`.
+  member bytes are cleared through the held descriptor and markers are removed
+  last. The empty held directory moves no-replace to one deterministic purge name
+  and is rechecked against the durable receipt.
+  Final member, marker, directory, and receipt removal is not authorized by that
+  recheck. On macOS the builder first derives an opaque `FSRef` from the already
+  open object through `/dev/fd/<fd>`, then invokes `FSUnlinkObject` on that
+  reference. The final removal API receives no mutable cleanup pathname, so a
+  same-UID rename plus same-name replacement after reference creation can remove
+  only the already authorized object or fail; the replacement is checked,
+  preserved, and reported. If this identity-bound API is unavailable, rejects an
+  object or filesystem, or returns an error, cleanup retains its durable
+  receipt/quarantine and fails closed. A post-removal pathname or link-count check
+  is recovery evidence only and is never treated as authority for a name-based
+  delete.
   A retry accepts at most one exact receipt and one tombstone/purge state. It never
   derives cleanup authority from the current same-name inode. A mismatch preserves
   the replacement and uses a no-follow, double-snapshot parent identity scan with
   a fixed 4096-entry limit to detect a renamed authorized inode; either result
-  fails closed. If a crash follows the authorized `rmdir`, the same bounded scan
-  must prove that inode has no remaining sibling binding before the receipt itself
-  is quarantined and removed. Crashes at every boundary therefore consume no
+  fails closed. If a crash follows the identity-bound directory removal, the same
+  bounded scan must prove that inode has no remaining sibling binding before the
+  receipt itself is quarantined and removed. Crashes at every boundary consume no
   additional names or payload copies, while normal success and candidate builds
   leave no cleanup receipt or sibling. A receipt interrupted before the transaction
   leaves the output is first matched to that still marker-authorized transaction,
