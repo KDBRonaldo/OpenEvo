@@ -273,6 +273,29 @@ describe("Desktop product provider boundary", () => {
     })).rejects.toThrow(/profile slot/i);
   });
 
+  it("fails closed without invoking an unavailable native credential command", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "start_sidecar") return releaseBootstrap(digest, flags);
+      throw new Error(`Unexpected Tauri command: ${command}`);
+    });
+
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      adapterFactory: async ({ native }) => {
+        await native.configureCredential(
+          "profile-fixture-1",
+          "ssh_private_key",
+          `"${"a".repeat(64)}"`,
+          "credential-action-0002",
+        );
+        return unavailableDesktopProductProvider;
+      },
+    })).rejects.toThrow(/SSH agent is the only supported authentication method/i);
+    expect(invokeMock.mock.calls.some(([command]) => command === "configure_credential")).toBe(false);
+  });
+
   it("rejects an older refresh result after a newer refresh has started", () => {
     const order = new ProductRefreshOrder();
     const older = order.begin();

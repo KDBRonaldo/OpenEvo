@@ -491,9 +491,6 @@ export function DesktopProductApp({
             setConnectionSettingsOpen(false);
             setSelectedProjectId((current) => current ?? snapshot.projects.find((item) => item.profile_id === observedProfile.profile_id)?.project_id ?? null);
           }}
-          onConfigureCredential={(slotKind) => profile
-            ? act(() => provider.configureCredential(profile.profile_id, slotKind, resourceIntent(snapshot, profile.etag))).then(() => undefined)
-            : Promise.resolve()}
         />
       ) : null}
     </div>
@@ -1171,7 +1168,6 @@ function RemoteWorkspaceDrawer({
   createSaveIntent,
   onSave,
   onCreateObserved,
-  onConfigureCredential,
 }: {
   profile: RemoteProfileV1 | null;
   observedProfiles: readonly RemoteProfileV1[];
@@ -1181,17 +1177,15 @@ function RemoteWorkspaceDrawer({
   createSaveIntent: (input: ProfileCreateV1) => ProfileSaveIntent;
   onSave: (intent: ProfileSaveIntent) => Promise<ProfileSaveAttemptResult>;
   onCreateObserved: (profile: RemoteProfileV1) => void;
-  onConfigureCredential: (slotKind: RemoteProfileV1["credential_slots"][number]["kind"]) => Promise<unknown>;
 }) {
   const [name, setName] = useState(profile?.name ?? "Research server");
   const [host, setHost] = useState(profile?.host ?? "");
   const [port, setPort] = useState(String(profile?.port ?? 22));
   const [user, setUser] = useState(profile?.user ?? "");
-  const [authenticationKind, setAuthenticationKind] = useState<RemoteProfileV1["authentication_kind"]>(profile?.authentication_kind ?? "ssh_agent");
   const [httpProxy, setHttpProxy] = useState(profile?.proxy.http_url ?? "");
   const [httpsProxy, setHttpsProxy] = useState(profile?.proxy.https_url ?? "");
   const [noProxy, setNoProxy] = useState(profile?.proxy.no_proxy.join(", ") ?? "");
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirty] = useState(profile !== null && profile.authentication_kind !== "ssh_agent");
   const guardedClose = useGuardedDrawerClose(dirty, onClose);
   const dialogRef = useDialogFocus(guardedClose.requestClose);
   const pendingSaveIntent = useRef<ProfileSaveIntent | null>(null);
@@ -1199,7 +1193,6 @@ function RemoteWorkspaceDrawer({
   const valid = name.trim() !== "" && host.trim() !== "" && user.trim() !== "" && Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65_535;
   const markDirty = () => { pendingSaveIntent.current = null; setDirty(true); };
   const update = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement>) => { setter(event.target.value); markDirty(); };
-  const visibleSlots = credentialSlotsForAuth(profile, authenticationKind);
   useEffect(() => {
     const pending = pendingSaveIntent.current;
     const createdProfile = pending?.route.kind === "create"
@@ -1223,9 +1216,8 @@ function RemoteWorkspaceDrawer({
           </section>
           <section className="form-section">
             <h3>Authentication</h3>
-            <label>Method<select value={authenticationKind} onChange={(event) => { setAuthenticationKind(event.target.value as RemoteProfileV1["authentication_kind"]); markDirty(); }}><option value="ssh_agent">System agent</option><option value="native_private_key">Private key</option><option value="native_password">Password</option></select></label>
-            <p className="form-help">Secrets are stored by macOS and are never shown in the app.</p>
-            {visibleSlots.length ? <div className="credential-list">{visibleSlots.map((slot) => <div className="credential-row" key={slot.kind}><CredentialStatus slot={slot} /><button type="button" className="secondary-button" disabled={!profile || busy} title={!profile ? "Save this workspace before configuring credentials" : `Configure ${credentialLabel(slot.kind)}`} onClick={() => void onConfigureCredential(slot.kind)}>{slot.status === "stored" ? "Replace" : "Configure"}</button></div>)}</div> : <div className="agent-note"><ShieldCheck size={17} /><span>The system agent will provide authentication.</span></div>}
+            <div className="agent-note"><ShieldCheck size={17} /><span>SSH agent</span></div>
+            {profile && profile.authentication_kind !== "ssh_agent" ? <p className="form-error" role="alert">The saved authentication method is unavailable in this release. Save this workspace to use SSH agent.</p> : null}
           </section>
           <section className="form-section">
             <h3>Network proxy</h3>
@@ -1241,7 +1233,7 @@ function RemoteWorkspaceDrawer({
             host: host.trim(),
             port: parsedPort,
             user: user.trim(),
-            authentication_kind: authenticationKind,
+            authentication_kind: "ssh_agent",
             proxy: {
               http_url: httpProxy.trim() || null,
               https_url: httpsProxy.trim() || null,
@@ -2017,29 +2009,9 @@ function useDialogFocus(onClose: () => void) {
 }
 
 function missingCredentialReason(profile: RemoteProfileV1): string | null {
-  const requiredKind = profile.authentication_kind === "native_password"
-    ? "ssh_password"
-    : profile.authentication_kind === "native_private_key"
-      ? "ssh_private_key"
-      : null;
-  if (!requiredKind) return null;
-  const slot = profile.credential_slots.find((item) => item.kind === requiredKind);
-  return slot?.status === "stored" ? null : `Configure the ${credentialLabel(requiredKind)} before connecting.`;
-}
-
-function credentialSlotsForAuth(
-  profile: RemoteProfileV1 | null,
-  authenticationKind: RemoteProfileV1["authentication_kind"],
-): RemoteProfileV1["credential_slots"] {
-  const kinds: RemoteProfileV1["credential_slots"][number]["kind"][] = authenticationKind === "native_password"
-    ? ["ssh_password"]
-    : authenticationKind === "native_private_key"
-      ? ["ssh_private_key", "ssh_private_key_passphrase"]
-      : [];
-  for (const proxyKind of ["http_proxy_password", "https_proxy_password"] as const) {
-    if (profile?.credential_slots.some((slot) => slot.kind === proxyKind)) kinds.push(proxyKind);
-  }
-  return kinds.map((kind) => profile?.credential_slots.find((slot) => slot.kind === kind) ?? { kind, status: "empty", updated_at: null });
+  return profile.authentication_kind === "ssh_agent"
+    ? null
+    : "Switch this remote workspace to SSH agent authentication before connecting.";
 }
 
 function credentialLabel(kind: RemoteProfileV1["credential_slots"][number]["kind"]): string {

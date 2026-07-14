@@ -186,17 +186,10 @@ describe("DesktopProductApp", () => {
     setInput("Workspace name", "Lab server");
     setInput("Server address", "lab.example.test");
     setInput("User name", "researcher");
-    setSelect("Method", "native_password");
+    expect(screenText()).toContain("SSH agent");
+    expect(screenText()).not.toContain("Private key");
+    expect(screenText()).not.toContain("Password");
     await clickButton("Save workspace");
-
-    expect(screenText()).toContain("Configure the Server password before connecting.");
-    await clickButton("Configure");
-    expect(screenText()).toContain("Not configured");
-    const credentialButton = document.querySelector<HTMLButtonElement>(".credential-row button");
-    if (!credentialButton) throw new Error("Credential configure button was not found.");
-    await clickElement(credentialButton);
-    expect(screenText()).toContain("Stored securely");
-    await clickAria("Close connection settings");
 
     await clickButton("Connect");
     await advance(25);
@@ -218,6 +211,29 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Compare catalyst candidates");
     expect(button("Start session").title).toBe("Start a new research session");
     expect(button("Start session").disabled).toBe(false);
+  });
+
+  it("lets an older unsupported credential profile migrate to SSH agent", async () => {
+    provider = createFixtureDesktopProductProvider();
+    await provider.createProfile({
+      name: "Legacy server",
+      host: "legacy.example.test",
+      port: 22,
+      user: "researcher",
+      authentication_kind: "native_password",
+      proxy: { http_url: null, https_url: null, no_proxy: [] },
+    }, { actionId: "legacy-profile-create-0001", streamEpoch: 1 });
+    root = await renderProduct(provider);
+
+    await clickAria("Remote workspace settings");
+    expect(screenText()).toContain("The saved authentication method is unavailable in this release.");
+    expect(screenText()).toContain("SSH agent");
+    expect(button("Save workspace").disabled).toBe(false);
+    await clickButton("Save workspace");
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    expect(refreshed.snapshot.profiles[0]?.authentication_kind).toBe("ssh_agent");
   });
 
   it("commits the later revision and pins it in the next session", async () => {

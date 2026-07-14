@@ -48,9 +48,11 @@ replacement, reset, stale completion, and failed save paths discard, while a
 successful create/patch settles as adopted only after the sidecar has durably
 committed the project reference. Only the opaque source reference enters the
 renderer DTO or public Desktop Local API. The
-remaining `configure_credential` command is still a required release
-integration dependency; the provider continues to fail closed until it is
-implemented.
+release UI exposes only SSH agent authentication. Password, private-key, and
+proxy-secret credential brokers remain contract extension points, but the
+default native bridge rejects those calls without invoking a nonexistent Tauri
+command. They must not appear as usable release controls until the native broker
+is implemented and reviewed.
 
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation
