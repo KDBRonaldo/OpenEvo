@@ -79,7 +79,10 @@ IfProjectMatch = Annotated[
         alias="If-Project-Match",
         min_length=66,
         max_length=66,
-        description="Current project ETag for atomic workspace publication.",
+        description=(
+            "For finalization, this must equal both upload.project_etag and the current "
+            "project ETag; the provider also verifies upload.project_snapshot is still current."
+        ),
     ),
 ]
 ResourceId = Annotated[str, m.StringConstraints(min_length=1, max_length=128)]
@@ -158,7 +161,8 @@ def create_core_control_contract_app() -> FastAPI:
     @router.post(
         "/environment/repair",
         operation_id="repairCoreEnvironmentV1",
-        response_model=m.EnvironmentRepairResponseV1,
+        response_model=m.OperationV1,
+        status_code=202,
         responses=_ERROR_RESPONSES,
         tags=["environment"],
     )
@@ -625,6 +629,30 @@ def create_core_control_contract_app() -> FastAPI:
     async def get_operation(operation_id: ResourceId) -> Response:
         return _not_implemented()
 
+    @router.post(
+        "/operations/{operation_id}/cancel",
+        operation_id="cancelCoreOperationV1",
+        response_model=m.OperationV1,
+        status_code=202,
+        responses={
+            **_ERROR_RESPONSES,
+            409: {
+                "model": m.OperationCancelConflictV1,
+                "description": (
+                    "The operation descriptor declares that this kind is not cancellable."
+                ),
+            },
+        },
+        tags=["operations"],
+    )
+    async def cancel_operation(
+        operation_id: ResourceId,
+        request: m.OperationCancelRequestV1,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _not_implemented()
+
     @router.get(
         "/logs/{logs_ref}",
         operation_id="getCoreLogsByRefV1",
@@ -696,7 +724,7 @@ def create_core_control_contract_app() -> FastAPI:
     @router.get(
         "/events",
         operation_id="streamCoreEventsV1",
-        response_model=m.EventEnvelopeV1,
+        response_model=m.SseFrameV1,
         responses=_ERROR_RESPONSES,
         tags=["events"],
     )
@@ -724,7 +752,7 @@ def create_core_control_contract_app() -> FastAPI:
         events_operation["x-sse-replay-max-events"] = 10_000
         events_operation["x-sse-cursor-expired-status"] = 410
         events_operation["responses"]["200"]["content"] = {
-            "text/event-stream": {"schema": {"$ref": "#/components/schemas/EventEnvelopeV1"}}
+            "text/event-stream": {"schema": {"$ref": "#/components/schemas/SseFrameV1"}}
         }
         app.openapi_schema = schema
         return schema
