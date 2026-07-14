@@ -3,15 +3,17 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import errno
+import hmac
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import threading
 import time
-from typing import Literal, cast
+from typing import Callable, Literal, cast
 
 import pytest
 
@@ -169,6 +171,86 @@ def _activate_project(
     return operation, remote
 
 
+def _reseal_provider_usage(
+    connection: sqlite3.Connection,
+    root: Path,
+) -> tuple[tuple[int, ...], bytes]:
+    values = tuple(
+        cast(
+            tuple[int, ...],
+            connection.execute(
+                "SELECT total_rows, total_bytes, remote_payload_count, "
+                "remote_payload_bytes, remote_accumulator_0, remote_accumulator_1, "
+                "remote_accumulator_2, remote_accumulator_3, profile_reservations, "
+                "project_reservations, idempotency_record_count, "
+                "pagination_cursor_count, generation FROM provider_storage_usage"
+            ).fetchone(),
+        )
+    )
+    tag = hmac.digest(
+        (root / "cursor-signing.key").read_bytes(),
+        provider_store_module._PROVIDER_STORAGE_USAGE_AUTHORITY_DOMAIN
+        + struct.pack(f">{len(values)}Q", *values),
+        "sha256",
+    )
+    updated = connection.execute(
+        "UPDATE provider_storage_usage SET authority_tag = ? WHERE singleton = 1",
+        (tag,),
+    )
+    assert updated.rowcount == 1
+    return values, tag
+
+
+def _provider_usage_row(connection: sqlite3.Connection) -> tuple[object, ...]:
+    return tuple(connection.execute("SELECT * FROM provider_storage_usage").fetchone())
+
+
+def _replay_provider_usage(
+    connection: sqlite3.Connection,
+    row: tuple[object, ...],
+) -> None:
+    columns = provider_store_module._PROVIDER_USAGE_COLUMNS
+    updated = connection.execute(
+        f"UPDATE provider_storage_usage SET "
+        f"{', '.join(f'{column} = ?' for column in columns)} WHERE singleton = 1",
+        row[1:],
+    )
+    assert updated.rowcount == 1
+
+
+def _initialize_empty_v4_provider_store(root: Path) -> tuple[int, int]:
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    key = b"k" * 32
+    (root / "cursor-signing.key").write_bytes(key)
+    os.chmod(root / "cursor-signing.key", 0o600)
+    timestamp = "2026-07-14T12:00:00.000000Z"
+    authority_tag = hmac.digest(
+        key,
+        provider_store_module._REMOTE_PAYLOAD_USAGE_AUTHORITY_DOMAIN + struct.pack(">QQ", 0, 0),
+        "sha256",
+    )
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for statement in provider_store_module._SCHEMA_V4:
+            connection.execute(statement)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((version, timestamp) for version in range(1, 5)),
+        )
+        connection.execute(
+            "INSERT INTO remote_payload_usage VALUES (1, 0, 0, ?)",
+            (authority_tag,),
+        )
+        connection.execute("PRAGMA user_version = 4")
+        usage = DesktopProviderStore._recovery_usage_v4(
+            connection,
+            include_remote_payload_usage=True,
+        )
+    os.chmod(root / "provider.sqlite3", 0o600)
+    return usage
+
+
 def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
     root = tmp_path / "state"
     store = DesktopProviderStore(root)
@@ -183,7 +265,7 @@ def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
     }
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in managed_files)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (3,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
     assert tuple(store._connection.execute("PRAGMA journal_mode").fetchone()) == ("delete",)
     assert tuple(store._connection.execute("PRAGMA max_page_count").fetchone()) == (
         store._max_page_count,
@@ -196,7 +278,13 @@ def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,)]
+    ] == [(1,), (2,), (3,), (4,), (5,)]
+    assert tuple(
+        store._connection.execute(
+            "SELECT total_rows, remote_payload_count, remote_payload_bytes, "
+            "length(authority_tag) FROM provider_storage_usage"
+        ).fetchone()
+    ) == (8, 0, 0, 32)
     assert not (root / "provider.sqlite3-wal").exists()
     assert not (root / "provider.sqlite3-shm").exists()
 
@@ -498,7 +586,7 @@ def test_rejects_unknown_schema_version(tmp_path: Path) -> None:
         DesktopProviderStore(root)
 
 
-def test_migrates_a_canonical_v1_store_to_v3(tmp_path: Path) -> None:
+def test_migrates_a_canonical_v1_store_to_v5(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
     os.chmod(root, 0o700)
@@ -518,18 +606,18 @@ def test_migrates_a_canonical_v1_store_to_v3(tmp_path: Path) -> None:
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (3,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
     assert [
         tuple(row)
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,)]
+    ] == [(1,), (2,), (3,), (4,), (5,)]
     profile = _create_profile(store, key="post-migration-create")
     assert store.get_profile(profile.profile_id) == profile
 
 
-def test_migrates_a_canonical_v2_store_to_v3(tmp_path: Path) -> None:
+def test_migrates_a_canonical_v2_store_to_v5(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
     os.chmod(root, 0o700)
@@ -585,13 +673,13 @@ def test_migrates_a_canonical_v2_store_to_v3(tmp_path: Path) -> None:
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (3,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
     assert [
         tuple(row)
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,)]
+    ] == [(1,), (2,), (3,), (4,), (5,)]
     assert [row[1] for row in store._connection.execute("PRAGMA table_info(projects)")] == [
         "project_id",
         "profile_id",
@@ -600,6 +688,10 @@ def test_migrates_a_canonical_v2_store_to_v3(tmp_path: Path) -> None:
         "state",
         "current_revision_id",
         "remote_state_json",
+        "remote_state_token_0",
+        "remote_state_token_1",
+        "remote_state_token_2",
+        "remote_state_token_3",
         "resource_version",
         "created_at",
         "updated_at",
@@ -628,6 +720,247 @@ def test_migrates_a_canonical_v2_store_to_v3(tmp_path: Path) -> None:
             "UPDATE projects SET remote_state_json = zeroblob(?) WHERE project_id = ?",
             (provider_store_module.MAX_REMOTE_PROJECT_STATE_BYTES + 1, "project-v2"),
         )
+
+
+def test_migrates_v3_remote_payload_usage_into_provider_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    (root / "cursor-signing.key").write_bytes(b"k" * 32)
+    os.chmod(root / "cursor-signing.key", 0o600)
+    remote = _remote_project_state("project-v3", "revision-v3")
+    remote_bytes = provider_store_module._canonical_json_bytes(remote.model_dump(mode="json"))
+    timestamp = "2026-07-14T12:00:00.000000Z"
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for statement in provider_store_module._SCHEMA_V3:
+            connection.execute(statement)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((1, timestamp), (2, timestamp), (3, timestamp)),
+        )
+        connection.execute(
+            """
+            INSERT INTO remote_profiles(
+                profile_id, name, document_json, connection_state,
+                credential_slots_json, host_key_fingerprint, resource_version,
+                created_at, updated_at
+            ) VALUES ('profile-v3', 'Research server', ?, 'disconnected', ?, NULL, 1, ?, ?)
+            """,
+            (provider_store_module._canonical_json_bytes(_profile()), b"[]", timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO projects(
+                project_id, profile_id, name, document_json, state,
+                current_revision_id, remote_state_json, resource_version,
+                created_at, updated_at
+            ) VALUES ('project-v3', 'profile-v3', 'Protein design', ?, 'active', ?, ?, 1, ?, ?)
+            """,
+            (
+                provider_store_module._canonical_json_bytes(_project("profile-v3")),
+                "revision-v3",
+                remote_bytes,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute("PRAGMA user_version = 3")
+    os.chmod(root / "provider.sqlite3", 0o600)
+
+    store = DesktopProviderStore(root)
+
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
+    assert tuple(
+        store._connection.execute(
+            "SELECT remote_payload_count, remote_payload_bytes, length(authority_tag) "
+            "FROM provider_storage_usage"
+        ).fetchone()
+    ) == (1, len(remote_bytes), 32)
+    migrated = store.get_project("project-v3")
+    assert migrated.state == "draft"
+    assert migrated.remote == remote
+
+
+def test_v3_to_v4_usage_migration_is_one_crash_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    (root / "cursor-signing.key").write_bytes(b"k" * 32)
+    os.chmod(root / "cursor-signing.key", 0o600)
+    timestamp = "2026-07-14T12:00:00.000000Z"
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for statement in provider_store_module._SCHEMA_V3:
+            connection.execute(statement)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((1, timestamp), (2, timestamp), (3, timestamp)),
+        )
+        connection.execute("PRAGMA user_version = 3")
+    os.chmod(root / "provider.sqlite3", 0o600)
+    original = DesktopProviderStore._migrate_v3_to_v4
+
+    def crash_after_migration(self: DesktopProviderStore, connection: sqlite3.Connection) -> None:
+        original(self, connection)
+        raise RuntimeError("injected usage migration crash")
+
+    monkeypatch.setattr(DesktopProviderStore, "_migrate_v3_to_v4", crash_after_migration)
+    with pytest.raises(RuntimeError, match="usage migration crash"):
+        DesktopProviderStore(root)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name = 'remote_payload_usage'"
+            ).fetchone()
+            is None
+        )
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,), (3,)]
+
+
+def test_v4_to_v5_provider_authority_migration_is_one_crash_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    key = b"k" * 32
+    (root / "cursor-signing.key").write_bytes(key)
+    os.chmod(root / "cursor-signing.key", 0o600)
+    timestamp = "2026-07-14T12:00:00.000000Z"
+    authority_tag = hmac.digest(
+        key,
+        provider_store_module._REMOTE_PAYLOAD_USAGE_AUTHORITY_DOMAIN + struct.pack(">QQ", 0, 0),
+        "sha256",
+    )
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for statement in provider_store_module._SCHEMA_V4:
+            connection.execute(statement)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((version, timestamp) for version in range(1, 5)),
+        )
+        connection.execute(
+            "INSERT INTO remote_payload_usage VALUES (1, 0, 0, ?)",
+            (authority_tag,),
+        )
+        connection.execute("PRAGMA user_version = 4")
+    os.chmod(root / "provider.sqlite3", 0o600)
+    original = DesktopProviderStore._migrate_v4_to_v5
+
+    def crash_after_migration(self: DesktopProviderStore, connection: sqlite3.Connection) -> None:
+        original(self, connection)
+        raise RuntimeError("injected v5 authority migration crash")
+
+    monkeypatch.setattr(DesktopProviderStore, "_migrate_v4_to_v5", crash_after_migration)
+    with pytest.raises(RuntimeError, match="v5 authority migration crash"):
+        DesktopProviderStore(root)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute(
+            "SELECT payload_count, payload_bytes FROM remote_payload_usage"
+        ).fetchone() == (0, 0)
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name = 'provider_storage_usage'"
+            ).fetchone()
+            is None
+        )
+
+
+@pytest.mark.parametrize(
+    ("budget_name", "usage_index"),
+    (("MAX_RECOVERY_ROWS", 0), ("MAX_RECOVERY_BYTES", 1)),
+    ids=("row-boundary", "byte-boundary"),
+)
+def test_v4_to_v5_migration_validates_final_write_budget_before_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget_name: str,
+    usage_index: int,
+) -> None:
+    root = tmp_path / "state"
+    v4_usage = _initialize_empty_v4_provider_store(root)
+    original_budget = getattr(provider_store_module, budget_name)
+    original_seal = DesktopProviderStore._seal_provider_storage_usage
+    seal_called = False
+
+    def unexpected_seal(
+        _self: DesktopProviderStore,
+        _connection: sqlite3.Connection,
+    ) -> tuple[tuple[int, ...], bytes]:
+        nonlocal seal_called
+        seal_called = True
+        raise AssertionError("v5 authority was sealed before final budget validation")
+
+    monkeypatch.setattr(provider_store_module, budget_name, v4_usage[usage_index])
+    monkeypatch.setattr(DesktopProviderStore, "_seal_provider_storage_usage", unexpected_seal)
+
+    with pytest.raises(ProviderDataCorruptionError, match="provider recovery budget exceeded"):
+        DesktopProviderStore(root)
+
+    assert seal_called is False
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name = 'provider_storage_usage'"
+            ).fetchone()
+            is None
+        )
+
+    monkeypatch.setattr(provider_store_module, budget_name, original_budget)
+    monkeypatch.setattr(DesktopProviderStore, "_seal_provider_storage_usage", original_seal)
+    reopened = DesktopProviderStore(root)
+    assert tuple(reopened._connection.execute("PRAGMA user_version").fetchone()) == (5,)
+
+
+def test_v3_usage_migration_applies_recovery_budget_before_payload_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    (root / "cursor-signing.key").write_bytes(b"k" * 32)
+    os.chmod(root / "cursor-signing.key", 0o600)
+    timestamp = "2026-07-14T12:00:00.000000Z"
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for statement in provider_store_module._SCHEMA_V3:
+            connection.execute(statement)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((1, timestamp), (2, timestamp), (3, timestamp)),
+        )
+        connection.execute("PRAGMA user_version = 3")
+    os.chmod(root / "provider.sqlite3", 0o600)
+
+    def unexpected_payload_scan(_connection: sqlite3.Connection) -> tuple[int, int, int]:
+        raise AssertionError("remote payload scan ran before the recovery row budget")
+
+    monkeypatch.setattr(provider_store_module, "MAX_RECOVERY_ROWS", 2)
+    monkeypatch.setattr(
+        DesktopProviderStore,
+        "_remote_state_recovery_usage",
+        staticmethod(unexpected_payload_scan),
+    )
+
+    with pytest.raises(ProviderDataCorruptionError, match="provider recovery budget"):
+        DesktopProviderStore(root)
 
 
 def test_v2_migration_rejects_a_noncanonical_ledger(tmp_path: Path) -> None:
@@ -814,6 +1147,7 @@ def test_startup_rejects_foreign_key_corruption(tmp_path: Path) -> None:
     with sqlite3.connect(root / "provider.sqlite3") as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("UPDATE projects SET profile_id = 'missing-profile'")
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="foreign key"):
         DesktopProviderStore(root)
@@ -829,6 +1163,7 @@ def test_startup_revalidates_typed_idempotency_response(tmp_path: Path) -> None:
             "UPDATE idempotency_records SET response_bytes = ?",
             (b'{"schema_version":"1"}',),
         )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="idempotent"):
         DesktopProviderStore(root)
@@ -933,7 +1268,13 @@ def test_remote_project_projection_survives_restart_as_historical_observation(
     reopened.close()
 
     reopened_again = DesktopProviderStore(root)
-    assert reopened_again.get_project(project.project_id).remote == remote
+    historical_again = reopened_again.get_project(project.project_id)
+    assert historical_again.remote == remote
+    reopened_again.delete_project(project.project_id, if_match=historical_again.etag)
+    assert reopened_again._validate_remote_payload_usage_authority(reopened_again._connection) == (
+        0,
+        0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -952,7 +1293,6 @@ def test_remote_project_projection_recovery_fails_closed(tmp_path: Path, corrupt
         project,
         key=f"remote-corrupt-{corruption}-activate",
     )
-    store.close()
     if corruption == "noncanonical":
         remote_bytes = (
             provider_store_module._canonical_json_bytes(remote.model_dump(mode="json")) + b" "
@@ -966,11 +1306,23 @@ def test_remote_project_projection_recovery_fails_closed(tmp_path: Path, corrupt
         else:
             cast(dict[str, object], remote_value["active_revision"])["id"] = "different-revision"
         remote_bytes = provider_store_module._canonical_json_bytes(remote_value)
+    remote_token = store._remote_payload_content_token(
+        project_id=project.project_id,
+        payload=remote_bytes,
+    )
+    store.close()
     with sqlite3.connect(root / "provider.sqlite3") as connection:
         connection.execute(
-            "UPDATE projects SET remote_state_json = ? WHERE project_id = ?",
-            (remote_bytes, project.project_id),
+            """
+            UPDATE projects
+            SET remote_state_json = ?,
+                remote_state_token_0 = ?, remote_state_token_1 = ?,
+                remote_state_token_2 = ?, remote_state_token_3 = ?
+            WHERE project_id = ?
+            """,
+            (remote_bytes, *remote_token, project.project_id),
         )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="remote project"):
         DesktopProviderStore(root)
@@ -989,22 +1341,28 @@ def test_remote_project_projection_budget_rejects_before_payload_read_or_parse(
         _project(profile.profile_id, name="First"),
         idempotency_key=f"remote-budget-{budget}-first",
     )
+    _, first_remote = _activate_project(
+        store,
+        first,
+        key=f"remote-budget-{budget}-first-activate",
+    )
     if budget == "aggregate":
         second = store.create_project(
             _project(profile.profile_id, name="Second"),
             idempotency_key="remote-budget-aggregate-second",
         )
-        _activate_project(store, first, key="remote-budget-aggregate-first-activate")
         _activate_project(store, second, key="remote-budget-aggregate-second-activate")
     store.close()
 
     if budget == "per_row":
-        with sqlite3.connect(root / "provider.sqlite3") as connection:
-            connection.execute("PRAGMA ignore_check_constraints = ON")
-            connection.execute(
-                "UPDATE projects SET remote_state_json = zeroblob(?) WHERE project_id = ?",
-                (provider_store_module.MAX_REMOTE_PROJECT_STATE_BYTES + 1, first.project_id),
-            )
+        remote_bytes = provider_store_module._canonical_json_bytes(
+            first_remote.model_dump(mode="json")
+        )
+        monkeypatch.setattr(
+            provider_store_module,
+            "MAX_REMOTE_PROJECT_STATE_BYTES",
+            len(remote_bytes) - 1,
+        )
     else:
         with sqlite3.connect(root / "provider.sqlite3") as connection:
             total_bytes = cast(
@@ -1043,11 +1401,527 @@ def test_remote_project_projection_budget_rejects_before_payload_read_or_parse(
     monkeypatch.setattr(provider_store_module.sqlite3, "connect", connect)
     monkeypatch.setattr(provider_store_module, "_decode_json_object", decode_probe)
 
-    with pytest.raises(ProviderDataCorruptionError, match="remote project state recovery"):
+    with pytest.raises(ProviderDataCorruptionError, match="remote project state"):
         DesktopProviderStore(root)
 
     assert not any("select * from projects" in statement for statement in statements)
     assert not any("then remote_state_json" in statement for statement in statements)
+
+
+@pytest.mark.parametrize("corruption", ["counter", "row"])
+def test_remote_payload_usage_tamper_fails_before_project_payload_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key=f"usage-tamper-{corruption}-create"
+    )
+    _, remote = _activate_project(store, project, key=f"usage-tamper-{corruption}-activate")
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        if corruption == "counter":
+            connection.execute(
+                "UPDATE provider_storage_usage SET remote_payload_bytes = remote_payload_bytes + 1"
+            )
+        else:
+            changed = remote.model_copy(update={"observed_at": "2026-07-14T12:00:01Z"})
+            connection.execute(
+                "UPDATE projects SET remote_state_json = ? WHERE project_id = ?",
+                (
+                    provider_store_module._canonical_json_bytes(changed.model_dump(mode="json")),
+                    project.project_id,
+                ),
+            )
+
+    original_decode = provider_store_module._decode_json_object
+
+    def decode_probe(raw: bytes, *, label: str):
+        if label == "remote project state":
+            raise AssertionError("tampered remote state reached JSON parsing")
+        return original_decode(raw, label=label)
+
+    monkeypatch.setattr(provider_store_module, "_decode_json_object", decode_probe)
+    with pytest.raises(ProviderDataCorruptionError, match="storage usage authority"):
+        store.get_profile(profile.profile_id)
+
+
+def test_startup_reconciles_sealed_usage_authority_against_project_rows(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="usage-reconcile-create"
+    )
+    _activate_project(store, project, key="usage-reconcile-activate")
+    authority = tuple(
+        store._connection.execute(
+            "SELECT total_rows, total_bytes, remote_payload_count, remote_payload_bytes, "
+            "remote_accumulator_0, remote_accumulator_1, remote_accumulator_2, "
+            "remote_accumulator_3, profile_reservations, project_reservations, "
+            "idempotency_record_count, pagination_cursor_count, generation "
+            "FROM provider_storage_usage"
+        ).fetchone()
+    )
+    forged = (*authority[:3], authority[3] + 1, *authority[4:])
+    forged_authority = store._provider_storage_usage_authority_tag(forged)
+    store.close()
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute(
+            """
+            UPDATE provider_storage_usage
+            SET remote_payload_bytes = ?, authority_tag = ?
+            WHERE singleton = 1
+            """,
+            (forged[3], forged_authority),
+        )
+
+    with pytest.raises(ProviderDataCorruptionError, match="differs from provider rows"):
+        DesktopProviderStore(root)
+
+
+def test_provider_usage_singleton_rejects_delete_and_replace_with_recursive_triggers_off(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    row = _provider_usage_row(store._connection)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute("PRAGMA recursive_triggers = OFF")
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be deleted"):
+            connection.execute("DELETE FROM provider_storage_usage WHERE singleton = 1")
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be inserted"):
+            connection.execute(
+                f"INSERT OR REPLACE INTO provider_storage_usage "
+                f"(singleton, {', '.join(provider_store_module._PROVIDER_USAGE_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in row)})",
+                row,
+            )
+
+    assert _provider_usage_row(store._connection) == row
+    store.get_profile(_create_profile(store, key="singleton-guard-profile").profile_id)
+
+
+@pytest.mark.parametrize("probe", ["online", "restart"])
+def test_signed_provider_usage_replay_is_rejected(
+    tmp_path: Path,
+    probe: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key=f"authority-replay-{probe}-create"
+    )
+    _, remote = _activate_project(store, project, key=f"authority-replay-{probe}-activate")
+    stale_authority = _provider_usage_row(store._connection)
+    changed = remote.model_copy(update={"observed_at": "2026-07-14T12:00:01Z"})
+    changed_bytes = provider_store_module._canonical_json_bytes(changed.model_dump(mode="json"))
+    old_bytes = provider_store_module._canonical_json_bytes(remote.model_dump(mode="json"))
+    assert len(changed_bytes) == len(old_bytes)
+    token = store._remote_payload_content_token(
+        project_id=project.project_id,
+        payload=changed_bytes,
+    )
+    with store._transaction(write=True) as connection:
+        connection.execute(
+            """
+            UPDATE projects
+            SET remote_state_json = ?,
+                remote_state_token_0 = ?, remote_state_token_1 = ?,
+                remote_state_token_2 = ?, remote_state_token_3 = ?
+            WHERE project_id = ?
+            """,
+            (changed_bytes, *token, project.project_id),
+        )
+    assert store.get_project(project.project_id).remote == changed
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        _replay_provider_usage(connection, stale_authority)
+
+    if probe == "online":
+        with pytest.raises(ProviderDataCorruptionError, match="replayed during this process"):
+            store.get_profile(profile.profile_id)
+    else:
+        store.close()
+        with pytest.raises(ProviderDataCorruptionError, match="differs from provider rows"):
+            DesktopProviderStore(root)
+
+
+@pytest.mark.parametrize("probe", ["online", "restart"])
+def test_equal_length_remote_payload_rewrite_cannot_reuse_signed_aggregate(
+    tmp_path: Path,
+    probe: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key=f"content-rewrite-{probe}-create"
+    )
+    _, remote = _activate_project(store, project, key=f"content-rewrite-{probe}-activate")
+    signed_authority = _provider_usage_row(store._connection)
+    changed = remote.model_copy(update={"observed_at": "2026-07-14T12:00:01Z"})
+    original_bytes = provider_store_module._canonical_json_bytes(remote.model_dump(mode="json"))
+    changed_bytes = provider_store_module._canonical_json_bytes(changed.model_dump(mode="json"))
+    assert changed_bytes != original_bytes
+    assert len(changed_bytes) == len(original_bytes)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute(
+            "UPDATE projects SET remote_state_json = ? WHERE project_id = ?",
+            (changed_bytes, project.project_id),
+        )
+        _replay_provider_usage(connection, signed_authority)
+
+    if probe == "restart":
+        store.close()
+        with pytest.raises(
+            ProviderDataCorruptionError,
+            match="remote project state content authority",
+        ):
+            DesktopProviderStore(root)
+    else:
+        with pytest.raises(
+            ProviderDataCorruptionError,
+            match="remote project state content authority",
+        ):
+            store.get_project(project.project_id)
+
+
+@pytest.mark.parametrize("mutation", ["removed", "corrupt"])
+@pytest.mark.parametrize("probe", ["online", "restart"])
+def test_provider_usage_trigger_tamper_fails_closed(
+    tmp_path: Path,
+    mutation: str,
+    probe: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    trigger_sql = provider_store_module._provider_usage_trigger_v5(
+        "projects",
+        next(
+            columns
+            for table, columns in provider_store_module._RECOVERY_USAGE_SPECIFICATIONS
+            if table == "projects"
+        ),
+        "UPDATE",
+    )
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute("DROP TRIGGER provider_usage_projects_update")
+        if mutation == "corrupt":
+            connection.execute(trigger_sql.replace("generation + 1", "generation + 2"))
+
+    if probe == "restart":
+        store.close()
+        with pytest.raises(ProviderSchemaError, match="fingerprint"):
+            DesktopProviderStore(root)
+    else:
+        with pytest.raises(ProviderSchemaError, match="fingerprint"):
+            store.get_profile(profile.profile_id)
+
+
+def test_profile_point_read_does_not_scan_one_hundred_thousand_projects(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project_document = provider_store_module._canonical_json_bytes(
+        ProjectCreateV1.model_validate(
+            _project(profile.profile_id, name="Bulk project")
+        ).model_dump(mode="json")
+    )
+    timestamp = "2026-07-14T12:00:00.000000Z"
+    current_rows = cast(
+        int,
+        store._connection.execute("SELECT total_rows FROM provider_storage_usage").fetchone()[0],
+    )
+    project_count = provider_store_module.MAX_RECOVERY_ROWS - current_rows
+    store._connection.execute("BEGIN IMMEDIATE")
+    try:
+        store._connection.executemany(
+            """
+            INSERT INTO projects(
+                project_id, profile_id, name, document_json, state,
+                current_revision_id, remote_state_json, resource_version,
+                created_at, updated_at
+            ) VALUES (?, ?, 'Bulk project', ?, 'draft', NULL, NULL, 1, ?, ?)
+            """,
+            (
+                (
+                    f"bulk-project-{index:06d}",
+                    profile.profile_id,
+                    project_document,
+                    timestamp,
+                    timestamp,
+                )
+                for index in range(project_count)
+            ),
+        )
+        sealed = store._seal_provider_storage_usage(store._connection)
+        store._connection.commit()
+        store._provider_usage_snapshot = sealed
+    except BaseException:
+        store._connection.rollback()
+        raise
+
+    plan = tuple(
+        str(row[3])
+        for row in store._connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM remote_profiles WHERE profile_id = ?",
+            (profile.profile_id,),
+        )
+    )
+    assert any("SEARCH remote_profiles" in step for step in plan)
+    assert not any("SCAN remote_profiles" in step for step in plan)
+    authority_plan = tuple(
+        str(row[3])
+        for row in store._connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM provider_storage_usage WHERE singleton = 1"
+        )
+    )
+    assert any(
+        "SEARCH provider_storage_usage USING PRIMARY KEY" in step for step in authority_plan
+    )
+    assert not any("SCAN provider_storage_usage" in step for step in authority_plan)
+    statements: list[str] = []
+    store._connection.set_trace_callback(
+        lambda statement: statements.append(" ".join(statement.lower().split()))
+    )
+
+    patched = store.patch_profile(
+        profile.profile_id,
+        {"name": "Research serveX"},
+        if_match=profile.etag,
+    )
+    assert patched.name == "Research serveX"
+    assert not any(" from projects" in statement for statement in statements)
+    assert sum("from provider_storage_usage" in statement for statement in statements) == 3
+    for table, _ in provider_store_module._RECOVERY_USAGE_SPECIFICATIONS:
+        assert not any(
+            ("count(" in statement or "sum(" in statement) and f" from {table}" in statement
+            for statement in statements
+        )
+
+
+def test_project_pagination_never_runs_remote_payload_aggregate_scans(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    for index in range(3):
+        store.create_project(
+            _project(profile.profile_id, name=f"Project {index}"),
+            idempotency_key=f"usage-pagination-create-{index:02d}",
+        )
+    statements: list[str] = []
+    store._connection.set_trace_callback(
+        lambda statement: statements.append(" ".join(statement.lower().split()))
+    )
+
+    first = store.list_projects(limit=1, sort="name", direction="asc")
+    assert first.next_cursor is not None
+    second = store.list_projects(
+        limit=1,
+        after=first.next_cursor,
+        sort="name",
+        direction="asc",
+    )
+
+    assert len(first.items) == len(second.items) == 1
+    assert first.items[0].project_id != second.items[0].project_id
+    assert not any(
+        "sum(length(cast(remote_state_json as blob)))" in statement
+        or "max(length(cast(remote_state_json as blob)))" in statement
+        for statement in statements
+    )
+
+
+def test_normal_provider_writes_use_o1_counters_and_bounded_expiry_cleanup(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id),
+        idempotency_key="sql-plan-project-create",
+    )
+
+    def traced(write: Callable[[], object]) -> tuple[str, ...]:
+        statements: list[str] = []
+        store._connection.set_trace_callback(
+            lambda statement: statements.append(" ".join(statement.lower().split()))
+        )
+        try:
+            write()
+        finally:
+            store._connection.set_trace_callback(None)
+        return tuple(statements)
+
+    traces = {
+        "create": traced(
+            lambda: _create_profile(
+                store,
+                name="SQL trace profile",
+                key="sql-trace-profile-create",
+            )
+        ),
+        "profile-action": traced(
+            lambda: store.begin_profile_runtime_action(
+                route=f"/desktop/v1/profiles/{profile.profile_id}/disconnect",
+                operation_kind="profile_disconnect",
+                profile_id=profile.profile_id,
+                key="sql-trace-profile-action",
+                body={},
+                if_match=profile.etag,
+                displace_existing=False,
+            )
+        ),
+        "project-action": traced(
+            lambda: store.begin_project_runtime_action(
+                route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+                operation_kind="workspace_sync",
+                project_id=project.project_id,
+                key="sql-trace-project-action",
+                body={},
+                if_match=project.etag,
+            )
+        ),
+        "cursor": traced(lambda: store.list_profiles(limit=1, sort="name", direction="asc")),
+    }
+
+    for path in ("create", "profile-action", "project-action"):
+        statements = traces[path]
+        assert not any("select count(*) from idempotency_records" in sql for sql in statements)
+        assert any(
+            "from idempotency_records indexed by idempotency_expiry_idx" in sql and "limit" in sql
+            for sql in statements
+        )
+        assert any(
+            "idempotency_record_count" in sql
+            and "from provider_storage_usage where singleton = 1" in sql
+            for sql in statements
+        )
+    cursor_statements = traces["cursor"]
+    assert not any("select count(*) from pagination_cursors" in sql for sql in cursor_statements)
+    assert any(
+        "delete from pagination_cursors" in sql
+        and "pagination_cursors_expiry_idx" in sql
+        and "limit" in sql
+        for sql in cursor_statements
+    )
+    assert any(
+        "pagination_cursor_count" in sql
+        and "from provider_storage_usage where singleton = 1" in sql
+        for sql in cursor_statements
+    )
+
+
+def test_normal_cleanup_queries_are_indexed_and_return_a_fixed_batch(tmp_path: Path) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    idempotency_plan = tuple(
+        str(row[3])
+        for row in store._connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT * FROM idempotency_records INDEXED BY idempotency_expiry_idx
+            WHERE cleanup_eligible = 1 AND expires_at_epoch <= ?
+            ORDER BY expires_at_epoch
+            LIMIT ?
+            """,
+            (0, provider_store_module.NORMAL_WRITE_CLEANUP_ROWS),
+        )
+    )
+    assert any(
+        "SEARCH idempotency_records USING INDEX idempotency_expiry_idx" in step
+        for step in idempotency_plan
+    )
+    assert not any("SCAN idempotency_records" in step for step in idempotency_plan)
+
+    cursor_plan = tuple(
+        str(row[3])
+        for row in store._connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            DELETE FROM pagination_cursors
+            WHERE cursor_digest IN (
+                SELECT cursor_digest
+                FROM pagination_cursors INDEXED BY pagination_cursors_expiry_idx
+                WHERE expires_at_epoch <= ?
+                ORDER BY expires_at_epoch
+                LIMIT ?
+            )
+            """,
+            (0, provider_store_module.NORMAL_WRITE_CLEANUP_ROWS),
+        )
+    )
+    assert any(
+        "SEARCH pagination_cursors USING INDEX pagination_cursors_expiry_idx" in step
+        for step in cursor_plan
+    )
+    assert not any("SCAN pagination_cursors" in step for step in cursor_plan)
+
+    counter_plan = tuple(
+        str(row[3])
+        for row in store._connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT idempotency_record_count, pagination_cursor_count
+            FROM provider_storage_usage WHERE singleton = 1
+            """
+        )
+    )
+    assert any("SEARCH provider_storage_usage USING PRIMARY KEY" in step for step in counter_plan)
+    assert not any("SCAN provider_storage_usage" in step for step in counter_plan)
+
+
+def test_provider_usage_authority_tracks_crud_replay_and_operation_lifecycle(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+
+    def assert_reconciled() -> None:
+        store._reconcile_provider_storage_usage(store._connection)
+
+    profile = _create_profile(store, key="usage-lifecycle-profile")
+    assert_reconciled()
+    replayed = store.create_profile(_profile(), idempotency_key="usage-lifecycle-profile")
+    assert replayed == profile
+    assert_reconciled()
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="usage-lifecycle-project"
+    )
+    assert_reconciled()
+    patched = store.patch_project(project.project_id, {"name": "Changed"}, if_match=project.etag)
+    assert_reconciled()
+    action = {
+        "route": f"/desktop/v1/projects/{patched.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": patched.project_id,
+        "key": "usage-lifecycle-operation",
+        "body": {},
+        "if_match": patched.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    assert_reconciled()
+    store.start_project_runtime_action(reservation=reservation, **action)
+    assert_reconciled()
+    store.complete_project_runtime_action(reservation=reservation, remote_state=None, **action)
+    assert_reconciled()
+    store.delete_project(patched.project_id, if_match=patched.etag)
+    assert_reconciled()
+    store.delete_profile(profile.profile_id, if_match=profile.etag)
+    assert_reconciled()
+    store.close()
+    reopened = DesktopProviderStore(root)
+    reopened._reconcile_provider_storage_usage(reopened._connection)
 
 
 def test_active_project_intent_patch_invalidates_remote_and_allows_reactivation(
@@ -1080,6 +1954,7 @@ def test_active_project_intent_patch_invalidates_remote_and_allows_reactivation(
     ).fetchone()
     assert tuple(row) == (None, None, version_before + 1)
     assert patched.etag == store._etag("project", project.project_id, version_before + 1)
+    assert store._validate_remote_payload_usage_authority(store._connection) == (0, 0)
 
     reservation = store.begin_project_runtime_action(
         route=f"/desktop/v1/projects/{project.project_id}/activate",
@@ -1337,6 +2212,82 @@ def test_idempotency_capacity_is_bounded_without_evicting_live_replays(
     with pytest.raises(IdempotencyCapacityError):
         _create_profile(store, name="Second", key="profile-create-0002")
     assert store.list_profiles().items == (first,)
+
+
+def test_lower_idempotency_capacity_reopen_rejects_retries_and_recovers(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    clock = MutableClock()
+    record_count = provider_store_module.NORMAL_WRITE_CLEANUP_ROWS + 2
+    store = DesktopProviderStore(
+        root,
+        clock=clock,
+        idempotency_retention_seconds=2,
+        max_idempotency_records=record_count,
+    )
+    first_profile: RemoteProfileV1 | None = None
+    for index in range(record_count - 1):
+        created = _create_profile(
+            store,
+            name=f"Capacity profile {index}",
+            key=f"lower-capacity-profile-{index:03d}",
+        )
+        if first_profile is None:
+            first_profile = created
+    assert first_profile is not None
+    clock.now += timedelta(seconds=1)
+    exact_key = f"lower-capacity-profile-{record_count - 1:03d}"
+    exact_name = f"Capacity profile {record_count - 1}"
+    original_exact = _create_profile(store, name=exact_name, key=exact_key)
+    with store._transaction(write=True) as connection:
+        ProviderMutation(store, connection, if_match=first_profile.etag).set_profile_runtime_state(
+            first_profile.profile_id,
+            if_match=first_profile.etag,
+            connection_state="connected",
+            credential_slots=first_profile.credential_slots,
+            host_key_fingerprint=first_profile.host_key_fingerprint,
+        )
+    clock.now += timedelta(seconds=3)
+    store.close()
+
+    for _ in range(2):
+        with pytest.raises(
+            provider_store_module.ProviderCapacityConfigurationError,
+            match="idempotency record capacity is lower than persisted usage",
+        ) as raised:
+            DesktopProviderStore(
+                root,
+                clock=clock,
+                idempotency_retention_seconds=2,
+                max_idempotency_records=1,
+            )
+        assert raised.value.record_type == "idempotency"
+        assert raised.value.configured_limit == 1
+        assert raised.value.persisted_count == record_count
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM idempotency_records").fetchone() == (
+            record_count,
+        )
+        assert connection.execute(
+            "SELECT connection_state FROM remote_profiles WHERE profile_id = ?",
+            (first_profile.profile_id,),
+        ).fetchone() == ("connected",)
+
+    recovered = DesktopProviderStore(
+        root,
+        clock=clock,
+        idempotency_retention_seconds=2,
+        max_idempotency_records=record_count,
+    )
+    assert recovered.get_profile(first_profile.profile_id).connection_state == "disconnected"
+    recreated_exact = _create_profile(recovered, name=exact_name, key=exact_key)
+    assert recreated_exact.profile_id != original_exact.profile_id
+    assert recovered._provider_record_counts(recovered._connection)[0] == 2
+    assert tuple(
+        recovered._connection.execute("SELECT count(*) FROM idempotency_records").fetchone()
+    ) == (2,)
 
 
 def test_idempotent_action_state_change_is_atomic_replayed_and_blocks_delete(
@@ -2258,6 +3209,9 @@ def test_project_activation_remote_publication_rolls_back_as_one_transaction(
     }
     reservation = store.begin_project_runtime_action(**action)
     running = store.start_project_runtime_action(reservation=reservation, **action)
+    usage_before = tuple(
+        store._connection.execute("SELECT * FROM provider_storage_usage").fetchone()
+    )
 
     def fail_terminal_write(*_args: object, **_kwargs: object) -> LocalOperationV1:
         raise RuntimeError("injected terminal write fault")
@@ -2274,6 +3228,10 @@ def test_project_activation_remote_publication_rolls_back_as_one_transaction(
     assert store.get_project(first.project_id).remote == first_remote
     assert store.get_project(second.project_id) == second
     assert store.get_local_operation(running.operation_id) == running
+    assert (
+        tuple(store._connection.execute("SELECT * FROM provider_storage_usage").fetchone())
+        == usage_before
+    )
 
 
 def test_non_activation_project_completion_rejects_remote_projection(tmp_path: Path) -> None:
@@ -2829,7 +3787,9 @@ def test_project_action_replay_rejects_cross_project_operation_substitution(
         "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
         (second_bytes, first_action["key"]),
     )
+    snapshot = _reseal_provider_usage(store._connection, store.state_root)
     store._connection.commit()
+    store._provider_usage_snapshot = snapshot
 
     with pytest.raises(ProviderDataCorruptionError, match="operation"):
         store.begin_project_runtime_action(**first_action)
@@ -2876,6 +3836,7 @@ def test_project_action_rejects_same_scope_operation_substitution(
                 "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
                 (second_bytes, first_action["key"]),
             )
+            _reseal_provider_usage(connection, root)
         with pytest.raises(ProviderDataCorruptionError, match="operation"):
             DesktopProviderStore(root)
     else:
@@ -2883,7 +3844,9 @@ def test_project_action_rejects_same_scope_operation_substitution(
             "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
             (second_bytes, first_action["key"]),
         )
+        snapshot = _reseal_provider_usage(store._connection, store.state_root)
         store._connection.commit()
+        store._provider_usage_snapshot = snapshot
         with pytest.raises(ProviderDataCorruptionError, match="operation"):
             store.begin_project_runtime_action(**first_action)
 
@@ -2927,6 +3890,7 @@ def test_startup_rejects_cross_project_operation_replay_substitution(tmp_path: P
             "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
             (second_bytes, first_action["key"]),
         )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="operation"):
         DesktopProviderStore(root)
@@ -2975,6 +3939,7 @@ def test_startup_rejects_rebinding_operation_id_to_another_action_authority(
             """,
             (second.operation.operation_id, second_bytes, first_action["key"]),
         )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="action authority"):
         DesktopProviderStore(root)
@@ -3066,6 +4031,7 @@ def test_startup_rejects_unbound_nonterminal_operation_before_cancellation(
                 """,
                 (reservation.operation.operation_id,),
             )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="action authority"):
         DesktopProviderStore(root)
@@ -3523,6 +4489,58 @@ def test_cursor_is_stable_tamper_evident_and_expiry_is_distinct(tmp_path: Path) 
         reopened.list_profiles(limit=1, after=tampered, sort="name", direction="asc")
 
 
+def test_lower_cursor_capacity_reopen_rejects_retries_and_recovers(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    clock = MutableClock()
+    record_count = provider_store_module.NORMAL_WRITE_CLEANUP_ROWS + 2
+    store = DesktopProviderStore(
+        root,
+        clock=clock,
+        cursor_ttl_seconds=1,
+        max_cursor_records=record_count,
+    )
+    _create_profile(store, name="Cursor A", key="lower-cursor-profile-a")
+    _create_profile(store, name="Cursor B", key="lower-cursor-profile-b")
+    for _ in range(record_count):
+        page = store.list_profiles(limit=1, sort="name", direction="asc")
+        assert page.next_cursor is not None
+    clock.now += timedelta(seconds=2)
+    store.close()
+
+    for _ in range(2):
+        with pytest.raises(
+            provider_store_module.ProviderCapacityConfigurationError,
+            match="pagination cursor capacity is lower than persisted usage",
+        ) as raised:
+            DesktopProviderStore(
+                root,
+                clock=clock,
+                cursor_ttl_seconds=1,
+                max_cursor_records=1,
+            )
+        assert raised.value.record_type == "cursor"
+        assert raised.value.configured_limit == 1
+        assert raised.value.persisted_count == record_count
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM pagination_cursors").fetchone() == (
+            record_count,
+        )
+
+    recovered = DesktopProviderStore(
+        root,
+        clock=clock,
+        cursor_ttl_seconds=1,
+        max_cursor_records=record_count,
+    )
+    page = recovered.list_profiles(limit=1, sort="name", direction="asc")
+    assert page.next_cursor is not None
+    assert recovered._provider_record_counts(recovered._connection)[1] == 3
+    assert tuple(
+        recovered._connection.execute("SELECT count(*) FROM pagination_cursors").fetchone()
+    ) == (3,)
+
+
 def test_cursor_covers_the_contract_maximum_utf8_name(tmp_path: Path) -> None:
     store = DesktopProviderStore(tmp_path / "state")
     maximum_character = chr(0x1F9EA)
@@ -3599,6 +4617,62 @@ def test_concurrent_writes_are_safe(tmp_path: Path) -> None:
 
     assert len(set(ids)) == 16
     assert len(store.list_profiles(limit=100).items) == 16
+
+
+def test_concurrent_remote_payload_writers_preserve_usage_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    projects = tuple(
+        store.create_project(
+            _project(profile.profile_id, name=f"Concurrent project {index}"),
+            idempotency_key=f"concurrent-remote-project-{index:04d}",
+        )
+        for index in range(16)
+    )
+
+    def activate(project: ProjectV1) -> str:
+        with store._transaction(write=True) as connection:
+            activated = ProviderMutation(store, connection).set_project_state(
+                project.project_id,
+                if_match=project.etag,
+                state="active",
+                remote_state=_remote_project_state(
+                    project.project_id,
+                    f"concurrent-revision-{project.project_id}",
+                ),
+            )
+            return activated.project_id
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        activated_ids = tuple(executor.map(activate, projects))
+
+    assert set(activated_ids) == {project.project_id for project in projects}
+    expected_bytes = cast(
+        int,
+        store._connection.execute(
+            "SELECT sum(length(remote_state_json)) FROM projects"
+        ).fetchone()[0],
+    )
+    assert store._validate_remote_payload_usage_authority(store._connection) == (
+        len(projects),
+        expected_bytes,
+    )
+    assert (
+        store._connection.execute(
+            "SELECT count(*) FROM projects WHERE state = 'active'"
+        ).fetchone()[0]
+        == 1
+    )
+    store.close()
+
+    reopened = DesktopProviderStore(root)
+    assert reopened._validate_remote_payload_usage_authority(reopened._connection) == (
+        len(projects),
+        expected_bytes,
+    )
 
 
 def test_concurrent_idempotency_replay_commits_one_resource(tmp_path: Path) -> None:

@@ -187,23 +187,74 @@ same OS user: such a process can race pathname checks or modify owner-readable
 state. Desktop relies on the macOS user-account boundary and the owner-only
 state directory for that threat boundary.
 
-Schema v3 has an exact canonical `sqlite_schema` fingerprint. Fresh stores are
-created directly in canonical v3; canonical v1 stores pass exact v1 validation
-before transactional v1 -> v2 -> v3 migration, and canonical v2 stores pass
-exact v2 schema and ledger validation before v2 -> v3 migration. Every DDL,
-ledger, project-copy, and `user_version` change is in the same crash transaction.
-Forged ledgers, near-match historical schemas, and partial migrations fail
-closed. Startup performs a database-size-bounded
-`integrity_check(1)`, `foreign_key_check`, bounded row and byte accounting, and
+Schema v5 has an exact canonical `sqlite_schema` fingerprint and retains exact
+v1-v4 historical fingerprints. Each historical layout and migration ledger is
+validated before the next transactional migration; DDL, ledger, project-copy,
+authority publication, and `user_version` changes share one crash transaction.
+Forged ledgers, near-match schemas, unknown views/triggers/indexes, and partial
+migrations fail closed. Startup performs a database-size-bounded
+`integrity_check(1)`, `foreign_key_check`, bounded row/byte reconciliation, and
 complete validation of migration, resource, operation, cursor, canonical
 JSON/blob, duplicated scalar, timestamp, version, and typed idempotency rows.
-Unknown views, triggers, indexes, or altered DDL are rejected. Database and
-journal byte limits, SQLite `max_page_count`, and `journal_size_limit` are set
-before schema or resource writes and are checked again before commit, so a
-budget rejection rolls the transaction back rather than reporting failure after
-a successful commit.
 
-The v3 project row stores `RemoteProjectStateV1` canonical JSON in a nullable
+The v5 `provider_storage_usage` singleton is the normal-transaction authority
+for the complete provider recovery row/byte budget, the 256 KiB per-value and
+16 MiB aggregate remote-state budget, and fixed terminal reservations. It also
+contains exact idempotency/cursor row counts, a generation, and four modular
+remote-content accumulators. Canonical row triggers update it transactionally
+and require exactly one affected authority row; its seal is a domain-separated
+HMAC under the owner-only signing key. The migration ledger becomes immutable at
+v5. The authority singleton rejects every later insert and delete, so `DELETE`
+followed by insert and `INSERT OR REPLACE` are rejected even when SQLite
+recursive triggers are off. Rollback restores data and authority together.
+
+Each non-null `RemoteProjectStateV1` BLOB has a per-project HMAC-derived content
+token over the project ID and exact canonical bytes. Project triggers add and
+subtract those tokens from the authenticated accumulators, and guarded project
+reads recompute the token before JSON parsing. Normal reads and writes validate
+the fixed-size schema and singleton in O(1) relative to provider data; they do
+not run table `count`/`sum(length(...))` scans. The process caches the last
+committed generation and seal, which rejects replay of an older signed authority
+during that process lifetime. Foreground idempotent writes use the singleton's
+exact count and first reclaim at most 128 expired cleanup-eligible rows through
+the v5 `(cleanup_eligible, expires_at_epoch)` index. The current request's exact
+key may then cause one additional primary-key deletion, making the precise
+idempotency bound 128 sweep rows plus one exact-key row. A nonterminal operation
+remains ineligible until terminal publication atomically changes that state.
+Cursor writes have a strict 128-row cleanup maximum through their expiry index.
+Thus cleanup work is bounded independently of table size, live action replay
+remains available, and later writes converge any remaining expired backlog.
+
+After authenticating the singleton and before any startup mutation, open compares
+the configured idempotency and cursor limits with their persisted exact counts.
+If either configured limit is lower, open raises
+`ProviderCapacityConfigurationError`, performs no cleanup, and commits no startup
+state. Repeated incompatible opens therefore cannot enter a rollback-only cleanup
+loop. Reopening with each limit at least equal to persisted usage is the recovery
+path; later successful writes can commit bounded cleanup. Startup and v4 -> v5
+migration may perform one bounded reconciliation of actual table totals, remote
+lengths/tokens, exact idempotency/cursor counts, and live reservations before any
+remote payload is decoded. After creating the singleton and migration row,
+migration validates both the final write budget and configured limits before
+seal, `user_version`, and commit; overflow or a lower configured limit rolls the
+entire transaction back to v4. The singleton itself consumes a fixed conservative
+512-byte recovery reservation, avoiding recursive accounting of its changing
+decimal counter representation.
+
+This authentication detects budget-changing partial SQLite edits and remote
+content edits while the signing key remains confidential, including equal-length
+remote JSON replacement, counter replay, and trigger removal or alteration. Other
+same-length, model-valid resource-field edits remain within the owner-only state
+directory threat boundary. The authority is not a trusted monotonic clock:
+an offline attacker who can restore a complete earlier, internally consistent
+database snapshot, or who can read the owner-only signing key and coherently
+rewrite all authenticated state, is outside this module's detection boundary.
+Detecting that rollback requires a platform-protected monotonic anchor outside
+the SQLite database and key file. Database and journal byte limits, SQLite
+`max_page_count`, and `journal_size_limit` remain independently enforced before
+commit.
+
+The project row stores `RemoteProjectStateV1` canonical JSON in a nullable
 private BLOB separate from the canonical `ProjectCreateV1` intent document.
 Activation accepts only a ready projection whose active revision project matches
 its Core-owned `core_project_id` and whose revision ID matches the local
