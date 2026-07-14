@@ -152,6 +152,23 @@ cargo metadata --locked --format-version 1
 cargo test --locked
 ```
 
+Desktop's local provider store keeps the idempotency reservation for every
+nonterminal local operation even after the normal retention deadline. Startup
+and replay require that reservation's canonical response and unique operation
+ID to match an operation-side authority digest over the full action identity,
+request digest, resource scope, and operation kind. Operation reads and replays
+do not reconcile or cancel live work, and every nonterminal operation must fit
+its fixed startup-cancellation slot before it is persisted. A nullable operation
+authority is only an in-transaction staging state: every mutation precommit and
+startup recovery rejects any operation without a digest. Before startup changes
+resource state or cancels work, every live operation must have exactly one
+canonical idempotency row with the same route, scope, key, request digest, kind,
+operation ID, and authority digest, and its fixed terminal reservation must fit.
+Corrupt live records are never converted into cancellation records. The
+canonical v2 schema fingerprint is the only accepted v2 authority: the
+unreleased intermediate branch-private v2 layout is rejected at startup without
+migration. Terminal reservations become eligible for ordinary retention cleanup.
+
 Current release smoke checks are pre-External-Beta maintainer checks. They
 validate Core Backend wheel identity and Desktop asset packaging, but they do
 not publish GitHub Release assets, PyPI artifacts, or a release-ready `.dmg`.

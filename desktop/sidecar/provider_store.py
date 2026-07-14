@@ -74,9 +74,9 @@ MAX_STARTUP_OPERATION_ROW_BYTES = MAX_DOCUMENT_BYTES + 16_384
 # Profile reservations always have empty progress/checks; this bounds their largest
 # success, cancellation, or bounded ApiErrorV1 terminal document with ample margin.
 PROFILE_RUNTIME_TERMINAL_SLOT_BYTES = 1_048_576
-PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES = (
-    2 * PROFILE_RUNTIME_TERMINAL_SLOT_BYTES + 16_384
-)
+PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES = 2 * PROFILE_RUNTIME_TERMINAL_SLOT_BYTES + 16_384
+PROJECT_RUNTIME_TERMINAL_SLOT_BYTES = 1_048_576
+PROJECT_RUNTIME_TERMINAL_RESERVATION_BYTES = 2 * PROJECT_RUNTIME_TERMINAL_SLOT_BYTES + 16_384
 DEFAULT_IDEMPOTENCY_RECORD_LIMIT = 10_000
 DEFAULT_CURSOR_RECORD_LIMIT = 10_000
 DEFAULT_IDEMPOTENCY_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -88,6 +88,7 @@ _CURSOR_NONCE_BYTES = 16
 _CURSOR_TOKEN_VERSION = 1
 _CURSOR_TOKEN = struct.Struct(">BQQ32s16s")
 _CURSOR_KEY_TEMP_PREFIX = f".{CURSOR_KEY_FILENAME}.tmp-"
+_ACTION_AUTHORITY_DOMAIN = b"openevo.desktop.local-action-authority.v1\0"
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
 _ETAG_RE = re.compile(r'^"[0-9a-f]{64}"$')
@@ -163,7 +164,23 @@ _SECRET_KEY_SUFFIXES = (
     "token",
 )
 _PROFILE_OPERATION_KINDS = {"profile_connect", "profile_disconnect", "host_key_accept"}
-_PROJECT_OPERATION_KINDS = {"project_activate", "project_doctor", "project_repair"}
+_PROJECT_OPERATION_KINDS = {
+    "project_activate",
+    "project_doctor",
+    "project_repair",
+    "bootstrap",
+    "workspace_sync",
+}
+_ACTION_ROUTE_SUFFIXES = {
+    "profile_connect": "connect",
+    "profile_disconnect": "disconnect",
+    "host_key_accept": "host-key/accept",
+    "project_activate": "activate",
+    "project_doctor": "doctor",
+    "project_repair": "repair",
+    "bootstrap": "bootstrap",
+    "workspace_sync": "workspace-sync",
+}
 
 
 def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
@@ -271,6 +288,13 @@ class ProfileRuntimeActionReservation:
     replayed: bool
 
 
+@dataclass(frozen=True)
+class ProjectRuntimeActionReservation:
+    operation: LocalOperationV1
+    project: ProjectV1 | None
+    replayed: bool
+
+
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _Direction = Literal["asc", "desc"]
 
@@ -361,6 +385,7 @@ _SCHEMA_V2 = (
         state TEXT NOT NULL,
         resource_type TEXT NOT NULL,
         resource_id TEXT NOT NULL,
+        action_identity_digest TEXT UNIQUE,
         document_json BLOB NOT NULL,
         resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
         created_at TEXT NOT NULL,
@@ -377,7 +402,10 @@ _SCHEMA_V2 = (
         CHECK (resource_type IN (
             'profile', 'project', 'operation', 'run', 'artifact', 'service',
             'diagnostic', 'maintenance'
-        ))
+        )),
+        CHECK (
+            action_identity_digest IS NULL OR length(action_identity_digest) = 64
+        )
     ) STRICT
     """,
     """
@@ -388,6 +416,7 @@ _SCHEMA_V2 = (
         resource_scope TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
         request_digest TEXT NOT NULL,
+        operation_id TEXT UNIQUE,
         response_type TEXT NOT NULL,
         status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 599),
         response_bytes BLOB NOT NULL,
@@ -400,9 +429,18 @@ _SCHEMA_V2 = (
         CHECK (length(CAST(resource_scope AS BLOB)) BETWEEN 1 AND 512),
         CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 16 AND 256),
         CHECK (length(request_digest) = 64),
+        CHECK (
+            operation_id IS NULL OR
+            length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 512
+        ),
         CHECK (response_type IN ('ProjectV1', 'RemoteProfileV1', 'LocalOperationV1')),
         CHECK (length(response_bytes) <= 136314880),
-        CHECK (expires_at_epoch > created_at_epoch)
+        CHECK (expires_at_epoch > created_at_epoch),
+        CHECK (
+            (response_type = 'LocalOperationV1' AND operation_id IS NOT NULL) OR
+            (response_type != 'LocalOperationV1' AND operation_id IS NULL)
+        ),
+        FOREIGN KEY (operation_id) REFERENCES local_operations(operation_id) ON DELETE RESTRICT
     ) STRICT
     """,
     """
@@ -551,6 +589,21 @@ class ProviderMutation:
         self._store._require_etag("profile", profile_id, row, if_match)
         return self._store._profile_from_row(row)
 
+    def require_project_authority(
+        self,
+        project_id: str,
+        *,
+        if_match: str,
+    ) -> ProjectV1:
+        """Validate project authority before an external idempotent action."""
+
+        self._store._validate_resource_id(project_id)
+        self._store._validate_if_match(if_match)
+        self._require_bound_if_match(if_match)
+        row = self._store._require_project_row(self._connection, project_id)
+        self._store._require_etag("project", project_id, row, if_match)
+        return self._store._project_from_row(row)
+
     def set_project_state(
         self,
         project_id: str,
@@ -558,6 +611,7 @@ class ProviderMutation:
         if_match: str,
         state: Literal["draft", "active", "archived", "blocked"],
         current_revision_id: str | None = None,
+        _reservation_operation_id: str | None = None,
     ) -> ProjectV1:
         self._store._validate_resource_id(project_id)
         self._store._validate_if_match(if_match)
@@ -569,6 +623,12 @@ class ProviderMutation:
         row = self._store._require_project_row(self._connection, project_id)
         self._store._require_etag("project", project_id, row, if_match)
         if state == "active":
+            self._store._require_project_operation_reservation_available(
+                self._connection,
+                project_id,
+                operation_kind="project_activate",
+                excluded_operation_id=_reservation_operation_id,
+            )
             self._connection.execute(
                 """
                 UPDATE projects
@@ -700,12 +760,11 @@ class ProviderMutation:
             (profile_id,),
         ).fetchall()
         for row in rows:
-            self._store._reconcile_operation_with_authority(
+            self._store._cancel_operation_with_authority(
                 self._connection,
                 self._store._require_operation_row(
                     self._connection, cast(str, row["operation_id"])
                 ),
-                force_cancel_nonterminal=True,
             )
 
     def create_local_operation(
@@ -743,6 +802,17 @@ class ProviderMutation:
         )
         self._store._validate_operation_authority(self._connection, operation)
         document = _canonical_json_bytes(operation.model_dump(mode="json"))
+        if not terminal:
+            if operation_kind in _PROJECT_OPERATION_KINDS:
+                self._store._require_project_operation_reservation_available(
+                    self._connection,
+                    resource.resource_id,
+                    operation_kind=operation_kind,
+                )
+            self._store._validate_nonterminal_operation_terminal_capacity(
+                self._connection,
+                operation,
+            )
         self._connection.execute(
             """
             INSERT INTO local_operations(
@@ -1187,9 +1257,7 @@ class DesktopProviderStore:
             raise
         except OSError as exc:
             action = "publish" if descriptor is None else "create"
-            raise ProviderStateRootError(
-                f"could not {action} cursor signing key"
-            ) from exc
+            raise ProviderStateRootError(f"could not {action} cursor signing key") from exc
         finally:
             cleanup_error: OSError | None = None
             if descriptor is not None:
@@ -1321,11 +1389,11 @@ class DesktopProviderStore:
             """
             INSERT INTO idempotency_records(
                 principal, method, route, resource_scope, idempotency_key,
-                request_digest, response_type, status_code, response_bytes,
+                request_digest, operation_id, response_type, status_code, response_bytes,
                 created_at_epoch, expires_at_epoch
             )
             SELECT principal, method, route, resource_scope, idempotency_key,
-                   request_digest, response_type, status_code, response_bytes,
+                   request_digest, NULL, response_type, status_code, response_bytes,
                    created_at_epoch, expires_at_epoch
             FROM idempotency_records_v1
             """
@@ -1383,6 +1451,7 @@ class DesktopProviderStore:
                 self._validate_operation_recovery_row(cast(sqlite3.Row, row))
             for row in connection.execute("SELECT * FROM idempotency_records"):
                 self._validate_idempotency_recovery_row(cast(sqlite3.Row, row))
+            self._validate_write_budget(connection)
             for row in connection.execute("SELECT * FROM pagination_cursors"):
                 self._validate_cursor_recovery_row(cast(sqlite3.Row, row))
             timestamp = self._timestamp()
@@ -1442,12 +1511,12 @@ class DesktopProviderStore:
             (
                 "idempotency_records",
                 "principal, method, route, resource_scope, idempotency_key, request_digest, "
-                "response_type, response_bytes",
+                "operation_id, response_type, response_bytes",
             ),
             (
                 "local_operations",
                 "operation_id, operation_kind, state, resource_type, resource_id, "
-                "document_json, created_at, finished_at",
+                "action_identity_digest, document_json, created_at, finished_at",
             ),
             (
                 "pagination_cursors",
@@ -1473,34 +1542,87 @@ class DesktopProviderStore:
         if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
             raise ProviderDataCorruptionError("provider recovery budget exceeded")
 
-    @classmethod
-    def _validate_write_budget(cls, connection: sqlite3.Connection) -> None:
-        total_rows, total_bytes = cls._recovery_usage(connection)
-        reservations = cast(
-            int,
-            connection.execute(
-                """
-                SELECT count(*)
-                FROM local_operations AS operation
-                WHERE operation.operation_kind IN (
-                    'profile_connect', 'profile_disconnect', 'host_key_accept'
-                ) AND operation.state IN ('queued', 'running', 'cancelling')
-                  AND EXISTS (
-                    SELECT 1
-                    FROM idempotency_records AS idempotency
-                    WHERE idempotency.response_type = 'LocalOperationV1'
-                      AND idempotency.response_bytes = operation.document_json
-                  )
-                """
-            ).fetchone()[0],
+    def _validate_write_budget(self, connection: sqlite3.Connection) -> None:
+        total_rows, total_bytes = self._recovery_usage(connection)
+        profile_reservations, project_reservations = self._validate_live_action_authorities(
+            connection
         )
-        reserved_bytes = reservations * PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES
+        reserved_bytes = (
+            profile_reservations * PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES
+            + project_reservations * PROJECT_RUNTIME_TERMINAL_RESERVATION_BYTES
+        )
         if (
             total_rows > MAX_RECOVERY_ROWS
             or total_bytes > MAX_RECOVERY_BYTES
             or reserved_bytes > MAX_RECOVERY_BYTES - total_bytes
         ):
             raise ProviderDataCorruptionError("provider recovery budget exceeded")
+
+    def _validate_live_action_authorities(self, connection: sqlite3.Connection) -> tuple[int, int]:
+        invalid_digest = connection.execute(
+            """
+            SELECT operation_id
+            FROM local_operations
+            WHERE action_identity_digest IS NULL
+               OR typeof(action_identity_digest) != 'text'
+               OR length(action_identity_digest) != 64
+               OR action_identity_digest GLOB '*[^0-9a-f]*'
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid_digest is not None:
+            raise ProviderDataCorruptionError(
+                "operation action authority digest is missing or invalid"
+            )
+
+        profile_reservations = 0
+        project_reservations = 0
+        after_operation_id = ""
+        while True:
+            operation_ids = connection.execute(
+                """
+                SELECT operation_id
+                FROM local_operations
+                WHERE state IN ('queued', 'running', 'cancelling')
+                  AND operation_id > ?
+                ORDER BY operation_id
+                LIMIT ?
+                """,
+                (after_operation_id, STARTUP_OPERATION_BATCH_ROWS),
+            ).fetchmany(STARTUP_OPERATION_BATCH_ROWS)
+            if not operation_ids:
+                return profile_reservations, project_reservations
+            for operation_id_row in operation_ids:
+                operation_id = cast(str, operation_id_row["operation_id"])
+                row = self._require_operation_row(connection, operation_id)
+                operation = self._operation_from_row(row)
+                self._validate_operation_indexed_scalars(row, operation)
+                self._idempotency_rows_for_operation(
+                    connection,
+                    operation,
+                    bytes(row["document_json"]),
+                )
+                if operation.operation_kind in _PROFILE_OPERATION_KINDS:
+                    reservation_label = "profile runtime"
+                elif operation.operation_kind in _PROJECT_OPERATION_KINDS:
+                    reservation_label = "project runtime"
+                else:
+                    raise ProviderDataCorruptionError(
+                        "live operation kind has no fixed terminal reservation"
+                    )
+                try:
+                    self._validate_nonterminal_operation_terminal_capacity(connection, operation)
+                except (ContractValidationError, ResourceNotFoundError) as exc:
+                    raise ProviderDataCorruptionError(
+                        f"{reservation_label} cancellation exceeds its fixed terminal capacity"
+                    ) from exc
+                if operation.operation_kind in _PROFILE_OPERATION_KINDS:
+                    profile_reservations += 1
+                else:
+                    project_reservations += 1
+                after_operation_id = operation_id
+            if len(operation_ids) < STARTUP_OPERATION_BATCH_ROWS:
+                return profile_reservations, project_reservations
 
     def _validate_migration_rows(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
@@ -1560,6 +1682,25 @@ class DesktopProviderStore:
 
     def _validate_operation_recovery_row(self, row: sqlite3.Row) -> None:
         operation = self._operation_from_row(row)
+        action_identity_digest = row["action_identity_digest"]
+        if (
+            type(action_identity_digest) is not str
+            or _DIGEST_RE.fullmatch(action_identity_digest) is None
+        ):
+            raise ProviderDataCorruptionError(
+                "operation action authority digest is missing or invalid"
+            )
+        self._validate_operation_indexed_scalars(row, operation)
+
+        try:
+            self._validate_operation_authority(self._connection, operation, allow_historical=True)
+        except (ContractValidationError, ResourceNotFoundError) as exc:
+            raise ProviderDataCorruptionError(
+                "stored operation differs from its authoritative resource"
+            ) from exc
+
+    @staticmethod
+    def _validate_operation_indexed_scalars(row: sqlite3.Row, operation: LocalOperationV1) -> None:
         if (
             operation.operation_kind != row["operation_kind"]
             or operation.state != row["state"]
@@ -1571,12 +1712,6 @@ class DesktopProviderStore:
             raise ProviderDataCorruptionError(
                 "operation indexed scalars differ from its canonical document"
             )
-        try:
-            self._validate_operation_authority(self._connection, operation, allow_historical=True)
-        except (ContractValidationError, ResourceNotFoundError) as exc:
-            raise ProviderDataCorruptionError(
-                "stored operation differs from its authoritative resource"
-            ) from exc
 
     def _validate_cursor_recovery_row(self, row: sqlite3.Row) -> None:
         if (
@@ -1617,6 +1752,14 @@ class DesktopProviderStore:
                 raise ProviderDataCorruptionError("idempotency identity is invalid") from exc
         if _DIGEST_RE.fullmatch(cast(str, row["request_digest"])) is None:
             raise ProviderDataCorruptionError("idempotency request digest is invalid")
+        operation_id = row["operation_id"]
+        if operation_id is not None:
+            try:
+                self._validate_resource_id(cast(str, operation_id))
+            except ContractValidationError as exc:
+                raise ProviderDataCorruptionError(
+                    "idempotency operation identity is invalid"
+                ) from exc
         if (
             type(row["created_at_epoch"]) is not int
             or type(row["expires_at_epoch"]) is not int
@@ -1629,12 +1772,7 @@ class DesktopProviderStore:
         if _canonical_json_bytes(response.model_dump(mode="json")) != response_bytes:
             raise ProviderDataCorruptionError("idempotency response is not canonical")
         if isinstance(response, LocalOperationV1):
-            try:
-                self._require_operation_row(self._connection, response.operation_id)
-            except ResourceNotFoundError as exc:
-                raise ProviderDataCorruptionError(
-                    "idempotency response references a missing local operation"
-                ) from exc
+            self._operation_for_idempotency_record(self._connection, row)
 
     @contextmanager
     def _transaction(self, *, write: bool) -> Iterator[sqlite3.Connection]:
@@ -1855,12 +1993,8 @@ class DesktopProviderStore:
 
     def get_local_operation(self, operation_id: str) -> LocalOperationV1:
         self._validate_resource_id(operation_id)
-        with self._transaction(write=True) as connection:
-            return self._reconcile_operation_with_authority(
-                connection,
-                self._require_operation_row(connection, operation_id),
-                force_cancel_nonterminal=False,
-            )
+        with self._transaction(write=False) as connection:
+            return self._operation_from_row(self._require_operation_row(connection, operation_id))
 
     def patch_project(
         self,
@@ -1875,6 +2009,7 @@ class DesktopProviderStore:
         with self._transaction(write=True) as connection:
             row = self._require_project_row(connection, project_id)
             self._require_etag("project", project_id, row, if_match)
+            self._require_project_not_busy(connection, project_id)
             if row["state"] == "active" or row["current_revision_id"] is not None:
                 raise ResourceInUseError("project", project_id)
             current = _decode_json_object(bytes(row["document_json"]), label="project")
@@ -1908,6 +2043,7 @@ class DesktopProviderStore:
         with self._transaction(write=True) as connection:
             row = self._require_project_row(connection, project_id)
             self._require_etag("project", project_id, row, if_match)
+            self._require_project_not_busy(connection, project_id)
             if row["state"] == "active" or row["current_revision_id"] is not None:
                 raise ResourceInUseError("project", project_id)
             connection.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
@@ -1984,6 +2120,7 @@ class DesktopProviderStore:
             raise ContractValidationError("profile runtime operation kind is invalid")
         identity = self._profile_action_identity(
             route=route,
+            operation_kind=operation_kind,
             profile_id=profile_id,
             key=key,
             body=body,
@@ -1991,12 +2128,16 @@ class DesktopProviderStore:
         )
         with self._transaction(write=True) as connection:
             now_epoch = identity[5]
-            connection.execute(
-                "DELETE FROM idempotency_records WHERE expires_at_epoch <= ?", (now_epoch,)
-            )
+            self._cleanup_expired_idempotency_records(connection, now_epoch)
             existing = self._profile_action_replay(connection, identity)
             if existing is not None:
                 return ProfileRuntimeActionReservation(existing, None, True)
+            self._validate_action_route_binding(
+                route=identity[1],
+                resource_scope=identity[2],
+                resource_type="profile",
+                operation_kind=operation_kind,
+            )
             count = cast(
                 int, connection.execute("SELECT count(*) FROM idempotency_records").fetchone()[0]
             )
@@ -2030,6 +2171,7 @@ class DesktopProviderStore:
                 resource_scope=identity[2],
                 key=identity[3],
                 request_digest=identity[4],
+                operation_id=operation.operation_id,
                 response_type="LocalOperationV1",
                 status_code=202,
                 response_bytes=response_bytes,
@@ -2051,6 +2193,7 @@ class DesktopProviderStore:
     ) -> LocalOperationV1:
         identity = self._profile_action_identity(
             route=route,
+            operation_kind=reservation.operation.operation_kind,
             profile_id=profile_id,
             key=key,
             body=body,
@@ -2105,6 +2248,7 @@ class DesktopProviderStore:
 
         identity = self._profile_action_identity(
             route=route,
+            operation_kind=reservation.operation.operation_kind,
             profile_id=profile_id,
             key=key,
             body=body,
@@ -2151,6 +2295,7 @@ class DesktopProviderStore:
 
         identity = self._profile_action_identity(
             route=route,
+            operation_kind=reservation.operation.operation_kind,
             profile_id=profile_id,
             key=key,
             body=body,
@@ -2166,28 +2311,36 @@ class DesktopProviderStore:
         self,
         *,
         route: str,
+        operation_kind: str,
         profile_id: str,
         key: str,
         body: BaseModel | Mapping[str, object],
         if_match: str,
     ) -> tuple[str, str, str, str, str, int]:
+        if operation_kind not in _PROFILE_OPERATION_KINDS:
+            raise ContractValidationError("profile runtime operation kind is invalid")
         self._validate_if_match(if_match)
         method = "POST"
         route = self._bounded_identity("route", route, MAX_IDENTITY_BYTES)
-        profile_id = self._bounded_identity(
-            "resource_scope", profile_id, MAX_IDENTITY_BYTES
-        )
-        key = self._bounded_identity(
-            "idempotency key", key, MAX_IDEMPOTENCY_KEY_BYTES, minimum=16
-        )
+        profile_id = self._bounded_identity("resource_scope", profile_id, MAX_IDENTITY_BYTES)
+        key = self._bounded_identity("idempotency key", key, MAX_IDEMPOTENCY_KEY_BYTES, minimum=16)
         body_value = body.model_dump(mode="json") if isinstance(body, BaseModel) else dict(body)
-        request_value = {"body": body_value, "headers": {"if-match": if_match}}
+        request_value = {
+            "operation_kind": operation_kind,
+            "body": body_value,
+            "headers": {"if-match": if_match},
+        }
         self._reject_credential_bearing_keys(request_value)
         request_bytes = _canonical_json_bytes(request_value)
         if len(request_bytes) > MAX_REQUEST_BYTES:
             raise ContractValidationError("canonical idempotency request exceeds the byte limit")
-        return method, route, profile_id, key, sha256(request_bytes).hexdigest(), int(
-            self._now().timestamp()
+        return (
+            method,
+            route,
+            profile_id,
+            key,
+            sha256(request_bytes).hexdigest(),
+            int(self._now().timestamp()),
         )
 
     def _profile_action_replay(
@@ -2197,7 +2350,7 @@ class DesktopProviderStore:
     ) -> LocalOperationV1 | None:
         row = connection.execute(
             """
-            SELECT request_digest, response_type, response_bytes
+            SELECT *
             FROM idempotency_records
             WHERE principal = ? AND method = ? AND route = ?
               AND resource_scope = ? AND idempotency_key = ?
@@ -2210,19 +2363,7 @@ class DesktopProviderStore:
             raise IdempotencyConflictError(
                 "idempotency key is already bound to a different request"
             )
-        if row["response_type"] != "LocalOperationV1":
-            raise ProviderDataCorruptionError(
-                "profile action replay response type is not LocalOperationV1"
-            )
-        stored = self._model_from_response(LocalOperationV1, bytes(row["response_bytes"]))
-        operation = self._operation_from_row(
-            self._require_operation_row(connection, stored.operation_id)
-        )
-        if stored.operation_id != operation.operation_id:
-            raise ProviderDataCorruptionError(
-                "profile action idempotency response references another operation"
-            )
-        return operation
+        return self._operation_for_idempotency_record(connection, cast(sqlite3.Row, row))
 
     def _require_reserved_profile_action(
         self,
@@ -2279,11 +2420,436 @@ class DesktopProviderStore:
             SET status_code = ?, response_bytes = ?
             WHERE principal = ? AND method = ? AND route = ?
               AND resource_scope = ? AND idempotency_key = ? AND request_digest = ?
+              AND operation_id = ?
             """,
-            (status_code, response_bytes, LOCAL_PRINCIPAL, *identity[:5]),
+            (
+                status_code,
+                response_bytes,
+                LOCAL_PRINCIPAL,
+                *identity[:5],
+                operation.operation_id,
+            ),
         )
         if updated.rowcount != 1:
             raise ProviderStoreError("profile action idempotency reservation changed")
+        return finished
+
+    def begin_project_runtime_action(
+        self,
+        *,
+        route: str,
+        operation_kind: str,
+        project_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+    ) -> ProjectRuntimeActionReservation:
+        """Atomically reserve one durable background action for a project."""
+
+        if operation_kind not in _PROJECT_OPERATION_KINDS:
+            raise ContractValidationError("project runtime operation kind is invalid")
+        identity = self._project_action_identity(
+            route=route,
+            operation_kind=operation_kind,
+            project_id=project_id,
+            key=key,
+            body=body,
+            if_match=if_match,
+        )
+        with self._transaction(write=True) as connection:
+            now_epoch = identity[5]
+            self._cleanup_expired_idempotency_records(connection, now_epoch)
+            existing = self._project_action_replay(connection, identity)
+            if existing is not None:
+                return ProjectRuntimeActionReservation(existing, None, True)
+            self._validate_action_route_binding(
+                route=identity[1],
+                resource_scope=identity[2],
+                resource_type="project",
+                operation_kind=operation_kind,
+            )
+            count = cast(
+                int, connection.execute("SELECT count(*) FROM idempotency_records").fetchone()[0]
+            )
+            if count >= self._max_idempotency_records:
+                raise IdempotencyCapacityError("live idempotency record capacity is exhausted")
+
+            transaction = ProviderMutation(self, connection, if_match=if_match)
+            project = transaction.require_project_authority(project_id, if_match=if_match)
+            self._require_project_not_busy(connection, project_id)
+            result: LocalOperationResultV1 | None = None
+            if operation_kind == "project_activate":
+                result = ProjectOperationResultV1(
+                    project_id=project.project_id,
+                    project_etag=project.etag,
+                    active=project.state == "active",
+                )
+            operation = transaction.create_local_operation(
+                operation_kind=operation_kind,
+                resource=ResourceRefV1(resource_type="project", resource_id=project_id),
+                state="queued",
+                result=result,
+            )
+            response_bytes = _canonical_json_bytes(operation.model_dump(mode="json"))
+            self._insert_idempotency_record(
+                connection,
+                principal=LOCAL_PRINCIPAL,
+                method=identity[0],
+                route=identity[1],
+                resource_scope=identity[2],
+                key=identity[3],
+                request_digest=identity[4],
+                operation_id=operation.operation_id,
+                response_type="LocalOperationV1",
+                status_code=202,
+                response_bytes=response_bytes,
+                now_epoch=now_epoch,
+            )
+            return ProjectRuntimeActionReservation(operation, project, False)
+
+    def start_project_runtime_action(
+        self,
+        *,
+        reservation: ProjectRuntimeActionReservation,
+        route: str,
+        operation_kind: str,
+        project_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+    ) -> LocalOperationV1:
+        identity = self._project_action_identity(
+            route=route,
+            operation_kind=operation_kind,
+            project_id=project_id,
+            key=key,
+            body=body,
+            if_match=if_match,
+        )
+        with self._transaction(write=True) as connection:
+            operation, row = self._require_reserved_project_action(
+                connection, identity, reservation.operation.operation_id
+            )
+            self._require_project_operation_kind(reservation, operation_kind)
+            if operation.state in {"succeeded", "failed", "cancelled", "running"}:
+                return operation
+            if operation.state != "queued":
+                raise ProviderStoreError("project runtime action is no longer startable")
+            version = cast(int, row["resource_version"]) + 1
+            timestamp = self._timestamp()
+            started = _validate_model(
+                LocalOperationV1,
+                {
+                    **operation.model_dump(mode="python"),
+                    "state": "running",
+                    "started_at": timestamp,
+                    "etag": self._etag("operation", operation.operation_id, version),
+                },
+            )
+            self._validate_operation_authority(connection, started)
+            self._replace_reserved_project_action(
+                connection,
+                identity,
+                row,
+                started,
+                status_code=202,
+            )
+            return started
+
+    def complete_project_runtime_action(
+        self,
+        *,
+        reservation: ProjectRuntimeActionReservation,
+        route: str,
+        operation_kind: str,
+        project_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+        current_revision_id: str | None,
+    ) -> LocalOperationV1:
+        identity = self._project_action_identity(
+            route=route,
+            operation_kind=operation_kind,
+            project_id=project_id,
+            key=key,
+            body=body,
+            if_match=if_match,
+        )
+        with self._transaction(write=True) as connection:
+            operation, row = self._require_reserved_project_action(
+                connection, identity, reservation.operation.operation_id
+            )
+            self._require_project_operation_kind(reservation, operation_kind)
+            if operation.state in {"succeeded", "failed", "cancelled"}:
+                return operation
+            if operation.state != "running":
+                raise ProviderStoreError("project runtime action is no longer completable")
+            result = operation.result
+            if operation_kind == "project_activate":
+                if current_revision_id is None:
+                    raise ContractValidationError(
+                        "project activation completion requires a revision identity"
+                    )
+                self._validate_resource_id(current_revision_id)
+                current = self._project_from_row(self._require_project_row(connection, project_id))
+                active = ProviderMutation(self, connection).set_project_state(
+                    project_id,
+                    if_match=current.etag,
+                    state="active",
+                    current_revision_id=current_revision_id,
+                    _reservation_operation_id=operation.operation_id,
+                )
+                result = ProjectOperationResultV1(
+                    project_id=project_id,
+                    project_etag=active.etag,
+                    active=True,
+                )
+            elif current_revision_id is not None:
+                raise ContractValidationError(
+                    "non-activation project completion cannot bind a revision identity"
+                )
+            return self._finish_reserved_project_action(
+                connection,
+                identity,
+                row,
+                operation,
+                state="succeeded",
+                status_code=202,
+                result=result,
+                error=None,
+            )
+
+    def fail_project_runtime_action(
+        self,
+        *,
+        reservation: ProjectRuntimeActionReservation,
+        route: str,
+        operation_kind: str,
+        project_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+        error: ApiErrorV1,
+    ) -> LocalOperationV1:
+        identity = self._project_action_identity(
+            route=route,
+            operation_kind=operation_kind,
+            project_id=project_id,
+            key=key,
+            body=body,
+            if_match=if_match,
+        )
+        with self._transaction(write=True) as connection:
+            operation, row = self._require_reserved_project_action(
+                connection, identity, reservation.operation.operation_id
+            )
+            self._require_project_operation_kind(reservation, operation_kind)
+            if operation.state in {"succeeded", "failed", "cancelled"}:
+                return operation
+            if operation.state not in {"queued", "running"}:
+                raise ProviderStoreError("project runtime action is no longer failable")
+            result = (
+                self._authoritative_operation_result(connection, operation)
+                if operation_kind == "project_activate"
+                else operation.result
+            )
+            return self._finish_reserved_project_action(
+                connection,
+                identity,
+                row,
+                operation,
+                state="failed",
+                status_code=error.http_status,
+                result=result,
+                error=error,
+            )
+
+    def observe_project_runtime_action(
+        self,
+        *,
+        reservation: ProjectRuntimeActionReservation,
+        route: str,
+        operation_kind: str,
+        project_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+    ) -> LocalOperationV1:
+        identity = self._project_action_identity(
+            route=route,
+            operation_kind=operation_kind,
+            project_id=project_id,
+            key=key,
+            body=body,
+            if_match=if_match,
+        )
+        with self._transaction(write=False) as connection:
+            operation, _ = self._require_reserved_project_action(
+                connection, identity, reservation.operation.operation_id
+            )
+            self._require_project_operation_kind(reservation, operation_kind)
+            return operation
+
+    def _project_action_identity(
+        self,
+        *,
+        route: str,
+        operation_kind: str,
+        project_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+    ) -> tuple[str, str, str, str, str, int]:
+        if operation_kind not in _PROJECT_OPERATION_KINDS:
+            raise ContractValidationError("project runtime operation kind is invalid")
+        self._validate_if_match(if_match)
+        method = "POST"
+        route = self._bounded_identity("route", route, MAX_IDENTITY_BYTES)
+        project_id = self._bounded_identity("resource_scope", project_id, MAX_IDENTITY_BYTES)
+        key = self._bounded_identity("idempotency key", key, MAX_IDEMPOTENCY_KEY_BYTES, minimum=16)
+        body_value = body.model_dump(mode="json") if isinstance(body, BaseModel) else dict(body)
+        request_value = {
+            "operation_kind": operation_kind,
+            "body": body_value,
+            "headers": {"if-match": if_match},
+        }
+        self._reject_credential_bearing_keys(request_value)
+        request_bytes = _canonical_json_bytes(request_value)
+        if len(request_bytes) > MAX_REQUEST_BYTES:
+            raise ContractValidationError("canonical idempotency request exceeds the byte limit")
+        return (
+            method,
+            route,
+            project_id,
+            key,
+            sha256(request_bytes).hexdigest(),
+            int(self._now().timestamp()),
+        )
+
+    def _project_action_replay(
+        self,
+        connection: sqlite3.Connection,
+        identity: tuple[str, str, str, str, str, int],
+    ) -> LocalOperationV1 | None:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM idempotency_records
+            WHERE principal = ? AND method = ? AND route = ?
+              AND resource_scope = ? AND idempotency_key = ?
+            """,
+            (LOCAL_PRINCIPAL, *identity[:4]),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["request_digest"] != identity[4]:
+            raise IdempotencyConflictError(
+                "idempotency key is already bound to a different request"
+            )
+        return self._operation_for_idempotency_record(connection, cast(sqlite3.Row, row))
+
+    def _require_reserved_project_action(
+        self,
+        connection: sqlite3.Connection,
+        identity: tuple[str, str, str, str, str, int],
+        operation_id: str,
+    ) -> tuple[LocalOperationV1, sqlite3.Row]:
+        replay = self._project_action_replay(connection, identity)
+        if replay is None or replay.operation_id != operation_id:
+            raise ProviderStoreError("project runtime action reservation is unavailable")
+        row = self._require_operation_row(connection, operation_id)
+        return self._operation_from_row(row), row
+
+    @staticmethod
+    def _require_project_operation_kind(
+        reservation: ProjectRuntimeActionReservation,
+        operation_kind: str,
+    ) -> None:
+        if (
+            operation_kind not in _PROJECT_OPERATION_KINDS
+            or reservation.operation.operation_kind != operation_kind
+        ):
+            raise ContractValidationError("project runtime reservation kind differs")
+
+    def _replace_reserved_project_action(
+        self,
+        connection: sqlite3.Connection,
+        identity: tuple[str, str, str, str, str, int],
+        row: sqlite3.Row,
+        operation: LocalOperationV1,
+        *,
+        status_code: int,
+    ) -> None:
+        response_bytes = _canonical_json_bytes(operation.model_dump(mode="json"))
+        if len(response_bytes) > PROJECT_RUNTIME_TERMINAL_SLOT_BYTES:
+            raise ProviderStoreError("project runtime response exceeds its reserved slot")
+        connection.execute(
+            """
+            UPDATE local_operations
+            SET state = ?, document_json = ?, resource_version = ?, finished_at = ?
+            WHERE operation_id = ?
+            """,
+            (
+                operation.state,
+                response_bytes,
+                cast(int, row["resource_version"]) + 1,
+                operation.finished_at,
+                operation.operation_id,
+            ),
+        )
+        updated = connection.execute(
+            """
+            UPDATE idempotency_records
+            SET status_code = ?, response_bytes = ?
+            WHERE principal = ? AND method = ? AND route = ?
+              AND resource_scope = ? AND idempotency_key = ? AND request_digest = ?
+              AND operation_id = ?
+            """,
+            (
+                status_code,
+                response_bytes,
+                LOCAL_PRINCIPAL,
+                *identity[:5],
+                operation.operation_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ProviderStoreError("project action idempotency reservation changed")
+
+    def _finish_reserved_project_action(
+        self,
+        connection: sqlite3.Connection,
+        identity: tuple[str, str, str, str, str, int],
+        row: sqlite3.Row,
+        operation: LocalOperationV1,
+        *,
+        state: Literal["succeeded", "failed"],
+        status_code: int,
+        result: LocalOperationResultV1 | None,
+        error: ApiErrorV1 | None,
+    ) -> LocalOperationV1:
+        version = cast(int, row["resource_version"]) + 1
+        timestamp = self._timestamp()
+        finished = _validate_model(
+            LocalOperationV1,
+            {
+                **operation.model_dump(mode="python"),
+                "state": state,
+                "result": result,
+                "error": error,
+                "finished_at": timestamp,
+                "etag": self._etag("operation", operation.operation_id, version),
+            },
+        )
+        self._validate_operation_authority(connection, finished)
+        self._replace_reserved_project_action(
+            connection,
+            identity,
+            row,
+            finished,
+            status_code=status_code,
+        )
         return finished
 
     def _execute_idempotent(
@@ -2313,12 +2879,10 @@ class DesktopProviderStore:
         now_epoch = int(self._now().timestamp())
 
         with self._transaction(write=True) as connection:
-            connection.execute(
-                "DELETE FROM idempotency_records WHERE expires_at_epoch <= ?", (now_epoch,)
-            )
+            self._cleanup_expired_idempotency_records(connection, now_epoch)
             existing = connection.execute(
                 """
-                SELECT request_digest, response_type, status_code, response_bytes
+                SELECT *
                 FROM idempotency_records
                 WHERE principal = ? AND method = ? AND route = ?
                   AND resource_scope = ? AND idempotency_key = ?
@@ -2346,10 +2910,9 @@ class DesktopProviderStore:
                 if isinstance(replay_response, LocalOperationV1):
                     replay_response = cast(
                         _ModelT,
-                        self._reconcile_operation_with_authority(
+                        self._operation_for_idempotency_record(
                             connection,
-                            self._require_operation_row(connection, replay_response.operation_id),
-                            force_cancel_nonterminal=False,
+                            cast(sqlite3.Row, existing),
                         ),
                     )
                     response_bytes = _canonical_json_bytes(replay_response.model_dump(mode="json"))
@@ -2381,6 +2944,22 @@ class DesktopProviderStore:
             response_bytes = _canonical_json_bytes(response.model_dump(mode="json"))
             if len(response_bytes) > MAX_RESPONSE_BYTES:
                 raise ProviderStoreError("idempotent response exceeds the byte limit")
+            if isinstance(response, LocalOperationV1):
+                if response.resource.resource_id != resource_scope:
+                    raise ProviderStoreError(
+                        "idempotent operation response differs from its resource scope"
+                    )
+                try:
+                    self._validate_action_route_binding(
+                        route=route,
+                        resource_scope=resource_scope,
+                        resource_type=response.resource.resource_type,
+                        operation_kind=response.operation_kind,
+                    )
+                except ContractValidationError as exc:
+                    raise ProviderStoreError(
+                        "idempotent operation response differs from its action route"
+                    ) from exc
             self._insert_idempotency_record(
                 connection,
                 principal=LOCAL_PRINCIPAL,
@@ -2389,6 +2968,9 @@ class DesktopProviderStore:
                 resource_scope=resource_scope,
                 key=key,
                 request_digest=request_digest,
+                operation_id=(
+                    response.operation_id if isinstance(response, LocalOperationV1) else None
+                ),
                 response_type=response_type,
                 status_code=status_code,
                 response_bytes=response_bytes,
@@ -2445,6 +3027,191 @@ class DesktopProviderStore:
         except KeyError as exc:
             raise ProviderDataCorruptionError("idempotency response type is invalid") from exc
 
+    @staticmethod
+    def _validate_action_route_binding(
+        *,
+        route: str,
+        resource_scope: str,
+        resource_type: str,
+        operation_kind: str,
+    ) -> None:
+        if operation_kind in _PROFILE_OPERATION_KINDS:
+            expected_resource_type = "profile"
+            collection = "profiles"
+        elif operation_kind in _PROJECT_OPERATION_KINDS:
+            expected_resource_type = "project"
+            collection = "projects"
+        else:
+            raise ContractValidationError("local action operation kind is not persistable")
+        expected_route = (
+            f"/desktop/v1/{collection}/{resource_scope}/{_ACTION_ROUTE_SUFFIXES[operation_kind]}"
+        )
+        if resource_type != expected_resource_type or route != expected_route:
+            raise ContractValidationError(
+                "local action route, resource scope, and operation kind differ"
+            )
+
+    def _operation_for_idempotency_record(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> LocalOperationV1:
+        if row["response_type"] != "LocalOperationV1":
+            raise ProviderDataCorruptionError(
+                "operation idempotency response type is not LocalOperationV1"
+            )
+        response_bytes = bytes(row["response_bytes"])
+        stored = self._model_from_response(LocalOperationV1, response_bytes)
+        if _canonical_json_bytes(stored.model_dump(mode="json")) != response_bytes:
+            raise ProviderDataCorruptionError("operation idempotency response is not canonical")
+        if row["operation_id"] != stored.operation_id:
+            raise ProviderDataCorruptionError(
+                "operation idempotency authority references another operation"
+            )
+        try:
+            operation_row = self._require_operation_row(connection, stored.operation_id)
+        except ResourceNotFoundError as exc:
+            raise ProviderDataCorruptionError(
+                "operation idempotency response references a missing local operation"
+            ) from exc
+        operation_bytes = bytes(operation_row["document_json"])
+        operation = self._operation_from_row(operation_row)
+        self._validate_operation_indexed_scalars(operation_row, operation)
+        if response_bytes != operation_bytes or stored != operation:
+            raise ProviderDataCorruptionError(
+                "operation idempotency response differs from its exact operation row"
+            )
+        expected_authority = self._action_authority_digest(
+            principal=cast(str, row["principal"]),
+            method=cast(str, row["method"]),
+            route=cast(str, row["route"]),
+            resource_scope=cast(str, row["resource_scope"]),
+            key=cast(str, row["idempotency_key"]),
+            request_digest=cast(str, row["request_digest"]),
+            operation=operation,
+        )
+        if not hmac.compare_digest(
+            cast(str | None, operation_row["action_identity_digest"]) or "",
+            expected_authority,
+        ):
+            raise ProviderDataCorruptionError(
+                "operation row differs from its exact idempotency action authority"
+            )
+        if (
+            row["principal"] != LOCAL_PRINCIPAL
+            or row["method"] != "POST"
+            or row["resource_scope"] != operation.resource.resource_id
+        ):
+            raise ProviderDataCorruptionError(
+                "operation idempotency identity differs from its operation"
+            )
+        try:
+            self._validate_action_route_binding(
+                route=cast(str, row["route"]),
+                resource_scope=cast(str, row["resource_scope"]),
+                resource_type=operation.resource.resource_type,
+                operation_kind=operation.operation_kind,
+            )
+        except ContractValidationError as exc:
+            raise ProviderDataCorruptionError(
+                "operation idempotency route differs from its operation binding"
+            ) from exc
+        return operation
+
+    @staticmethod
+    def _action_authority_digest(
+        *,
+        principal: str,
+        method: str,
+        route: str,
+        resource_scope: str,
+        key: str,
+        request_digest: str,
+        operation: LocalOperationV1,
+    ) -> str:
+        identity_bytes = _canonical_json_bytes(
+            {
+                "principal": principal,
+                "method": method,
+                "route": route,
+                "resource_scope": resource_scope,
+                "idempotency_key": key,
+                "request_digest": request_digest,
+                "operation_id": operation.operation_id,
+                "operation_kind": operation.operation_kind,
+            }
+        )
+        return sha256(_ACTION_AUTHORITY_DOMAIN + identity_bytes).hexdigest()
+
+    def _cleanup_expired_idempotency_records(
+        self,
+        connection: sqlite3.Connection,
+        now_epoch: int,
+    ) -> None:
+        connection.execute(
+            """
+            DELETE FROM idempotency_records
+            WHERE expires_at_epoch <= ? AND response_type != 'LocalOperationV1'
+            """,
+            (now_epoch,),
+        )
+        after_operation_id = ""
+        while True:
+            operation_ids = connection.execute(
+                """
+                SELECT operation_id
+                FROM idempotency_records
+                WHERE expires_at_epoch <= ? AND response_type = 'LocalOperationV1'
+                  AND operation_id > ?
+                ORDER BY operation_id
+                LIMIT ?
+                """,
+                (now_epoch, after_operation_id, STARTUP_OPERATION_BATCH_ROWS),
+            ).fetchall()
+            if not operation_ids:
+                return
+            for operation_id_row in operation_ids:
+                operation_id = cast(str, operation_id_row["operation_id"])
+                row = connection.execute(
+                    "SELECT * FROM idempotency_records WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                if row is None:
+                    raise ProviderDataCorruptionError(
+                        "operation idempotency record changed during cleanup"
+                    )
+                row = cast(sqlite3.Row, row)
+                operation = self._operation_for_idempotency_record(connection, row)
+                if operation.state not in {"queued", "running", "cancelling"}:
+                    deleted = connection.execute(
+                        """
+                        DELETE FROM idempotency_records
+                        WHERE principal = ? AND method = ? AND route = ?
+                          AND resource_scope = ? AND idempotency_key = ?
+                          AND request_digest = ? AND operation_id = ?
+                          AND response_type = 'LocalOperationV1' AND response_bytes = ?
+                          AND expires_at_epoch <= ?
+                        """,
+                        (
+                            row["principal"],
+                            row["method"],
+                            row["route"],
+                            row["resource_scope"],
+                            row["idempotency_key"],
+                            row["request_digest"],
+                            row["operation_id"],
+                            row["response_bytes"],
+                            now_epoch,
+                        ),
+                    )
+                    if deleted.rowcount != 1:
+                        raise ProviderDataCorruptionError(
+                            "terminal operation idempotency record changed during cleanup"
+                        )
+                after_operation_id = operation_id
+            if len(operation_ids) < STARTUP_OPERATION_BATCH_ROWS:
+                return
+
     def _insert_idempotency_record(
         self,
         connection: sqlite3.Connection,
@@ -2455,18 +3222,54 @@ class DesktopProviderStore:
         resource_scope: str,
         key: str,
         request_digest: str,
+        operation_id: str | None,
         response_type: str,
         status_code: int,
         response_bytes: bytes,
         now_epoch: int,
     ) -> None:
+        if (response_type == "LocalOperationV1") != (operation_id is not None):
+            raise ProviderStoreError(
+                "operation idempotency response requires an exact operation identity"
+            )
+        if operation_id is not None:
+            operation_row = self._require_operation_row(connection, operation_id)
+            operation = self._operation_from_row(operation_row)
+            if bytes(operation_row["document_json"]) != response_bytes:
+                raise ProviderStoreError(
+                    "operation idempotency response differs from the operation row"
+                )
+            authority_digest = self._action_authority_digest(
+                principal=principal,
+                method=method,
+                route=route,
+                resource_scope=resource_scope,
+                key=key,
+                request_digest=request_digest,
+                operation=operation,
+            )
+            bound = connection.execute(
+                """
+                UPDATE local_operations
+                SET action_identity_digest = ?
+                WHERE operation_id = ?
+                  AND (
+                    action_identity_digest IS NULL OR action_identity_digest = ?
+                  )
+                """,
+                (authority_digest, operation_id, authority_digest),
+            )
+            if bound.rowcount != 1:
+                raise ProviderStoreError(
+                    "operation is already bound to another idempotency action"
+                )
         connection.execute(
             """
             INSERT INTO idempotency_records(
                 principal, method, route, resource_scope, idempotency_key,
-                request_digest, response_type, status_code, response_bytes,
+                request_digest, operation_id, response_type, status_code, response_bytes,
                 created_at_epoch, expires_at_epoch
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 principal,
@@ -2475,6 +3278,7 @@ class DesktopProviderStore:
                 resource_scope,
                 key,
                 request_digest,
+                operation_id,
                 response_type,
                 status_code,
                 response_bytes,
@@ -2588,6 +3392,111 @@ class DesktopProviderStore:
         if row is None:
             raise ResourceNotFoundError("project", project_id)
         return cast(sqlite3.Row, row)
+
+    @staticmethod
+    def _require_project_not_busy(
+        connection: sqlite3.Connection,
+        project_id: str,
+        *,
+        excluded_operation_id: str | None = None,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT operation_id
+            FROM local_operations
+            WHERE resource_type = 'project' AND resource_id = ?
+              AND state IN ('queued', 'running', 'cancelling')
+              AND operation_id != ?
+            ORDER BY operation_id
+            LIMIT 1
+            """,
+            (project_id, excluded_operation_id or ""),
+        ).fetchone()
+        if row is not None:
+            raise ResourceInUseError("project", project_id)
+
+    @classmethod
+    def _require_project_operation_reservation_available(
+        cls,
+        connection: sqlite3.Connection,
+        project_id: str,
+        *,
+        operation_kind: str,
+        excluded_operation_id: str | None = None,
+    ) -> None:
+        """Reserve every project row a nonterminal operation can mutate."""
+
+        if operation_kind not in _PROJECT_OPERATION_KINDS:
+            raise ContractValidationError("project runtime operation kind is invalid")
+        if excluded_operation_id is not None:
+            excluded = cls._require_operation_row(connection, excluded_operation_id)
+            if (
+                excluded["operation_kind"] != operation_kind
+                or excluded["resource_type"] != "project"
+                or excluded["resource_id"] != project_id
+                or excluded["state"] not in {"queued", "running", "cancelling"}
+            ):
+                raise ContractValidationError(
+                    "project reservation exclusion differs from its operation authority"
+                )
+        cls._require_project_not_busy(
+            connection,
+            project_id,
+            excluded_operation_id=excluded_operation_id,
+        )
+        project = cls._require_project_row(connection, project_id)
+        if operation_kind == "project_activate":
+            competing_activation = connection.execute(
+                """
+                SELECT resource_id
+                FROM local_operations
+                WHERE operation_kind = 'project_activate'
+                  AND resource_type = 'project'
+                  AND state IN ('queued', 'running', 'cancelling')
+                  AND operation_id != ?
+                ORDER BY operation_id
+                LIMIT 1
+                """,
+                (excluded_operation_id or "",),
+            ).fetchone()
+            if competing_activation is not None:
+                raise ResourceInUseError("project", cast(str, competing_activation["resource_id"]))
+
+            active = connection.execute(
+                """
+                SELECT project_id
+                FROM projects
+                WHERE state = 'active' AND project_id != ?
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            if active is not None:
+                active_project_id = cast(str, active["project_id"])
+                cls._require_project_not_busy(
+                    connection,
+                    active_project_id,
+                    excluded_operation_id=excluded_operation_id,
+                )
+            return
+
+        if project["state"] == "active":
+            displacing_activation = connection.execute(
+                """
+                SELECT operation_id
+                FROM local_operations
+                WHERE operation_kind = 'project_activate'
+                  AND resource_type = 'project'
+                  AND resource_id != ?
+                  AND state IN ('queued', 'running', 'cancelling')
+                  AND operation_id != ?
+                ORDER BY operation_id
+                LIMIT 1
+                """,
+                (project_id, excluded_operation_id or ""),
+            ).fetchone()
+            if displacing_activation is not None:
+                raise ResourceInUseError("project", project_id)
 
     @staticmethod
     def _require_operation_row(connection: sqlite3.Connection, operation_id: str) -> sqlite3.Row:
@@ -2718,6 +3627,57 @@ class DesktopProviderStore:
                     "succeeded project operation requires a project result"
                 )
 
+    @staticmethod
+    def _operation_terminal_slot_bytes(operation_kind: str) -> int:
+        if operation_kind in _PROFILE_OPERATION_KINDS:
+            return PROFILE_RUNTIME_TERMINAL_SLOT_BYTES
+        if operation_kind in _PROJECT_OPERATION_KINDS:
+            return PROJECT_RUNTIME_TERMINAL_SLOT_BYTES
+        raise ContractValidationError("local operation kind has no terminal capacity slot")
+
+    def _validate_nonterminal_operation_terminal_capacity(
+        self,
+        connection: sqlite3.Connection,
+        operation: LocalOperationV1,
+    ) -> None:
+        cancelled = _validate_model(
+            LocalOperationV1,
+            {
+                **operation.model_dump(mode="python"),
+                "state": "cancelled",
+                "result": self._startup_cancellation_result(connection, operation),
+                "error": None,
+                "finished_at": operation.created_at,
+                "etag": self._etag("operation", operation.operation_id, 2),
+            },
+        )
+        terminal_bytes = _canonical_json_bytes(cancelled.model_dump(mode="json"))
+        if len(terminal_bytes) > self._operation_terminal_slot_bytes(operation.operation_kind):
+            raise ContractValidationError(
+                "nonterminal local operation exceeds its fixed terminal slot"
+            )
+
+    def _startup_cancellation_result(
+        self,
+        connection: sqlite3.Connection,
+        operation: LocalOperationV1,
+    ) -> LocalOperationResultV1 | None:
+        if operation.operation_kind in _PROFILE_OPERATION_KINDS:
+            return ConnectionOperationResultV1(
+                profile_id=operation.resource.resource_id,
+                connection_state="disconnected",
+            )
+        if operation.operation_kind == "project_activate":
+            row = self._require_project_row(connection, operation.resource.resource_id)
+            return ProjectOperationResultV1(
+                project_id=operation.resource.resource_id,
+                project_etag=self._etag(
+                    "project", operation.resource.resource_id, row["resource_version"] + 1
+                ),
+                active=False,
+            )
+        return operation.result
+
     def _authoritative_operation_result(
         self, connection: sqlite3.Connection, operation: LocalOperationV1
     ) -> LocalOperationResultV1 | None:
@@ -2758,22 +3718,15 @@ class DesktopProviderStore:
             )
         return operation.result
 
-    def _reconcile_operation_with_authority(
+    def _cancel_operation_with_authority(
         self,
         connection: sqlite3.Connection,
         row: sqlite3.Row,
-        *,
-        force_cancel_nonterminal: bool,
     ) -> LocalOperationV1:
         operation = self._operation_from_row(row)
         if operation.state in {"succeeded", "failed", "cancelled"}:
             return operation
         authoritative_result = self._authoritative_operation_result(connection, operation)
-        nonterminal = operation.state not in {"succeeded", "failed", "cancelled"}
-        if not (
-            (force_cancel_nonterminal and nonterminal) or operation.result != authoritative_result
-        ):
-            return operation
         version = cast(int, row["resource_version"]) + 1
         timestamp = self._timestamp()
         reconciled = _validate_model(
@@ -2788,14 +3741,19 @@ class DesktopProviderStore:
             },
         )
         response_bytes = _canonical_json_bytes(reconciled.model_dump(mode="json"))
-        if (
-            operation.operation_kind in _PROFILE_OPERATION_KINDS
-            and len(response_bytes) > PROFILE_RUNTIME_TERMINAL_SLOT_BYTES
-        ):
-            raise ProviderDataCorruptionError(
-                "profile runtime cancellation exceeds its reserved slot"
+        if len(response_bytes) > self._operation_terminal_slot_bytes(operation.operation_kind):
+            label = (
+                "profile runtime"
+                if operation.operation_kind in _PROFILE_OPERATION_KINDS
+                else "project runtime"
             )
+            raise ProviderDataCorruptionError(f"{label} cancellation exceeds its reserved slot")
         previous_bytes = bytes(row["document_json"])
+        idempotency_rows = self._idempotency_rows_for_operation(
+            connection,
+            operation,
+            previous_bytes,
+        )
         connection.execute(
             """
             UPDATE local_operations
@@ -2810,15 +3768,63 @@ class DesktopProviderStore:
                 reconciled.operation_id,
             ),
         )
-        connection.execute(
-            """
-            UPDATE idempotency_records
-            SET response_bytes = ?
-            WHERE response_type = 'LocalOperationV1' AND response_bytes = ?
-            """,
-            (response_bytes, previous_bytes),
-        )
+        for idempotency_row in idempotency_rows:
+            updated = connection.execute(
+                """
+                UPDATE idempotency_records
+                SET response_bytes = ?
+                WHERE principal = ? AND method = ? AND route = ?
+                  AND resource_scope = ? AND idempotency_key = ?
+                  AND request_digest = ? AND response_type = 'LocalOperationV1'
+                  AND operation_id = ? AND response_bytes = ?
+                """,
+                (
+                    response_bytes,
+                    idempotency_row["principal"],
+                    idempotency_row["method"],
+                    idempotency_row["route"],
+                    idempotency_row["resource_scope"],
+                    idempotency_row["idempotency_key"],
+                    idempotency_row["request_digest"],
+                    operation.operation_id,
+                    previous_bytes,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ProviderDataCorruptionError(
+                    "operation idempotency response changed during reconciliation"
+                )
         return reconciled
+
+    def _idempotency_rows_for_operation(
+        self,
+        connection: sqlite3.Connection,
+        operation: LocalOperationV1,
+        response_bytes: bytes,
+    ) -> tuple[sqlite3.Row, ...]:
+        cursor = connection.execute(
+            """
+            SELECT *
+            FROM idempotency_records
+            WHERE response_type = 'LocalOperationV1' AND operation_id = ?
+            """,
+            (operation.operation_id,),
+        )
+        rows = tuple(cast(sqlite3.Row, row) for row in cursor.fetchmany(2))
+        if len(rows) != 1:
+            raise ProviderDataCorruptionError(
+                "live operation action authority must have exactly one idempotency record"
+            )
+        for row in rows:
+            referenced = self._operation_for_idempotency_record(connection, row)
+            if (
+                referenced.operation_id != operation.operation_id
+                or bytes(row["response_bytes"]) != response_bytes
+            ):
+                raise ProviderDataCorruptionError(
+                    "operation idempotency response references another operation"
+                )
+        return rows
 
     def _reconcile_profile_operations(
         self,
@@ -2842,10 +3848,9 @@ class DesktopProviderStore:
                 return
             for operation_id_row in operation_ids:
                 operation_id = cast(str, operation_id_row["operation_id"])
-                self._reconcile_operation_with_authority(
+                self._cancel_operation_with_authority(
                     connection,
                     self._require_operation_row(connection, operation_id),
-                    force_cancel_nonterminal=True,
                 )
                 after_operation_id = operation_id
             if len(operation_ids) < STARTUP_OPERATION_BATCH_ROWS:
@@ -2902,10 +3907,9 @@ class DesktopProviderStore:
                     raise ProviderDataCorruptionError(
                         "startup operation row changed during recovery"
                     )
-                self._reconcile_operation_with_authority(
+                self._cancel_operation_with_authority(
                     connection,
                     cast(sqlite3.Row, row),
-                    force_cancel_nonterminal=True,
                 )
                 after_operation_id = operation_id
             if len(metadata_rows) < STARTUP_OPERATION_BATCH_ROWS:
@@ -3040,7 +4044,9 @@ class DesktopProviderStore:
                 secrets.token_bytes(_CURSOR_NONCE_BYTES),
             )
         except (OverflowError, struct.error, ValueError) as exc:
-            raise ProviderStoreError("provider cursor timestamps are outside token bounds") from exc
+            raise ProviderStoreError(
+                "provider cursor timestamps are outside token bounds"
+            ) from exc
         cursor = (
             f"{self._b64encode(token)}."
             f"{self._b64encode(hmac.digest(self._cursor_key, token, 'sha256'))}"
@@ -3172,6 +4178,7 @@ __all__ = (
     "IdempotencyResult",
     "ProviderDataCorruptionError",
     "ProviderMutation",
+    "ProjectRuntimeActionReservation",
     "ProviderSchemaError",
     "ProviderStateRootError",
     "ProviderStoreError",

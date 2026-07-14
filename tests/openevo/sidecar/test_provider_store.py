@@ -21,9 +21,11 @@ from desktop.sidecar.contracts.v1.models import (
     ConnectionOperationResultV1,
     CredentialSlotStatusV1,
     LocalOperationV1,
+    NormalizedCheckV1,
     ProjectCreateV1,
     ProjectOperationResultV1,
     ProjectPatchV1,
+    ProjectV1,
     RemoteProfilePatchV1,
     RemoteProfileV1,
     ResourceRefV1,
@@ -463,6 +465,68 @@ def test_migrates_a_canonical_v1_store_to_v2(tmp_path: Path) -> None:
     assert store.get_profile(profile.profile_id) == profile
 
 
+def test_rejects_unreleased_intermediate_v2_without_exact_action_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    (root / "cursor-signing.key").write_bytes(b"k" * 32)
+    os.chmod(root / "cursor-signing.key", 0o600)
+    intermediate_schema = list(provider_store_module._SCHEMA_V2)
+    intermediate_schema[3] = (
+        intermediate_schema[3]
+        .replace("        action_identity_digest TEXT UNIQUE,\n", "")
+        .replace(
+            ",\n        CHECK (\n"
+            "            action_identity_digest IS NULL OR "
+            "length(action_identity_digest) = 64\n"
+            "        )",
+            "",
+        )
+    )
+    intermediate_schema[4] = (
+        intermediate_schema[4]
+        .replace("        operation_id TEXT UNIQUE,\n", "")
+        .replace(
+            "        CHECK (\n"
+            "            operation_id IS NULL OR\n"
+            "            length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 512\n"
+            "        ),\n",
+            "",
+        )
+        .replace(
+            ",\n        CHECK (\n"
+            "            (response_type = 'LocalOperationV1' "
+            "AND operation_id IS NOT NULL) OR\n"
+            "            (response_type != 'LocalOperationV1' "
+            "AND operation_id IS NULL)\n"
+            "        ),\n"
+            "        FOREIGN KEY (operation_id) REFERENCES "
+            "local_operations(operation_id) ON DELETE RESTRICT",
+            "",
+        )
+    )
+    assert "action_identity_digest" not in intermediate_schema[3]
+    assert "operation_id TEXT UNIQUE" not in intermediate_schema[4]
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for statement in intermediate_schema:
+            connection.execute(statement)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (
+                (1, "2026-07-14T12:00:00.000000Z"),
+                (2, "2026-07-14T12:00:00.000000Z"),
+            ),
+        )
+        connection.execute("PRAGMA user_version = 2")
+    os.chmod(root / "provider.sqlite3", 0o600)
+
+    with pytest.raises(ProviderSchemaError, match="fingerprint"):
+        DesktopProviderStore(root)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -877,20 +941,24 @@ def test_nonterminal_profile_reservation_is_cancelled_exactly_once_on_restart(
     assert late_success == recovered.operation
     assert late_failure == recovered.operation
     assert reopened.get_profile(profile.profile_id).connection_state == "disconnected"
-    assert bytes(
-        reopened._connection.execute(
-            "SELECT response_bytes FROM idempotency_records WHERE idempotency_key = ?",
-            (action["key"],),
-        ).fetchone()[0]
-    ) == frozen
+    assert (
+        bytes(
+            reopened._connection.execute(
+                "SELECT response_bytes FROM idempotency_records WHERE idempotency_key = ?",
+                (action["key"],),
+            ).fetchone()[0]
+        )
+        == frozen
+    )
     reopened.close()
 
     reopened_again = DesktopProviderStore(root)
     replay = reopened_again.begin_profile_runtime_action(**action)
     assert replay.replayed is True
-    assert provider_store_module._canonical_json_bytes(
-        replay.operation.model_dump(mode="json")
-    ) == frozen
+    assert (
+        provider_store_module._canonical_json_bytes(replay.operation.model_dump(mode="json"))
+        == frozen
+    )
     assert replay.operation.etag == recovered_etag
 
 
@@ -901,12 +969,43 @@ def test_nonterminal_profile_runtime_operation_blocks_delete(
 ) -> None:
     store = DesktopProviderStore(tmp_path / "state")
     profile = _create_profile(store)
-    with store._transaction(write=True) as connection:
-        ProviderMutation(store, connection).create_local_operation(
-            operation_kind="profile_disconnect",
-            resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
-            state=state,
+    reservation = store.begin_profile_runtime_action(
+        route=f"/desktop/v1/profiles/{profile.profile_id}/disconnect",
+        operation_kind="profile_disconnect",
+        profile_id=profile.profile_id,
+        key=f"profile-delete-guard-{state}",
+        body={},
+        if_match=profile.etag,
+        displace_existing=False,
+    )
+    if state != "running":
+        operation = LocalOperationV1.model_validate(
+            {
+                **reservation.operation.model_dump(mode="python"),
+                "state": state,
+                "started_at": None if state == "queued" else reservation.operation.started_at,
+            }
         )
+        operation_bytes = provider_store_module._canonical_json_bytes(
+            operation.model_dump(mode="json")
+        )
+        with store._transaction(write=True) as connection:
+            connection.execute(
+                """
+                UPDATE local_operations
+                SET state = ?, document_json = ?
+                WHERE operation_id = ?
+                """,
+                (state, operation_bytes, operation.operation_id),
+            )
+            connection.execute(
+                """
+                UPDATE idempotency_records
+                SET response_bytes = ?
+                WHERE operation_id = ?
+                """,
+                (operation_bytes, operation.operation_id),
+            )
 
     with pytest.raises(ResourceInUseError):
         store.delete_profile(profile.profile_id, if_match=profile.etag)
@@ -1047,6 +1146,91 @@ def test_profile_failure_finalizes_inside_reserved_terminal_slots(
     replay = store.begin_profile_runtime_action(**action)
     assert replay.replayed is True
     assert replay.operation == failed
+
+
+def test_live_profile_operation_get_and_replay_are_read_only_and_completion_wins(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    action = {
+        "route": f"/desktop/v1/profiles/{profile.profile_id}/connect",
+        "operation_kind": "profile_connect",
+        "profile_id": profile.profile_id,
+        "key": "profile-read-only-observation",
+        "body": {},
+        "if_match": profile.etag,
+        "displace_existing": True,
+    }
+    reservation = store.begin_profile_runtime_action(**action)
+    initial = reservation.operation
+
+    observed = store.get_local_operation(initial.operation_id)
+    replay = store.begin_profile_runtime_action(**action)
+
+    assert observed == initial
+    assert replay.replayed is True
+    assert replay.operation == initial
+    assert store.get_profile(profile.profile_id).connection_state == "connecting"
+    finished = store.complete_profile_runtime_action(
+        reservation=reservation,
+        route=cast(str, action["route"]),
+        profile_id=profile.profile_id,
+        key=cast(str, action["key"]),
+        body={},
+        if_match=profile.etag,
+        connection_state="connected",
+        host_key_fingerprint="SHA256:read-only-observation",
+    )
+    assert finished.state == "succeeded"
+    assert finished.result == ConnectionOperationResultV1(
+        profile_id=profile.profile_id,
+        connection_state="connected",
+    )
+
+
+def test_generic_live_operation_replay_does_not_reconcile_or_cancel(tmp_path: Path) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+
+    def begin(transaction: ProviderMutation):
+        transaction.set_profile_runtime_state(
+            profile.profile_id,
+            if_match=profile.etag,
+            connection_state="connecting",
+            credential_slots=(),
+            host_key_fingerprint=None,
+        )
+        return 202, transaction.create_local_operation(
+            operation_kind="profile_connect",
+            resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
+            state="running",
+        )
+
+    action = {
+        "route": f"/desktop/v1/profiles/{profile.profile_id}/connect",
+        "resource_scope": profile.profile_id,
+        "key": "profile-generic-read-only-replay",
+        "body": {},
+        "if_match": profile.etag,
+        "semantic_headers": {},
+        "response_model": LocalOperationV1,
+        "mutation": begin,
+    }
+    first = store.execute_idempotent_action(**action)
+    replay = store.execute_idempotent_action(
+        **{
+            **action,
+            "mutation": lambda transaction: pytest.fail(f"unexpected mutation: {transaction}"),
+        }
+    )
+
+    operation = LocalOperationV1.model_validate_json(replay.response_bytes)
+    assert replay.replayed is True
+    assert replay.response_bytes == first.response_bytes
+    assert operation.state == "running"
+    assert operation.result is None
+    assert store.get_local_operation(operation.operation_id) == operation
 
 
 def test_connecting_second_profile_atomically_displaces_first_profile(
@@ -1256,6 +1440,1010 @@ def test_action_idempotency_binds_if_match_headers_and_response_type(tmp_path: P
         store.execute_idempotent_action(**{**arguments, "if_match": f'"{"0" * 64}"'})
     with pytest.raises(ProviderDataCorruptionError, match="response type"):
         store.execute_idempotent_action(**{**arguments, "response_model": type(profile)})
+
+
+def test_project_runtime_action_is_durable_idempotent_and_completes_atomically(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-runtime-create-01"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": project.project_id,
+        "key": "project-runtime-activate-01",
+        "body": {},
+        "if_match": project.etag,
+    }
+
+    reservation = store.begin_project_runtime_action(**action)
+    assert reservation.replayed is False
+    assert reservation.project == project
+    assert reservation.operation.state == "queued"
+    assert reservation.operation.started_at is None
+    assert reservation.operation.result == ProjectOperationResultV1(
+        project_id=project.project_id,
+        project_etag=project.etag,
+        active=False,
+    )
+
+    replay = store.begin_project_runtime_action(**action)
+    assert replay.replayed is True
+    assert replay.project is None
+    assert replay.operation == reservation.operation
+    with pytest.raises(ResourceInUseError):
+        store.patch_project(project.project_id, {"name": "Changed"}, if_match=project.etag)
+    with pytest.raises(ResourceInUseError):
+        store.delete_project(project.project_id, if_match=project.etag)
+    with pytest.raises(ResourceInUseError):
+        store.begin_project_runtime_action(
+            **{
+                **action,
+                "route": f"/desktop/v1/projects/{project.project_id}/doctor",
+                "operation_kind": "project_doctor",
+                "key": "project-runtime-doctor-0001",
+            }
+        )
+
+    running = store.start_project_runtime_action(reservation=reservation, **action)
+    assert running.state == "running"
+    assert running.started_at is not None
+    assert store.begin_project_runtime_action(**action).operation == running
+
+    finished = store.complete_project_runtime_action(
+        reservation=reservation,
+        current_revision_id="core-revision-0001",
+        **action,
+    )
+    active = store.get_project(project.project_id)
+    assert finished.state == "succeeded"
+    assert finished.finished_at is not None
+    assert finished.result == ProjectOperationResultV1(
+        project_id=project.project_id,
+        project_etag=active.etag,
+        active=True,
+    )
+    assert active.state == "active"
+    with store._transaction(write=False) as connection:
+        assert (
+            connection.execute(
+                "SELECT current_revision_id FROM projects WHERE project_id = ?",
+                (project.project_id,),
+            ).fetchone()[0]
+            == "core-revision-0001"
+        )
+    assert store.begin_project_runtime_action(**action).operation == finished
+
+
+@pytest.mark.parametrize(
+    ("operation_kind", "route_suffix"),
+    [
+        ("project_doctor", "doctor"),
+        ("project_repair", "repair"),
+        ("bootstrap", "bootstrap"),
+        ("workspace_sync", "workspace-sync"),
+    ],
+)
+@pytest.mark.parametrize("start_operation", [False, True], ids=["queued", "running"])
+def test_cross_project_activation_rejects_busy_active_project(
+    tmp_path: Path,
+    operation_kind: str,
+    route_suffix: str,
+    start_operation: bool,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-busy-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-busy-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    first_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/{route_suffix}",
+        "operation_kind": operation_kind,
+        "project_id": first.project_id,
+        "key": f"activation-busy-{operation_kind}-{start_operation}",
+        "body": {},
+        "if_match": first.etag,
+    }
+    first_reservation = store.begin_project_runtime_action(**first_action)
+    if start_operation:
+        store.start_project_runtime_action(reservation=first_reservation, **first_action)
+    second_action = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": f"activation-busy-second-{operation_kind}-{start_operation}",
+        "body": {},
+        "if_match": second.etag,
+    }
+
+    with pytest.raises(ResourceInUseError) as raised:
+        store.begin_project_runtime_action(**second_action)
+
+    assert raised.value.resource_id == first.project_id
+    assert store.get_project(first.project_id) == first
+    assert store.get_project(second.project_id) == second
+
+
+@pytest.mark.parametrize(
+    ("operation_kind", "route_suffix"),
+    [
+        ("project_doctor", "doctor"),
+        ("project_repair", "repair"),
+        ("bootstrap", "bootstrap"),
+        ("workspace_sync", "workspace-sync"),
+    ],
+)
+def test_activation_reservation_excludes_new_work_on_active_project(
+    tmp_path: Path,
+    operation_kind: str,
+    route_suffix: str,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-reverse-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-reverse-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    activation = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": f"activation-reverse-{operation_kind}",
+        "body": {},
+        "if_match": second.etag,
+    }
+    reservation = store.begin_project_runtime_action(**activation)
+    active_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/{route_suffix}",
+        "operation_kind": operation_kind,
+        "project_id": first.project_id,
+        "key": f"activation-reverse-active-{operation_kind}",
+        "body": {},
+        "if_match": first.etag,
+    }
+
+    with pytest.raises(ResourceInUseError) as raised:
+        store.begin_project_runtime_action(**active_action)
+
+    assert raised.value.resource_id == first.project_id
+    store.start_project_runtime_action(reservation=reservation, **activation)
+    store.complete_project_runtime_action(
+        reservation=reservation,
+        current_revision_id="second-revision",
+        **activation,
+    )
+    assert store.get_project(first.project_id).state == "draft"
+    assert store.get_project(second.project_id).state == "active"
+
+
+def test_activation_completion_rechecks_late_cross_project_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-late-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-late-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    activation = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": "activation-late-second-action",
+        "body": {},
+        "if_match": second.etag,
+    }
+    reservation = store.begin_project_runtime_action(**activation)
+    store.start_project_runtime_action(reservation=reservation, **activation)
+    active_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/doctor",
+        "operation_kind": "project_doctor",
+        "project_id": first.project_id,
+        "key": "activation-late-first-doctor",
+        "body": {},
+        "if_match": first.etag,
+    }
+    with monkeypatch.context() as bypass:
+        bypass.setattr(
+            DesktopProviderStore,
+            "_require_project_operation_reservation_available",
+            classmethod(lambda _cls, *_args, **_kwargs: None),
+        )
+        store.begin_project_runtime_action(**active_action)
+
+    with pytest.raises(ResourceInUseError) as raised:
+        store.complete_project_runtime_action(
+            reservation=reservation,
+            current_revision_id="second-revision",
+            **activation,
+        )
+
+    assert raised.value.resource_id == first.project_id
+    assert store.get_local_operation(reservation.operation.operation_id).state == "running"
+    assert store.get_project(first.project_id) == first
+    assert store.get_project(second.project_id) == second
+
+
+def test_project_activation_and_active_work_reservations_are_serialized(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-race-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-race-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    actions = (
+        {
+            "route": f"/desktop/v1/projects/{first.project_id}/workspace-sync",
+            "operation_kind": "workspace_sync",
+            "project_id": first.project_id,
+            "key": "activation-race-first-sync",
+            "body": {},
+            "if_match": first.etag,
+        },
+        {
+            "route": f"/desktop/v1/projects/{second.project_id}/activate",
+            "operation_kind": "project_activate",
+            "project_id": second.project_id,
+            "key": "activation-race-second-activate",
+            "body": {},
+            "if_match": second.etag,
+        },
+    )
+    barrier = threading.Barrier(2)
+
+    def reserve(action: dict[str, object]) -> str:
+        barrier.wait(timeout=5)
+        try:
+            store.begin_project_runtime_action(**action)
+        except ResourceInUseError:
+            return "busy"
+        return "reserved"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(reserve, actions))
+
+    assert sorted(outcomes) == ["busy", "reserved"]
+    assert (
+        store._connection.execute(
+            "SELECT count(*) FROM local_operations "
+            "WHERE state IN ('queued', 'running', 'cancelling')"
+        ).fetchone()[0]
+        == 1
+    )
+    assert store.get_project(first.project_id) == first
+    assert store.get_project(second.project_id) == second
+
+
+def test_restart_cancels_activation_exclusion_before_accepting_active_project_work(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-restart-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-restart-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    activation = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": "activation-restart-second-action",
+        "body": {},
+        "if_match": second.etag,
+    }
+    reservation = store.begin_project_runtime_action(**activation)
+    store.close()
+
+    reopened = DesktopProviderStore(root)
+    replay = reopened.begin_project_runtime_action(**activation)
+    recovered_first = reopened.get_project(first.project_id)
+    assert replay.operation.operation_id == reservation.operation.operation_id
+    assert replay.operation.state == "cancelled"
+    assert recovered_first.state == "draft"
+    assert recovered_first.etag != first.etag
+
+    doctor = reopened.begin_project_runtime_action(
+        route=f"/desktop/v1/projects/{first.project_id}/doctor",
+        operation_kind="project_doctor",
+        project_id=first.project_id,
+        key="activation-restart-first-doctor",
+        body={},
+        if_match=recovered_first.etag,
+    )
+    assert doctor.operation.state == "queued"
+
+
+def test_expired_live_project_action_survives_cleanup_and_can_finish(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    store = DesktopProviderStore(
+        tmp_path / "state",
+        clock=clock,
+        idempotency_retention_seconds=1,
+    )
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-live-expiry-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-live-expiry-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    clock.now += timedelta(seconds=2)
+
+    _create_profile(store, name="Cleanup trigger", key="profile-cleanup-trigger")
+
+    persisted = store._connection.execute(
+        "SELECT response_bytes FROM idempotency_records WHERE idempotency_key = ?",
+        (action["key"],),
+    ).fetchone()
+    assert persisted is not None
+    running = store.start_project_runtime_action(reservation=reservation, **action)
+    finished = store.complete_project_runtime_action(
+        reservation=reservation,
+        current_revision_id=None,
+        **action,
+    )
+    assert running.state == "running"
+    assert finished.state == "succeeded"
+    _create_profile(store, name="Terminal cleanup trigger", key="profile-terminal-cleanup")
+    assert (
+        store._connection.execute(
+            "SELECT 1 FROM idempotency_records WHERE idempotency_key = ?",
+            (action["key"],),
+        ).fetchone()
+        is None
+    )
+
+
+def test_project_action_replay_rejects_cross_project_operation_substitution(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="project-replay-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="project-replay-second-create",
+    )
+    first_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": first.project_id,
+        "key": "project-replay-first-action",
+        "body": {},
+        "if_match": first.etag,
+    }
+    second_action = {
+        "route": f"/desktop/v1/projects/{second.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": second.project_id,
+        "key": "project-replay-second-action",
+        "body": {},
+        "if_match": second.etag,
+    }
+    store.begin_project_runtime_action(**first_action)
+    second_reservation = store.begin_project_runtime_action(**second_action)
+    second_bytes = provider_store_module._canonical_json_bytes(
+        second_reservation.operation.model_dump(mode="json")
+    )
+    store._connection.execute(
+        "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
+        (second_bytes, first_action["key"]),
+    )
+    store._connection.commit()
+
+    with pytest.raises(ProviderDataCorruptionError, match="operation"):
+        store.begin_project_runtime_action(**first_action)
+
+
+@pytest.mark.parametrize("recovery", [False, True], ids=["replay", "startup"])
+def test_project_action_rejects_same_scope_operation_substitution(
+    tmp_path: Path,
+    recovery: bool,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-same-scope-create"
+    )
+    first_action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-same-scope-first-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    first_reservation = store.begin_project_runtime_action(**first_action)
+    store.start_project_runtime_action(reservation=first_reservation, **first_action)
+    store.complete_project_runtime_action(
+        reservation=first_reservation,
+        current_revision_id=None,
+        **first_action,
+    )
+    second_action = {
+        **first_action,
+        "key": "project-same-scope-second-action",
+    }
+    second_reservation = store.begin_project_runtime_action(**second_action)
+    second_bytes = provider_store_module._canonical_json_bytes(
+        second_reservation.operation.model_dump(mode="json")
+    )
+    if recovery:
+        store.close()
+        with sqlite3.connect(root / "provider.sqlite3") as connection:
+            connection.execute(
+                "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
+                (second_bytes, first_action["key"]),
+            )
+        with pytest.raises(ProviderDataCorruptionError, match="operation"):
+            DesktopProviderStore(root)
+    else:
+        store._connection.execute(
+            "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
+            (second_bytes, first_action["key"]),
+        )
+        store._connection.commit()
+        with pytest.raises(ProviderDataCorruptionError, match="operation"):
+            store.begin_project_runtime_action(**first_action)
+
+
+def test_startup_rejects_cross_project_operation_replay_substitution(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="project-startup-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="project-startup-second-create",
+    )
+    first_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": first.project_id,
+        "key": "project-startup-first-action",
+        "body": {},
+        "if_match": first.etag,
+    }
+    second_action = {
+        "route": f"/desktop/v1/projects/{second.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": second.project_id,
+        "key": "project-startup-second-action",
+        "body": {},
+        "if_match": second.etag,
+    }
+    store.begin_project_runtime_action(**first_action)
+    second_reservation = store.begin_project_runtime_action(**second_action)
+    second_bytes = provider_store_module._canonical_json_bytes(
+        second_reservation.operation.model_dump(mode="json")
+    )
+    store.close()
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute(
+            "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
+            (second_bytes, first_action["key"]),
+        )
+
+    with pytest.raises(ProviderDataCorruptionError, match="operation"):
+        DesktopProviderStore(root)
+
+
+def test_startup_rejects_rebinding_operation_id_to_another_action_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-authority-create"
+    )
+    first_action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-authority-first-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    first = store.begin_project_runtime_action(**first_action)
+    store.start_project_runtime_action(reservation=first, **first_action)
+    store.complete_project_runtime_action(
+        reservation=first,
+        current_revision_id=None,
+        **first_action,
+    )
+    second_action = {**first_action, "key": "project-authority-second-action"}
+    second = store.begin_project_runtime_action(**second_action)
+    second_bytes = provider_store_module._canonical_json_bytes(
+        second.operation.model_dump(mode="json")
+    )
+    store.close()
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute(
+            "DELETE FROM idempotency_records WHERE idempotency_key = ?",
+            (second_action["key"],),
+        )
+        connection.execute(
+            """
+            UPDATE idempotency_records
+            SET operation_id = ?, response_bytes = ?
+            WHERE idempotency_key = ?
+            """,
+            (second.operation.operation_id, second_bytes, first_action["key"]),
+        )
+
+    with pytest.raises(ProviderDataCorruptionError, match="action authority"):
+        DesktopProviderStore(root)
+
+
+@pytest.mark.parametrize("state", ["running", "succeeded"])
+def test_mutation_cannot_commit_an_operation_without_action_authority(
+    tmp_path: Path,
+    state: Literal["running", "succeeded"],
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-orphan-mutation-create"
+    )
+
+    def create_orphan_then_return_project(
+        transaction: ProviderMutation,
+    ) -> tuple[int, ProjectV1]:
+        transaction.create_local_operation(
+            operation_kind="workspace_sync",
+            resource=ResourceRefV1(resource_type="project", resource_id=project.project_id),
+            state=state,
+        )
+        return 200, transaction.require_project_authority(
+            project.project_id, if_match=project.etag
+        )
+
+    with pytest.raises(ProviderDataCorruptionError, match="action authority"):
+        store.execute_idempotent_action(
+            route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+            resource_scope=project.project_id,
+            key="project-orphan-mutation-action",
+            body={},
+            if_match=project.etag,
+            semantic_headers={},
+            response_model=ProjectV1,
+            mutation=create_orphan_then_return_project,
+        )
+
+    assert store._connection.execute("SELECT count(*) FROM local_operations").fetchone()[0] == 0
+    assert (
+        store._connection.execute(
+            "SELECT 1 FROM idempotency_records WHERE idempotency_key = ?",
+            ("project-orphan-mutation-action",),
+        ).fetchone()
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "clear_digest",
+    [False, True],
+    ids=["missing-record", "missing-record-and-digest"],
+)
+def test_startup_rejects_unbound_nonterminal_operation_before_cancellation(
+    tmp_path: Path,
+    clear_digest: bool,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-orphan-startup-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-orphan-startup-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    assert reservation.operation.state == "queued"
+    store.close()
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute(
+            "DELETE FROM idempotency_records WHERE operation_id = ?",
+            (reservation.operation.operation_id,),
+        )
+        if clear_digest:
+            connection.execute(
+                """
+                UPDATE local_operations
+                SET action_identity_digest = NULL
+                WHERE operation_id = ?
+                """,
+                (reservation.operation.operation_id,),
+            )
+
+    with pytest.raises(ProviderDataCorruptionError, match="action authority"):
+        DesktopProviderStore(root)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT state, document_json FROM local_operations WHERE operation_id = ?",
+            (reservation.operation.operation_id,),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "queued"
+    assert LocalOperationV1.model_validate_json(bytes(row[1])).state == "queued"
+
+
+def test_project_action_operation_kind_is_part_of_idempotency_identity(tmp_path: Path) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-kind-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-kind-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    store.begin_project_runtime_action(**action)
+
+    with pytest.raises(IdempotencyConflictError):
+        store.begin_project_runtime_action(**{**action, "operation_kind": "project_doctor"})
+
+
+def test_project_reservation_fails_when_terminal_slots_do_not_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-capacity-create"
+    )
+    _, used_bytes = store._recovery_usage(store._connection)
+    monkeypatch.setattr(
+        provider_store_module,
+        "MAX_RECOVERY_BYTES",
+        used_bytes + provider_store_module.PROJECT_RUNTIME_TERMINAL_RESERVATION_BYTES,
+    )
+
+    with pytest.raises(ProviderDataCorruptionError, match="recovery budget exceeded"):
+        store.begin_project_runtime_action(
+            route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+            operation_kind="workspace_sync",
+            project_id=project.project_id,
+            key="project-no-terminal-capacity",
+            body={},
+            if_match=project.etag,
+        )
+
+
+def test_generic_nonterminal_operation_rejects_oversized_terminal_shape(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-large-operation-create"
+    )
+    checks = tuple(
+        NormalizedCheckV1(
+            check_id=f"check-{index}",
+            label="l" * 512,
+            status="running",
+            summary="s" * 512,
+        )
+        for index in range(1_425)
+    )
+    checks_bytes = provider_store_module._canonical_json_bytes(
+        [check.model_dump(mode="json") for check in checks]
+    )
+    assert 1_580_000 <= len(checks_bytes) <= 1_600_000
+
+    def create_large_operation(transaction: ProviderMutation):
+        return 202, transaction.create_local_operation(
+            operation_kind="workspace_sync",
+            resource=ResourceRefV1(resource_type="project", resource_id=project.project_id),
+            state="running",
+            checks=checks,
+        )
+
+    with pytest.raises(ContractValidationError, match="terminal slot"):
+        store.execute_idempotent_action(
+            route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+            resource_scope=project.project_id,
+            key="project-large-operation-action",
+            body={},
+            if_match=project.etag,
+            semantic_headers={},
+            response_model=LocalOperationV1,
+            mutation=create_large_operation,
+        )
+    assert store._connection.execute("SELECT count(*) FROM local_operations").fetchone()[0] == 0
+    assert (
+        store._connection.execute(
+            "SELECT 1 FROM idempotency_records WHERE idempotency_key = ?",
+            ("project-large-operation-action",),
+        ).fetchone()
+        is None
+    )
+
+
+def test_project_runtime_action_failure_is_replayable_and_keeps_project_draft(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-runtime-fail-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": project.project_id,
+        "key": "project-runtime-fail-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    store.start_project_runtime_action(reservation=reservation, **action)
+    error = ApiErrorV1(
+        request_id=reservation.operation.operation_id,
+        code="core_activation_failed",
+        http_status=503,
+        message="OpenEvo Core activation failed.",
+        severity=ErrorSeverity.BLOCKING,
+        category=ErrorCategory.PROJECT,
+        retryable=True,
+        repair_action=RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Retry project activation.",
+    )
+
+    failed = store.fail_project_runtime_action(
+        reservation=reservation,
+        error=error,
+        **action,
+    )
+
+    assert failed.state == "failed"
+    assert failed.error == error
+    assert failed.result == reservation.operation.result
+    assert store.get_project(project.project_id).state == "draft"
+    assert store.begin_project_runtime_action(**action).operation == failed
+
+
+def test_project_runtime_reservation_prevents_superseding_activation(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="project-runtime-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="project-runtime-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": first.project_id,
+        "key": "project-runtime-first-reactivate",
+        "body": {},
+        "if_match": first.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    store.start_project_runtime_action(reservation=reservation, **action)
+    with store._transaction(write=True) as connection:
+        with pytest.raises(ResourceInUseError):
+            ProviderMutation(store, connection).set_project_state(
+                second.project_id,
+                if_match=second.etag,
+                state="active",
+                current_revision_id="second-revision",
+            )
+    error = ApiErrorV1(
+        request_id=reservation.operation.operation_id,
+        code="activation_failed",
+        http_status=409,
+        message="Project activation failed.",
+        severity=ErrorSeverity.BLOCKING,
+        category=ErrorCategory.PROJECT,
+        retryable=True,
+        repair_action=RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Retry project activation.",
+    )
+
+    failed = store.fail_project_runtime_action(
+        reservation=reservation,
+        error=error,
+        **action,
+    )
+
+    assert failed.state == "failed"
+    assert failed.result == ProjectOperationResultV1(
+        project_id=first.project_id,
+        project_etag=first.etag,
+        active=True,
+    )
+    assert store.get_project(first.project_id) == first
+    assert store.get_project(second.project_id) == second
+
+
+def test_project_runtime_action_restart_cancels_once_and_updates_replay(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-runtime-crash-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-runtime-crash-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    running = store.start_project_runtime_action(reservation=reservation, **action)
+    assert running.state == "running"
+    store.close()
+
+    reopened = DesktopProviderStore(root)
+    replay = reopened.begin_project_runtime_action(**action)
+    assert replay.replayed is True
+    assert replay.operation.state == "cancelled"
+    assert replay.operation.finished_at is not None
+    frozen_etag = replay.operation.etag
+    assert reopened.get_local_operation(replay.operation.operation_id).etag == frozen_etag
+    assert reopened.begin_project_runtime_action(**action).operation.etag == frozen_etag
+
+
+def test_project_startup_cancellation_rejects_terminal_slot_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-slot-create"
+    )
+    store.begin_project_runtime_action(
+        route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        operation_kind="workspace_sync",
+        project_id=project.project_id,
+        key="project-slot-action",
+        body={},
+        if_match=project.etag,
+    )
+    store.close()
+    monkeypatch.setattr(provider_store_module, "PROJECT_RUNTIME_TERMINAL_SLOT_BYTES", 1)
+
+    with pytest.raises(ProviderDataCorruptionError, match="project runtime cancellation"):
+        DesktopProviderStore(root)
+
+
+def test_non_activation_project_runtime_action_succeeds_without_project_result(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-runtime-sync-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-runtime-sync-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    store.start_project_runtime_action(reservation=reservation, **action)
+
+    finished = store.complete_project_runtime_action(
+        reservation=reservation,
+        current_revision_id=None,
+        **action,
+    )
+
+    assert finished.state == "succeeded"
+    assert finished.result is None
+    assert store.get_project(project.project_id) == project
 
 
 def test_active_project_switch_is_atomic_and_active_config_is_immutable(tmp_path: Path) -> None:
@@ -1727,16 +2915,16 @@ def test_startup_reconciliation_streams_large_operation_sets_in_bounded_batches(
     store = DesktopProviderStore(root)
     profile = _create_profile(store)
     operation_count = provider_store_module.STARTUP_OPERATION_BATCH_ROWS * 2 + 3
-    with store._transaction(write=True) as connection:
-        transaction = ProviderMutation(store, connection)
-        for _index in range(operation_count):
-            transaction.create_local_operation(
-                operation_kind="profile_connect",
-                resource=ResourceRefV1(
-                    resource_type="profile", resource_id=profile.profile_id
-                ),
-                state="running",
-            )
+    for index in range(operation_count):
+        store.begin_profile_runtime_action(
+            route=f"/desktop/v1/profiles/{profile.profile_id}/disconnect",
+            operation_kind="profile_disconnect",
+            profile_id=profile.profile_id,
+            key=f"profile-stream-disconnect-{index:04d}",
+            body={},
+            if_match=profile.etag,
+            displace_existing=False,
+        )
     store.close()
 
     original_connect = sqlite3.connect
@@ -1754,6 +2942,10 @@ def test_startup_reconciliation_streams_large_operation_sets_in_bounded_batches(
 
         def fetchone(self):
             return self._cursor.fetchone()
+
+        @property
+        def rowcount(self):
+            return self._cursor.rowcount
 
         def fetchmany(self, size: int | None = None):
             if size is not None:
@@ -1805,9 +2997,12 @@ def test_startup_reconciliation_streams_large_operation_sets_in_bounded_batches(
 
     assert len(batch_limits) >= 3
     assert max(batch_limits) <= provider_store_module.STARTUP_OPERATION_BATCH_ROWS
-    assert reopened._connection.execute(
-        "SELECT count(*) FROM local_operations WHERE state = 'cancelled'"
-    ).fetchone()[0] == operation_count
+    assert (
+        reopened._connection.execute(
+            "SELECT count(*) FROM local_operations WHERE state = 'cancelled'"
+        ).fetchone()[0]
+        == operation_count
+    )
     reopened.close()
 
 
