@@ -67,6 +67,14 @@ fields implicitly classified. Its states are `pre_patch`, `unknown`, and
 5. atomically append the mapping version and remove that exact applied
    operation.
 
+The bound create operation first persists the create response's complete
+immutable projection: Core project ID, canonical `ProjectCreateV1`, task
+snapshot, and `created_at`. The initial project GET and every initial workspace
+finalize must match it exactly. A Desktop-authorized patch may replace canonical
+project intent and task snapshot according to its signed-snapshot rules, but it
+must preserve the Core project ID and `created_at`; this check runs before the
+response can become an applied durable outcome.
+
 The last transaction compares the complete previous mapping. A rollback leaves
 the old mapping and applied operation intact. If Local intent advanced from A
 to B after Core applied A, recovery proves the persisted A outcome, commits A
@@ -93,14 +101,16 @@ a requested B then starts from A's current ETag and gets a separate mapping
 generation.
 
 The completed mapping also stores the canonical mapped request, exact
-project/task/workspace content snapshots, a complete mutable authority
-projection (status, project/workspace snapshots, publication, revision,
-registry, model preparation, timestamp, and ETag), monotonic mapping generation,
-and predecessor request digest. The scalar snapshot/revision/registry/ETag/time
-indexes must exactly mirror that projection. Mapping commit receives the
-complete expected prior mapping; a durable adapter must retain the ordered audit
-history and reject lost updates. Every load recomputes the canonical request
-digest and validates the projection binding before Core transport.
+project/task/workspace content snapshots, a complete immutable authority
+projection (Core project ID, canonical project intent, task snapshot, and
+`created_at`), a complete mutable authority projection (status,
+project/workspace snapshots, publication, revision, registry, model preparation,
+timestamp, and ETag), monotonic mapping generation, and predecessor request
+digest. The scalar snapshot/revision/registry/ETag/time indexes must exactly
+mirror those projections. Mapping commit receives the complete expected prior
+mapping; a durable adapter must retain the ordered audit history and reject lost
+updates. Every load recomputes the canonical request digest and validates both
+projection bindings before Core transport.
 
 ## Session Ownership
 
@@ -132,10 +142,11 @@ Pydantic exception.
 
 Every config-dependent capability, validation, and run call also rereads the
 Core project before using it. The active session retains the completed durable
-mapping: its canonical `ProjectCreateV1` and project/task/workspace content
+mapping: its complete immutable projection and project/task/workspace content
 snapshots remain fixed. The refresh compares Core project intent through the
-same canonical project-identity helper used by activation and compares the
-complete immutable authority projection. The last validated session project is
+same canonical project-identity helper used by activation and compares Core
+project ID, canonical intent, task snapshot, and `created_at` through the shared
+immutable authority validator. The last validated session project is
 the mutable predecessor. It may remain byte-for-byte equal or advance by one
 revision generation with a new ETag and strictly newer `updated_at`; only the
 active revision, matching registry digest, ETag, and timestamp may differ.
@@ -197,24 +208,26 @@ archive declaration, and base workspace snapshot. A changed imported workspace
 therefore gets a new upload instead of reusing the prior version's session.
 
 For an existing mapping, Desktop first rereads the exact Core project. Unchanged
-intent must match the stored canonical request and immutable content snapshots.
-The mapping's complete mutable authority must be identical when the active
-revision is unchanged. Cross-session activation may accept one direct revision
-successor without changing Local intent: it must issue a new project ETag,
-strictly increase `updated_at`, preserve status, snapshots, publication, and
-model preparation, and may update only active revision and registry alongside
-that ETag/time pair. Desktop accepts and CAS versions that authority only after
-capabilities, project readiness, revision-head agreement, and Core validation
-all succeed.
+intent must match the stored canonical request, content snapshots, and complete
+immutable projection, including exact `created_at`. The mapping's complete
+mutable authority must be identical when the active revision is unchanged.
+Cross-session activation may accept one direct revision successor without
+changing Local intent: it must issue a new project ETag, strictly increase
+`updated_at`, preserve status, snapshots, publication, model preparation, and
+the complete immutable projection, and may update only active revision and
+registry alongside that ETag/time pair. Desktop accepts and CAS versions that
+authority only after capabilities, project readiness, revision-head agreement,
+and Core validation all succeed.
 
 Changed name, task, model/execution, evolution config, or workspace is sent
 through frozen Core `patch_project` with the freshly read Core ETag and a
 deterministic key derived from old and new canonical request digests. Core must
 return a new project snapshot and ETag, plus a new task/workspace snapshot state
-when those inputs changed. Replacing one unpublished imported draft with another
-may legally keep the workspace snapshot `null`; the new project snapshot and
-ETag version that draft transition. A Core reread validates ownership but is never proof
-of which request produced observed content. Every unknown patch replays the
+when those inputs changed, while retaining the exact Core project ID and
+`created_at`. Replacing one unpublished imported draft with another may legally
+keep the workspace snapshot `null`; the new project snapshot and ETag version
+that draft transition. A Core reread validates ownership but is never proof of
+which request produced observed content. Every unknown patch replays the
 durable canonical request with its original ETag and key until the exact response
 is persisted. Mapping CAS occurs only after workspace publication, readiness,
 revision-head agreement, and Core validation, preserving the prior mapping as

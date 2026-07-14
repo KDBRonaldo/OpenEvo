@@ -316,20 +316,26 @@ only with the persisted canonical create request, its digest, and its
 idempotency key. Durable create state distinguishes `pre_create`, `unknown`,
 and `bound`: a proven pre-transport failure may accept a new Local action key,
 unknown outcome requires exact replay, and a bound project resumes without
-another create. If mapping commit is interrupted and the Local draft is edited,
-the bound operation first verifies the original request against that Core
-project and then converges the new intent through a versioned patch. For an
-initial imported workspace, the durable exact finalize outcome is the revision
-authority at the unmapped boundary. Recovery validates its project snapshots,
-publication, and every revision edge through current authority before using the
-current ETag, issuing a patch or upload, or committing the first mapping.
+another create. Binding also persists the create response's complete immutable
+projection: Core project ID, canonical `ProjectCreateV1`, task snapshot, and
+project `created_at`. Every later GET and initial finalize must preserve that
+projection. If mapping commit is interrupted and the Local draft is edited, the
+bound operation first verifies the original request and immutable identity
+against that Core project, then converges the new intent through a versioned
+patch. For an initial imported workspace, the durable exact finalize outcome is
+the revision authority at the unmapped boundary. Recovery validates its
+immutable projection, project snapshots, publication, and every revision edge
+through current authority before using the current ETag, issuing a patch or
+upload, or committing the first mapping.
 
 Mapped Local edits use Core `patch_project`, the freshly read project ETag, and
 a deterministic old/new request key. The mapping records canonical mapped
-intent and immutable project/task/workspace content snapshots separately from
-the complete mutable Core authority projection: status, project/workspace
-snapshots, workspace publication, active revision, registry digest, model
-preparation, project `updated_at`, and project ETag. Every
+intent, exact project/task/workspace content snapshots, and the complete
+immutable projection (Core project ID, canonical project intent, task snapshot,
+and `created_at`) separately from the complete mutable Core authority
+projection: status, project/workspace snapshots, workspace publication, active
+revision, registry digest, model preparation, project `updated_at`, and project
+ETag. Every
 initial-publication, mapped, patch-recovery, and finalize-recovery read uses the
 same transition validator before using the current ETag. An unchanged revision
 requires that complete projection, including ETag, timestamp, and registry, to
@@ -359,7 +365,10 @@ operation. It binds canonical old/new Local intent, patch digest and key, the
 pre-patch Core project/ETag/snapshots, the validated Core outcome, and explicit
 immutable-content and mutable-publication/runtime projections covering that
 outcome. Reads are not used to infer an unknown result; the exact mutation is
-replayed. An imported patch may then be finalized without invalidating its
+replayed. A patch may authorize new project intent and task snapshot authority,
+but its response must preserve the Core project ID and original `created_at`;
+the response is rejected before applied-outcome persistence otherwise. An
+imported patch may then be finalized without invalidating its
 durable proof: recovery requires the persisted upload's predecessor snapshot
 and ETag plus the durable exact finalize response's project/workspace snapshots
 and publication before accepting current status/ETag or later successor

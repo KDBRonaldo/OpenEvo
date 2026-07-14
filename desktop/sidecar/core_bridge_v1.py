@@ -374,6 +374,7 @@ class CoreProjectCreateOperationV1:
     idempotency_key: str
     state: CoreProjectCreateStateV1 = CoreProjectCreateStateV1.PRE_CREATE
     core_project_id: str | None = None
+    project_immutable_authority: CoreProjectPatchImmutableAuthorityV1 | None = None
     workspace_upload_id: str | None = None
     workspace_upload_project_snapshot: core_v1.ImmutableSnapshotRefV1 | None = None
     workspace_upload_abort: CoreWorkspaceUploadAbortOperationV1 | None = None
@@ -384,6 +385,13 @@ class CoreProjectCreateOperationV1:
             raise ValueError("project create request digest does not match canonical request")
         if (self.state is CoreProjectCreateStateV1.BOUND) != (self.core_project_id is not None):
             raise ValueError("only a bound create operation has a Core project ID")
+        if (self.core_project_id is None) != (self.project_immutable_authority is None):
+            raise ValueError("a bound create operation must retain immutable project authority")
+        if self.project_immutable_authority is not None and (
+            self.project_immutable_authority.project_id != self.core_project_id
+            or self.project_immutable_authority.project_create != self.project_create
+        ):
+            raise ValueError("create immutable authority must match the bound Core project")
         if (self.workspace_upload_id is None) != (self.workspace_upload_project_snapshot is None):
             raise ValueError("workspace upload ID and project snapshot must be paired")
         if self.workspace_upload_abort is not None and (
@@ -493,6 +501,8 @@ class CoreProjectPatchOperationV1:
             raise ValueError("only an applied project patch has complete durable authority")
         if self.outcome is not None and self.outcome.id != self.core_project_id:
             raise ValueError("project patch outcome belongs to another project")
+        if self.outcome is not None and self.outcome.created_at != self.base_project.created_at:
+            raise ValueError("project patch outcome changed immutable project creation time")
         if self.outcome is not None and not _project_identity_matches(
             self.outcome, self.new_project_create
         ):
@@ -519,6 +529,7 @@ class CoreProjectMappingV1:
     project_etag: str
     active_revision: core_v1.RevisionRefV1
     project_updated_at: str
+    immutable_authority: CoreProjectPatchImmutableAuthorityV1
     mutable_authority: CoreProjectPatchMutableAuthorityV1
     mapping_generation: int
     predecessor_request_sha256: str | None
@@ -566,6 +577,8 @@ class DesktopCoreBridgePersistence(Protocol):
         self,
         operation: CoreProjectCreateOperationV1,
         core_project_id: str,
+        *,
+        immutable_authority: CoreProjectPatchImmutableAuthorityV1,
     ) -> CoreProjectCreateOperationV1: ...
 
     def update_create(
@@ -1715,10 +1728,13 @@ class DesktopCoreBridgeV1:
                     idempotency_key=operation.idempotency_key,
                 ),
             )
+            _ensure_project_identity(result.project, request)
+            immutable_authority = _patch_immutable_authority(result.project)
             expected_bound = replace(
                 operation,
                 state=CoreProjectCreateStateV1.BOUND,
                 core_project_id=result.project.id,
+                project_immutable_authority=immutable_authority,
             )
             stored_bound = self._adapter_external(
                 token,
@@ -1726,6 +1742,7 @@ class DesktopCoreBridgeV1:
                 lambda: self._persistence.bind_created_project(
                     operation,
                     result.project.id,
+                    immutable_authority=immutable_authority,
                 ),
                 label="project create binding",
             )
@@ -1755,6 +1772,14 @@ class DesktopCoreBridgeV1:
         request_sha256: str,
         core_host_identity: str,
     ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1 | None]:
+        _ensure_immutable_authority_transition(
+            _mapping_immutable_authority(mapping),
+            _patch_immutable_authority(current),
+            mismatch_code="core_project_mapping_mismatch",
+            mismatch_message=(
+                "Core immutable authority does not match the durable project mapping."
+            ),
+        )
         _ensure_mutable_authority_transition(
             _mapping_mutable_authority(mapping),
             _patch_mutable_authority(current),
@@ -1804,6 +1829,14 @@ class DesktopCoreBridgeV1:
         request_sha256: str,
         core_host_identity: str,
     ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1 | None]:
+        _ensure_immutable_authority_transition(
+            _create_immutable_authority(operation),
+            _patch_immutable_authority(current),
+            mismatch_code="core_project_create_binding_mismatch",
+            mismatch_message=(
+                "Core immutable authority does not match the durable project create."
+            ),
+        )
         if _project_identity_matches(current, requested):
             raise _bridge_error(
                 "core_project_patch_proof_missing",
@@ -1893,6 +1926,15 @@ class DesktopCoreBridgeV1:
         CoreProjectPatchOperationV1,
         tuple[core_v1.RevisionRefV1 | None, ...],
     ]:
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(operation.base_project),
+            _patch_immutable_authority(current),
+            allow_project_patch=True,
+            mismatch_code="core_project_patch_replay_mismatch",
+            mismatch_message=(
+                "Current Core project changed immutable patch base identity."
+            ),
+        )
         if operation.state is CoreProjectPatchStateV1.APPLIED:
             assert operation.outcome is not None
             finalize_authority: CoreWorkspaceUploadFinalizeAuthorityV1 | None = None
@@ -2152,6 +2194,12 @@ class DesktopCoreBridgeV1:
                 idempotency_key=_derived_key(upload_key_seed, "finalize"),
             ),
         )
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(core_project),
+            _patch_immutable_authority(finalized.project),
+            mismatch_code="workspace_finalize_authority_mismatch",
+            mismatch_message="Core workspace finalize changed immutable project authority.",
+        )
         finalize_authority = CoreWorkspaceUploadFinalizeAuthorityV1(
             upload=upload,
             request_sha256=_model_digest(finalize_request),
@@ -2394,12 +2442,14 @@ class DesktopCoreBridgeV1:
         previous = session.project
         mapping = session.mapping
         _ensure_project_identity(project, mapping.project_create)
-        if _patch_immutable_authority(project) != _patch_immutable_authority(previous):
-            raise _bridge_error(
-                "core_project_identity_mismatch",
-                "The refreshed Core project changed immutable project authority.",
-                status=409,
-            )
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(previous),
+            _patch_immutable_authority(project),
+            mismatch_code="core_project_identity_mismatch",
+            mismatch_message=(
+                "The refreshed Core project changed immutable project authority."
+            ),
+        )
         _ensure_mapping_content_snapshots(mapping, project)
         _ensure_mutable_authority_transition(
             _patch_mutable_authority(previous),
@@ -2719,6 +2769,20 @@ def _ensure_create_operation(
     if operation.workspace_upload_finalize is not None:
         _ensure_workspace_finalize_authority_binding(operation.workspace_upload_finalize)
     bound = operation.state is CoreProjectCreateStateV1.BOUND
+    if bound:
+        create_immutable = _create_immutable_authority(operation)
+        if operation.workspace_upload_finalize is not None:
+            _ensure_immutable_authority_transition(
+                create_immutable,
+                _patch_immutable_authority(
+                    operation.workspace_upload_finalize.outcome.project
+                ),
+                allow_project_patch=True,
+                mismatch_code="core_project_create_replay_mismatch",
+                mismatch_message=(
+                    "Workspace finalize changed immutable project create identity."
+                ),
+            )
     if (
         operation.local_project_id != project.project_id
         or operation.profile_id != project.profile_id
@@ -2788,11 +2852,27 @@ def _ensure_patch_operation_authority(
             status=409,
         )
     if mapping is None:
+        _ensure_immutable_authority_transition(
+            _create_immutable_authority(operation),
+            _patch_immutable_authority(patch.base_project),
+            mismatch_code="core_project_patch_replay_mismatch",
+            mismatch_message=(
+                "The durable Core project patch base does not descend from the create authority."
+            ),
+        )
         base_matches = (
             patch.old_request_sha256 == operation.request_sha256
             and patch.old_project_create == operation.project_create
         )
     else:
+        _ensure_immutable_authority_transition(
+            _mapping_immutable_authority(mapping),
+            _patch_immutable_authority(patch.base_project),
+            mismatch_code="core_project_patch_replay_mismatch",
+            mismatch_message=(
+                "The durable Core project patch base does not descend from the mapping."
+            ),
+        )
         _ensure_mutable_authority_transition(
             _mapping_mutable_authority(mapping),
             _patch_mutable_authority(patch.base_project),
@@ -2827,12 +2907,14 @@ def _ensure_persisted_patch_outcome(
     assert operation.outcome is not None
     assert operation.outcome_immutable is not None
     assert operation.outcome_mutable is not None
-    if _patch_immutable_authority(current) != operation.outcome_immutable:
-        raise _bridge_error(
-            "core_project_patch_outcome_mismatch",
-            "Core no longer matches the immutable applied project patch authority.",
-            status=409,
-        )
+    _ensure_immutable_authority_transition(
+        operation.outcome_immutable,
+        _patch_immutable_authority(current),
+        mismatch_code="core_project_patch_outcome_mismatch",
+        mismatch_message=(
+            "Core no longer matches the immutable applied project patch authority."
+        ),
+    )
     _ensure_project_identity(operation.outcome, operation.new_project_create)
     _ensure_patch_signed_new_snapshots(
         operation.base_project,
@@ -2904,6 +2986,23 @@ def _ensure_workspace_finalize_proof(
     requested_workspace = operation.new_project_create.workspace
     upload = authority.upload if authority is not None else None
     finalized_project = authority.outcome.project if authority is not None else None
+    if finalized_project is not None:
+        _ensure_immutable_authority_transition(
+            operation.outcome_immutable,
+            _patch_immutable_authority(finalized_project),
+            mismatch_code="core_project_patch_outcome_mismatch",
+            mismatch_message=(
+                "Core workspace finalize changed immutable applied patch authority."
+            ),
+        )
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(finalized_project),
+            _patch_immutable_authority(current),
+            mismatch_code="core_project_patch_outcome_mismatch",
+            mismatch_message=(
+                "Core no longer matches immutable workspace finalize authority."
+            ),
+        )
     if not isinstance(requested_workspace, core_v1.ImportedWorkspaceSpecV1) or (
         authority is None
         or upload is None
@@ -2919,7 +3018,6 @@ def _ensure_workspace_finalize_proof(
         or finalized_project.current_project_snapshot != current.current_project_snapshot
         or finalized_project.current_workspace_snapshot != current.current_workspace_snapshot
         or finalized_project.workspace_publication != current.workspace_publication
-        or _patch_immutable_authority(finalized_project) != operation.outcome_immutable
     ):
         raise _bridge_error(
             "core_project_patch_outcome_mismatch",
@@ -2997,6 +3095,42 @@ def _utc_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
 
 
+def _create_immutable_authority(
+    operation: CoreProjectCreateOperationV1,
+) -> CoreProjectPatchImmutableAuthorityV1:
+    authority = operation.project_immutable_authority
+    if (
+        operation.state is not CoreProjectCreateStateV1.BOUND
+        or operation.core_project_id is None
+        or authority is None
+        or authority.project_id != operation.core_project_id
+        or authority.project_create != operation.project_create
+    ):
+        raise _bridge_error(
+            "core_project_create_binding_mismatch",
+            "The durable project create binding has incomplete immutable authority.",
+            status=409,
+        )
+    return authority
+
+
+def _mapping_immutable_authority(
+    mapping: CoreProjectMappingV1,
+) -> CoreProjectPatchImmutableAuthorityV1:
+    authority = mapping.immutable_authority
+    if (
+        authority.project_id != mapping.core_project_id
+        or authority.project_create != mapping.project_create
+        or authority.task_snapshot != mapping.task_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_mapping_mismatch",
+            "The durable Core project mapping has inconsistent immutable authority.",
+            status=409,
+        )
+    return authority
+
+
 def _mapping_mutable_authority(
     mapping: CoreProjectMappingV1,
 ) -> CoreProjectPatchMutableAuthorityV1:
@@ -3025,6 +3159,7 @@ def _ensure_mapping_authority(
     *,
     core_host_identity: str,
 ) -> None:
+    _mapping_immutable_authority(mapping)
     _mapping_mutable_authority(mapping)
     if (
         mapping.local_project_id != project.project_id
@@ -3058,6 +3193,26 @@ def _ensure_bound_operation(
         )
     if operation.workspace_upload_finalize is not None:
         _ensure_workspace_finalize_authority_binding(operation.workspace_upload_finalize)
+        _ensure_immutable_authority_transition(
+            _create_immutable_authority(operation),
+            _patch_immutable_authority(
+                operation.workspace_upload_finalize.outcome.project
+            ),
+            allow_project_patch=True,
+            mismatch_code="core_project_create_binding_mismatch",
+            mismatch_message=(
+                "Workspace finalize changed immutable project create identity."
+            ),
+        )
+    _ensure_immutable_authority_transition(
+        _create_immutable_authority(operation),
+        _mapping_immutable_authority(mapping),
+        allow_project_patch=True,
+        mismatch_code="core_project_create_binding_mismatch",
+        mismatch_message=(
+            "The Core mapping changed immutable project create identity."
+        ),
+    )
     return operation
 
 
@@ -3103,18 +3258,45 @@ def _ensure_initial_publication_authority(
             "The durable project create binding does not own the publication authority.",
             status=409,
         )
+    create_immutable = _create_immutable_authority(operation)
+    _ensure_immutable_authority_transition(
+        create_immutable,
+        _patch_immutable_authority(descendant),
+        mismatch_code="core_project_initial_publication_mismatch",
+        mismatch_message=(
+            "Core does not match the immutable project create authority."
+        ),
+    )
     finalize = operation.workspace_upload_finalize
     finalized_project: core_v1.ProjectV1 | None = None
     if finalize is not None:
         _ensure_workspace_finalize_authority_binding(finalize)
         candidate = finalize.outcome.project
         if _project_identity_matches(candidate, operation.project_create):
+            _ensure_immutable_authority_transition(
+                create_immutable,
+                _patch_immutable_authority(candidate),
+                mismatch_code="core_project_initial_publication_mismatch",
+                mismatch_message=(
+                    "The durable workspace finalize changed project create authority."
+                ),
+            )
             finalized_project = candidate
-        elif not (
+        elif (
             pending_patch is not None
             and pending_patch.state is CoreProjectPatchStateV1.APPLIED
+            and pending_patch.outcome_immutable is not None
             and _project_identity_matches(candidate, pending_patch.new_project_create)
         ):
+            _ensure_immutable_authority_transition(
+                pending_patch.outcome_immutable,
+                _patch_immutable_authority(candidate),
+                mismatch_code="core_project_initial_publication_mismatch",
+                mismatch_message=(
+                    "The durable workspace finalize changed applied patch authority."
+                ),
+            )
+        else:
             raise _bridge_error(
                 "core_project_initial_publication_mismatch",
                 "The durable workspace publication does not match a proven project intent.",
@@ -3123,10 +3305,16 @@ def _ensure_initial_publication_authority(
 
     authority = finalized_project.active_revision if finalized_project is not None else None
     if finalized_project is not None:
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(finalized_project),
+            _patch_immutable_authority(descendant),
+            mismatch_code="core_project_initial_publication_mismatch",
+            mismatch_message=(
+                "Core no longer matches immutable initial workspace publication authority."
+            ),
+        )
         same_content_authority = (
             finalized_project.id == operation.core_project_id == descendant.id
-            and _patch_immutable_authority(descendant)
-            == _patch_immutable_authority(finalized_project)
             and descendant.current_project_snapshot
             == finalized_project.current_project_snapshot
             and descendant.current_workspace_snapshot
@@ -3164,6 +3352,13 @@ def _ensure_patch_signed_new_snapshots(
     patched: core_v1.ProjectV1,
     requested: core_v1.ProjectCreateV1,
 ) -> None:
+    _ensure_immutable_authority_transition(
+        _patch_immutable_authority(previous),
+        _patch_immutable_authority(patched),
+        allow_project_patch=True,
+        mismatch_code="core_project_patch_outcome_mismatch",
+        mismatch_message="Core patch changed immutable project identity.",
+    )
     if patched.current_project_snapshot == previous.current_project_snapshot:
         raise _bridge_error(
             "core_project_patch_not_versioned",
@@ -3214,6 +3409,14 @@ def _ensure_mapping_content_snapshots(
     mapping: CoreProjectMappingV1,
     project: core_v1.ProjectV1,
 ) -> None:
+    _ensure_immutable_authority_transition(
+        _mapping_immutable_authority(mapping),
+        _patch_immutable_authority(project),
+        mismatch_code="core_project_mapping_mismatch",
+        mismatch_message=(
+            "The Core project changed immutable authority outside Desktop authority."
+        ),
+    )
     if (
         mapping.core_project_id != project.id
         or mapping.project_snapshot != project.current_project_snapshot
@@ -3252,6 +3455,30 @@ def _ensure_revision_authority_successor(
         raise _bridge_error(
             "core_project_revision_authority_mismatch",
             f"Core active revision does not directly descend from the {label} authority.",
+            status=409,
+        )
+
+
+def _ensure_immutable_authority_transition(
+    authority: CoreProjectPatchImmutableAuthorityV1,
+    current: CoreProjectPatchImmutableAuthorityV1,
+    *,
+    allow_project_patch: bool = False,
+    mismatch_code: str,
+    mismatch_message: str,
+) -> None:
+    if allow_project_patch:
+        expected_authority = replace(
+            authority,
+            project_create=current.project_create,
+            task_snapshot=current.task_snapshot,
+        )
+    else:
+        expected_authority = authority
+    if current != expected_authority:
+        raise _bridge_error(
+            mismatch_code,
+            mismatch_message,
             status=409,
         )
 
@@ -3376,8 +3603,10 @@ def _mapping_from_request(
             "core_project_not_ready",
             "Core has not published the project workspace snapshot and active revision.",
         )
+    immutable_authority = _patch_immutable_authority(project)
     mutable_authority = _patch_mutable_authority(project)
     if previous_mapping is not None:
+        _mapping_immutable_authority(previous_mapping)
         _mapping_mutable_authority(previous_mapping)
     chain_start = (
         previous_mapping.active_revision
@@ -3404,6 +3633,7 @@ def _mapping_from_request(
         and previous_mapping.task_snapshot == project.current_task_snapshot
         and previous_mapping.workspace_snapshot == workspace_snapshot
         and previous_mapping.registry_digest == capabilities.registry_digest
+        and previous_mapping.immutable_authority == immutable_authority
         and previous_mapping.mutable_authority == mutable_authority
     ):
         mapping_generation = previous_mapping.mapping_generation
@@ -3425,6 +3655,7 @@ def _mapping_from_request(
         project_etag=project.etag,
         active_revision=active_revision,
         project_updated_at=project.updated_at,
+        immutable_authority=immutable_authority,
         mutable_authority=mutable_authority,
         mapping_generation=mapping_generation,
         predecessor_request_sha256=predecessor_request_sha256,

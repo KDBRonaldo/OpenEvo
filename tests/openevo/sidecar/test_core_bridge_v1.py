@@ -143,6 +143,7 @@ def _project(
     etag: str | None = None,
     active_revision: core_v1.RevisionRefV1 = REVISION,
     registry_digest: str = REGISTRY_DIGEST,
+    created_at: str = NOW,
     updated_at: str = NOW,
 ) -> core_v1.ProjectV1:
     imported = isinstance(request.workspace, core_v1.ImportedWorkspaceSpecV1)
@@ -185,7 +186,7 @@ def _project(
             ),
             updated_at=NOW,
         ),
-        created_at=NOW,
+        created_at=created_at,
         updated_at=updated_at,
         etag=etag or (ETAG_C if ready else ETAG_A),
         spec=request.spec,
@@ -295,6 +296,8 @@ class FakePersistence:
         self,
         operation: CoreProjectCreateOperationV1,
         core_project_id: str,
+        *,
+        immutable_authority: bridge_module.CoreProjectPatchImmutableAuthorityV1,
     ) -> CoreProjectCreateOperationV1:
         self.events.append("bind_created_project")
         assert self.operation == operation
@@ -302,6 +305,7 @@ class FakePersistence:
             operation,
             state=CoreProjectCreateStateV1.BOUND,
             core_project_id=core_project_id,
+            project_immutable_authority=immutable_authority,
         )
         return self.operation
 
@@ -446,7 +450,11 @@ class FakeCore:
         self.project_etag = ETAG_C
         self.active_revision = REVISION
         self.registry_digest = REGISTRY_DIGEST
+        self.project_created_at = NOW
         self.project_updated_at = NOW
+        self.create_created_at: str | None = None
+        self.finalize_created_at: str | None = None
+        self.patch_created_at: str | None = None
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request)
@@ -472,7 +480,11 @@ class FakeCore:
                 raise httpx.ReadError("response lost", request=request)
             return httpx.Response(
                 201,
-                json=_project(self.request, ready=False).model_dump(mode="json"),
+                json=_project(
+                    self.request,
+                    ready=False,
+                    created_at=self.create_created_at or self.project_created_at,
+                ).model_dump(mode="json"),
             )
         if path == f"/v1/projects/{CORE_PROJECT_ID}":
             if request.method == "PATCH":
@@ -537,6 +549,7 @@ class FakeCore:
                     etag=self.project_etag,
                     active_revision=self.active_revision,
                     registry_digest=self.registry_digest,
+                    created_at=self.patch_created_at or self.project_created_at,
                     updated_at=self.project_updated_at,
                 )
                 self.patch_replays[request.headers["Idempotency-Key"]] = patched_project
@@ -564,6 +577,7 @@ class FakeCore:
                     etag=self.project_etag,
                     active_revision=self.active_revision,
                     registry_digest=self.registry_digest,
+                    created_at=self.project_created_at,
                     updated_at=self.project_updated_at,
                 ).model_dump(mode="json"),
             )
@@ -624,6 +638,7 @@ class FakeCore:
                 etag=self.project_etag,
                 active_revision=self.active_revision,
                 registry_digest=self.registry_digest,
+                created_at=self.finalize_created_at or self.project_created_at,
                 updated_at=self.project_updated_at,
             )
             assert published.workspace_publication is not None
@@ -876,7 +891,13 @@ def test_activate_then_create_run_uses_real_strict_clients_and_core_authority() 
     assert capabilities.registry_digest == REGISTRY_DIGEST
     assert validation.valid is True
     assert persistence.events[0] == "reserve_create"
+    assert persistence.operation is not None
     assert persistence.mapping is not None
+    assert (
+        persistence.operation.project_immutable_authority
+        == persistence.mapping.immutable_authority
+        == bridge_module._patch_immutable_authority(activation.core_project)
+    )
     assert persistence.mapping.mutable_authority == bridge_module._patch_mutable_authority(
         activation.core_project
     )
@@ -896,6 +917,34 @@ def test_activate_then_create_run_uses_real_strict_clients_and_core_authority() 
             ),
         )
     ]
+
+
+def test_create_get_rejects_project_created_at_drift_before_mutation() -> None:
+    local_project = _local_project()
+    persistence = FakePersistence()
+    fake_core = FakeCore(local_project)
+    fake_core.create_created_at = NOW
+    fake_core.project_created_at = "2026-07-14T11:59:00Z"
+    bridge, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.activate_project(
+            local_project,
+            idempotency_key="create-get-created-at-reject-0001",
+        )
+
+    assert exc_info.value.error.code == "core_project_initial_publication_mismatch"
+    assert exc_info.value.error.http_status == 409
+    assert persistence.operation is not None
+    assert persistence.operation.project_immutable_authority is not None
+    assert persistence.operation.project_immutable_authority.created_at == NOW
+    assert persistence.mapping is None
+    assert not fake_core.patch_requests
+    assert _workspace_mutation_count(fake_core) == 0
 
 
 def test_existing_mapping_is_reopened_without_project_create() -> None:
@@ -1097,6 +1146,38 @@ def test_mapping_recovery_rejects_same_revision_updated_at_rollback_before_mutat
     assert _workspace_mutation_count(fake_core) == workspace_mutations
 
 
+def test_mapping_recovery_rejects_project_created_at_drift_before_mutation() -> None:
+    local_project = _local_project()
+    first, persistence, fake_core, _ = _bridge(local_project)
+    first.activate_project(local_project, idempotency_key="mapped-created-at-base-0001")
+    first.close()
+    mapping = persistence.mapping
+    assert mapping is not None
+
+    fake_core.project_created_at = "2026-07-14T11:59:00Z"
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    history_count = len(persistence.mapping_history)
+    recovered, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            local_project,
+            idempotency_key="mapped-created-at-recovery-0002",
+        )
+
+    assert exc_info.value.error.code == "core_project_mapping_mismatch"
+    assert exc_info.value.error.http_status == 409
+    assert persistence.mapping == mapping
+    assert len(persistence.mapping_history) == history_count
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+
+
 @pytest.mark.parametrize(
     "reported_revision",
     [
@@ -1228,6 +1309,30 @@ def test_import_activation_reads_only_opaque_archive_and_finalizes_workspace() -
     assert [request.method for request in upload_calls] == ["POST", "PUT", "POST"]
     assert all("adopted-import-1" not in str(request.url) for request in upload_calls)
     assert all("/home/" not in request.content.decode("ascii") for request in upload_calls)
+
+
+def test_workspace_finalize_rejects_project_created_at_drift_before_persistence() -> None:
+    local_project = _local_project(imported=True)
+    persistence = FakePersistence()
+    fake_core = FakeCore(local_project)
+    fake_core.finalize_created_at = "2026-07-14T11:59:00Z"
+    bridge, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.activate_project(
+            local_project,
+            idempotency_key="finalize-created-at-reject-0001",
+        )
+
+    assert exc_info.value.error.code == "workspace_finalize_authority_mismatch"
+    assert exc_info.value.error.http_status == 409
+    assert persistence.operation is not None
+    assert persistence.operation.workspace_upload_finalize is None
+    assert persistence.mapping is None
 
 
 def test_unknown_project_create_outcome_retries_exact_persisted_intent() -> None:
@@ -1738,6 +1843,49 @@ def test_mapping_canonical_request_digest_corruption_fails_before_core_transport
 
     assert exc_info.value.error.code == "core_project_mapping_mismatch"
     assert len(fake_core.calls) == calls_before
+
+
+def test_patch_response_rejects_project_created_at_drift_before_persistence() -> None:
+    original = _local_project()
+    first, persistence, fake_core, _ = _bridge(original)
+    first.activate_project(original, idempotency_key="patch-created-at-base-0001")
+    first.close()
+    mapping = persistence.mapping
+    assert mapping is not None
+
+    modified = original.model_copy(
+        update={
+            "task": local_v1.ProjectTaskV1(
+                title="Reject rewritten creation time",
+                objective="Preserve immutable Core project identity.",
+            ),
+            "updated_at": "2026-07-14T12:01:00Z",
+        }
+    )
+    fake_core.patch_created_at = "2026-07-14T11:59:00Z"
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    history_count = len(persistence.mapping_history)
+    applied_count = persistence.events.count("record_patch_applied")
+    second, _, _, _ = _bridge(
+        modified,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        second.activate_project(
+            modified,
+            idempotency_key="patch-created-at-reject-0002",
+        )
+
+    assert exc_info.value.error.code == "core_project_patch_outcome_mismatch"
+    assert exc_info.value.error.http_status == 409
+    assert persistence.mapping == mapping
+    assert len(persistence.mapping_history) == history_count
+    assert persistence.patch_operation is not None
+    assert persistence.patch_operation.state is CoreProjectPatchStateV1.UNKNOWN
+    assert persistence.events.count("record_patch_applied") == applied_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
 
 
 def test_mapped_project_edits_patch_core_and_commit_versioned_mapping() -> None:
