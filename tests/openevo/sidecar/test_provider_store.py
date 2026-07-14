@@ -1050,6 +1050,75 @@ def test_remote_project_projection_budget_rejects_before_payload_read_or_parse(
     assert not any("then remote_state_json" in statement for statement in statements)
 
 
+def test_remote_project_projection_queries_reject_aggregate_before_payload_fetch_or_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project_document = provider_store_module._canonical_json_bytes(
+        ProjectCreateV1.model_validate(_project(profile.profile_id)).model_dump(mode="json")
+    )
+    timestamp = "2026-07-14T12:00:00.000000Z"
+    project_ids = [f"aggregate-corrupt-project-{index:03d}" for index in range(65)]
+    store._connection.execute("BEGIN IMMEDIATE")
+    try:
+        store._connection.executemany(
+            """
+            INSERT INTO projects(
+                project_id, profile_id, name, document_json, state,
+                current_revision_id, remote_state_json, resource_version,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'draft', NULL, zeroblob(?), 1, ?, ?)
+            """,
+            (
+                (
+                    project_id,
+                    profile.profile_id,
+                    f"Aggregate corrupt project {index:03d}",
+                    project_document,
+                    provider_store_module.MAX_REMOTE_PROJECT_STATE_BYTES,
+                    timestamp,
+                    timestamp,
+                )
+                for index, project_id in enumerate(project_ids)
+            ),
+        )
+        store._connection.commit()
+    except BaseException:
+        store._connection.rollback()
+        raise
+
+    statements: list[str] = []
+    store._connection.set_trace_callback(
+        lambda statement: statements.append(" ".join(statement.lower().split()))
+    )
+    original_decode = provider_store_module._decode_json_object
+
+    def decode_probe(raw: bytes, *, label: str):
+        if label == "remote project state":
+            raise AssertionError("aggregate-oversized remote state reached JSON parsing")
+        return original_decode(raw, label=label)
+
+    monkeypatch.setattr(provider_store_module, "_decode_json_object", decode_probe)
+
+    queries = (
+        lambda: store.get_project(project_ids[0]),
+        lambda: store.list_projects(limit=100),
+    )
+    for query in queries:
+        statements.clear()
+        with pytest.raises(
+            ProviderDataCorruptionError,
+            match="remote project state recovery budget exceeded",
+        ):
+            query()
+        assert any(
+            "sum(length(cast(remote_state_json as blob)))" in statement for statement in statements
+        )
+        assert not any("then remote_state_json" in statement for statement in statements)
+
+
 def test_active_project_intent_patch_invalidates_remote_and_allows_reactivation(
     tmp_path: Path,
 ) -> None:

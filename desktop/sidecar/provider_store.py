@@ -1980,6 +1980,7 @@ class DesktopProviderStore:
             connection = self._connection
             try:
                 connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                self._validate_remote_state_recovery_budget(connection)
                 yield connection
                 if write:
                     self._validate_write_budget(connection)

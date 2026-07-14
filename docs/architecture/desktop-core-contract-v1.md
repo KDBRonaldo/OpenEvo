@@ -171,6 +171,11 @@ a successful commit.
 
 The v3 project row stores `RemoteProjectStateV1` canonical JSON in a nullable
 private BLOB separate from the canonical `ProjectCreateV1` intent document.
+Each value is limited to 256 KiB and the table aggregate is limited to 16 MiB.
+Every ordinary transaction checks both limits after `BEGIN` and before any
+remote-state payload query. Project get/list therefore use the same SQLite
+snapshot for the aggregate check and guarded payload read, and fail before
+payload materialization or list `fetchall()` when the aggregate is over budget.
 Activation accepts only a ready projection whose active revision project matches
 its Core-owned `core_project_id` and whose revision ID matches the local
 `current_revision_id`; Local and Core project IDs remain distinct identities.
