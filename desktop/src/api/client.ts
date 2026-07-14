@@ -1,11 +1,25 @@
 import { invoke } from "@tauri-apps/api/core";
 
-interface TauriSidecarStatus {
-  state: string;
-  port: number | null;
-  pid: number | null;
-  url: string | null;
-  command: string | null;
+type DesktopFeatureFlagV1 =
+  | "remote_profiles"
+  | "project_validation"
+  | "operation_events"
+  | "run_observability"
+  | "artifact_inspection"
+  | "service_control"
+  | "diagnostics"
+  | "maintenance";
+
+interface DesktopBootstrapContextV1 {
+  schema_version: "1";
+  endpoint: string;
+  session_token: string;
+  negotiated_contract: {
+    major: 1;
+    openapi_sha256: string;
+    provider_kind: "desktop_sidecar";
+    feature_flags: DesktopFeatureFlagV1[];
+  };
 }
 
 declare global {
@@ -15,7 +29,7 @@ declare global {
   }
 }
 
-let sidecarStartPromise: Promise<TauriSidecarStatus> | null = null;
+let sidecarStartPromise: Promise<DesktopBootstrapContextV1> | null = null;
 
 async function request<T>(
   method: string,
@@ -32,7 +46,11 @@ async function request<T>(
     headers: requestHeaders,
     body: body ? JSON.stringify(body) : undefined,
   };
-  const response = await fetch(await resolveRequestUrl(path), init);
+  const resolved = await resolveRequest(path);
+  if (resolved.sessionToken) {
+    requestHeaders.set("X-OpenEvo-Desktop-Session", resolved.sessionToken);
+  }
+  const response = await fetch(resolved.url, init);
   if (!response.ok) {
     let detail: any;
     try {
@@ -56,13 +74,17 @@ async function request<T>(
   return (await response.text()) as unknown as T;
 }
 
-async function resolveRequestUrl(path: string): Promise<string> {
+async function resolveRequest(
+  path: string,
+): Promise<{ url: string; sessionToken?: string }> {
   if (!path.startsWith("/openevo-api/") || !isTauriRuntime()) {
-    return path;
+    return { url: path };
   }
-  const status = await ensureTauriSidecar();
-  const baseUrl = sidecarBaseUrl(status);
-  return `${baseUrl}${path}`;
+  const context = await ensureTauriSidecar();
+  return {
+    url: `${new URL(context.endpoint).origin}${path}`,
+    sessionToken: context.session_token,
+  };
 }
 
 function isTauriRuntime(): boolean {
@@ -72,34 +94,15 @@ function isTauriRuntime(): boolean {
   return Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 }
 
-async function ensureTauriSidecar(): Promise<TauriSidecarStatus> {
+async function ensureTauriSidecar(): Promise<DesktopBootstrapContextV1> {
   if (!sidecarStartPromise) {
-    sidecarStartPromise = invoke<TauriSidecarStatus>("start_sidecar")
-      .then((status) => {
-        if (status.state !== "running" && status.state !== "starting") {
-          throw new Error(`OpenEvo sidecar is not running: ${status.state}`);
-        }
-        if (status.port === null && status.url === null) {
-          throw new Error("OpenEvo sidecar did not provide a local API endpoint");
-        }
-        return status;
-      })
+    sidecarStartPromise = invoke<DesktopBootstrapContextV1>("start_sidecar")
       .catch((error) => {
         sidecarStartPromise = null;
         throw error;
       });
   }
   return sidecarStartPromise;
-}
-
-function sidecarBaseUrl(status: TauriSidecarStatus): string {
-  if (status.url) {
-    return new URL(status.url).origin;
-  }
-  if (status.port !== null) {
-    return `http://127.0.0.1:${status.port}`;
-  }
-  throw new Error("OpenEvo sidecar did not provide a local API endpoint");
 }
 
 export function resetOpenEvoSidecarForTests() {

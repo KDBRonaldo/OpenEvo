@@ -123,20 +123,42 @@ message without either host path.
 
 The native host binds the loopback listener before spawn and transfers that
 already-bound socket on inherited FD 3, removing the release-and-rebind port
-window. Native code sends exactly one UTF-8 JSON frame of at most 256 bytes over
+window. Native code sends exactly one UTF-8 JSON frame of at most 512 bytes over
 the child's stdin and then closes the pipe. Its exact keys are `protocol`,
-`instance_id`, and `readiness_key`; protocol is
-`openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and readiness key is
-256 fresh bits. Duplicate, missing, unknown, malformed, or trailing input is
-rejected. Neither value is placed in argv, environment, a file, or native
-status. The readiness key is never returned to the renderer; the non-secret
-instance ID is returned only as part of the challenge-bound health response.
+`instance_id`, `readiness_key`, and `session_token`; protocol is
+`openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and both credentials
+are independently generated 256-bit values. Duplicate, missing, unknown,
+malformed, or trailing input is rejected by the strict sidecar integration.
+None of these values is placed in argv, environment, or a file. The readiness
+key and Desktop session token are never returned by HTTP discovery, native
+status, or logs; only `start_sidecar` returns the session token directly to the
+renderer. The non-secret instance ID is returned only as part of the
+challenge-bound health response.
 
 Readiness sends a fresh 256-bit challenge to `/health`. The closed Rust response
 model requires the exact protocol and instance ID and verifies HMAC-SHA256 over
 `protocol NUL instance_id NUL challenge`. Unknown fields, stale challenge
 proofs, arbitrary HTTP 200 responses, invalid UTF-8, and responses over the
-fixed byte limit cannot satisfy startup readiness.
+fixed byte limit cannot satisfy startup readiness. After identity proof, native
+code reads the sidecar's actual `/version` response into a deny-unknown-fields
+model and requires Local API major 1, release provider `desktop_sidecar`, the
+frozen OpenAPI digest, and a unique subset of the closed feature-flag enum. The
+expected digest has one build-time source of truth,
+`DESKTOP_LOCAL_API_OPENAPI_SHA256`; the current value is an integration
+placeholder and the final Local contract update replaces that single constant.
+Native readiness also requires `GET /openevo-api/desktop/shell` to return 404,
+so the old shell token route cannot remain in a release sidecar inventory.
+Contract, digest, provider, feature, or route mismatch triggers owned child-group
+cleanup and startup fails closed.
+
+`start_sidecar` and lifecycle status are separate renderer contracts.
+`start_sidecar` returns exactly `DesktopBootstrapContextV1` with keys
+`schema_version`, `endpoint`, `session_token`, and `negotiated_contract`.
+`endpoint` is the loopback origin without a path. `negotiated_contract` has
+exactly `major`, `openapi_sha256`, `provider_kind`, and `feature_flags`.
+`host_status` and `stop_sidecar` return only `{state}`; they never expose a PID,
+port, URL, endpoint, command, or credential. Internal lifecycle snapshots retain
+the process data required for ownership but are not serializable renderer DTOs.
 
 Release policy does not read `OPENEVO_DESKTOP_SIDECAR_COMMAND`,
 `OPENEVO_DESKTOP_SIDECAR_PROGRAM`,
@@ -183,8 +205,13 @@ and cleanup observe leader exit with `waitid(..., WNOWAIT)` and do not reap it.
 Immediately before every TERM or KILL, cleanup repeats that non-reaping child
 check; an inspection error authorizes no numeric-PGID signal. While the manager
 is `Anchored`, the retained child identity prevents PID/PGID reuse and authorizes
-TERM/KILL to the group. Linux enumerates `/proc` and macOS uses
-`proc_listpgrppids` to confirm that no live non-leader group member remains.
+TERM/KILL to the group. Linux enumerates `/proc`; a visible PID's denied or
+malformed `stat` data fails closed, while only a real `NotFound` race is skipped.
+macOS treats both return values from `proc_listpgrppids` as PID counts. Only the
+buffer call receives byte capacity. A full buffer causes bounded growth and
+retry; impossible sizes, over-counts, or persistent truncation fail closed.
+Both platforms therefore retain ownership when the leader has exited but a
+descendant remains in the process group.
 Only after the leader has exited and the rest of the group is absent does cleanup
 switch irreversibly to `Finalizing` and call `Child::try_wait`. A final reap
 error retains ownership for retry, but every retry in `Finalizing` is reap-only:
@@ -224,6 +251,17 @@ Sidecar stdout and stderr are connected to the null device. There is no native
 raw-log buffer and no `app_logs` Tauri command, so renderer JavaScript cannot
 receive child output; sidecar status also omits command, path, argv, credential,
 and backend details.
+
+The native half of this bootstrap protocol is implemented here. The Python
+sidecar currently present on this branch still implements the legacy shell
+surface and the three-key native frame. It is intentionally not accepted by the
+new release handshake. The remaining integration point is a strict Local API v1
+sidecar that consumes the four-key frame, uses `session_token` exclusively for
+`X-OpenEvo-Desktop-Session`, reports the final frozen `/version` metadata, and
+omits the legacy shell route. There is no legacy-token or direct-backend
+fallback while that integration is pending; the ignored packaged externalBin
+smoke becomes passing evidence only after the strict sidecar is merged and the
+single digest constant is updated.
 
 This phase does not implement a macOS Keychain secret broker. In particular,
 `password_ref` and `passphrase_ref` cannot yet be resolved for SSH operations,

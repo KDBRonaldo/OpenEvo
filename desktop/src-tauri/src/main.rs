@@ -26,12 +26,17 @@ compile_error!("OpenEvo Desktop native sidecar FD execution supports only Linux 
 
 const BUNDLED_SIDECAR_BINARY: &str = "openevo-desktop-sidecar";
 const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v1";
+const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
+const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
+    "c9f2fa2cdcc2ff5cde40b9bbd007430ac0ccfdf6452844315d8e29d913f0b7a0";
+const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_EXECUTABLE_FD_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_FD";
 const INHERITED_LISTENER_FD: libc::c_int = 3;
 const INHERITED_EXECUTABLE_FD: libc::c_int = 4;
 const INSTANCE_ID_BYTES: usize = 16;
 const READINESS_KEY_BYTES: usize = 32;
-const NATIVE_INSTANCE_FRAME_MAX_BYTES: usize = 256;
+const SESSION_TOKEN_BYTES: usize = 32;
+const NATIVE_INSTANCE_FRAME_MAX_BYTES: usize = 512;
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SIDECAR_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -41,6 +46,10 @@ const SIDECAR_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SIDECAR_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const SIDECAR_EXIT_EMERGENCY_TERM_GRACE: Duration = Duration::from_millis(250);
+#[cfg(any(test, target_os = "macos"))]
+const MACOS_PROCESS_GROUP_LIST_RETRIES: usize = 4;
+#[cfg(any(test, target_os = "macos"))]
+const MACOS_PROCESS_GROUP_MAX_PIDS: usize = 1_048_576;
 const RELEASE_FORBIDDEN_SIDECAR_ENV: [&str; 6] = [
     "OPENEVO_DESKTOP_SIDECAR_COMMAND",
     "OPENEVO_DESKTOP_SIDECAR_PROGRAM",
@@ -366,6 +375,27 @@ struct AllocatedSidecarListener {
 struct NativeInstanceCredential {
     instance_id: [u8; INSTANCE_ID_BYTES],
     readiness_key: [u8; READINESS_KEY_BYTES],
+    session_token: [u8; SESSION_TOKEN_BYTES],
+}
+
+struct EncodedSecret(String);
+
+impl EncodedSecret {
+    fn new(bytes: &[u8]) -> Self {
+        Self(encode_hex(bytes))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for EncodedSecret {
+    fn drop(&mut self) {
+        unsafe {
+            self.0.as_bytes_mut().fill(0);
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -373,21 +403,27 @@ struct NativeInstanceFrame<'a> {
     protocol: &'static str,
     instance_id: &'a str,
     readiness_key: &'a str,
+    session_token: &'a str,
 }
 
 impl NativeInstanceCredential {
     fn generate() -> HostResult<Self> {
         let mut instance_id = [0_u8; INSTANCE_ID_BYTES];
         let mut readiness_key = [0_u8; READINESS_KEY_BYTES];
+        let mut session_token = [0_u8; SESSION_TOKEN_BYTES];
         OsRng
             .try_fill_bytes(&mut instance_id)
             .map_err(|_| instance_credential_error())?;
         OsRng
             .try_fill_bytes(&mut readiness_key)
             .map_err(|_| instance_credential_error())?;
+        OsRng
+            .try_fill_bytes(&mut session_token)
+            .map_err(|_| instance_credential_error())?;
         Ok(Self {
             instance_id,
             readiness_key,
+            session_token,
         })
     }
 
@@ -398,23 +434,30 @@ impl NativeInstanceCredential {
     fn write_to_child(&self, child: &mut Child) -> HostResult<()> {
         let mut stdin = child.stdin.take().ok_or_else(instance_channel_error)?;
         let instance_id = self.instance_id_hex();
-        let readiness_key = encode_hex(&self.readiness_key);
+        let readiness_key = EncodedSecret::new(&self.readiness_key);
+        let session_token = EncodedSecret::new(&self.session_token);
         let frame = NativeInstanceFrame {
             protocol: NATIVE_SIDECAR_PROTOCOL,
             instance_id: &instance_id,
-            readiness_key: &readiness_key,
+            readiness_key: readiness_key.expose(),
+            session_token: session_token.expose(),
         };
         let mut encoded = serde_json::to_vec(&frame).map_err(|_| instance_channel_error())?;
         encoded.push(b'\n');
         if encoded.len() > NATIVE_INSTANCE_FRAME_MAX_BYTES {
+            encoded.fill(0);
             return Err(instance_channel_error());
         }
-        stdin
-            .write_all(&encoded)
-            .map_err(|_| instance_channel_error())?;
-        stdin.flush().map_err(|_| instance_channel_error())?;
+        let write_result = stdin.write_all(&encoded).and_then(|_| stdin.flush());
         encoded.fill(0);
-        Ok(())
+        write_result.map_err(|_| instance_channel_error())
+    }
+
+    fn take_session_credential(&mut self) -> SessionCredential {
+        SessionCredential(std::mem::replace(
+            &mut self.session_token,
+            [0_u8; SESSION_TOKEN_BYTES],
+        ))
     }
 }
 
@@ -422,15 +465,69 @@ impl Drop for NativeInstanceCredential {
     fn drop(&mut self) {
         self.instance_id.fill(0);
         self.readiness_key.fill(0);
+        self.session_token.fill(0);
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-struct SidecarStatus {
+struct SessionCredential([u8; SESSION_TOKEN_BYTES]);
+
+impl SessionCredential {
+    fn expose(&self) -> String {
+        encode_hex(&self.0)
+    }
+}
+
+impl Drop for SessionCredential {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FeatureFlagV1 {
+    RemoteProfiles,
+    ProjectValidation,
+    OperationEvents,
+    RunObservability,
+    ArtifactInspection,
+    ServiceControl,
+    Diagnostics,
+    Maintenance,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NegotiatedContractV1 {
+    major: u8,
+    openapi_sha256: String,
+    provider_kind: String,
+    feature_flags: Vec<FeatureFlagV1>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DesktopBootstrapContextV1 {
+    schema_version: &'static str,
+    endpoint: String,
+    session_token: String,
+    negotiated_contract: NegotiatedContractV1,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HostStatus {
+    state: String,
+}
+
+#[derive(Clone, Debug)]
+struct LifecycleStatus {
     state: String,
     port: Option<u16>,
     pid: Option<u32>,
     url: Option<String>,
+}
+
+struct SidecarBootstrapState {
+    session_credential: SessionCredential,
+    negotiated_contract: NegotiatedContractV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -447,7 +544,8 @@ enum GroupSignalAuthority {
 }
 
 struct ManagedSidecar {
-    status: SidecarStatus,
+    status: LifecycleStatus,
+    bootstrap: Option<SidecarBootstrapState>,
     lifecycle: ManagedLifecycle,
     startup_epoch: u64,
     spawn_pending: bool,
@@ -487,6 +585,23 @@ impl ManagedSidecar {
 
     fn child_mut(&mut self) -> HostResult<&mut Child> {
         self.child.as_mut().ok_or_else(sidecar_state_error)
+    }
+
+    fn host_status(&self) -> HostStatus {
+        HostStatus {
+            state: self.status.state.clone(),
+        }
+    }
+
+    fn bootstrap_context(&self) -> HostResult<DesktopBootstrapContextV1> {
+        let bootstrap = self.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
+        let port = self.status.port.ok_or_else(sidecar_state_error)?;
+        Ok(DesktopBootstrapContextV1 {
+            schema_version: "1",
+            endpoint: format!("http://127.0.0.1:{port}"),
+            session_token: bootstrap.session_credential.expose(),
+            negotiated_contract: bootstrap.negotiated_contract.clone(),
+        })
     }
 }
 
@@ -589,6 +704,21 @@ struct NativeHealthResponse {
     instance_proof: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionInfoV1 {
+    schema_version: String,
+    api_name: String,
+    preferred_major: u8,
+    supported_majors: Vec<u8>,
+    openapi_sha256: String,
+    build_version: String,
+    source_commit: String,
+    build_channel: String,
+    provider_kind: String,
+    feature_flags: Vec<FeatureFlagV1>,
+}
+
 trait ProcessControl {
     fn leader_exited(&self, child: &Child) -> std::io::Result<bool>;
     fn reap_leader(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>>;
@@ -669,10 +799,7 @@ fn leader_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
 #[cfg(target_os = "linux")]
 fn group_has_members_except_leader(process_group: i32, leader: i32) -> std::io::Result<bool> {
     for entry in fs::read_dir("/proc")? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
+        let entry = entry?;
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -683,27 +810,89 @@ fn group_has_members_except_leader(process_group: i32, leader: i32) -> std::io::
         if pid == leader {
             continue;
         }
-        let stat = match fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
-            Err(error) => return Err(error),
-        };
-        let Some(after_name) = stat.rsplit_once(')').map(|(_, suffix)| suffix) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid proc stat",
-            ));
-        };
-        let mut fields = after_name.split_whitespace();
-        let state = fields.next();
-        let _parent = fields.next();
-        let group = fields.next().and_then(|value| value.parse::<i32>().ok());
-        if group == Some(process_group) && state != Some("Z") {
+        if let Some(true) =
+            inspect_linux_proc_stat(fs::read_to_string(entry.path().join("stat")), process_group)?
+        {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn inspect_linux_proc_stat(
+    stat: std::io::Result<String>,
+    process_group: i32,
+) -> std::io::Result<Option<bool>> {
+    match stat {
+        Ok(stat) => linux_proc_stat_is_live_group_member(&stat, process_group).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_proc_stat_is_live_group_member(stat: &str, process_group: i32) -> std::io::Result<bool> {
+    let after_name = stat
+        .rsplit_once(')')
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc stat"))?;
+    let mut fields = after_name.split_whitespace();
+    let state = fields.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing proc state")
+    })?;
+    if state.len() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid proc state",
+        ));
+    }
+    fields.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing proc parent")
+    })?;
+    let group = fields
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing proc group"))?
+        .parse::<i32>()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc group"))?;
+    Ok(group == process_group && state != "Z")
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_group_has_members_except_leader_with<C, F>(
+    leader: i32,
+    mut count_pids: C,
+    mut fill_pids: F,
+) -> std::io::Result<bool>
+where
+    C: FnMut() -> std::io::Result<usize>,
+    F: FnMut(&mut [libc::pid_t]) -> std::io::Result<usize>,
+{
+    let required = count_pids()?;
+    let mut capacity = required
+        .checked_add(16)
+        .filter(|value| *value <= MACOS_PROCESS_GROUP_MAX_PIDS)
+        .ok_or_else(|| std::io::Error::other("process group listing is too large"))?;
+    for _ in 0..MACOS_PROCESS_GROUP_LIST_RETRIES {
+        let mut pids = vec![0 as libc::pid_t; capacity];
+        let used = fill_pids(&mut pids)?;
+        if used > capacity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process group listing exceeded its buffer",
+            ));
+        }
+        if used < capacity {
+            return Ok(pids[..used].iter().any(|pid| *pid > 0 && *pid != leader));
+        }
+        capacity = capacity
+            .checked_mul(2)
+            .filter(|value| *value <= MACOS_PROCESS_GROUP_MAX_PIDS)
+            .ok_or_else(|| std::io::Error::other("process group listing is too large"))?;
+    }
+    Err(std::io::Error::other(
+        "process group listing remained truncated",
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -711,37 +900,28 @@ fn group_has_members_except_leader(process_group: i32, leader: i32) -> std::io::
     use std::ffi::c_void;
     use std::ptr;
 
-    let required = unsafe { libc::proc_listpgrppids(process_group, ptr::null_mut(), 0) };
-    if required < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if required == 0 {
-        return Ok(false);
-    }
-    let extra_entries = 16_usize;
-    let entry_size = std::mem::size_of::<libc::pid_t>();
-    let capacity = usize::try_from(required)
-        .unwrap_or(0)
-        .div_ceil(entry_size)
-        .saturating_add(extra_entries);
-    let mut pids = vec![0 as libc::pid_t; capacity];
-    let buffer_bytes = pids
-        .len()
-        .checked_mul(entry_size)
-        .and_then(|size| libc::c_int::try_from(size).ok())
-        .ok_or_else(|| std::io::Error::other("process group listing is too large"))?;
-    let used = unsafe {
-        libc::proc_listpgrppids(
-            process_group,
-            pids.as_mut_ptr().cast::<c_void>(),
-            buffer_bytes,
-        )
-    };
-    if used < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let count = usize::try_from(used).unwrap_or(0) / entry_size;
-    Ok(pids[..count].iter().any(|pid| *pid > 0 && *pid != leader))
+    macos_group_has_members_except_leader_with(
+        leader,
+        || {
+            let count = unsafe { libc::proc_listpgrppids(process_group, ptr::null_mut(), 0) };
+            usize::try_from(count).map_err(|_| std::io::Error::last_os_error())
+        },
+        |pids| {
+            let byte_capacity = pids
+                .len()
+                .checked_mul(std::mem::size_of::<libc::pid_t>())
+                .and_then(|size| libc::c_int::try_from(size).ok())
+                .ok_or_else(|| std::io::Error::other("process group listing is too large"))?;
+            let count = unsafe {
+                libc::proc_listpgrppids(
+                    process_group,
+                    pids.as_mut_ptr().cast::<c_void>(),
+                    byte_capacity,
+                )
+            };
+            usize::try_from(count).map_err(|_| std::io::Error::last_os_error())
+        },
+    )
 }
 
 fn allocate_sidecar_listener() -> HostResult<AllocatedSidecarListener> {
@@ -763,12 +943,9 @@ fn allocate_sidecar_listener() -> HostResult<AllocatedSidecarListener> {
     Ok(AllocatedSidecarListener { listener, port })
 }
 
-fn stopped_sidecar_status() -> SidecarStatus {
-    SidecarStatus {
+fn stopped_host_status() -> HostStatus {
+    HostStatus {
         state: "stopped".to_string(),
-        port: None,
-        pid: None,
-        url: None,
     }
 }
 
@@ -1661,6 +1838,65 @@ fn pre_exec_error() -> std::io::Error {
     std::io::Error::from_raw_os_error(libc::EIO)
 }
 
+struct LoopbackHttpResponse {
+    status: u16,
+    body: String,
+}
+
+fn loopback_http_get(
+    port: u16,
+    path: &str,
+    header: Option<(&str, &str)>,
+) -> HostResult<LoopbackHttpResponse> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, SIDECAR_HEALTH_CONNECT_TIMEOUT)
+        .map_err(|_| sidecar_health_error())?;
+    stream
+        .set_read_timeout(Some(SIDECAR_HEALTH_CONNECT_TIMEOUT))
+        .map_err(|_| sidecar_health_error())?;
+    stream
+        .set_write_timeout(Some(SIDECAR_HEALTH_CONNECT_TIMEOUT))
+        .map_err(|_| sidecar_health_error())?;
+    let extra_header = header
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_header}Connection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| sidecar_health_error())?;
+    let mut response = Vec::new();
+    stream
+        .take((SIDECAR_HEALTH_RESPONSE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut response)
+        .map_err(|_| sidecar_health_error())?;
+    if response.len() > SIDECAR_HEALTH_RESPONSE_MAX_BYTES {
+        return Err(sidecar_health_error());
+    }
+    let response = String::from_utf8(response).map_err(|_| sidecar_health_error())?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(sidecar_health_error)?;
+    let mut status_fields = headers
+        .lines()
+        .next()
+        .ok_or_else(sidecar_health_error)?
+        .split_whitespace();
+    let protocol = status_fields.next().ok_or_else(sidecar_health_error)?;
+    let status = status_fields
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(sidecar_health_error)?;
+    if protocol != "HTTP/1.1" && protocol != "HTTP/1.0" {
+        return Err(sidecar_health_error());
+    }
+    Ok(LoopbackHttpResponse {
+        status,
+        body: body.to_string(),
+    })
+}
+
 fn check_sidecar_health(port: u16, credential: &NativeInstanceCredential) -> HostResult<()> {
     let mut challenge = [0_u8; READINESS_KEY_BYTES];
     OsRng
@@ -1677,39 +1913,16 @@ fn check_sidecar_health_with_challenge(
     if challenge.len() != 64 || !challenge.bytes().all(is_lower_hex) {
         return Err(sidecar_health_error());
     }
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, SIDECAR_HEALTH_CONNECT_TIMEOUT)
-        .map_err(|_| sidecar_health_error())?;
-    stream
-        .set_read_timeout(Some(SIDECAR_HEALTH_CONNECT_TIMEOUT))
-        .map_err(|_| sidecar_health_error())?;
-    stream
-        .set_write_timeout(Some(SIDECAR_HEALTH_CONNECT_TIMEOUT))
-        .map_err(|_| sidecar_health_error())?;
-    let request = format!(
-        "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-OpenEvo-Native-Challenge: {challenge}\r\nConnection: close\r\n\r\n"
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|_| sidecar_health_error())?;
-    let mut response = Vec::new();
-    stream
-        .take((SIDECAR_HEALTH_RESPONSE_MAX_BYTES + 1) as u64)
-        .read_to_end(&mut response)
-        .map_err(|_| sidecar_health_error())?;
-    if response.len() > SIDECAR_HEALTH_RESPONSE_MAX_BYTES {
-        return Err(sidecar_health_error());
-    }
-    let response = std::str::from_utf8(&response).map_err(|_| sidecar_health_error())?;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(sidecar_health_error)?;
-    let status_line = headers.lines().next().ok_or_else(sidecar_health_error)?;
-    if status_line != "HTTP/1.1 200 OK" && status_line != "HTTP/1.0 200 OK" {
+    let response = loopback_http_get(
+        port,
+        "/health",
+        Some(("X-OpenEvo-Native-Challenge", challenge)),
+    )?;
+    if response.status != 200 {
         return Err(sidecar_health_error());
     }
     let health: NativeHealthResponse =
-        serde_json::from_str(body).map_err(|_| sidecar_health_error())?;
+        serde_json::from_str(&response.body).map_err(|_| sidecar_health_error())?;
     let instance_id = credential.instance_id_hex();
     if health.service != "openevo-sidecar"
         || health.status != "ok"
@@ -1725,6 +1938,49 @@ fn check_sidecar_health_with_challenge(
     mac.verify_slice(&proof).map_err(|_| sidecar_health_error())
 }
 
+fn check_sidecar_contract(port: u16) -> HostResult<NegotiatedContractV1> {
+    let response = loopback_http_get(port, "/version", None)
+        .map_err(|_| sidecar_contract_incompatible_error())?;
+    if response.status != 200 {
+        return Err(sidecar_contract_incompatible_error());
+    }
+    let version: VersionInfoV1 =
+        serde_json::from_str(&response.body).map_err(|_| sidecar_contract_incompatible_error())?;
+    let duplicate_features = version
+        .feature_flags
+        .iter()
+        .enumerate()
+        .any(|(index, flag)| version.feature_flags[..index].contains(flag));
+    if version.schema_version != "1"
+        || version.api_name != DESKTOP_LOCAL_API_NAME
+        || version.preferred_major != 1
+        || version.supported_majors.is_empty()
+        || version.supported_majors.iter().any(|major| *major != 1)
+        || version.openapi_sha256 != DESKTOP_LOCAL_API_OPENAPI_SHA256
+        || version.build_version.is_empty()
+        || version.build_version.len() > 512
+        || version.build_version.contains('\0')
+        || !(7..=40).contains(&version.source_commit.len())
+        || !version.source_commit.bytes().all(is_lower_hex)
+        || version.build_channel != "release"
+        || version.provider_kind != "desktop_sidecar"
+        || duplicate_features
+    {
+        return Err(sidecar_contract_incompatible_error());
+    }
+    let legacy = loopback_http_get(port, LEGACY_DESKTOP_SHELL_ROUTE, None)
+        .map_err(|_| sidecar_contract_incompatible_error())?;
+    if legacy.status != 404 {
+        return Err(sidecar_contract_incompatible_error());
+    }
+    Ok(NegotiatedContractV1 {
+        major: 1,
+        openapi_sha256: DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),
+        provider_kind: "desktop_sidecar".to_string(),
+        feature_flags: version.feature_flags,
+    })
+}
+
 fn readiness_hmac_domain(instance_id: &str, challenge: &str) -> String {
     format!("{NATIVE_SIDECAR_PROTOCOL}\0{instance_id}\0{challenge}")
 }
@@ -1736,7 +1992,7 @@ fn wait_for_sidecar_ready(
     credential: &NativeInstanceCredential,
     timeout: Duration,
     is_cancelled: impl Fn() -> bool,
-) -> HostResult<()> {
+) -> HostResult<NegotiatedContractV1> {
     wait_for_sidecar_ready_with_inspection(port, credential, timeout, is_cancelled, || {
         OsProcessControl
             .leader_exited(child)
@@ -1751,7 +2007,7 @@ fn wait_for_state_owned_sidecar_ready<C: ProcessControl>(
     credential: &NativeInstanceCredential,
     timeout: Duration,
     startup_epoch: u64,
-) -> HostResult<()> {
+) -> HostResult<NegotiatedContractV1> {
     wait_for_sidecar_ready_with_inspection(
         port,
         credential,
@@ -1778,7 +2034,7 @@ fn wait_for_sidecar_ready_with_inspection(
     timeout: Duration,
     is_cancelled: impl Fn() -> bool,
     mut child_exited: impl FnMut() -> HostResult<bool>,
-) -> HostResult<()> {
+) -> HostResult<NegotiatedContractV1> {
     let deadline = Instant::now() + timeout;
     loop {
         if is_cancelled() {
@@ -1791,7 +2047,7 @@ fn wait_for_sidecar_ready_with_inspection(
             ));
         }
         if check_sidecar_health(port, credential).is_ok() {
-            return Ok(());
+            return check_sidecar_contract(port);
         }
         if Instant::now() >= deadline {
             return Err(NativeHostError::new(
@@ -1807,6 +2063,13 @@ fn sidecar_health_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_health_unavailable",
         "The OpenEvo Desktop sidecar did not prove its native instance identity.",
+    )
+}
+
+fn sidecar_contract_incompatible_error() -> NativeHostError {
+    NativeHostError::new(
+        "sidecar_contract_incompatible",
+        "The OpenEvo Desktop sidecar does not match the frozen Local API contract.",
     )
 }
 
@@ -2463,16 +2726,24 @@ fn spawn_sidecar_gated(
 fn publish_sidecar_gated(
     state: &DesktopHostState,
     startup_epoch: u64,
-) -> HostResult<SidecarStatus> {
-    publish_sidecar_gated_with(state, startup_epoch, SIDECAR_STATE_LOCK_TIMEOUT, || {})
+    bootstrap: SidecarBootstrapState,
+) -> HostResult<DesktopBootstrapContextV1> {
+    publish_sidecar_gated_with(
+        state,
+        startup_epoch,
+        bootstrap,
+        SIDECAR_STATE_LOCK_TIMEOUT,
+        || {},
+    )
 }
 
 fn publish_sidecar_gated_with(
     state: &DesktopHostState,
     startup_epoch: u64,
+    bootstrap: SidecarBootstrapState,
     state_lock_timeout: Duration,
     before_state_lock: impl FnOnce(),
-) -> HostResult<SidecarStatus> {
+) -> HostResult<DesktopBootstrapContextV1> {
     if startup_cancelled(state, startup_epoch) {
         return Err(sidecar_start_cancelled_error());
     }
@@ -2501,7 +2772,8 @@ fn publish_sidecar_gated_with(
     managed.status.state = "running".to_string();
     let port = managed.status.port.ok_or_else(sidecar_state_error)?;
     managed.status.url = Some(format!("http://127.0.0.1:{port}/openevo"));
-    Ok(managed.status.clone())
+    managed.bootstrap = Some(bootstrap);
+    managed.bootstrap_context()
 }
 
 fn reserve_starting_sidecar(state: &DesktopHostState, managed: ManagedSidecar) -> HostResult<()> {
@@ -2634,37 +2906,37 @@ fn wait_for_startup_to_finish<C: ProcessControl>(
     Ok(())
 }
 
-fn host_status_inner(state: &DesktopHostState) -> HostResult<SidecarStatus> {
+fn host_status_inner(state: &DesktopHostState) -> HostResult<HostStatus> {
     host_status_inner_with(state, &OsProcessControl)
 }
 
 fn host_status_inner_with<C: ProcessControl>(
     state: &DesktopHostState,
     control: &C,
-) -> HostResult<SidecarStatus> {
+) -> HostResult<HostStatus> {
     let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
     let Some(managed) = sidecar.as_mut() else {
-        return Ok(stopped_sidecar_status());
+        return Ok(stopped_host_status());
     };
     if managed.lifecycle == ManagedLifecycle::CleanupPending {
-        return Ok(managed.status.clone());
+        return Ok(managed.host_status());
     }
     if managed.child.is_none() {
-        return Ok(managed.status.clone());
+        return Ok(managed.host_status());
     }
     match control.leader_exited(managed.child_mut()?) {
         Ok(true) => {
             managed.status.state = "exited".to_string();
             managed.status.url = None;
             if cleanup_managed_sidecar_with(control, managed).is_ok() {
-                let status = managed.status.clone();
+                let status = managed.host_status();
                 remove_cleaned_sidecar(state, &mut sidecar)?;
                 Ok(status)
             } else {
-                Ok(managed.status.clone())
+                Ok(managed.host_status())
             }
         }
-        Ok(false) => Ok(managed.status.clone()),
+        Ok(false) => Ok(managed.host_status()),
         Err(_) => {
             managed.mark_cleanup_pending();
             Err(sidecar_inspection_error())
@@ -2676,7 +2948,7 @@ fn start_sidecar_inner(
     state: &DesktopHostState,
     policy: LaunchPolicy,
     bundled_path: Option<&Path>,
-) -> HostResult<SidecarStatus> {
+) -> HostResult<DesktopBootstrapContextV1> {
     start_sidecar_inner_with(state, policy, bundled_path, &OsProcessControl)
 }
 
@@ -2685,7 +2957,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     policy: LaunchPolicy,
     bundled_path: Option<&Path>,
     control: &C,
-) -> HostResult<SidecarStatus> {
+) -> HostResult<DesktopBootstrapContextV1> {
     if state.shutdown_requested.load(Ordering::Acquire) {
         return Err(NativeHostError::new(
             "sidecar_host_shutting_down",
@@ -2702,7 +2974,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
             return Err(sidecar_start_in_progress_error());
         }
         match control.leader_exited(managed.child_mut()?) {
-            Ok(false) => return Ok(managed.status.clone()),
+            Ok(false) => return managed.bootstrap_context(),
             Ok(true) => {
                 if cleanup_managed_sidecar_with(control, managed).is_err() {
                     return Err(sidecar_stop_error());
@@ -2723,10 +2995,10 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     if let Some(executable) = launch.verified_executable.as_ref() {
         executable.validate()?;
     }
-    let credential = NativeInstanceCredential::generate()?;
+    let mut credential = NativeInstanceCredential::generate()?;
     let mut prepared = command_from_launch_spec(&launch, &allocated.listener)?;
     let parent_liveness_writer = prepared.take_parent_liveness_writer()?;
-    let status = SidecarStatus {
+    let status = LifecycleStatus {
         state: "starting".to_string(),
         port: Some(port),
         pid: None,
@@ -2734,6 +3006,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     };
     let managed = ManagedSidecar {
         status,
+        bootstrap: None,
         lifecycle: ManagedLifecycle::Starting,
         startup_epoch,
         spawn_pending: true,
@@ -2758,7 +3031,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     if let Err(error) = write_state_owned_credential(state, &credential) {
         return Err(fail_state_owned_startup(state, control, error));
     }
-    if let Err(error) = wait_for_state_owned_sidecar_ready(
+    let negotiated_contract = match wait_for_state_owned_sidecar_ready(
         state,
         control,
         port,
@@ -2766,15 +3039,20 @@ fn start_sidecar_inner_with<C: ProcessControl>(
         SIDECAR_STARTUP_TIMEOUT,
         startup_epoch,
     ) {
-        return Err(fail_state_owned_startup(state, control, error));
-    }
-    match publish_sidecar_gated(state, startup_epoch) {
-        Ok(status) => Ok(status),
+        Ok(contract) => contract,
+        Err(error) => return Err(fail_state_owned_startup(state, control, error)),
+    };
+    let bootstrap = SidecarBootstrapState {
+        session_credential: credential.take_session_credential(),
+        negotiated_contract,
+    };
+    match publish_sidecar_gated(state, startup_epoch, bootstrap) {
+        Ok(context) => Ok(context),
         Err(error) => Err(fail_state_owned_startup(state, control, error)),
     }
 }
 
-fn stop_sidecar_inner(state: &DesktopHostState) -> HostResult<SidecarStatus> {
+fn stop_sidecar_inner(state: &DesktopHostState) -> HostResult<HostStatus> {
     stop_sidecar_inner_with(state, &OsProcessControl, SIDECAR_STATE_LOCK_TIMEOUT)
 }
 
@@ -2782,7 +3060,7 @@ fn stop_sidecar_inner_with<C: ProcessControl>(
     state: &DesktopHostState,
     control: &C,
     lock_timeout: Duration,
-) -> HostResult<SidecarStatus> {
+) -> HostResult<HostStatus> {
     advance_cancellation(state);
     abort_parent_liveness(state, lock_timeout)?;
     wait_for_startup_to_finish(state, control, lock_timeout)?;
@@ -2796,15 +3074,15 @@ fn stop_sidecar_inner_with<C: ProcessControl>(
     let mut sidecar = lock_sidecar_bounded(state, lock_timeout)?;
     let Some(managed) = sidecar.as_mut() else {
         reset_launch_state_to_idle(state);
-        return Ok(stopped_sidecar_status());
+        return Ok(stopped_host_status());
     };
     cleanup_managed_sidecar_with(control, managed)?;
     remove_cleaned_sidecar(state, &mut sidecar)?;
-    Ok(stopped_sidecar_status())
+    Ok(stopped_host_status())
 }
 
 #[tauri::command]
-fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<SidecarStatus> {
+fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStatus> {
     host_status_inner(&state)
 }
 
@@ -2812,13 +3090,13 @@ fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<SidecarS
 fn start_sidecar(
     _app: tauri::AppHandle,
     state: tauri::State<'_, DesktopHostState>,
-) -> HostResult<SidecarStatus> {
+) -> HostResult<DesktopBootstrapContextV1> {
     let bundled_path = bundled_sidecar_path();
     start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref())
 }
 
 #[tauri::command]
-fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> HostResult<SidecarStatus> {
+fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStatus> {
     stop_sidecar_inner(&state)
 }
 
@@ -2894,7 +3172,9 @@ mod tests {
 
     #[test]
     fn sidecar_status_has_no_command_path_credential_or_log_surface() {
-        let status = serde_json::to_value(stopped_sidecar_status()).unwrap();
+        let status = serde_json::to_value(stopped_host_status()).unwrap();
+
+        assert_eq!(status, serde_json::json!({"state": "stopped"}));
 
         for forbidden in [
             "command",
@@ -2908,6 +3188,147 @@ mod tests {
         ] {
             assert!(status.get(forbidden).is_none());
         }
+    }
+
+    #[test]
+    fn bootstrap_and_host_status_use_exact_disjoint_renderer_dtos() {
+        let context = DesktopBootstrapContextV1 {
+            schema_version: "1",
+            endpoint: "http://127.0.0.1:49152".to_string(),
+            session_token: "7c".repeat(SESSION_TOKEN_BYTES),
+            negotiated_contract: test_bootstrap_state().negotiated_contract,
+        };
+        let context = serde_json::to_value(context).unwrap();
+        let status = serde_json::to_value(HostStatus {
+            state: "running".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            context
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "endpoint",
+                "negotiated_contract",
+                "schema_version",
+                "session_token",
+            ]
+        );
+        assert_eq!(
+            context["negotiated_contract"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["feature_flags", "major", "openapi_sha256", "provider_kind"]
+        );
+        assert_eq!(status, serde_json::json!({"state": "running"}));
+        for forbidden in ["endpoint", "session_token", "pid", "port", "url", "command"] {
+            assert!(status.get(forbidden).is_none());
+        }
+    }
+
+    #[test]
+    fn native_child_frame_has_exact_private_credential_keys() {
+        let credential = test_credential();
+        let instance_id = credential.instance_id_hex();
+        let readiness_key = encode_hex(&credential.readiness_key);
+        let session_token = encode_hex(&credential.session_token);
+        let frame = serde_json::to_value(NativeInstanceFrame {
+            protocol: NATIVE_SIDECAR_PROTOCOL,
+            instance_id: &instance_id,
+            readiness_key: &readiness_key,
+            session_token: &session_token,
+        })
+        .unwrap();
+
+        assert_eq!(
+            frame
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["instance_id", "protocol", "readiness_key", "session_token"]
+        );
+        assert_eq!(session_token.len(), SESSION_TOKEN_BYTES * 2);
+    }
+
+    #[test]
+    fn macos_pid_count_abstraction_retries_full_buffers_and_finds_a_descendant() {
+        let leader = 4100;
+        let descendant = 4101;
+        let calls = AtomicU64::new(0);
+
+        let found = macos_group_has_members_except_leader_with(
+            leader,
+            || Ok(1),
+            |buffer| {
+                let call = calls.fetch_add(1, Ordering::AcqRel);
+                if call == 0 {
+                    buffer.fill(leader);
+                    Ok(buffer.len())
+                } else {
+                    buffer[0] = descendant;
+                    Ok(1)
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(found);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn macos_pid_count_abstraction_observes_growth_after_an_empty_count() {
+        let found = macos_group_has_members_except_leader_with(
+            4100,
+            || Ok(0),
+            |buffer| {
+                buffer[0] = 4101;
+                Ok(1)
+            },
+        )
+        .unwrap();
+
+        assert!(found);
+    }
+
+    #[test]
+    fn macos_pid_count_abstraction_fails_closed_on_persistent_truncation() {
+        let error =
+            macos_group_has_members_except_leader_with(4100, || Ok(1), |buffer| Ok(buffer.len()))
+                .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn linux_proc_inspection_fails_closed_on_permission_and_parse_errors() {
+        let permission = inspect_linux_proc_stat(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            4100,
+        )
+        .unwrap_err();
+        let malformed =
+            inspect_linux_proc_stat(Ok("4101 malformed".to_string()), 4100).unwrap_err();
+
+        assert_eq!(permission.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(malformed.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            inspect_linux_proc_stat(
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                4100,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -3471,6 +3892,119 @@ mod tests {
     }
 
     #[test]
+    fn contract_handshake_returns_only_the_frozen_release_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            serve_contract_response(&listener, valid_version_response(), 404, requests_tx)
+        });
+
+        let contract = check_sidecar_contract(port).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(contract.major, 1);
+        assert_eq!(contract.openapi_sha256, DESKTOP_LOCAL_API_OPENAPI_SHA256);
+        assert_eq!(contract.provider_kind, "desktop_sidecar");
+        assert_eq!(
+            contract.feature_flags,
+            [
+                FeatureFlagV1::RemoteProfiles,
+                FeatureFlagV1::ProjectValidation,
+            ]
+        );
+        let requests = requests_rx.into_iter().collect::<Vec<_>>().join("\n");
+        assert!(requests.contains("GET /version HTTP/1.1"));
+        assert!(requests.contains(&format!("GET {LEGACY_DESKTOP_SHELL_ROUTE} HTTP/1.1")));
+        assert!(!requests.contains(&"7c".repeat(SESSION_TOKEN_BYTES)));
+    }
+
+    #[test]
+    fn contract_handshake_rejects_digest_provider_and_legacy_route_inventory_mismatches() {
+        for version in [
+            valid_version_response_with("openapi_sha256", serde_json::json!("0".repeat(64))),
+            valid_version_response_with("provider_kind", serde_json::json!("contract_simulator")),
+            valid_version_response_with("unexpected", serde_json::json!(true)),
+            valid_version_response_with(
+                "feature_flags",
+                serde_json::json!(["remote_profiles", "remote_profiles"]),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_http_request(&mut stream);
+                write_json_response(&mut stream, 200, version);
+            });
+
+            let error = check_sidecar_contract(port).unwrap_err();
+            server.join().unwrap();
+
+            assert_eq!(error.code, "sidecar_contract_incompatible");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (requests_tx, _) = mpsc::channel();
+        let server = thread::spawn(move || {
+            serve_contract_response(&listener, valid_version_response(), 200, requests_tx)
+        });
+
+        let error = check_sidecar_contract(port).unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "sidecar_contract_incompatible");
+    }
+
+    #[test]
+    fn contract_mismatch_cleanup_kills_the_owned_child_group() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let credential = test_credential();
+        let instance_id = credential.instance_id;
+        let readiness_key = credential.readiness_key;
+        let server = thread::spawn(move || {
+            serve_health_on_listener(&listener, instance_id, readiness_key, None, false);
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                200,
+                valid_version_response_with("openapi_sha256", serde_json::json!("0".repeat(64))),
+            );
+        });
+        let state = DesktopHostState::default();
+        let (mut managed, _, _) = managed_test_sidecar();
+        let process_group = managed.process_group;
+        managed.lifecycle = ManagedLifecycle::Starting;
+        managed.status.state = "starting".to_string();
+        managed.status.port = Some(port);
+        managed.bootstrap = None;
+        *state.sidecar.lock().unwrap() = Some(managed);
+        state.launch_state.store(
+            encode_launch_state(0, LaunchPhase::Spawning),
+            Ordering::Release,
+        );
+
+        let error = wait_for_state_owned_sidecar_ready(
+            &state,
+            &OsProcessControl,
+            port,
+            &credential,
+            Duration::from_secs(1),
+            0,
+        )
+        .unwrap_err();
+        let returned = fail_state_owned_startup(&state, &OsProcessControl, error);
+        server.join().unwrap();
+
+        assert_eq!(returned.code, "sidecar_contract_incompatible");
+        assert!(state.sidecar.lock().unwrap().is_none());
+        assert!(!process_group_exists(process_group).unwrap());
+    }
+
+    #[test]
     fn explicit_stop_escalation_kills_the_entire_sidecar_process_group() {
         let fixture = SidecarFixture::directory();
         let descendant_pid_path = fixture.path().join("descendant.pid");
@@ -3497,6 +4031,50 @@ mod tests {
 
         assert!(!process_group_exists(process_group).unwrap());
         assert!(wait_for_pid_exit(descendant_pid, Duration::from_secs(1)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_listing_keeps_ownership_after_the_leader_exits() {
+        let fixture = SidecarFixture::directory();
+        let descendant_pid_path = fixture.path().join("linux-descendant.pid");
+        let mut leader = spawn_exiting_leader_with_descendant(&descendant_pid_path);
+        let process_group = leader.id() as i32;
+        wait_for_file(&descendant_pid_path);
+        wait_for_leader_exit(&leader);
+
+        assert!(group_has_members_except_leader(process_group, process_group).unwrap());
+
+        terminate_process_group(
+            &mut leader,
+            process_group,
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(!process_group_exists(process_group).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_proc_listing_keeps_ownership_after_the_leader_exits() {
+        let fixture = SidecarFixture::directory();
+        let descendant_pid_path = fixture.path().join("macos-descendant.pid");
+        let mut leader = spawn_exiting_leader_with_descendant(&descendant_pid_path);
+        let process_group = leader.id() as i32;
+        wait_for_file(&descendant_pid_path);
+        wait_for_leader_exit(&leader);
+
+        assert!(group_has_members_except_leader(process_group, process_group).unwrap());
+
+        terminate_process_group(
+            &mut leader,
+            process_group,
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(!process_group_exists(process_group).unwrap());
     }
 
     #[test]
@@ -3625,12 +4203,13 @@ mod tests {
         reserve_starting_sidecar(
             &state,
             ManagedSidecar {
-                status: SidecarStatus {
+                status: LifecycleStatus {
                     state: "starting".to_string(),
                     port: Some(allocated.port),
                     pid: None,
                     url: None,
                 },
+                bootstrap: None,
                 lifecycle: ManagedLifecycle::Starting,
                 startup_epoch,
                 spawn_pending: true,
@@ -3829,12 +4408,13 @@ mod tests {
         reserve_starting_sidecar(
             &state,
             ManagedSidecar {
-                status: SidecarStatus {
+                status: LifecycleStatus {
                     state: "starting".to_string(),
                     port: Some(port),
                     pid: None,
                     url: None,
                 },
+                bootstrap: None,
                 lifecycle: ManagedLifecycle::Starting,
                 startup_epoch,
                 spawn_pending: true,
@@ -3877,12 +4457,13 @@ mod tests {
         reserve_starting_sidecar(
             &state,
             ManagedSidecar {
-                status: SidecarStatus {
+                status: LifecycleStatus {
                     state: "starting".to_string(),
                     port: Some(allocated.port),
                     pid: None,
                     url: None,
                 },
+                bootstrap: None,
                 lifecycle: ManagedLifecycle::Starting,
                 startup_epoch,
                 spawn_pending: true,
@@ -3985,6 +4566,7 @@ mod tests {
             publish_sidecar_gated_with(
                 &publish_state,
                 startup_epoch,
+                test_bootstrap_state(),
                 Duration::from_secs(1),
                 || {
                     reached.wait();
@@ -3995,7 +4577,7 @@ mod tests {
         drop(guard);
 
         let status = publication.join().unwrap().unwrap();
-        assert_eq!(status.state, "running");
+        assert_eq!(status.schema_version, "1");
         assert_eq!(
             lock_sidecar_bounded(&state, Duration::ZERO)
                 .unwrap()
@@ -4052,7 +4634,7 @@ mod tests {
         managed.status.state = "starting".to_string();
         managed.status.url = None;
         *state.sidecar.lock().unwrap() = Some(managed);
-        let error = publish_sidecar_gated(&state, startup_epoch)
+        let error = publish_sidecar_gated(&state, startup_epoch, test_bootstrap_state())
             .expect_err("cancelled startup must not publish");
         assert_eq!(error.code, "sidecar_start_cancelled");
         drop(startup_claim);
@@ -4069,12 +4651,13 @@ mod tests {
         reserve_starting_sidecar(
             &state,
             ManagedSidecar {
-                status: SidecarStatus {
+                status: LifecycleStatus {
                     state: "starting".to_string(),
                     port: Some(allocated.port),
                     pid: None,
                     url: None,
                 },
+                bootstrap: None,
                 lifecycle: ManagedLifecycle::Starting,
                 startup_epoch,
                 spawn_pending: true,
@@ -4168,12 +4751,13 @@ mod tests {
             reserve_starting_sidecar(
                 &startup_state,
                 ManagedSidecar {
-                    status: SidecarStatus {
+                    status: LifecycleStatus {
                         state: "starting".to_string(),
                         port: Some(allocated.port),
                         pid: None,
                         url: None,
                     },
+                    bootstrap: None,
                     lifecycle: ManagedLifecycle::Starting,
                     startup_epoch,
                     spawn_pending: true,
@@ -4266,12 +4850,13 @@ mod tests {
         let process_group = child.id() as i32;
         install_parent_liveness(&state, parent_liveness).unwrap();
         let managed = ManagedSidecar {
-            status: SidecarStatus {
+            status: LifecycleStatus {
                 state: "running".to_string(),
                 port: Some(allocated.port),
                 pid: Some(child.id()),
                 url: None,
             },
+            bootstrap: None,
             lifecycle: ManagedLifecycle::Running,
             startup_epoch: 0,
             spawn_pending: false,
@@ -4357,7 +4942,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a freshly generated PyInstaller externalBin"]
+    #[ignore = "requires a freshly generated strict Local API PyInstaller externalBin"]
     fn packaged_external_bin_native_launch_smoke() {
         let path = PathBuf::from(
             std::env::var_os("OPENEVO_PACKAGED_SIDECAR_PATH")
@@ -4365,16 +4950,22 @@ mod tests {
         );
         let state = DesktopHostState::default();
 
-        let status = start_sidecar_inner(&state, LaunchPolicy::Release, Some(&path)).unwrap();
-        assert_eq!(status.state, "running");
+        let context = start_sidecar_inner(&state, LaunchPolicy::Release, Some(&path)).unwrap();
+        assert_eq!(context.schema_version, "1");
+        let endpoint_port = context
+            .endpoint
+            .strip_prefix("http://127.0.0.1:")
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
         let private_root = {
             let sidecar = state.sidecar.lock().unwrap();
             let managed = sidecar.as_ref().unwrap();
             assert_eq!(managed.lifecycle, ManagedLifecycle::Running);
-            assert_eq!(managed.status.port, status.port);
+            assert_eq!(managed.status.port, Some(endpoint_port));
             assert_eq!(
                 managed._listener.local_addr().unwrap().port(),
-                status.port.unwrap()
+                endpoint_port
             );
             let executable = managed.verified_executable.as_ref().unwrap();
             executable.validate().unwrap();
@@ -4398,18 +4989,24 @@ mod tests {
         proof_challenge: Option<String>,
         include_unknown_field: bool,
     ) {
+        serve_health_on_listener(
+            &listener,
+            instance_id,
+            readiness_key,
+            proof_challenge,
+            include_unknown_field,
+        );
+    }
+
+    fn serve_health_on_listener(
+        listener: &TcpListener,
+        instance_id: [u8; INSTANCE_ID_BYTES],
+        readiness_key: [u8; READINESS_KEY_BYTES],
+        proof_challenge: Option<String>,
+        include_unknown_field: bool,
+    ) {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 512];
-        loop {
-            let count = stream.read(&mut buffer).unwrap();
-            assert!(count > 0);
-            request.extend_from_slice(&buffer[..count]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
-        }
-        let request = std::str::from_utf8(&request).unwrap();
+        let request = read_http_request(&mut stream);
         let challenge = request
             .lines()
             .find_map(|line| line.strip_prefix("X-OpenEvo-Native-Challenge: "))
@@ -4431,12 +5028,81 @@ mod tests {
                 .unwrap()
                 .insert("unexpected".to_string(), serde_json::json!(true));
         }
+        write_json_response(&mut stream, 200, body);
+    }
+
+    fn serve_contract_response(
+        listener: &TcpListener,
+        version: serde_json::Value,
+        legacy_status: u16,
+        requests: mpsc::Sender<String>,
+    ) {
+        let (mut version_stream, _) = listener.accept().unwrap();
+        let version_request = read_http_request(&mut version_stream);
+        let _ = requests.send(version_request);
+        write_json_response(&mut version_stream, 200, version);
+        drop(version_stream);
+
+        let (mut legacy_stream, _) = listener.accept().unwrap();
+        let legacy_request = read_http_request(&mut legacy_stream);
+        let _ = requests.send(legacy_request);
+        write_json_response(
+            &mut legacy_stream,
+            legacy_status,
+            serde_json::json!({"detail": "not found"}),
+        );
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn write_json_response(stream: &mut TcpStream, status: u16, body: serde_json::Value) {
         let body = serde_json::to_string(&body).unwrap();
+        let reason = match status {
+            200 => "OK",
+            404 => "Not Found",
+            _ => "Response",
+        };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();
+    }
+
+    fn valid_version_response() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "1",
+            "api_name": DESKTOP_LOCAL_API_NAME,
+            "preferred_major": 1,
+            "supported_majors": [1],
+            "openapi_sha256": DESKTOP_LOCAL_API_OPENAPI_SHA256,
+            "build_version": "0.1.0",
+            "source_commit": "0123456789abcdef0123456789abcdef01234567",
+            "build_channel": "release",
+            "provider_kind": "desktop_sidecar",
+            "feature_flags": ["remote_profiles", "project_validation"],
+        })
+    }
+
+    fn valid_version_response_with(key: &str, value: serde_json::Value) -> serde_json::Value {
+        let mut response = valid_version_response();
+        response
+            .as_object_mut()
+            .unwrap()
+            .insert(key.to_string(), value);
+        response
     }
 
     fn read_verified_file(executable: &VerifiedExecutableFile) -> Vec<u8> {
@@ -4497,6 +5163,24 @@ mod tests {
         command.spawn().unwrap()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_exiting_leader_with_descendant(pid_path: &Path) -> Child {
+        let script = format!(
+            "exec python3 -c 'import os,time; p=os.fork(); open(\"{}\", \"w\").write(str(p)) if p else time.sleep(30); os._exit(0) if p else None'",
+            pid_path.display(),
+        );
+        spawn_test_process_group(&script)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn wait_for_leader_exit(leader: &Child) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !leader_exited_without_reaping(leader).unwrap() {
+            assert!(Instant::now() < deadline, "leader did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn wait_for_file(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !path.exists() {
@@ -4523,6 +5207,19 @@ mod tests {
         NativeInstanceCredential {
             instance_id: [0x1a; INSTANCE_ID_BYTES],
             readiness_key: [0x5a; READINESS_KEY_BYTES],
+            session_token: [0x7c; SESSION_TOKEN_BYTES],
+        }
+    }
+
+    fn test_bootstrap_state() -> SidecarBootstrapState {
+        SidecarBootstrapState {
+            session_credential: SessionCredential([0x7c; SESSION_TOKEN_BYTES]),
+            negotiated_contract: NegotiatedContractV1 {
+                major: 1,
+                openapi_sha256: DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),
+                provider_kind: "desktop_sidecar".to_string(),
+                feature_flags: vec![FeatureFlagV1::RemoteProfiles],
+            },
         }
     }
 
@@ -4770,12 +5467,13 @@ mod tests {
         let process_group = child.id() as i32;
         (
             ManagedSidecar {
-                status: SidecarStatus {
+                status: LifecycleStatus {
                     state: "running".to_string(),
                     port: Some(listener_port),
                     pid: Some(child.id()),
                     url: Some(format!("http://127.0.0.1:{listener_port}/openevo")),
                 },
+                bootstrap: Some(test_bootstrap_state()),
                 lifecycle: ManagedLifecycle::Running,
                 startup_epoch: 0,
                 spawn_pending: false,

@@ -8,6 +8,8 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+const SESSION_TOKEN = "s".repeat(32);
+
 describe("OpenEvo API client host routing", () => {
   afterEach(() => {
     vi.clearAllMocks();
@@ -33,13 +35,7 @@ describe("OpenEvo API client host routing", () => {
 
   it("starts the native sidecar once and routes Tauri API calls to localhost", async () => {
     window.__TAURI_INTERNALS__ = {};
-    vi.mocked(invoke).mockResolvedValue({
-      state: "running",
-      port: 49152,
-      pid: 42,
-      url: "http://127.0.0.1:49152/openevo",
-      command: "python3 -m desktop.server.launcher --port 49152",
-    });
+    vi.mocked(invoke).mockResolvedValue(bootstrapContext(49152, SESSION_TOKEN));
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockImplementation(() => Promise.resolve(jsonResponse({ status: "ok" })));
@@ -53,19 +49,18 @@ describe("OpenEvo API client host routing", () => {
       "http://127.0.0.1:49152/openevo-api/desktop/shell",
       "http://127.0.0.1:49152/openevo-api/desktop/bootstrap",
     ]);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(new Headers(init?.headers).get("X-OpenEvo-Desktop-Session")).toBe(
+        SESSION_TOKEN,
+      );
+    }
   });
 
   it("retries sidecar startup after a failed native invoke", async () => {
     window.__TAURI__ = {};
     vi.mocked(invoke)
       .mockRejectedValueOnce(new Error("sidecar missing"))
-      .mockResolvedValueOnce({
-        state: "running",
-        port: 3766,
-        pid: 51,
-        url: null,
-        command: "python3 -m desktop.server.launcher --port 3766",
-      });
+      .mockResolvedValueOnce(bootstrapContext(3766, "t".repeat(32)));
     vi.spyOn(globalThis, "fetch").mockImplementation(() =>
       Promise.resolve(jsonResponse({ status: "ok" })),
     );
@@ -78,6 +73,20 @@ describe("OpenEvo API client host routing", () => {
     expect(invoke).toHaveBeenCalledTimes(2);
   });
 });
+
+function bootstrapContext(port: number, sessionToken: string) {
+  return {
+    schema_version: "1",
+    endpoint: `http://127.0.0.1:${port}`,
+    session_token: sessionToken,
+    negotiated_contract: {
+      major: 1,
+      openapi_sha256: "a".repeat(64),
+      provider_kind: "desktop_sidecar",
+      feature_flags: ["remote_profiles"],
+    },
+  } as const;
+}
 
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
