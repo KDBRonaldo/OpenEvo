@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import shutil
 import stat
@@ -30,124 +30,259 @@ def verify_and_materialize_workspace(
 ) -> None:
     """Verify the complete canonical ustar and atomically publish extracted files."""
 
-    _verify_archive_identity(archive_path, declaration)
+    stream, archive_identity = _open_verified_archive(archive_path, declaration)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = destination.parent / f".workspace-{uuid.uuid4().hex}.tmp"
     temporary.mkdir(mode=0o700)
+    os.chmod(temporary, 0o700, follow_symlinks=False)
     try:
-        _parse_archive(archive_path, declaration, extract_root=temporary)
+        _parse_archive(stream, declaration, extract_root=temporary, verify_root_fd=None)
         _fsync_tree(temporary)
         os.rename(temporary, destination)
         _fsync_directory(destination.parent)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
+    finally:
+        _close_verified_archive(archive_path, stream, archive_identity)
 
 
 def verify_workspace_archive(
     archive_path: Path,
     declaration: WorkspaceArchiveDeclarationV1,
 ) -> None:
-    _verify_archive_identity(archive_path, declaration)
-    _parse_archive(archive_path, declaration, extract_root=None)
+    stream, archive_identity = _open_verified_archive(archive_path, declaration)
+    try:
+        _parse_archive(stream, declaration, extract_root=None, verify_root_fd=None)
+    finally:
+        _close_verified_archive(archive_path, stream, archive_identity)
 
 
-def _verify_archive_identity(
-    archive_path: Path,
-    declaration: WorkspaceArchiveDeclarationV1,
-) -> None:
-    metadata = archive_path.stat(follow_symlinks=False)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise WorkspaceArchiveError("workspace archive must be a private regular file")
-    if metadata.st_size != declaration.byte_size:
-        raise WorkspaceArchiveError("workspace archive size differs from its declaration")
-    digest = hashlib.sha256()
-    with archive_path.open("rb", buffering=1024 * 1024) as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    if digest.hexdigest() != declaration.content_sha256:
-        raise WorkspaceArchiveError("workspace archive digest differs from its declaration")
-
-
-def _parse_archive(
+def verify_materialized_workspace(
     archive_path: Path,
     declaration: WorkspaceArchiveDeclarationV1,
     *,
+    archive_root_fd: int | None = None,
+    archive_name: str | None = None,
+    workspace_root_fd: int,
+    snapshot_name: str,
+) -> None:
+    """Verify one published snapshot through a held managed-root directory FD."""
+
+    stream, archive_identity = _open_verified_archive(
+        archive_path,
+        declaration,
+        parent_fd=archive_root_fd,
+        entry_name=archive_name,
+    )
+    snapshot_fd: int | None = None
+    try:
+        try:
+            snapshot_fd = os.open(
+                snapshot_name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=workspace_root_fd,
+            )
+        except OSError as exc:
+            raise WorkspaceArchiveError("published workspace snapshot is missing or unsafe") from exc
+        snapshot_identity = os.fstat(snapshot_fd)
+        _validate_directory_metadata(snapshot_identity, mode=0o700, label="snapshot root")
+        _require_entry_binding(workspace_root_fd, snapshot_name, snapshot_identity)
+        _parse_archive(
+            stream,
+            declaration,
+            extract_root=None,
+            verify_root_fd=snapshot_fd,
+        )
+        _require_entry_binding(workspace_root_fd, snapshot_name, snapshot_identity)
+    finally:
+        if snapshot_fd is not None:
+            os.close(snapshot_fd)
+        _close_verified_archive(
+            archive_path,
+            stream,
+            archive_identity,
+            parent_fd=archive_root_fd,
+            entry_name=archive_name,
+        )
+
+
+def _open_verified_archive(
+    archive_path: Path,
+    declaration: WorkspaceArchiveDeclarationV1,
+    *,
+    parent_fd: int | None = None,
+    entry_name: str | None = None,
+):
+    try:
+        if parent_fd is None:
+            fd = os.open(archive_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        elif entry_name is not None:
+            fd = os.open(
+                entry_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        else:
+            raise WorkspaceArchiveError("workspace archive entry identity is incomplete")
+    except OSError as exc:
+        raise WorkspaceArchiveError("workspace archive is missing or unsafe") from exc
+    stream = os.fdopen(fd, "rb", buffering=1024 * 1024)
+    try:
+        metadata = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise WorkspaceArchiveError("workspace archive must be an owner-bound regular file")
+        if parent_fd is None:
+            _require_path_binding(archive_path, metadata)
+        else:
+            assert entry_name is not None
+            _require_entry_binding(parent_fd, entry_name, metadata)
+        if metadata.st_size != declaration.byte_size:
+            raise WorkspaceArchiveError("workspace archive size differs from its declaration")
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != declaration.content_sha256:
+            raise WorkspaceArchiveError("workspace archive digest differs from its declaration")
+        stream.seek(0)
+        return stream, metadata
+    except Exception:
+        stream.close()
+        raise
+
+
+def _close_verified_archive(
+    archive_path: Path,
+    stream,
+    identity: os.stat_result,
+    *,
+    parent_fd: int | None = None,
+    entry_name: str | None = None,
+) -> None:
+    try:
+        if not _same_identity(os.fstat(stream.fileno()), identity):
+            raise WorkspaceArchiveError("workspace archive identity changed during verification")
+        if parent_fd is None:
+            _require_path_binding(archive_path, identity)
+        else:
+            assert entry_name is not None
+            _require_entry_binding(parent_fd, entry_name, identity)
+    finally:
+        stream.close()
+
+
+def _parse_archive(
+    stream,
+    declaration: WorkspaceArchiveDeclarationV1,
+    *,
     extract_root: Path | None,
+    verify_root_fd: int | None,
 ) -> None:
     entries: set[str] = set()
     directories: set[str] = set()
+    expected_children: dict[str, set[str]] = {"": set()}
     previous_header_path: bytes | None = None
     entry_count = 0
     extracted_bytes = 0
 
-    with archive_path.open("rb", buffering=1024 * 1024) as stream:
-        while True:
-            header = stream.read(_BLOCK_SIZE)
-            if len(header) != _BLOCK_SIZE:
-                raise WorkspaceArchiveError("workspace archive ended before its terminator")
-            if header == _ZERO_BLOCK:
-                if stream.read(_BLOCK_SIZE) != _ZERO_BLOCK or stream.read(1) != b"":
-                    raise WorkspaceArchiveError(
-                        "workspace archive requires exactly two zero blocks and no trailing data"
+    while True:
+        header = stream.read(_BLOCK_SIZE)
+        if len(header) != _BLOCK_SIZE:
+            raise WorkspaceArchiveError("workspace archive ended before its terminator")
+        if header == _ZERO_BLOCK:
+            if stream.read(_BLOCK_SIZE) != _ZERO_BLOCK or stream.read(1) != b"":
+                raise WorkspaceArchiveError(
+                    "workspace archive requires exactly two zero blocks and no trailing data"
+                )
+            break
+
+        entry = _parse_header(header)
+        header_path = entry.header_path
+        if previous_header_path is not None and header_path <= previous_header_path:
+            raise WorkspaceArchiveError("workspace entries are not in canonical byte order")
+        previous_header_path = header_path
+        logical_path = entry.logical_path
+        if logical_path in entries:
+            raise WorkspaceArchiveError("workspace paths must be unique")
+        entries.add(logical_path)
+        _validate_parents(logical_path, directories)
+        parent, _, name = logical_path.rpartition("/")
+        expected_children.setdefault(parent, set()).add(name)
+
+        entry_count += 1
+        if entry_count > declaration.policy.max_entries:
+            raise WorkspaceArchiveError("workspace archive exceeds its entry budget")
+        extracted_bytes += entry.size
+        if extracted_bytes > declaration.policy.max_extracted_bytes:
+            raise WorkspaceArchiveError("workspace archive exceeds its extracted byte budget")
+
+        target = extract_root / logical_path if extract_root is not None else None
+        if entry.directory:
+            directories.add(logical_path)
+            expected_children.setdefault(logical_path, set())
+            if target is not None:
+                target.mkdir(mode=0o755)
+                os.chmod(target, entry.mode, follow_symlinks=False)
+            if verify_root_fd is not None:
+                directory_fd = _open_directory_at(verify_root_fd, logical_path)
+                try:
+                    _validate_directory_metadata(
+                        os.fstat(directory_fd), mode=entry.mode, label="workspace directory"
                     )
-                break
+                finally:
+                    os.close(directory_fd)
+            continue
 
-            entry = _parse_header(header)
-            header_path = entry.header_path
-            if previous_header_path is not None and header_path <= previous_header_path:
-                raise WorkspaceArchiveError("workspace entries are not in canonical byte order")
-            previous_header_path = header_path
-            logical_path = entry.logical_path
-            if logical_path in entries:
-                raise WorkspaceArchiveError("workspace paths must be unique")
-            entries.add(logical_path)
-            _validate_parents(logical_path, directories)
-
-            entry_count += 1
-            if entry_count > declaration.policy.max_entries:
-                raise WorkspaceArchiveError("workspace archive exceeds its entry budget")
-            extracted_bytes += entry.size
-            if extracted_bytes > declaration.policy.max_extracted_bytes:
-                raise WorkspaceArchiveError("workspace archive exceeds its extracted byte budget")
-
-            target = extract_root / logical_path if extract_root is not None else None
-            if entry.directory:
-                directories.add(logical_path)
-                if target is not None:
-                    target.mkdir(mode=0o755)
-                continue
-
-            remaining = entry.size
-            output_fd: int | None = None
-            try:
-                if target is not None:
-                    output_fd = os.open(
-                        target,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                        0o600,
-                    )
-                while remaining:
-                    chunk = stream.read(min(1024 * 1024, remaining))
-                    if not chunk:
-                        raise WorkspaceArchiveError("workspace file body is truncated")
-                    if output_fd is not None:
-                        _write_all(output_fd, chunk)
-                    remaining -= len(chunk)
-                padding_size = (-entry.size) % _BLOCK_SIZE
-                if padding_size and stream.read(padding_size) != b"\0" * padding_size:
-                    raise WorkspaceArchiveError("workspace file padding is not canonical")
+        remaining = entry.size
+        output_fd: int | None = None
+        verified_fd: int | None = None
+        try:
+            if target is not None:
+                output_fd = os.open(
+                    target,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            if verify_root_fd is not None:
+                verified_fd = _open_file_at(verify_root_fd, logical_path)
+                _validate_file_metadata(
+                    os.fstat(verified_fd), size=entry.size, mode=entry.mode
+                )
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise WorkspaceArchiveError("workspace file body is truncated")
                 if output_fd is not None:
-                    os.fsync(output_fd)
-                    os.fchmod(output_fd, entry.mode)
-            finally:
-                if output_fd is not None:
-                    os.close(output_fd)
+                    _write_all(output_fd, chunk)
+                if verified_fd is not None and _read_exact(verified_fd, len(chunk)) != chunk:
+                    raise WorkspaceArchiveError("published workspace file content is invalid")
+                remaining -= len(chunk)
+            padding_size = (-entry.size) % _BLOCK_SIZE
+            if padding_size and stream.read(padding_size) != b"\0" * padding_size:
+                raise WorkspaceArchiveError("workspace file padding is not canonical")
+            if output_fd is not None:
+                os.fchmod(output_fd, entry.mode)
+                os.fsync(output_fd)
+            if verified_fd is not None:
+                _validate_file_metadata(
+                    os.fstat(verified_fd), size=entry.size, mode=entry.mode
+                )
+        finally:
+            if verified_fd is not None:
+                os.close(verified_fd)
+            if output_fd is not None:
+                os.close(output_fd)
 
     if entry_count != declaration.entry_count:
         raise WorkspaceArchiveError("workspace entry count differs from its declaration")
     if extracted_bytes != declaration.extracted_byte_size:
         raise WorkspaceArchiveError("workspace extracted size differs from its declaration")
+    if verify_root_fd is not None:
+        _validate_tree_shape(verify_root_fd, expected_children)
 
 
 class _Entry:
@@ -269,7 +404,7 @@ def _validate_logical_path(path: str) -> None:
         raise WorkspaceArchiveError("workspace path is not POSIX relative")
     if unicodedata.normalize("NFC", path) != path:
         raise WorkspaceArchiveError("workspace path is not NFC normalized")
-    parts = PurePosixPath(path).parts
+    parts = path.split("/")
     if len(parts) > 32 or any(part in {"", ".", ".."} for part in parts):
         raise WorkspaceArchiveError("workspace path violates its segment budget")
     if any(ord(character) < 32 or ord(character) == 127 for character in path):
@@ -281,6 +416,100 @@ def _validate_parents(path: str, directories: set[str]) -> None:
     for index in range(1, len(parts)):
         if "/".join(parts[:index]) not in directories:
             raise WorkspaceArchiveError("workspace parent directory is missing or out of order")
+
+
+def _open_directory_at(root_fd: int, path: str) -> int:
+    current_fd = os.dup(root_fd)
+    try:
+        for part in path.split("/"):
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except OSError as exc:
+        os.close(current_fd)
+        raise WorkspaceArchiveError("published workspace directory is missing or unsafe") from exc
+
+
+def _open_file_at(root_fd: int, path: str) -> int:
+    parent, _, name = path.rpartition("/")
+    parent_fd = _open_directory_at(root_fd, parent) if parent else os.dup(root_fd)
+    try:
+        return os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+    except OSError as exc:
+        raise WorkspaceArchiveError("published workspace file is missing or unsafe") from exc
+    finally:
+        os.close(parent_fd)
+
+
+def _validate_directory_metadata(metadata: os.stat_result, *, mode: int, label: str) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise WorkspaceArchiveError(f"published {label} metadata is invalid")
+
+
+def _validate_file_metadata(metadata: os.stat_result, *, size: int, mode: int) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != mode
+        or metadata.st_size != size
+    ):
+        raise WorkspaceArchiveError("published workspace file metadata is invalid")
+
+
+def _validate_tree_shape(root_fd: int, expected_children: dict[str, set[str]]) -> None:
+    for directory, expected in expected_children.items():
+        directory_fd = _open_directory_at(root_fd, directory) if directory else os.dup(root_fd)
+        try:
+            if set(os.listdir(directory_fd)) != expected:
+                raise WorkspaceArchiveError("published workspace tree contains unexpected entries")
+        except OSError as exc:
+            raise WorkspaceArchiveError("published workspace tree is unreadable") from exc
+        finally:
+            os.close(directory_fd)
+
+
+def _read_exact(fd: int, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _require_path_binding(path: Path, expected: os.stat_result) -> None:
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise WorkspaceArchiveError("workspace archive path binding is invalid") from exc
+    if not _same_identity(current, expected):
+        raise WorkspaceArchiveError("workspace archive path binding changed")
+
+
+def _require_entry_binding(parent_fd: int, name: str, expected: os.stat_result) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise WorkspaceArchiveError("published workspace snapshot binding is invalid") from exc
+    if not _same_identity(current, expected):
+        raise WorkspaceArchiveError("published workspace snapshot binding changed")
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
 
 def _write_all(fd: int, content: bytes) -> None:
@@ -308,5 +537,6 @@ def _fsync_directory(path: Path) -> None:
 __all__ = [
     "WorkspaceArchiveError",
     "verify_and_materialize_workspace",
+    "verify_materialized_workspace",
     "verify_workspace_archive",
 ]

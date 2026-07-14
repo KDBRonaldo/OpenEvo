@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -15,6 +16,7 @@ from openevo.backend.contracts.v1 import (
     openapi_sha256,
 )
 from openevo.backend.contracts.v1.models import SseFrameV1, WorkspaceArchiveDeclarationV1
+from openevo.backend.contracts.v1.store import CoreControlStoreV1, StoreCorruptionError
 from openevo.backend.contracts.v1.workspace import (
     WorkspaceArchiveError,
     verify_workspace_archive,
@@ -101,7 +103,12 @@ def _workspace_archive() -> bytes:
     )
 
 
-def _project_create(*, archive: bytes | None = None) -> dict[str, object]:
+def _project_create(
+    *,
+    archive: bytes | None = None,
+    archive_entry_count: int = 2,
+    extracted_byte_size: int = len(b"OpenEvo provider workspace\n"),
+) -> dict[str, object]:
     workspace: dict[str, object]
     if archive is None:
         workspace = {"kind": "scratch", "display_name": "Scratch workspace"}
@@ -113,8 +120,8 @@ def _project_create(*, archive: bytes | None = None) -> dict[str, object]:
                 "content_sha256": hashlib.sha256(archive).hexdigest(),
                 "byte_size": len(archive),
                 "format": "openevo_deterministic_tar_v1",
-                "entry_count": 2,
-                "extracted_byte_size": len(b"OpenEvo provider workspace\n"),
+                "entry_count": archive_entry_count,
+                "extracted_byte_size": extracted_byte_size,
                 "policy": _archive_policy(),
             },
         }
@@ -159,6 +166,47 @@ def _create_project(client: TestClient, payload: dict[str, object]) -> tuple[dic
     )
     assert response.status_code == 201, response.text
     return response.json(), response.headers["etag"]
+
+
+def _finalize_workspace(tmp_path: Path, archive: bytes, *, key_suffix: str) -> dict:
+    payload = _project_create(archive=archive)
+    with TestClient(_app(tmp_path)) as client:
+        project, project_etag = _create_project(client, payload)
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": f"begin-upload-{key_suffix}",
+                "If-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": payload["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": f"chunk-upload-{key_suffix}",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+        finalized = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/finalize",
+            headers={
+                **AUTH,
+                "Idempotency-Key": f"finalize-upload-{key_suffix}",
+                "If-Match": chunk.headers["etag"],
+                "If-Project-Match": project_etag,
+            },
+            json={"schema_version": "1", "content_sha256": hashlib.sha256(archive).hexdigest()},
+        )
+        assert finalized.status_code == 201, finalized.text
+        return finalized.json()
 
 
 def test_provider_preserves_frozen_openapi_and_negotiates_v1(tmp_path: Path) -> None:
@@ -469,6 +517,200 @@ def test_workspace_finalize_rejects_digest_and_stale_project_cas(tmp_path: Path)
         assert patch.status_code == 200
         assert stale.status_code == 412
         assert stale.json()["code"] == "project_etag_precondition_failed"
+
+
+def test_workspace_chunk_handles_short_writes_before_advancing_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _workspace_archive()
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        project, project_etag = _create_project(client, _project_create(archive=archive))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={**AUTH, "Idempotency-Key": "begin-upload-short-write", "If-Match": project_etag},
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        real_write = os.write
+        write_lengths: list[int] = []
+
+        def short_write(fd: int, content: bytes | memoryview) -> int:
+            requested = len(content)
+            accepted = max(1, requested // 2) if not write_lengths else requested
+            write_lengths.append(accepted)
+            return real_write(fd, content[:accepted])
+
+        monkeypatch.setattr("openevo.backend.contracts.v1.store.os.write", short_write)
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-short-write",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+
+        assert chunk.status_code == 200, chunk.text
+        assert len(write_lengths) >= 2
+        assert chunk.json()["accepted_offset"] == len(archive)
+        upload_path = (
+            tmp_path
+            / "core-control-v1"
+            / "workspace-uploads"
+            / f"{upload.json()['id']}.part"
+        )
+        assert upload_path.read_bytes() == archive
+
+
+def test_workspace_chunk_zero_write_fails_without_advancing_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _workspace_archive()
+    app = _app(tmp_path)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        project, project_etag = _create_project(client, _project_create(archive=archive))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={**AUTH, "Idempotency-Key": "begin-upload-zero-write", "If-Match": project_etag},
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        monkeypatch.setattr("openevo.backend.contracts.v1.store.os.write", lambda _fd, _data: 0)
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-zero-write",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+        status = client.get(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}",
+            headers=AUTH,
+        )
+
+        assert chunk.status_code == 500
+        assert status.json()["accepted_offset"] == 0
+        upload_path = (
+            tmp_path
+            / "core-control-v1"
+            / "workspace-uploads"
+            / f"{upload.json()['id']}.part"
+        )
+        assert upload_path.stat().st_size == 0
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "missing"])
+def test_workspace_recovery_rejects_invalid_published_snapshot(
+    tmp_path: Path, damage: str
+) -> None:
+    result = _finalize_workspace(tmp_path, _workspace_archive(), key_suffix=damage)
+    snapshot = result["publication"]["workspace_snapshot"]["id"]
+    published_file = (
+        tmp_path / "core-control-v1" / "workspace-snapshots" / snapshot / "src" / "AGENTS.md"
+    )
+    if damage == "corrupt":
+        published_file.write_bytes(b"corrupt\n")
+    else:
+        published_file.unlink()
+        published_file.parent.rmdir()
+        published_file.parent.parent.rmdir()
+
+    try:
+        recovered = CoreControlStoreV1(tmp_path)
+    except StoreCorruptionError:
+        pass
+    else:
+        recovered.close()
+        pytest.fail(f"{damage} published workspace snapshot was accepted")
+
+
+def test_workspace_recovery_removes_orphans_without_following_symlinks(tmp_path: Path) -> None:
+    result = _finalize_workspace(tmp_path, _workspace_archive(), key_suffix="orphan")
+    snapshot_root = tmp_path / "core-control-v1" / "workspace-snapshots"
+    orphan = snapshot_root / "workspace-snapshot-orphan"
+    orphan.mkdir(mode=0o700)
+    (orphan / "uncommitted.txt").write_text("uncommitted", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "keep.txt"
+    outside_file.write_text("keep", encoding="utf-8")
+    symlink = snapshot_root / "workspace-snapshot-symlink"
+    symlink.symlink_to(outside, target_is_directory=True)
+
+    with TestClient(_app(tmp_path)) as client:
+        project = client.get(f"/v1/projects/{result['project_id']}", headers=AUTH)
+        assert project.status_code == 200
+
+    assert not orphan.exists()
+    assert not os.path.lexists(symlink)
+    assert outside_file.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_workspace_finalize_maps_root_dot_entry_to_archive_rejection(
+    tmp_path: Path, directory: bool
+) -> None:
+    body = b"" if directory else b"root entry\n"
+    archive = b"".join(
+        (
+            _tar_header(".", body_size=len(body), directory=directory),
+            body,
+            b"\0" * ((512 - len(body) % 512) % 512),
+            b"\0" * 1024,
+        )
+    )
+    app = _app(tmp_path)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        payload = _project_create(
+            archive=archive,
+            archive_entry_count=1,
+            extracted_byte_size=len(body),
+        )
+        project, project_etag = _create_project(client, payload)
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={**AUTH, "Idempotency-Key": "begin-upload-root-dot", "If-Match": project_etag},
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": payload["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-root-dot",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+        finalized = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/finalize",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "finalize-upload-root-dot",
+                "If-Match": chunk.headers["etag"],
+                "If-Project-Match": project_etag,
+            },
+            json={"schema_version": "1", "content_sha256": hashlib.sha256(archive).hexdigest()},
+        )
+
+        assert finalized.status_code == 409
+        assert finalized.json()["code"] == "workspace_archive_invalid"
 
 
 def test_capabilities_and_project_validation_use_verified_registry(tmp_path: Path) -> None:

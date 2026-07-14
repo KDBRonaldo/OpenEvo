@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -11,7 +12,6 @@ import json
 import os
 from pathlib import Path
 import secrets
-import shutil
 import sqlite3
 import stat
 import threading
@@ -21,7 +21,11 @@ from typing import Any, Literal, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from . import models as m
-from .workspace import WorkspaceArchiveError, verify_and_materialize_workspace
+from .workspace import (
+    WorkspaceArchiveError,
+    verify_and_materialize_workspace,
+    verify_materialized_workspace,
+)
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -205,8 +209,15 @@ class CoreControlStoreV1:
             for statement in _SCHEMA:
                 self._connection.execute(statement)
             self._signing_key = self._load_or_create_signing_key()
-        self._harden_database_files()
-        self._recover_and_validate()
+        try:
+            self._harden_database_files()
+            self._recover_and_validate()
+        except Exception:
+            self._connection.close()
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            self._lock_file.close()
+            self._closed = True
+            raise
 
     def close(self) -> None:
         with self._mutex:
@@ -482,6 +493,7 @@ class CoreControlStoreV1:
         with self._mutex:
             old_offset = 0
             file_path: Path | None = None
+            file_fd: int | None = None
             try:
                 with self._transaction():
                     replay = self._idempotency_replay(
@@ -511,11 +523,19 @@ class CoreControlStoreV1:
                         )
                     old_offset = upload.accepted_offset
                     file_path = self.upload_root / row["file_name"]
-                    with file_path.open("r+b", buffering=0) as stream:
-                        stream.seek(old_offset)
-                        stream.write(content)
-                        stream.flush()
-                        os.fsync(stream.fileno())
+                    file_fd = os.open(
+                        file_path,
+                        os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    _require_bound_regular_file(file_path, file_fd, expected_size=old_offset)
+                    os.lseek(file_fd, old_offset, os.SEEK_SET)
+                    _write_all(file_fd, content)
+                    os.fsync(file_fd)
+                    _require_bound_regular_file(
+                        file_path,
+                        file_fd,
+                        expected_size=old_offset + len(content),
+                    )
                     now = self._timestamp()
                     version = int(row["resource_version"]) + 1
                     updated_data = upload.model_dump(mode="python", exclude={"etag"})
@@ -538,12 +558,13 @@ class CoreControlStoreV1:
                     )
                     return result
             except Exception:
-                if file_path is not None and file_path.exists():
-                    with file_path.open("r+b") as stream:
-                        stream.truncate(old_offset)
-                        stream.flush()
-                        os.fsync(stream.fileno())
+                if file_fd is not None:
+                    os.ftruncate(file_fd, old_offset)
+                    os.fsync(file_fd)
                 raise
+            finally:
+                if file_fd is not None:
+                    os.close(file_fd)
 
     def finalize_upload(
         self,
@@ -598,83 +619,79 @@ class CoreControlStoreV1:
                     "workspace_archive_invalid", "The workspace archive is not canonical."
                 ) from exc
 
-            try:
-                with self._transaction():
-                    upload_row, upload = self._upload_row(project_id, upload_id)
-                    project_row, project = self._project_row(project_id)
-                    self._validate_finalize_preconditions(
-                        upload,
-                        project,
-                        request,
-                        if_match=if_match,
-                        if_project_match=if_project_match,
-                    )
-                    content_ref = m.ContentRefV1(
-                        content_id=_new_id("workspace-content"),
-                        sha256=upload.archive.content_sha256,
-                        byte_size=upload.archive.byte_size,
-                    )
-                    publication = m.WorkspacePublicationV1(
-                        archive=upload.archive,
-                        content_ref=content_ref,
-                        workspace_snapshot=workspace_snapshot,
-                        published_at=now,
-                    )
-                    project_version = int(project_row["resource_version"]) + 1
-                    project_data = project.model_dump(
-                        mode="python", exclude={"etag", "current_project_snapshot"}
-                    )
-                    project_data.update(
-                        current_workspace_snapshot=workspace_snapshot,
-                        workspace_publication=publication,
-                        updated_at=now,
-                    )
-                    project_snapshot = _snapshot(
-                        m.SnapshotKind.PROJECT, _project_snapshot_payload(project_data), now
-                    )
-                    project_data["current_project_snapshot"] = project_snapshot
-                    updated_project = m.ProjectV1(
-                        **project_data, etag=_etag(project_data, version=project_version)
-                    )
-                    upload_version = int(upload_row["resource_version"]) + 1
-                    upload_data = upload.model_dump(mode="python", exclude={"etag"})
-                    upload_data.update(
-                        status=m.WorkspaceUploadStatus.FINALIZED,
-                        publication=publication,
-                        updated_at=now,
-                    )
-                    updated_upload = m.WorkspaceUploadSessionV1(
-                        **upload_data, etag=_etag(upload_data, version=upload_version)
-                    )
-                    self._connection.execute(
-                        "UPDATE projects SET document_json = ?, resource_version = ?, "
-                        "updated_at = ? WHERE project_id = ?",
-                        (_model_bytes(updated_project), project_version, now, project_id),
-                    )
-                    self._connection.execute(
-                        "UPDATE workspace_uploads SET document_json = ?, resource_version = ?, "
-                        "updated_at = ? WHERE upload_id = ?",
-                        (_model_bytes(updated_upload), upload_version, now, upload_id),
-                    )
-                    response = m.WorkspaceUploadFinalizeResponseV1(
-                        project_id=project_id,
-                        upload=updated_upload,
-                        publication=publication,
-                        project=updated_project,
-                    )
-                    self._append_project_event(updated_project, now=now)
-                    result = StoredResult(201, response, updated_upload.etag)
-                    self._store_idempotency(
-                        "finalizeCoreWorkspaceUploadV1",
-                        scope,
-                        idempotency_key,
-                        digest,
-                        result,
-                    )
-                    return result
-            except Exception:
-                shutil.rmtree(destination, ignore_errors=True)
-                raise
+            with self._transaction():
+                upload_row, upload = self._upload_row(project_id, upload_id)
+                project_row, project = self._project_row(project_id)
+                self._validate_finalize_preconditions(
+                    upload,
+                    project,
+                    request,
+                    if_match=if_match,
+                    if_project_match=if_project_match,
+                )
+                content_ref = m.ContentRefV1(
+                    content_id=_new_id("workspace-content"),
+                    sha256=upload.archive.content_sha256,
+                    byte_size=upload.archive.byte_size,
+                )
+                publication = m.WorkspacePublicationV1(
+                    archive=upload.archive,
+                    content_ref=content_ref,
+                    workspace_snapshot=workspace_snapshot,
+                    published_at=now,
+                )
+                project_version = int(project_row["resource_version"]) + 1
+                project_data = project.model_dump(
+                    mode="python", exclude={"etag", "current_project_snapshot"}
+                )
+                project_data.update(
+                    current_workspace_snapshot=workspace_snapshot,
+                    workspace_publication=publication,
+                    updated_at=now,
+                )
+                project_snapshot = _snapshot(
+                    m.SnapshotKind.PROJECT, _project_snapshot_payload(project_data), now
+                )
+                project_data["current_project_snapshot"] = project_snapshot
+                updated_project = m.ProjectV1(
+                    **project_data, etag=_etag(project_data, version=project_version)
+                )
+                upload_version = int(upload_row["resource_version"]) + 1
+                upload_data = upload.model_dump(mode="python", exclude={"etag"})
+                upload_data.update(
+                    status=m.WorkspaceUploadStatus.FINALIZED,
+                    publication=publication,
+                    updated_at=now,
+                )
+                updated_upload = m.WorkspaceUploadSessionV1(
+                    **upload_data, etag=_etag(upload_data, version=upload_version)
+                )
+                self._connection.execute(
+                    "UPDATE projects SET document_json = ?, resource_version = ?, "
+                    "updated_at = ? WHERE project_id = ?",
+                    (_model_bytes(updated_project), project_version, now, project_id),
+                )
+                self._connection.execute(
+                    "UPDATE workspace_uploads SET document_json = ?, resource_version = ?, "
+                    "updated_at = ? WHERE upload_id = ?",
+                    (_model_bytes(updated_upload), upload_version, now, upload_id),
+                )
+                response = m.WorkspaceUploadFinalizeResponseV1(
+                    project_id=project_id,
+                    upload=updated_upload,
+                    publication=publication,
+                    project=updated_project,
+                )
+                self._append_project_event(updated_project, now=now)
+                result = StoredResult(201, response, updated_upload.etag)
+                self._store_idempotency(
+                    "finalizeCoreWorkspaceUploadV1",
+                    scope,
+                    idempotency_key,
+                    digest,
+                    result,
+                )
+                return result
 
     def abort_upload(
         self,
@@ -1187,6 +1204,7 @@ class CoreControlStoreV1:
 
     def _recover_and_validate(self) -> None:
         with self._mutex, self._transaction():
+            project_publications: dict[str, m.WorkspacePublicationV1] = {}
             for row in self._connection.execute("SELECT * FROM projects"):
                 project = _validate_bytes(m.ProjectV1, row["document_json"])
                 version = int(row["resource_version"])
@@ -1198,7 +1216,20 @@ class CoreControlStoreV1:
                     or project.etag != _etag(project_data, version=version)
                 ):
                     raise StoreCorruptionError("project row identity is invalid")
+                if project.workspace_publication is not None:
+                    publication = project.workspace_publication
+                    expected_digest = hashlib.sha256(
+                        _canonical_bytes({"archive_sha256": publication.archive.content_sha256})
+                    ).hexdigest()
+                    if publication.workspace_snapshot.content_sha256 != expected_digest:
+                        raise StoreCorruptionError("workspace snapshot digest binding is invalid")
+                    existing = project_publications.setdefault(
+                        publication.workspace_snapshot.id, publication
+                    )
+                    if existing != publication:
+                        raise StoreCorruptionError("workspace snapshot publication is ambiguous")
             referenced_files: set[str] = set()
+            snapshot_sources: dict[str, tuple[m.WorkspacePublicationV1, str]] = {}
             for row in self._connection.execute("SELECT * FROM workspace_uploads"):
                 upload = _validate_bytes(m.WorkspaceUploadSessionV1, row["document_json"])
                 version = int(row["resource_version"])
@@ -1214,24 +1245,25 @@ class CoreControlStoreV1:
                 file_name = row["file_name"]
                 if file_name != f"{upload.id}.part":
                     raise StoreCorruptionError("workspace upload file identity is invalid")
-                referenced_files.add(file_name)
-                path = self.upload_root / file_name
                 if upload.status is m.WorkspaceUploadStatus.OPEN:
-                    metadata = path.stat(follow_symlinks=False)
-                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                        raise StoreCorruptionError("workspace upload file is unsafe")
-                    if metadata.st_size < upload.accepted_offset:
-                        raise StoreCorruptionError(
-                            "workspace upload file is shorter than its offset"
-                        )
-                    if metadata.st_size > upload.accepted_offset:
-                        with path.open("r+b") as stream:
-                            stream.truncate(upload.accepted_offset)
-                            stream.flush()
-                            os.fsync(stream.fileno())
-            for path in self.upload_root.iterdir():
-                if path.name not in referenced_files and path.is_file() and not path.is_symlink():
-                    path.unlink()
+                    referenced_files.add(file_name)
+                elif upload.status is m.WorkspaceUploadStatus.FINALIZED:
+                    referenced_files.add(file_name)
+                    publication = upload.publication
+                    if publication is None:
+                        raise StoreCorruptionError("finalized workspace upload has no publication")
+                    snapshot_id = publication.workspace_snapshot.id
+                    existing = snapshot_sources.setdefault(
+                        snapshot_id, (publication, file_name)
+                    )
+                    if existing[0] != publication:
+                        raise StoreCorruptionError("workspace snapshot source is ambiguous")
+            for snapshot_id, publication in project_publications.items():
+                source = snapshot_sources.get(snapshot_id)
+                if source is None or source[0] != publication:
+                    raise StoreCorruptionError(
+                        "published project workspace has no authoritative upload"
+                    )
             for row in self._connection.execute(
                 "SELECT sequence, event_id, frame_json FROM events ORDER BY sequence"
             ):
@@ -1255,6 +1287,108 @@ class CoreControlStoreV1:
                 _validate_bytes(m.ApiErrorV1, row["error_json"])
                 if len(row["request_digest"]) != 64:
                     raise StoreCorruptionError("failed idempotency request digest is invalid")
+
+            with self._managed_root_fd(self.upload_root) as upload_root_fd:
+                for file_name in referenced_files:
+                    row = self._connection.execute(
+                        "SELECT document_json FROM workspace_uploads WHERE file_name = ?",
+                        (file_name,),
+                    ).fetchone()
+                    if row is None:
+                        raise StoreCorruptionError("workspace upload source disappeared")
+                    upload = _validate_bytes(m.WorkspaceUploadSessionV1, row["document_json"])
+                    if upload.status is m.WorkspaceUploadStatus.OPEN:
+                        self._recover_open_upload(
+                            upload_root_fd,
+                            file_name,
+                            accepted_offset=upload.accepted_offset,
+                        )
+                for name in os.listdir(upload_root_fd):
+                    if name not in referenced_files:
+                        _remove_entry_at(upload_root_fd, name)
+                with self._managed_root_fd(self.workspace_root) as workspace_root_fd:
+                    for snapshot_id, (publication, archive_name) in snapshot_sources.items():
+                        try:
+                            archive_fd = os.open(
+                                archive_name,
+                                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                                dir_fd=upload_root_fd,
+                            )
+                            try:
+                                _require_bound_regular_entry(
+                                    upload_root_fd,
+                                    archive_name,
+                                    archive_fd,
+                                    expected_size=publication.archive.byte_size,
+                                )
+                            finally:
+                                os.close(archive_fd)
+                            verify_materialized_workspace(
+                                self.upload_root / archive_name,
+                                publication.archive,
+                                archive_root_fd=upload_root_fd,
+                                archive_name=archive_name,
+                                workspace_root_fd=workspace_root_fd,
+                                snapshot_name=snapshot_id,
+                            )
+                        except (OSError, WorkspaceArchiveError) as exc:
+                            raise StoreCorruptionError(
+                                "published workspace snapshot is missing or invalid"
+                            ) from exc
+                    for name in os.listdir(workspace_root_fd):
+                        if name not in snapshot_sources:
+                            _remove_entry_at(workspace_root_fd, name)
+
+    def _recover_open_upload(
+        self,
+        upload_root_fd: int,
+        file_name: str,
+        *,
+        accepted_offset: int,
+    ) -> None:
+        try:
+            fd = os.open(
+                file_name,
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=upload_root_fd,
+            )
+        except OSError as exc:
+            raise StoreCorruptionError("workspace upload file is missing or unsafe") from exc
+        try:
+            metadata = os.fstat(fd)
+            _require_private_regular_metadata(metadata)
+            _require_entry_binding(upload_root_fd, file_name, metadata)
+            if metadata.st_size < accepted_offset:
+                raise StoreCorruptionError("workspace upload file is shorter than its offset")
+            if metadata.st_size > accepted_offset:
+                os.ftruncate(fd, accepted_offset)
+                os.fsync(fd)
+            _require_bound_regular_entry(
+                upload_root_fd,
+                file_name,
+                fd,
+                expected_size=accepted_offset,
+            )
+        finally:
+            os.close(fd)
+
+    @contextmanager
+    def _managed_root_fd(self, path: Path):
+        try:
+            fd = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as exc:
+            raise StoreCorruptionError("Core Control managed root is unavailable") from exc
+        try:
+            identity = os.fstat(fd)
+            _require_private_directory_metadata(identity)
+            _require_path_binding(path, identity)
+            yield fd
+            _require_path_binding(path, identity)
+        finally:
+            os.close(fd)
 
     def _prepare_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1439,6 +1573,116 @@ def _validate_bytes(model: type[_ModelT], value: bytes) -> _ModelT:
         return model.model_validate_json(bytes(value))
     except ValidationError as exc:
         raise StoreCorruptionError(f"persisted {model.__name__} is invalid") from exc
+
+
+def _write_all(fd: int, content: bytes) -> None:
+    view = memoryview(content)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("failed to write workspace upload")
+        view = view[written:]
+
+
+def _require_bound_regular_file(path: Path, fd: int, *, expected_size: int) -> None:
+    metadata = os.fstat(fd)
+    _require_private_regular_metadata(metadata)
+    if metadata.st_size != expected_size:
+        raise StoreCorruptionError("workspace upload file size is invalid")
+    _require_path_binding(path, metadata)
+
+
+def _require_bound_regular_entry(
+    parent_fd: int,
+    name: str,
+    fd: int,
+    *,
+    expected_size: int,
+) -> None:
+    metadata = os.fstat(fd)
+    _require_private_regular_metadata(metadata)
+    if metadata.st_size != expected_size:
+        raise StoreCorruptionError("workspace upload file size is invalid")
+    _require_entry_binding(parent_fd, name, metadata)
+
+
+def _require_private_regular_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise StoreCorruptionError("workspace upload file is unsafe")
+
+
+def _require_private_directory_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise StoreCorruptionError("Core Control managed root is not privately owned")
+
+
+def _require_path_binding(path: Path, expected: os.stat_result) -> None:
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise StoreCorruptionError("Core Control managed path binding is invalid") from exc
+    if not _same_identity(current, expected):
+        raise StoreCorruptionError("Core Control managed path binding changed")
+
+
+def _require_entry_binding(parent_fd: int, name: str, expected: os.stat_result) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise StoreCorruptionError("Core Control managed entry binding is invalid") from exc
+    if not _same_identity(current, expected):
+        raise StoreCorruptionError("Core Control managed entry binding changed")
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _remove_entry_at(parent_fd: int, name: str) -> None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise StoreCorruptionError("Core Control managed orphan is unreadable") from exc
+    if metadata.st_uid != os.geteuid():
+        raise StoreCorruptionError("Core Control managed orphan has the wrong owner")
+    if not stat.S_ISDIR(metadata.st_mode):
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+        except OSError as exc:
+            raise StoreCorruptionError("Core Control managed orphan could not be removed") from exc
+        return
+
+    try:
+        child_fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise StoreCorruptionError("Core Control managed orphan directory is unsafe") from exc
+    try:
+        if not _same_identity(os.fstat(child_fd), metadata):
+            raise StoreCorruptionError("Core Control managed orphan binding changed")
+        for child_name in os.listdir(child_fd):
+            _remove_entry_at(child_fd, child_name)
+        _require_entry_binding(parent_fd, name, metadata)
+    finally:
+        os.close(child_fd)
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError as exc:
+        raise StoreCorruptionError("Core Control managed orphan directory could not be removed") from exc
 
 
 def _fsync_directory(path: Path) -> None:

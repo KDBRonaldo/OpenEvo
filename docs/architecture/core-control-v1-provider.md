@@ -64,6 +64,15 @@ The store uses full synchronous commits and WAL journaling. It does not persist
 the bearer, host paths in API resources, model credentials, commands, or open
 metadata.
 
+Startup recovery runs while the provider holds its exclusive process lock. It
+opens both managed workspace roots as owner-verified private directory FDs,
+validates every project publication against its finalized upload and the exact
+published tree, and fails startup when a referenced archive or snapshot is
+missing, replaced, or corrupt. Unreferenced upload files, temporary
+publications, and snapshots left by a crash after publish rename but before the
+SQLite commit are removed relative to those held FDs without following
+symlinks; cleanup never traverses outside the managed roots.
+
 Project and upload ETags hash canonical resource content plus an internal
 monotonic resource version. Idempotency identity binds the Core v1 principal,
 operation ID, resource scope, canonical request, and semantic CAS headers. An
@@ -80,9 +89,12 @@ an active revision, so projects cannot become `ready` in this phase.
 Upload creation freezes the current project snapshot, project ETag, archive
 declaration, and optional base workspace snapshot. A chunk is accepted only at
 `accepted_offset`, is limited by the frozen 8 MiB chunk contract, and must match
-its decoded length and SHA-256. Bytes are flushed and `fsync`ed before SQLite
-advances the offset. On startup, an uncommitted file tail is truncated to the
-durable offset; a file shorter than that offset fails closed.
+its decoded length and SHA-256. Core loops over short writes and treats a zero
+write as failure; the held upload FD is truncated back to the previous durable
+offset on any write, `fsync`, or database failure. SQLite advances the offset
+only after every byte is present and `fsync`ed. On startup, an uncommitted file
+tail is truncated to the durable offset; a file shorter than that offset fails
+closed.
 
 Finalize requires both upload `If-Match` and `If-Project-Match`. The latter must
 equal the upload's frozen project ETag and the current project ETag, and the
@@ -90,13 +102,16 @@ frozen project snapshot must still be current. Core verifies complete size and
 SHA-256, every deterministic POSIX ustar header and checksum, NFC POSIX paths,
 parent/order rules, modes, entry and extracted-byte totals, zero padding, and
 the exact two-block terminator. Symlinks, hardlinks, devices, extensions,
-sparse/out-of-order content, and trailing bytes are rejected.
+sparse/out-of-order content, root or embedded `.`/`..` path segments, and
+trailing bytes are rejected as typed `workspace_archive_invalid` conflicts.
 
 Verified files are written under a private temporary snapshot directory,
 `fsync`ed, and renamed into the snapshot namespace. A final SQLite transaction
 rechecks both mutable resources, stores one `WorkspacePublicationV1`, signs a
 new project snapshot, updates the project and upload, and appends the project
-event. No run consumes this snapshot until the later run-owner phase.
+event. Recovery verifies the published owner, modes, link counts, exact entry
+set, sizes, and bytes against the retained canonical archive before serving
+projects. No run consumes this snapshot until the later run-owner phase.
 
 ## SSE Recovery
 
