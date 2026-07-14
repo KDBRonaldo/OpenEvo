@@ -58,10 +58,13 @@ The release identity covers:
 - every verified distribution artifact digest and installed inventory digest;
 - the release source commit.
 
-Each Desktop bootstrap creates a new random generation. The installer first
-creates an inode-bound authority under the owner-only
-`~/.openevo/core/release-staging/` root; it does not create the final release
-path. A system interpreter running with `-I` creates the venv there with copied
+Each Desktop bootstrap creates a new random generation. Under the owner-only
+`~/.openevo/core/release-staging/` root, the installer moves a new directory
+through closed `creating -> pending -> active` names; `pending` records the
+exact device and inode but its name alone does not authorize cleanup, and
+`active` is entered only after its inode-bound authority file is complete and
+durable. It does not create the final release path. A system interpreter
+running with `-I` creates the venv there with copied
 interpreter binaries, bootstraps pip, installs the uploaded wheel, and imports
 the Core service from that staged interpreter. It never imports through
 `PYTHONPATH`, writes the user site, or reuses or force-reinstalls an existing
@@ -73,15 +76,25 @@ complete lock-declared Core distribution inventory before entering lifecycle wor
 failure leaves the live generation and daemon untouched.
 
 Generation installation is serialized by an owner/inode-verified no-follow
-lock. Each stage also retains a `0600` authority lease through venv, ensurepip,
-pip, and import verification; installer children inherit that lease. Recovery
-scans at most eight closed-name stage roots and removes only owner-bound regular
-files, directories, and symlinks through held directory FDs, with fixed node,
-byte, and depth budgets. The authority is removed last. `SIGKILL`, ENOSPC, or an
-ordinary install failure is therefore either cleaned immediately or left as the
-same retryable authority. A busy, malformed, over-budget, replaced, or otherwise
-unsafe stage fails closed as `core_bootstrap_install_failed`; it is never a
-release and is not deleted by pathname guesswork.
+lock. Each active stage also retains a `0600` authority lease through venv,
+ensurepip, pip, and import verification; installer children inherit that lease.
+Recovery scans at most eight closed-name stage roots and removes only an exact
+name-encoded inode through held directory FDs, with fixed node, byte, and depth
+budgets. Cleanup first atomically enters `retiring`; the authority is removed
+only after all other entries are removed and the still-authorized inode moves
+to a random, inode-encoded `discard` tombstone in `release-quarantine`. Recovery
+may continue traversing a `retiring` inode only while its exact authority is
+valid. It may remove a `discard` tombstone only when it contains that valid
+authority alone, or when it is already empty after a durable authority unlink;
+it never traverses an authority-less tombstone. A crash before authority
+publication, including an authority-free `pending` or legacy `staged-*`
+residue, moves that directory without traversal or deletion into owner-only
+`release-quarantine`.
+`SIGKILL`, ENOSPC, and authority write/fsync failures therefore converge on the
+next serialized retry. A busy, malformed active authority, over-budget tree,
+replaced bound inode, or otherwise unsafe stage fails closed as
+`core_bootstrap_install_failed`; it is never a release and is not deleted by
+pathname guesswork.
 
 Concurrent verified generation interpreters serialize daemon attachment and
 replacement with the same host bootstrap lock. Direct service ensure calls

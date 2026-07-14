@@ -74,11 +74,16 @@ and invalid selection responses. This internal change does not alter frozen
 Desktop/Core OpenAPI or event contracts.
 
 The generation installer serializes recovery and installation under a verified
-owner-only lock. It creates venvs only under bounded `release-staging`, keeps an
-inode-bound child-inherited authority lease through ensurepip, wheel install, and
-staged import verification, and atomically publishes to
-`releases/<generation>` only after success. Failed cleanup leaves its authority
-for a typed fail-closed retry. Exit 73 maps to
+owner-only lock. It moves venv roots through inode-encoded
+`pending -> active -> retiring` stage names, keeps a child-inherited authority
+lease through ensurepip, wheel install, and staged import verification, and
+atomically publishes to `releases/<generation>` only after success. Recovery can
+finish a valid-authority retiring inode, then move the empty inode to a random
+inode-bound tombstone before removing authority. An authority-less tombstone is
+eligible only for an empty-directory removal; it is never traversed. A crash
+before authority publication is preserved in `release-quarantine` without
+traversal and cannot block the next retry. Unsafe bound
+state remains a typed fail-closed error. Exit 73 maps to
 `core_bootstrap_install_failed`, whose Desktop projection contains no command,
 path, proxy value, output, or secret.
 

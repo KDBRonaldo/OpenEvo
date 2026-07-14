@@ -339,7 +339,10 @@ def test_generation_bootstrap_retains_unsafe_cleanup_authority_and_fails_closed(
             exec(compile(core_control._GENERATION_BOOTSTRAP, "<bootstrap>", "exec"), {})
         assert failed.value.code == 73
 
-    stage = tmp_path / "core" / "release-staging" / f"staged-{generation}"
+    stages = list((tmp_path / "core" / "release-staging").iterdir())
+    assert len(stages) == 1
+    stage = stages[0]
+    assert stage.name.startswith(f"retiring-{generation}-")
     assert (stage / ".openevo-generation-authority").is_file()
     assert stat.S_ISFIFO(os.lstat(stage / "unsafe").st_mode)
     assert not install_root.exists()
@@ -350,6 +353,7 @@ def _generation_subprocess_source(
     install_root: Path,
     wheel: Path,
     kill_during_install: bool = False,
+    fault: str | None = None,
 ) -> str:
     run_body = (
         "os.kill(os.getpid(), signal.SIGKILL)"
@@ -357,7 +361,113 @@ def _generation_subprocess_source(
         else "return types.SimpleNamespace(returncode=0)"
     )
     return f"""
-import os, pathlib, signal, subprocess, sys, types, venv
+import errno, os, pathlib, signal, subprocess, sys, types, venv
+fault = {fault!r}
+real_fsync = os.fsync
+real_mkdir = os.mkdir
+real_rmdir = os.rmdir
+real_unlink = os.unlink
+real_write = os.write
+authority_fd = None
+fault_fired = False
+cleanup_faults = {{
+    'before_retiring_fsync',
+    'after_retiring_fsync',
+    'before_clear_fsync',
+    'after_clear_fsync',
+    'before_discard_quarantine_fsync',
+    'after_discard_quarantine_fsync',
+    'before_discard_staging_fsync',
+    'after_discard_staging_fsync',
+    'after_authority_unlink',
+    'before_empty_discard_fsync',
+    'after_empty_discard_fsync',
+    'before_discard_rmdir',
+    'after_discard_rmdir',
+}}
+def kill():
+    os.kill(os.getpid(), signal.SIGKILL)
+def fd_path(fd):
+    try:
+        return pathlib.Path(os.readlink(f'/proc/self/fd/{{fd}}'))
+    except OSError:
+        return None
+def fd_names(fd):
+    try:
+        return set(os.listdir(fd))
+    except OSError:
+        return set()
+def fault_mkdir(path, *args, **kwargs):
+    result = real_mkdir(path, *args, **kwargs)
+    if fault == 'after_mkdir' and str(path).startswith('creating-'):
+        kill()
+    return result
+def fault_write(fd, payload):
+    global authority_fd, fault_fired
+    if payload.startswith(b'openevo-core-generation-stage-v2'):
+        authority_fd = fd
+        if fault == 'authority_write' and not fault_fired:
+            fault_fired = True
+            raise OSError(errno.ENOSPC, 'authority write fault')
+    result = real_write(fd, payload)
+    if fault == 'after_authority_write' and fd == authority_fd:
+        kill()
+    return result
+def fault_fsync(fd):
+    global fault_fired
+    path = fd_path(fd)
+    name = path.name if path is not None else ''
+    names = fd_names(fd)
+    if fault == 'authority_fsync' and fd == authority_fd and not fault_fired:
+        fault_fired = True
+        raise OSError(errno.ENOSPC, 'authority fsync fault')
+    before = (
+        (fault == 'before_creating_fsync' and name == 'release-staging' and any(item.startswith('creating-') for item in names))
+        or (fault == 'before_pending_fsync' and name == 'release-staging' and any(item.startswith('pending-') for item in names))
+        or (fault == 'before_authority_dir_fsync' and name.startswith('pending-'))
+        or (fault == 'before_active_fsync' and name == 'release-staging' and any(item.startswith('active-') for item in names))
+        or (fault == 'before_install_stage_fsync' and name.startswith('active-') and 'bin' in names)
+        or (fault == 'before_retiring_fsync' and name == 'release-staging' and any(item.startswith('retiring-') for item in names))
+        or (fault == 'before_clear_fsync' and name.startswith('retiring-'))
+        or (fault == 'before_discard_quarantine_fsync' and name == 'release-quarantine' and any(item.startswith('discard-') for item in names))
+        or (fault == 'before_discard_staging_fsync' and name == 'release-staging' and not names and (path.parent / 'release-quarantine').is_dir())
+        or (fault == 'before_empty_discard_fsync' and name.startswith('discard-') and '.openevo-generation-authority' not in names)
+        or (fault == 'before_release_fsync' and name == 'releases' and {install_root.name!r} in names)
+        or (fault == 'before_publish_staging_fsync' and name == 'release-staging' and not names and (path.parent / 'releases' / {install_root.name!r}).is_dir())
+    )
+    if before:
+        kill()
+    result = real_fsync(fd)
+    after = (
+        (fault == 'after_creating_fsync' and name == 'release-staging' and any(item.startswith('creating-') for item in names))
+        or (fault == 'after_pending_fsync' and name == 'release-staging' and any(item.startswith('pending-') for item in names))
+        or (fault == 'after_authority_file_fsync' and fd == authority_fd)
+        or (fault == 'after_authority_dir_fsync' and name.startswith('pending-'))
+        or (fault == 'after_active_fsync' and name == 'release-staging' and any(item.startswith('active-') for item in names))
+        or (fault == 'after_install_stage_fsync' and name.startswith('active-') and 'bin' in names)
+        or (fault == 'after_retiring_fsync' and name == 'release-staging' and any(item.startswith('retiring-') for item in names))
+        or (fault == 'after_clear_fsync' and name.startswith('retiring-'))
+        or (fault == 'after_discard_quarantine_fsync' and name == 'release-quarantine' and any(item.startswith('discard-') for item in names))
+        or (fault == 'after_discard_staging_fsync' and name == 'release-staging' and not names and (path.parent / 'release-quarantine').is_dir())
+        or (fault == 'after_empty_discard_fsync' and name.startswith('discard-') and '.openevo-generation-authority' not in names)
+        or (fault == 'after_release_fsync' and name == 'releases' and {install_root.name!r} in names)
+        or (fault == 'after_publish_staging_fsync' and name == 'release-staging' and not names and (path.parent / 'releases' / {install_root.name!r}).is_dir())
+    )
+    if after:
+        kill()
+    return result
+def fault_unlink(path, *args, **kwargs):
+    result = real_unlink(path, *args, **kwargs)
+    if fault == 'after_authority_unlink' and path == '.openevo-generation-authority':
+        kill()
+    return result
+def fault_rmdir(path, *args, **kwargs):
+    if fault == 'before_discard_rmdir' and str(path).startswith('discard-'):
+        kill()
+    result = real_rmdir(path, *args, **kwargs)
+    if fault == 'after_discard_rmdir' and str(path).startswith('discard-'):
+        kill()
+    return result
 class FakeEnvBuilder:
     def __init__(self, **kwargs):
         pass
@@ -367,9 +477,16 @@ class FakeEnvBuilder:
         interpreter.write_bytes(b'python')
         interpreter.chmod(0o700)
 def fake_run(*args, **kwargs):
+    if fault in cleanup_faults:
+        return types.SimpleNamespace(returncode=1)
     {run_body}
 venv.EnvBuilder = FakeEnvBuilder
 subprocess.run = fake_run
+os.fsync = fault_fsync
+os.mkdir = fault_mkdir
+os.rmdir = fault_rmdir
+os.unlink = fault_unlink
+os.write = fault_write
 os.execve = lambda *args: (_ for _ in ()).throw(SystemExit(0))
 sys.argv = ['generation-bootstrap', {str(install_root)!r}, {str(wheel)!r}, sys.executable, 'bootstrap']
 exec(compile({core_control._GENERATION_BOOTSTRAP!r}, '<bootstrap>', 'exec'), {{}})
@@ -401,7 +518,10 @@ def test_generation_bootstrap_recovers_sigkill_residue_and_retries_successfully(
         text=True,
     )
     assert crashed.returncode == -signal.SIGKILL
-    stale_stage = service_root / "release-staging" / f"staged-{crashed_generation}"
+    stale_stages = list((service_root / "release-staging").iterdir())
+    assert len(stale_stages) == 1
+    stale_stage = stale_stages[0]
+    assert stale_stage.name.startswith(f"active-{crashed_generation}-")
     assert (stale_stage / ".openevo-generation-authority").is_file()
 
     recovered_root = service_root / "releases" / recovered_generation
@@ -421,6 +541,533 @@ def test_generation_bootstrap_recovers_sigkill_residue_and_retries_successfully(
     assert recovered_root.is_dir()
     assert not stale_stage.exists()
     assert list((service_root / "release-staging").iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("fault", "residue_root", "residue_state", "quarantined"),
+    [
+        ("after_mkdir", "release-staging", "creating", True),
+        ("after_authority_unlink", "release-quarantine", "discard", False),
+    ],
+)
+def test_generation_bootstrap_recovers_exact_sigkill_windows(
+    tmp_path: Path,
+    fault: str,
+    residue_root: str,
+    residue_state: str,
+    quarantined: bool,
+) -> None:
+    service_root = tmp_path / "core"
+    crashed_generation = "9" * 32
+    retried_generation = "a" * 32
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    crashed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / crashed_generation,
+                wheel=wheel,
+                fault=fault,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert crashed.returncode == -signal.SIGKILL, crashed.stderr
+    residue = list((service_root / residue_root).iterdir())
+    assert len(residue) == 1
+    assert residue[0].name.startswith(f"{residue_state}-{crashed_generation}")
+    if fault == "after_authority_unlink":
+        assert not (residue[0] / ".openevo-generation-authority").exists()
+
+    retried = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / retried_generation,
+                wheel=wheel,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.returncode == 0, retried.stderr
+    assert (service_root / "releases" / retried_generation).is_dir()
+    assert list((service_root / "release-staging").iterdir()) == []
+    quarantine = list((service_root / "release-quarantine").iterdir())
+    assert bool(quarantine) is quarantined
+    if quarantine:
+        assert quarantine[0].name.startswith(f"quarantined-{crashed_generation}-")
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "after_mkdir",
+        "before_creating_fsync",
+        "after_creating_fsync",
+        "before_pending_fsync",
+        "after_pending_fsync",
+        "after_authority_write",
+        "after_authority_file_fsync",
+        "before_authority_dir_fsync",
+        "after_authority_dir_fsync",
+        "before_active_fsync",
+        "after_active_fsync",
+        "before_install_stage_fsync",
+        "after_install_stage_fsync",
+        "before_release_fsync",
+        "after_release_fsync",
+        "before_publish_staging_fsync",
+        "after_publish_staging_fsync",
+        "before_retiring_fsync",
+        "after_retiring_fsync",
+        "before_clear_fsync",
+        "after_clear_fsync",
+        "before_discard_quarantine_fsync",
+        "after_discard_quarantine_fsync",
+        "before_discard_staging_fsync",
+        "after_discard_staging_fsync",
+        "after_authority_unlink",
+        "before_empty_discard_fsync",
+        "after_empty_discard_fsync",
+        "before_discard_rmdir",
+        "after_discard_rmdir",
+    ],
+)
+def test_generation_bootstrap_recovers_every_persistence_boundary(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    service_root = tmp_path / "core"
+    crashed_generation = "3" * 32
+    retried_generation = "4" * 32
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    crashed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / crashed_generation,
+                wheel=wheel,
+                fault=fault,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert crashed.returncode == -signal.SIGKILL, (fault, crashed.stderr)
+
+    retried = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / retried_generation,
+                wheel=wheel,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.returncode == 0, (fault, retried.stderr)
+    assert (service_root / "releases" / retried_generation).is_dir()
+    assert list((service_root / "release-staging").iterdir()) == []
+    assert not any(
+        path.name.startswith("discard-")
+        for path in (service_root / "release-quarantine").iterdir()
+    )
+
+
+@pytest.mark.parametrize("fault", ["authority_write", "authority_fsync"])
+def test_generation_bootstrap_recovers_authority_io_failure(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    service_root = tmp_path / "core"
+    failed_generation = "b" * 32
+    retried_generation = "c" * 32
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    failed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / failed_generation,
+                wheel=wheel,
+                fault=fault,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert failed.returncode == 73, failed.stderr
+    assert list((service_root / "release-staging").iterdir()) == []
+
+    retried = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / retried_generation,
+                wheel=wheel,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.returncode == 0, retried.stderr
+    assert (service_root / "releases" / retried_generation).is_dir()
+    assert list((service_root / "release-staging").iterdir()) == []
+
+
+def test_generation_bootstrap_recovers_sigkill_before_tombstone_removal(
+    tmp_path: Path,
+) -> None:
+    service_root = tmp_path / "core"
+    crashed_generation = "f" * 32
+    retried_generation = "0" * 32
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    crashed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / crashed_generation,
+                wheel=wheel,
+                fault="before_discard_rmdir",
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert crashed.returncode == -signal.SIGKILL, crashed.stderr
+    assert list((service_root / "release-staging").iterdir()) == []
+    tombstones = list((service_root / "release-quarantine").iterdir())
+    assert len(tombstones) == 1
+    assert tombstones[0].name.startswith(f"discard-{crashed_generation}-")
+
+    retried = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / retried_generation,
+                wheel=wheel,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.returncode == 0, retried.stderr
+    assert (service_root / "releases" / retried_generation).is_dir()
+    assert list((service_root / "release-staging").iterdir()) == []
+    assert list((service_root / "release-quarantine").iterdir()) == []
+
+
+def test_generation_bootstrap_quarantines_legacy_unauthorized_stage_without_deleting(
+    tmp_path: Path,
+) -> None:
+    service_root = tmp_path / "core"
+    legacy_generation = "d" * 32
+    retried_generation = "e" * 32
+    legacy_stage = service_root / "release-staging" / f"staged-{legacy_generation}"
+    legacy_stage.mkdir(mode=0o700, parents=True)
+    sentinel = legacy_stage / "foreign-sentinel"
+    sentinel.write_bytes(b"preserve me")
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+
+    retried = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / retried_generation,
+                wheel=wheel,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.returncode == 0, retried.stderr
+    assert list((service_root / "release-staging").iterdir()) == []
+    quarantined = list((service_root / "release-quarantine").iterdir())
+    assert len(quarantined) == 1
+    assert quarantined[0].name.startswith(f"quarantined-{legacy_generation}-")
+    assert (quarantined[0] / sentinel.name).read_bytes() == b"preserve me"
+
+
+@pytest.mark.parametrize("state", ["pending", "retiring"])
+def test_generation_bootstrap_never_claims_authority_free_bound_stage(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    service_root = tmp_path / "core"
+    foreign_generation = "1" * 32
+    retried_generation = "2" * 32
+    staging_root = service_root / "release-staging"
+    foreign_stage = staging_root / "unbound"
+    foreign_stage.mkdir(mode=0o700, parents=True)
+    metadata = foreign_stage.stat()
+    bound_name = (
+        f"{state}-{foreign_generation}-{metadata.st_dev:x}-{metadata.st_ino:x}"
+    )
+    foreign_stage = foreign_stage.rename(staging_root / bound_name)
+    sentinel = foreign_stage / "foreign-sentinel"
+    sentinel.write_bytes(b"preserve me")
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+
+    retried = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / retried_generation,
+                wheel=wheel,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.returncode == 0, retried.stderr
+    assert list(staging_root.iterdir()) == []
+    quarantined = list((service_root / "release-quarantine").iterdir())
+    assert len(quarantined) == 1
+    assert quarantined[0].name.startswith(f"quarantined-{foreign_generation}-")
+    assert (quarantined[0] / sentinel.name).read_bytes() == b"preserve me"
+
+
+def _create_bound_stage(
+    service_root: Path,
+    *,
+    generation: str,
+    state: str,
+) -> Path:
+    staging_root = service_root / "release-staging"
+    stage = staging_root / "unbound"
+    stage.mkdir(mode=0o700, parents=True)
+    metadata = stage.stat()
+    return stage.rename(
+        staging_root
+        / f"{state}-{generation}-{metadata.st_dev:x}-{metadata.st_ino:x}"
+    )
+
+
+def _write_stage_authority(stage: Path, generation: str) -> Path:
+    metadata = stage.stat()
+    authority = stage / ".openevo-generation-authority"
+    authority.write_text(
+        "openevo-core-generation-stage-v2\n"
+        f"{generation}\n{metadata.st_dev}:{metadata.st_ino}\n",
+        encoding="ascii",
+    )
+    authority.chmod(0o600)
+    return authority
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "stage_symlink",
+        "stage_mode",
+        "stage_identity",
+        "authority_symlink",
+        "authority_mode",
+        "authority_identity",
+        "authority_owner",
+    ],
+)
+def test_generation_bootstrap_rejects_untrusted_active_stage_without_deleting(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    service_root = tmp_path / "core"
+    generation = "5" * 32
+    retry_generation = "6" * 32
+    external = tmp_path / "external"
+    external.mkdir()
+    external_sentinel = external / "sentinel"
+    external_sentinel.write_bytes(b"preserve external")
+    staging_root = service_root / "release-staging"
+
+    if corruption == "stage_symlink":
+        staging_root.mkdir(mode=0o700, parents=True)
+        stage = staging_root / f"active-{generation}-1-1"
+        stage.symlink_to(external, target_is_directory=True)
+        preserved = external_sentinel
+    else:
+        stage = _create_bound_stage(
+            service_root,
+            generation=generation,
+            state="active",
+        )
+        sentinel = stage / "foreign-sentinel"
+        sentinel.write_bytes(b"preserve stage")
+        preserved = sentinel
+        authority = _write_stage_authority(stage, generation)
+        if corruption == "stage_mode":
+            stage.chmod(0o755)
+        elif corruption == "stage_identity":
+            metadata = stage.stat()
+            stage = stage.rename(
+                staging_root
+                / f"active-{generation}-{metadata.st_dev:x}-{metadata.st_ino + 1:x}"
+            )
+            preserved = stage / sentinel.name
+        elif corruption == "authority_symlink":
+            authority.unlink()
+            authority.symlink_to(external_sentinel)
+        elif corruption == "authority_mode":
+            authority.chmod(0o644)
+        elif corruption == "authority_identity":
+            authority.write_text(
+                "openevo-core-generation-stage-v2\n"
+                f"{'7' * 32}\n1:1\n",
+                encoding="ascii",
+            )
+        elif corruption == "authority_owner":
+            if os.geteuid() != 0:
+                pytest.skip("changing authority ownership requires root")
+            os.chown(authority, 1, 1)
+
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    retried = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / retry_generation,
+                wheel=wheel,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.returncode == 73, (corruption, retried.stderr)
+    assert preserved.read_bytes().startswith(b"preserve")
+    assert not (service_root / "releases" / retry_generation).exists()
+
+
+def test_generation_bootstrap_unlinks_stage_symlink_without_following_target(
+    tmp_path: Path,
+) -> None:
+    service_root = tmp_path / "core"
+    stale_generation = "7" * 32
+    retry_generation = "8" * 32
+    stage = _create_bound_stage(
+        service_root,
+        generation=stale_generation,
+        state="active",
+    )
+    _write_stage_authority(stage, stale_generation)
+    external = tmp_path / "external-sentinel"
+    external.write_bytes(b"preserve external")
+    (stage / "external-link").symlink_to(external)
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+
+    retried = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / retry_generation,
+                wheel=wheel,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.returncode == 0, retried.stderr
+    assert external.read_bytes() == b"preserve external"
+    assert list((service_root / "release-staging").iterdir()) == []
+
+
+def test_generation_bootstrap_never_traverses_authority_free_tombstone(
+    tmp_path: Path,
+) -> None:
+    service_root = tmp_path / "core"
+    stale_generation = "9" * 32
+    retry_generation = "a" * 32
+    quarantine_root = service_root / "release-quarantine"
+    tombstone = quarantine_root / "unbound"
+    tombstone.mkdir(mode=0o700, parents=True)
+    metadata = tombstone.stat()
+    tombstone = tombstone.rename(
+        quarantine_root
+        / (
+            f"discard-{stale_generation}-{metadata.st_dev:x}-{metadata.st_ino:x}-"
+            f"{'b' * 32}"
+        )
+    )
+    sentinel = tombstone / "foreign-sentinel"
+    sentinel.write_bytes(b"preserve tombstone")
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+
+    retried = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _generation_subprocess_source(
+                install_root=service_root / "releases" / retry_generation,
+                wheel=wheel,
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.returncode == 73, retried.stderr
+    assert sentinel.read_bytes() == b"preserve tombstone"
+    assert not (service_root / "releases" / retry_generation).exists()
 
 
 def test_generation_bootstrap_serializes_concurrent_publications(tmp_path: Path) -> None:

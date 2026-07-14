@@ -41,6 +41,7 @@ import fcntl
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import stat
 import sys
@@ -53,7 +54,7 @@ service_argv = sys.argv[4:]
 uid = os.geteuid()
 generation = install_root.name
 service_root = install_root.parent.parent
-staging_name = "staged-" + generation
+creating_name = "creating-" + generation
 authority_name = ".openevo-generation-authority"
 max_staged_generations = 8
 max_cleanup_nodes = 200000
@@ -155,6 +156,31 @@ def open_lock(parent, name):
         raise
 
 
+def bound_stage_name(state, stage_generation, stage_metadata):
+    return (
+        state
+        + "-"
+        + stage_generation
+        + "-"
+        + format(stage_metadata.st_dev, "x")
+        + "-"
+        + format(stage_metadata.st_ino, "x")
+    )
+
+
+def parse_bound_stage_name(stage_name):
+    match = re.fullmatch(
+        r"(pending|active|retiring)-([0-9a-f]{32})-([0-9a-f]+)-([0-9a-f]+)",
+        stage_name,
+    )
+    if match is None:
+        return None
+    state, stage_generation, device, inode = match.groups()
+    if device != format(int(device, 16), "x") or inode != format(int(inode, 16), "x"):
+        fail()
+    return state, stage_generation, int(device, 16), int(inode, 16)
+
+
 def create_authority(stage_fd, stage_metadata):
     fd = os.open(
         authority_name,
@@ -164,7 +190,7 @@ def create_authority(stage_fd, stage_metadata):
     )
     try:
         payload = (
-            "openevo-core-generation-stage-v1\n"
+            "openevo-core-generation-stage-v2\n"
             + generation
             + "\n"
             + str(stage_metadata.st_dev)
@@ -194,7 +220,7 @@ def create_authority(stage_fd, stage_metadata):
         raise
 
 
-def verify_authority(stage_fd, stage_name, *, lock):
+def verify_authority(stage_fd, stage_generation, *, lock, allow_legacy=False):
     authority_fd = os.open(
         authority_name,
         os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -205,26 +231,35 @@ def verify_authority(stage_fd, stage_name, *, lock):
         authority = os.fstat(authority_fd)
         current = os.stat(authority_name, dir_fd=stage_fd, follow_symlinks=False)
         expected = (
-            "openevo-core-generation-stage-v1\n"
-            + stage_name[len("staged-"):]
+            "openevo-core-generation-stage-v2\n"
+            + stage_generation
             + "\n"
             + str(stage_metadata.st_dev)
             + ":"
             + str(stage_metadata.st_ino)
             + "\n"
         ).encode("ascii")
+        legacy_expected = (
+            "openevo-core-generation-stage-v1\n"
+            + stage_generation
+            + "\n"
+            + str(stage_metadata.st_dev)
+            + ":"
+            + str(stage_metadata.st_ino)
+            + "\n"
+        ).encode("ascii")
+        accepted = (expected, legacy_expected) if allow_legacy else (expected,)
         if (
             not stat.S_ISREG(authority.st_mode)
             or authority.st_uid != uid
             or authority.st_nlink != 1
             or stat.S_IMODE(authority.st_mode) != 0o600
-            or authority.st_size != len(expected)
             or authority.st_size > 256
             or (authority.st_dev, authority.st_ino) != (current.st_dev, current.st_ino)
         ):
             fail()
         content = os.pread(authority_fd, 257, 0)
-        if content != expected:
+        if content not in accepted or authority.st_size != len(content):
             fail()
         if lock:
             try:
@@ -237,7 +272,41 @@ def verify_authority(stage_fd, stage_name, *, lock):
         raise
 
 
-def cleanup_stage(staging_fd, stage_name):
+def has_valid_authority(stage_fd, stage_generation, *, allow_legacy=False):
+    try:
+        authority_fd = verify_authority(
+            stage_fd,
+            stage_generation,
+            lock=False,
+            allow_legacy=allow_legacy,
+        )
+    except (FileNotFoundError, InstallFailure, OSError):
+        return False
+    os.close(authority_fd)
+    return True
+
+
+def quarantine_unbound_stage(staging_fd, quarantine_fd, stage_name):
+    stage_fd = os.open(stage_name, dir_flags, dir_fd=staging_fd)
+    try:
+        opened = require_owned_dir(stage_fd)
+        current = os.stat(stage_name, dir_fd=staging_fd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            fail()
+        match = re.search(r"([0-9a-f]{32})", stage_name)
+        if match is None:
+            fail()
+        quarantine_name = bound_stage_name("retiring", match.group(1), opened).replace(
+            "retiring-", "quarantined-", 1
+        )
+        rename_noreplace(staging_fd, stage_name, quarantine_fd, quarantine_name)
+        os.fsync(quarantine_fd)
+        os.fsync(staging_fd)
+    finally:
+        os.close(stage_fd)
+
+
+def cleanup_bound_stage(staging_fd, quarantine_fd, stage_name, *, legacy=False):
     stage_fd = os.open(stage_name, dir_flags, dir_fd=staging_fd)
     authority_fd = -1
     budget = {"nodes": 0, "bytes": 0}
@@ -246,7 +315,25 @@ def cleanup_stage(staging_fd, stage_name):
         current = os.stat(stage_name, dir_fd=staging_fd, follow_symlinks=False)
         if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
             fail()
-        authority_fd = verify_authority(stage_fd, stage_name, lock=True)
+        if legacy:
+            stage_generation = stage_name[len("staged-"):]
+            authority_fd = verify_authority(
+                stage_fd, stage_generation, lock=True, allow_legacy=True
+            )
+            retiring_name = bound_stage_name("retiring", stage_generation, opened)
+        else:
+            parsed = parse_bound_stage_name(stage_name)
+            if parsed is None:
+                fail()
+            state, stage_generation, expected_device, expected_inode = parsed
+            if (opened.st_dev, opened.st_ino) != (expected_device, expected_inode):
+                fail()
+            authority_fd = verify_authority(stage_fd, stage_generation, lock=True)
+            retiring_name = bound_stage_name("retiring", stage_generation, opened)
+        if stage_name != retiring_name:
+            rename_noreplace(staging_fd, stage_name, staging_fd, retiring_name)
+            os.fsync(staging_fd)
+            stage_name = retiring_name
 
         def clear_directory(fd, depth):
             if depth > max_cleanup_depth:
@@ -301,29 +388,130 @@ def cleanup_stage(staging_fd, stage_name):
             os.fsync(fd)
 
         clear_directory(stage_fd, 0)
-        current_authority = os.stat(
-            authority_name, dir_fd=stage_fd, follow_symlinks=False
-        )
-        opened_authority = os.fstat(authority_fd)
-        if (opened_authority.st_dev, opened_authority.st_ino) != (
-            current_authority.st_dev,
-            current_authority.st_ino,
-        ):
-            fail()
-        os.unlink(authority_name, dir_fd=stage_fd)
-        os.fsync(stage_fd)
         current = os.stat(stage_name, dir_fd=staging_fd, follow_symlinks=False)
         if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            fail()
+        discard_name = (
+            "discard-"
+            + stage_generation
+            + "-"
+            + format(opened.st_dev, "x")
+            + "-"
+            + format(opened.st_ino, "x")
+            + "-"
+            + secrets.token_hex(16)
+        )
+        rename_noreplace(staging_fd, stage_name, quarantine_fd, discard_name)
+        os.fsync(quarantine_fd)
+        os.fsync(staging_fd)
+        discarded = os.stat(discard_name, dir_fd=quarantine_fd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (discarded.st_dev, discarded.st_ino):
             fail()
     finally:
         if authority_fd >= 0:
             os.close(authority_fd)
+        if stage_fd >= 0:
+            os.close(stage_fd)
+
+    cleanup_discard(quarantine_fd, discard_name)
+
+
+def cleanup_discard(quarantine_fd, discard_name):
+    match = re.fullmatch(
+        r"discard-([0-9a-f]{32})-([0-9a-f]+)-([0-9a-f]+)-[0-9a-f]{32}",
+        discard_name,
+    )
+    if match is None:
+        fail()
+    stage_generation, device, inode = match.groups()
+    if device != format(int(device, 16), "x") or inode != format(int(inode, 16), "x"):
+        fail()
+    expected_identity = (int(device, 16), int(inode, 16))
+    stage_fd = os.open(discard_name, dir_flags, dir_fd=quarantine_fd)
+    authority_fd = -1
+    try:
+        opened = require_owned_dir(stage_fd)
+        current = os.stat(discard_name, dir_fd=quarantine_fd, follow_symlinks=False)
+        if (
+            (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            or (opened.st_dev, opened.st_ino) != expected_identity
+        ):
+            fail()
+        with os.scandir(stage_fd) as entries:
+            names = [entry.name for entry in entries]
+        if names == [authority_name]:
+            authority_fd = verify_authority(
+                stage_fd,
+                stage_generation,
+                lock=True,
+                allow_legacy=True,
+            )
+            with os.scandir(stage_fd) as entries:
+                if [entry.name for entry in entries] != [authority_name]:
+                    fail()
+            opened_authority = os.fstat(authority_fd)
+            current_authority = os.stat(
+                authority_name, dir_fd=stage_fd, follow_symlinks=False
+            )
+            if (opened_authority.st_dev, opened_authority.st_ino) != (
+                current_authority.st_dev,
+                current_authority.st_ino,
+            ):
+                fail()
+            os.unlink(authority_name, dir_fd=stage_fd)
+            os.fsync(stage_fd)
+        elif names:
+            fail()
+        with os.scandir(stage_fd) as entries:
+            if next(entries, None) is not None:
+                fail()
+        current = os.stat(discard_name, dir_fd=quarantine_fd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            fail()
+        os.rmdir(discard_name, dir_fd=quarantine_fd)
+        os.fsync(quarantine_fd)
+    finally:
+        if authority_fd >= 0:
+            os.close(authority_fd)
         os.close(stage_fd)
-    os.rmdir(stage_name, dir_fd=staging_fd)
-    os.fsync(staging_fd)
 
 
-def reconcile_staging(staging_fd):
+def reconcile_quarantine(quarantine_fd):
+    names = []
+    with os.scandir(quarantine_fd) as entries:
+        for entry in entries:
+            if len(names) >= max_staged_generations * 8:
+                fail()
+            names.append(entry.name)
+    for name in names:
+        if re.fullmatch(
+            r"quarantined-[0-9a-f]{32}-[0-9a-f]+-[0-9a-f]+", name
+        ) is not None:
+            continue
+        if not name.startswith("discard-"):
+            fail()
+        cleanup_discard(quarantine_fd, name)
+
+
+def recover_bound_stage(staging_fd, quarantine_fd, stage_name):
+    parsed = parse_bound_stage_name(stage_name)
+    if parsed is None:
+        fail()
+    state, stage_generation, _device, _inode = parsed
+    stage_fd = os.open(stage_name, dir_flags, dir_fd=staging_fd)
+    try:
+        valid_authority = has_valid_authority(stage_fd, stage_generation)
+    finally:
+        os.close(stage_fd)
+    if valid_authority:
+        cleanup_bound_stage(staging_fd, quarantine_fd, stage_name)
+    elif state in {"pending", "retiring"}:
+        quarantine_unbound_stage(staging_fd, quarantine_fd, stage_name)
+    else:
+        fail()
+
+
+def reconcile_staging(staging_fd, quarantine_fd):
     names = []
     with os.scandir(staging_fd) as entries:
         for entry in entries:
@@ -331,9 +519,19 @@ def reconcile_staging(staging_fd):
                 fail()
             names.append(entry.name)
     for name in names:
-        if re.fullmatch(r"staged-[0-9a-f]{32}", name) is None:
-            fail()
-        cleanup_stage(staging_fd, name)
+        if re.fullmatch(r"creating-[0-9a-f]{32}", name) is not None:
+            quarantine_unbound_stage(staging_fd, quarantine_fd, name)
+            continue
+        if re.fullmatch(r"staged-[0-9a-f]{32}", name) is not None:
+            try:
+                cleanup_bound_stage(staging_fd, quarantine_fd, name, legacy=True)
+            except (FileNotFoundError, InstallFailure, OSError):
+                quarantine_unbound_stage(staging_fd, quarantine_fd, name)
+            continue
+        if parse_bound_stage_name(name) is not None:
+            recover_bound_stage(staging_fd, quarantine_fd, name)
+            continue
+        fail()
 
 
 def rename_noreplace(source_parent, source_name, destination_parent, destination_name):
@@ -397,9 +595,12 @@ service_environment = {
 service_root_fd = -1
 lock_fd = -1
 staging_fd = -1
+quarantine_fd = -1
 releases_fd = -1
 stage_fd = -1
 authority_fd = -1
+stage_name = None
+creating_created = False
 published = False
 try:
     try:
@@ -410,21 +611,31 @@ try:
         lock_fd = open_lock(service_root_fd, "generation-install.lock")
         require_binding(service_root, service_root_fd)
         staging_fd = ensure_private_dir(service_root_fd, "release-staging")
+        quarantine_fd = ensure_private_dir(service_root_fd, "release-quarantine")
         releases_fd = ensure_private_dir(service_root_fd, "releases")
-        reconcile_staging(staging_fd)
+        reconcile_quarantine(quarantine_fd)
+        reconcile_staging(staging_fd, quarantine_fd)
         require_binding(service_root, service_root_fd)
-        os.mkdir(staging_name, 0o700, dir_fd=staging_fd)
+        os.mkdir(creating_name, 0o700, dir_fd=staging_fd)
+        creating_created = True
         os.fsync(staging_fd)
-        stage_fd = os.open(staging_name, dir_flags, dir_fd=staging_fd)
+        stage_fd = os.open(creating_name, dir_flags, dir_fd=staging_fd)
         stage_metadata = require_owned_dir(stage_fd)
-        current_stage = os.stat(staging_name, dir_fd=staging_fd, follow_symlinks=False)
+        current_stage = os.stat(creating_name, dir_fd=staging_fd, follow_symlinks=False)
         if (stage_metadata.st_dev, stage_metadata.st_ino) != (
             current_stage.st_dev,
             current_stage.st_ino,
         ):
             fail()
+        stage_name = bound_stage_name("pending", generation, stage_metadata)
+        rename_noreplace(staging_fd, creating_name, staging_fd, stage_name)
+        os.fsync(staging_fd)
         authority_fd = create_authority(stage_fd, stage_metadata)
-        staged_root = Path("/proc/self/fd") / str(staging_fd) / staging_name
+        active_name = bound_stage_name("active", generation, stage_metadata)
+        rename_noreplace(staging_fd, stage_name, staging_fd, active_name)
+        os.fsync(staging_fd)
+        stage_name = active_name
+        staged_root = Path("/proc/self/fd") / str(staging_fd) / stage_name
         venv.EnvBuilder(with_pip=False, symlinks=False).create(staged_root)
         staged_interpreter = staged_root / "bin" / "python"
         module_runner = (
@@ -489,14 +700,14 @@ try:
         ):
             fail()
         require_binding(service_root, service_root_fd)
-        current_stage = os.stat(staging_name, dir_fd=staging_fd, follow_symlinks=False)
+        current_stage = os.stat(stage_name, dir_fd=staging_fd, follow_symlinks=False)
         if (stage_metadata.st_dev, stage_metadata.st_ino) != (
             current_stage.st_dev,
             current_stage.st_ino,
         ):
             fail()
         os.fsync(stage_fd)
-        rename_noreplace(staging_fd, staging_name, releases_fd, generation)
+        rename_noreplace(staging_fd, stage_name, releases_fd, generation)
         published = True
         os.fsync(releases_fd)
         os.fsync(staging_fd)
@@ -519,7 +730,12 @@ try:
                 if stage_fd >= 0:
                     os.close(stage_fd)
                     stage_fd = -1
-                cleanup_stage(staging_fd, staging_name)
+                if stage_name is not None:
+                    recover_bound_stage(staging_fd, quarantine_fd, stage_name)
+                elif creating_created and quarantine_fd >= 0:
+                    quarantine_unbound_stage(
+                        staging_fd, quarantine_fd, creating_name
+                    )
             except BaseException:
                 pass
         raise SystemExit(73) from None
@@ -530,6 +746,8 @@ finally:
         os.close(stage_fd)
     if releases_fd >= 0:
         os.close(releases_fd)
+    if quarantine_fd >= 0:
+        os.close(quarantine_fd)
     if staging_fd >= 0:
         os.close(staging_fd)
     if lock_fd >= 0:
