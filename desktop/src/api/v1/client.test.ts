@@ -8,7 +8,12 @@ import {
   negotiateVersion,
   type FetchLike,
 } from "./client";
-import { CONTRACT_FIXTURE_V1, PROFILE_PAGE_FIXTURE_V1 } from "./fixtures";
+import {
+  CONTRACT_FIXTURE_V1,
+  LOCAL_LOG_PAGE_FIXTURE_V1,
+  PROFILE_PAGE_FIXTURE_V1,
+  REFERENCED_LOG_PAGE_FIXTURE_V1,
+} from "./fixtures";
 
 const OTHER_OPENAPI_DIGEST = "d".repeat(64);
 
@@ -46,6 +51,81 @@ describe("Desktop Local API v1 client", () => {
     expect(headers.get("If-Match")).toBe(CONTRACT_FIXTURE_V1.profile.etag);
     expect(headers.get(DESKTOP_SESSION_HEADER)).toBe(CONTRACT_FIXTURE_V1.bootstrap.session_token);
     expect(init?.body).toBeUndefined();
+  });
+
+  it("keeps validation bodyless and lets Core own run admission references", async () => {
+    const fetchMock = vi
+      .fn<FetchLike>()
+      .mockResolvedValueOnce(jsonResponse(CONTRACT_FIXTURE_V1.validation))
+      .mockResolvedValueOnce(jsonResponse(CONTRACT_FIXTURE_V1.run, 202));
+    const client = fixtureClient(fetchMock);
+    const action = {
+      idempotencyKey: "project-action-fixture",
+      ifMatch: CONTRACT_FIXTURE_V1.project.etag,
+    };
+
+    await client.validateProject(CONTRACT_FIXTURE_V1.project.project_id, action);
+    await client.createRun({ project_id: CONTRACT_FIXTURE_V1.project.project_id }, action);
+
+    expect(fetchMock.mock.calls[0][1]?.body).toBeUndefined();
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      project_id: CONTRACT_FIXTURE_V1.project.project_id,
+    });
+    for (const call of fetchMock.mock.calls) {
+      const headers = new Headers(call[1]?.headers);
+      expect(headers.get("Idempotency-Key")).toBe(action.idempotencyKey);
+      expect(headers.get("If-Match")).toBe(action.ifMatch);
+    }
+  });
+
+  it("returns Core operations and exposes operation plus referenced-log reads", async () => {
+    const fetchMock = vi
+      .fn<FetchLike>()
+      .mockResolvedValueOnce(jsonResponse(CONTRACT_FIXTURE_V1.serviceOperation, 202))
+      .mockResolvedValueOnce(jsonResponse(CONTRACT_FIXTURE_V1.serviceOperation))
+      .mockResolvedValueOnce(jsonResponse(REFERENCED_LOG_PAGE_FIXTURE_V1));
+    const client = fixtureClient(fetchMock);
+
+    const operation = await client.restartService("service-control-fixture-1", {
+      idempotencyKey: "service-restart-fixture",
+      ifMatch: CONTRACT_FIXTURE_V1.service.etag,
+    });
+    const refreshed = await client.getCoreOperation(operation.id);
+    const logs = await client.coreLogs(operation.logs_ref);
+
+    expect(operation.kind).toBe("service_restart");
+    expect(refreshed.id).toBe(operation.id);
+    expect(logs.logs_ref).toBe(operation.logs_ref);
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/services/service-control-fixture-1/restart");
+    expect(String(fetchMock.mock.calls[1][0])).toContain(`/core/operations/${operation.id}`);
+    expect(String(fetchMock.mock.calls[2][0])).toContain(`/core/logs/${operation.logs_ref}`);
+    expect("stopService" in client).toBe(false);
+  });
+
+  it("parses local operation logs separately from Core logs", async () => {
+    const fetchMock = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(LOCAL_LOG_PAGE_FIXTURE_V1));
+    const client = fixtureClient(fetchMock);
+
+    const page = await client.operationLogs("operation-fixture-1");
+
+    expect(page.items[0]?.log_id).toBe("local-log-fixture-1");
+  });
+
+  it("returns the Core diagnostic directly from creation", async () => {
+    const fetchMock = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(CONTRACT_FIXTURE_V1.diagnostic, 202));
+    const client = fixtureClient(fetchMock);
+
+    const diagnostic = await client.createDiagnostic({
+      ...CONTRACT_FIXTURE_V1.diagnosticRequest,
+      scopes: [...CONTRACT_FIXTURE_V1.diagnosticRequest.scopes],
+    }, {
+      idempotencyKey: "diagnostic-create-fixture",
+    });
+
+    expect(diagnostic.id).toBe("diagnostic-fixture-1");
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual(
+      CONTRACT_FIXTURE_V1.diagnosticRequest,
+    );
   });
 
   it("keeps discovery unauthenticated while still using the injected endpoint", async () => {
@@ -120,21 +200,29 @@ describe("Desktop Local API v1 client", () => {
   it("covers maintenance and completed diagnostic routes with strict headers and parsing", async () => {
     const fetchMock = vi
       .fn<FetchLike>()
-      .mockResolvedValueOnce(jsonResponse(CONTRACT_FIXTURE_V1.operation, 202))
+      .mockResolvedValueOnce(jsonResponse(CONTRACT_FIXTURE_V1.cacheOperation, 202))
       .mockResolvedValueOnce(jsonResponse(CONTRACT_FIXTURE_V1.diagnostic))
       .mockResolvedValueOnce(noContentResponse());
     const client = fixtureClient(fetchMock);
 
-    await client.cleanupMaintenanceCache({ idempotencyKey: "cleanup-fixture-1" });
+    await client.cleanupMaintenanceCache({
+      ...CONTRACT_FIXTURE_V1.cacheCleanupRequest,
+      scopes: [...CONTRACT_FIXTURE_V1.cacheCleanupRequest.scopes],
+    }, {
+      idempotencyKey: "cleanup-fixture-1",
+    });
     const diagnostic = await client.getDiagnostic("diagnostic-fixture-1");
     await client.deleteRun("run-fixture-1", { ifMatch: CONTRACT_FIXTURE_V1.run.etag });
 
-    expect(diagnostic.status).toBe("healthy");
+    expect(diagnostic.status).toBe("running");
     expect(String(fetchMock.mock.calls[0][0]).endsWith("/desktop/v1/maintenance/cache-cleanup")).toBe(true);
     expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("Idempotency-Key")).toBe(
       "cleanup-fixture-1",
     );
     expect(new Headers(fetchMock.mock.calls[0][1]?.headers).has("If-Match")).toBe(false);
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual(
+      CONTRACT_FIXTURE_V1.cacheCleanupRequest,
+    );
     expect(String(fetchMock.mock.calls[1][0]).endsWith("/desktop/v1/diagnostics/diagnostic-fixture-1")).toBe(true);
     expect(new Headers(fetchMock.mock.calls[2][1]?.headers).get("If-Match")).toBe(
       CONTRACT_FIXTURE_V1.run.etag,
@@ -181,8 +269,11 @@ describe("Desktop Local API v1 client", () => {
       client.createProfile(profileCreateInput(), { idempotencyKey: "profile-create-fixture" }),
     ).resolves.toMatchObject({ profile_id: CONTRACT_FIXTURE_V1.profile.profile_id });
     await expect(
-      client.createRun(runCreateInput(), { idempotencyKey: "run-create-fixture" }),
-    ).resolves.toMatchObject({ run_id: CONTRACT_FIXTURE_V1.run.run_id });
+      client.createRun(runCreateInput(), {
+        idempotencyKey: "run-create-fixture",
+        ifMatch: CONTRACT_FIXTURE_V1.project.etag,
+      }),
+    ).resolves.toMatchObject({ id: CONTRACT_FIXTURE_V1.run.id });
   });
 
   it.each([
@@ -237,7 +328,10 @@ describe("Desktop Local API v1 client", () => {
       201,
       CONTRACT_FIXTURE_V1.run,
       (client: ReturnType<typeof fixtureClient>) =>
-        client.createRun(runCreateInput(), { idempotencyKey: "run-create-fixture" }),
+        client.createRun(runCreateInput(), {
+          idempotencyKey: "run-create-fixture",
+          ifMatch: CONTRACT_FIXTURE_V1.project.etag,
+        }),
     ],
     [
       "DELETE",
@@ -343,15 +437,7 @@ function profileCreateInput() {
 }
 
 function runCreateInput() {
-  const run = CONTRACT_FIXTURE_V1.run;
-  return {
-    project_id: run.project_id,
-    project_snapshot: run.project_snapshot,
-    task_snapshot: run.task_snapshot,
-    workspace_snapshot: run.workspace_snapshot,
-    capability_registry_digest: run.capability_registry_digest,
-    required_revision: run.pinned_revision,
-  };
+  return { project_id: CONTRACT_FIXTURE_V1.run.project_id };
 }
 
 if (false) {

@@ -1,38 +1,77 @@
 {
   "artifact_content": {
     "artifact_id": "artifact-fixture-1",
-    "content_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "artifact_type": "text_memory",
     "documents": [
       {
+        "byte_size": 29,
         "content": "# Memory\n\nValidated behavior.",
+        "content_sha256": "b55fbf2b2178de65f2976cc8ec000129c5220a69268ce1dc145c20cbbf16c60c",
+        "display_name": "Task memory",
         "document_id": "memory",
-        "media_type": "text/markdown",
-        "title": "Task memory"
+        "mime_type": "text/markdown",
+        "relative_path": "memory.md",
+        "truncated": false
       }
     ],
+    "returned_utf8_bytes": 29,
     "schema_version": "1",
     "total_documents": 1,
+    "total_utf8_bytes": 29,
     "truncated": false
   },
   "artifact_diff": {
     "artifact_id": "artifact-fixture-1",
-    "base_artifact_id": null,
+    "artifact_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "hunks": [
       {
-        "heading": "Task memory",
-        "hunk_id": "memory-hunk-1",
+        "new_document": {
+          "artifact_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "artifact_id": "artifact-fixture-1",
+          "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "document_id": "memory",
+          "relative_path": "memory.md"
+        },
+        "old_document": {
+          "artifact_content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "artifact_id": "artifact-fixture-0",
+          "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "document_id": "memory",
+          "relative_path": "memory.md"
+        },
         "lines": [
           {
             "kind": "context",
-            "new_line": 1,
-            "old_line": 1,
+            "new_line_number": 1,
+            "old_line_number": 1,
             "text": ""
           }
-        ]
+        ],
+        "new_count": 1,
+        "new_start": 1,
+        "old_count": 1,
+        "old_start": 1
       }
     ],
+    "previous_artifact_content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "previous_artifact_id": "artifact-fixture-0",
     "schema_version": "1",
+    "total_hunks": 1,
+    "total_lines": 1,
     "truncated": false
+  },
+  "execution": {
+    "normalized": {
+      "capture_mode": "transcript",
+      "codex_model": null,
+      "hf_model": "open-models/research-model-fixture-1",
+      "mode": "self-deployed",
+      "token_level_metrics_available": false
+    },
+    "wire": {
+      "hf_model": "open-models/research-model-fixture-1",
+      "mode": "self-deployed"
+    }
   },
   "health": {
     "instance_id": "11111111111111111111111111111111",
@@ -40,6 +79,37 @@
     "protocol": "openevo-native-sidecar-v1",
     "service": "openevo-sidecar",
     "status": "ok"
+  },
+  "operation_defaults": {
+    "normalized": {
+      "checks": [],
+      "created_at": "2026-07-14T12:00:00Z",
+      "error": null,
+      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+      "finished_at": null,
+      "operation_id": "operation-fixture-1",
+      "operation_kind": "bootstrap",
+      "progress": null,
+      "resource": {
+        "resource_id": "project-fixture-1",
+        "resource_type": "project"
+      },
+      "result": null,
+      "schema_version": "1",
+      "started_at": null,
+      "state": "queued"
+    },
+    "wire": {
+      "created_at": "2026-07-14T12:00:00Z",
+      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+      "operation_id": "operation-fixture-1",
+      "operation_kind": "bootstrap",
+      "resource": {
+        "resource_id": "project-fixture-1",
+        "resource_type": "project"
+      },
+      "state": "queued"
+    }
   },
   "profile_create": {
     "normalized": {
@@ -60,17 +130,18 @@
       "user": "researcher"
     }
   },
-  "execution": {
+  "profile_patch": {
     "normalized": {
-      "capture_mode": "transcript",
-      "codex_model": null,
-      "hf_model": "open-models/research-model-fixture-1",
-      "mode": "self-deployed",
-      "token_level_metrics_available": false
+      "proxy": {
+        "http_url": null,
+        "https_url": null,
+        "no_proxy": []
+      }
     },
     "wire": {
-      "hf_model": "open-models/research-model-fixture-1",
-      "mode": "self-deployed"
+      "proxy": {
+        "https_url": null
+      }
     }
   },
   "project_create": {
@@ -105,95 +176,21 @@
       "title": "Design task"
     }
   },
-  "profile_patch": {
-    "normalized": {
-      "proxy": {
-        "http_url": null,
-        "https_url": null,
-        "no_proxy": []
-      }
-    },
-    "wire": {
-      "proxy": {
-        "https_url": null
-      }
-    }
-  },
-  "operation_defaults": {
-    "normalized": {
-      "checks": [],
-      "created_at": "2026-07-14T12:00:00Z",
-      "error": null,
-      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
-      "finished_at": null,
-      "operation_id": "operation-fixture-1",
-      "operation_kind": "cache_cleanup",
-      "progress": null,
-      "resource": {
-        "resource_id": "maintenance-fixture-1",
-        "resource_type": "maintenance"
-      },
-      "result": null,
-      "schema_version": "1",
-      "started_at": null,
-      "state": "queued"
-    },
-    "wire": {
-      "created_at": "2026-07-14T12:00:00Z",
-      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
-      "operation_id": "operation-fixture-1",
-      "operation_kind": "cache_cleanup",
-      "resource": {
-        "resource_id": "maintenance-fixture-1",
-        "resource_type": "maintenance"
-      },
-      "state": "queued"
-    }
-  },
-  "service_defaults": {
-    "normalized": {
-      "display_name": "OpenEvo Core",
-      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
-      "health_summary": "Core is ready.",
-      "kind": "core",
-      "observed_at": "2026-07-14T12:00:00Z",
-      "restart_supported": true,
-      "schema_version": "1",
-      "service_id": "service-core-fixture-1",
-      "state": "healthy"
-    },
-    "wire": {
-      "display_name": "OpenEvo Core",
-      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
-      "health_summary": "Core is ready.",
-      "kind": "core",
-      "observed_at": "2026-07-14T12:00:00Z",
-      "restart_supported": true,
-      "service_id": "service-core-fixture-1",
-      "state": "healthy"
-    }
-  },
   "run_create": {
-    "capability_registry_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "project_id": "project-fixture-1",
-    "project_snapshot": {
-      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "snapshot_id": "project-snapshot-fixture-1"
-    },
-    "required_revision": {
-      "generation": 2,
-      "manifest_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "revision_id": "revision-fixture-2",
-      "state": "queued"
-    },
-    "task_snapshot": {
-      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "snapshot_id": "task-snapshot-fixture-1"
-    },
-    "workspace_snapshot": {
-      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "snapshot_id": "workspace-snapshot-fixture-1"
-    }
+    "project_id": "project-fixture-1"
+  },
+  "service": {
+    "display_name": "OpenEvo Core",
+    "error": null,
+    "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+    "id": "service-control-fixture-1",
+    "kind": "control",
+    "model_preparation": null,
+    "observed_at": "2026-07-14T12:00:00Z",
+    "restartable": true,
+    "status": "running",
+    "status_message": "Core is ready.",
+    "updated_at": "2026-07-14T12:00:00Z"
   },
   "state": {
     "active_project": {
@@ -205,7 +202,7 @@
     "contract": {
       "compatible": true,
       "core_openapi_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "desktop_openapi_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "desktop_openapi_sha256": "c9f2fa2cdcc2ff5cde40b9bbd007430ac0ccfdf6452844315d8e29d913f0b7a0",
       "selected_major": 1
     },
     "core": {
@@ -224,5 +221,12 @@
     "observed_at": "2026-07-14T12:00:00Z",
     "pending_operation_ids": [],
     "schema_version": "1"
+  },
+  "workspace_import": {
+    "byte_size": 1024,
+    "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "entry_count": 1,
+    "extracted_byte_size": 128,
+    "import_id": "workspace-import-fixture-1"
   }
 }

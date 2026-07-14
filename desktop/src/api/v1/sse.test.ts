@@ -17,8 +17,46 @@ describe("Desktop Local API v1 SSE parser", () => {
 
     expect(parsed.kind).toBe("event");
     if (parsed.kind === "event") {
-      expect(parsed.envelope.data.kind).toBe("run_changed");
+      expect(parsed.envelope.data.kind).toBe("resource_changed");
       expect(parsed.id).toBe(EVENT_FIXTURE_V1.event_id);
+    }
+  });
+
+  it("rejects resource notifications without a change ID or authoritative identity", () => {
+    expect(() =>
+      parseSseFrame({
+        id: EVENT_FIXTURE_V1.event_id,
+        event: EVENT_FIXTURE_V1.event_name,
+        data: JSON.stringify({
+          ...EVENT_FIXTURE_V1,
+          data: { ...EVENT_FIXTURE_V1.data, change_id: undefined },
+        }),
+      }),
+    ).toThrow(DesktopContractError);
+    expect(() =>
+      parseSseFrame({
+        id: EVENT_FIXTURE_V1.event_id,
+        event: EVENT_FIXTURE_V1.event_name,
+        data: JSON.stringify({
+          ...EVENT_FIXTURE_V1,
+          data: { ...EVENT_FIXTURE_V1.data, resource_etag: null, content_sha256: null },
+        }),
+      }),
+    ).toThrow(DesktopContractError);
+  });
+
+  it("enforces Desktop and Core resource authority boundaries", () => {
+    for (const data of [
+      { ...EVENT_FIXTURE_V1.data, authority: "desktop", resource: { resource_type: "run", resource_id: "run-fixture-1" } },
+      { ...EVENT_FIXTURE_V1.data, authority: "core", resource: { resource_type: "project", resource_id: "project-fixture-1" } },
+    ]) {
+      expect(() =>
+        parseSseFrame({
+          id: EVENT_FIXTURE_V1.event_id,
+          event: EVENT_FIXTURE_V1.event_name,
+          data: JSON.stringify({ ...EVENT_FIXTURE_V1, data }),
+        }),
+      ).toThrow(DesktopContractError);
     }
   });
 

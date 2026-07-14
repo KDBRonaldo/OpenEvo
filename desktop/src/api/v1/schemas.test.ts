@@ -6,137 +6,281 @@ import {
   artifactContentV1Schema,
   artifactDiffV1Schema,
   artifactV1Schema,
+  cacheCleanupRequestV1Schema,
+  capabilitiesEnvelopeV1Schema,
   desktopBootstrapContextV1Schema,
   desktopStateV1Schema,
+  diagnosticCreateV1Schema,
   diagnosticReportV1Schema,
   eventEnvelopeV1Schema,
   executionSettingsV1Schema,
   healthV1Schema,
+  localLogEntryV1Schema,
   localOperationV1Schema,
   logEntryV1Schema,
-  profilePageV1Schema,
+  operationV1Schema,
   profileCreateV1Schema,
+  profilePageV1Schema,
   profilePatchV1Schema,
-  projectCapabilitiesV1Schema,
   projectCreateV1Schema,
   projectPatchV1Schema,
-  projectValidateRequestV1Schema,
   projectV1Schema,
   projectValidationV1Schema,
   remoteProfileV1Schema,
-  runCreateV1Schema,
   runContextV1Schema,
+  runCreateV1Schema,
   runPageV1Schema,
+  runSummaryV1Schema,
   runV1Schema,
   serviceV1Schema,
   timelineEntryV1Schema,
   versionInfoV1Schema,
+  workspaceImportRefV1Schema,
 } from "./schemas";
 
 describe("Desktop Local API v1 schemas", () => {
-  it("parses the deterministic fixture across every response family", () => {
+  it("parses deterministic fixtures across local and Core response families", () => {
     expect(versionInfoV1Schema.parse(CONTRACT_FIXTURE_V1.version).preferred_major).toBe(1);
     expect(desktopBootstrapContextV1Schema.parse(CONTRACT_FIXTURE_V1.bootstrap).endpoint).toContain("127.0.0.1");
     expect(healthV1Schema.parse(CONTRACT_FIXTURE_V1.health).status).toBe("ok");
     expect(apiErrorV1Schema.parse(CONTRACT_FIXTURE_V1.error).code).toBe("project_not_ready");
     expect(desktopStateV1Schema.parse(CONTRACT_FIXTURE_V1.state).contract.compatible).toBe(true);
     expect(remoteProfileV1Schema.parse(CONTRACT_FIXTURE_V1.profile).authentication_kind).toBe("native_private_key");
-    expect(projectV1Schema.parse(CONTRACT_FIXTURE_V1.project).execution.mode).toBe("self-deployed");
+    expect(remoteProfileV1Schema.parse(CONTRACT_FIXTURE_V1.profile).credential_slots.at(-1)?.kind).toBe("hugging_face_token");
+    expect(projectV1Schema.parse(CONTRACT_FIXTURE_V1.project).remote?.model_preparation.status).toBe("ready");
     expect(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation).state).toBe("running");
-    expect(runV1Schema.parse(CONTRACT_FIXTURE_V1.run).pinned_revision.generation).toBe(1);
-    expect(timelineEntryV1Schema.parse(CONTRACT_FIXTURE_V1.timeline).stage).toBe("agent");
-    expect(logEntryV1Schema.parse(CONTRACT_FIXTURE_V1.log).source).toBe("run");
-    expect(runContextV1Schema.parse(CONTRACT_FIXTURE_V1.context).contributions).toHaveLength(1);
+    expect(localLogEntryV1Schema.parse(CONTRACT_FIXTURE_V1.operationLog).source).toBe("connection");
+    expect(runSummaryV1Schema.parse(CONTRACT_FIXTURE_V1.runSummary).pinned_revision?.generation).toBe(1);
+    expect(runV1Schema.parse(CONTRACT_FIXTURE_V1.run).attempts).toHaveLength(1);
+    expect(timelineEntryV1Schema.parse(CONTRACT_FIXTURE_V1.timeline).phase).toBe("execution");
+    expect(logEntryV1Schema.parse(CONTRACT_FIXTURE_V1.log).stream).toBe("agent");
+    expect(runContextV1Schema.parse(CONTRACT_FIXTURE_V1.context).artifacts).toHaveLength(1);
     expect(CONTRACT_FIXTURE_V1.artifacts.map((artifact) => artifactV1Schema.parse(artifact).artifact_type)).toEqual([
       "text_memory",
       "skill_bundle",
       "agent_system",
       "parametric_memory",
     ]);
-    expect(artifactContentV1Schema.parse(CONTRACT_FIXTURE_V1.artifactContent).documents).toHaveLength(1);
-    expect(artifactDiffV1Schema.parse(CONTRACT_FIXTURE_V1.artifactDiff).hunks).toHaveLength(1);
-    expect(serviceV1Schema.parse(CONTRACT_FIXTURE_V1.service).state).toBe("healthy");
-    expect(diagnosticReportV1Schema.parse(CONTRACT_FIXTURE_V1.diagnostic).status).toBe("healthy");
-    expect(projectCapabilitiesV1Schema.parse(CONTRACT_FIXTURE_V1.capabilities).registry_digest).toHaveLength(64);
-    expect(projectValidationV1Schema.parse(CONTRACT_FIXTURE_V1.validation).valid).toBe(true);
+    expect(artifactContentV1Schema.parse(CONTRACT_FIXTURE_V1.artifactContent).returned_utf8_bytes).toBe(29);
+    expect(artifactDiffV1Schema.parse(CONTRACT_FIXTURE_V1.artifactDiff).total_lines).toBe(1);
+    expect(serviceV1Schema.parse(CONTRACT_FIXTURE_V1.service).status).toBe("running");
+    expect(operationV1Schema.parse(CONTRACT_FIXTURE_V1.serviceOperation).kind).toBe("service_restart");
+    expect(diagnosticCreateV1Schema.parse(CONTRACT_FIXTURE_V1.diagnosticRequest).scopes).toHaveLength(1);
+    expect(diagnosticReportV1Schema.parse(CONTRACT_FIXTURE_V1.diagnostic).status).toBe("running");
+    expect(cacheCleanupRequestV1Schema.parse(CONTRACT_FIXTURE_V1.cacheCleanupRequest).older_than_days).toBe(30);
+    expect(operationV1Schema.parse(CONTRACT_FIXTURE_V1.cacheOperation).status).toBe("running");
+    expect(capabilitiesEnvelopeV1Schema.parse(CONTRACT_FIXTURE_V1.capabilities).capabilities.registry_digest).toHaveLength(64);
+    expect(projectValidationV1Schema.parse(CONTRACT_FIXTURE_V1.validation).checks[0]?.status).toBe("ok");
   });
 
   it("parses the Python-owned cross-language critical fixture", () => {
     expect(healthV1Schema.parse(criticalFixture.health).protocol).toBe("openevo-native-sidecar-v1");
     expect(desktopStateV1Schema.parse(criticalFixture.state).core.state).toBe("online");
-    expect(runCreateV1Schema.parse(criticalFixture.run_create).required_revision.state).toBe("queued");
+    expect(runCreateV1Schema.parse(criticalFixture.run_create)).toEqual({ project_id: "project-fixture-1" });
     expect(profileCreateV1Schema.parse(criticalFixture.profile_create.wire)).toEqual(criticalFixture.profile_create.normalized);
     expect(executionSettingsV1Schema.parse(criticalFixture.execution.wire)).toEqual(criticalFixture.execution.normalized);
     expect(profilePatchV1Schema.parse(criticalFixture.profile_patch.wire)).toEqual(criticalFixture.profile_patch.normalized);
+    expect(workspaceImportRefV1Schema.parse(criticalFixture.workspace_import)).toEqual(criticalFixture.workspace_import);
     expect(localOperationV1Schema.parse(criticalFixture.operation_defaults.wire)).toEqual(criticalFixture.operation_defaults.normalized);
-    expect(serviceV1Schema.parse(criticalFixture.service_defaults.wire)).toEqual(criticalFixture.service_defaults.normalized);
-    expect(artifactContentV1Schema.parse(criticalFixture.artifact_content).total_documents).toBe(1);
+    expect(serviceV1Schema.parse(criticalFixture.service)).toEqual(criticalFixture.service);
+    expect(artifactContentV1Schema.parse(criticalFixture.artifact_content).returned_utf8_bytes).toBe(29);
     expect(artifactDiffV1Schema.parse(criticalFixture.artifact_diff).hunks[0]?.lines[0]?.text).toBe("");
   });
 
-  it("rejects unknown response fields instead of stripping them", () => {
-    expect(() =>
-      remoteProfileV1Schema.parse({
-        ...CONTRACT_FIXTURE_V1.profile,
-        backend_url: "https://core.example.test",
-      }),
-    ).toThrow();
-    expect(() =>
-      runV1Schema.parse({
-        ...CONTRACT_FIXTURE_V1.run,
-        pid: 4242,
-      }),
-    ).toThrow();
-  });
-
-  it("preserves unknown method config fields without field-name heuristics", () => {
-    const config = {
-      password: "algorithm-owned-value",
-      command: { strategy: "reflect" },
-      future_plugin_field: [1, true, null],
-    };
-    const project = projectV1Schema.parse({
+  it("keeps ProjectTask closed and accepts only opaque native workspace imports", () => {
+    const imported = {
       ...CONTRACT_FIXTURE_V1.project,
-      evolution: {
-        targets: {
-          ...CONTRACT_FIXTURE_V1.project.evolution.targets,
-          text_memory: {
-            ...CONTRACT_FIXTURE_V1.project.evolution.targets.text_memory,
-            config,
-          },
-        },
-      },
-    });
-    expect(project.evolution.targets.text_memory?.config).toEqual(config);
-  });
-
-  it("uses a dedicated reachable required-revision wire schema", () => {
-    const wire = {
-      project_id: "project-1",
-      project_snapshot: { snapshot_id: "project-snapshot-1", digest: "a".repeat(64) },
-      task_snapshot: { snapshot_id: "task-snapshot-1", digest: "b".repeat(64) },
-      workspace_snapshot: { snapshot_id: "workspace-snapshot-1", digest: "c".repeat(64) },
-      capability_registry_digest: "d".repeat(64),
-      required_revision: {
-        revision_id: "revision-2",
-        generation: 2,
-        manifest_digest: "e".repeat(64),
-        state: "active",
+      source: {
+        kind: "native_folder_snapshot",
+        display_name: "Imported workspace",
+        import_ref: CONTRACT_FIXTURE_V1.workspaceImport,
       },
     } as const;
+    expect(projectV1Schema.parse(imported).source.import_ref?.byte_size).toBe(1_024);
 
-    for (const state of ["active", "queued", "preparing"] as const) {
-      expect(runCreateV1Schema.parse({ ...wire, required_revision: { ...wire.required_revision, state } }).required_revision.state).toBe(state);
+    expect(() => projectV1Schema.parse({ ...CONTRACT_FIXTURE_V1.project, task: { ...CONTRACT_FIXTURE_V1.project.task, task_ref: { content_id: "raw" } } })).toThrow();
+    expect(() => projectV1Schema.parse({ ...CONTRACT_FIXTURE_V1.project, source: { ...imported.source, source_ref: "/Users/researcher/data" } })).toThrow();
+    expect(() => projectV1Schema.parse({ ...CONTRACT_FIXTURE_V1.project, source: { ...imported.source, workspace_path: "/Users/researcher/data" } })).toThrow();
+    expect(() => projectV1Schema.parse({ ...CONTRACT_FIXTURE_V1.project, source: { kind: "git_snapshot", display_name: "Git" } })).toThrow();
+  });
+
+  it("enforces lossless local-to-Core text and evolution ID boundaries", () => {
+    const base = {
+      name: "P",
+      profile_id: "profile-1",
+      task: { title: "T", objective: "Run the task." },
+      source: { kind: "scratch", display_name: "S" },
+      execution: { mode: "self-deployed", hf_model: "m" },
+      evolution: { targets: { "Text_memory.v1": { enabled: true, method: "Method.v1", config: {} } } },
+    } as const;
+    expect(projectCreateV1Schema.parse(base).evolution.targets["Text_memory.v1"]?.method).toBe("Method.v1");
+    expect(projectCreateV1Schema.parse({ ...base, name: "n".repeat(128) }).name).toHaveLength(128);
+    expect(projectCreateV1Schema.parse({ ...base, task: { ...base.task, title: "t".repeat(256) } }).task.title).toHaveLength(256);
+    expect(projectCreateV1Schema.parse({ ...base, source: { ...base.source, display_name: "s".repeat(256) } }).source.display_name).toHaveLength(256);
+    expect(projectCreateV1Schema.parse({ ...base, execution: { mode: "self-deployed", hf_model: "m".repeat(256) } }).execution.hf_model).toHaveLength(256);
+    expect(projectCreateV1Schema.parse({ ...base, execution: { mode: "codex_subscription_transcript", codex_model: "c".repeat(256) } }).execution.codex_model).toHaveLength(256);
+
+    for (const invalid of [
+      { ...base, name: "n".repeat(129) },
+      { ...base, task: { ...base.task, title: "t".repeat(257) } },
+      { ...base, source: { ...base.source, display_name: "s".repeat(257) } },
+      { ...base, execution: { mode: "self-deployed", hf_model: "m".repeat(257) } },
+      { ...base, execution: { mode: "codex_subscription_transcript", codex_model: "c".repeat(257) } },
+      { ...base, evolution: { targets: { "1invalid": { enabled: true, method: "Method.v1", config: {} } } } },
+      { ...base, evolution: { targets: { valid: { enabled: true, method: "method/invalid", config: {} } } } },
+      { ...base, evolution: { targets: { ["t".repeat(129)]: { enabled: true, method: "Method.v1", config: {} } } } },
+    ]) {
+      expect(() => projectCreateV1Schema.parse(invalid)).toThrow();
     }
-    for (const state of ["failed", "cancelled"] as const) {
-      expect(() => runCreateV1Schema.parse({ ...wire, required_revision: { ...wire.required_revision, state } })).toThrow();
+  });
+
+  it("matches workspace import tar bounds, alignment, and empty archive semantics", () => {
+    expect(workspaceImportRefV1Schema.parse(CONTRACT_FIXTURE_V1.workspaceImport).entry_count).toBe(1);
+    expect(
+      workspaceImportRefV1Schema.parse({
+        ...CONTRACT_FIXTURE_V1.workspaceImport,
+        entry_count: 0,
+        extracted_byte_size: 0,
+      }).extracted_byte_size,
+    ).toBe(0);
+
+    for (const invalid of [
+      { ...CONTRACT_FIXTURE_V1.workspaceImport, byte_size: 512 },
+      { ...CONTRACT_FIXTURE_V1.workspaceImport, byte_size: 1_025 },
+      { ...CONTRACT_FIXTURE_V1.workspaceImport, byte_size: 16 * 1024 * 1024 * 1024 + 512 },
+      { ...CONTRACT_FIXTURE_V1.workspaceImport, entry_count: 100_001 },
+      { ...CONTRACT_FIXTURE_V1.workspaceImport, entry_count: 0, extracted_byte_size: 1 },
+      { ...CONTRACT_FIXTURE_V1.workspaceImport, extracted_byte_size: 16 * 1024 * 1024 * 1024 + 1 },
+    ]) {
+      expect(() => workspaceImportRefV1Schema.parse(invalid)).toThrow();
     }
+  });
+
+  it("preserves complete Core revision and model-preparation state", () => {
+    const remote = projectV1Schema.parse(CONTRACT_FIXTURE_V1.project).remote!;
+    expect(remote.active_revision).toEqual({
+      id: "revision-fixture-1",
+      project_id: "project-fixture-1",
+      generation: 1,
+      manifest_sha256: "c".repeat(64),
+    });
+    expect(remote.model_preparation).toMatchObject({
+      model_ref: "open-models/research-model-fixture-1",
+      downloaded_bytes: 1_024,
+      total_bytes: 1_024,
+    });
+    expect(() =>
+      projectV1Schema.parse({
+        ...CONTRACT_FIXTURE_V1.project,
+        remote: { ...CONTRACT_FIXTURE_V1.project.remote, active_revision: { id: "lossy-revision" } },
+      }),
+    ).toThrow();
+    expect(() =>
+      projectV1Schema.parse({
+        ...CONTRACT_FIXTURE_V1.project,
+        remote: {
+          ...CONTRACT_FIXTURE_V1.project.remote,
+          model_preparation: { ...CONTRACT_FIXTURE_V1.project.remote.model_preparation, status: "downloading" },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      projectV1Schema.parse({
+        ...CONTRACT_FIXTURE_V1.project,
+        remote: { ...CONTRACT_FIXTURE_V1.project.remote, core_project_id: "different-project" },
+      }),
+    ).toThrow();
+  });
+
+  it("accepts queued runs only without a pin and keeps required revision and transition", () => {
+    const queued = runSummaryV1Schema.parse(CONTRACT_FIXTURE_V1.queuedRunSummary);
+    expect(queued.pinned_revision).toBeNull();
+    expect(queued.required_revision.relation).toBe("successor");
+    expect(queued.revision_transition?.successor_revision.generation).toBe(2);
+
+    expect(() => runSummaryV1Schema.parse({ ...CONTRACT_FIXTURE_V1.queuedRunSummary, pinned_revision: CONTRACT_FIXTURE_V1.runSummary.pinned_revision })).toThrow();
+    const { required_revision: _required, ...withoutRequired } = CONTRACT_FIXTURE_V1.queuedRunSummary;
+    expect(() => runSummaryV1Schema.parse(withoutRequired)).toThrow();
+    const { revision_transition: _transition, ...withoutTransition } = CONTRACT_FIXTURE_V1.queuedRunSummary;
+    expect(() => runSummaryV1Schema.parse(withoutTransition)).toThrow();
+  });
+
+  it("makes RunCreate renderer-owned only by project identity", () => {
+    expect(runCreateV1Schema.parse({ project_id: "project-fixture-1" })).toEqual({ project_id: "project-fixture-1" });
+    for (const field of ["project_snapshot", "task_snapshot", "workspace_snapshot", "capability_registry_digest", "required_revision"]) {
+      expect(() => runCreateV1Schema.parse({ project_id: "project-fixture-1", [field]: "forbidden" })).toThrow();
+    }
+  });
+
+  it("keeps capabilities lossless, including unavailable support and canonical config JSON", () => {
+    const parsed = capabilitiesEnvelopeV1Schema.parse(CONTRACT_FIXTURE_V1.capabilities);
+    const method = parsed.capabilities.targets[0]?.methods[0];
+    expect(method).toMatchObject({
+      exposure: "desktop",
+      execution_modes: ["self_deployed"],
+      config_schema_json: '{"additionalProperties":false,"properties":{},"type":"object"}',
+    });
+
+    const unavailableAxis = {
+      state: "unavailable",
+      reason_code: "runtime_missing",
+      message: "Required runtime is unavailable.",
+      missing_requirements: ["gpu"],
+    } as const;
+    const unavailableSupport = {
+      overall: "unavailable",
+      execution: unavailableAxis,
+      capture: { ...unavailableAxis, state: "supported", reason_code: null, message: "Supported.", missing_requirements: [] },
+      harness: { ...unavailableAxis, state: "supported", reason_code: null, message: "Supported.", missing_requirements: [] },
+      runtime: unavailableAxis,
+    } as const;
+    const capability = CONTRACT_FIXTURE_V1.capabilities.capabilities.targets[0];
+    expect(
+      capabilitiesEnvelopeV1Schema.parse({
+        ...CONTRACT_FIXTURE_V1.capabilities,
+        capabilities: {
+          ...CONTRACT_FIXTURE_V1.capabilities.capabilities,
+          targets: [
+            {
+              ...capability,
+              configured_default_support: unavailableSupport,
+              effective_default_method_id: null,
+              accepted_methods: capability.accepted_methods.map((entry) => ({ ...entry, support: unavailableSupport })),
+              methods: capability.methods.map((entry) => ({ ...entry, support: unavailableSupport })),
+            },
+          ],
+        },
+      }).capabilities.targets[0]?.configured_default_support.overall,
+    ).toBe("unavailable");
+
+    expect(() => capabilitiesEnvelopeV1Schema.parse({ ...CONTRACT_FIXTURE_V1.capabilities, methods: [] })).toThrow();
+    expect(() =>
+      capabilitiesEnvelopeV1Schema.parse({
+        ...CONTRACT_FIXTURE_V1.capabilities,
+        capabilities: {
+          ...CONTRACT_FIXTURE_V1.capabilities.capabilities,
+          targets: [{ ...capability, methods: [{ ...capability.methods[0], config_schema_json: '{"type":"object","additionalProperties":false,"properties":{}}' }] }],
+        },
+      }),
+    ).toThrow(/canonical/i);
+  });
+
+  it("separates local operation logs from Core run and service logs", () => {
+    expect(localLogEntryV1Schema.parse(CONTRACT_FIXTURE_V1.operationLog).log_id).toBe("local-log-fixture-1");
+    expect(logEntryV1Schema.parse(CONTRACT_FIXTURE_V1.log).id).toBe("log-fixture-1");
+    expect(() => logEntryV1Schema.parse(CONTRACT_FIXTURE_V1.operationLog)).toThrow();
+    expect(() => localLogEntryV1Schema.parse(CONTRACT_FIXTURE_V1.log)).toThrow();
+  });
+
+  it("rejects unknown fields from Core-owned response DTOs", () => {
+    expect(() => runV1Schema.parse({ ...CONTRACT_FIXTURE_V1.run, pid: 4242 })).toThrow();
+    expect(() => serviceV1Schema.parse({ ...CONTRACT_FIXTURE_V1.service, stop_supported: true })).toThrow();
+    expect(() => diagnosticReportV1Schema.parse({ ...CONTRACT_FIXTURE_V1.diagnostic, local_report: {} })).toThrow();
+    expect(() => artifactV1Schema.parse({ ...CONTRACT_FIXTURE_V1.artifacts[0], uri: "file:///secret" })).toThrow();
   });
 
   it("normalizes declared defaults and distinguishes omitted patch fields from null", () => {
-    expect(
-      profileCreateV1Schema.parse({ name: "Lab GPU", host: "gpu.example.org", user: "researcher" }),
-    ).toEqual({
+    expect(profileCreateV1Schema.parse({ name: "Lab GPU", host: "gpu.example.org", user: "researcher" })).toEqual({
       name: "Lab GPU",
       host: "gpu.example.org",
       port: 22,
@@ -152,129 +296,65 @@ describe("Desktop Local API v1 schemas", () => {
       hf_model: "open-models/model-1",
     });
     expect(profilePatchV1Schema.parse({ name: "Renamed" })).toEqual({ name: "Renamed" });
-    expect(profilePatchV1Schema.parse({ proxy: { https_url: null } })).toEqual({
-      proxy: { http_url: null, https_url: null, no_proxy: [] },
-    });
     expect(() => profilePatchV1Schema.parse({ host: null })).toThrow();
-    expect(() => profilePatchV1Schema.parse({ proxy: null })).toThrow();
     expect(() => projectPatchV1Schema.parse({ execution: null })).toThrow();
   });
 
-  it("uses only the closed evolution.targets wrapper for projects and validation", () => {
-    const target = {
-      enabled: true,
-      method: "reference_text_memory",
-      config: { password: "algorithm-owned-value", future_field: 1 },
-    } as const;
-    const project = {
-      name: "Protein Design",
-      profile_id: "profile-1",
-      task: { title: "Design", objective: "Produce a candidate." },
-      source: { kind: "scratch", display_name: "New workspace" },
-      execution: { mode: "self-deployed", hf_model: "open-models/model-1" },
-      evolution: { targets: { text_memory: target } },
-    } as const;
-    expect(projectCreateV1Schema.parse(project).evolution.targets.text_memory?.config).toEqual(target.config);
-    expect(
-      projectValidateRequestV1Schema.parse({
-        project_etag: `"${"a".repeat(64)}"`,
-        capability_registry_digest: "b".repeat(64),
-        execution: project.execution,
-        evolution: project.evolution,
-      }).evolution.targets.text_memory?.method,
-    ).toBe("reference_text_memory");
-    expect(() => projectCreateV1Schema.parse({ ...project, evolution: { text_memory: target } })).toThrow();
+  it("preserves unknown method config while enforcing JavaScript-safe integers", () => {
+    const config = { password: "algorithm-owned-value", command: { strategy: "reflect" }, future_plugin_field: [1, true, null] };
+    const project = projectV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.project,
+      evolution: {
+        targets: {
+          ...CONTRACT_FIXTURE_V1.project.evolution.targets,
+          text_memory: { ...CONTRACT_FIXTURE_V1.project.evolution.targets.text_memory, config },
+        },
+      },
+    });
+    expect(project.evolution.targets.text_memory?.config).toEqual(config);
+    expect(() => projectCreateV1Schema.parse({ ...project, evolution: { targets: { text_memory: { enabled: true, method: "reference_text_memory", config: { unsafe: Number.MAX_SAFE_INTEGER + 1 } } } } })).toThrow();
   });
 
-  it("uses a bounded trimmed hf_model only for self-deployed execution", () => {
-    expect(executionSettingsV1Schema.parse({ mode: "self-deployed", hf_model: "open-models/model-1" }).hf_model).toBe(
-      "open-models/model-1",
-    );
-    for (const hf_model of ["", " open-models/model-1", "open-models/model-1\n"]) {
-      expect(() => executionSettingsV1Schema.parse({ mode: "self-deployed", hf_model })).toThrow();
-    }
-    expect(() => executionSettingsV1Schema.parse({ mode: "self-deployed", managed_model_id: "legacy-model" })).toThrow();
-    expect(() =>
-      executionSettingsV1Schema.parse({ mode: "codex_subscription_transcript", codex_model: "gpt-5", hf_model: "open-models/model-1" }),
-    ).toThrow();
+  it("parses closed pages and keeps run list items as summaries", () => {
+    expect(profilePageV1Schema.parse(PROFILE_PAGE_FIXTURE_V1).items[0]?.profile_id).toBe("profile-fixture-1");
+    expect(runPageV1Schema.parse(RUN_PAGE_FIXTURE_V1).items[0]?.id).toBe("run-fixture-1");
+    expect(() => runPageV1Schema.parse({ ...RUN_PAGE_FIXTURE_V1, items: [CONTRACT_FIXTURE_V1.run] })).toThrow();
+    expect(() => profilePageV1Schema.parse({ ...PROFILE_PAGE_FIXTURE_V1, total: 1 })).toThrow();
   });
 
-  it("matches Python network host and remote user validation", () => {
-    for (const [host, user] of [
-      ["gpu.example.org", "researcher"],
-      ["gpu.example.org.", "researcher.name"],
-      ["192.0.2.10", "researcher-1"],
-      ["2001:db8::10", "researcher_1"],
-      ["127.1", "researcher"],
-    ] as const) {
-      expect(profileCreateV1Schema.parse({ name: "Lab GPU", host, user }).host).toBe(host);
-    }
-
-    for (const [field, value] of [
-      ["host", "gpu_name.example.org"],
-      ["host", "-gpu.example.org"],
-      ["host", "https://gpu.example.org"],
-      ["user", "researcher name"],
-      ["user", "researcher@lab"],
-      ["user", "../researcher"],
-    ] as const) {
-      expect(() =>
-        profileCreateV1Schema.parse({ name: "Lab GPU", host: "gpu.example.org", user: "researcher", [field]: value }),
-      ).toThrow();
-    }
-  });
-
-  it("accepts empty context lines in a bounded artifact diff", () => {
-    expect(
-      artifactDiffV1Schema.parse({
-        schema_version: "1",
-        artifact_id: "artifact-1",
-        base_artifact_id: null,
-        hunks: [
-          {
-            hunk_id: "hunk-1",
-            heading: "Memory",
-            lines: [{ kind: "context", old_line: 1, new_line: 1, text: "" }],
-          },
-        ],
-        truncated: false,
-      }).hunks[0]?.lines[0]?.text,
-    ).toBe("");
-  });
-
-  it("accepts only the exact self-deployed execution mode spelling", () => {
-    expect(() =>
-      projectV1Schema.parse({
-        ...CONTRACT_FIXTURE_V1.project,
-        execution: { ...CONTRACT_FIXTURE_V1.project.execution, mode: "self deployed" },
-      }),
-    ).toThrow();
-  });
-
-  it("rejects malformed timestamps, digests, and proxy credentials", () => {
-    expect(() => remoteProfileV1Schema.parse({ ...CONTRACT_FIXTURE_V1.profile, updated_at: "2026-07-14" })).toThrow();
-    expect(() =>
-      runV1Schema.parse({ ...CONTRACT_FIXTURE_V1.run, capability_registry_digest: "ABC" }),
-    ).toThrow();
-    expect(() =>
-      remoteProfileV1Schema.parse({
-        ...CONTRACT_FIXTURE_V1.profile,
-        proxy: { ...CONTRACT_FIXTURE_V1.profile.proxy, http_url: "http://user:password@proxy.example.test" },
-      }),
-    ).toThrow(/user information/i);
-  });
-
-  it("parses closed pages and rejects inconsistent cursors", () => {
-    expect(profilePageV1Schema.parse(PROFILE_PAGE_FIXTURE_V1).items[0].profile_id).toBe("profile-fixture-1");
-    expect(runPageV1Schema.parse(RUN_PAGE_FIXTURE_V1).has_more).toBe(false);
-    expect(() => runPageV1Schema.parse({ ...RUN_PAGE_FIXTURE_V1, has_more: true })).toThrow(/cursor/i);
-    expect(() => runPageV1Schema.parse({ ...RUN_PAGE_FIXTURE_V1, total: 1 })).toThrow();
-  });
-
-  it("parses closed event envelopes", () => {
+  it("accepts only invalidation-style local SSE events", () => {
     const event = eventEnvelopeV1Schema.parse(EVENT_FIXTURE_V1);
-    expect(event.event_name).toBe("desktop.v1.run.changed");
-    expect(event.data.kind).toBe("run_changed");
-    expect(() => eventEnvelopeV1Schema.parse({ ...EVENT_FIXTURE_V1, remote_path: "/srv/openevo" })).toThrow();
+    expect(event.event_name).toBe("desktop.v1.resource.changed");
+    expect(event.data.kind).toBe("resource_changed");
+    expect(() => eventEnvelopeV1Schema.parse({ ...EVENT_FIXTURE_V1, data: { ...EVENT_FIXTURE_V1.data, change_id: undefined } })).toThrow();
+    expect(() => eventEnvelopeV1Schema.parse({ ...EVENT_FIXTURE_V1, data: { ...EVENT_FIXTURE_V1.data, resource_etag: null, content_sha256: null } })).toThrow();
+    expect(() => eventEnvelopeV1Schema.parse({ ...EVENT_FIXTURE_V1, data: { ...EVENT_FIXTURE_V1.data, authority: "desktop" } })).toThrow();
+    expect(() =>
+      eventEnvelopeV1Schema.parse({
+        ...EVENT_FIXTURE_V1,
+        data: {
+          ...EVENT_FIXTURE_V1.data,
+          authority: "core",
+          resource: { resource_type: "project", resource_id: "project-fixture-1" },
+        },
+      }),
+    ).toThrow();
+    expect(
+      eventEnvelopeV1Schema.parse({
+        ...EVENT_FIXTURE_V1,
+        data: {
+          ...EVENT_FIXTURE_V1.data,
+          authority: "desktop",
+          resource: { resource_type: "project", resource_id: "project-fixture-1" },
+        },
+      }).data.kind,
+    ).toBe("resource_changed");
+    expect(() =>
+      eventEnvelopeV1Schema.parse({
+        ...EVENT_FIXTURE_V1,
+        event_name: "desktop.v1.run.timeline",
+        data: { kind: "run_timeline", run_id: "run-fixture-1", entry: CONTRACT_FIXTURE_V1.timeline },
+      }),
+    ).toThrow();
   });
 });

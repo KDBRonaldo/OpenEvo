@@ -5,6 +5,7 @@ import {
   artifactDiffV1Schema,
   artifactPageV1Schema,
   artifactV1Schema,
+  cacheCleanupRequestV1Schema,
   desktopBootstrapContextV1Schema,
   desktopStateV1Schema,
   diagnosticCreateV1Schema,
@@ -12,8 +13,10 @@ import {
   etagSchema,
   healthV1Schema,
   hostKeyAcceptV1Schema,
+  localLogPageV1Schema,
   localOperationV1Schema,
   logPageV1Schema,
+  operationV1Schema,
   opaqueIdSchema,
   profileCreateV1Schema,
   profilePageV1Schema,
@@ -23,15 +26,14 @@ import {
   projectPageV1Schema,
   projectPatchV1Schema,
   projectV1Schema,
-  projectValidateRequestV1Schema,
   projectValidationV1Schema,
+  referencedLogPageV1Schema,
   remoteProfileV1Schema,
   runContextV1Schema,
   runCreateV1Schema,
   runPageV1Schema,
   runV1Schema,
   servicePageV1Schema,
-  serviceV1Schema,
   sha256DigestSchema,
   timelinePageV1Schema,
   versionInfoV1Schema,
@@ -39,6 +41,7 @@ import {
   type ArtifactContentV1,
   type ArtifactDiffV1,
   type ArtifactV1,
+  type CacheCleanupRequestV1,
   type DesktopBootstrapContextV1,
   type DesktopStateV1,
   type DiagnosticCreateV1,
@@ -46,7 +49,9 @@ import {
   type HealthV1,
   type HostKeyAcceptV1,
   type LocalOperationV1,
+  type LocalLogEntryV1,
   type LogEntryV1,
+  type OperationV1,
   type PageV1,
   type ProfileCreateV1,
   type ProfilePatchV1,
@@ -55,10 +60,11 @@ import {
   type ProjectPatchV1,
   type ProjectV1,
   type ProjectValidationV1,
-  type ProjectValidateRequestV1,
+  type ReferencedLogPageV1,
   type RemoteProfileV1,
   type RunContextV1,
   type RunCreateV1,
+  type RunSummaryV1,
   type RunV1,
   type ServiceV1,
   type TimelineEntryV1,
@@ -218,12 +224,12 @@ export interface DesktopApiClientV1 {
   bootstrapProject(projectId: string, options: ActionRequestOptions): Promise<LocalOperationV1>;
   syncProjectWorkspace(projectId: string, options: ActionRequestOptions): Promise<LocalOperationV1>;
   projectCapabilities(projectId: string): Promise<ProjectCapabilitiesV1>;
-  validateProject(projectId: string, input: ProjectValidateRequestV1, options: ActionRequestOptions): Promise<ProjectValidationV1>;
+  validateProject(projectId: string, options: ActionRequestOptions): Promise<ProjectValidationV1>;
   getOperation(operationId: string): Promise<LocalOperationV1>;
-  operationLogs(operationId: string, options?: ListRequestOptions): Promise<PageV1<LogEntryV1>>;
+  operationLogs(operationId: string, options?: ListRequestOptions): Promise<PageV1<LocalLogEntryV1>>;
   cancelOperation(operationId: string, options: ActionRequestOptions): Promise<LocalOperationV1>;
-  listRuns(options?: ListRequestOptions): Promise<PageV1<RunV1>>;
-  createRun(input: RunCreateV1, options: CreateRequestOptions): Promise<RunV1>;
+  listRuns(options?: ListRequestOptions): Promise<PageV1<RunSummaryV1>>;
+  createRun(input: RunCreateV1, options: ActionRequestOptions): Promise<RunV1>;
   getRun(runId: string): Promise<RunV1>;
   deleteRun(runId: string, options: IfMatchRequestOptions): Promise<void>;
   cancelRun(runId: string, options: ActionRequestOptions): Promise<RunV1>;
@@ -236,13 +242,14 @@ export interface DesktopApiClientV1 {
   artifactContent(artifactId: string): Promise<ArtifactContentV1>;
   artifactDiff(artifactId: string): Promise<ArtifactDiffV1>;
   listServices(options?: ListRequestOptions): Promise<PageV1<ServiceV1>>;
-  restartService(serviceId: string, options: ActionRequestOptions): Promise<LocalOperationV1>;
-  stopService(serviceId: string, options: ActionRequestOptions): Promise<LocalOperationV1>;
+  restartService(serviceId: string, options: ActionRequestOptions): Promise<OperationV1>;
+  getCoreOperation(operationId: string): Promise<OperationV1>;
+  coreLogs(logsRef: string, options?: ListRequestOptions): Promise<ReferencedLogPageV1>;
   serviceLogs(serviceId: string, options?: ListRequestOptions): Promise<PageV1<LogEntryV1>>;
-  createDiagnostic(input: DiagnosticCreateV1, options: CreateRequestOptions): Promise<LocalOperationV1>;
+  createDiagnostic(input: DiagnosticCreateV1, options: CreateRequestOptions): Promise<DiagnosticReportV1>;
   getDiagnostic(diagnosticId: string): Promise<DiagnosticReportV1>;
-  deleteDiagnostic(diagnosticId: string, options: IfMatchRequestOptions): Promise<void>;
-  cleanupMaintenanceCache(options: CreateRequestOptions): Promise<LocalOperationV1>;
+  deleteDiagnostic(diagnosticId: string, options: ActionRequestOptions): Promise<void>;
+  cleanupMaintenanceCache(input: CacheCleanupRequestV1, options: CreateRequestOptions): Promise<OperationV1>;
   eventStreamRequest(lastEventId?: string): Promise<EventStreamRequest>;
 }
 
@@ -338,12 +345,15 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
   async function requestNoContent(
     method: string,
     path: string,
-    requestOptions: { ifMatch: string },
+    requestOptions: { ifMatch: string; idempotencyKey?: string },
   ): Promise<void> {
     const bootstrap = await context();
     const headers = new Headers({ Accept: "application/json" });
     headers.set(DESKTOP_SESSION_HEADER, bootstrap.session_token);
     headers.set("If-Match", ifMatchSchema.parse(requestOptions.ifMatch));
+    if (requestOptions.idempotencyKey !== undefined) {
+      headers.set("Idempotency-Key", idempotencyKeySchema.parse(requestOptions.idempotencyKey));
+    }
     const response = await options.fetch(buildUrl(bootstrap.endpoint, path), {
       method,
       headers,
@@ -453,26 +463,25 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
       action(`${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}/workspace-sync`, localOperationV1Schema, actionOptions),
     projectCapabilities: (projectId) =>
       request("GET", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}/capabilities`, projectCapabilitiesV1Schema, 200),
-    validateProject: (projectId, input, actionOptions) =>
+    validateProject: (projectId, actionOptions) =>
       request("POST", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}/validate`, projectValidationV1Schema, 200, {
-        body: input,
-        bodySchema: projectValidateRequestV1Schema,
         idempotencyKey: actionOptions.idempotencyKey,
         ifMatch: actionOptions.ifMatch,
       }),
     getOperation: (operationId) =>
       request("GET", `${DESKTOP_API_V1_PREFIX}/operations/${segment(operationId)}`, localOperationV1Schema, 200),
     operationLogs: (operationId, listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/operations/${segment(operationId)}/logs`, listOptions), logPageV1Schema, 200),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/operations/${segment(operationId)}/logs`, listOptions), localLogPageV1Schema, 200),
     cancelOperation: (operationId, actionOptions) =>
       action(`${DESKTOP_API_V1_PREFIX}/operations/${segment(operationId)}/cancel`, localOperationV1Schema, actionOptions),
     listRuns: (listOptions) =>
       request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/runs`, listOptions), runPageV1Schema, 200),
-    createRun: (input, createOptions) =>
+    createRun: (input, actionOptions) =>
       request("POST", `${DESKTOP_API_V1_PREFIX}/runs`, runV1Schema, 202, {
         body: input,
         bodySchema: runCreateV1Schema,
-        idempotencyKey: createOptions.idempotencyKey,
+        idempotencyKey: actionOptions.idempotencyKey,
+        ifMatch: actionOptions.ifMatch,
       }),
     getRun: (runId) => request("GET", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}`, runV1Schema, 200),
     deleteRun: (runId, actionOptions) =>
@@ -504,13 +513,18 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
     listServices: (listOptions) =>
       request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/services`, listOptions), servicePageV1Schema, 200),
     restartService: (serviceId, actionOptions) =>
-      action(`${DESKTOP_API_V1_PREFIX}/services/${segment(serviceId)}/restart`, localOperationV1Schema, actionOptions),
-    stopService: (serviceId, actionOptions) =>
-      action(`${DESKTOP_API_V1_PREFIX}/services/${segment(serviceId)}/stop`, localOperationV1Schema, actionOptions),
+      request("POST", `${DESKTOP_API_V1_PREFIX}/services/${segment(serviceId)}/restart`, operationV1Schema, 202, {
+        idempotencyKey: actionOptions.idempotencyKey,
+        ifMatch: actionOptions.ifMatch,
+      }),
+    getCoreOperation: (operationId) =>
+      request("GET", `${DESKTOP_API_V1_PREFIX}/core/operations/${segment(operationId)}`, operationV1Schema, 200),
+    coreLogs: (logsRef, listOptions) =>
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/core/logs/${segment(logsRef)}`, listOptions), referencedLogPageV1Schema, 200),
     serviceLogs: (serviceId, listOptions) =>
       request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/services/${segment(serviceId)}/logs`, listOptions), logPageV1Schema, 200),
     createDiagnostic: (input, createOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/diagnostics`, localOperationV1Schema, 202, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/diagnostics`, diagnosticReportV1Schema, 202, {
         body: input,
         bodySchema: diagnosticCreateV1Schema,
         idempotencyKey: createOptions.idempotencyKey,
@@ -519,8 +533,10 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
       request("GET", `${DESKTOP_API_V1_PREFIX}/diagnostics/${segment(diagnosticId)}`, diagnosticReportV1Schema, 200),
     deleteDiagnostic: (diagnosticId, actionOptions) =>
       requestNoContent("DELETE", `${DESKTOP_API_V1_PREFIX}/diagnostics/${segment(diagnosticId)}`, actionOptions),
-    cleanupMaintenanceCache: (createOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/maintenance/cache-cleanup`, localOperationV1Schema, 202, {
+    cleanupMaintenanceCache: (input, createOptions) =>
+      request("POST", `${DESKTOP_API_V1_PREFIX}/maintenance/cache-cleanup`, operationV1Schema, 202, {
+        body: input,
+        bodySchema: cacheCleanupRequestV1Schema,
         idempotencyKey: createOptions.idempotencyKey,
       }),
     eventStreamRequest: async (lastEventId) => {

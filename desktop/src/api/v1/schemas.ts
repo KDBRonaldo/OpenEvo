@@ -6,10 +6,17 @@ export const MAX_JSON_NODES = 8_192;
 export const MAX_JSON_COLLECTION_ITEMS = 1_024;
 export const MAX_JSON_TEXT_BYTES = 262_144;
 export const MAX_JSON_TOTAL_BYTES = 1_048_576;
+export const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 
+const MAX_ARTIFACT_PREVIEW_BYTES = 2 * 1024 * 1024;
+const MAX_ARTIFACT_PREVIEW_DOCUMENTS = 128;
+const MAX_ARTIFACT_DIFF_HUNKS = 128;
+const MAX_ARTIFACT_DIFF_LINES = 8_192;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const UTC_RFC3339 = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?Z$/;
+const CORE_UTC_RFC3339 = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const STABLE_ID = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/;
 
 export const schemaVersionV1Schema = z.literal("1").default("1");
 export const opaqueIdSchema = z
@@ -18,16 +25,38 @@ export const opaqueIdSchema = z
   .max(256)
   .refine((value) => value === value.trim() && !CONTROL_CHARACTERS.test(value), "must be trimmed text without control characters");
 export const shortTextSchema = z.string().min(1).max(512).refine((value) => !value.includes("\0"));
+const projectDisplayNameSchema = z.string().min(1).max(128).refine((value) => !value.includes("\0"));
+const localCoreShortTextSchema = z.string().min(1).max(256).refine((value) => !value.includes("\0"));
 export const longTextSchema = z.string().min(1).max(65_536).refine((value) => !value.includes("\0"));
-export const diffTextSchema = z.string().max(65_536).refine((value) => !value.includes("\0"));
 export const utcTimestampSchema = z.string().regex(UTC_RFC3339, "must be a UTC RFC 3339 timestamp");
 export const sha256DigestSchema = z.string().regex(SHA256, "must be lowercase SHA-256 hex");
 export const etagSchema = z.string().regex(/^"[0-9a-f]{64}"$/);
 export const executionModeV1Schema = z.enum(["codex_subscription_transcript", "self-deployed"]);
+
+const coreOpaqueIdSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[^\u0000-\u0020\u007f](?:[^\u0000-\u001f\u007f]*[^\u0000-\u0020\u007f])?$/);
+const coreShortTextSchema = z.string().min(1).max(256);
+const displayNameSchema = z.string().min(1).max(128);
+const descriptionSchema = z.string().min(1).max(4_096);
+const coreLogTextSchema = z.string().max(16_384);
+const contentTextSchema = z.string().max(2 * 1024 * 1024);
+const coreUtcTimestampSchema = z.string().regex(CORE_UTC_RFC3339);
+const agentModelRefSchema = z
+  .string()
+  .min(1)
+  .max(256)
+  .regex(/^[^\u0000-\u0020\u007f](?:[^\u0000-\u001f\u007f]*[^\u0000-\u0020\u007f])?$/);
+const stableIdSchema = z.string().regex(STABLE_ID);
+const safeIntegerSchema = z.number().int().safe();
+const nonNegativeSafeIntegerSchema = safeIntegerSchema.min(0);
+const mimeTypeSchema = z.string().max(127).regex(/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/);
 const huggingFaceModelSchema = z
   .string()
   .min(1)
-  .max(512)
+  .max(256)
   .refine((value) => value === value.trim() && !CONTROL_CHARACTERS.test(value), "hf_model must be trimmed text without control characters");
 
 export type SafeJsonValue = null | boolean | number | string | SafeJsonValue[] | { [key: string]: SafeJsonValue };
@@ -93,7 +122,7 @@ export const desktopBootstrapContextV1Schema = z
   .object({
     schema_version: schemaVersionV1Schema,
     endpoint: z.string().url().refine(isLoopbackEndpoint, "sidecar endpoint must be an unauthenticated loopback HTTP URL"),
-    session_token: z.string().min(32).max(4096).refine((value) => !CONTROL_CHARACTERS.test(value)),
+    session_token: z.string().min(32).max(4_096).refine((value) => !CONTROL_CHARACTERS.test(value)),
     negotiated_contract: negotiatedContractV1Schema,
   })
   .strict();
@@ -114,20 +143,37 @@ export const healthV1Schema = z
     if (present === proof.length && value.status !== "ok") issue(context, ["status"], "native readiness proof requires ok status");
   });
 
+const errorSeveritySchema = z.enum(["info", "warning", "blocking"]);
+const errorCategorySchema = z.enum(["environment", "project", "run", "artifact", "service", "authentication", "contract", "internal"]);
+const repairActionSchema = z.enum([
+  "openevo_can_retry",
+  "openevo_can_install",
+  "openevo_can_reconfigure",
+  "user_action_required",
+  "unsupported",
+]);
+const errorFieldIssueV1Schema = z.object({ field: z.string().min(1).max(256), issue: coreShortTextSchema }).strict();
+const errorConflictV1Schema = z.object({ resource_type: z.string().min(1).max(64), resource_id: coreOpaqueIdSchema }).strict();
+const apiErrorDetailsV1Schema = z
+  .object({
+    field_issues: z.array(errorFieldIssueV1Schema).max(64).default([]),
+    conflicts: z.array(errorConflictV1Schema).max(32).default([]),
+  })
+  .strict();
 export const apiErrorV1Schema = z
   .object({
     schema_version: schemaVersionV1Schema,
-    request_id: opaqueIdSchema,
-    code: z.string().regex(/^[a-z][a-z0-9_]{0,127}$/),
+    request_id: coreOpaqueIdSchema,
+    code: z.string().min(1).max(128).regex(/^[a-z][a-z0-9_]*$/),
     http_status: z.number().int().min(400).max(599),
-    message: shortTextSchema,
-    severity: z.enum(["info", "warning", "blocking"]),
-    category: z.enum(["contract", "authentication", "profile", "connection", "project", "capability", "operation", "run", "artifact", "service", "diagnostic", "maintenance"]),
+    message: descriptionSchema,
+    severity: errorSeveritySchema,
+    category: errorCategorySchema,
     retryable: z.boolean(),
-    repair_action: z.enum(["none", "openevo_can_retry", "user_input_required", "reconnect_required", "upgrade_required"]),
-    next_action: shortTextSchema.nullable().default(null),
-    details: safeJsonObjectSchema.default({}),
-    logs_ref: opaqueIdSchema.nullable().default(null),
+    repair_action: repairActionSchema,
+    next_action: descriptionSchema,
+    details: apiErrorDetailsV1Schema.default({}),
+    logs_ref: coreOpaqueIdSchema.nullable().default(null),
   })
   .strict();
 
@@ -181,7 +227,7 @@ export const desktopStateV1Schema = z
 
 export const credentialSlotStatusSchema = z
   .object({
-    kind: z.enum(["ssh_password", "ssh_private_key", "ssh_private_key_passphrase", "http_proxy_password", "https_proxy_password"]),
+    kind: z.enum(["ssh_password", "ssh_private_key", "ssh_private_key_passphrase", "http_proxy_password", "https_proxy_password", "hugging_face_token"]),
     status: z.enum(["empty", "stored", "unavailable"]),
     updated_at: utcTimestampSchema.nullable().default(null),
   })
@@ -229,13 +275,12 @@ export const hostKeyAcceptV1Schema = z
   .object({ algorithm: z.enum(["ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512"]), fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9+/]{20,88}={0,2}$/) })
   .strict();
 
-export const contentRefV1Schema = z.object({ content_id: opaqueIdSchema, sha256: sha256DigestSchema, byte_size: z.number().int().min(0).max(1_000_000_000_000) }).strict();
 export const executionSettingsV1Schema = z
   .object({
     mode: executionModeV1Schema,
     capture_mode: z.literal("transcript").default("transcript"),
     token_level_metrics_available: z.literal(false).default(false),
-    codex_model: shortTextSchema.nullable().default(null),
+    codex_model: localCoreShortTextSchema.nullable().default(null),
     hf_model: huggingFaceModelSchema.nullable().default(null),
   })
   .strict()
@@ -243,23 +288,44 @@ export const executionSettingsV1Schema = z
     const subscription = value.mode === "codex_subscription_transcript";
     if (subscription !== (value.codex_model !== null) || subscription === (value.hf_model !== null)) issue(context, [], "execution mode and model fields do not agree");
   });
-export const projectTaskV1Schema = z.object({ title: shortTextSchema, objective: longTextSchema, task_ref: contentRefV1Schema.nullable().default(null) }).strict();
-export const projectSourceV1Schema = z
-  .object({ kind: z.enum(["scratch", "native_folder_snapshot", "git_snapshot", "remote_snapshot"]), display_name: shortTextSchema, source_ref: contentRefV1Schema.nullable().default(null) })
+export const projectTaskV1Schema = z.object({ title: localCoreShortTextSchema, objective: longTextSchema }).strict();
+export const workspaceImportRefV1Schema = z
+  .object({
+    import_id: opaqueIdSchema,
+    content_sha256: sha256DigestSchema,
+    byte_size: safeIntegerSchema.min(1_024).max(16 * 1024 * 1024 * 1024),
+    entry_count: safeIntegerSchema.min(0).max(100_000),
+    extracted_byte_size: safeIntegerSchema.min(0).max(16 * 1024 * 1024 * 1024),
+  })
   .strict()
   .superRefine((value, context) => {
-    if ((value.kind === "scratch") !== (value.source_ref === null)) issue(context, ["source_ref"], "snapshot source reference does not agree with source kind");
+    if (value.byte_size % 512 !== 0) issue(context, ["byte_size"], "workspace import size must align to a tar block");
+    if (value.entry_count === 0 && value.extracted_byte_size !== 0) issue(context, ["extracted_byte_size"], "empty import cannot declare extracted bytes");
+  });
+export const projectSourceV1Schema = z
+  .object({
+    kind: z.enum(["scratch", "native_folder_snapshot"]),
+    display_name: localCoreShortTextSchema,
+    import_ref: workspaceImportRefV1Schema.nullable().default(null),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.kind === "scratch" && value.import_ref !== null) issue(context, ["import_ref"], "scratch sources must not include import_ref");
+    if (value.kind === "native_folder_snapshot" && value.import_ref === null) issue(context, ["import_ref"], "native folder sources require an opaque import_ref");
   });
 export const evolutionTargetSelectionV1Schema = z
-  .object({ enabled: z.boolean(), method: opaqueIdSchema.nullable().default(null), config: safeJsonObjectSchema.default({}) })
+  .object({ enabled: z.boolean(), method: stableIdSchema.nullable().default(null), config: safeJsonObjectSchema.default({}) })
   .strict()
   .refine((value) => !value.enabled || value.method !== null, { path: ["method"], message: "enabled targets require a method" });
 export const evolutionSelectionsV1Schema = z
-  .record(opaqueIdSchema, evolutionTargetSelectionV1Schema)
+  .record(stableIdSchema, evolutionTargetSelectionV1Schema)
   .refine((value) => Object.keys(value).length <= 128, "at most 128 evolution targets are allowed");
-export const evolutionConfigV1Schema = z.object({ targets: evolutionSelectionsV1Schema }).strict();
+export const evolutionConfigV1Schema = z
+  .object({ targets: evolutionSelectionsV1Schema })
+  .strict()
+  .refine((value) => utf8ByteLength(JSON.stringify(value)) <= 1_048_576, "evolution config exceeds the aggregate byte budget");
 const projectFields = {
-  name: shortTextSchema,
+  name: projectDisplayNameSchema,
   profile_id: opaqueIdSchema,
   task: projectTaskV1Schema,
   source: projectSourceV1Schema,
@@ -268,13 +334,52 @@ const projectFields = {
 };
 export const projectCreateV1Schema = z.object(projectFields).strict();
 export const projectPatchV1Schema = z.object(projectFields).partial().strict().refine((value) => Object.keys(value).length > 0, "project patch must not be empty");
+
+export const revisionRefV1Schema = z
+  .object({
+    id: coreOpaqueIdSchema,
+    project_id: coreOpaqueIdSchema,
+    generation: nonNegativeSafeIntegerSchema,
+    manifest_sha256: sha256DigestSchema,
+  })
+  .strict();
+export const modelPreparationV1Schema = z
+  .object({
+    model_ref: agentModelRefSchema,
+    status: z.enum(["unresolved", "downloading", "ready", "failed"]),
+    downloaded_bytes: nonNegativeSafeIntegerSchema.nullable().default(null),
+    total_bytes: nonNegativeSafeIntegerSchema.nullable().default(null),
+    error: apiErrorV1Schema.nullable().default(null),
+    updated_at: coreUtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.downloaded_bytes !== null && value.total_bytes === null) issue(context, ["downloaded_bytes"], "downloaded_bytes requires total_bytes");
+    if (value.downloaded_bytes !== null && value.total_bytes !== null && value.downloaded_bytes > value.total_bytes) issue(context, ["downloaded_bytes"], "downloaded_bytes exceeds total_bytes");
+    if ((value.status === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required only for failed model preparation");
+  });
+export const remoteProjectStateV1Schema = z
+  .object({
+    core_project_id: opaqueIdSchema,
+    status: z.enum(["draft", "ready", "blocked", "archived"]),
+    active_revision: revisionRefV1Schema.nullable().default(null),
+    registry_digest: sha256DigestSchema.nullable().default(null),
+    model_preparation: modelPreparationV1Schema,
+    observed_at: utcTimestampSchema,
+    etag: etagSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.status === "ready" && (value.active_revision === null || value.registry_digest === null || value.model_preparation.status !== "ready")) issue(context, ["status"], "ready remote projects require a revision, registry, and prepared model");
+    if (value.active_revision !== null && value.active_revision.project_id !== value.core_project_id) issue(context, ["active_revision"], "remote project revision belongs to another project");
+  });
 export const projectV1Schema = z
   .object({
     schema_version: schemaVersionV1Schema,
     project_id: opaqueIdSchema,
     ...projectFields,
     state: z.enum(["draft", "active", "archived", "blocked"]),
-    current_revision_id: opaqueIdSchema.nullable().default(null),
+    remote: remoteProjectStateV1Schema.nullable().default(null),
     etag: etagSchema,
     created_at: utcTimestampSchema,
     updated_at: utcTimestampSchema,
@@ -285,7 +390,7 @@ export const resourceRefV1Schema = z
   .object({ resource_type: z.enum(["profile", "project", "operation", "run", "artifact", "service", "diagnostic", "maintenance"]), resource_id: opaqueIdSchema })
   .strict();
 export const operationProgressV1Schema = z
-  .object({ current: z.number().int().nonnegative(), total: z.number().int().positive(), label: shortTextSchema })
+  .object({ current: nonNegativeSafeIntegerSchema, total: safeIntegerSchema.min(1), label: shortTextSchema })
   .strict()
   .refine((value) => value.current <= value.total, { path: ["current"], message: "current must not exceed total" });
 export const normalizedCheckV1Schema = z
@@ -300,19 +405,19 @@ export const normalizedCheckV1Schema = z
 export const diagnosticFindingV1Schema = z
   .object({ finding_id: opaqueIdSchema, severity: z.enum(["info", "warning", "blocking"]), category: z.enum(["desktop", "ssh", "core", "model_service", "workspace", "run", "evolution"]), summary: shortTextSchema, next_action: shortTextSchema.nullable().default(null) })
   .strict();
-export const diagnosticReportV1Schema = z
+export const desktopDiagnosticReportV1Schema = z
   .object({ schema_version: schemaVersionV1Schema, diagnostic_id: opaqueIdSchema, status: z.enum(["healthy", "degraded", "blocked"]), generated_at: utcTimestampSchema, checks: z.array(normalizedCheckV1Schema), findings: z.array(diagnosticFindingV1Schema), etag: etagSchema })
   .strict();
 const localOperationResultV1Schema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("connection"), profile_id: opaqueIdSchema, connection_state: z.enum(["connected", "disconnected", "host_key_required"]) }).strict(),
   z.object({ kind: z.literal("project"), project_id: opaqueIdSchema, project_etag: etagSchema, active: z.boolean() }).strict(),
-  z.object({ kind: z.literal("diagnostic"), report: diagnosticReportV1Schema }).strict(),
+  z.object({ kind: z.literal("diagnostic"), report: desktopDiagnosticReportV1Schema }).strict(),
 ]);
 export const localOperationV1Schema = z
   .object({
     schema_version: schemaVersionV1Schema,
     operation_id: opaqueIdSchema,
-    operation_kind: z.enum(["profile_connect", "profile_disconnect", "host_key_accept", "project_activate", "project_doctor", "project_repair", "bootstrap", "workspace_sync", "service_restart", "service_stop", "diagnostics", "cache_cleanup"]),
+    operation_kind: z.enum(["profile_connect", "profile_disconnect", "host_key_accept", "project_activate", "project_doctor", "project_repair", "bootstrap", "workspace_sync"]),
     state: z.enum(["queued", "running", "succeeded", "failed", "cancelling", "cancelled"]),
     resource: resourceRefV1Schema,
     progress: operationProgressV1Schema.nullable().default(null),
@@ -330,169 +435,680 @@ export const localOperationV1Schema = z
     if (terminal !== (value.finished_at !== null)) issue(context, ["finished_at"], "terminal state and finished_at must agree");
     if ((value.state === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required exactly for failed operations");
   });
-export const logEntryV1Schema = z
-  .object({ log_id: opaqueIdSchema, occurred_at: utcTimestampSchema, level: z.enum(["debug", "info", "warning", "error"]), source: z.enum(["desktop", "connection", "core", "run", "evolution", "service"]), message: longTextSchema, code: shortTextSchema.nullable().default(null) })
-  .strict();
-
-export const capabilitySupportAxisV1Schema = z
-  .object({ supported: z.boolean(), reason_code: shortTextSchema.nullable().default(null), summary: shortTextSchema.nullable().default(null) })
-  .strict()
-  .superRefine((value, context) => {
-    if (value.supported !== (value.reason_code === null && value.summary === null)) issue(context, [], "support axis reason does not agree with supported state");
-  });
-export const methodSupportV1Schema = z
-  .object({ overall: z.enum(["supported", "unsupported"]), execution: capabilitySupportAxisV1Schema, capture: capabilitySupportAxisV1Schema, harness: capabilitySupportAxisV1Schema, runtime: capabilitySupportAxisV1Schema })
-  .strict();
-export const resolvedMethodCapabilityV1Schema = z.object({ method_id: opaqueIdSchema, identity_digest: sha256DigestSchema, support: methodSupportV1Schema }).strict();
-export const methodCapabilityV1Schema = z
-  .object({ method_id: opaqueIdSchema, display_name: shortTextSchema, description: shortTextSchema, maturity: z.enum(["experimental", "preview", "stable"]), identity_digest: sha256DigestSchema, config_schema: safeJsonObjectSchema, default_config: safeJsonObjectSchema, support: methodSupportV1Schema })
-  .strict();
-export const selectionResolverCapabilityV1Schema = z
-  .object({ selection_value: opaqueIdSchema, display_name: shortTextSchema, description: shortTextSchema, resolved_methods: z.array(resolvedMethodCapabilityV1Schema) })
-  .strict();
-export const targetCapabilityV1Schema = z
-  .object({ target_id: opaqueIdSchema, display_name: shortTextSchema, description: shortTextSchema, artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system", "parametric_memory"]), release_enabled: z.boolean(), configured_default_method_id: opaqueIdSchema, effective_default_method_id: opaqueIdSchema.nullable().default(null), methods: z.array(methodCapabilityV1Schema), accepted_methods: z.array(resolvedMethodCapabilityV1Schema), selection_resolvers: z.array(selectionResolverCapabilityV1Schema).default([]) })
-  .strict();
-export const projectCapabilitiesV1Schema = z
-  .object({ schema_version: schemaVersionV1Schema, project_id: opaqueIdSchema, execution_mode: executionModeV1Schema, source: z.literal("verified_remote_core").default("verified_remote_core"), registry_verified: z.literal(true).default(true), registry_digest: sha256DigestSchema, core_version: shortTextSchema, fetched_at: utcTimestampSchema, targets: z.array(targetCapabilityV1Schema) })
-  .strict();
-
-export const projectValidateRequestV1Schema = z
-  .object({ project_etag: etagSchema, capability_registry_digest: sha256DigestSchema, execution: executionSettingsV1Schema, evolution: evolutionConfigV1Schema })
-  .strict();
-export const validationIssueV1Schema = z
-  .object({ issue_id: opaqueIdSchema, severity: z.enum(["warning", "blocking"]), field: shortTextSchema, code: shortTextSchema, message: shortTextSchema, next_action: shortTextSchema.nullable().default(null) })
-  .strict();
-export const projectValidationV1Schema = z
-  .object({ schema_version: schemaVersionV1Schema, project_id: opaqueIdSchema, project_etag: etagSchema, capability_registry_digest: sha256DigestSchema, valid: z.boolean(), issues: z.array(validationIssueV1Schema), validated_at: utcTimestampSchema })
-  .strict()
-  .refine((value) => value.valid !== value.issues.some((entry) => entry.severity === "blocking"), { path: ["valid"], message: "validity must agree with blocking issues" });
-
-export const immutableSnapshotRefV1Schema = z.object({ snapshot_id: opaqueIdSchema, digest: sha256DigestSchema }).strict();
-export const revisionRefV1Schema = z
-  .object({ revision_id: opaqueIdSchema, generation: z.number().int().nonnegative(), manifest_digest: sha256DigestSchema, state: z.enum(["active", "queued", "preparing", "failed", "cancelled"]) })
-  .strict();
-export const requiredRevisionV1Schema = z
-  .object({ revision_id: opaqueIdSchema, generation: z.number().int().nonnegative(), manifest_digest: sha256DigestSchema, state: z.enum(["active", "queued", "preparing"]) })
-  .strict();
-export const runCreateV1Schema = z
-  .object({ project_id: opaqueIdSchema, project_snapshot: immutableSnapshotRefV1Schema, task_snapshot: immutableSnapshotRefV1Schema, workspace_snapshot: immutableSnapshotRefV1Schema, capability_registry_digest: sha256DigestSchema, required_revision: requiredRevisionV1Schema })
-  .strict();
-export const runQueuedReasonV1Schema = z
-  .object({ code: z.enum(["capacity_unavailable", "required_revision_uncommitted", "service_starting", "project_activation_pending"]), summary: shortTextSchema, retry_after_seconds: z.number().int().min(1).max(86_400).nullable().default(null) })
-  .strict();
-export const runAttemptV1Schema = z
-  .object({ attempt_id: opaqueIdSchema, number: z.number().int().positive(), state: z.enum(["queued", "preparing", "running", "cancelling", "succeeded", "failed", "cancelled"]), started_at: utcTimestampSchema.nullable().default(null), finished_at: utcTimestampSchema.nullable().default(null) })
-  .strict();
-export const runV1Schema = z
+export const localLogEntryV1Schema = z
   .object({
-    schema_version: schemaVersionV1Schema,
-    run_id: opaqueIdSchema,
-    project_id: opaqueIdSchema,
-    state: z.enum(["queued", "preparing", "running", "cancelling", "succeeded", "failed", "cancelled"]),
-    queued_reason: runQueuedReasonV1Schema.nullable().default(null),
-    project_snapshot: immutableSnapshotRefV1Schema,
-    task_snapshot: immutableSnapshotRefV1Schema,
-    workspace_snapshot: immutableSnapshotRefV1Schema,
-    capability_registry_digest: sha256DigestSchema,
-    pinned_revision: revisionRefV1Schema,
-    successor_revision: revisionRefV1Schema.nullable().default(null),
-    latest_attempt: runAttemptV1Schema,
-    created_at: utcTimestampSchema,
-    updated_at: utcTimestampSchema,
-    etag: etagSchema,
-    error: apiErrorV1Schema.nullable().default(null),
+    log_id: opaqueIdSchema,
+    occurred_at: utcTimestampSchema,
+    level: z.enum(["debug", "info", "warning", "error"]),
+    source: z.enum(["desktop", "connection", "core", "run", "evolution", "service"]),
+    message: longTextSchema,
+    code: shortTextSchema.nullable().default(null),
+  })
+  .strict();
+
+const axisSupportV1Schema = z
+  .object({
+    state: z.enum(["supported", "unsupported", "unavailable"]),
+    reason_code: stableIdSchema.nullable().default(null),
+    message: z.string().max(4_096).refine((value) => value.trim().length > 0),
+    missing_requirements: z.array(stableIdSchema).max(256).default([]),
   })
   .strict()
   .superRefine((value, context) => {
-    if ((value.state === "queued") !== (value.queued_reason !== null)) issue(context, ["queued_reason"], "queued reason must agree with run state");
-    if ((value.state === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required exactly for failed runs");
+    if (value.state === "supported" && (value.reason_code !== null || value.missing_requirements.length > 0)) issue(context, ["state"], "supported axis cannot include a failure reason");
+    if (value.state !== "supported" && value.reason_code === null) issue(context, ["reason_code"], "unsupported and unavailable axes require a reason code");
+    if (new Set(value.missing_requirements).size !== value.missing_requirements.length) issue(context, ["missing_requirements"], "missing requirements must be unique");
   });
-export const timelineEntryV1Schema = z
-  .object({ entry_id: opaqueIdSchema, occurred_at: utcTimestampSchema, stage: z.enum(["admission", "workspace", "agent", "capture", "dataset", "evolution", "materialization", "revision"]), state: z.enum(["queued", "running", "succeeded", "failed", "cancelled", "blocked"]), title: shortTextSchema, summary: shortTextSchema, progress: operationProgressV1Schema.nullable().default(null) })
+export const methodSupportV1Schema = z
+  .object({
+    overall: z.enum(["supported", "unsupported", "unavailable"]),
+    execution: axisSupportV1Schema,
+    capture: axisSupportV1Schema,
+    harness: axisSupportV1Schema,
+    runtime: axisSupportV1Schema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const states = [value.execution.state, value.capture.state, value.harness.state, value.runtime.state];
+    const expected = states.includes("unsupported") ? "unsupported" : states.includes("unavailable") ? "unavailable" : "supported";
+    if (value.overall !== expected) issue(context, ["overall"], "overall support must match the four axes");
+  });
+export const methodInputBindingV1Schema = z
+  .object({
+    binding_id: stableIdSchema,
+    source: z.enum(["current_dataset", "history_datasets", "current_target_artifacts", "explicit_inputs"]),
+    artifact_type: stableIdSchema,
+    min_count: nonNegativeSafeIntegerSchema.default(0),
+    max_count: safeIntegerSchema.min(1).nullable().default(null),
+  })
+  .strict()
+  .refine((value) => value.max_count === null || value.min_count <= value.max_count, { path: ["max_count"], message: "min_count must not exceed max_count" });
+export const evolutionExecutionProfileV1Schema = z
+  .object({
+    execution_mode: z.enum(["subscription", "self_deployed"]),
+    capture_mode: z.enum(["transcript", "token_level"]),
+    harness_id: stableIdSchema,
+    harness_capabilities: z.array(stableIdSchema).max(256).default([]),
+    runtime_capabilities: z.array(stableIdSchema).max(256).default([]),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.execution_mode === "subscription" && value.capture_mode !== "transcript") issue(context, ["capture_mode"], "subscription execution requires transcript capture");
+    for (const key of ["harness_capabilities", "runtime_capabilities"] as const) {
+      if (new Set(value[key]).size !== value[key].length) issue(context, [key], `${key} must be unique`);
+    }
+  });
+const canonicalJsonObjectStringSchema = z
+  .string()
+  .min(2)
+  .refine((value) => utf8ByteLength(value) <= 262_144, "canonical JSON exceeds maximum bytes")
+  .refine(isCanonicalJsonObject, "must contain a canonical JSON object with sorted keys");
+export const evolutionResolvedMethodCapabilityV1Schema = z
+  .object({ method_id: stableIdSchema, implementation_identity_digest: sha256DigestSchema, support: methodSupportV1Schema })
   .strict();
-export const contextContributionV1Schema = z
-  .object({ target_id: opaqueIdSchema, artifact_id: opaqueIdSchema, artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system", "parametric_memory"]), selected: z.boolean(), summary: shortTextSchema })
+export const evolutionMethodCapabilityV1Schema = z
+  .object({
+    method_id: stableIdSchema,
+    display_name: z.string().max(4_096).refine((value) => value.trim().length > 0),
+    description: z.string().max(4_096).refine((value) => value.trim().length > 0),
+    exposure: z.enum(["desktop", "maintainer", "internal"]),
+    maturity: z.enum(["stable", "experimental"]),
+    execution_modes: z.array(z.enum(["subscription", "self_deployed"])).max(2),
+    capture_modes: z.array(z.enum(["transcript", "token_level"])).max(2),
+    supported_harness_ids: z.array(z.string()).max(256),
+    harness_requirements: z.array(z.string()).max(256),
+    runtime_requirements: z.array(z.string()).max(256),
+    input_bindings: z.array(methodInputBindingV1Schema).max(256),
+    output_artifact_types: z.array(z.string()).max(256),
+    config_schema_json: canonicalJsonObjectStringSchema,
+    default_config_json: canonicalJsonObjectStringSchema,
+    implementation_identity_digest: sha256DigestSchema,
+    support: methodSupportV1Schema,
+  })
   .strict();
-export const runContextV1Schema = z
-  .object({ schema_version: schemaVersionV1Schema, run_id: opaqueIdSchema, pinned_revision: revisionRefV1Schema, successor_revision: revisionRefV1Schema.nullable().default(null), contributions: z.array(contextContributionV1Schema) })
+export const evolutionSelectionResolverCapabilityV1Schema = z
+  .object({
+    selection_value: stableIdSchema,
+    display_name: z.string().max(4_096).refine((value) => value.trim().length > 0),
+    description: z.string().max(4_096).refine((value) => value.trim().length > 0),
+    resolved_methods: z.array(evolutionResolvedMethodCapabilityV1Schema).min(1).max(256),
+  })
+  .strict()
+  .superRefine((value, context) => uniqueSortedBy(value.resolved_methods, "method_id", context, ["resolved_methods"]));
+export const evolutionTargetCapabilityV1Schema = z
+  .object({
+    target_id: stableIdSchema,
+    display_name: z.string().max(4_096).refine((value) => value.trim().length > 0),
+    description: z.string().max(4_096).refine((value) => value.trim().length > 0),
+    artifact_type: stableIdSchema,
+    exposure: z.enum(["desktop", "maintainer", "internal"]),
+    maturity: z.enum(["stable", "experimental"]),
+    handler_id: stableIdSchema,
+    configured_default_method_id: stableIdSchema,
+    effective_default_method_id: stableIdSchema.nullable(),
+    configured_default_support: methodSupportV1Schema,
+    renderer_kind: z.enum(["markdown", "file_bundle", "structured_summary", "adapter"]),
+    renderer_contract_version: z.string().max(4_096).refine((value) => value.trim().length > 0),
+    contribution_contract_version: z.string().max(4_096).refine((value) => value.trim().length > 0),
+    context_order: z.number().int().min(0).max(10_000),
+    implementation_identity_digest: sha256DigestSchema,
+    handler_identity_digest: sha256DigestSchema,
+    accepted_methods: z.array(evolutionResolvedMethodCapabilityV1Schema).min(1).max(256),
+    selection_resolvers: z.array(evolutionSelectionResolverCapabilityV1Schema).max(64),
+    methods: z.array(evolutionMethodCapabilityV1Schema).max(256),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    uniqueSortedBy(value.methods, "method_id", context, ["methods"]);
+    uniqueSortedBy(value.accepted_methods, "method_id", context, ["accepted_methods"]);
+    uniqueSortedBy(value.selection_resolvers, "selection_value", context, ["selection_resolvers"]);
+    const visible = new Map(value.methods.map((method) => [method.method_id, method]));
+    const accepted = new Map(value.accepted_methods.map((method) => [method.method_id, method]));
+    const configured = visible.get(value.configured_default_method_id);
+    if (!configured) issue(context, ["configured_default_method_id"], "configured default must be visible");
+    else if (!sameValue(configured.support, value.configured_default_support)) issue(context, ["configured_default_support"], "configured default support must match the method");
+    for (const method of value.methods) {
+      const acceptedMethod = accepted.get(method.method_id);
+      if (!acceptedMethod || acceptedMethod.implementation_identity_digest !== method.implementation_identity_digest || !sameValue(acceptedMethod.support, method.support)) {
+        issue(context, ["accepted_methods"], "visible and accepted method metadata must match");
+      }
+    }
+    for (const resolver of value.selection_resolvers) {
+      for (const method of resolver.resolved_methods) {
+        if (!sameValue(accepted.get(method.method_id), method)) issue(context, ["selection_resolvers"], "resolver methods must exactly match accepted methods");
+      }
+    }
+    if (value.effective_default_method_id !== null) {
+      if (value.effective_default_method_id !== value.configured_default_method_id) issue(context, ["effective_default_method_id"], "effective default cannot replace the configured default");
+      if (visible.get(value.effective_default_method_id)?.support.overall !== "supported") issue(context, ["effective_default_method_id"], "effective default must be supported");
+    }
+  });
+export const evolutionCapabilitiesV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    core_version: z.string().refine((value) => value.trim().length > 0),
+    registry_digest: sha256DigestSchema,
+    evaluated_profile: evolutionExecutionProfileV1Schema,
+    targets: z.array(evolutionTargetCapabilityV1Schema).max(128),
+  })
+  .strict()
+  .superRefine((value, context) => uniqueSortedBy(value.targets, "target_id", context, ["targets"]));
+export const capabilitiesEnvelopeV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    project_id: opaqueIdSchema,
+    project_etag: etagSchema,
+    source: z.literal("verified_remote_core").default("verified_remote_core"),
+    registry_verified: z.literal(true).default(true),
+    fetched_at: utcTimestampSchema,
+    capabilities: evolutionCapabilitiesV1Schema,
+  })
+  .strict();
+export const projectCapabilitiesV1Schema = capabilitiesEnvelopeV1Schema;
+
+const checkStatusSchema = z.enum(["ok", "warning", "blocking", "unavailable"]);
+export const validationCheckV1Schema = z
+  .object({
+    id: coreOpaqueIdSchema,
+    status: checkStatusSchema,
+    message: descriptionSchema,
+    target_id: coreOpaqueIdSchema.nullable().default(null),
+    method_id: coreOpaqueIdSchema.nullable().default(null),
+  })
+  .strict();
+export const projectValidationV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    project_id: opaqueIdSchema,
+    project_etag: etagSchema,
+    registry_digest: sha256DigestSchema,
+    valid: z.boolean(),
+    checks: z.array(validationCheckV1Schema).max(256),
+    validated_at: utcTimestampSchema,
+  })
   .strict();
 
-export const artifactLineageV1Schema = z
-  .object({ source_dataset_ids: z.array(opaqueIdSchema).default([]), parent_artifact_ids: z.array(opaqueIdSchema).default([]), producing_job_id: opaqueIdSchema.nullable().default(null) })
+export const immutableSnapshotRefV1Schema = z
+  .object({
+    id: coreOpaqueIdSchema,
+    kind: z.enum(["project", "task", "workspace"]),
+    content_sha256: sha256DigestSchema,
+    created_at: coreUtcTimestampSchema,
+  })
   .strict();
-export const artifactCompatibilityV1Schema = z
-  .object({ execution_modes: z.array(executionModeV1Schema), harness_ids: z.array(opaqueIdSchema).default([]), base_model_ids: z.array(opaqueIdSchema).default([]) })
+export const reachableRequiredRevisionRefV1Schema = z
+  .object({
+    revision: revisionRefV1Schema,
+    reachable_from_revision_id: coreOpaqueIdSchema,
+    relation: z.enum(["active", "successor"]),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.relation === "active" && value.revision.id !== value.reachable_from_revision_id) issue(context, ["reachable_from_revision_id"], "active required revision must be the reachable head");
+    if (value.relation === "successor" && value.revision.id === value.reachable_from_revision_id) issue(context, ["reachable_from_revision_id"], "successor must differ from its predecessor");
+  });
+export const runCreateV1Schema = z.object({ project_id: opaqueIdSchema }).strict();
+export const queuedReasonV1Schema = z
+  .object({
+    code: z.enum(["admission_pending", "capacity", "service_starting", "required_revision_uncommitted"]),
+    summary: coreShortTextSchema,
+    retry_after_seconds: z.number().int().min(0).max(86_400).nullable().default(null),
+  })
   .strict();
-export const artifactScoreV1Schema = z.object({ name: z.string().regex(/^[a-z][a-z0-9_]{0,127}$/), value: z.number().finite() }).strict();
-const artifactBase = {
-  schema_version: schemaVersionV1Schema,
-  artifact_id: opaqueIdSchema,
-  project_id: opaqueIdSchema,
-  run_id: opaqueIdSchema,
-  target_id: opaqueIdSchema,
-  display_name: shortTextSchema,
-  summary: shortTextSchema,
-  content_digest: sha256DigestSchema,
-  byte_size: z.number().int().min(0).max(1_000_000_000_000),
-  lineage: artifactLineageV1Schema,
-  compatibility: artifactCompatibilityV1Schema,
-  scores: z.array(artifactScoreV1Schema).default([]),
+const runStatusSchema = z.enum(["queued", "preparing", "running", "cancelling", "succeeded", "failed", "cancelled"]);
+export const attemptV1Schema = z
+  .object({
+    id: coreOpaqueIdSchema,
+    run_id: coreOpaqueIdSchema,
+    number: z.number().int().min(1).max(100),
+    status: runStatusSchema,
+    queued_reason: queuedReasonV1Schema.nullable().default(null),
+    created_at: coreUtcTimestampSchema,
+    updated_at: coreUtcTimestampSchema,
+    started_at: coreUtcTimestampSchema.nullable().default(null),
+    finished_at: coreUtcTimestampSchema.nullable().default(null),
+    error: apiErrorV1Schema.nullable().default(null),
+  })
+  .strict()
+  .superRefine(validateAttempt);
+export const revisionTransitionV1Schema = z
+  .object({
+    state: z.enum(["not_started", "sealing_dataset", "running_methods", "validating", "materializing", "preparing_serving", "committing", "active", "failed", "unavailable"]),
+    predecessor_revision: revisionRefV1Schema,
+    successor_revision: revisionRefV1Schema,
+    progress_completed: z.number().int().min(0).max(10_000),
+    progress_total: z.number().int().min(0).max(10_000),
+    message: descriptionSchema,
+    error: apiErrorV1Schema.nullable().default(null),
+    updated_at: coreUtcTimestampSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.progress_completed > value.progress_total) issue(context, ["progress_completed"], "transition progress exceeds total");
+    if ((value.state === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required only for failed transitions");
+    if (value.successor_revision.project_id !== value.predecessor_revision.project_id) issue(context, ["successor_revision"], "transition cannot cross projects");
+    if (value.successor_revision.generation !== value.predecessor_revision.generation + 1) issue(context, ["successor_revision", "generation"], "successor generation must follow predecessor");
+  });
+
+const runSummaryFields = {
+  id: coreOpaqueIdSchema,
+  project_id: coreOpaqueIdSchema,
+  project_snapshot: immutableSnapshotRefV1Schema,
+  task_snapshot: immutableSnapshotRefV1Schema,
+  workspace_snapshot: immutableSnapshotRefV1Schema,
+  registry_digest: sha256DigestSchema,
+  execution_mode: executionModeV1Schema,
+  capture_mode: z.enum(["transcript", "token_level"]),
+  status: runStatusSchema,
+  queued_reason: queuedReasonV1Schema.nullable().default(null),
+  current_attempt_id: coreOpaqueIdSchema.nullable().default(null),
+  current_attempt: attemptV1Schema.nullable().default(null),
+  attempt_count: z.number().int().min(0).max(100),
+  current_error: apiErrorV1Schema.nullable().default(null),
+  pinned_revision: revisionRefV1Schema.nullable().default(null),
+  required_revision: reachableRequiredRevisionRefV1Schema,
+  revision_transition: revisionTransitionV1Schema.nullable().default(null),
+  created_at: coreUtcTimestampSchema,
+  updated_at: coreUtcTimestampSchema,
+  started_at: coreUtcTimestampSchema.nullable().default(null),
+  finished_at: coreUtcTimestampSchema.nullable().default(null),
+  etag: etagSchema,
+};
+export const runSummaryV1Schema = z.object(runSummaryFields).strict().superRefine(validateRunSummary);
+export const runV1Schema = z
+  .object({ ...runSummaryFields, attempts: z.array(attemptV1Schema).max(100) })
+  .strict()
+  .superRefine((value, context) => {
+    validateRunSummary(value, context);
+    if (value.attempts.length !== value.attempt_count) issue(context, ["attempts"], "attempt_count must match attempts");
+    if (new Set(value.attempts.map((attempt) => attempt.id)).size !== value.attempts.length) issue(context, ["attempts"], "attempt IDs must be unique");
+    if (value.attempts.some((attempt) => attempt.run_id !== value.id)) issue(context, ["attempts"], "attempt belongs to another run");
+    if (value.attempts.some((attempt, index) => attempt.number !== index + 1)) issue(context, ["attempts"], "attempt numbers must be contiguous and ordered");
+    if (value.attempts.length > 0 && value.attempts.at(-1)?.id !== value.current_attempt_id) issue(context, ["current_attempt_id"], "current attempt must be the last attempt");
+    if (value.attempts.length > 0 && !sameValue(value.attempts.at(-1), value.current_attempt)) issue(context, ["current_attempt"], "current attempt must equal the last attempt");
+    if (value.attempts.slice(0, -1).some((attempt) => !["succeeded", "failed", "cancelled"].includes(attempt.status))) issue(context, ["attempts"], "superseded attempts must be terminal");
+  });
+export const timelineEntryV1Schema = z
+  .object({
+    id: coreOpaqueIdSchema,
+    run_id: coreOpaqueIdSchema,
+    attempt_id: coreOpaqueIdSchema.nullable().default(null),
+    sequence: nonNegativeSafeIntegerSchema,
+    service_id: coreOpaqueIdSchema,
+    phase: z.enum(["admission", "preparation", "execution", "capture", "dataset", "evolution", "materialization", "revision", "terminal"]),
+    status: z.enum(["pending", "running", "succeeded", "failed", "cancelled", "unavailable"]),
+    title: displayNameSchema,
+    message: descriptionSchema,
+    occurred_at: coreUtcTimestampSchema,
+    artifact_ids: z.array(coreOpaqueIdSchema).max(128).default([]),
+    content_sha256: sha256DigestSchema,
+    error: apiErrorV1Schema.nullable().default(null),
+  })
+  .strict()
+  .refine((value) => (value.status === "failed") === (value.error !== null), { path: ["error"], message: "error is required only for failed timeline entries" });
+export const logEntryV1Schema = z
+  .object({
+    id: coreOpaqueIdSchema,
+    sequence: nonNegativeSafeIntegerSchema,
+    occurred_at: coreUtcTimestampSchema,
+    stream: z.enum(["core", "agent", "evolution", "service"]),
+    level: z.enum(["debug", "info", "warning", "error"]),
+    message: coreLogTextSchema,
+    run_id: coreOpaqueIdSchema.nullable().default(null),
+    attempt_id: coreOpaqueIdSchema.nullable().default(null),
+    service_id: coreOpaqueIdSchema,
+    content_sha256: sha256DigestSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.attempt_id !== null && value.run_id === null) issue(context, ["attempt_id"], "attempt ID requires run ID");
+    if (["agent", "evolution"].includes(value.stream) && value.run_id === null) issue(context, ["run_id"], "agent and evolution logs require run identity");
+  });
+export const contextArtifactRefV1Schema = z
+  .object({ artifact_id: coreOpaqueIdSchema, artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system", "parametric_memory"]), target_id: coreOpaqueIdSchema, revision: revisionRefV1Schema })
+  .strict();
+export const adapterRefV1Schema = z
+  .object({ artifact_id: coreOpaqueIdSchema, adapter_id: coreOpaqueIdSchema, base_model_ref: agentModelRefSchema, revision: revisionRefV1Schema })
+  .strict();
+export const runContextV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    run_id: coreOpaqueIdSchema,
+    project_id: coreOpaqueIdSchema,
+    project_snapshot: immutableSnapshotRefV1Schema,
+    task_snapshot: immutableSnapshotRefV1Schema,
+    workspace_snapshot: immutableSnapshotRefV1Schema,
+    status: runStatusSchema,
+    queued_reason: queuedReasonV1Schema.nullable().default(null),
+    current_attempt_id: coreOpaqueIdSchema.nullable().default(null),
+    current_attempt: attemptV1Schema.nullable().default(null),
+    attempt_count: z.number().int().min(0).max(100),
+    current_error: apiErrorV1Schema.nullable().default(null),
+    pinned_revision: revisionRefV1Schema.nullable().default(null),
+    required_revision: reachableRequiredRevisionRefV1Schema,
+    revision_transition: revisionTransitionV1Schema.nullable().default(null),
+    registry_digest: sha256DigestSchema,
+    execution_mode: executionModeV1Schema,
+    capture_mode: z.enum(["transcript", "token_level"]),
+    created_at: coreUtcTimestampSchema,
+    updated_at: coreUtcTimestampSchema,
+    started_at: coreUtcTimestampSchema.nullable().default(null),
+    finished_at: coreUtcTimestampSchema.nullable().default(null),
+    etag: etagSchema,
+    token_level_metrics_available: z.boolean(),
+    artifacts: z.array(contextArtifactRefV1Schema).max(256),
+    adapters: z.array(adapterRefV1Schema).max(64),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    validateRunSummary({ ...value, id: value.run_id }, context);
+    if (value.capture_mode === "transcript" && value.token_level_metrics_available) issue(context, ["token_level_metrics_available"], "transcript capture has no token-level metrics");
+  });
+
+const artifactCompatibilityV1Schema = z
+  .object({ execution_modes: z.array(executionModeV1Schema).max(2), harness_ids: z.array(coreOpaqueIdSchema).max(64), base_model_refs: z.array(agentModelRefSchema).max(64) })
+  .strict();
+const artifactLineageV1Schema = z
+  .object({ method_id: coreOpaqueIdSchema, job_id: coreOpaqueIdSchema, source_dataset_ids: z.array(coreOpaqueIdSchema).max(128), source_artifact_ids: z.array(coreOpaqueIdSchema).max(128) })
+  .strict();
+const artifactScoreV1Schema = z.object({ name: z.string().min(1).max(64).regex(/^[a-z][a-z0-9_]*$/), value: z.number().finite().min(-1_000_000).max(1_000_000) }).strict();
+const artifactBaseFields = {
+  id: coreOpaqueIdSchema,
+  project_id: coreOpaqueIdSchema,
+  run_id: coreOpaqueIdSchema.nullable().default(null),
+  target_id: coreOpaqueIdSchema,
+  display_name: displayNameSchema,
+  summary: descriptionSchema,
+  byte_size: nonNegativeSafeIntegerSchema,
+  produced_revision: revisionRefV1Schema,
+  membership_revisions: z.array(revisionRefV1Schema).max(128),
+  content_sha256: sha256DigestSchema,
   selected: z.boolean(),
   promoted: z.boolean(),
-  revision_ids: z.array(opaqueIdSchema).default([]),
-  created_at: utcTimestampSchema,
+  release_enabled: z.boolean(),
+  compatibility: artifactCompatibilityV1Schema,
+  lineage: artifactLineageV1Schema,
+  scores: z.array(artifactScoreV1Schema).max(64),
+  created_at: coreUtcTimestampSchema,
 };
-export const textMemoryArtifactV1Schema = z.object({ ...artifactBase, artifact_type: z.literal("text_memory"), format: z.enum(["markdown", "plain_text"]) }).strict();
-export const skillBundleArtifactV1Schema = z.object({ ...artifactBase, artifact_type: z.literal("skill_bundle"), skill_count: z.number().int().min(1).max(1_024) }).strict();
-export const agentSystemArtifactV1Schema = z.object({ ...artifactBase, artifact_type: z.literal("agent_system"), instruction_kind: z.enum(["agents", "claude", "gemini", "openhands_microagent", "generic"]) }).strict();
-export const parametricMemoryArtifactV1Schema = z.object({ ...artifactBase, artifact_type: z.literal("parametric_memory"), release_enabled: z.literal(false), adapter_id: opaqueIdSchema, base_model_id: opaqueIdSchema, adapter_format: shortTextSchema }).strict();
-export const artifactV1Schema = z.discriminatedUnion("artifact_type", [textMemoryArtifactV1Schema, skillBundleArtifactV1Schema, agentSystemArtifactV1Schema, parametricMemoryArtifactV1Schema]);
-export const artifactDocumentV1Schema = z.object({ document_id: opaqueIdSchema, title: shortTextSchema, media_type: z.enum(["text/markdown", "text/plain"]), content: longTextSchema }).strict();
-export const artifactContentV1Schema = z
-  .object({ schema_version: schemaVersionV1Schema, artifact_id: opaqueIdSchema, content_digest: sha256DigestSchema, documents: z.array(artifactDocumentV1Schema).min(1).max(128), total_documents: z.number().int().min(1).max(1_000_000), truncated: z.boolean() })
-  .strict()
+const textMemoryArtifactV1Schema = z.object({ ...artifactBaseFields, artifact_type: z.literal("text_memory"), metadata: z.object({ record_count: nonNegativeSafeIntegerSchema, source_dataset_ids: z.array(coreOpaqueIdSchema).max(128) }).strict() }).strict();
+const skillBundleArtifactV1Schema = z.object({ ...artifactBaseFields, artifact_type: z.literal("skill_bundle"), metadata: z.object({ document_count: z.number().int().min(1).max(128), root_document: z.literal("SKILL.md").default("SKILL.md") }).strict() }).strict();
+const agentSystemArtifactV1Schema = z.object({ ...artifactBaseFields, artifact_type: z.literal("agent_system"), metadata: z.object({ target_path: z.string().min(1).max(256).refine(isAllowedAgentTargetPath) }).strict() }).strict();
+const parametricMemoryArtifactV1Schema = z.object({ ...artifactBaseFields, artifact_type: z.literal("parametric_memory"), release_enabled: z.literal(false), metadata: z.object({ adapter_id: coreOpaqueIdSchema, base_model_ref: agentModelRefSchema, adapter_format: z.literal("lora") }).strict() }).strict();
+export const artifactV1Schema = z
+  .discriminatedUnion("artifact_type", [textMemoryArtifactV1Schema, skillBundleArtifactV1Schema, agentSystemArtifactV1Schema, parametricMemoryArtifactV1Schema])
   .superRefine((value, context) => {
-    if (value.total_documents < value.documents.length) issue(context, ["total_documents"], "total document count is smaller than the preview");
-    if (value.truncated !== (value.total_documents > value.documents.length)) issue(context, ["truncated"], "truncation must agree with total document count");
-    const bytes = value.documents.reduce((total, document) => total + new TextEncoder().encode(document.content).byteLength, 0);
-    if (bytes > 2 * 1024 * 1024) issue(context, ["documents"], "artifact preview exceeds aggregate byte budget");
+    const revisions = [value.produced_revision, ...value.membership_revisions];
+    if (revisions.some((revision) => revision.project_id !== value.project_id)) issue(context, ["produced_revision"], "artifact revision belongs to another project");
+    const ids = value.membership_revisions.map((revision) => revision.id);
+    if (new Set(ids).size !== ids.length) issue(context, ["membership_revisions"], "membership revisions must be unique");
   });
-export const diffLineV1Schema = z.object({ kind: z.enum(["context", "added", "removed"]), old_line: z.number().int().positive().nullable().default(null), new_line: z.number().int().positive().nullable().default(null), text: diffTextSchema }).strict();
-export const diffHunkV1Schema = z.object({ hunk_id: opaqueIdSchema, heading: shortTextSchema, lines: z.array(diffLineV1Schema).max(10_000) }).strict();
-export const artifactDiffV1Schema = z.object({ schema_version: schemaVersionV1Schema, artifact_id: opaqueIdSchema, base_artifact_id: opaqueIdSchema.nullable().default(null), hunks: z.array(diffHunkV1Schema).max(1_024), truncated: z.boolean() }).strict();
-export const serviceV1Schema = z
-  .object({ schema_version: schemaVersionV1Schema, service_id: opaqueIdSchema, display_name: shortTextSchema, kind: z.enum(["core", "gateway", "model", "worker", "artifact_store"]), state: z.enum(["starting", "healthy", "degraded", "stopped", "failed", "unavailable"]), health_summary: shortTextSchema, restart_supported: z.boolean(), observed_at: utcTimestampSchema, etag: etagSchema })
-  .strict();
-export const diagnosticCreateV1Schema = z
-  .object({ scope: z.enum(["active_project", "connection", "core", "run", "services"]), resource_id: opaqueIdSchema.nullable().default(null) })
+export const artifactDocumentV1Schema = z
+  .object({
+    document_id: coreOpaqueIdSchema,
+    display_name: displayNameSchema,
+    relative_path: z.string().max(256).regex(/^[^/\u0000-\u001f\u007f][^\u0000-\u001f\u007f]*$/).nullable().default(null),
+    mime_type: mimeTypeSchema,
+    content: contentTextSchema,
+    content_sha256: sha256DigestSchema,
+    byte_size: nonNegativeSafeIntegerSchema,
+    truncated: z.boolean(),
+  })
   .strict()
   .superRefine((value, context) => {
-    const resourceScope = value.scope === "run" || value.scope === "services";
-    if (resourceScope !== (value.resource_id !== null)) issue(context, ["resource_id"], "resource ID must agree with diagnostic scope");
+    if (value.relative_path !== null && value.relative_path.split("/").some((segment) => ["", ".", ".."].includes(segment))) issue(context, ["relative_path"], "relative path contains an unsafe segment");
+    const returned = utf8ByteLength(value.content);
+    if (returned > value.byte_size) issue(context, ["content"], "document preview exceeds authoritative byte size");
+    if (!value.truncated && returned !== value.byte_size) issue(context, ["byte_size"], "complete document byte size must match content");
+  });
+export const artifactContentV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    artifact_id: coreOpaqueIdSchema,
+    artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system", "parametric_memory"]),
+    documents: z.array(artifactDocumentV1Schema).max(MAX_ARTIFACT_PREVIEW_DOCUMENTS),
+    total_documents: nonNegativeSafeIntegerSchema,
+    total_utf8_bytes: nonNegativeSafeIntegerSchema,
+    returned_utf8_bytes: nonNegativeSafeIntegerSchema.max(MAX_ARTIFACT_PREVIEW_BYTES),
+    truncated: z.boolean(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const returned = value.documents.reduce((total, document) => total + utf8ByteLength(document.content), 0);
+    if (returned > MAX_ARTIFACT_PREVIEW_BYTES) issue(context, ["documents"], "artifact preview exceeds the aggregate UTF-8 byte budget");
+    if (returned !== value.returned_utf8_bytes) issue(context, ["returned_utf8_bytes"], "returned bytes must match document previews");
+    if (value.documents.length > value.total_documents) issue(context, ["total_documents"], "returned documents exceed total documents");
+    if (value.returned_utf8_bytes > value.total_utf8_bytes) issue(context, ["total_utf8_bytes"], "returned bytes exceed total bytes");
+    const actuallyTruncated = value.documents.length < value.total_documents || value.returned_utf8_bytes < value.total_utf8_bytes || value.documents.some((document) => document.truncated);
+    if (value.truncated !== actuallyTruncated) issue(context, ["truncated"], "truncated must match preview totals");
+  });
+export const diffLineV1Schema = z
+  .object({
+    kind: z.enum(["context", "added", "removed"]),
+    old_line_number: safeIntegerSchema.min(1).nullable().default(null),
+    new_line_number: safeIntegerSchema.min(1).nullable().default(null),
+    text: coreLogTextSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const valid = value.kind === "context"
+      ? value.old_line_number !== null && value.new_line_number !== null
+      : value.kind === "added"
+        ? value.old_line_number === null && value.new_line_number !== null
+        : value.old_line_number !== null && value.new_line_number === null;
+    if (!valid) issue(context, [], "line numbers must match diff line kind");
+  });
+export const artifactDiffDocumentIdentityV1Schema = z
+  .object({
+    artifact_id: coreOpaqueIdSchema,
+    artifact_content_sha256: sha256DigestSchema,
+    document_id: coreOpaqueIdSchema,
+    relative_path: z.string().min(1).max(256).regex(/^[^/\\\u0000-\u001f\u007f][^\\\u0000-\u001f\u007f]*$/),
+    content_sha256: sha256DigestSchema,
+  })
+  .strict()
+  .refine((value) => !value.relative_path.split("/").some((segment) => ["", ".", ".."].includes(segment)), {
+    path: ["relative_path"],
+    message: "relative path contains an unsafe segment",
+  });
+export const diffHunkV1Schema = z
+  .object({
+    old_document: artifactDiffDocumentIdentityV1Schema,
+    new_document: artifactDiffDocumentIdentityV1Schema,
+    old_start: nonNegativeSafeIntegerSchema,
+    old_count: nonNegativeSafeIntegerSchema,
+    new_start: nonNegativeSafeIntegerSchema,
+    new_count: nonNegativeSafeIntegerSchema,
+    lines: z.array(diffLineV1Schema).max(512),
+  })
+  .strict();
+export const artifactDiffV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    artifact_id: coreOpaqueIdSchema,
+    artifact_content_sha256: sha256DigestSchema,
+    previous_artifact_id: coreOpaqueIdSchema,
+    previous_artifact_content_sha256: sha256DigestSchema,
+    hunks: z.array(diffHunkV1Schema).max(MAX_ARTIFACT_DIFF_HUNKS),
+    total_hunks: nonNegativeSafeIntegerSchema,
+    total_lines: nonNegativeSafeIntegerSchema,
+    truncated: z.boolean(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    for (const [index, hunk] of value.hunks.entries()) {
+      if (hunk.old_document.artifact_id !== value.previous_artifact_id
+        || hunk.old_document.artifact_content_sha256 !== value.previous_artifact_content_sha256) {
+        issue(context, ["hunks", index, "old_document"], "old document identity must match the previous artifact");
+      }
+      if (hunk.new_document.artifact_id !== value.artifact_id
+        || hunk.new_document.artifact_content_sha256 !== value.artifact_content_sha256) {
+        issue(context, ["hunks", index, "new_document"], "new document identity must match the current artifact");
+      }
+    }
+    const lines = value.hunks.reduce((total, hunk) => total + hunk.lines.length, 0);
+    const bytes = value.hunks.reduce((total, hunk) => total + hunk.lines.reduce((subtotal, line) => subtotal + utf8ByteLength(line.text), 0), 0);
+    if (lines > MAX_ARTIFACT_DIFF_LINES) issue(context, ["hunks"], "artifact diff exceeds the line budget");
+    if (bytes > MAX_ARTIFACT_PREVIEW_BYTES) issue(context, ["hunks"], "artifact diff exceeds the UTF-8 byte budget");
+    if (value.hunks.length > value.total_hunks || lines > value.total_lines) issue(context, [], "returned diff exceeds authoritative totals");
+    if (value.truncated !== (value.hunks.length < value.total_hunks || lines < value.total_lines)) issue(context, ["truncated"], "truncated must match diff totals");
+  });
+
+export const serviceV1Schema = z
+  .object({
+    id: coreOpaqueIdSchema,
+    display_name: displayNameSchema,
+    kind: z.enum(["control", "gateway", "inference", "evolution_worker", "artifact_store"]),
+    status: z.enum(["stopped", "starting", "running", "degraded", "failed", "unavailable"]),
+    restartable: z.boolean(),
+    status_message: coreShortTextSchema.nullable().default(null),
+    error: apiErrorV1Schema.nullable().default(null),
+    model_preparation: modelPreparationV1Schema.nullable().default(null),
+    updated_at: coreUtcTimestampSchema,
+    observed_at: coreUtcTimestampSchema,
+    etag: etagSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if ((value.status === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required only for failed services");
+    if (value.kind !== "inference" && value.model_preparation !== null) issue(context, ["model_preparation"], "model preparation belongs only to inference services");
+  });
+const diagnosticScopeSchema = z.enum(["environment", "project", "run", "services", "registry", "storage"]);
+const diagnosticTargetV1Schema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("global") }).strict(),
+  z.object({ kind: z.literal("project"), project_id: coreOpaqueIdSchema }).strict(),
+  z.object({ kind: z.literal("run"), project_id: coreOpaqueIdSchema, run_id: coreOpaqueIdSchema }).strict(),
+]);
+export const diagnosticCreateV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    scopes: z.array(diagnosticScopeSchema).min(1).max(16),
+    target: diagnosticTargetV1Schema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (new Set(value.scopes).size !== value.scopes.length) issue(context, ["scopes"], "diagnostic scopes must be unique");
+    const scopes = new Set(value.scopes);
+    const global = new Set(["environment", "services", "registry", "storage"]);
+    if (value.target.kind === "global" && value.scopes.some((scope) => !global.has(scope))) issue(context, ["scopes"], "global diagnostics accept only global scopes");
+    if (value.target.kind === "project" && !(scopes.size === 1 && scopes.has("project"))) issue(context, ["scopes"], "project diagnostics require exactly the project scope");
+    if (value.target.kind === "run" && !(scopes.size === 1 && scopes.has("run"))) issue(context, ["scopes"], "run diagnostics require exactly the run scope");
+  });
+const diagnosticCheckV1Schema = z
+  .object({ id: coreOpaqueIdSchema, scope: diagnosticScopeSchema, status: checkStatusSchema, message: descriptionSchema, repair_action: repairActionSchema, logs_ref: coreOpaqueIdSchema.nullable().default(null) })
+  .strict();
+export const diagnosticReportV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    id: coreOpaqueIdSchema,
+    status: z.enum(["queued", "running", "succeeded", "failed"]),
+    scopes: z.array(diagnosticScopeSchema).min(1).max(16),
+    target: diagnosticTargetV1Schema,
+    checks: z.array(diagnosticCheckV1Schema).max(256),
+    created_at: coreUtcTimestampSchema,
+    updated_at: coreUtcTimestampSchema,
+    observed_at: coreUtcTimestampSchema,
+    finished_at: coreUtcTimestampSchema.nullable().default(null),
+    error: apiErrorV1Schema.nullable().default(null),
+    etag: etagSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    validateAsyncStatus(value, context);
+    const request = diagnosticCreateV1Schema.safeParse({ scopes: value.scopes, target: value.target });
+    if (!request.success) issue(context, ["target"], "diagnostic target and scopes are inconsistent");
+    if (value.checks.some((check) => !value.scopes.includes(check.scope))) issue(context, ["checks"], "diagnostic check has an unrequested scope");
+  });
+const cacheScopeSchema = z.enum(["model_downloads", "build_artifacts", "completed_runs", "completed_diagnostics"]);
+export const cacheCleanupRequestV1Schema = z
+  .object({ schema_version: schemaVersionV1Schema, scopes: z.array(cacheScopeSchema).min(1).max(8), older_than_days: z.number().int().min(1).max(3_650) })
+  .strict()
+  .refine((value) => new Set(value.scopes).size === value.scopes.length, { path: ["scopes"], message: "cache scopes must be unique" });
+export const cacheCleanupResultV1Schema = z
+  .object({
+    scopes: z.array(cacheScopeSchema).min(1).max(8),
+    removed_entries: z.number().int().min(0).max(100_000_000),
+    reclaimed_bytes: nonNegativeSafeIntegerSchema,
+  })
+  .strict();
+export const operationV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    id: coreOpaqueIdSchema,
+    kind: z.enum(["service_restart", "cache_cleanup"]),
+    status: z.enum(["queued", "running", "succeeded", "failed"]),
+    service_id: coreOpaqueIdSchema.nullable().default(null),
+    cache_scopes: z.array(cacheScopeSchema).max(8).default([]),
+    service: serviceV1Schema.nullable().default(null),
+    cache_cleanup: cacheCleanupResultV1Schema.nullable().default(null),
+    logs_ref: coreOpaqueIdSchema,
+    created_at: coreUtcTimestampSchema,
+    updated_at: coreUtcTimestampSchema,
+    observed_at: coreUtcTimestampSchema,
+    finished_at: coreUtcTimestampSchema.nullable().default(null),
+    error: apiErrorV1Schema.nullable().default(null),
+    etag: etagSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    validateAsyncStatus(value, context);
+    const succeeded = value.status === "succeeded";
+    if (value.kind === "service_restart") {
+      if (value.service_id === null || value.cache_scopes.length > 0 || value.cache_cleanup !== null) issue(context, ["kind"], "service restart operation has an invalid subject");
+      if (succeeded !== (value.service !== null)) issue(context, ["service"], "successful service restart requires the service result");
+      if (value.service !== null && value.service.id !== value.service_id) issue(context, ["service"], "service result has the wrong ID");
+    } else {
+      if (value.service_id !== null || value.service !== null || value.cache_scopes.length === 0) issue(context, ["kind"], "cache cleanup operation has an invalid subject");
+      if (new Set(value.cache_scopes).size !== value.cache_scopes.length) issue(context, ["cache_scopes"], "cache cleanup scopes must be unique");
+      if (succeeded !== (value.cache_cleanup !== null)) issue(context, ["cache_cleanup"], "successful cache cleanup requires its result");
+      if (value.cache_cleanup !== null && !sameValue(value.cache_cleanup.scopes, value.cache_scopes)) issue(context, ["cache_cleanup", "scopes"], "cache cleanup result scopes must match the operation");
+    }
+    if (!succeeded && (value.service !== null || value.cache_cleanup !== null)) issue(context, [], "only successful operations carry a result");
   });
 
 const stateEventV1Schema = z.object({ kind: z.literal("state_changed"), state: desktopStateV1Schema }).strict();
-const resourceEventV1Schema = z.object({ kind: z.enum(["profile_changed", "project_changed", "operation_changed", "run_changed", "artifact_available", "service_changed"]), resource: resourceRefV1Schema, change: z.enum(["created", "updated", "deleted"]) }).strict();
-const timelineEventV1Schema = z.object({ kind: z.literal("run_timeline"), run_id: opaqueIdSchema, entry: timelineEntryV1Schema }).strict();
-const logEventV1Schema = z.object({ kind: z.literal("log_appended"), resource: resourceRefV1Schema, entry: logEntryV1Schema }).strict();
-const diagnosticEventV1Schema = z.object({ kind: z.literal("diagnostic_ready"), diagnostic_id: opaqueIdSchema, operation_id: opaqueIdSchema }).strict();
-const heartbeatEventV1Schema = z.object({ kind: z.literal("heartbeat") }).strict();
-export const eventDataV1Schema = z.discriminatedUnion("kind", [stateEventV1Schema, resourceEventV1Schema, timelineEventV1Schema, logEventV1Schema, diagnosticEventV1Schema, heartbeatEventV1Schema]);
-export const eventNameV1Schema = z.enum(["desktop.v1.state.changed", "desktop.v1.profile.changed", "desktop.v1.project.changed", "desktop.v1.operation.changed", "desktop.v1.run.changed", "desktop.v1.run.timeline", "desktop.v1.log.appended", "desktop.v1.artifact.available", "desktop.v1.service.changed", "desktop.v1.diagnostic.ready", "desktop.v1.heartbeat"]);
-const EVENT_BY_KIND: Record<z.infer<typeof eventDataV1Schema>["kind"], z.infer<typeof eventNameV1Schema>> = {
-  state_changed: "desktop.v1.state.changed", profile_changed: "desktop.v1.profile.changed", project_changed: "desktop.v1.project.changed", operation_changed: "desktop.v1.operation.changed", run_changed: "desktop.v1.run.changed", run_timeline: "desktop.v1.run.timeline", log_appended: "desktop.v1.log.appended", artifact_available: "desktop.v1.artifact.available", service_changed: "desktop.v1.service.changed", diagnostic_ready: "desktop.v1.diagnostic.ready", heartbeat: "desktop.v1.heartbeat",
-};
-export const eventEnvelopeV1Schema = z
-  .object({ schema_version: schemaVersionV1Schema, event_id: opaqueIdSchema, event_name: eventNameV1Schema, occurred_at: utcTimestampSchema, sequence: z.number().int().nonnegative(), data: eventDataV1Schema })
+const resourceEventV1Schema = z
+  .object({
+    kind: z.literal("resource_changed"),
+    authority: z.enum(["desktop", "core"]),
+    resource: resourceRefV1Schema,
+    change: z.enum(["created", "updated", "deleted", "appended"]),
+    change_id: opaqueIdSchema,
+    resource_etag: etagSchema.nullable().default(null),
+    content_sha256: sha256DigestSchema.nullable().default(null),
+  })
   .strict()
-  .refine((value) => EVENT_BY_KIND[value.data.kind] === value.event_name, { path: ["event_name"], message: "event name must match typed event data" });
+  .superRefine((value, context) => {
+    if (value.resource_etag === null && value.content_sha256 === null) issue(context, ["resource_etag"], "resource events require an authoritative ETag or digest");
+    const desktopResources = new Set(["profile", "project", "operation", "maintenance"]);
+    if (value.authority === "desktop" && !desktopResources.has(value.resource.resource_type)) issue(context, ["authority"], "Desktop authority cannot identify a Core-owned resource");
+    if (value.authority === "core" && ["profile", "project", "maintenance"].includes(value.resource.resource_type)) issue(context, ["authority"], "Core changes must use a mapped Desktop project resource");
+  });
+const heartbeatEventV1Schema = z.object({ kind: z.literal("heartbeat") }).strict();
+export const eventDataV1Schema = z.union([stateEventV1Schema, resourceEventV1Schema, heartbeatEventV1Schema]);
+export const eventNameV1Schema = z.enum(["desktop.v1.state.changed", "desktop.v1.resource.changed", "desktop.v1.heartbeat"]);
+export const eventEnvelopeV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    event_id: opaqueIdSchema,
+    event_name: eventNameV1Schema,
+    occurred_at: utcTimestampSchema,
+    sequence: nonNegativeSafeIntegerSchema,
+    data: eventDataV1Schema,
+  })
+  .strict()
+  .refine((value) => {
+    const expected = value.data.kind === "state_changed"
+      ? "desktop.v1.state.changed"
+      : value.data.kind === "resource_changed"
+        ? "desktop.v1.resource.changed"
+        : "desktop.v1.heartbeat";
+    return expected === value.event_name;
+  }, { path: ["event_name"], message: "event name must match typed event data" });
 export const sseFrameV1Schema = z
   .object({ id: opaqueIdSchema, event: eventNameV1Schema, data: eventEnvelopeV1Schema })
   .strict()
-  .refine((value) => value.id === value.data.event_id && value.event === value.data.event_name, {
-    message: "SSE frame identity must match its event envelope",
-  });
+  .refine((value) => value.id === value.data.event_id && value.event === value.data.event_name, { message: "SSE frame identity must match its event envelope" });
 
 export function pageV1Schema<T extends z.ZodTypeAny>(itemSchema: T) {
   return z
@@ -500,20 +1116,32 @@ export function pageV1Schema<T extends z.ZodTypeAny>(itemSchema: T) {
     .strict()
     .refine((value) => value.has_more === (value.next_cursor !== null), { path: ["next_cursor"], message: "cursor must agree with has_more" });
 }
+function corePageV1Schema<T extends z.ZodTypeAny>(itemSchema: T, maxItems = 100) {
+  return z
+    .object({ schema_version: schemaVersionV1Schema, items: z.array(itemSchema).max(maxItems), next_cursor: z.string().min(1).max(512).nullable().default(null), has_more: z.boolean() })
+    .strict();
+}
 export const profilePageV1Schema = pageV1Schema(remoteProfileV1Schema);
 export const projectPageV1Schema = pageV1Schema(projectV1Schema);
-export const runPageV1Schema = pageV1Schema(runV1Schema);
-export const timelinePageV1Schema = pageV1Schema(timelineEntryV1Schema);
-export const logPageV1Schema = pageV1Schema(logEntryV1Schema);
-export const artifactPageV1Schema = pageV1Schema(artifactV1Schema);
-export const servicePageV1Schema = pageV1Schema(serviceV1Schema);
-export const emptyActionV1Schema = z.object({}).strict();
+export const localLogPageV1Schema = pageV1Schema(localLogEntryV1Schema);
+export const runPageV1Schema = corePageV1Schema(runSummaryV1Schema);
+export const timelinePageV1Schema = corePageV1Schema(timelineEntryV1Schema);
+export const logPageV1Schema = corePageV1Schema(logEntryV1Schema);
+export const referencedLogPageV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    items: z.array(logEntryV1Schema).max(100),
+    next_cursor: z.string().min(1).max(512).nullable().default(null),
+    has_more: z.boolean(),
+    logs_ref: coreOpaqueIdSchema,
+  })
+  .strict();
+export const artifactPageV1Schema = corePageV1Schema(artifactV1Schema);
+export const servicePageV1Schema = corePageV1Schema(serviceV1Schema, 64);
 
 export const versionV1Schema = versionInfoV1Schema;
 export const remoteProfileCreateV1Schema = profileCreateV1Schema;
 export const remoteProfilePatchV1Schema = profilePatchV1Schema;
-export const capabilitiesEnvelopeV1Schema = projectCapabilitiesV1Schema;
-export const projectValidationRequestV1Schema = projectValidateRequestV1Schema;
 export const diagnosticRequestV1Schema = diagnosticCreateV1Schema;
 
 export type VersionInfoV1 = z.infer<typeof versionInfoV1Schema>;
@@ -530,6 +1158,8 @@ export type ProjectV1 = z.infer<typeof projectV1Schema>;
 export type ProjectCreateV1 = z.input<typeof projectCreateV1Schema>;
 export type ProjectPatchV1 = z.input<typeof projectPatchV1Schema>;
 export type LocalOperationV1 = z.infer<typeof localOperationV1Schema>;
+export type LocalLogEntryV1 = z.infer<typeof localLogEntryV1Schema>;
+export type RunSummaryV1 = z.infer<typeof runSummaryV1Schema>;
 export type RunV1 = z.infer<typeof runV1Schema>;
 export type RunCreateV1 = z.input<typeof runCreateV1Schema>;
 export type TimelineEntryV1 = z.infer<typeof timelineEntryV1Schema>;
@@ -539,10 +1169,12 @@ export type ArtifactV1 = z.infer<typeof artifactV1Schema>;
 export type ArtifactContentV1 = z.infer<typeof artifactContentV1Schema>;
 export type ArtifactDiffV1 = z.infer<typeof artifactDiffV1Schema>;
 export type ServiceV1 = z.infer<typeof serviceV1Schema>;
+export type OperationV1 = z.infer<typeof operationV1Schema>;
+export type ReferencedLogPageV1 = z.infer<typeof referencedLogPageV1Schema>;
 export type DiagnosticReportV1 = z.infer<typeof diagnosticReportV1Schema>;
 export type DiagnosticCreateV1 = z.input<typeof diagnosticCreateV1Schema>;
-export type ProjectCapabilitiesV1 = z.infer<typeof projectCapabilitiesV1Schema>;
-export type ProjectValidateRequestV1 = z.input<typeof projectValidateRequestV1Schema>;
+export type CacheCleanupRequestV1 = z.input<typeof cacheCleanupRequestV1Schema>;
+export type ProjectCapabilitiesV1 = z.infer<typeof capabilitiesEnvelopeV1Schema>;
 export type ProjectValidationV1 = z.infer<typeof projectValidationV1Schema>;
 export type EventEnvelopeV1 = z.infer<typeof eventEnvelopeV1Schema>;
 export type EventDataV1 = z.infer<typeof eventDataV1Schema>;
@@ -553,11 +1185,138 @@ export type VersionV1 = VersionInfoV1;
 export type RemoteProfileCreateV1 = ProfileCreateV1;
 export type RemoteProfilePatchV1 = ProfilePatchV1;
 export type CapabilitiesEnvelopeV1 = ProjectCapabilitiesV1;
-export type ProjectValidationRequestV1 = ProjectValidateRequestV1;
 export type DiagnosticRequestV1 = DiagnosticCreateV1;
+
+function validateAttempt(
+  value: {
+    status: "queued" | "preparing" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
+    queued_reason: unknown | null;
+    started_at: string | null;
+    finished_at: string | null;
+    error: unknown | null;
+  },
+  context: z.RefinementCtx,
+): void {
+  const terminal = ["succeeded", "failed", "cancelled"].includes(value.status);
+  const started = ["running", "cancelling", "succeeded", "failed"].includes(value.status);
+  if ((value.status === "queued") !== (value.queued_reason !== null)) issue(context, ["queued_reason"], "queued reason is required only for queued attempts");
+  if (terminal !== (value.finished_at !== null)) issue(context, ["finished_at"], "finished_at is required only for terminal attempts");
+  if (started && value.started_at === null) issue(context, ["started_at"], "started_at is required after an attempt starts");
+  if ((value.status === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required only for failed attempts");
+}
+
+type RunSummaryShape = z.infer<z.ZodObject<typeof runSummaryFields>>;
+
+function validateRunSummary(value: RunSummaryShape, context: z.RefinementCtx): void {
+  const terminal = ["succeeded", "failed", "cancelled"].includes(value.status);
+  const started = ["running", "cancelling", "succeeded", "failed"].includes(value.status);
+  if ((value.status === "queued") !== (value.queued_reason !== null)) issue(context, ["queued_reason"], "queued reason is required only for queued runs");
+  if (terminal !== (value.finished_at !== null)) issue(context, ["finished_at"], "finished_at is required only for terminal runs");
+  if (started && value.started_at === null) issue(context, ["started_at"], "started_at is required after a run starts");
+  if ((value.attempt_count === 0) !== (value.current_attempt_id === null)) issue(context, ["current_attempt_id"], "current attempt ID must match attempt count");
+  if ((value.current_attempt_id === null) !== (value.current_attempt === null)) issue(context, ["current_attempt"], "current attempt must match its ID");
+  if (value.current_attempt !== null) {
+    if (value.current_attempt.id !== value.current_attempt_id || value.current_attempt.run_id !== value.id) issue(context, ["current_attempt"], "current attempt identity is invalid");
+    if (!sameValue(value.current_attempt.error, value.current_error)) issue(context, ["current_error"], "run and current attempt errors must match");
+    if (value.current_attempt.number !== value.attempt_count) issue(context, ["current_attempt", "number"], "current attempt number must match attempt count");
+    if (value.current_attempt.status !== value.status) issue(context, ["current_attempt", "status"], "run and current attempt statuses must match");
+  }
+  if (value.pinned_revision !== null && !sameValue(value.pinned_revision, value.required_revision.revision)) issue(context, ["pinned_revision"], "run may pin only its required revision");
+  if (value.status === "queued" && value.pinned_revision !== null) issue(context, ["pinned_revision"], "queued run cannot claim a revision pin");
+  const pinRequired = ["preparing", "running", "cancelling", "succeeded", "failed"].includes(value.status)
+    || (value.status === "cancelled" && value.started_at !== null);
+  if (pinRequired && value.pinned_revision === null) issue(context, ["pinned_revision"], "admitted run requires its exact revision pin");
+  if (value.project_snapshot.kind !== "project") issue(context, ["project_snapshot", "kind"], "project snapshot has the wrong kind");
+  if (value.task_snapshot.kind !== "task") issue(context, ["task_snapshot", "kind"], "task snapshot has the wrong kind");
+  if (value.workspace_snapshot.kind !== "workspace") issue(context, ["workspace_snapshot", "kind"], "workspace snapshot has the wrong kind");
+  if (value.required_revision.revision.project_id !== value.project_id) issue(context, ["required_revision"], "required revision belongs to another project");
+  if (value.required_revision.relation === "active") {
+    if (value.revision_transition !== null) issue(context, ["revision_transition"], "active required revision has no successor transition");
+  } else if (value.revision_transition === null) {
+    issue(context, ["revision_transition"], "successor required revision requires its transition");
+  } else {
+    if (value.revision_transition.predecessor_revision.id !== value.required_revision.reachable_from_revision_id
+      || !sameValue(value.revision_transition.successor_revision, value.required_revision.revision)) {
+      issue(context, ["revision_transition"], "successor transition must prove the required revision");
+    }
+    if (value.pinned_revision !== null && value.revision_transition.state !== "active") issue(context, ["revision_transition", "state"], "admitted successor transition must be active");
+  }
+  if ((value.status === "failed") !== (value.current_error !== null)) issue(context, ["current_error"], "current error is required only for failed runs");
+  if (value.execution_mode === "codex_subscription_transcript" && value.capture_mode !== "transcript") issue(context, ["capture_mode"], "subscription execution requires transcript capture");
+}
+
+function validateAsyncStatus(
+  value: { status: "queued" | "running" | "succeeded" | "failed"; finished_at: string | null; error: ApiErrorV1 | null },
+  context: z.RefinementCtx,
+): void {
+  const terminal = value.status === "succeeded" || value.status === "failed";
+  if (terminal !== (value.finished_at !== null)) issue(context, ["finished_at"], "finished_at is required only for terminal state");
+  if ((value.status === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required only for failed state");
+}
 
 function issue(context: z.RefinementCtx, path: (string | number)[], message: string): void {
   context.addIssue({ code: z.ZodIssueCode.custom, path, message });
+}
+
+function uniqueSortedBy<T extends Record<K, string>, K extends keyof T>(
+  values: T[],
+  key: K,
+  context: z.RefinementCtx,
+  path: (string | number)[],
+): void {
+  const ids = values.map((value) => value[key]);
+  if (new Set(ids).size !== ids.length) issue(context, path, `${String(key)} values must be unique`);
+  if (ids.some((id, index) => index > 0 && ids[index - 1]! > id)) issue(context, path, `${String(key)} values must be sorted`);
+}
+
+function isCanonicalJsonObject(value: string): boolean {
+  try {
+    const decoded: unknown = JSON.parse(value);
+    if (decoded === null || Array.isArray(decoded) || typeof decoded !== "object") return false;
+    const validation = validateCapabilityJson(decoded);
+    return validation && JSON.stringify(sortJson(decoded as Record<string, unknown>)) === value;
+  } catch {
+    return false;
+  }
+}
+
+function validateCapabilityJson(value: unknown): boolean {
+  let nodes = 0;
+  let collectionItems = 0;
+  const pending: Array<[unknown, number]> = [[value, 1]];
+  while (pending.length > 0) {
+    const [current, depth] = pending.pop()!;
+    nodes += 1;
+    if (nodes > 8_192 || depth > 16) return false;
+    if (typeof current === "number" && (!Number.isFinite(current) || (Number.isInteger(current) && !Number.isSafeInteger(current)))) return false;
+    if (Array.isArray(current)) {
+      collectionItems += current.length;
+      current.forEach((child) => pending.push([child, depth + 1]));
+    } else if (current !== null && typeof current === "object") {
+      const children = Object.values(current);
+      collectionItems += children.length;
+      children.forEach((child) => pending.push([child, depth + 1]));
+    }
+    if (collectionItems > 4_096) return false;
+  }
+  return true;
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([key, child]) => [key, sortJson(child)]));
+  }
+  return value;
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function isAllowedAgentTargetPath(value: string): boolean {
+  if (["AGENTS.md", "agents.md", "CLAUDE.md", "GEMINI.md"].includes(value)) return true;
+  return value.startsWith(".openhands/microagents/") && value.endsWith(".md") && !value.slice(".openhands/microagents/".length).includes("/") && value !== ".openhands/microagents/.md" && !value.includes("..");
 }
 
 function isLoopbackEndpoint(value: string): boolean {
@@ -592,21 +1351,27 @@ function validateBoundedJson(value: Record<string, SafeJsonValue>, context: z.Re
       if (entries.length > MAX_JSON_COLLECTION_ITEMS) return issue(context, path, "JSON object exceeds the item budget");
       for (const [key, child] of entries) {
         if (!key || key.length > 256 || key !== key.trim()) return issue(context, [...path, key], "JSON keys must be short trimmed strings");
-        const size = new TextEncoder().encode(key).byteLength;
+        const size = utf8ByteLength(key);
         textBytes += size;
         encodedBytes += size + 4;
         pending.push([child, depth + 1, [...path, key]]);
       }
     } else if (typeof current === "string") {
-      const size = new TextEncoder().encode(current).byteLength;
+      const size = utf8ByteLength(current);
       textBytes += size;
       encodedBytes += size + 2;
+    } else if (typeof current === "number") {
+      encodedBytes += Number.isInteger(current) ? String(current).length : 32;
     } else {
-      encodedBytes += typeof current === "number" ? 32 : 5;
+      encodedBytes += 5;
     }
     if (textBytes > MAX_JSON_TEXT_BYTES) return issue(context, path, "JSON exceeds the text budget");
     if (encodedBytes > MAX_JSON_TOTAL_BYTES) return issue(context, path, "JSON exceeds the byte budget");
   }
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function isNetworkHost(value: string): boolean {
@@ -621,7 +1386,6 @@ function isIpv6Address(value: string): boolean {
   const address = scopeSeparator === -1 ? value : value.slice(0, scopeSeparator);
   const scope = scopeSeparator === -1 ? null : value.slice(scopeSeparator + 1);
   if (scope === "" || (scope !== null && scope.includes("%")) || !address.includes(":")) return false;
-
   const compressed = address.split("::");
   if (compressed.length > 2) return false;
   const groups = compressed.flatMap((side) => (side === "" ? [] : side.split(":")));
