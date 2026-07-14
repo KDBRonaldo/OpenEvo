@@ -583,6 +583,130 @@ def test_successor_activation_preserves_existing_task_pin(tmp_path: Path) -> Non
     assert store.active_revision_lease_count(genesis.revision_id) == 1
 
 
+def test_successor_activation_rejects_queued_request_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    queued = _admit(
+        store,
+        context,
+        snapshot,
+        _intent(task_id="task-next", generation=1, idempotency_key="next"),
+        _envelope(context, snapshot, task_id="task-next"),
+    )
+    mismatched = _manifest(
+        context,
+        snapshot,
+        generation=1,
+        predecessor_revision_id=genesis.revision_id,
+        workspace_marker="different-workspace",
+    )
+
+    with pytest.raises(RevisionConflictError, match="queued task admission"):
+        store.activate_successor_revision(mismatched)
+
+    assert store.get_active_revision(mismatched.stream_id) == genesis
+    assert store.get_task_admission(queued.admission_id) == queued
+    restarted = _restart(tmp_path)
+    assert restarted.get_active_revision(mismatched.stream_id) == genesis
+    assert restarted.get_task_admission(queued.admission_id) == queued
+
+
+def test_unpinned_active_generation_queue_blocks_next_successor(
+    tmp_path: Path,
+) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    intent = _intent(task_id="task-next", generation=1, idempotency_key="next")
+    envelope = _envelope(context, snapshot, task_id="task-next")
+    queued = _admit(store, context, snapshot, intent, envelope)
+    first_manifest = _manifest(
+        context,
+        snapshot,
+        generation=1,
+        predecessor_revision_id=genesis.revision_id,
+    )
+    first = store.activate_successor_revision(first_manifest)
+    second_manifest = _manifest(
+        context,
+        snapshot,
+        generation=2,
+        predecessor_revision_id=first.revision_id,
+    )
+
+    assert store.activate_successor_revision(first_manifest) == first
+    with pytest.raises(RevisionConflictError, match="must be pinned or cancelled"):
+        store.activate_successor_revision(second_manifest)
+
+    restarted = _restart(tmp_path)
+    assert restarted.get_task_admission(queued.admission_id) == queued
+    admitted = _admit(restarted, context, snapshot, intent, envelope)
+    assert admitted.status is AdmissionStatus.ADMITTED
+    assert admitted.pinned_revision_id == first.revision_id
+    second = restarted.activate_successor_revision(second_manifest)
+    assert second.manifest == second_manifest
+
+
+def test_queued_retry_and_next_activation_serialize_without_invalid_head(
+    tmp_path: Path,
+) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    intent = _intent(task_id="task-next", generation=1, idempotency_key="next")
+    envelope = _envelope(context, snapshot, task_id="task-next")
+    _admit(store, context, snapshot, intent, envelope)
+    first = store.activate_successor_revision(
+        _manifest(
+            context,
+            snapshot,
+            generation=1,
+            predecessor_revision_id=genesis.revision_id,
+        )
+    )
+    second_manifest = _manifest(
+        context,
+        snapshot,
+        generation=2,
+        predecessor_revision_id=first.revision_id,
+    )
+    barrier = threading.Barrier(3)
+    admissions: list[TaskAdmissionRecord] = []
+    activations = []
+    activation_errors: list[BaseException] = []
+
+    def retry_admission() -> None:
+        barrier.wait()
+        admissions.append(_admit(store, context, snapshot, intent, envelope))
+
+    def activate_next() -> None:
+        barrier.wait()
+        try:
+            activations.append(store.activate_successor_revision(second_manifest))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            activation_errors.append(exc)
+
+    threads = [
+        threading.Thread(target=retry_admission),
+        threading.Thread(target=activate_next),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(admissions) == 1
+    assert admissions[0].status is AdmissionStatus.ADMITTED
+    assert admissions[0].pinned_revision_id == first.revision_id
+    assert len(activations) + len(activation_errors) == 1
+    if activation_errors:
+        assert isinstance(activation_errors[0], RevisionConflictError)
+        activations.append(store.activate_successor_revision(second_manifest))
+    assert activations[0].manifest == second_manifest
+    assert _restart(tmp_path).get_active_revision(second_manifest.stream_id) == activations[0]
+
+
 def test_successor_activation_rejects_stale_fork_and_generation_gap(
     tmp_path: Path,
 ) -> None:
@@ -636,6 +760,13 @@ def test_concurrent_successor_activation_has_one_authoritative_result(
 ) -> None:
     store, context, snapshot = _initialized_store(tmp_path)
     genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    _admit(
+        store,
+        context,
+        snapshot,
+        _intent(task_id="task-next", generation=1, idempotency_key="next"),
+        _envelope(context, snapshot, task_id="task-next"),
+    )
     manifest = _manifest(
         context,
         snapshot,
@@ -668,6 +799,13 @@ def test_concurrent_successor_activation_has_one_authoritative_result(
 def test_competing_concurrent_successors_cannot_fork_stream(tmp_path: Path) -> None:
     store, context, snapshot = _initialized_store(tmp_path)
     genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    _admit(
+        store,
+        context,
+        snapshot,
+        _intent(task_id="task-next", generation=1, idempotency_key="next"),
+        _envelope(context, snapshot, task_id="task-next"),
+    )
     manifests = [
         _manifest(
             context,
@@ -676,7 +814,7 @@ def test_competing_concurrent_successors_cannot_fork_stream(tmp_path: Path) -> N
             predecessor_revision_id=genesis.revision_id,
             workspace_marker=marker,
         )
-        for marker in ("workspace-successor-a", "workspace-successor-b")
+        for marker in ("workspace-v1", "workspace-successor-b")
     ]
     barrier = threading.Barrier(3)
     results = []

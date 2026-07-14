@@ -4774,6 +4774,50 @@ class EvolutionStore:
             )
         return active, active_generation
 
+    def _validate_successor_admission_barrier(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        active: _AuthoritativeRevisionClosure,
+        active_generation: int,
+        successor_revision_id: str,
+        successor_manifest: RevisionManifestV1,
+    ) -> None:
+        successor = self._revision_recovery_identity(
+            successor_revision_id,
+            successor_manifest,
+        )
+        rows = conn.execute(
+            """
+            SELECT * FROM task_admissions
+            WHERE stream_id = ? AND status = 'queued'
+            ORDER BY admission_id
+            """,
+            (successor_manifest.stream_id,),
+        )
+        for row in rows:
+            record = self._task_admission_from_row(row)
+            self._validate_admission_request_sources(conn, record.request)
+            self._validate_unpinned_admission_authority(
+                record,
+                active_generation=active_generation,
+                active_revision=active.identity,
+            )
+            if record.request.required_generation == active_generation:
+                raise RevisionConflictError(
+                    "active-generation queued admissions must be pinned or cancelled "
+                    "before successor activation"
+                )
+            try:
+                self._validate_admission_request_against_revision(
+                    record.request,
+                    successor,
+                )
+            except TaskAdmissionConflictError as exc:
+                raise RevisionConflictError(
+                    "successor revision does not match a queued task admission"
+                ) from exc
+
     def create_genesis_revision(self, manifest: RevisionManifestV1) -> RevisionRecord:
         """Create one explicit generation-zero stream head, or return its exact retry."""
 
@@ -4993,6 +5037,13 @@ class EvolutionStore:
                     )
                 self._validate_revision_materialization(conn, manifest)
                 self._validate_revision_execution_snapshot(conn, manifest)
+                self._validate_successor_admission_barrier(
+                    conn,
+                    active=active,
+                    active_generation=active_generation,
+                    successor_revision_id=revision_id,
+                    successor_manifest=manifest,
+                )
                 collision = conn.execute(
                     "SELECT 1 FROM revisions WHERE manifest_digest = ?",
                     (manifest_digest,),

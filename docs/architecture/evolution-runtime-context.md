@@ -97,7 +97,9 @@ old/new exact UTF-8 byte delta，并在 UPDATE 后 readback 重验，exact retry
 
 Store 的内部 `activate_successor_revision` 已提供严格相邻 N+1 的最终 ledger commit：它在一个写事务中
 重验 predecessor、materialized context、registered execution snapshot 和容量，再写 revision 与推进 head；
-并发/重试幂等，竞争 fork 和 generation gap fail closed，旧 task pin 保持不变。该 primitive 尚未接入
+下一代 queued request 必须全部匹配候选 revision，当前代仍未 pin 的 queued row 会阻止再次推进 head，
+且 activation 不改写 request。并发/重试幂等，竞争 fork 和 generation gap fail closed，旧 task pin 保持
+不变。该 primitive 尚未接入
 Gateway、Core run owner、Desktop 或 benchmark automation，也不自行证明 transition readiness。
 Transition sealing、所有 enabled target 的 readiness、adapter load/restart、health check 和调用该 commit
 的 run-owner 编排仍是 B3.2-B3.4 工作。因此 materializer、strict v2 transport、Gateway

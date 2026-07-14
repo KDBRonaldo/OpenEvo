@@ -236,7 +236,10 @@ Store 还提供内部 `activate_successor_revision` 原子提交 primitive：只
 successor，在同一 `BEGIN IMMEDIATE` 中重验 predecessor、materialized context、registered execution
 snapshot 和 ledger capacity，再同时写入 immutable revision 与推进 stream head。相同 successor 的并发或
 历史重试幂等返回；竞争 fork、generation gap 和 stale predecessor 拒绝；已经 admitted 的 task 继续固定在
-原 revision。该 primitive 只负责最终 ledger commit，不签发 readiness 证明，也不允许 Desktop 或 HTTP
+原 revision。事务还逐项验证下一代 queued request 与候选 revision identity；不匹配时拒绝 activation，
+不会改写 request。已经推进到当前代但尚未经 retry pin 的 queued row 会阻止下一代 activation，直到它被
+pin 或取消，避免提交一个 startup recovery 必然拒绝的 ledger。该 primitive 只负责最终 ledger commit，
+不签发 readiness 证明，也不允许 Desktop 或 HTTP
 调用方直接发布 successor；Core run/transition owner 仍必须先完成 dataset seal、全部 enabled target、
 materialization、serving preparation 和 health checks。
 

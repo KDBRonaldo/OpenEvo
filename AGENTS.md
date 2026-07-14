@@ -44,8 +44,9 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 不能静默使用 stale/partial revision。不要在 method descriptor 或 method config 中加入各自的
 online/offline timing、background/barrier 选择或 streaming/in-session ABI。方法差异继续通过
 input bindings、execution/capture/harness/runtime requirements、config 和 typed outputs 表达。
-这是产品目标 contract；当前完整的 cross-session revision/admission/atomic activation 尚未实现，不能把
-内部 materializer 或现有 legacy Gateway path 描述为已经满足该 contract。
+这是产品目标 contract；Store 当前只提供 atomic successor ledger commit primitive，完整的
+cross-session run-owner/readiness orchestration 尚未实现，不能把内部 ledger、materializer 或现有
+legacy Gateway path 描述为已经满足该 contract。
 
 Desktop/Core 的发布边界以 `docs/architecture/desktop-core-contract-v1.md` 为准。React
 renderer 只能调用带 Desktop session 鉴权的 `/desktop/v1/*` 本地 sidecar API，不能看到
@@ -97,9 +98,11 @@ SSH 直接执行。两个 API 都必须有严格 closed model、version/digest n
   它不得按 target ID 分支，也不得在持久化 contract 中暴露 artifact URI、host path 或 opaque
   scanner handle。
 - `src/openevo/evolution/revisions.py`: immutable cross-session revision 与 task admission contract。
-  Store 当前只允许显式 generation-zero head；当前 generation admission 固定 exact revision，且只把
-  下一 generation 持久化为 queued/not-ready。Successor transition/readiness/atomic activation 尚未
-  实现前，不得增加绕过这些阶段的任意 revision publish 入口。Execution snapshot 使用 closed typed
+  Store 允许显式 generation-zero head，并提供严格相邻 successor 的 atomic ledger commit primitive；
+  当前 generation admission 固定 exact revision，下一 generation 持久化为 queued/not-ready。Activation
+  在同一事务要求 queued request identity 匹配候选 revision，且仍未 pin 的当前代 queued admission 会阻止
+  后续 head 推进。该 primitive 不提供 transition/readiness 证明或 run-owner 编排，不得增加绕过这些阶段
+  的任意 revision publish 入口。Execution snapshot 使用 closed typed
   model/runtime/serving data；model source 必须显式声明 `hugging_face`、`managed_snapshot` 或
   `subscription`，不能持久化 host path/URI。Store 只接受 verified producer sealed 的
   `VerifiedExecutionSnapshot`，再从 typed canonical bytes 计算 ID/digest 并记录 producer ID；该对象不能
@@ -151,10 +154,10 @@ guarded `CASE` 逐行取值并重验 UTF-8 bytes；不得让超限单值先进�
 legacy job/artifact recovery。Task admission 首次写入与 recovery 使用同一 row/aggregate byte capacity；每次
 非幂等状态 UPDATE 必须先按 old/new exact UTF-8 byte delta 验证容量，并在 UPDATE 后 readback 重验，exact
 retry 不因已满而失败。`get_active_revision` 与 `get_task_admission` 必须在显式一致 read transaction 内分别
-执行 stream/admission 的完整权威闭包校验。Genesis、queued、admitted 与 terminal retry 以及 terminal
-transition 都必须在同一事务走 active head、revision、materialization、execution snapshot 和完整
-envelope/pin 的统一权威闭包校验。当前内部 ledger 不等于 successor activation，也尚未接入公开 Core API、
-Gateway、run owner 或 Desktop。
+执行 stream/admission 的完整权威闭包校验。Genesis、successor activation、queued、admitted 与 terminal
+retry 以及 terminal transition 都必须在同一事务走 active head、revision、materialization、execution
+snapshot 和完整 envelope/pin 的统一权威闭包校验。当前内部 ledger commit primitive 不等于完整
+successor readiness/activation orchestration，也尚未接入公开 Core API、Gateway、run owner 或 Desktop。
 
 新的 Core experiment job 必须通过 `POST /v1/planned-jobs` 创建。Plan-bound job 持久化
 plan、plan digest、target、reachable registry digest、method identity、canonical execution envelope 和有序
