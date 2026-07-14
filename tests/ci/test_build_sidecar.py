@@ -43,6 +43,8 @@ def _write_repo_skeleton(repo: Path) -> None:
                     "benchmark",
                     "developer mode",
                     "developer_mode",
+                    "contract_simulator",
+                    "scaffold",
                     "dry-run",
                     "dry_run",
                     "stdout",
@@ -184,7 +186,10 @@ def test_product_web_build_requires_exact_audited_dist_and_packaged_assets(
         "benchmark",
         "developer mode",
         "developer_mode",
+        "contract_simulator",
+        "scaffold",
         "dry-run",
+        "dry_run",
         "stdout",
         "stderr",
         "host path",
@@ -205,6 +210,43 @@ def test_product_web_build_rejects_forbidden_static_text(
 
     with pytest.raises(RuntimeError, match="forbidden product text"):
         builder._validate_product_web_build(repo / "desktop")
+
+
+def test_product_web_policy_rejects_every_non_release_provider_kind() -> None:
+    policy = json.loads(
+        Path("desktop/packaging/product-web-policy.json").read_text(encoding="utf-8")
+    )
+
+    assert {"contract_simulator", "scaffold", "dry_run"}.issubset(
+        policy["forbidden_text"]
+    )
+    schemas = Path("desktop/src/api/v1/schemas.ts").read_text(encoding="utf-8")
+    assert '["dry", "run"].join("_")' not in schemas
+
+
+def test_packaged_product_graph_excludes_non_release_provider_code() -> None:
+    release_schema = Path(
+        "desktop/src/api/v1/providerKinds.release.ts"
+    ).read_text(encoding="utf-8")
+    vite_config = Path("desktop/vite.config.ts").read_text(encoding="utf-8")
+    packaged_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(Path("desktop/packaging/web").rglob("*"))
+        if path.is_file()
+        and path.suffix.lower() in {".css", ".html", ".js", ".json", ".map", ".txt"}
+    )
+
+    assert 'z.literal("desktop_sidecar")' in release_schema
+    assert "providerKinds.release.ts" in vite_config
+    for forbidden in (
+        "contract_simulator",
+        "scaffold",
+        "dry_run",
+        "FixtureDesktopProductProvider",
+        "createFixtureDesktopProductProvider",
+    ):
+        assert forbidden not in release_schema
+        assert forbidden not in packaged_text
 
 
 def test_sidecar_archive_product_web_matches_audited_build_and_rejects_tampering(

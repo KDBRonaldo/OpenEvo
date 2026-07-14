@@ -54,18 +54,31 @@ not complete the ordinary science E2E, create/redownload a draft GitHub Release,
 or authorize a public tag. The executable sidecar smoke proves
 its local health/static-asset path, discovery of the embedded Core wheel plus
 framework lock, and its token-protected capability proxy against a real backend.
-The native application smoke opens the app parent and then pins the `.app`,
-`Contents`, `Info.plist`, `MacOS`, and the executable named by
-`CFBundleExecutable` with component-relative no-follow descriptors. It parses a
-regular `Info.plist` through its held descriptor, records each descriptor and
-pathname identity, and rechecks the complete chain before spawn and again in the
-child immediately before exec. The executable itself is launched through its
-inherited descriptor (`/dev/fd` on macOS and `/proc/self/fd` in Linux regression
-tests), so replacement after the last pathname check cannot redirect execution.
-Detected symlink, directory, or leaf replacement fails closed. Only the macOS
-candidate job proves that the real copied Mach-O app launches through the macOS
-descriptor authority; Linux tests prove the chain and replacement behavior but
-are not macOS launch evidence. The release renderer reports readiness only after
+The native application smoke uses component-relative no-follow descriptors for
+the bundle path, `Contents`, `Info.plist`, `MacOS`, and the executable named by
+`CFBundleExecutable`. On Darwin it first canonicalizes only the bundle parent so
+the root-owned `/var` to `/private/var` system alias does not become a fake
+directory component; it never resolves the `.app` itself. It then starts at the
+filesystem root and opens every canonical parent component. Every directory, the regular link-count-one `Info.plist`, and
+the regular executable must be owned by root or the current effective UID and
+must reject group/other write; the executable must additionally be
+link-count-one and executable. Root execution consequently accepts only
+root-owned components. The smoke records descriptor and pathname identity and
+rechecks the complete chain before `Popen`, in the child immediately before
+exec, and after the spawn handshake. Detected symlink, ownership, mode, hardlink,
+directory, or leaf replacement fails closed.
+
+Linux regression tests continue to execute the held executable through
+`/proc/self/fd`. Darwin launches the original
+`Contents/MacOS/CFBundleExecutable` pathname because Mach-O execution through
+`/dev/fd` returns `EACCES` and would also break normal bundle-relative resource
+discovery. The final pathname check and `execve` cannot be made one atomic
+operation on Darwin. A process running as the same effective UID can therefore
+race that final gap; same-UID mutation is explicitly inside this smoke trust
+boundary. Only the macOS candidate job proves that the real copied Mach-O app
+launches and resolves its bundle resources under this policy. Linux tests prove
+the no-follow chain and replacement checks but are not macOS launch evidence.
+The release renderer reports readiness only after
 Local API negotiation. Tauri performs a non-reaping leader check, reproves the
 private sidecar session, and then rechecks the same managed instance, lifecycle,
 contract, and leader under the manager lock before accepting that report. This
@@ -275,10 +288,21 @@ managed sidecar, its unreaped leader is still live, and its retained credential
 still proves both authenticated acceptance and unauthenticated rejection. The
 session probe runs without the manager lock; before emitting the marker, native
 code reacquires the lock and requires the same random instance, endpoint,
-lifecycle, contract, and a second non-reaping leader check. It then emits a fixed,
-non-secret readiness marker for packaged application validation. This marker is
-diagnostic evidence only; it carries no endpoint, process identity, session
-credential, host path, or user data.
+lifecycle, contract, and a second non-reaping leader check. It then reads the
+leader's kernel birth identity (`/proc/<pid>/stat` start ticks on Linux or
+`PROC_PIDTBSDINFO` start time on macOS), verifies that `PID == PGID` from the
+`setsid` launch, and emits an internal sidecar-process marker followed by the
+fixed renderer-ready marker. The process marker contains only the non-secret
+instance ID, PID, PGID, platform-tagged birth identity; it is native-smoke
+evidence, not an HTTP or renderer contract.
+
+The Python smoke validates that marker against the live process before accepting
+renderer readiness. It then terminates the app's separate session, waits a
+bounded interval for the Rust parent-liveness watchdog to remove the exact
+sidecar group, and requires the group to disappear. A surviving group is killed
+within a second bounded interval and still makes the smoke red; timeout and
+error paths run the same cleanup, so a passing or failing smoke cannot leave its
+observed sidecar group behind.
 
 Release policy does not read `OPENEVO_DESKTOP_SIDECAR_COMMAND`,
 `OPENEVO_DESKTOP_SIDECAR_PROGRAM`,
@@ -667,6 +691,13 @@ The release build must use locked and reviewed inputs:
 Developer fallbacks such as source-checkout Python launchers, custom sidecar
 commands, backend URL overrides, and dry-run transports must be rejected by a
 release build.
+The product Vite mode aliases the general provider-kind parser to a release-only
+module that accepts only `desktop_sidecar`. Development and test builds retain
+the simulator/scaffold/dry-run schema and fixtures. Rollup therefore removes
+those modules and provider strings from the production dependency graph, while
+the product web policy independently rejects all three strings in generated or
+packaged assets. Benchmark and legacy observability modules remain outside the
+product graph as before.
 The repository does not carry a shell-script sidecar fallback; the generated
 target-triple binary is a required build input.
 

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import os
 from pathlib import Path
 import plistlib
+import re
 import signal
 import stat
 import subprocess
@@ -25,6 +27,7 @@ from smoke_openevo_desktop_sidecar import SmokeFailure, smoke_sidecar  # noqa: E
 SIDECAR_NAME = "openevo-desktop-sidecar"
 APP_BUNDLE_NAME = "OpenEvo Desktop.app"
 RENDERER_READY_PREFIX = "OPENEVO_DESKTOP_RENDERER_READY_V1"
+SIDECAR_PROCESS_PREFIX = "OPENEVO_DESKTOP_SIDECAR_PROCESS_V1"
 REPO_ROOT = SCRIPT_DIR.parent.parent
 DESKTOP_OPENAPI = REPO_ROOT / "desktop/sidecar/contracts/v1/openapi.json"
 DESKTOP_OPENAPI_SHA256 = hashlib.sha256(DESKTOP_OPENAPI.read_bytes()).hexdigest()
@@ -33,6 +36,8 @@ NATIVE_LOG_LIMIT = 64 * 1024
 NATIVE_LOG_READ_SIZE = 16 * 1024
 NATIVE_GROUP_TERM_TIMEOUT_SECONDS = 5.0
 NATIVE_GROUP_KILL_TIMEOUT_SECONDS = 5.0
+SIDECAR_GROUP_EXIT_TIMEOUT_SECONDS = 5.0
+SIDECAR_GROUP_KILL_TIMEOUT_SECONDS = 5.0
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
 )
@@ -98,6 +103,37 @@ def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _validate_darwin_component(
+    metadata: os.stat_result,
+    *,
+    kind: str,
+    path: Path,
+) -> None:
+    effective_uid = os.geteuid()
+    trusted_owner = metadata.st_uid in ({0} if effective_uid == 0 else {0, effective_uid})
+    writable_by_group_or_other = metadata.st_mode & 0o022 != 0
+    is_directory = stat.S_ISDIR(metadata.st_mode)
+    is_regular = stat.S_ISREG(metadata.st_mode)
+    valid_kind = is_directory if kind == "directory" else is_regular
+    valid_links = kind == "directory" or metadata.st_nlink == 1
+    executable = kind != "executable" or metadata.st_mode & 0o111 != 0
+    if (
+        not trusted_owner
+        or writable_by_group_or_other
+        or not valid_kind
+        or not valid_links
+        or not executable
+    ):
+        raise SmokeFailure(
+            f"OpenEvo Desktop native executable path is not trustworthy: {path}"
+        )
+
+
+def _validate_component(metadata: os.stat_result, *, kind: str, path: Path) -> None:
+    if sys.platform == "darwin":
+        _validate_darwin_component(metadata, kind=kind, path=path)
+
+
 class _PinnedNativeExecutable:
     def __init__(
         self,
@@ -114,14 +150,28 @@ class _PinnedNativeExecutable:
 
     @classmethod
     def open(cls, app_bundle: Path) -> _PinnedNativeExecutable:
+        if sys.platform == "darwin":
+            # macOS commonly exposes /private/var through the root-owned /var
+            # alias. Resolve only the parent; the app bundle itself remains a
+            # no-follow component in the verified chain.
+            app_bundle = Path(os.path.realpath(app_bundle.parent)) / app_bundle.name
         descriptors: list[int] = []
         bindings: list[tuple[int, str, int, tuple[int, ...]]] = []
 
-        def open_component(parent_fd: int, name: str, flags: int) -> int:
+        def open_component(
+            parent_fd: int,
+            name: str,
+            flags: int,
+            *,
+            kind: str,
+            path: Path,
+        ) -> int:
             try:
                 descriptor = os.open(name, flags, dir_fd=parent_fd)
                 descriptors.append(descriptor)
-                expected = _file_identity(os.fstat(descriptor))
+                metadata = os.fstat(descriptor)
+                _validate_component(metadata, kind=kind, path=path)
+                expected = _file_identity(metadata)
                 linked = _file_identity(
                     os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 )
@@ -137,11 +187,50 @@ class _PinnedNativeExecutable:
             return descriptor
 
         try:
-            parent_fd = os.open(app_bundle.parent, _DIRECTORY_OPEN_FLAGS)
-            descriptors.append(parent_fd)
-            app_fd = open_component(parent_fd, app_bundle.name, _DIRECTORY_OPEN_FLAGS)
-            contents_fd = open_component(app_fd, "Contents", _DIRECTORY_OPEN_FLAGS)
-            info_fd = open_component(contents_fd, "Info.plist", _FILE_OPEN_FLAGS)
+            if sys.platform == "darwin":
+                if not app_bundle.is_absolute():
+                    raise SmokeFailure(
+                        f"OpenEvo Desktop native executable path is not trustworthy: {app_bundle}"
+                    )
+                current_path = Path("/")
+                parent_fd = os.open(current_path, _DIRECTORY_OPEN_FLAGS)
+                descriptors.append(parent_fd)
+                _validate_component(
+                    os.fstat(parent_fd), kind="directory", path=current_path
+                )
+                for component in app_bundle.parent.parts[1:]:
+                    current_path /= component
+                    parent_fd = open_component(
+                        parent_fd,
+                        component,
+                        _DIRECTORY_OPEN_FLAGS,
+                        kind="directory",
+                        path=current_path,
+                    )
+            else:
+                parent_fd = os.open(app_bundle.parent, _DIRECTORY_OPEN_FLAGS)
+                descriptors.append(parent_fd)
+            app_fd = open_component(
+                parent_fd,
+                app_bundle.name,
+                _DIRECTORY_OPEN_FLAGS,
+                kind="directory",
+                path=app_bundle,
+            )
+            contents_fd = open_component(
+                app_fd,
+                "Contents",
+                _DIRECTORY_OPEN_FLAGS,
+                kind="directory",
+                path=app_bundle / "Contents",
+            )
+            info_fd = open_component(
+                contents_fd,
+                "Info.plist",
+                _FILE_OPEN_FLAGS,
+                kind="info",
+                path=app_bundle / "Contents" / "Info.plist",
+            )
             info_path = app_bundle / "Contents" / "Info.plist"
             if not stat.S_ISREG(os.fstat(info_fd).st_mode):
                 raise SmokeFailure(f"OpenEvo Desktop has an invalid Info.plist: {info_path}")
@@ -167,8 +256,20 @@ class _PinnedNativeExecutable:
                 raise SmokeFailure(
                     "OpenEvo Desktop Info.plist has an invalid CFBundleExecutable"
                 )
-            macos_fd = open_component(contents_fd, "MacOS", _DIRECTORY_OPEN_FLAGS)
-            executable_fd = open_component(macos_fd, executable_name, _FILE_OPEN_FLAGS)
+            macos_fd = open_component(
+                contents_fd,
+                "MacOS",
+                _DIRECTORY_OPEN_FLAGS,
+                kind="directory",
+                path=app_bundle / "Contents" / "MacOS",
+            )
+            executable_fd = open_component(
+                macos_fd,
+                executable_name,
+                _FILE_OPEN_FLAGS,
+                kind="executable",
+                path=app_bundle / "Contents" / "MacOS" / executable_name,
+            )
             metadata = os.fstat(executable_fd)
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o111 == 0:
                 raise SmokeFailure(
@@ -202,7 +303,7 @@ class _PinnedNativeExecutable:
     def execution_path(self) -> str:
         descriptor = self.executable_fd
         if sys.platform == "darwin":
-            return f"/dev/fd/{descriptor}"
+            return str(self.path)
         if Path("/proc/self/fd").is_dir():
             return f"/proc/self/fd/{descriptor}"
         raise SmokeFailure("OpenEvo Desktop cannot execute the pinned native executable")
@@ -227,7 +328,7 @@ class _PinnedNativeExecutable:
     def prepare_exec(self) -> None:
         self.validate()
         for descriptor in self._descriptors:
-            if descriptor != self.executable_fd:
+            if sys.platform == "darwin" or descriptor != self.executable_fd:
                 os.close(descriptor)
 
     def close(self) -> None:
@@ -287,6 +388,199 @@ class _NativeLogReader:
 
     def tail_text(self) -> str:
         return self._tail.decode("utf-8", errors="replace")
+
+
+class _SidecarProcessEvidence:
+    __slots__ = ("instance_id", "pid", "process_group", "birth_identity")
+
+    def __init__(
+        self,
+        *,
+        instance_id: str,
+        pid: int,
+        process_group: int,
+        birth_identity: str,
+    ) -> None:
+        self.instance_id = instance_id
+        self.pid = pid
+        self.process_group = process_group
+        self.birth_identity = birth_identity
+
+
+_SIDECAR_INSTANCE_ID = re.compile(r"^[0-9a-f]{32}$")
+_LINUX_BIRTH_IDENTITY = re.compile(r"^linux:[1-9][0-9]*$")
+_DARWIN_BIRTH_IDENTITY = re.compile(r"^darwin:[1-9][0-9]*:[0-9]{1,6}$")
+
+
+def _parse_sidecar_process_marker(line: str) -> _SidecarProcessEvidence | None:
+    if not line.startswith(f"{SIDECAR_PROCESS_PREFIX} "):
+        return None
+    parts = line.split(" ")
+    if len(parts) != 5 or any(not part for part in parts):
+        raise SmokeFailure("OpenEvo Desktop reported invalid sidecar process evidence")
+    _, instance_id, pid_text, process_group_text, birth_identity = parts
+    try:
+        pid = int(pid_text)
+        process_group = int(process_group_text)
+    except ValueError as exc:
+        raise SmokeFailure(
+            "OpenEvo Desktop reported invalid sidecar process evidence"
+        ) from exc
+    birth_pattern = (
+        _DARWIN_BIRTH_IDENTITY if sys.platform == "darwin" else _LINUX_BIRTH_IDENTITY
+    )
+    if (
+        not _SIDECAR_INSTANCE_ID.fullmatch(instance_id)
+        or pid <= 1
+        or process_group != pid
+        or not birth_pattern.fullmatch(birth_identity)
+    ):
+        raise SmokeFailure("OpenEvo Desktop reported invalid sidecar process evidence")
+    return _SidecarProcessEvidence(
+        instance_id=instance_id,
+        pid=pid,
+        process_group=process_group,
+        birth_identity=birth_identity,
+    )
+
+
+def _linux_process_birth_identity(pid: int) -> str:
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        suffix = stat_text.rsplit(")", 1)[1].split()
+        start_ticks = suffix[19]
+    except (IndexError, OSError) as exc:
+        raise SmokeFailure("OpenEvo Desktop sidecar process identity could not be verified") from exc
+    if not start_ticks.isascii() or not start_ticks.isdigit() or int(start_ticks) <= 0:
+        raise SmokeFailure("OpenEvo Desktop sidecar process identity could not be verified")
+    return f"linux:{start_ticks}"
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _darwin_process_birth_identity(pid: int) -> str:
+    info = _DarwinProcBsdInfo()
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidinfo = libproc.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+        result = proc_pidinfo(
+            pid,
+            3,  # PROC_PIDTBSDINFO
+            0,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+    except (AttributeError, OSError) as exc:
+        raise SmokeFailure("OpenEvo Desktop sidecar process identity could not be verified") from exc
+    if (
+        result != ctypes.sizeof(info)
+        or info.pbi_pid != pid
+        or info.pbi_start_tvsec == 0
+        or info.pbi_start_tvusec >= 1_000_000
+    ):
+        raise SmokeFailure("OpenEvo Desktop sidecar process identity could not be verified")
+    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+
+
+def _process_birth_identity(pid: int) -> str:
+    if sys.platform == "darwin":
+        return _darwin_process_birth_identity(pid)
+    if Path("/proc").is_dir():
+        return _linux_process_birth_identity(pid)
+    raise SmokeFailure("OpenEvo Desktop sidecar process identity is unsupported")
+
+
+def _validate_sidecar_process_evidence(
+    evidence: _SidecarProcessEvidence,
+    *,
+    native_process_group: int,
+) -> None:
+    try:
+        actual_process_group = os.getpgid(evidence.pid)
+    except OSError as exc:
+        raise SmokeFailure("OpenEvo Desktop sidecar process identity could not be verified") from exc
+    if (
+        evidence.process_group == native_process_group
+        or actual_process_group != evidence.process_group
+        or _process_birth_identity(evidence.pid) != evidence.birth_identity
+    ):
+        raise SmokeFailure("OpenEvo Desktop sidecar process identity could not be verified")
+
+
+def _wait_for_process_group_exit(process_group: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while _native_process_group_exists(process_group):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def _verify_sidecar_process_group_exit(evidence: _SidecarProcessEvidence) -> None:
+    if _wait_for_process_group_exit(
+        evidence.process_group, SIDECAR_GROUP_EXIT_TIMEOUT_SECONDS
+    ):
+        return
+    leader_is_gone = False
+    try:
+        leader_group = os.getpgid(evidence.pid)
+    except ProcessLookupError:
+        leader_is_gone = True
+    except OSError as exc:
+        raise SmokeFailure(
+            "OpenEvo Desktop sidecar process group survived but could not be inspected"
+        ) from exc
+    if not leader_is_gone and (
+        leader_group != evidence.process_group
+        or _process_birth_identity(evidence.pid) != evidence.birth_identity
+    ):
+        raise SmokeFailure(
+            "OpenEvo Desktop sidecar process group survived but its leader identity changed"
+        )
+    _signal_native_process_group(evidence.process_group, signal.SIGKILL)
+    cleaned = _wait_for_process_group_exit(
+        evidence.process_group, SIDECAR_GROUP_KILL_TIMEOUT_SECONDS
+    )
+    if not cleaned:
+        raise SmokeFailure(
+            "OpenEvo Desktop sidecar process group survived active cleanup"
+        )
+    raise SmokeFailure(
+        "OpenEvo Desktop sidecar process group survived the Rust watchdog and required cleanup"
+    )
 
 
 def _native_process_group_exists(process_group: int) -> bool:
@@ -357,7 +651,7 @@ def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
                 process = subprocess.Popen(
                     [str(executable)],
                     executable=pinned.execution_path(),
-                    cwd=app_bundle.parent,
+                    cwd=pinned.app_bundle.parent,
                     stdin=subprocess.DEVNULL,
                     stdout=output,
                     stderr=subprocess.STDOUT,
@@ -365,20 +659,43 @@ def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
                     pass_fds=pinned.inherited_fds,
                     preexec_fn=pinned.prepare_exec,
                 )
+                pinned.validate()
         except (OSError, subprocess.SubprocessError) as exc:
             raise SmokeFailure(
                 f"OpenEvo Desktop native executable could not start: {executable}"
             ) from exc
         log_reader = _NativeLogReader(log_path)
         deadline = time.monotonic() + timeout_seconds
+        sidecar_evidence: _SidecarProcessEvidence | None = None
         try:
             while time.monotonic() < deadline:
-                if RENDERER_READY_MARKER in log_reader.read_complete_lines():
+                renderer_ready = False
+                for line in log_reader.read_complete_lines():
+                    evidence = _parse_sidecar_process_marker(line)
+                    if evidence is not None:
+                        if sidecar_evidence is not None:
+                            raise SmokeFailure(
+                                "OpenEvo Desktop reported duplicate sidecar process evidence"
+                            )
+                        _validate_sidecar_process_evidence(
+                            evidence, native_process_group=process.pid
+                        )
+                        sidecar_evidence = evidence
+                    if line == RENDERER_READY_MARKER:
+                        renderer_ready = True
+                if renderer_ready:
+                    if sidecar_evidence is None:
+                        raise SmokeFailure(
+                            "OpenEvo Desktop renderer readiness omitted sidecar process evidence"
+                        )
                     time.sleep(0.25)
                     if process.poll() is not None:
                         raise SmokeFailure(
                             "OpenEvo Desktop exited immediately after renderer readiness"
                         )
+                    _validate_sidecar_process_evidence(
+                        sidecar_evidence, native_process_group=process.pid
+                    )
                     return executable
                 exit_code = process.poll()
                 if exit_code is not None:
@@ -392,7 +709,15 @@ def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
                 f"{log_reader.tail_text()[-2048:]}"
             )
         finally:
-            _terminate_native_process(process)
+            native_cleanup_error: SmokeFailure | None = None
+            try:
+                _terminate_native_process(process)
+            except SmokeFailure as exc:
+                native_cleanup_error = exc
+            if sidecar_evidence is not None:
+                _verify_sidecar_process_group_exit(sidecar_evidence)
+            if native_cleanup_error is not None:
+                raise native_cleanup_error
 
 
 def smoke_bundle(bundle_root: Path, *, timeout_seconds: float) -> Path:

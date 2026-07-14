@@ -1,4 +1,7 @@
 import { z } from "zod";
+import { providerKindSchema } from "./providerKinds";
+
+export { providerKindSchema } from "./providerKinds";
 
 export const MAX_PAGE_SIZE = 100;
 export const MAX_JSON_DEPTH = 16;
@@ -78,8 +81,6 @@ export const safeJsonObjectSchema: z.ZodType<Record<string, SafeJsonValue>> = z
   .record(z.string(), safeJsonValueSchema)
   .superRefine((value, context) => validateBoundedJson(value, context));
 
-const dryRunProviderKind = ["dry", "run"].join("_") as "dry_run";
-export const providerKindSchema = z.enum(["desktop_sidecar", "contract_simulator", "scaffold", dryRunProviderKind]);
 export const featureFlagV1Schema = z.enum([
   "remote_profiles",
   "project_validation",

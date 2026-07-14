@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import plistlib
 import signal
+import stat
+from types import SimpleNamespace
 import time
 from zipfile import ZipFile
 
@@ -95,6 +97,63 @@ def _process_is_live(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def _write_fake_native_with_independent_sidecar(
+    app: Path,
+    *,
+    renderer_marker: str,
+    sidecar_pid_path: Path,
+    clean_sidecar: bool,
+    exit_after_markers: bool = False,
+) -> Path:
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import ctypes\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        "child = subprocess.Popen([\"/bin/sh\", \"-c\", \"trap '' TERM; exec sleep 30\"], start_new_session=True)\n"
+        f"Path({str(sidecar_pid_path)!r}).write_text(str(child.pid), encoding='utf-8')\n"
+        "if sys.platform == 'darwin':\n"
+        "    class ProcBsdInfo(ctypes.Structure):\n"
+        "        _fields_ = [('pbi_flags', ctypes.c_uint32), ('pbi_status', ctypes.c_uint32), ('pbi_xstatus', ctypes.c_uint32), ('pbi_pid', ctypes.c_uint32), ('pbi_ppid', ctypes.c_uint32), ('pbi_uid', ctypes.c_uint32), ('pbi_gid', ctypes.c_uint32), ('pbi_ruid', ctypes.c_uint32), ('pbi_rgid', ctypes.c_uint32), ('pbi_svuid', ctypes.c_uint32), ('pbi_svgid', ctypes.c_uint32), ('rfu_1', ctypes.c_uint32), ('pbi_comm', ctypes.c_char * 16), ('pbi_name', ctypes.c_char * 32), ('pbi_nfiles', ctypes.c_uint32), ('pbi_pgid', ctypes.c_uint32), ('pbi_pjobc', ctypes.c_uint32), ('e_tdev', ctypes.c_uint32), ('e_tpgid', ctypes.c_uint32), ('pbi_nice', ctypes.c_int32), ('pbi_start_tvsec', ctypes.c_uint64), ('pbi_start_tvusec', ctypes.c_uint64)]\n"
+        "    info = ProcBsdInfo()\n"
+        "    proc_pidinfo = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidinfo\n"
+        "    proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]\n"
+        "    proc_pidinfo.restype = ctypes.c_int\n"
+        "    assert proc_pidinfo(child.pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) == ctypes.sizeof(info)\n"
+        "    birth = f'darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}'\n"
+        "else:\n"
+        "    start_ticks = Path(f'/proc/{child.pid}/stat').read_text(encoding='utf-8').rsplit(')', 1)[1].split()[19]\n"
+        "    birth = f'linux:{start_ticks}'\n"
+        "print(f'OPENEVO_DESKTOP_SIDECAR_PROCESS_V1 {\"a\" * 32} {child.pid} {os.getpgid(child.pid)} {birth}', flush=True)\n"
+        f"print({renderer_marker!r}, flush=True)\n"
+        + (
+            "def stop(_signum, _frame):\n"
+            "    try:\n"
+            "        os.killpg(child.pid, signal.SIGKILL)\n"
+            "    except ProcessLookupError:\n"
+            "        pass\n"
+            "    child.wait()\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            if clean_sidecar
+            else ""
+        )
+        + ("raise SystemExit(7)\n" if exit_after_markers else "while True:\n    time.sleep(1)\n"),
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
 
 
 def test_desktop_wheel_smoke_exercises_config_backed_lifecycle(
@@ -194,6 +253,23 @@ def test_bundle_smoke_requires_openevo_desktop_app_bundle(tmp_path: Path) -> Non
 def test_bundle_smoke_launches_the_native_app_until_renderer_is_ready(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
     app = tmp_path / "OpenEvo Desktop.app"
+    executable = _write_fake_native_with_independent_sidecar(
+        app,
+        renderer_marker=smoke.RENDERER_READY_MARKER,
+        sidecar_pid_path=tmp_path / "sidecar.pid",
+        clean_sidecar=True,
+    )
+
+    launched = smoke.smoke_native_app(app, timeout_seconds=5)
+
+    assert launched == executable
+
+
+def test_bundle_smoke_requires_instance_bound_sidecar_process_evidence(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
     executable = app / "Contents" / "MacOS" / "openevo-desktop"
     executable.parent.mkdir(parents=True)
     (app / "Contents" / "Info.plist").write_bytes(
@@ -205,9 +281,137 @@ def test_bundle_smoke_launches_the_native_app_until_renderer_is_ready(tmp_path: 
     )
     executable.chmod(0o755)
 
-    launched = smoke.smoke_native_app(app, timeout_seconds=5)
+    with pytest.raises(smoke.SmokeFailure, match="sidecar process evidence"):
+        smoke.smoke_native_app(app, timeout_seconds=1)
 
-    assert launched == executable
+
+def test_bundle_smoke_proves_independent_sidecar_group_exit(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    sidecar_pid_path = tmp_path / "sidecar.pid"
+    executable = _write_fake_native_with_independent_sidecar(
+        app,
+        renderer_marker=smoke.RENDERER_READY_MARKER,
+        sidecar_pid_path=sidecar_pid_path,
+        clean_sidecar=True,
+    )
+
+    assert smoke.smoke_native_app(app, timeout_seconds=2) == executable
+    assert not _process_is_live(int(sidecar_pid_path.read_text(encoding="utf-8")))
+
+
+def test_bundle_smoke_cleans_and_fails_for_surviving_setsid_sidecar(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    sidecar_pid_path = tmp_path / "leaked-sidecar.pid"
+    _write_fake_native_with_independent_sidecar(
+        app,
+        renderer_marker=smoke.RENDERER_READY_MARKER,
+        sidecar_pid_path=sidecar_pid_path,
+        clean_sidecar=False,
+    )
+
+    try:
+        with pytest.raises(smoke.SmokeFailure, match="sidecar process group survived"):
+            smoke.smoke_native_app(app, timeout_seconds=2)
+    finally:
+        if sidecar_pid_path.exists():
+            sidecar_pid = int(sidecar_pid_path.read_text(encoding="utf-8"))
+            try:
+                os.killpg(sidecar_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    assert not _process_is_live(int(sidecar_pid_path.read_text(encoding="utf-8")))
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "error"])
+def test_bundle_smoke_cleans_independent_sidecar_on_readiness_failure(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    sidecar_pid_path = tmp_path / f"{outcome}-sidecar.pid"
+    _write_fake_native_with_independent_sidecar(
+        app,
+        renderer_marker="not-ready",
+        sidecar_pid_path=sidecar_pid_path,
+        clean_sidecar=True,
+        exit_after_markers=outcome == "error",
+    )
+
+    with pytest.raises(smoke.SmokeFailure):
+        smoke.smoke_native_app(app, timeout_seconds=0.5)
+    assert not _process_is_live(int(sidecar_pid_path.read_text(encoding="utf-8")))
+
+
+def test_bundle_smoke_uses_the_original_bundle_path_on_darwin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    canonical_executable = (
+        Path(os.path.realpath(app.parent)) / app.name / "Contents" / "MacOS" / executable.name
+    )
+    with smoke._PinnedNativeExecutable.open(app) as pinned:
+        monkeypatch.setattr(smoke.sys, "platform", "darwin")
+        assert pinned.execution_path() == str(canonical_executable)
+
+
+def test_bundle_smoke_canonicalizes_only_a_darwin_parent_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    canonical_parent = tmp_path / "canonical"
+    app = canonical_parent / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    alias = tmp_path / "alias"
+    alias.symlink_to(canonical_parent, target_is_directory=True)
+    monkeypatch.setattr(smoke.sys, "platform", "darwin")
+    monkeypatch.setattr(smoke, "_validate_component", lambda *args, **kwargs: None)
+
+    expected_app = Path(os.path.realpath(canonical_parent)) / app.name
+    with smoke._PinnedNativeExecutable.open(alias / app.name) as pinned:
+        assert pinned.app_bundle == expected_app
+        assert pinned.execution_path() == str(
+            expected_app / "Contents" / "MacOS" / executable.name
+        )
+
+
+@pytest.mark.parametrize(
+    ("metadata", "kind"),
+    [
+        (SimpleNamespace(st_mode=stat.S_IFDIR | 0o775, st_uid=os.geteuid(), st_nlink=1), "directory"),
+        (SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=os.geteuid() + 1, st_nlink=1), "executable"),
+        (SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=os.geteuid(), st_nlink=2), "executable"),
+    ],
+)
+def test_bundle_smoke_rejects_untrusted_darwin_components(
+    metadata: SimpleNamespace,
+    kind: str,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+
+    with pytest.raises(smoke.SmokeFailure, match="not trustworthy"):
+        smoke._validate_darwin_component(metadata, kind=kind, path=Path("component"))
 
 
 @pytest.mark.parametrize("component", ["app", "Contents", "MacOS"])
@@ -366,12 +570,22 @@ def test_bundle_smoke_keeps_an_early_marker_beyond_the_log_tail(
 
     def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
         output = kwargs["stdout"]
+        output.write(
+            (
+                f"{smoke.SIDECAR_PROCESS_PREFIX} {'a' * 32} "
+                "515151 515151 linux:12345\n"
+            ).encode()
+        )
         output.write((smoke.RENDERER_READY_MARKER + "\n").encode())
         output.write(b"x" * (smoke.NATIVE_LOG_LIMIT + 1))
         output.flush()
         return FakeProcess()
 
     monkeypatch.setattr(smoke.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        smoke, "_validate_sidecar_process_evidence", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(smoke, "_verify_sidecar_process_group_exit", lambda evidence: None)
     monkeypatch.setattr(smoke, "_terminate_native_process", lambda process: None)
     monkeypatch.setattr(smoke.time, "sleep", lambda seconds: None)
 
@@ -410,6 +624,7 @@ def test_bundle_smoke_rejects_non_dictionary_info_plist(tmp_path: Path) -> None:
 def test_bundle_smoke_always_cleans_the_native_process_group(
     tmp_path: Path,
     outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     smoke = _load_bundle_smoke_module()
     app = tmp_path / "OpenEvo Desktop.app"
@@ -426,11 +641,16 @@ def test_bundle_smoke_always_cleans_the_native_process_group(
         "trap '' TERM\n"
         "sh -c 'trap \"\" TERM; while :; do sleep 1; done' &\n"
         f"echo $! > '{child_pid_path}'\n"
+        f"printf '%s\\n' '{smoke.SIDECAR_PROCESS_PREFIX} {'a' * 32} 515151 515151 linux:12345'\n"
         f"printf '%s\\n' '{marker}'\n"
         f"{final_command}\n",
         encoding="utf-8",
     )
     executable.chmod(0o755)
+    monkeypatch.setattr(
+        smoke, "_validate_sidecar_process_evidence", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(smoke, "_verify_sidecar_process_group_exit", lambda evidence: None)
 
     if outcome == "success":
         assert smoke.smoke_native_app(app, timeout_seconds=1) == executable

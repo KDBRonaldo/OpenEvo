@@ -33,6 +33,7 @@ const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V1";
+const SIDECAR_PROCESS_MARKER: &str = "OPENEVO_DESKTOP_SIDECAR_PROCESS_V1";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
 const NATIVE_WORKSPACE_IMPORT_ROUTE: &str = "/openevo-native/workspace-imports";
@@ -1193,6 +1194,81 @@ fn linux_proc_stat_is_live_group_member(stat: &str, process_group: i32) -> std::
         .parse::<i32>()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc group"))?;
     Ok(group == process_group && state != "Z")
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_proc_stat_start_ticks(stat: &str) -> std::io::Result<u64> {
+    let after_name = stat
+        .rsplit_once(')')
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc stat"))?;
+    let start_ticks = after_name
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing proc start"))?
+        .parse::<u64>()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc start"))?;
+    if start_ticks == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid proc start",
+        ));
+    }
+    Ok(start_ticks)
+}
+
+#[cfg(target_os = "linux")]
+fn sidecar_process_birth_identity(pid: i32) -> std::io::Result<(i32, String)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after_name = stat
+        .rsplit_once(')')
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc stat"))?;
+    let process_group = after_name
+        .split_whitespace()
+        .nth(2)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing proc group"))?
+        .parse::<i32>()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc group"))?;
+    let start_ticks = linux_proc_stat_start_ticks(&stat)?;
+    Ok((process_group, format!("linux:{start_ticks}")))
+}
+
+#[cfg(target_os = "macos")]
+fn sidecar_process_birth_identity(pid: i32) -> std::io::Result<(i32, String)> {
+    use std::ffi::c_void;
+
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let expected_size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let buffer_size = libc::c_int::try_from(expected_size)
+        .map_err(|_| std::io::Error::other("process identity buffer is too large"))?;
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast::<c_void>(),
+            buffer_size,
+        )
+    };
+    if result != buffer_size {
+        return Err(std::io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid as u32
+        || info.pbi_pgid == 0
+        || info.pbi_start_tvsec == 0
+        || info.pbi_start_tvusec >= 1_000_000
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid process identity",
+        ));
+    }
+    Ok((
+        info.pbi_pgid as i32,
+        format!("darwin:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+    ))
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -4478,6 +4554,17 @@ fn renderer_ready_inner_with<C: ProcessControl>(
     {
         return Err(sidecar_contract_incompatible_error());
     }
+    let pid = child.id() as i32;
+    let (observed_process_group, birth_identity) =
+        sidecar_process_birth_identity(pid).map_err(|_| sidecar_inspection_error())?;
+    if managed.process_group != pid || observed_process_group != managed.process_group {
+        return Err(sidecar_inspection_error());
+    }
+    eprintln!(
+        "{SIDECAR_PROCESS_MARKER} {} {pid} {} {birth_identity}",
+        encode_hex(&managed.instance_id),
+        managed.process_group,
+    );
     eprintln!("{RENDERER_READY_MARKER} {openapi_sha256}");
     Ok(())
 }
@@ -5102,6 +5189,21 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn linux_proc_birth_identity_uses_the_kernel_start_ticks_field() {
+        let stat = concat!(
+            "4101 (openevo sidecar) S 1 4101 4101 0 0 0 0 0 0 ",
+            "0 0 0 0 0 0 0 0 0 987654 0 0"
+        );
+
+        assert_eq!(linux_proc_stat_start_ticks(stat).unwrap(), 987654);
+        assert!(linux_proc_stat_start_ticks("4101 malformed").is_err());
+        assert!(linux_proc_stat_start_ticks(
+            "4101 (sidecar) S 1 4101 4101 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+        )
+        .is_err());
     }
 
     #[test]

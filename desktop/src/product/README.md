@@ -10,6 +10,12 @@ Release startup has one entry point: `createReleaseDesktopProductProvider`.
 It accepts a provider only after the Tauri bootstrap and `DesktopApiClientV1`
 agree on contract major, checked-in OpenAPI digest, provider kind, and required
 features. The contract simulator is test-only and is not a release fallback.
+The `openevo-desktop` Vite mode replaces the general provider-kind parser with
+`providerKinds.release.ts`, whose only accepted value is `desktop_sidecar`.
+Rollup can then remove simulator, scaffold, and dry-run provider definitions and
+their strings from the packaged renderer. Normal development/typecheck/test
+imports continue to use `providerKinds.ts`, so contract fixtures remain usable
+without becoming release dependencies.
 
 For renderer visual QA, run the Vite development server and open
 `/product-preview.html?scenario=<name>`. The closed scenario set is `new-user`,
