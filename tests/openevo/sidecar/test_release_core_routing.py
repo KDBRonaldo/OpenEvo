@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.testclient import TestClient
 import pytest
 
 from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1, DesktopCoreBridgeV1
 from desktop.sidecar.core_client_v1 import CoreClientErrorV1
+from desktop.sidecar.event_broker_v1 import (
+    DesktopEventBrokerV1,
+    DesktopEventCursorExpiredError,
+)
 from desktop.sidecar.provider_store import DesktopProviderStore, ETagConflictError
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import DesktopReleaseProvider
@@ -36,6 +41,8 @@ class _Lifecycle:
 def _provider(
     tmp_path: Path,
     bridge: Mock | None,
+    *,
+    event_broker: DesktopEventBrokerV1 | None = None,
 ) -> tuple[DesktopReleaseProvider, DesktopProviderStore, local_v1.ProjectV1]:
     state_root = tmp_path / "state"
     store = DesktopProviderStore(state_root)
@@ -77,6 +84,7 @@ def _provider(
         readiness_key=b"r" * 32,
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,  # type: ignore[arg-type]
+        event_broker=event_broker,
         clock=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
     )
     return provider, store, project
@@ -375,6 +383,67 @@ def test_existing_local_operation_read_is_available_without_core_bridge(tmp_path
         assert fetched.resource == operation.resource
     finally:
         provider.close()
+
+
+def test_release_provider_streams_brokered_state_events(tmp_path: Path) -> None:
+    broker = DesktopEventBrokerV1(
+        heartbeat_interval=60,
+        poll_interval=0.01,
+        clock=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
+        event_id_factory=lambda: "release-event-routing-0001",
+    )
+    provider, _, _ = _provider(tmp_path, None, event_broker=broker)
+    response = provider.invoke(
+        "subscribeDesktopEvents",
+        {"last_event_id": None},
+    )
+    assert isinstance(response, StreamingResponse)
+
+    provider.publish_state_changed()
+
+    frame = asyncio.run(response.body_iterator.__anext__())
+    assert isinstance(frame, bytes)
+    assert b"event: desktop.v1.state.changed\n" in frame
+    assert b'"kind":"state_changed"' in frame
+    provider.close()
+    assert broker.subscriber_count == 0
+
+
+def test_release_provider_rejects_an_expired_event_cursor(tmp_path: Path) -> None:
+    broker = DesktopEventBrokerV1()
+    provider, _, _ = _provider(tmp_path, None, event_broker=broker)
+    try:
+        with pytest.raises(DesktopEventCursorExpiredError):
+            provider.invoke(
+                "subscribeDesktopEvents",
+                {"last_event_id": "expired-release-event"},
+            )
+    finally:
+        provider.close()
+
+
+def test_release_app_maps_expired_event_cursor_to_reset_response(tmp_path: Path) -> None:
+    token = "desktop-session-token-0000000000000009"
+    app = create_release_desktop_local_api_app(
+        state_root=tmp_path / "event-cursor",
+        session_token=token,
+        instance_id="9" * 32,
+        readiness_key=b"u" * 32,
+        source_commit="1234567",
+        build_channel="test",
+        remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
+        event_broker=DesktopEventBrokerV1(),
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            "/desktop/v1/events",
+            headers={
+                "X-OpenEvo-Desktop-Session": token,
+                "Last-Event-ID": "expired-release-event",
+            },
+        )
+    assert response.status_code == 410
+    assert response.json()["code"] == "event_cursor_expired"
 
 
 def test_release_app_serves_bridge_results_and_preserves_typed_errors(tmp_path: Path) -> None:

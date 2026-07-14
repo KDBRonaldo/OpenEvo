@@ -11,7 +11,7 @@ import sqlite3
 from threading import Lock
 from typing import Literal, NoReturn, cast
 
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from desktop.sidecar.contracts.v1 import models as local_v1
@@ -34,10 +34,12 @@ from desktop.sidecar.contracts.v1.models import (
     RemoteProfileCreateV1,
     RemoteProfilePatchV1,
     RemoteProfileV1,
+    StateEventV1,
     VersionV1,
     WorkspaceImportRefV1,
 )
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeV1
+from desktop.sidecar.event_broker_v1 import DesktopEventBrokerV1
 from desktop.sidecar.provider_store import (
     DesktopProviderStore,
     ETagConflictError,
@@ -113,6 +115,7 @@ class DesktopReleaseProvider:
         readiness_key: bytes,
         remote_lifecycle: DesktopRemoteLifecycle,
         core_bridge: DesktopCoreBridgeV1 | None = None,
+        event_broker: DesktopEventBrokerV1 | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if re.fullmatch(r"[0-9a-f]{32}", instance_id) is None:
@@ -123,6 +126,7 @@ class DesktopReleaseProvider:
         self._workspace_import_store = workspace_import_store
         self._remote_lifecycle = remote_lifecycle
         self._core_bridge = core_bridge
+        self._event_broker = event_broker
         self._connection_state_lock = Lock()
         self._connection_generation = 0
         self._connection_owner: str | None = None
@@ -184,20 +188,25 @@ class DesktopReleaseProvider:
             "getDiagnostic": self._get_diagnostic,
             "deleteDiagnostic": self._delete_diagnostic,
             "cleanupCaches": self._cleanup_caches,
+            "subscribeDesktopEvents": self._subscribe_events,
         }
 
     def close(self) -> None:
         try:
-            if self._core_bridge is not None:
-                self._core_bridge.close()
+            if self._event_broker is not None:
+                self._event_broker.close()
         finally:
             try:
-                self._remote_lifecycle.close()
+                if self._core_bridge is not None:
+                    self._core_bridge.close()
             finally:
                 try:
-                    self._store.close()
+                    self._remote_lifecycle.close()
                 finally:
-                    self._workspace_import_store.close()
+                    try:
+                        self._store.close()
+                    finally:
+                        self._workspace_import_store.close()
 
     @property
     def workspace_import_store(self) -> WorkspaceImportStore:
@@ -993,10 +1002,33 @@ class DesktopReleaseProvider:
             idempotency_key=cast(str, arguments["idempotency_key"]),
         )
 
+    def _subscribe_events(self, arguments: Mapping[str, object]) -> StreamingResponse:
+        broker = self._require_event_broker("subscribeDesktopEvents")
+        subscription = broker.subscribe(cast(str | None, arguments["last_event_id"]))
+        return StreamingResponse(
+            subscription,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    def publish_state_changed(self) -> None:
+        """Publish one invalidation snapshot after a durable Desktop transition."""
+
+        if self._event_broker is not None:
+            self._event_broker.publish(StateEventV1(state=self._get_state({})))
+
     def _require_bridge(self, operation_id: str) -> DesktopCoreBridgeV1:
         if self._core_bridge is None:
             self._unavailable(operation_id)
         return self._core_bridge
+
+    def _require_event_broker(self, operation_id: str) -> DesktopEventBrokerV1:
+        if self._event_broker is None:
+            self._unavailable(operation_id)
+        return self._event_broker
 
     def _require_project_match(self, project_id: str, if_match: str) -> ProjectV1:
         project = self._store.get_project(project_id)

@@ -16,6 +16,14 @@ from desktop.sidecar.contracts.v1.app import DESKTOP_SESSION_HEADER, create_cont
 from desktop.sidecar.contracts.v1.models import ApiErrorV1
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1, DesktopCoreBridgeV1
 from desktop.sidecar.core_client_v1 import CoreClientErrorV1, CoreClientLocalErrorV1
+from desktop.sidecar.event_broker_v1 import (
+    DesktopEventBrokerClosedError,
+    DesktopEventBrokerError,
+    DesktopEventBrokerV1,
+    DesktopEventCapacityError,
+    DesktopEventCursorExpiredError,
+    DesktopEventSubscriberLimitError,
+)
 from desktop.sidecar.provider_store import (
     ContractValidationError,
     CursorExpiredError,
@@ -260,6 +268,7 @@ def create_release_desktop_local_api_app(
     clock: Callable[[], datetime] | None = None,
     remote_lifecycle: DesktopRemoteLifecycle | None = None,
     core_bridge: DesktopCoreBridgeV1 | None = None,
+    event_broker: DesktopEventBrokerV1 | None = None,
 ) -> FastAPI:
     """Create the release Desktop Local API v1 app and own its durable store."""
 
@@ -295,23 +304,28 @@ def create_release_desktop_local_api_app(
             readiness_key=readiness_key,
             remote_lifecycle=lifecycle,
             core_bridge=core_bridge,
+            event_broker=event_broker,
             clock=clock,
         )
         app = create_contract_app(provider)
     except BaseException:
         try:
-            if core_bridge is not None:
-                core_bridge.close()
+            if event_broker is not None:
+                event_broker.close()
         finally:
             try:
-                if lifecycle is not None:
-                    lifecycle.close()
+                if core_bridge is not None:
+                    core_bridge.close()
             finally:
                 try:
-                    store.close()
+                    if lifecycle is not None:
+                        lifecycle.close()
                 finally:
-                    if workspace_import_store is not None:
-                        workspace_import_store.close()
+                    try:
+                        store.close()
+                    finally:
+                        if workspace_import_store is not None:
+                            workspace_import_store.close()
         raise
     app.state.desktop_release_provider = provider
 
@@ -439,6 +453,43 @@ def create_release_desktop_local_api_app(
             category=category,
             retryable=exc.error.retryable,
             repair_action=("openevo_can_retry" if exc.error.retryable else "none"),
+        )
+
+    @app.exception_handler(DesktopEventCursorExpiredError)
+    async def handle_event_cursor_expired(
+        request: Request, exc: DesktopEventCursorExpiredError
+    ) -> JSONResponse:
+        del exc
+        return _error_response(
+            request,
+            status_code=410,
+            code="event_cursor_expired",
+            message="The Desktop event cursor is outside the replay window.",
+            category="operation",
+            repair_action="openevo_can_retry",
+            next_action="Refresh Desktop state and reconnect the event stream.",
+        )
+
+    @app.exception_handler(DesktopEventBrokerError)
+    async def handle_event_broker_error(
+        request: Request, exc: DesktopEventBrokerError
+    ) -> JSONResponse:
+        retryable = isinstance(
+            exc,
+            (
+                DesktopEventBrokerClosedError,
+                DesktopEventCapacityError,
+                DesktopEventSubscriberLimitError,
+            ),
+        )
+        return _error_response(
+            request,
+            status_code=503,
+            code="event_stream_unavailable",
+            message="The Desktop event stream is temporarily unavailable.",
+            category="operation",
+            retryable=retryable,
+            repair_action="openevo_can_retry" if retryable else "none",
         )
 
     @app.exception_handler(RequestValidationError)

@@ -295,14 +295,17 @@ validation envelopes bind the returned Core authority to the current Local
 project identity and ETag. Typed Core failures are preserved without exposing a
 Core URL or bearer. Without an injected bridge these routes remain fail-closed.
 
-Core bootstrap/tunnel composition, Local activation/doctor/repair/workspace-sync
-operations, Local operation logs/cancellation, and Desktop event aggregation
-remain unavailable in this provider slice. The advertised feature set therefore
-remains `remote_profiles` only; direct route wiring is not sufficient to claim a
-complete release feature. Unavailable routes return a closed `ApiErrorV1` with
-HTTP 503 and never fixture data or a synthetic ready/success state. A successful
-SSH check reports Core as `offline` with `core_not_started`; it does not claim a
-live tunnel.
+When release composition also supplies `DesktopEventBrokerV1`, the provider
+serves its bounded SSE subscription directly and maps expired cursors to the
+frozen 410 reset response. Core bootstrap/tunnel composition, Local
+activation/doctor/repair/workspace-sync operations, Local operation
+logs/cancellation, and the Core-to-Desktop event relay remain unavailable in
+this provider slice. The advertised feature set therefore remains
+`remote_profiles` only; direct route and broker wiring are not sufficient to
+claim a complete release feature. Unavailable routes return a closed
+`ApiErrorV1` with HTTP 503 and never fixture data or a synthetic ready/success
+state. A successful SSH check reports Core as `offline` with
+`core_not_started`; it does not claim a live tunnel.
 
 `core_bridge_v1.py` now provides the strict active-project bridge needed by the
 next provider slice. It injects a host-global `CoreHostService`, a tunnel
@@ -473,6 +476,14 @@ subscriber and release its queue charges. Idle streams emit an SSE comment
 every 15 seconds, which carries no sequence or replay authority. Closing the
 broker atomically prevents publication, clears all memory charges, and
 terminates all existing subscriptions.
+
+`DesktopReleaseProvider` returns a `StreamingResponse` over this subscription
+when the broker is part of release composition. It uses no-cache/no-buffering
+headers, rejects an unknown cursor before sending HTTP 200, and closes the
+broker before bridge and store shutdown so connected renderers terminate. The
+provider's state-change publisher emits the complete current `DesktopStateV1`;
+it remains an invalidation signal, and the renderer still reloads authoritative
+resources.
 
 This module does not infer resource state or cache partial Core payloads. The
 release composition remains responsible for mapping validated Core events to
