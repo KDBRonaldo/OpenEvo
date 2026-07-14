@@ -1438,7 +1438,7 @@ class DesktopProviderStore:
                 self._validate_operation_recovery_row(cast(sqlite3.Row, row))
             for row in connection.execute("SELECT * FROM idempotency_records"):
                 self._validate_idempotency_recovery_row(cast(sqlite3.Row, row))
-            self._validate_live_action_authorities(connection)
+            self._validate_write_budget(connection)
             for row in connection.execute("SELECT * FROM pagination_cursors"):
                 self._validate_cursor_recovery_row(cast(sqlite3.Row, row))
             timestamp = self._timestamp()
@@ -1529,48 +1529,10 @@ class DesktopProviderStore:
         if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
             raise ProviderDataCorruptionError("provider recovery budget exceeded")
 
-    @classmethod
-    def _validate_write_budget(cls, connection: sqlite3.Connection) -> None:
-        total_rows, total_bytes = cls._recovery_usage(connection)
-        cls._validate_live_action_authorities(connection)
-        profile_reservations = cast(
-            int,
-            connection.execute(
-                """
-                SELECT count(*)
-                FROM local_operations AS operation
-                WHERE operation.operation_kind IN (
-                    'profile_connect', 'profile_disconnect', 'host_key_accept'
-                ) AND operation.state IN ('queued', 'running', 'cancelling')
-                  AND EXISTS (
-                    SELECT 1
-                    FROM idempotency_records AS idempotency
-                    WHERE idempotency.response_type = 'LocalOperationV1'
-                      AND idempotency.operation_id = operation.operation_id
-                      AND idempotency.response_bytes = operation.document_json
-                  )
-                """
-            ).fetchone()[0],
-        )
-        project_reservations = cast(
-            int,
-            connection.execute(
-                """
-                SELECT count(*)
-                FROM local_operations AS operation
-                WHERE operation.operation_kind IN (
-                    'project_activate', 'project_doctor', 'project_repair',
-                    'bootstrap', 'workspace_sync'
-                ) AND operation.state IN ('queued', 'running', 'cancelling')
-                  AND EXISTS (
-                    SELECT 1
-                    FROM idempotency_records AS idempotency
-                    WHERE idempotency.response_type = 'LocalOperationV1'
-                      AND idempotency.operation_id = operation.operation_id
-                      AND idempotency.response_bytes = operation.document_json
-                  )
-                """
-            ).fetchone()[0],
+    def _validate_write_budget(self, connection: sqlite3.Connection) -> None:
+        total_rows, total_bytes = self._recovery_usage(connection)
+        profile_reservations, project_reservations = self._validate_live_action_authorities(
+            connection
         )
         reserved_bytes = (
             profile_reservations * PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES
@@ -1583,28 +1545,71 @@ class DesktopProviderStore:
         ):
             raise ProviderDataCorruptionError("provider recovery budget exceeded")
 
-    @staticmethod
-    def _validate_live_action_authorities(connection: sqlite3.Connection) -> None:
-        missing = connection.execute(
+    def _validate_live_action_authorities(self, connection: sqlite3.Connection) -> tuple[int, int]:
+        invalid_digest = connection.execute(
             """
-            SELECT 1
-            FROM local_operations AS operation
-            WHERE operation.state IN ('queued', 'running', 'cancelling')
-              AND operation.action_identity_digest IS NOT NULL
-              AND NOT EXISTS (
-                SELECT 1
-                FROM idempotency_records AS idempotency
-                WHERE idempotency.operation_id = operation.operation_id
-                  AND idempotency.response_type = 'LocalOperationV1'
-                  AND idempotency.response_bytes = operation.document_json
-              )
+            SELECT operation_id
+            FROM local_operations
+            WHERE action_identity_digest IS NULL
+               OR typeof(action_identity_digest) != 'text'
+               OR length(action_identity_digest) != 64
+               OR action_identity_digest GLOB '*[^0-9a-f]*'
             LIMIT 1
             """
         ).fetchone()
-        if missing is not None:
+        if invalid_digest is not None:
             raise ProviderDataCorruptionError(
-                "live operation action authority has no exact idempotency record"
+                "operation action authority digest is missing or invalid"
             )
+
+        profile_reservations = 0
+        project_reservations = 0
+        after_operation_id = ""
+        while True:
+            operation_ids = connection.execute(
+                """
+                SELECT operation_id
+                FROM local_operations
+                WHERE state IN ('queued', 'running', 'cancelling')
+                  AND operation_id > ?
+                ORDER BY operation_id
+                LIMIT ?
+                """,
+                (after_operation_id, STARTUP_OPERATION_BATCH_ROWS),
+            ).fetchmany(STARTUP_OPERATION_BATCH_ROWS)
+            if not operation_ids:
+                return profile_reservations, project_reservations
+            for operation_id_row in operation_ids:
+                operation_id = cast(str, operation_id_row["operation_id"])
+                row = self._require_operation_row(connection, operation_id)
+                operation = self._operation_from_row(row)
+                self._validate_operation_indexed_scalars(row, operation)
+                self._idempotency_rows_for_operation(
+                    connection,
+                    operation,
+                    bytes(row["document_json"]),
+                )
+                if operation.operation_kind in _PROFILE_OPERATION_KINDS:
+                    reservation_label = "profile runtime"
+                elif operation.operation_kind in _PROJECT_OPERATION_KINDS:
+                    reservation_label = "project runtime"
+                else:
+                    raise ProviderDataCorruptionError(
+                        "live operation kind has no fixed terminal reservation"
+                    )
+                try:
+                    self._validate_nonterminal_operation_terminal_capacity(connection, operation)
+                except (ContractValidationError, ResourceNotFoundError) as exc:
+                    raise ProviderDataCorruptionError(
+                        f"{reservation_label} cancellation exceeds its fixed terminal capacity"
+                    ) from exc
+                if operation.operation_kind in _PROFILE_OPERATION_KINDS:
+                    profile_reservations += 1
+                else:
+                    project_reservations += 1
+                after_operation_id = operation_id
+            if len(operation_ids) < STARTUP_OPERATION_BATCH_ROWS:
+                return profile_reservations, project_reservations
 
     def _validate_migration_rows(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
@@ -1665,11 +1670,24 @@ class DesktopProviderStore:
     def _validate_operation_recovery_row(self, row: sqlite3.Row) -> None:
         operation = self._operation_from_row(row)
         action_identity_digest = row["action_identity_digest"]
-        if action_identity_digest is not None and (
+        if (
             type(action_identity_digest) is not str
             or _DIGEST_RE.fullmatch(action_identity_digest) is None
         ):
-            raise ProviderDataCorruptionError("operation action authority digest is invalid")
+            raise ProviderDataCorruptionError(
+                "operation action authority digest is missing or invalid"
+            )
+        self._validate_operation_indexed_scalars(row, operation)
+
+        try:
+            self._validate_operation_authority(self._connection, operation, allow_historical=True)
+        except (ContractValidationError, ResourceNotFoundError) as exc:
+            raise ProviderDataCorruptionError(
+                "stored operation differs from its authoritative resource"
+            ) from exc
+
+    @staticmethod
+    def _validate_operation_indexed_scalars(row: sqlite3.Row, operation: LocalOperationV1) -> None:
         if (
             operation.operation_kind != row["operation_kind"]
             or operation.state != row["state"]
@@ -1681,12 +1699,6 @@ class DesktopProviderStore:
             raise ProviderDataCorruptionError(
                 "operation indexed scalars differ from its canonical document"
             )
-        try:
-            self._validate_operation_authority(self._connection, operation, allow_historical=True)
-        except (ContractValidationError, ResourceNotFoundError) as exc:
-            raise ProviderDataCorruptionError(
-                "stored operation differs from its authoritative resource"
-            ) from exc
 
     def _validate_cursor_recovery_row(self, row: sqlite3.Row) -> None:
         if (
@@ -3050,6 +3062,7 @@ class DesktopProviderStore:
             ) from exc
         operation_bytes = bytes(operation_row["document_json"])
         operation = self._operation_from_row(operation_row)
+        self._validate_operation_indexed_scalars(operation_row, operation)
         if response_bytes != operation_bytes or stored != operation:
             raise ProviderDataCorruptionError(
                 "operation idempotency response differs from its exact operation row"
@@ -3689,17 +3702,19 @@ class DesktopProviderStore:
         operation: LocalOperationV1,
         response_bytes: bytes,
     ) -> tuple[sqlite3.Row, ...]:
-        rows = tuple(
-            cast(sqlite3.Row, row)
-            for row in connection.execute(
-                """
-                SELECT *
-                FROM idempotency_records
-                WHERE response_type = 'LocalOperationV1' AND operation_id = ?
-                """,
-                (operation.operation_id,),
-            )
+        cursor = connection.execute(
+            """
+            SELECT *
+            FROM idempotency_records
+            WHERE response_type = 'LocalOperationV1' AND operation_id = ?
+            """,
+            (operation.operation_id,),
         )
+        rows = tuple(cast(sqlite3.Row, row) for row in cursor.fetchmany(2))
+        if len(rows) != 1:
+            raise ProviderDataCorruptionError(
+                "live operation action authority must have exactly one idempotency record"
+            )
         for row in rows:
             referenced = self._operation_for_idempotency_record(connection, row)
             if (

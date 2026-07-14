@@ -25,6 +25,7 @@ from desktop.sidecar.contracts.v1.models import (
     ProjectCreateV1,
     ProjectOperationResultV1,
     ProjectPatchV1,
+    ProjectV1,
     RemoteProfilePatchV1,
     RemoteProfileV1,
     ResourceRefV1,
@@ -968,12 +969,43 @@ def test_nonterminal_profile_runtime_operation_blocks_delete(
 ) -> None:
     store = DesktopProviderStore(tmp_path / "state")
     profile = _create_profile(store)
-    with store._transaction(write=True) as connection:
-        ProviderMutation(store, connection).create_local_operation(
-            operation_kind="profile_disconnect",
-            resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
-            state=state,
+    reservation = store.begin_profile_runtime_action(
+        route=f"/desktop/v1/profiles/{profile.profile_id}/disconnect",
+        operation_kind="profile_disconnect",
+        profile_id=profile.profile_id,
+        key=f"profile-delete-guard-{state}",
+        body={},
+        if_match=profile.etag,
+        displace_existing=False,
+    )
+    if state != "running":
+        operation = LocalOperationV1.model_validate(
+            {
+                **reservation.operation.model_dump(mode="python"),
+                "state": state,
+                "started_at": None if state == "queued" else reservation.operation.started_at,
+            }
         )
+        operation_bytes = provider_store_module._canonical_json_bytes(
+            operation.model_dump(mode="json")
+        )
+        with store._transaction(write=True) as connection:
+            connection.execute(
+                """
+                UPDATE local_operations
+                SET state = ?, document_json = ?
+                WHERE operation_id = ?
+                """,
+                (state, operation_bytes, operation.operation_id),
+            )
+            connection.execute(
+                """
+                UPDATE idempotency_records
+                SET response_bytes = ?
+                WHERE operation_id = ?
+                """,
+                (operation_bytes, operation.operation_id),
+            )
 
     with pytest.raises(ResourceInUseError):
         store.delete_profile(profile.profile_id, if_match=profile.etag)
@@ -1722,6 +1754,106 @@ def test_startup_rejects_rebinding_operation_id_to_another_action_authority(
 
     with pytest.raises(ProviderDataCorruptionError, match="action authority"):
         DesktopProviderStore(root)
+
+
+@pytest.mark.parametrize("state", ["running", "succeeded"])
+def test_mutation_cannot_commit_an_operation_without_action_authority(
+    tmp_path: Path,
+    state: Literal["running", "succeeded"],
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-orphan-mutation-create"
+    )
+
+    def create_orphan_then_return_project(
+        transaction: ProviderMutation,
+    ) -> tuple[int, ProjectV1]:
+        transaction.create_local_operation(
+            operation_kind="workspace_sync",
+            resource=ResourceRefV1(resource_type="project", resource_id=project.project_id),
+            state=state,
+        )
+        return 200, transaction.require_project_authority(
+            project.project_id, if_match=project.etag
+        )
+
+    with pytest.raises(ProviderDataCorruptionError, match="action authority"):
+        store.execute_idempotent_action(
+            route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+            resource_scope=project.project_id,
+            key="project-orphan-mutation-action",
+            body={},
+            if_match=project.etag,
+            semantic_headers={},
+            response_model=ProjectV1,
+            mutation=create_orphan_then_return_project,
+        )
+
+    assert store._connection.execute("SELECT count(*) FROM local_operations").fetchone()[0] == 0
+    assert (
+        store._connection.execute(
+            "SELECT 1 FROM idempotency_records WHERE idempotency_key = ?",
+            ("project-orphan-mutation-action",),
+        ).fetchone()
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "clear_digest",
+    [False, True],
+    ids=["missing-record", "missing-record-and-digest"],
+)
+def test_startup_rejects_unbound_nonterminal_operation_before_cancellation(
+    tmp_path: Path,
+    clear_digest: bool,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-orphan-startup-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-orphan-startup-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    assert reservation.operation.state == "queued"
+    store.close()
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute(
+            "DELETE FROM idempotency_records WHERE operation_id = ?",
+            (reservation.operation.operation_id,),
+        )
+        if clear_digest:
+            connection.execute(
+                """
+                UPDATE local_operations
+                SET action_identity_digest = NULL
+                WHERE operation_id = ?
+                """,
+                (reservation.operation.operation_id,),
+            )
+
+    with pytest.raises(ProviderDataCorruptionError, match="action authority"):
+        DesktopProviderStore(root)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT state, document_json FROM local_operations WHERE operation_id = ?",
+            (reservation.operation.operation_id,),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "queued"
+    assert LocalOperationV1.model_validate_json(bytes(row[1])).state == "queued"
 
 
 def test_project_action_operation_kind_is_part_of_idempotency_identity(tmp_path: Path) -> None:
@@ -2483,14 +2615,16 @@ def test_startup_reconciliation_streams_large_operation_sets_in_bounded_batches(
     store = DesktopProviderStore(root)
     profile = _create_profile(store)
     operation_count = provider_store_module.STARTUP_OPERATION_BATCH_ROWS * 2 + 3
-    with store._transaction(write=True) as connection:
-        transaction = ProviderMutation(store, connection)
-        for _index in range(operation_count):
-            transaction.create_local_operation(
-                operation_kind="profile_connect",
-                resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
-                state="running",
-            )
+    for index in range(operation_count):
+        store.begin_profile_runtime_action(
+            route=f"/desktop/v1/profiles/{profile.profile_id}/disconnect",
+            operation_kind="profile_disconnect",
+            profile_id=profile.profile_id,
+            key=f"profile-stream-disconnect-{index:04d}",
+            body={},
+            if_match=profile.etag,
+            displace_existing=False,
+        )
     store.close()
 
     original_connect = sqlite3.connect
@@ -2508,6 +2642,10 @@ def test_startup_reconciliation_streams_large_operation_sets_in_bounded_batches(
 
         def fetchone(self):
             return self._cursor.fetchone()
+
+        @property
+        def rowcount(self):
+            return self._cursor.rowcount
 
         def fetchmany(self, size: int | None = None):
             if size is not None:
