@@ -2345,20 +2345,32 @@ def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
                 "import sys",
                 "import time",
                 "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])",
-                "with open(sys.argv[1], 'w', encoding='ascii') as stream:",
+                "pid_path = sys.argv[1]",
+                "pending_pid_path = f'{pid_path}.pending'",
+                "with open(pending_pid_path, 'w', encoding='ascii') as stream:",
                 "    json.dump([os.getpid(), child.pid], stream)",
                 "    stream.flush()",
                 "    os.fsync(stream.fileno())",
+                "os.replace(pending_pid_path, pid_path)",
                 "time.sleep(30)",
             )
         ),
         encoding="ascii",
     )
 
+    spawned_process_ids: list[int] | None = None
+
     def cancel_after_spawn(*_args: object, **_kwargs: object) -> tuple[bytes, bytes]:
+        nonlocal spawned_process_ids
         deadline = time.monotonic() + 3
-        while not pid_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
+        while time.monotonic() < deadline:
+            try:
+                spawned_process_ids = json.loads(pid_path.read_text(encoding="ascii"))
+            except FileNotFoundError:
+                time.sleep(0.01)
+                continue
+            break
+        assert spawned_process_ids is not None
         raise KeyboardInterrupt
 
     monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
@@ -2371,7 +2383,8 @@ def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
             5,
         )
 
-    leader_id, descendant_id = json.loads(pid_path.read_text(encoding="ascii"))
+    assert spawned_process_ids is not None
+    leader_id, descendant_id = spawned_process_ids
     _assert_processes_gone(leader_id, descendant_id)
 
 
