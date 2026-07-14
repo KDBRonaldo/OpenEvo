@@ -82,8 +82,9 @@ The store holds no-follow ancestor/root descriptors. Its owner-only root also
 contains the link-count-one `0600` cross-process lock file, so independent store
 instances use one verifiable lock namespace rather than per-instance lock paths.
 Every operation rechecks root and lock pathname-to-descriptor identity and uses
-a shared/exclusive `flock`. Exclusive acquisition uses a short bounded timeout
-and returns typed `host_key_in_use` instead of waiting indefinitely. Each profile
+a shared/exclusive `flock`. Both shared and exclusive acquisition use monotonic,
+nonblocking retry with the same short bounded timeout and return typed
+`host_key_in_use` instead of waiting indefinitely. Each profile
 is mapped to an opaque SHA-256 filename, and each known-host file must be a
 link-count-one, owner-controlled regular file with mode `0600`. Reads are
 descriptor-relative and no-follow. Publication writes and fsyncs a private
@@ -152,7 +153,12 @@ expected_fingerprint=...)` is an atomic compare-and-swap operation.
 private pending seal and canonical digest, exact profile/store identity and
 candidate, repeats the complete probe, then checks the old fingerprint under the
 exclusive lock before replacement. There is no caller-constructible confirmed
-pending capability.
+pending capability. Rotation fully rereads and canonical-validates its private
+temporary record before `os.replace`; successful return from `os.replace` is the
+irreversible commit point. Any directory fsync, authoritative reread, or
+canonical-validation failure after that point returns typed
+`host_key_rotation_indeterminate`. Callers must reload using the candidate
+fingerprint and must not assume that old trust remains installed.
 
 Before revoke or rotation attempts the exclusive lock, the store requests closure
 of matching tunnels registered in the current process. `SshTunnel` is a context
@@ -161,7 +167,10 @@ the trust lease when SSH exits independently. A tunnel in another process must b
 closed by that owner; otherwise mutation fails with `host_key_in_use` after the
 bounded lock timeout. Synchronous commands intentionally keep their shared lease
 until completion. Revoking the store record is not a general remote-session
-termination mechanism.
+termination mechanism. Registration and exit-monitor startup are one constructor
+transaction: any failure after process creation unregisters the closer, performs
+bounded terminate/wait/kill cleanup, and releases the trust lease before a typed
+start failure is returned.
 
 `SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
 it before building every command. A release call without a binding fails closed.
@@ -231,9 +240,12 @@ valid marker is a typed connection failure. Host-key-specific failures may only
 come from a separately verified transport setup/protocol signal, never by parsing
 arbitrary stderr text.
 
-Process-start, connection, and rsync failures are renderer-safe typed errors.
-The deployment logger records only the typed code, numeric return code when one
-exists, and a random opaque diagnostic ID. It never records raw SSH/rsync
+Configuration, host-key, timeout, process-start, connection, and rsync failures
+are renderer-safe closed typed errors. Translation discards the original
+exception object and chain, so exception strings and formatted tracebacks cannot
+expose subprocess argv, stdout/stderr, local or remote paths, lease tokens, or
+credentials. The deployment logger records only the typed code and a random
+opaque diagnostic ID. It never records raw SSH/rsync
 stdout/stderr, exception text, local paths, or usernames. Command output remains
 available only through the existing restricted result/diagnostic handling path;
 known trust paths are redacted from returned remote-command stderr as defense in

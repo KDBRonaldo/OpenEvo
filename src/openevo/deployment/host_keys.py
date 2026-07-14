@@ -67,6 +67,7 @@ _TUNNEL_CLOSERS: dict[tuple[int, int, str, str], set[Callable[[], None]]] = {}
 
 class HostKeyStoreErrorCode(str, Enum):
     HOST_KEY_IN_USE = "host_key_in_use"
+    ROTATION_INDETERMINATE = "host_key_rotation_indeterminate"
 
 
 class HostKeyStoreError(RuntimeError):
@@ -77,6 +78,9 @@ class HostKeyStoreError(RuntimeError):
         messages = {
             HostKeyStoreErrorCode.HOST_KEY_IN_USE: (
                 "SSH host-key trust is in use. Close the active tunnel and retry."
+            ),
+            HostKeyStoreErrorCode.ROTATION_INDETERMINATE: (
+                "SSH host-key rotation may have committed. Reload trust before retrying."
             ),
         }
         super().__init__(messages[code])
@@ -188,7 +192,7 @@ class ProviderKnownHostStore:
         self._anchor = _StoreAnchor(
             self._root,
             ancestor,
-            exclusive_timeout_seconds=_validate_lock_timeout(lock_timeout_seconds),
+            lock_timeout_seconds=_validate_lock_timeout(lock_timeout_seconds),
         )
         self._runner = runner or _run_keyscan
         self._pending_token = object()
@@ -400,11 +404,13 @@ class ProviderKnownHostStore:
             current = _binding_from_content(path, content, profile, self._anchor)
             if current.fingerprint != expected_old_fingerprint:
                 raise ValueError("trusted host key does not match expected fingerprint")
-            _replace_secure_file(root_fd, path.name, expected)
-            published = _read_secure_file(root_fd, path.name)
-            if published != expected:
-                raise ValueError("known-host rotation content changed")
-            return _binding_from_content(path, published, profile, self._anchor)
+            return _replace_secure_file(
+                root_fd,
+                path,
+                expected,
+                profile=profile,
+                anchor=self._anchor,
+            )
 
     def _persist(
         self,
@@ -477,7 +483,7 @@ class _StoreAnchor:
         root: Path,
         secure_ancestor: Path,
         *,
-        exclusive_timeout_seconds: float,
+        lock_timeout_seconds: float,
     ) -> None:
         self.root = root
         self.secure_ancestor = secure_ancestor
@@ -485,7 +491,7 @@ class _StoreAnchor:
         self._root_fd: int | None = None
         self._lock_anchor_fd: int | None = None
         self._guard = threading.Lock()
-        self._exclusive_timeout_seconds = exclusive_timeout_seconds
+        self._lock_timeout_seconds = lock_timeout_seconds
         ancestor_stat = os.fstat(self._ancestor_fd)
         self.registry_key = (ancestor_stat.st_dev, ancestor_stat.st_ino, root.name)
 
@@ -500,7 +506,7 @@ class _StoreAnchor:
             _acquire_store_lock(
                 lock_fd,
                 exclusive=exclusive,
-                timeout_seconds=self._exclusive_timeout_seconds,
+                timeout_seconds=self._lock_timeout_seconds,
             )
             self._validate_ancestor_binding()
             self._validate_root_binding()
@@ -1153,15 +1159,45 @@ def _write_new_secure_file(root_fd: int, name: str, content: bytes) -> None:
         os.close(fd)
 
 
-def _replace_secure_file(root_fd: int, name: str, content: bytes) -> None:
-    temp_name = f".{name}.{secrets.token_hex(12)}.rotate"
+def _replace_secure_file(
+    root_fd: int,
+    path: Path,
+    content: bytes,
+    *,
+    profile: RemoteProfileConfig,
+    anchor: _StoreAnchor,
+) -> TrustedKnownHostsBinding:
+    temp_name = f".{path.name}.{secrets.token_hex(12)}.rotate"
     created = False
     try:
         _write_new_secure_file(root_fd, temp_name, content)
         created = True
-        os.replace(temp_name, name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        prepared = _read_secure_file(root_fd, temp_name)
+        if prepared != content:
+            raise ValueError("known-host rotation temporary content changed")
+        _binding_from_content(anchor.root / temp_name, prepared, profile, anchor)
+
+        os.replace(temp_name, path.name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
         created = False
-        os.fsync(root_fd)
+        post_commit_failed = False
+        published_binding: TrustedKnownHostsBinding | None = None
+        try:
+            os.fsync(root_fd)
+            published = _read_secure_file(root_fd, path.name)
+            if published != content:
+                raise ValueError("known-host rotation content changed")
+            published_binding = _binding_from_content(
+                path,
+                published,
+                profile,
+                anchor,
+            )
+        except Exception:
+            post_commit_failed = True
+        if post_commit_failed:
+            raise HostKeyStoreError(HostKeyStoreErrorCode.ROTATION_INDETERMINATE)
+        assert published_binding is not None
+        return published_binding
     finally:
         if created:
             try:
@@ -1187,16 +1223,14 @@ def _acquire_store_lock(
     exclusive: bool,
     timeout_seconds: float,
 ) -> None:
-    if not exclusive:
-        fcntl.flock(lock_fd, fcntl.LOCK_SH)
-        return
     deadline = time.monotonic() + timeout_seconds
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     while True:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_fd, operation | fcntl.LOCK_NB)
             return
         except OSError as exc:
-            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EINTR}:
                 raise
         if time.monotonic() >= deadline:
             raise HostKeyStoreError(HostKeyStoreErrorCode.HOST_KEY_IN_USE)

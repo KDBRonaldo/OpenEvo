@@ -7,7 +7,9 @@ import shlex
 import shutil
 import subprocess
 import struct
+import threading
 import time
+import traceback
 from pathlib import Path
 
 import pytest
@@ -221,8 +223,10 @@ def _assert_marked_command(wrapped: str, expected: str) -> str:
 
 
 def test_transport_fails_closed_without_trusted_host_binding() -> None:
-    with pytest.raises(ValueError, match="trusted host-key binding"):
+    with pytest.raises(SshTransportError) as exc_info:
         SshRemoteExecutorTransport(_profile())
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_run_forces_provider_known_hosts_options(tmp_path: Path) -> None:
@@ -268,9 +272,10 @@ def test_run_revalidates_binding_before_spawning(tmp_path: Path) -> None:
     )
     binding.known_hosts_file.unlink()
 
-    with pytest.raises(ValueError, match="missing"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.run("true")
 
+    assert exc_info.value.code is SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
     assert runner.calls == []
 
 
@@ -556,7 +561,7 @@ def test_unverified_ssh_255_is_connection_failure_and_logs_no_process_output(
     assert canary not in caplog.text
     assert "REMOTE HOST" not in caplog.text
     assert "code=connection_failed" in caplog.text
-    assert "return_code=255" in caplog.text
+    assert "return_code" not in caplog.text
     assert re.search(r"diagnostic_id=[0-9a-f]{24}", caplog.text)
 
 
@@ -646,37 +651,46 @@ def test_run_exports_env_before_multiline_remote_script(tmp_path: Path) -> None:
 def test_run_rejects_invalid_env_key(tmp_path: Path) -> None:
     transport = _transport(tmp_path, runner=RecordingRunner())
 
-    with pytest.raises(ValueError, match="invalid remote environment key"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.run("true", env={"BAD KEY": "value"})
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_run_rejects_relative_cwd(tmp_path: Path) -> None:
     transport = _transport(tmp_path, runner=RecordingRunner())
 
-    with pytest.raises(ValueError, match="cwd must be an absolute remote path"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.run("true", cwd="relative")
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_run_rejects_cwd_with_control_character(tmp_path: Path) -> None:
     transport = _transport(tmp_path, runner=RecordingRunner())
 
-    with pytest.raises(ValueError, match="cwd must not contain control characters"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.run("true", cwd="/tmp/project\nid")
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_run_rejects_cwd_with_shell_metacharacter(tmp_path: Path) -> None:
     transport = _transport(tmp_path, runner=RecordingRunner())
 
-    with pytest.raises(ValueError, match="cwd contains unsupported characters"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.run("true", cwd="/tmp/project;touch-pwned")
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_password_ref_auth_is_not_supported_without_vault() -> None:
-    with pytest.raises(ValueError, match="password_ref") as exc_info:
+    with pytest.raises(SshTransportError) as exc_info:
         SshRemoteExecutorTransport(
             _profile(auth={"method": "password_ref", "password_ref": "secret-id"})
         )
 
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
     assert "secret-id" not in str(exc_info.value)
 
 
@@ -684,7 +698,7 @@ def test_passphrase_ref_is_not_supported_without_vault(tmp_path: Path) -> None:
     key = tmp_path / "id_ed25519"
     key.write_text("key", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="passphrase_ref") as exc_info:
+    with pytest.raises(SshTransportError) as exc_info:
         SshRemoteExecutorTransport(
             _profile(
                 auth={
@@ -695,27 +709,36 @@ def test_passphrase_ref_is_not_supported_without_vault(tmp_path: Path) -> None:
             )
         )
 
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
     assert "passphrase-secret" not in str(exc_info.value)
 
 
 def test_rejects_unsafe_remote_identity() -> None:
-    with pytest.raises(ValueError, match="host"):
+    with pytest.raises(SshTransportError) as exc_info:
         SshRemoteExecutorTransport(_profile(host="-oProxyCommand=bad"))
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_rejects_host_with_at_sign_to_prevent_target_rewrite() -> None:
-    with pytest.raises(ValueError, match="host"):
+    with pytest.raises(SshTransportError) as exc_info:
         SshRemoteExecutorTransport(_profile(host="trusted.example@attacker.example"))
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_rejects_colon_option_injection_that_is_not_ipv6() -> None:
-    with pytest.raises(ValueError, match="host"):
+    with pytest.raises(SshTransportError) as exc_info:
         SshRemoteExecutorTransport(_profile(host="trusted.example:ProxyCommand=bad"))
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_rejects_user_with_at_sign_to_prevent_target_rewrite() -> None:
-    with pytest.raises(ValueError, match="user"):
+    with pytest.raises(SshTransportError) as exc_info:
         SshRemoteExecutorTransport(_profile(user="alice@trusted.example"))
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_upload_dir_creates_remote_parent_and_runs_rsync(tmp_path: Path) -> None:
@@ -808,6 +831,146 @@ def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process(
     assert tunnel.closed is True
 
 
+def test_open_tunnel_thread_start_failure_cleans_process_registration_and_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubbornTunnelProcess(FakeTunnelProcess):
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            if not self.killed:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            return 0
+
+    class StubbornTunnelStarter(RecordingTunnelStarter):
+        def __call__(self, argv: list[str]) -> FakeTunnelProcess:
+            self.calls.append(argv)
+            process = StubbornTunnelProcess()
+            self.processes.append(process)
+            return process
+
+    profile = _profile()
+    binding = _trusted_binding(tmp_path, profile)
+    starter = StubbornTunnelStarter()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=binding,
+        runner=RecordingRunner(),
+        tunnel_starter=starter,
+        port_allocator=lambda: 49155,
+    )
+
+    def fail_start(self: threading.Thread) -> None:
+        raise RuntimeError("SECRET_THREAD_START_FAILURE")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+
+    with pytest.raises(SshTransportError) as exc_info:
+        transport.open_tunnel(remote_port=8765, wait_for_ready=False)
+
+    error = exc_info.value
+    process = starter.processes[0]
+    lease_path = Path(
+        next(
+            value.removeprefix("UserKnownHostsFile=")
+            for value in starter.calls[0]
+            if value.startswith("UserKnownHostsFile=")
+        )
+    )
+    assert error.code is SshTransportErrorCode.START_FAILED
+    assert process.terminated is True
+    assert process.waited is True
+    assert process.killed is True
+    assert not lease_path.exists()
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert "SECRET_THREAD_START_FAILURE" not in "".join(
+        traceback.format_exception(error)
+    )
+
+    store = ProviderKnownHostStore(
+        binding.known_hosts_file.parent,
+        runner=lambda argv, timeout: subprocess.CompletedProcess(argv, 1),
+        lock_timeout_seconds=0.05,
+    )
+    store.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+
+def test_ssh_errors_do_not_expose_secret_exception_state(
+    tmp_path: Path,
+) -> None:
+    secrets = (
+        "SECRET_REMOTE_COMMAND",
+        "SECRET_STDERR",
+        "SECRET_STDOUT",
+        "SECRET_LOCAL_PATH",
+        "SECRET_REMOTE_PATH",
+        "SECRET_LEASE_TOKEN",
+    )
+
+    class SecretFailureRunner(RecordingRunner):
+        def __call__(
+            self, argv: list[str], timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append((argv, timeout_seconds))
+            raise OSError(" ".join(secrets))
+
+    transport = _transport(tmp_path, runner=SecretFailureRunner())
+
+    captured: SshTransportError | None = None
+    try:
+        secret_command = secrets[0]
+        transport.run(secret_command)
+    except SshTransportError as error:
+        captured = error
+        rendered = "".join(traceback.format_exception(error))
+        chain = (error.__cause__, error.__context__)
+    else:  # pragma: no cover - the injected runner always fails
+        raise AssertionError("SSH failure was not raised")
+
+    assert captured is not None
+    assert captured.code is SshTransportErrorCode.START_FAILED
+    assert chain == (None, None)
+    for secret in secrets:
+        assert secret not in str(captured)
+        assert secret not in rendered
+
+
+def test_ssh_timeout_discards_command_output_and_exception_chain(tmp_path: Path) -> None:
+    secrets = (
+        "SECRET_TIMEOUT_COMMAND",
+        "SECRET_TIMEOUT_STDOUT",
+        "SECRET_TIMEOUT_STDERR",
+    )
+
+    class SecretTimeoutRunner(RecordingRunner):
+        def __call__(
+            self, argv: list[str], timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append((argv, timeout_seconds))
+            raise subprocess.TimeoutExpired(
+                [secrets[0]],
+                timeout_seconds,
+                output=secrets[1],
+                stderr=secrets[2],
+            )
+
+    transport = _transport(tmp_path, runner=SecretTimeoutRunner())
+    secret_command = secrets[0]
+
+    with pytest.raises(SshTransportError) as exc_info:
+        transport.run(secret_command)
+
+    error = exc_info.value
+    rendered = "".join(traceback.format_exception(error))
+    assert error.code is SshTransportErrorCode.TIMEOUT
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    for secret in secrets:
+        assert secret not in str(error)
+        assert secret not in rendered
+
+
 def test_tunnel_context_manager_and_exit_monitor_release_trust_lease(
     tmp_path: Path,
 ) -> None:
@@ -873,8 +1036,10 @@ def test_trust_mutation_requests_matching_tunnel_close_before_replace(
 def test_upload_dir_rejects_missing_local_path(tmp_path: Path) -> None:
     transport = _transport(tmp_path, runner=RecordingRunner())
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.upload_dir(str(tmp_path / "missing"), "/remote/path")
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_upload_dir_rejects_non_directory_local_path(tmp_path: Path) -> None:
@@ -882,8 +1047,10 @@ def test_upload_dir_rejects_non_directory_local_path(tmp_path: Path) -> None:
     local.write_text("not a directory", encoding="utf-8")
     transport = _transport(tmp_path, runner=RecordingRunner())
 
-    with pytest.raises(ValueError, match="not a directory"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.upload_dir(str(local), "/remote/path")
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_upload_dir_rejects_relative_remote_path(tmp_path: Path) -> None:
@@ -891,8 +1058,10 @@ def test_upload_dir_rejects_relative_remote_path(tmp_path: Path) -> None:
     local.mkdir()
     transport = _transport(tmp_path, runner=RecordingRunner())
 
-    with pytest.raises(ValueError, match="remote_path must be an absolute remote path"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.upload_dir(str(local), "relative/path")
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_upload_dir_rejects_remote_path_with_control_character(tmp_path: Path) -> None:
@@ -900,8 +1069,10 @@ def test_upload_dir_rejects_remote_path_with_control_character(tmp_path: Path) -
     local.mkdir()
     transport = _transport(tmp_path, runner=RecordingRunner())
 
-    with pytest.raises(ValueError, match="remote_path must not contain control characters"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.upload_dir(str(local), "/remote/path\nid")
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_upload_dir_rejects_remote_path_with_shell_metacharacter(tmp_path: Path) -> None:
@@ -909,8 +1080,10 @@ def test_upload_dir_rejects_remote_path_with_shell_metacharacter(tmp_path: Path)
     local.mkdir()
     transport = _transport(tmp_path, runner=RecordingRunner())
 
-    with pytest.raises(ValueError, match="remote_path contains unsupported characters"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.upload_dir(str(local), "/remote/path;touch-pwned")
+
+    assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
 
 
 def test_upload_dir_raises_when_remote_mkdir_fails(tmp_path: Path) -> None:
@@ -919,8 +1092,10 @@ def test_upload_dir_raises_when_remote_mkdir_fails(tmp_path: Path) -> None:
     runner = RecordingRunner(fail=True)
     transport = _transport(tmp_path, runner=runner)
 
-    with pytest.raises(RuntimeError, match="remote mkdir failed"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.upload_dir(str(local), "/remote/path")
+
+    assert exc_info.value.code is SshTransportErrorCode.RSYNC_FAILED
 
 
 def test_upload_dir_raises_when_rsync_fails(tmp_path: Path) -> None:
@@ -929,5 +1104,7 @@ def test_upload_dir_raises_when_rsync_fails(tmp_path: Path) -> None:
     runner = FailSecondCallRunner()
     transport = _transport(tmp_path, runner=runner)
 
-    with pytest.raises(RuntimeError, match="rsync failed"):
+    with pytest.raises(SshTransportError) as exc_info:
         transport.upload_dir(str(local), "/remote/path")
+
+    assert exc_info.value.code is SshTransportErrorCode.RSYNC_FAILED

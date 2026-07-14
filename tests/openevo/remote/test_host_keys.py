@@ -8,12 +8,14 @@ import stat
 import struct
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import openevo.deployment.host_keys as host_keys_module
 from openevo.deployment.host_keys import (
     HostKeyStoreError,
     HostKeyStoreErrorCode,
@@ -556,6 +558,91 @@ def test_rotate_reprobe_failure_preserves_old_trust(tmp_path: Path) -> None:
     assert old.known_hosts_file.read_bytes() == original
 
 
+def test_rotate_validates_temporary_record_before_irreversible_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    old = _confirmed_binding(tmp_path, profile)
+    original = old.known_hosts_file.read_bytes()
+    replacement_output = _valid_output(profile, marker=b"replacement")
+    store = ProviderKnownHostStore(
+        old.known_hosts_file.parent,
+        runner=KeyscanRunner(replacement_output),
+    )
+    pending = store.probe(profile)
+    replacement = pending.candidates[0]
+    real_binding_from_content = host_keys_module._binding_from_content
+
+    def reject_temporary_record(path, content, active_profile, anchor):
+        if path.name.endswith(".rotate"):
+            raise ValueError("injected temporary validation failure")
+        return real_binding_from_content(path, content, active_profile, anchor)
+
+    monkeypatch.setattr(
+        "openevo.deployment.host_keys._binding_from_content",
+        reject_temporary_record,
+    )
+
+    with pytest.raises(ValueError, match="temporary validation failure"):
+        store.rotate_from_pending(
+            pending,
+            profile=profile,
+            algorithm=replacement.algorithm,
+            fingerprint=replacement.fingerprint,
+            expected_old_fingerprint=old.fingerprint,
+        )
+
+    assert old.known_hosts_file.read_bytes() == original
+    assert store.load(profile, expected_fingerprint=old.fingerprint) is not None
+
+
+def test_rotate_post_replace_failure_is_typed_indeterminate_and_reloadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    old = _confirmed_binding(tmp_path, profile)
+    replacement_output = _valid_output(profile, marker=b"replacement")
+    store = ProviderKnownHostStore(
+        old.known_hosts_file.parent,
+        runner=KeyscanRunner(replacement_output),
+    )
+    pending = store.probe(profile)
+    replacement = pending.candidates[0]
+    real_fsync = os.fsync
+    directory_fsyncs = 0
+
+    def fail_rotation_directory_fsync(fd: int) -> None:
+        nonlocal directory_fsyncs
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_fsyncs += 1
+            if directory_fsyncs == 1:
+                raise OSError("SECRET_POST_REPLACE_PATH")
+        real_fsync(fd)
+
+    monkeypatch.setattr("openevo.deployment.host_keys.os.fsync", fail_rotation_directory_fsync)
+
+    with pytest.raises(HostKeyStoreError) as exc_info:
+        store.rotate_from_pending(
+            pending,
+            profile=profile,
+            algorithm=replacement.algorithm,
+            fingerprint=replacement.fingerprint,
+            expected_old_fingerprint=old.fingerprint,
+        )
+
+    error = exc_info.value
+    assert error.code is HostKeyStoreErrorCode.ROTATION_INDETERMINATE
+    assert "reload" in str(error).lower()
+    assert "SECRET_POST_REPLACE_PATH" not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    reloaded = store.load(profile, expected_fingerprint=replacement.fingerprint)
+    assert reloaded is not None
+    assert reloaded.fingerprint == replacement.fingerprint
+
+
 def test_concurrent_rotate_allows_only_one_first_writer(tmp_path: Path) -> None:
     profile = _profile()
     old = _confirmed_binding(tmp_path, profile)
@@ -642,6 +729,30 @@ def test_exclusive_lock_timeout_is_typed_and_shared_across_store_instances(
     lock_path = binding.known_hosts_file.parent / ".openevo-host-key.lock"
     assert lock_path.is_file()
     assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+def test_shared_lock_timeout_is_monotonic_bounded_and_typed(tmp_path: Path) -> None:
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    holder = ProviderKnownHostStore(
+        binding.known_hosts_file.parent,
+        runner=KeyscanRunner(""),
+        lock_timeout_seconds=0.05,
+    )
+    contender = ProviderKnownHostStore(
+        binding.known_hosts_file.parent,
+        runner=KeyscanRunner(""),
+        lock_timeout_seconds=0.05,
+    )
+
+    started = time.monotonic()
+    with holder._anchor.locked_root(create=False, exclusive=True):
+        with pytest.raises(HostKeyStoreError) as exc_info:
+            contender.load(profile, expected_fingerprint=binding.fingerprint)
+    elapsed = time.monotonic() - started
+
+    assert exc_info.value.code is HostKeyStoreErrorCode.HOST_KEY_IN_USE
+    assert elapsed < 0.5
 
 
 def test_existing_instances_reject_replaced_lock_namespace(tmp_path: Path) -> None:
