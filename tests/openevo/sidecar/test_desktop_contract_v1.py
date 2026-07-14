@@ -636,6 +636,9 @@ def test_cross_language_critical_fixture_matches_python_contract() -> None:
     parse_json(RunCreateV1, fixture["run_create"])
     parse_json(ProjectCreateV1, fixture["project_create"])
     parse_json(LocalOperationV1, fixture["operation_defaults"]["wire"])
+    assert fixture["state"]["contract"]["desktop_openapi_sha256"] == (
+        DESKTOP_OPENAPI_SHA256
+    )
 
 
 def test_snapshots_are_canonical_and_digests_are_stable() -> None:
