@@ -117,6 +117,14 @@ nonblocking cross-process `flock` and process-local reentrant transaction lock
 make one connection the only writer/reader owner. Forked children reject the
 inherited store and do not explicitly unlock the parent's lease.
 
+The database is opened no-follow relative to the held root and remains pinned by
+that FD. SQLite receives a `file:/dev/fd/<fd>?mode=rw` URI through the native
+macOS/Linux VFS. Before any SQLite configuration or schema write, the store
+requires the connection-reported database inode, held descriptor inode, and
+managed pathname inode to equal the original pin. A pathname replacement at the
+`sqlite3.connect` boundary therefore opens the pinned inode or fails, and the
+replacement inode is never initialized.
+
 SQLite private schema v3 uses DELETE journaling and `synchronous=FULL`; WAL and SHM are
 forbidden. The store enforces 1-GiB database and 2-GiB journal limits, exact
 schema rows plus a bound schema-fingerprint metadata row, SQLite integrity and
@@ -145,10 +153,14 @@ and verified before the database identity becomes `bound`. Restart may complete
 that sequence only when the pending row names the exact database, lock, root,
 marker and anchor inodes, both authority digests equal the canonical empty
 store, generation is zero, and all authority tables are empty. Either marker
-may be empty or already contain that exact pending identity. A bound store
-requires both markers. Unknown entries in a fresh dedicated state root,
-unrecognized schemas, nonempty pending authority, or mismatched marker identity
-fail closed instead of being claimed as a new store.
+may be empty, contain that exact pending identity, or have a torn first-slot
+publication while its never-used inactive slot remains entirely zero. Only this
+exact pending state may rewrite an invalid primary slot; a valid different
+marker or a dirty inactive slot fails closed. A bound store requires both valid
+markers and never interprets marker corruption as an unpublished bootstrap.
+Unknown entries in a fresh dedicated state root, unrecognized schemas, nonempty
+pending authority, or mismatched marker identity fail closed instead of being
+claimed as a new store.
 
 ## Session Ownership
 

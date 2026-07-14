@@ -224,10 +224,13 @@ The current provider implements:
 
 The dedicated Core bridge store commits a generation-zero `pending` identity
 before publishing its root-local marker and parent anchor, then marks the row
-`bound`. Restart completes only that exact empty, inode-bound pending bootstrap;
-unknown old state is never adopted. Durable unknown workspace finalize authority
-is replayed with its original request, ETags, and key before the bridge applies
-any newer Local project or workspace patch.
+`bound`. Restart completes only that exact empty, inode-bound pending bootstrap.
+A torn first-slot write is replaceable only while that row remains `pending` and
+the never-published backup slot is still zero; malformed, empty, or missing
+markers in a `bound` store fail closed. Unknown old state is never adopted.
+Durable unknown workspace finalize authority is replayed with its original
+request, ETags, and key before the bridge applies any newer Local project or
+workspace patch.
 
 Connection mutations atomically reserve idempotency capacity, two fixed terminal
 response slots for the operation and idempotency documents, profile action
@@ -372,7 +375,11 @@ callback protocol. It owns a dedicated sidecar-private state directory rather
 than extending the public provider database. The directory must remain a real,
 owner-held mode-`0700` inode. Its database and owner-lock files are no-follow,
 link-count-one mode-`0600` regular files whose device/inode identities are pinned
-for the store lifetime. A nonblocking `flock` permits one process owner, a
+for the store lifetime. The database remains held by a no-follow descriptor and
+SQLite opens `/dev/fd/<fd>` in `mode=rw`; the connection-reported inode, held FD,
+and managed pathname must all match before configuration or schema writes. This
+uses the native SQLite VFS on macOS and Linux and closes the pathname swap window
+around `sqlite3.connect`. A nonblocking `flock` permits one process owner, a
 process-local reentrant lock serializes SQLite use. Every public read, write, and
 close checks the creator PID before it can acquire an inherited lock, so a
 post-fork child fails closed without deadlocking or unlocking its parent owner.
@@ -380,15 +387,17 @@ post-fork child fails closed without deadlocking or unlocking its parent owner.
 The store uses SQLite's rollback journal with `synchronous=FULL`, forbids WAL/SHM,
 caps the database at 1 GiB and journal at 2 GiB, and validates an exact private
 schema fingerprint and metadata row in every transaction. Private persistence
-schema v2 is independent of the public Core/Desktop API version. Only a genuinely
-empty database with empty fresh marker files may initialize v2. A nonempty,
-unversioned, v1, markerless, or partially initialized legacy store fails closed;
-there is no inference-based migration. Startup performs SQLite and
-foreign-key integrity checks before decoding authority. Recovery is bounded to
-120,000 rows and 512 MiB of indexed/document bytes; each closed document is at
-most 4 MiB. SQL length probes and exact-length guarded reads run before a
-document BLOB enters Python. Mapping history is contiguous per project and
-bounded to 100,000 rows by default.
+schema v3 is independent of the public Core/Desktop API version. A genuinely
+empty database may create v3 by atomically committing its schema and exact
+generation-zero `pending` identity before publishing either marker. Restart may
+finish only that recognized empty pending bootstrap; a nonempty unversioned, v1,
+v2, markerless bound, or otherwise unrecognized partial store fails closed.
+There is no inference-based migration. Startup performs SQLite and foreign-key
+integrity checks before decoding authority. Recovery is bounded to 120,000 rows
+and 512 MiB of indexed/document bytes; each closed document is at most 4 MiB.
+SQL length probes and exact-length guarded reads run before a document BLOB
+enters Python. Mapping history is contiguous per project and bounded to 100,000
+rows by default.
 
 The database has a random non-secret store identity bound to the exact root,
 database, owner lock, root marker, and external pathname anchor identities. The
@@ -400,7 +409,11 @@ database generation first, then fsyncs the root marker and external anchor. On
 startup only an exact one-generation marker lag whose previous digest matches the
 database proof may be completed forward. A database behind either marker, a
 same-generation digest rewrite, a foreign store ID, or any physical identity
-substitution is durable rollback/cross-store corruption and fails closed.
+substitution is durable rollback/cross-store corruption and fails closed. For
+the first generation only, the exact empty `pending` database row authorizes
+retrying an empty or torn primary slot when its inactive slot remains all-zero.
+A valid different marker, a dirty inactive slot, or any invalid marker after the
+row becomes `bound` is not an unpublished state and fails closed.
 
 Create, patch, mapping, abort, and finalize authority use explicit closed
 canonical JSON records with a per-row SHA-256 binding. Decode strictly rebuilds

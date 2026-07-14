@@ -1009,6 +1009,7 @@ class DesktopCoreBridgeStoreV1:
                 IDENTITY_MARKER_FILENAME: self._file_identity(marker_stat),
             }
             self._anchor_identity = self._file_identity(anchor_stat)
+            self._open_database_file()
             self._verify_storage_files()
             self._connection = self._open_database_connection()
             self._initialize_schema(fresh_database=fresh_database)
@@ -1055,6 +1056,10 @@ class DesktopCoreBridgeStoreV1:
                 connection.close()
             finally:
                 del self._connection
+        database_fd = getattr(self, "_database_fd", None)
+        if database_fd is not None:
+            os.close(database_fd)
+            del self._database_fd
         owner_lock_fd = getattr(self, "_owner_lock_fd", None)
         if owner_lock_fd is not None:
             try:
@@ -1318,6 +1323,20 @@ class DesktopCoreBridgeStoreV1:
         self._owner_lock_fd = descriptor
         self._owner_lock_identity = self._file_identity(os.fstat(descriptor))
 
+    def _open_database_file(self) -> None:
+        expected = self._verify_private_file(DATABASE_FILENAME)
+        flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(DATABASE_FILENAME, flags, dir_fd=self._root_fd)
+        except OSError as exc:
+            raise CoreBridgeStoreStateRootError(
+                "bridge database could not be securely opened"
+            ) from exc
+        if self._file_identity(os.fstat(descriptor)) != self._file_identity(expected):
+            os.close(descriptor)
+            raise CoreBridgeStoreStateRootError("bridge database identity changed while opening")
+        self._database_fd = descriptor
+
     def _verify_storage_files(self) -> None:
         self._verify_root()
         self._verify_anchor_parent()
@@ -1326,6 +1345,11 @@ class DesktopCoreBridgeStoreV1:
             value = self._verify_private_file(name)
             if identities is not None and self._file_identity(value) != identities[name]:
                 raise CoreBridgeStoreStateRootError(f"private bridge file {name} identity changed")
+        database_fd = getattr(self, "_database_fd", None)
+        if database_fd is not None and self._file_identity(os.fstat(database_fd)) != (
+            self._managed_identities[DATABASE_FILENAME]
+        ):
+            raise CoreBridgeStoreStateRootError("held bridge database identity changed")
         marker_size = self._verify_private_file(IDENTITY_MARKER_FILENAME).st_size
         if marker_size != MARKER_FILE_BYTES and not (
             not self._identity_ready and marker_size == 0
@@ -1357,20 +1381,30 @@ class DesktopCoreBridgeStoreV1:
     def _open_database_connection(self) -> sqlite3.Connection:
         self._verify_storage_files()
         try:
+            descriptor_path = f"/dev/fd/{self._database_fd}"
             connection = sqlite3.connect(
-                self.database_path,
+                f"file:{descriptor_path}?mode=rw",
                 timeout=30,
                 isolation_level=None,
                 check_same_thread=False,
+                uri=True,
             )
             connection.row_factory = sqlite3.Row
             database_rows = connection.execute("PRAGMA database_list").fetchall()
             if len(database_rows) != 1:
                 raise CoreBridgeStoreStateRootError("SQLite opened an unexpected database set")
-            if os.path.abspath(cast(str, database_rows[0][2])) != os.path.abspath(
-                self.database_path
-            ):
-                raise CoreBridgeStoreStateRootError("SQLite opened an unexpected bridge database")
+            opened_path = cast(str, database_rows[0][2])
+            try:
+                opened_stat = os.stat(opened_path)
+            except OSError as exc:
+                raise CoreBridgeStoreStateRootError(
+                    "SQLite bridge database identity could not be verified"
+                ) from exc
+            if self._file_identity(opened_stat) != self._managed_identities[DATABASE_FILENAME]:
+                raise CoreBridgeStoreStateRootError(
+                    "SQLite opened an unexpected bridge database inode"
+                )
+            self._verify_storage_files()
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA busy_timeout = 30000")
             if connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0] != "delete":
@@ -1515,7 +1549,7 @@ class DesktopCoreBridgeStoreV1:
         dir_fd: int,
         expected: os.stat_result,
         label: str,
-        allow_unpublished: bool = False,
+        initial_publication: dict[str, object] | None = None,
     ) -> dict[str, object] | None:
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         try:
@@ -1591,8 +1625,14 @@ class DesktopCoreBridgeStoreV1:
             except (CoreBridgeStoreError, TypeError, ValueError, json.JSONDecodeError):
                 continue
         if not records:
-            if allow_unpublished and raw.rstrip(b" \0") == b"":
-                return None
+            if initial_publication is not None:
+                if cast(int, initial_publication["marker_generation"]) != 0:
+                    raise CoreBridgeStoreStateRootError(
+                        f"bridge durable {label} initial publication is invalid"
+                    )
+                inactive_slot = raw[MARKER_SLOT_BYTES:]
+                if inactive_slot == b"\0" * MARKER_SLOT_BYTES:
+                    return None
             raise CoreBridgeStoreStateRootError(
                 f"bridge durable {label} has no valid slot"
             )
@@ -1607,25 +1647,25 @@ class DesktopCoreBridgeStoreV1:
         return records[-1]
 
     def _read_identity_marker(
-        self, *, allow_unpublished: bool = False
+        self, *, initial_publication: dict[str, object] | None = None
     ) -> dict[str, object] | None:
         return self._read_marker_file(
             name=IDENTITY_MARKER_FILENAME,
             dir_fd=self._root_fd,
             expected=self._verify_private_file(IDENTITY_MARKER_FILENAME),
             label="identity marker",
-            allow_unpublished=allow_unpublished,
+            initial_publication=initial_publication,
         )
 
     def _read_root_anchor(
-        self, *, allow_unpublished: bool = False
+        self, *, initial_publication: dict[str, object] | None = None
     ) -> dict[str, object] | None:
         return self._read_marker_file(
             name=self._anchor_name,
             dir_fd=self._anchor_parent_fd,
             expected=self._verify_anchor_file(),
             label="root identity anchor",
-            allow_unpublished=allow_unpublished,
+            initial_publication=initial_publication,
         )
 
     def _write_marker_file(
@@ -1795,12 +1835,12 @@ class DesktopCoreBridgeStoreV1:
         marker_operations = (
             (
                 "identity marker",
-                lambda: self._read_identity_marker(allow_unpublished=True),
+                lambda: self._read_identity_marker(initial_publication=identity),
                 self._write_identity_marker,
             ),
             (
                 "root identity anchor",
-                lambda: self._read_root_anchor(allow_unpublished=True),
+                lambda: self._read_root_anchor(initial_publication=identity),
                 self._write_root_anchor,
             ),
         )

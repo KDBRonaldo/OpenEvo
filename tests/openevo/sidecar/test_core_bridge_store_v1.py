@@ -1264,6 +1264,133 @@ def test_fresh_pending_identity_binding_recovers_after_marker_publish_failure(
     reopened.close()
 
 
+@pytest.mark.parametrize("failed_write", [1, 2], ids=["inner-marker", "root-anchor"])
+def test_fresh_pending_identity_binding_recovers_after_short_marker_pwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_write: int,
+) -> None:
+    root = tmp_path / "state"
+    original_pwrite = store_module.os.pwrite
+    write_count = 0
+
+    def short_pwrite(descriptor: int, data: bytes, offset: int) -> int:
+        nonlocal write_count
+        write_count += 1
+        if write_count == failed_write:
+            written = 32
+            assert original_pwrite(descriptor, data[:written], offset) == written
+            return written
+        return original_pwrite(descriptor, data, offset)
+
+    monkeypatch.setattr(store_module.os, "pwrite", short_pwrite)
+    with pytest.raises(CoreBridgeStoreStateRootError, match="write was incomplete"):
+        DesktopCoreBridgeStoreV1(root)
+
+    reopened = DesktopCoreBridgeStoreV1(root)
+    with sqlite3.connect(reopened.database_path) as connection:
+        assert connection.execute(
+            "SELECT binding_state FROM store_identity"
+        ).fetchone() == ("bound",)
+    reopened.close()
+
+
+@pytest.mark.parametrize("failed_write", [1, 2], ids=["inner-marker", "root-anchor"])
+def test_fresh_pending_identity_binding_rejects_dirty_inactive_marker_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_write: int,
+) -> None:
+    root = tmp_path / "state"
+    original_pwrite = store_module.os.pwrite
+    write_count = 0
+
+    def short_pwrite(descriptor: int, data: bytes, offset: int) -> int:
+        nonlocal write_count
+        write_count += 1
+        if write_count == failed_write:
+            written = 32
+            assert original_pwrite(descriptor, data[:written], offset) == written
+            return written
+        return original_pwrite(descriptor, data, offset)
+
+    monkeypatch.setattr(store_module.os, "pwrite", short_pwrite)
+    with pytest.raises(CoreBridgeStoreStateRootError, match="write was incomplete"):
+        DesktopCoreBridgeStoreV1(root)
+
+    partial = (
+        root / store_module.IDENTITY_MARKER_FILENAME
+        if failed_write == 1
+        else next(root.parent.glob(f"{store_module.ROOT_ANCHOR_PREFIX}*.identity"))
+    )
+    with partial.open("r+b") as stream:
+        stream.seek(store_module.MARKER_SLOT_BYTES)
+        stream.write(b"!")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    with pytest.raises(CoreBridgeStoreStateRootError, match="no valid slot"):
+        DesktopCoreBridgeStoreV1(root)
+
+
+@pytest.mark.parametrize("target", ["inner-marker", "root-anchor"])
+def test_bound_store_rejects_corrupt_only_published_marker(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopCoreBridgeStoreV1(root)
+    anchor_name = store._anchor_name
+    store.close()
+    marker = (
+        root / store_module.IDENTITY_MARKER_FILENAME
+        if target == "inner-marker"
+        else root.parent / anchor_name
+    )
+    with marker.open("r+b") as stream:
+        stream.seek(0)
+        stream.write(b"!")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    with pytest.raises(CoreBridgeStoreStateRootError, match="no valid slot"):
+        DesktopCoreBridgeStoreV1(root)
+
+
+def test_database_connect_path_swap_fails_without_writing_replacement_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    database = root / store_module.DATABASE_FILENAME
+    displaced = tmp_path / "displaced.sqlite3"
+    original_connect = store_module.sqlite3.connect
+    swapped = False
+    opened_database_identity: tuple[int, int] | None = None
+
+    def swap_before_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        nonlocal opened_database_identity, swapped
+        if not swapped:
+            swapped = True
+            database.rename(displaced)
+            database.touch(mode=0o600)
+            os.chmod(database, 0o600)
+        connection = original_connect(*args, **kwargs)
+        opened_path = Path(connection.execute("PRAGMA database_list").fetchone()[2])
+        opened_stat = opened_path.stat()
+        opened_database_identity = (opened_stat.st_dev, opened_stat.st_ino)
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", swap_before_connect)
+    with pytest.raises(CoreBridgeStoreStateRootError, match="bridge file|database"):
+        DesktopCoreBridgeStoreV1(root)
+
+    displaced_stat = displaced.stat()
+    assert opened_database_identity == (displaced_stat.st_dev, displaced_stat.st_ino)
+    assert database.read_bytes() == b""
+    assert displaced.read_bytes() == b""
+
+
 def test_fresh_database_does_not_claim_unknown_old_state(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
