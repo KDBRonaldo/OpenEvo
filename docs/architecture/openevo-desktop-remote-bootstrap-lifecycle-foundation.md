@@ -104,7 +104,10 @@ Managed runtime fallback images are built from public Python and Node bases and
 install the pinned Codex CLI used by the existing Codex harness examples. The
 fallback is only for OpenEvo-managed image names. Developer-supplied
 `custom_image` profiles remain pull-only, because OpenEvo cannot infer their
-Dockerfile or system dependencies.
+Dockerfile or system dependencies. The generated Dockerfile uses HTTPS Debian
+sources and requires valid archive signatures. A full remote filesystem,
+unreachable proxy, or invalid mirror metadata therefore fails bootstrap with an
+actionable report instead of enabling an unauthenticated package path.
 
 Subscription-mode Codex auth is checked on the remote host during preflight and
 bootstrap. At gateway runtime initialization, the host `~/.codex/auth.json` is

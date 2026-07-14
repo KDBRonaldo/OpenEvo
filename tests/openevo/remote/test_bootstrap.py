@@ -550,6 +550,9 @@ def test_managed_runtime_bootstrap_builds_image_when_pull_fails() -> None:
     )
     assert "node:22-bookworm-slim" in docker_step.command
     assert "@openai/codex@0.121.0" in docker_step.command
+    assert "https://deb.debian.org" in docker_step.command
+    assert "allow-unauthenticated" not in docker_step.command.lower()
+    assert "trusted=yes" not in docker_step.command.lower()
     assert "--build-arg HTTP_PROXY" in docker_step.command
     assert docker_step.manifest["managed_runtime"] is True
 

@@ -68,7 +68,10 @@ available to the remote Docker daemon, bootstrap writes an OpenEvo-managed
 Dockerfile under the run state directory and builds the same image tag on the
 remote server. The generated image contains Python, Node, common build tools,
 and the pinned Codex CLI required by the Codex harness. Custom images remain
-pull-only because OpenEvo cannot infer their system dependencies.
+pull-only because OpenEvo cannot infer their system dependencies. The fallback
+build fetches Debian package metadata over HTTPS and retains the distribution's
+archive signature verification; proxy or mirror failures never downgrade that
+verification.
 
 ## Execution Modes
 
