@@ -5,6 +5,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DesktopProductApp } from "./DesktopProductApp";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./fixtureProvider";
+import type { DesktopProductSnapshot } from "./provider";
+import { sameSessionOutputIdentity } from "./sessionOutputIdentity";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -95,6 +97,81 @@ describe("DesktopProductApp", () => {
       await Promise.resolve();
     });
     expect(screenText()).not.toContain("STALE PREVIOUS RUN OUTPUT");
+  });
+
+  it("keeps opaque run and nullable attempt identities structurally distinct", () => {
+    expect(sameSessionOutputIdentity(
+      { runId: "run:segment", attemptId: "attempt" },
+      { runId: "run", attemptId: "segment:attempt" },
+    )).toBe(false);
+    expect(sameSessionOutputIdentity(
+      { runId: "run", attemptId: null },
+      { runId: "run", attemptId: "no-attempt" },
+    )).toBe(false);
+  });
+
+  it("hides resolved output synchronously when a colliding attempt identity becomes current", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const initial = await provider.refresh();
+    if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const baseRun = initial.snapshot.runs[0];
+    if (!baseRun) throw new Error("Expected a completed fixture run.");
+    const baseLogs = await provider.getRunLogs(baseRun.id);
+    const oldSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", null);
+    const nextSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", "no-attempt");
+    const oldLogs = relabelLogs(baseLogs, "run-collision", null, "OLD NO-ATTEMPT OUTPUT");
+    const nextRequest = deferred<ReturnType<typeof relabelLogs>>();
+    vi.spyOn(provider, "refresh")
+      .mockResolvedValueOnce({ status: "fresh", snapshot: oldSnapshot })
+      .mockResolvedValueOnce({ status: "fresh", snapshot: nextSnapshot });
+    vi.spyOn(provider, "getRunLogs")
+      .mockResolvedValueOnce(oldLogs)
+      .mockImplementationOnce(() => nextRequest.promise);
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("OLD NO-ATTEMPT OUTPUT");
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+
+    expect(screenText()).not.toContain("OLD NO-ATTEMPT OUTPUT");
+    expect(document.querySelector('[aria-label="Refreshing session output"]')).not.toBeNull();
+
+    await act(async () => {
+      nextRequest.resolve(relabelLogs(baseLogs, "run-collision", "no-attempt", "CURRENT ATTEMPT OUTPUT"));
+      await Promise.resolve();
+    });
+    expect(screenText()).toContain("CURRENT ATTEMPT OUTPUT");
+  });
+
+  it("never publishes an old colliding request after a rapid attempt switch", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const initial = await provider.refresh();
+    if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const baseRun = initial.snapshot.runs[0];
+    if (!baseRun) throw new Error("Expected a completed fixture run.");
+    const baseLogs = await provider.getRunLogs(baseRun.id);
+    const oldSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", null);
+    const nextSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", "no-attempt");
+    const oldRequest = deferred<ReturnType<typeof relabelLogs>>();
+    vi.spyOn(provider, "refresh")
+      .mockResolvedValueOnce({ status: "fresh", snapshot: oldSnapshot })
+      .mockResolvedValueOnce({ status: "fresh", snapshot: nextSnapshot });
+    vi.spyOn(provider, "getRunLogs")
+      .mockImplementationOnce(() => oldRequest.promise)
+      .mockResolvedValueOnce(relabelLogs(baseLogs, "run-collision", "no-attempt", "CURRENT ATTEMPT OUTPUT"));
+    root = await renderProduct(provider);
+
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+    expect(screenText()).toContain("CURRENT ATTEMPT OUTPUT");
+
+    await act(async () => {
+      oldRequest.resolve(relabelLogs(baseLogs, "run-collision", null, "STALE NO-ATTEMPT OUTPUT"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screenText()).toContain("CURRENT ATTEMPT OUTPUT");
+    expect(screenText()).not.toContain("STALE NO-ATTEMPT OUTPUT");
   });
 
   it("gates sessions offline and completes first-time workspace setup", async () => {
@@ -878,6 +955,48 @@ function labelledControl<T extends HTMLElement>(text: string, selector: string):
 
 function screenText(): string {
   return document.body.textContent ?? "";
+}
+
+function withRunOutputIdentity(
+  snapshot: DesktopProductSnapshot,
+  runId: string,
+  attemptId: string | null,
+): DesktopProductSnapshot {
+  const source = snapshot.runs[0];
+  if (!source) throw new Error("Expected a run fixture.");
+  const sourceAttempt = source.current_attempt ?? source.attempts[0];
+  if (attemptId !== null && !sourceAttempt) throw new Error("Expected an attempt fixture.");
+  const attempt = attemptId === null
+    ? null
+    : { ...sourceAttempt, id: attemptId, run_id: runId };
+  const run = {
+    ...source,
+    id: runId,
+    current_attempt_id: attemptId,
+    current_attempt: attempt,
+    attempt_count: attempt === null ? 0 : 1,
+    attempts: attempt === null ? [] : [attempt],
+  };
+  return {
+    ...snapshot,
+    runs: [run],
+    timelines: { [runId]: snapshot.timelines[source.id] ?? [] },
+  };
+}
+
+function relabelLogs(
+  logs: Awaited<ReturnType<FixtureDesktopProductProvider["getRunLogs"]>>,
+  runId: string,
+  attemptId: string | null,
+  message: string,
+) {
+  return logs.map((entry, index) => ({
+    ...entry,
+    id: `${runId}-log-${index}`,
+    run_id: runId,
+    attempt_id: attemptId,
+    message: index === 0 ? message : entry.message,
+  }));
 }
 
 function deferred<T>(): {

@@ -29,7 +29,7 @@ import {
   XCircle,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { DesktopApiError } from "../api/v1/client";
 import type { OpenEvoJsonObject } from "../api/evolutionConfigSchema";
 import type {
@@ -59,6 +59,11 @@ import {
   unavailableDesktopProductProvider,
 } from "./provider";
 import { MethodConfigEditor, methodConfigErrors } from "./MethodConfigEditor";
+import {
+  sameSessionOutputIdentity,
+  sessionOutputIdentity,
+  type SessionOutputIdentity,
+} from "./sessionOutputIdentity";
 
 type ProductEvolutionTargets = ProjectV1["evolution"]["targets"];
 type EvolutionCapabilitiesV1 = ProjectCapabilitiesV1["capabilities"];
@@ -738,9 +743,12 @@ function SessionOutput({
   provider: DesktopProductProvider;
   streamEpoch: number;
 }) {
-  const identity = `${run.id}:${run.current_attempt_id ?? "no-attempt"}`;
+  const identity = useMemo(
+    () => sessionOutputIdentity(run),
+    [run.current_attempt_id, run.id],
+  );
   const [output, setOutput] = useState<{
-    readonly identity: string;
+    readonly identity: SessionOutputIdentity;
     readonly logs: readonly LogEntryV1[];
     readonly loading: boolean;
     readonly error: string | null;
@@ -748,6 +756,11 @@ function SessionOutput({
   const [filter, setFilter] = useState<SessionLogFilter>("all");
   const [retry, setRetry] = useState(0);
   const requestSequence = useRef(0);
+  const currentIdentity = useRef(identity);
+
+  useLayoutEffect(() => {
+    currentIdentity.current = identity;
+  }, [identity]);
 
   useEffect(() => {
     setFilter("all");
@@ -757,23 +770,25 @@ function SessionOutput({
     const request = requestSequence.current + 1;
     requestSequence.current = request;
     setOutput({ identity, logs: [], loading: true, error: null });
-    void provider.getRunLogs(run.id)
+    void provider.getRunLogs(identity.runId)
       .then((next) => {
-        if (requestSequence.current === request) {
+        if (requestSequence.current === request
+          && sameSessionOutputIdentity(currentIdentity.current, identity)) {
           setOutput({ identity, logs: next, loading: false, error: null });
         }
       })
       .catch((reason) => {
-        if (requestSequence.current === request) {
+        if (requestSequence.current === request
+          && sameSessionOutputIdentity(currentIdentity.current, identity)) {
           setOutput({ identity, logs: [], loading: false, error: userMessage(reason) });
         }
       });
     return () => {
       if (requestSequence.current === request) requestSequence.current += 1;
     };
-  }, [identity, provider, retry, run.id, run.updated_at, streamEpoch]);
+  }, [identity, provider, retry, run.updated_at, streamEpoch]);
 
-  const currentOutput = output.identity === identity
+  const currentOutput = sameSessionOutputIdentity(output.identity, identity)
     ? output
     : { identity, logs: [] as readonly LogEntryV1[], loading: true, error: null };
   const { logs, loading, error } = currentOutput;

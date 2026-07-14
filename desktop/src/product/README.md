@@ -22,10 +22,11 @@ raw paths, and secret values are not accepted.
 Run output is loaded on demand through the frozen run-log route rather than
 stored in the global renderer snapshot. The provider applies the same bounded
 pagination rules and rejects cross-wired run, attempt, service, duplicate, or
-non-monotonic log identities. Renderer request state is tagged with the exact
-run and current-attempt identity; a transition renders an empty loading state
-until its own request resolves, and superseded requests cannot publish into the
-new identity. The Research view renders at most the latest 200
+non-monotonic log identities. Renderer request state is tagged with separate
+opaque run ID and nullable current-attempt ID fields, without delimiter or
+sentinel encoding. A transition renders an empty loading state until its own
+request resolves, and superseded requests cannot publish into the new identity.
+The Research view renders at most the latest 200
 matching records and separates agent, evolution, and system streams; SSE
 snapshot epochs trigger an authoritative output refresh while a session runs.
 
