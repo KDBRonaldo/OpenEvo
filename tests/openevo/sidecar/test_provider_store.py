@@ -2214,6 +2214,82 @@ def test_idempotency_capacity_is_bounded_without_evicting_live_replays(
     assert store.list_profiles().items == (first,)
 
 
+def test_lower_idempotency_capacity_reopen_rejects_retries_and_recovers(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    clock = MutableClock()
+    record_count = provider_store_module.NORMAL_WRITE_CLEANUP_ROWS + 2
+    store = DesktopProviderStore(
+        root,
+        clock=clock,
+        idempotency_retention_seconds=2,
+        max_idempotency_records=record_count,
+    )
+    first_profile: RemoteProfileV1 | None = None
+    for index in range(record_count - 1):
+        created = _create_profile(
+            store,
+            name=f"Capacity profile {index}",
+            key=f"lower-capacity-profile-{index:03d}",
+        )
+        if first_profile is None:
+            first_profile = created
+    assert first_profile is not None
+    clock.now += timedelta(seconds=1)
+    exact_key = f"lower-capacity-profile-{record_count - 1:03d}"
+    exact_name = f"Capacity profile {record_count - 1}"
+    original_exact = _create_profile(store, name=exact_name, key=exact_key)
+    with store._transaction(write=True) as connection:
+        ProviderMutation(store, connection, if_match=first_profile.etag).set_profile_runtime_state(
+            first_profile.profile_id,
+            if_match=first_profile.etag,
+            connection_state="connected",
+            credential_slots=first_profile.credential_slots,
+            host_key_fingerprint=first_profile.host_key_fingerprint,
+        )
+    clock.now += timedelta(seconds=3)
+    store.close()
+
+    for _ in range(2):
+        with pytest.raises(
+            provider_store_module.ProviderCapacityConfigurationError,
+            match="idempotency record capacity is lower than persisted usage",
+        ) as raised:
+            DesktopProviderStore(
+                root,
+                clock=clock,
+                idempotency_retention_seconds=2,
+                max_idempotency_records=1,
+            )
+        assert raised.value.record_type == "idempotency"
+        assert raised.value.configured_limit == 1
+        assert raised.value.persisted_count == record_count
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM idempotency_records").fetchone() == (
+            record_count,
+        )
+        assert connection.execute(
+            "SELECT connection_state FROM remote_profiles WHERE profile_id = ?",
+            (first_profile.profile_id,),
+        ).fetchone() == ("connected",)
+
+    recovered = DesktopProviderStore(
+        root,
+        clock=clock,
+        idempotency_retention_seconds=2,
+        max_idempotency_records=record_count,
+    )
+    assert recovered.get_profile(first_profile.profile_id).connection_state == "disconnected"
+    recreated_exact = _create_profile(recovered, name=exact_name, key=exact_key)
+    assert recreated_exact.profile_id != original_exact.profile_id
+    assert recovered._provider_record_counts(recovered._connection)[0] == 2
+    assert tuple(
+        recovered._connection.execute("SELECT count(*) FROM idempotency_records").fetchone()
+    ) == (2,)
+
+
 def test_idempotent_action_state_change_is_atomic_replayed_and_blocks_delete(
     tmp_path: Path,
 ) -> None:
@@ -4411,6 +4487,58 @@ def test_cursor_is_stable_tamper_evident_and_expiry_is_distinct(tmp_path: Path) 
         )
     with pytest.raises(CursorInvalidError):
         reopened.list_profiles(limit=1, after=tampered, sort="name", direction="asc")
+
+
+def test_lower_cursor_capacity_reopen_rejects_retries_and_recovers(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    clock = MutableClock()
+    record_count = provider_store_module.NORMAL_WRITE_CLEANUP_ROWS + 2
+    store = DesktopProviderStore(
+        root,
+        clock=clock,
+        cursor_ttl_seconds=1,
+        max_cursor_records=record_count,
+    )
+    _create_profile(store, name="Cursor A", key="lower-cursor-profile-a")
+    _create_profile(store, name="Cursor B", key="lower-cursor-profile-b")
+    for _ in range(record_count):
+        page = store.list_profiles(limit=1, sort="name", direction="asc")
+        assert page.next_cursor is not None
+    clock.now += timedelta(seconds=2)
+    store.close()
+
+    for _ in range(2):
+        with pytest.raises(
+            provider_store_module.ProviderCapacityConfigurationError,
+            match="pagination cursor capacity is lower than persisted usage",
+        ) as raised:
+            DesktopProviderStore(
+                root,
+                clock=clock,
+                cursor_ttl_seconds=1,
+                max_cursor_records=1,
+            )
+        assert raised.value.record_type == "cursor"
+        assert raised.value.configured_limit == 1
+        assert raised.value.persisted_count == record_count
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM pagination_cursors").fetchone() == (
+            record_count,
+        )
+
+    recovered = DesktopProviderStore(
+        root,
+        clock=clock,
+        cursor_ttl_seconds=1,
+        max_cursor_records=record_count,
+    )
+    page = recovered.list_profiles(limit=1, sort="name", direction="asc")
+    assert page.next_cursor is not None
+    assert recovered._provider_record_counts(recovered._connection)[1] == 3
+    assert tuple(
+        recovered._connection.execute("SELECT count(*) FROM pagination_cursors").fetchone()
+    ) == (3,)
 
 
 def test_cursor_covers_the_contract_maximum_utf8_name(tmp_path: Path) -> None:

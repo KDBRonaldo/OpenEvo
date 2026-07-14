@@ -376,6 +376,23 @@ class IdempotencyCapacityError(ProviderStoreError):
     """The bounded live idempotency record capacity is exhausted."""
 
 
+class ProviderCapacityConfigurationError(ProviderStoreError):
+    """A configured record limit is lower than authenticated persisted usage."""
+
+    def __init__(
+        self,
+        record_type: Literal["idempotency", "cursor"],
+        *,
+        configured_limit: int,
+        persisted_count: int,
+    ) -> None:
+        label = "idempotency record" if record_type == "idempotency" else "pagination cursor"
+        super().__init__(f"configured {label} capacity is lower than persisted usage")
+        self.record_type = record_type
+        self.configured_limit = configured_limit
+        self.persisted_count = persisted_count
+
+
 class CursorInvalidError(ProviderStoreError):
     """A cursor is malformed, tampered with, or bound to another query."""
 
@@ -2278,7 +2295,8 @@ class DesktopProviderStore:
         try:
             connection.execute("BEGIN EXCLUSIVE")
             self._validate_schema(connection)
-            self._validate_provider_storage_usage_authority(connection)
+            usage_values, _ = self._validate_provider_storage_usage_authority(connection)
+            self._validate_configured_record_capacities(usage_values)
             integrity = connection.execute("PRAGMA integrity_check(1)").fetchall()
             if [tuple(row) for row in integrity] != [("ok",)]:
                 raise ProviderDataCorruptionError("provider SQLite integrity check failed")
@@ -2815,6 +2833,7 @@ class DesktopProviderStore:
                 "provider storage usage authority was sealed before budget validation"
             )
         self._validate_write_budget_values(values)
+        self._validate_configured_record_capacities(values)
 
     def _validate_write_budget(self, connection: sqlite3.Connection) -> None:
         values, _ = self._validate_provider_storage_usage_authority(connection)
@@ -2825,6 +2844,21 @@ class DesktopProviderStore:
             self._provider_storage_usage_row(connection)
         )
         return values[10], values[11]
+
+    def _validate_configured_record_capacities(self, values: tuple[int, ...]) -> None:
+        idempotency_record_count, pagination_cursor_count = values[10:12]
+        if idempotency_record_count > self._max_idempotency_records:
+            raise ProviderCapacityConfigurationError(
+                "idempotency",
+                configured_limit=self._max_idempotency_records,
+                persisted_count=idempotency_record_count,
+            )
+        if pagination_cursor_count > self._max_cursor_records:
+            raise ProviderCapacityConfigurationError(
+                "cursor",
+                configured_limit=self._max_cursor_records,
+                persisted_count=pagination_cursor_count,
+            )
 
     def _validate_live_action_authorities(self, connection: sqlite3.Connection) -> tuple[int, int]:
         invalid_digest = connection.execute(

@@ -297,16 +297,28 @@ provider-table `count(*)` or aggregate scans.
 Recovery accounting charges the singleton a fixed conservative 512-byte
 reservation instead of recursively measuring its changing decimal counters.
 
-Normal idempotent create, profile-action, and project-action writes reclaim at
-most 128 expired cleanup-eligible replay rows per transaction through the v5
-`(cleanup_eligible, expires_at_epoch)` index. Nonterminal operation replays are
-not cleanup eligible, so they remain available even after their original
-retention time; terminal publication atomically makes the replay eligible.
-Pagination cursor writes similarly remove at most 128 expired rows through the
-expiry index. The authenticated counters are then used for exact capacity
-decisions. This bounds foreground cleanup work independently of table size while
-preserving live-action replay and hard capacity limits; additional expired rows
-are reclaimed by later writes.
+Normal idempotent create, profile-action, and project-action writes first reclaim
+at most 128 expired cleanup-eligible replay rows through the v5
+`(cleanup_eligible, expires_at_epoch)` index. The exact idempotency key for the
+current request is then read by primary key and may cause one additional expired,
+cleanup-eligible row to be deleted. An idempotency write therefore deletes at
+most 129 rows: a 128-row indexed sweep plus one exact-key point cleanup. A
+nonterminal operation replay is not cleanup eligible, so it remains available
+even after its original retention time; terminal publication atomically makes
+the replay eligible. Pagination cursor writes remove strictly at most 128 expired
+rows through the expiry index. The authenticated counters are then used for exact
+capacity decisions. This bounds foreground cleanup work independently of table
+size while preserving live-action replay and hard capacity limits; additional
+expired rows are reclaimed by later writes.
+
+At open, after authenticating the singleton and before any startup mutation, the
+store compares both configured record limits with the persisted exact counts. A
+limit lower than its persisted count raises
+`ProviderCapacityConfigurationError`; open does not try cleanup and commits no
+startup state. Repeating the same incompatible open is read-only and fails the
+same way. Reopening with limits at least as large as the reported persisted usage
+is the recovery path, after which successful writes can commit bounded cleanup
+batches. The same check runs before a v4 -> v5 migration is sealed or committed.
 
 The singleton cannot be inserted or deleted after v5 initialization, and the
 migration ledger is immutable. `DELETE` plus reinsert and `INSERT OR REPLACE`
@@ -324,9 +336,10 @@ The v4 -> v5 migration does the same and publishes project tokens, the authority
 triggers, migration row, and schema version in one SQLite transaction. After the
 singleton and v5 migration row exist, but before the authority is sealed or
 `user_version` changes, migration validates the final authority against the full
-write row/byte/reservation budgets. Failure rolls the transaction back to the
-reopenable v4 layout. Oversized, noncanonical, trigger-tampered, partially
-replayed, or equal-length rewritten state fails closed.
+write row/byte/reservation budgets and the configured record limits. Failure
+rolls the transaction back to the reopenable v4 layout. Oversized,
+configuration-incompatible, noncanonical, trigger-tampered, partially replayed,
+or equal-length rewritten state fails closed.
 
 The authority assumes the owner-only signing key remains confidential and is not
 an external monotonic anchor. An offline attacker who restores a complete earlier
