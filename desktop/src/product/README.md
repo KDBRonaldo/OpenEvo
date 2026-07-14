@@ -19,6 +19,13 @@ folder and credential operations remain native-host calls whose results are
 strictly parsed as `ProjectSourceV1` and `RemoteProfileV1`; renderer file inputs,
 raw paths, and secret values are not accepted.
 
+Run output is loaded on demand through the frozen run-log route rather than
+stored in the global renderer snapshot. The provider applies the same bounded
+pagination rules and rejects cross-wired run, attempt, service, duplicate, or
+non-monotonic log identities. The Research view renders at most the latest 200
+matching records and separates agent, evolution, and system streams; SSE
+snapshot epochs trigger an authoritative output refresh while a session runs.
+
 The release adapter deliberately has no fallback for those native calls. The
 Tauri commands `select_project_source` and `configure_credential` are required
 release integration dependencies and are not implemented by the current Rust
@@ -86,6 +93,11 @@ profile appears, an unchanged draft retries the original create intent. Editing
 the draft or establishing a new update precondition creates a new
 route-appropriate intent. Drafts survive reloads and require confirmation
 before Escape, overlay, or close-button dismissal.
+
+First-time project creation and activation are two distinct authoritative
+mutations. After create succeeds, the renderer reloads the saved project and
+uses that fresh stream epoch and ETag for activation; it never chains activation
+with the pre-create renderer snapshot.
 
 Revision generation is shown only from the authoritative
 `ProjectV1.remote.active_revision`. Core-owned runs and artifacts are associated

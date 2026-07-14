@@ -775,6 +775,145 @@ pre.json {
   line-height: 1.35;
 }
 
+.session-output-panel {
+  padding: 18px;
+}
+
+.session-output-state,
+.session-output-toolbar,
+.session-output-error,
+.session-output-meta {
+  display: flex;
+  align-items: center;
+}
+
+.session-output-state {
+  gap: 7px;
+  color: var(--subtle);
+  font-size: 11px;
+}
+
+.session-output-toolbar {
+  gap: 2px;
+  margin-top: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.session-output-toolbar button {
+  min-height: 28px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.session-output-toolbar button:hover,
+.session-output-toolbar button.active {
+  color: var(--ink);
+  background: #edf0ed;
+}
+
+.session-output-list {
+  max-height: 360px;
+  overflow: auto;
+}
+
+.session-output-entry {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 14px;
+  padding: 10px 2px;
+  border-bottom: 1px solid #edf0ed;
+}
+
+.session-output-entry:last-child {
+  border-bottom: 0;
+}
+
+.session-output-entry.warning .session-output-message {
+  color: var(--warning);
+}
+
+.session-output-entry.error .session-output-message {
+  color: var(--danger);
+}
+
+.session-output-meta {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.session-output-meta time {
+  color: var(--subtle);
+  font-size: 10px;
+}
+
+.session-stream {
+  display: inline-flex;
+  min-height: 19px;
+  align-items: center;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: #46504a;
+  background: #edf0ed;
+  font-size: 9px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.session-stream.agent {
+  color: #22604e;
+  background: var(--accent-soft);
+}
+
+.session-stream.evolution {
+  color: #315f88;
+  background: var(--blue-soft);
+}
+
+.session-stream.service {
+  color: #805711;
+  background: var(--warning-soft);
+}
+
+.session-output-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #364039;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.session-output-empty,
+.session-output-limit {
+  padding: 20px 2px;
+  color: var(--subtle);
+  font-size: 11px;
+  text-align: center;
+}
+
+.session-output-limit {
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-soft);
+}
+
+.session-output-error {
+  justify-content: center;
+  gap: 8px;
+  min-height: 86px;
+  color: var(--danger);
+  font-size: 11px;
+}
+
 .quiet-empty,
 .completed-summary {
   display: flex;

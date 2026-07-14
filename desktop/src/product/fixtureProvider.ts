@@ -8,6 +8,7 @@ import {
   desktopStateV1Schema,
   diagnosticReportV1Schema,
   localOperationV1Schema,
+  logEntryV1Schema,
   operationV1Schema,
   projectCapabilitiesV1Schema,
   projectSourceV1Schema,
@@ -24,6 +25,7 @@ import {
   type DiagnosticReportV1,
   type HostKeyAcceptV1,
   type LocalOperationV1,
+  type LogEntryV1,
   type OperationV1,
   type ProfileCreateV1,
   type ProfilePatchV1,
@@ -79,6 +81,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private projects: ProjectV1[];
   private runs: RunV1[] = [];
   private timelines: Record<string, TimelineEntryV1[]> = {};
+  private logs: Record<string, LogEntryV1[]> = {};
   private artifacts: ArtifactV1[] = [];
   private artifactCollection: DesktopProductSnapshot["artifactCollection"] = { status: "complete" };
   private services: ServiceV1[];
@@ -528,18 +531,77 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.timelines[runId] = [
       this.timeline(runNumber, "admission", "pending", "Session admitted", `Waiting for Revision ${generation}.`),
     ];
+    this.logs[runId] = [
+      this.log(run, "core", "Session admitted with an immutable project snapshot."),
+    ];
     this.emit();
 
-    this.schedule(1, () => this.transitionRun(runId, "preparing", "preparation", "running", "Preparing workspace", "The project snapshot is being prepared."));
-    this.schedule(2, () => this.transitionRun(runId, "running", "execution", "running", "Research task", "The task is running with its pinned revision."));
-    this.schedule(3, () => this.appendTimeline(runId, "capture", "succeeded", "Session captured", "The session record is sealed."));
-    this.schedule(4, () => {
-      this.appendTimeline(runId, "evolution", "running", "Updating evolution targets", "Memory, skills, and instructions are being updated.");
-    });
-    this.schedule(5, () => {
-      this.appendTimeline(runId, "materialization", "running", "Preparing next revision", "Validated outputs are being assembled atomically.");
-    });
-    this.schedule(6, () => this.finishRun(runId, generation + 1));
+    this.schedule(1, () => this.whileRunActive(runId, () => {
+      this.transitionRun(
+        runId,
+        "preparing",
+        "preparation",
+        "running",
+        "Preparing workspace",
+        "The project snapshot is being prepared.",
+      );
+    }));
+    this.schedule(2, () => this.whileRunActive(runId, () => {
+      this.transitionRun(
+        runId,
+        "running",
+        "execution",
+        "running",
+        "Research task",
+        "The task is running with its pinned revision.",
+      );
+      this.appendLog(
+        runId,
+        "agent",
+        "Research execution is using the selected workspace and evidence sources.",
+      );
+    }));
+    this.schedule(3, () => this.whileRunActive(runId, () => {
+      this.appendTimeline(
+        runId,
+        "capture",
+        "succeeded",
+        "Session captured",
+        "The session record is sealed.",
+      );
+      this.appendLog(
+        runId,
+        "agent",
+        "Evidence synthesis completed with three supported findings.",
+      );
+    }));
+    this.schedule(4, () => this.whileRunActive(runId, () => {
+      this.appendTimeline(
+        runId,
+        "evolution",
+        "running",
+        "Updating evolution targets",
+        "Memory, skills, and instructions are being updated.",
+      );
+      this.appendLog(
+        runId,
+        "evolution",
+        "Memory and skills were prepared for the next session.",
+      );
+    }));
+    this.schedule(5, () => this.whileRunActive(runId, () => {
+      this.appendTimeline(
+        runId,
+        "materialization",
+        "running",
+        "Preparing next revision",
+        "Validated outputs are being assembled atomically.",
+      );
+    }));
+    this.schedule(6, () => this.whileRunActive(
+      runId,
+      () => this.finishRun(runId, generation + 1),
+    ));
     return structuredClone(run);
   }
 
@@ -566,6 +628,11 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.replaceRun(cancelled);
     this.appendTimeline(runId, "terminal", "cancelled", "Session cancelled", "No successor revision was activated.");
     return structuredClone(cancelled);
+  }
+
+  async getRunLogs(runId: string): Promise<readonly LogEntryV1[]> {
+    this.requireRun(runId);
+    return structuredClone(this.logs[runId] ?? []);
   }
 
   async getArtifactContent(artifactId: string): Promise<ArtifactContentV1> {
@@ -659,6 +726,13 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.runs = [run];
     this.timelines[run.id] = [
       this.timeline(1, "revision", "succeeded", "Revision 2 active", "The next session will use the new revision.", run.id),
+    ];
+    this.logs[run.id] = [
+      this.log(run, "agent", "Evidence synthesis completed with three supported findings."),
+    ];
+    this.logs[run.id] = [
+      ...this.logs[run.id],
+      this.log(run, "evolution", "Memory and skills were prepared for the next session."),
     ];
     this.projects = [projectV1Schema.parse({
       ...project,
@@ -871,6 +945,52 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       this.timeline(sequence, phase, status, title, summary, runId),
     ];
     this.emit();
+  }
+
+  private appendLog(
+    runId: string,
+    stream: LogEntryV1["stream"],
+    message: string,
+  ): void {
+    const run = this.requireRun(runId);
+    const observed = runV1Schema.parse({
+      ...run,
+      updated_at: this.fixtureEventTimestamp(runId),
+    });
+    this.replaceRun(observed);
+    this.logs[runId] = [...(this.logs[runId] ?? []), this.log(observed, stream, message)];
+    this.emit();
+  }
+
+  private whileRunActive(runId: string, action: () => void): void {
+    const run = this.runs.find((item) => item.id === runId);
+    if (!run || isTerminal(run.status)) return;
+    action();
+  }
+
+  private fixtureEventTimestamp(runId: string): string {
+    const eventCount = (this.timelines[runId]?.length ?? 0) + (this.logs[runId]?.length ?? 0) + 1;
+    return new Date(Date.parse(NOW) + eventCount * 1_000).toISOString();
+  }
+
+  private log(
+    run: RunV1,
+    stream: LogEntryV1["stream"],
+    message: string,
+  ): LogEntryV1 {
+    const sequence = (this.logs[run.id]?.length ?? 0) + 1;
+    return logEntryV1Schema.parse({
+      id: `log-fixture-${run.id}-${sequence}`,
+      sequence,
+      occurred_at: NOW,
+      stream,
+      level: "info",
+      message,
+      run_id: run.id,
+      attempt_id: run.current_attempt_id,
+      service_id: "service-control-fixture-1",
+      content_sha256: sequence % 2 === 0 ? B : A,
+    });
   }
 
   private timeline(

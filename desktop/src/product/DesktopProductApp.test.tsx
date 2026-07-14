@@ -40,6 +40,36 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Session history");
   });
 
+  it("shows bounded session output and filters agent and evolution records", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("Session output");
+    expect(screenText()).toContain("Evidence synthesis completed with three supported findings.");
+    expect(screenText()).toContain("Memory and skills were prepared for the next session.");
+
+    await clickButton("Evolution logs");
+    expect(screenText()).not.toContain("Evidence synthesis completed with three supported findings.");
+    expect(screenText()).toContain("Memory and skills were prepared for the next session.");
+
+    await clickButton("Agent logs");
+    expect(screenText()).toContain("Evidence synthesis completed with three supported findings.");
+    expect(screenText()).not.toContain("Memory and skills were prepared for the next session.");
+  });
+
+  it("refreshes live session output after authoritative stream updates", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 20 });
+    root = await renderProduct(provider);
+
+    await clickButton("Start session");
+    expect(screenText()).toContain("Session admitted with an immutable project snapshot.");
+    expect(screenText()).not.toContain("Research execution is using the selected workspace");
+
+    await advance(45);
+    expect(screenText()).toContain("Research execution is using the selected workspace and evidence sources.");
+  });
+
   it("gates sessions offline and completes first-time workspace setup", async () => {
     vi.useFakeTimers();
     provider = createFixtureDesktopProductProvider({ stepDelayMs: 20 });
@@ -81,6 +111,7 @@ describe("DesktopProductApp", () => {
     setInput("Hugging Face model", "Qwen/Qwen3-8B");
     await clickButton("Save");
     expect(screenText()).toContain("Compare catalyst candidates");
+    expect(button("Start session").title).toBe("Start a new research session");
     expect(button("Start session").disabled).toBe(false);
   });
 
@@ -123,7 +154,7 @@ describe("DesktopProductApp", () => {
     expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(4);
   });
 
-  it("clears terminal run and attempt fields when a fixture transition re-enters preparation", async () => {
+  it("keeps a terminal fixture run immutable when scheduled steps fire later", async () => {
     vi.useFakeTimers();
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, stepDelayMs: 20 });
     const initial = await provider.refresh();
@@ -138,12 +169,12 @@ describe("DesktopProductApp", () => {
     if (transitioned.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
     const current = transitioned.snapshot.runs.find((candidate) => candidate.id === run.id);
 
-    expect(current?.status).toBe("preparing");
-    expect(current?.finished_at).toBeNull();
+    expect(current?.status).toBe("cancelled");
+    expect(current?.finished_at).not.toBeNull();
     expect(current?.current_error).toBeNull();
-    expect(current?.current_attempt?.finished_at).toBeNull();
+    expect(current?.current_attempt?.finished_at).not.toBeNull();
     expect(current?.current_attempt?.error).toBeNull();
-    expect(current?.attempts.at(-1)?.finished_at).toBeNull();
+    expect(current?.attempts.at(-1)?.finished_at).not.toBeNull();
     expect(current?.attempts.at(-1)?.error).toBeNull();
   });
 

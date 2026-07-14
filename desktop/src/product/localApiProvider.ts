@@ -12,6 +12,7 @@ import {
   type ArtifactDiffV1,
   type ArtifactV1,
   type LocalOperationV1,
+  type LogEntryV1,
   type OperationV1,
   type PageV1,
   type ProjectCapabilitiesV1,
@@ -283,6 +284,37 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     this.assertKnownRunResponse(run, runId, "Run cancellation returned the wrong run");
     this.invalidate();
     return run;
+  }
+
+  async getRunLogs(runId: string): Promise<readonly LogEntryV1[]> {
+    const snapshot = this.snapshot;
+    const run = snapshot?.runs.find((item) => item.id === runId);
+    if (!snapshot || !run) {
+      throw new DesktopContractError("Run logs reference a run outside the current snapshot");
+    }
+    const logs = await collectPages(
+      (options) => this.client.runLogs(runId, options),
+      new RefreshBudget(),
+      { sort: "sequence", direction: "asc" },
+    );
+    if (logs.some((entry) => entry.run_id !== runId)) {
+      throw new DesktopContractError("Run log collection contains an entry for another run");
+    }
+    const attemptIds = new Set(run.attempts.map((attempt) => attempt.id));
+    if (logs.some((entry) => entry.attempt_id !== null && !attemptIds.has(entry.attempt_id))) {
+      throw new DesktopContractError("Run log collection references an attempt outside its run");
+    }
+    const serviceIds = new Set(snapshot.services.map((service) => service.id));
+    if (logs.some((entry) => !serviceIds.has(entry.service_id))) {
+      throw new DesktopContractError("Run log collection references an unknown service");
+    }
+    assertUniqueIdentity(logs, (entry) => entry.id, "Run log collection contains a duplicate identity");
+    for (let index = 1; index < logs.length; index += 1) {
+      if (logs[index]!.sequence <= logs[index - 1]!.sequence) {
+        throw new DesktopContractError("Run log collection is not strictly ordered by sequence");
+      }
+    }
+    return logs;
   }
 
   async retryRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1> {
@@ -726,12 +758,17 @@ export function createLocalApiDesktopProductProvider(
 async function collectPages<T>(
   load: (options: ListRequestOptions) => Promise<PageV1<T>>,
   budget: RefreshBudget,
+  baseOptions: Omit<ListRequestOptions, "limit" | "after"> = {},
 ): Promise<T[]> {
   const items: T[] = [];
   const cursors = new Set<string>();
   let after: string | undefined;
   for (let pageNumber = 0; pageNumber < MAX_COLLECTION_PAGES; pageNumber += 1) {
-    const page = await load({ limit: PAGE_LIMIT, ...(after === undefined ? {} : { after }) });
+    const page = await load({
+      limit: PAGE_LIMIT,
+      ...baseOptions,
+      ...(after === undefined ? {} : { after }),
+    });
     budget.consumePage(page.items.length);
     items.push(...page.items);
     if (page.has_more !== (page.next_cursor !== null)) {
