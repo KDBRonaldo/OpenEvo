@@ -150,14 +150,19 @@ exact `pass_fds` set. There is no `fchmod`: anonymous socket mode and link count
 are not an authority boundary, and Darwin may return `EINVAL` for that operation.
 There is also no `-L` listener, control master, control socket, pathname pre-pin
 window, or same-UID unlink/rebind target. The HTTP layer rechecks child authority
-after reading each bearer-authenticated response.
+after reading each bearer-authenticated response. A `poll()` exception is an
+authority failure rather than evidence that the SSH child remains alive.
 
 Tunnel authentication preserves retryable deadline and daemon-exit failures.
 Every path that does not return the verified handle, including cancellation or
 another `BaseException`, executes the tunnel's bounded terminate/wait/kill close
 path in `finally`. Trust leases are released only after every connection child
 exit is confirmed; otherwise process-local orphan quarantine retains ownership
-and retries on later tunnel operations or matching trust mutation.
+and retries on later tunnel operations or matching trust mutation. When setup
+fails and child exit cannot be confirmed, the endpoint is permanently marked
+closing before its lock is released and cannot create another connection child;
+quarantine retains the endpoint until bounded cleanup can prove exit and finish
+closure.
 
 The exhibition release path uses this attachment for subscription execution and
 transcript capture. After attach, this bootstrap layer does not start a science run, Gateway,

@@ -199,7 +199,9 @@ particular, the transport does not call `fchmod` and does not treat permission
 bits or link count as an authority boundary; Darwin may reject `fchmod` on these
 FDs with `EINVAL`, and those filesystem fields do not establish socket
 ownership. A changed FD identity, socket type, owner, or anonymous address fails
-the connection and triggers bounded child cleanup.
+the connection and triggers bounded child cleanup. An exception from the child
+`poll()` authority probe is also a connection failure; it can never be treated
+as proof that the child is running.
 
 There is no `-L` listener, `-S` control socket, control master, filesystem
 pathname, hard-link pre-pin window, or temporary TCP-port reservation in this
@@ -214,7 +216,11 @@ or child creation can fail. `BaseException`, including cancellation, closes
 untransferred socket FDs and is re-raised unchanged. Close performs bounded
 terminate/wait/kill for every owned child. If exit cannot be proven, a
 process-local quarantine retains the child and trust lease for retry, so trust
-rotation cannot leave an unowned forwarding authority.
+rotation cannot leave an unowned forwarding authority. A connection setup
+failure with an unconfirmed child permanently marks that Core endpoint closing
+before releasing its state lock. The endpoint cannot create another child
+generation while quarantine retries retain ownership, and it finalizes only
+after every owned child exit is confirmed.
 
 `SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
 it before building every command. A release call without a binding fails closed.

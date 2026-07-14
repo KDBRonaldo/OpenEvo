@@ -152,6 +152,9 @@ class _CoreTunnelEndpoint:
                     exited, _failure = _terminate_tunnel_process(process)
                     if exited:
                         self._children.pop(generation, None)
+                    else:
+                        self._close_requested = True
+                        self._retain_orphan()
                 if isinstance(exc, Exception):
                     _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
                     raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
@@ -349,7 +352,13 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
             if self._closed.is_set() or (self._close_requested and not retry):
                 return
             self._close_requested = True
-        if _tunnel_process_is_running(self.process):
+        probe_failure: BaseException | None = None
+        try:
+            running = _tunnel_process_is_running(self.process)
+        except BaseException as exc:
+            running = True
+            probe_failure = exc
+        if running:
             try:
                 self.process.terminate()
             except BaseException as exc:
@@ -357,6 +366,10 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
                 _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
                 if not isinstance(exc, Exception):
                     raise
+        if probe_failure is not None:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            if not isinstance(probe_failure, Exception):
+                raise probe_failure
 
     def _request_registered_close(self) -> None:
         with self._state_guard:
@@ -1018,11 +1031,7 @@ def _wait_for_tunnel_process_exit(
 
 
 def _tunnel_process_is_running(process: TunnelProcess) -> bool:
-    try:
-        return process.poll() is None
-    except Exception:
-        _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
-        return True
+    return process.poll() is None
 
 
 def _forget_orphaned_tunnel(tunnel: SshTunnel) -> None:

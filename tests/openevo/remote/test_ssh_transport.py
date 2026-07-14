@@ -1141,6 +1141,108 @@ def test_core_tunnel_rejects_child_that_exits_during_connection_start(
     tunnel.close()
 
 
+def test_core_tunnel_child_authority_poll_failure_fails_closed_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    class PollFailureProcess(FakeTunnelProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.poll_fails = True
+
+        def poll(self) -> int | None:
+            if self.poll_fails:
+                raise OSError("poll failed")
+            return super().poll()
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.poll_fails = False
+
+    process = PollFailureProcess()
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=lambda _argv, _fd: process,
+    ).open_core_tunnel(remote_port=8765)
+
+    with pytest.raises(SshTransportError) as rejected:
+        tunnel.open_verified_socket(timeout_seconds=1.0)
+
+    assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+    assert process.terminated is True
+    assert process.waited is True
+    assert tunnel._endpoint._children == {}
+    tunnel.close()
+
+
+def test_core_tunnel_identity_failure_poisons_endpoint_when_child_exit_is_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    class RecoverableProcess(FakeTunnelProcess):
+        cleanup_fails = True
+
+        def poll(self) -> int | None:
+            return None if self.cleanup_fails else super().poll()
+
+        def terminate(self) -> None:
+            self.terminated = True
+            if not self.cleanup_fails:
+                self.return_code = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            if self.cleanup_fails:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            assert self.return_code is not None
+            return self.return_code
+
+        def kill(self) -> None:
+            self.killed = True
+            if not self.cleanup_fails:
+                self.return_code = -9
+
+    replacement_local, replacement_peer = socket.socketpair(
+        socket.AF_UNIX,
+        socket.SOCK_STREAM,
+    )
+    process = RecoverableProcess()
+    starts = 0
+
+    def replace_peer(_argv: list[str], stream_fd: int) -> FakeTunnelProcess:
+        nonlocal starts
+        starts += 1
+        os.dup2(replacement_peer.fileno(), stream_fd)
+        return process
+
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=replace_peer,
+    ).open_core_tunnel(remote_port=8765)
+    try:
+        with pytest.raises(SshTransportError) as rejected:
+            tunnel.open_verified_socket(timeout_seconds=1.0)
+
+        assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+        assert process.terminated is True
+        assert process.waited is True
+        assert process.killed is True
+        assert tunnel._endpoint._close_requested is True
+        assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
+
+        with pytest.raises(SshTransportError) as poisoned:
+            tunnel.open_verified_socket(timeout_seconds=1.0)
+
+        assert poisoned.value.code is SshTransportErrorCode.CONNECTION_FAILED
+        assert starts == 1
+
+        process.cleanup_fails = False
+        ssh_module._retry_orphaned_tunnel_cleanup()
+        assert tunnel.closed is True
+        assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+    finally:
+        replacement_local.close()
+        replacement_peer.close()
+
+
 def test_core_connection_subprocess_passes_only_peer_fd_to_exact_ssh_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
