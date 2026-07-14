@@ -69,6 +69,16 @@ _SECRET_RE = re.compile(
     r"|bearer\s+[A-Za-z0-9._~+/=-]+"
 )
 _SECRET_KEY_RE = re.compile(rf"(?i)^{_SECRET_KEY_PATTERN}$")
+_SPACE_SEPARATED_OPTION_SECRET_RE = re.compile(
+    rf"(?i)(?P<prefix>(?<![A-Za-z0-9_-])--(?:{_SECRET_KEY_PATTERN})\s+)"
+    r"(?P<secret>\S+)"
+)
+_SPACE_SEPARATED_ENV_SECRET_RE = re.compile(
+    r"(?P<prefix>(?<![A-Za-z0-9_])(?:[A-Z][A-Z0-9]*_)*(?:"
+    r"AUTHORIZATION|COOKIE|CREDENTIAL|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|TOKEN|"
+    r"PASSWORD|PASSWD|SECRET|PRIVATE_KEY|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN"
+    r")\s+)(?P<secret>\S+)"
+)
 _SAFE_STRUCTURED_LOG_KEYS = frozenset(
     {
         "code",
@@ -87,8 +97,13 @@ _SAFE_STRUCTURED_LOG_KEYS = frozenset(
         "timestamp",
     }
 )
-_URL_CREDENTIAL_RE = re.compile(r"(?i)(https?://)([^/@\s]+)@")
-_URL_QUERY_RE = re.compile(r"(?i)(https?://[^\s?#]+)[?#][^\s]+")
+_URI_RE = re.compile(
+    r"(?<![A-Za-z0-9+.-])(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)"
+    r"(?P<authority>[^\s/?#<>{}\"]*)"
+    r"(?P<path>/[^\s?#<>{}\"]*)?"
+    r"(?P<query>\?(?:<redacted>|[^\s#<>{}\"]*))?"
+    r"(?P<fragment>#(?:<redacted>|[^\s<>{}\"]*))?"
+)
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.:/-])/(?:[^\s/:]+/)+[^\s,:;]+")
 _MAX_LEDGER_BYTES = 1 * 1024 * 1024
 _MAX_FRAMEWORK_LOCK_BYTES = 4 * 1024 * 1024
@@ -1770,6 +1785,7 @@ class CoreServiceSupervisor:
             raise ValueError("restart operation_id is invalid")
         with self._mutex:
             self._require_open()
+            self._verify_release_installation()
             if total_timeout is not None and total_timeout <= 0:
                 raise ValueError("total_timeout must be positive")
             prior = self._restart_results.get(operation_id)
@@ -3078,12 +3094,30 @@ def _sanitize(value: str) -> str:
             sort_keys=True,
             separators=(",", ":"),
         )
-    text = text.replace("\r", " ").replace("\n", " ")
+    return _sanitize_scalar_text(text, max_chars=16_384)
+
+
+def _sanitize_scalar_text(value: str, *, max_chars: int) -> str:
+    text = value.replace("\x00", "").replace("\r", " ").replace("\n", " ")
+    text = _URI_RE.sub(_sanitize_uri_match, text)
+    text = _SPACE_SEPARATED_OPTION_SECRET_RE.sub(r"\g<prefix><redacted>", text)
+    text = _SPACE_SEPARATED_ENV_SECRET_RE.sub(r"\g<prefix><redacted>", text)
     text = _SECRET_RE.sub("<redacted>", text)
-    text = _URL_CREDENTIAL_RE.sub(r"\1<redacted>@", text)
-    text = _URL_QUERY_RE.sub(r"\1?<redacted>", text)
     text = _ABSOLUTE_PATH_RE.sub("<path>", text)
-    return " ".join(text.split())[:16_384]
+    return " ".join(text.split())[:max_chars]
+
+
+def _sanitize_uri_match(match: re.Match[str]) -> str:
+    authority = match.group("authority")
+    if "@" in authority:
+        _userinfo, host = authority.rsplit("@", 1)
+        authority = f"<redacted>@{host}"
+    suffix = ""
+    if match.group("query") is not None:
+        suffix = "?<redacted>"
+    elif match.group("fragment") is not None:
+        suffix = "#<redacted>"
+    return f"{match.group('scheme')}{authority}{match.group('path') or ''}{suffix}"
 
 
 def _sanitize_structured_log(value: object, *, key: str | None = None) -> object:
@@ -3103,7 +3137,7 @@ def _sanitize_structured_log(value: object, *, key: str | None = None) -> object
     if isinstance(value, list):
         return ["<redacted>" for _item in value[:128]]
     if isinstance(value, str):
-        return _SECRET_RE.sub("<redacted>", value)[:4096]
+        return _sanitize_scalar_text(value, max_chars=4096)
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return "<redacted>"

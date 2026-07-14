@@ -62,11 +62,12 @@ installed `openevo` package.
 Construction has an explicit `release` versus `development_test` boundary.
 Release accepts only a loader-sealed `VerifiedExecutableRegistry`; it rejects an
 injected digest, interpreter, process backend, health checker, port probe, or
-runtime probe. Construction and every non-replay `ensure`/`restart` re-read the
-sealed registry's exact installed distribution inventories through a private
-framework-owner helper and require the resulting install/registry identity to
-remain unchanged. The helper first checks the unforgeable registry and
-distribution seals and is not exported by the framework public API.
+runtime probe. Construction and every `ensure`/`restart`, including completed
+restart replays, re-read the sealed registry's exact installed distribution
+inventories through a private framework-owner helper and require the resulting
+install/registry identity to remain unchanged. The helper first checks the
+unforgeable registry and distribution seals and is not exported by the framework
+public API.
 `development_test` must instead be selected explicitly and is the only mode that
 accepts test identities and runtime dependency injection. It cannot alter the
 release path.
@@ -85,8 +86,13 @@ missing or mismatched value fails closed.
 Durable output filtering treats JSON as a closed diagnostic object. Known
 credential, authorization, cookie, API key, token, password, private-key, and
 AWS-secret fields are redacted; values under unknown structured fields are not
-persisted. Header, environment, JSON, URL, and key-value forms receive the same
-filter before bounded storage. A per-process streaming redactor retains only one
+persisted. Header, environment, JSON, URI, and key-value forms receive the same
+bounded scalar filter before storage. URI filtering follows the closed scheme
+syntax and removes userinfo, query, and fragment data for non-HTTP schemes such
+as PostgreSQL and Redis as well as HTTP. Space-separated secret options and
+environment forms such as `--api-key value` and `OPENAI_API_KEY value` redact
+only the value. Allowlisted JSON strings use the same scalar sanitizer as plain
+text. A per-process streaming redactor retains only one
 bounded incomplete line, so every secret form is recognized even when any token,
 JSON field, URL, or header is split across arbitrary stdout/stderr chunks. Lines
 over 16 KiB are discarded through the next newline and represented only by
@@ -185,6 +191,10 @@ cannot be reused for another service. The process-local replay table has a fixed
 capacity: exact completed replays remain available at capacity, while a new
 operation is rejected before changing service state. Entries live until the
 supervisor closes; eviction cannot silently turn an old replay into a new restart.
+Release restart requests reverify the sealed installed inventory after acquiring
+the lifecycle mutex and validating the supervisor root, before any completed
+replay can return. An attestation change therefore fails closed without spawning
+or mutating service state.
 Because auth,
 registration, and health are generation-scoped, a restart rotates the credential
 and replaces the complete four-service group rather than leaving a mixed

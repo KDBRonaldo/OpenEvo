@@ -590,25 +590,58 @@ def test_streaming_log_redaction_hides_fragmented_credentials_and_flushes_carry(
 
 
 @pytest.mark.parametrize(
-    ("payload", "forbidden"),
+    ("payload", "forbidden", "preserved"),
     [
-        (b"Authorization: Bearer auth-secret-value\n", b"auth-secret-value"),
-        (b"Cookie: session=cookie-secret; csrf=csrf-secret\n", b"cookie-secret"),
-        (b"X-API-Key: api-key-secret\n", b"api-key-secret"),
+        (
+            b"Authorization: Bearer auth-secret-value\n",
+            b"auth-secret-value",
+            b"<redacted>",
+        ),
+        (
+            b"Cookie: session=cookie-secret; csrf=csrf-secret\n",
+            b"cookie-secret",
+            b"<redacted>",
+        ),
+        (b"X-API-Key: api-key-secret\n", b"api-key-secret", b"<redacted>"),
         (
             b"request https://user:pass@example.test/path?q=query-secret#fragment\n",
             b"query-secret",
+            b"example.test/path",
+        ),
+        (
+            b"db postgresql://db-user:db-pass@db.internal/app?sslmode=query-secret#writer",
+            b"db-pass",
+            b"db.internal/app",
+        ),
+        (
+            b"cache redis://:redis-pass@[::1]:6379/0?client=query-secret#worker\n",
+            b"redis-pass",
+            b"[::1]:6379/0",
+        ),
+        (
+            b"snapshot file:///var/lib/openevo/cache?mode=query-secret#worker\n",
+            b"query-secret",
+            b"file:///var/lib/openevo/cache",
         ),
         (
             b'{"message":"failed","authorization":"json-secret",'
             b'"nested":{"api_key":"nested-secret"}}\n',
             b"json-secret",
+            b'"message":"failed"',
+        ),
+        (b"worker --api-key cli-secret --model gpt-5\n", b"cli-secret", b"--model gpt-5"),
+        (b"OPENAI_API_KEY env-secret worker ready\n", b"env-secret", b"worker ready"),
+        (
+            "状态 ready --password utf8-secret".encode(),
+            b"utf8-secret",
+            "状态 ready".encode(),
         ),
     ],
 )
 def test_generic_log_redaction_is_safe_at_every_chunk_boundary(
     payload: bytes,
     forbidden: bytes,
+    preserved: bytes,
 ) -> None:
     credential = "supervisor-credential-secret"
     for split in range(len(payload) + 1):
@@ -618,17 +651,166 @@ def test_generic_log_redaction_is_safe_at_every_chunk_boundary(
         rendered += redactor.flush()
         assert forbidden not in rendered
         assert b"<redacted>" in rendered
+        assert preserved in rendered
+        assert redactor.buffered_bytes == 0
 
 
-def test_log_redactor_drops_oversize_line_with_bounded_carry_and_flushes_eof() -> None:
+@pytest.mark.parametrize(
+    ("message", "forbidden", "preserved"),
+    [
+        (
+            "db postgresql://db-user:db-pass@db.internal/app?sslmode=require#writer",
+            ("db-user", "db-pass", "sslmode=require", "writer"),
+            ("db.internal/app",),
+        ),
+        (
+            "cache redis://:redis-pass@[::1]:6379/0?client=worker#primary",
+            ("redis-pass", "client=worker", "primary"),
+            ("[::1]:6379/0",),
+        ),
+        (
+            "snapshot file:///var/lib/openevo/cache?mode=file-secret#primary",
+            ("mode=file-secret", "primary"),
+            ("file:///var/lib/openevo/cache",),
+        ),
+        (
+            "worker --api-key cli-secret --model gpt-5",
+            ("cli-secret",),
+            ("worker", "--model gpt-5"),
+        ),
+        (
+            "OPENAI_API_KEY env-secret worker ready",
+            ("env-secret",),
+            ("worker ready",),
+        ),
+        (
+            "redis cache ready; query plan complete; token budget 128",
+            (),
+            ("redis cache ready", "query plan complete", "token budget 128"),
+        ),
+        (
+            "public endpoint redis://cache.internal:6379/0",
+            (),
+            ("redis://cache.internal:6379/0",),
+        ),
+    ],
+)
+def test_plain_and_allowlisted_json_strings_use_the_same_sanitizer(
+    message: str,
+    forbidden: tuple[str, ...],
+    preserved: tuple[str, ...],
+) -> None:
+    plain = supervisor_module._sanitize(message)
+    structured = json.loads(
+        supervisor_module._sanitize(json.dumps({"event": "probe", "message": message}))
+    )["message"]
+
+    assert structured == plain
+    assert all(value not in plain for value in forbidden)
+    assert all(value in plain for value in preserved)
+
+
+@pytest.mark.parametrize(
+    "chunk_sizes",
+    [
+        (1,),
+        (2, 3, 5, 7, 11),
+        (17, 64, 257, 1024),
+    ],
+)
+def test_durable_logs_and_ledger_redact_all_forms_across_chunks_utf8_eof_and_oversize(
+    tmp_path: Path,
+    framework_lock: Path,
+    chunk_sizes: tuple[int, ...],
+) -> None:
+    supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock)
+    safe_line = "状态 ready; redis cache healthy"
+    payload = (
+        b"db postgresql://db-user:db-pass@db.internal/app?sslmode=query-secret#writer\n"
+        b"cache redis://:redis-pass@cache.internal:6379/0?client=client-secret#primary\n"
+        b'{"event":"probe","message":"OPENAI_API_KEY json-env-secret worker ready; '
+        b'redis://:json-redis-secret@json-cache.internal:6379/0?client=json-query#json-fragment"}\n'
+        b"worker --api-key cli-secret --model gpt-5\n" + safe_line.encode("utf-8") + b"\n"
+    )
+    offset = 0
+    chunk_index = 0
+    try:
+        _ensure_subscription(supervisor)
+        while offset < len(payload):
+            size = chunk_sizes[chunk_index % len(chunk_sizes)]
+            backend.emit("gateway", payload[offset : offset + size])
+            offset += size
+            chunk_index += 1
+        backend.emit("gateway", b"\noversize " + b"x" * 8_000)
+        backend.emit("gateway", b"x" * 9_000)
+        backend.emit(
+            "gateway",
+            b" postgresql://oversize-user:oversize-secret@db.internal/app?x=oversize-query\n",
+        )
+        eof_payload = b"eof OPENAI_API_KEY eof-secret worker stopped"
+        for offset in range(0, len(eof_payload), 3):
+            backend.emit("gateway", eof_payload[offset : offset + 3])
+        backend.crash("gateway", 29)
+
+        rendered = "\n".join(entry.message for entry in supervisor.logs("gateway", limit=100))
+        ledger = (tmp_path / "core-services" / "ledger.json").read_text(encoding="utf-8")
+        forbidden = (
+            "db-user",
+            "db-pass",
+            "query-secret",
+            "writer",
+            "redis-pass",
+            "client-secret",
+            "primary",
+            "json-env-secret",
+            "json-redis-secret",
+            "json-query",
+            "json-fragment",
+            "cli-secret",
+            "oversize-secret",
+            "oversize-query",
+            "eof-secret",
+        )
+        assert all(value not in rendered for value in forbidden)
+        assert all(value not in ledger for value in forbidden)
+        assert safe_line in rendered
+        assert "--model gpt-5" in rendered
+        assert "worker stopped" in rendered
+        assert "<redacted-oversize-line>" in rendered
+        assert all(
+            len(entry.message.encode("utf-8")) <= 16_384 for entry in supervisor.logs("gateway")
+        )
+    finally:
+        supervisor.close()
+
+
+@pytest.mark.parametrize("chunk_sizes", [(1,), (2, 3, 5, 7), (31, 64, 127)])
+@pytest.mark.parametrize("terminator", [b"\n", b""])
+def test_log_redactor_drops_oversize_line_with_bounded_carry_and_flushes_eof(
+    chunk_sizes: tuple[int, ...],
+    terminator: bytes,
+) -> None:
     redactor = supervisor_module._BoundedLogStreamRedactor(
         "supervisor-credential-secret",
         max_line_bytes=64,
     )
+    secret = b"oversize-secret-value"
+    payload = b"Authorization: Bearer " + b"x" * 512 + secret + terminator
+    rendered = bytearray()
+    offset = 0
+    chunk_index = 0
 
-    assert redactor.feed(b"Authorization: Bearer " + b"x" * 10_000) == b""
-    assert redactor.buffered_bytes <= 64
-    assert redactor.flush() == b"<redacted-oversize-line>\n"
+    while offset < len(payload):
+        size = chunk_sizes[chunk_index % len(chunk_sizes)]
+        rendered.extend(redactor.feed(payload[offset : offset + size]))
+        assert redactor.buffered_bytes <= 64
+        offset += size
+        chunk_index += 1
+    rendered.extend(redactor.flush())
+
+    assert bytes(rendered) == b"<redacted-oversize-line>\n"
+    assert secret not in rendered
+    assert redactor.buffered_bytes == 0
 
 
 def test_release_mode_requires_verified_registry_and_reverifies_each_ensure(
@@ -675,6 +857,62 @@ def test_release_mode_requires_verified_registry_and_reverifies_each_ensure(
                 ServiceExecutionMode.SELF_DEPLOYED,
                 model_ref="Qwen/release-probe",
             )
+    finally:
+        supervisor.close()
+
+
+def test_release_restart_completed_replay_reverifies_inventory_before_return(
+    tmp_path: Path,
+    framework_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "verified-restart-registry")
+    backend = FakeProcessBackend()
+    runtime_probe = FakeManagedScienceRuntimeProbe()
+
+    class ReleaseHealthChecker(FakeHealthChecker):
+        pass
+
+    monkeypatch.setattr(supervisor_module, "RealSubprocessBackend", lambda: backend)
+    monkeypatch.setattr(supervisor_module, "DefaultHealthChecker", ReleaseHealthChecker)
+    monkeypatch.setattr(supervisor_module, "SocketPortProbe", FakePortProbe)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_probe_rollout_registration",
+        lambda *_args: (True, "healthy"),
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "LocalManagedScienceRuntimeProbe",
+        lambda: runtime_probe,
+    )
+    supervisor = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.RELEASE,
+        service_root=tmp_path / "release-restart-services",
+        framework_lock=framework_lock,
+        verified_registry=registry,
+    )
+    try:
+        _ensure_subscription(supervisor)
+        completed = supervisor.restart("gateway", operation_id="release-replay")
+        spawn_count = len(backend.spawned)
+        ledger_before = (tmp_path / "release-restart-services" / "ledger.json").read_bytes()
+
+        from openevo.evolution.framework import loading
+
+        def reject_inventory(_attestation: object) -> None:
+            raise RuntimeError("controlled attested inventory change")
+
+        monkeypatch.setattr(loading, "_reverify_distribution_inventory", reject_inventory)
+
+        with pytest.raises(SupervisorStateError, match="could not be revalidated"):
+            supervisor.restart("gateway", operation_id="release-replay")
+
+        assert len(backend.spawned) == spawn_count
+        assert (
+            tmp_path / "release-restart-services" / "ledger.json"
+        ).read_bytes() == ledger_before
+        assert supervisor._restart_results["release-replay"] == ("gateway", completed)
     finally:
         supervisor.close()
 
