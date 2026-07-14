@@ -70,6 +70,14 @@ type ActionAttemptResult = {
   readonly refreshedSnapshot: DesktopProductSnapshot | null;
 };
 type SaveAttemptResult = { readonly saved: boolean; readonly replaceActionId: boolean };
+type ProfileSaveIntent = {
+  readonly canonicalPayload: string;
+  readonly input: ProfileCreateV1;
+  readonly route:
+    | { readonly kind: "create"; readonly intent: ProductMutationIntent }
+    | { readonly kind: "update"; readonly profileId: string; readonly intent: ProductResourceMutationIntent };
+};
+type ProfileSaveAttemptResult = { readonly saved: boolean; readonly pendingIntent: ProfileSaveIntent | null };
 
 export interface DesktopProductAppProps {
   provider?: DesktopProductProvider;
@@ -158,7 +166,7 @@ export function DesktopProductApp({
   const projectRuns = stableRunOrder(snapshot?.runs.filter((run) => run.project_id === project?.project_id) ?? []);
   const activeRun = projectRuns.find((run) => !isTerminal(run.state)) ?? null;
 
-  const act = useCallback(async (action: () => Promise<unknown>, conflictRecovery: ActionRecovery = null): Promise<ActionAttemptResult> => {
+  const act = useCallback(async (action: () => Promise<unknown>, conflictRecovery: ActionRecovery = null, refreshOnUnknown = false): Promise<ActionAttemptResult> => {
     setActionState("working");
     setActionError(null);
     setActionRecovery(null);
@@ -176,6 +184,8 @@ export function DesktopProductApp({
         if (conflictRecovery && canReadmitRun(error.apiError, refreshedSnapshot, conflictRecovery.projectId)) {
           setActionRecovery(conflictRecovery);
         }
+      } else if (refreshOnUnknown) {
+        refreshedSnapshot = await refresh();
       }
       setActionError(userMessage(error));
       return { saved: false, error, refreshedSnapshot };
@@ -374,19 +384,37 @@ export function DesktopProductApp({
       {connectionSettingsOpen ? (
         <RemoteWorkspaceDrawer
           profile={profile}
+          observedProfiles={snapshot.profiles}
+          streamEpoch={snapshot.stream.status === "fresh" ? snapshot.stream.epoch : null}
           busy={actionState === "working"}
           onClose={() => setConnectionSettingsOpen(false)}
-          onSave={async (input, actionId) => {
-            const requestEpoch = snapshot.stream.epoch;
-            const requestEtag = profile?.etag ?? null;
-            const result = await act(() => profile
-              ? provider.updateProfile(profile.profile_id, input, resourceIntent(snapshot, profile.etag, actionId))
-              : provider.createProfile(input, mutationIntent(snapshot, actionId)));
-            if (result.saved) setConnectionSettingsOpen(false);
+          createSaveIntent={(input) => profileSaveIntent(snapshot, profile, input)}
+          onSave={async (intent) => {
+            const route = intent.route;
+            const result = await act(() => route.kind === "create"
+              ? provider.createProfile(intent.input, route.intent)
+              : provider.updateProfile(route.profileId, intent.input, route.intent), null, true);
+            const createdProfile = route.kind === "create"
+              ? matchingProfile(result.refreshedSnapshot, intent.canonicalPayload)
+              : null;
+            if (result.saved || createdProfile) {
+              setActionError(null);
+              setConnectionSettingsOpen(false);
+              return { saved: true, pendingIntent: null };
+            }
+            const requestEpoch = route.intent.streamEpoch;
+            const resource = route.kind === "update"
+              ? { kind: "profile" as const, id: route.profileId, etag: route.intent.etag }
+              : null;
             return {
-              saved: result.saved,
-              replaceActionId: requestPreconditionChanged(result, requestEpoch, requestEtag === null ? null : { kind: "profile", id: profile!.profile_id, etag: requestEtag }),
+              saved: false,
+              pendingIntent: requestPreconditionChanged(result, requestEpoch, resource) ? null : intent,
             };
+          }}
+          onCreateObserved={(observedProfile) => {
+            setActionError(null);
+            setConnectionSettingsOpen(false);
+            setSelectedProjectId((current) => current ?? snapshot.projects.find((item) => item.profile_id === observedProfile.profile_id)?.project_id ?? null);
           }}
           onConfigureCredential={(slotKind) => profile
             ? act(() => provider.configureCredential(profile.profile_id, slotKind, resourceIntent(snapshot, profile.etag))).then(() => undefined)
@@ -903,15 +931,23 @@ function ServiceRow({ service, busy, onRestart }: { service: ServiceV1; busy: bo
 
 function RemoteWorkspaceDrawer({
   profile,
+  observedProfiles,
+  streamEpoch,
   busy,
   onClose,
+  createSaveIntent,
   onSave,
+  onCreateObserved,
   onConfigureCredential,
 }: {
   profile: RemoteProfileV1 | null;
+  observedProfiles: readonly RemoteProfileV1[];
+  streamEpoch: number | null;
   busy: boolean;
   onClose: () => void;
-  onSave: (input: ProfileCreateV1, actionId: string) => Promise<SaveAttemptResult>;
+  createSaveIntent: (input: ProfileCreateV1) => ProfileSaveIntent;
+  onSave: (intent: ProfileSaveIntent) => Promise<ProfileSaveAttemptResult>;
+  onCreateObserved: (profile: RemoteProfileV1) => void;
   onConfigureCredential: (slotKind: RemoteProfileV1["credential_slots"][number]["kind"]) => Promise<unknown>;
 }) {
   const [name, setName] = useState(profile?.name ?? "Research server");
@@ -925,12 +961,22 @@ function RemoteWorkspaceDrawer({
   const [dirty, setDirty] = useState(false);
   const guardedClose = useGuardedDrawerClose(dirty, onClose);
   const dialogRef = useDialogFocus(guardedClose.requestClose);
-  const saveActionId = useRef(newActionId());
+  const pendingSaveIntent = useRef<ProfileSaveIntent | null>(null);
   const parsedPort = Number(port);
   const valid = name.trim() !== "" && host.trim() !== "" && user.trim() !== "" && Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65_535;
-  const markDirty = () => { saveActionId.current = newActionId(); setDirty(true); };
+  const markDirty = () => { pendingSaveIntent.current = null; setDirty(true); };
   const update = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement>) => { setter(event.target.value); markDirty(); };
   const visibleSlots = credentialSlotsForAuth(profile, authenticationKind);
+  useEffect(() => {
+    const pending = pendingSaveIntent.current;
+    const createdProfile = pending?.route.kind === "create"
+      ? observedProfiles.find((item) => canonicalProfile(item) === pending.canonicalPayload)
+      : null;
+    if (createdProfile) {
+      pendingSaveIntent.current = null;
+      onCreateObserved(createdProfile);
+    }
+  }, [observedProfiles, onCreateObserved]);
   return (
     <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) guardedClose.requestClose(); }}>
       <aside ref={dialogRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="workspace-settings-title" tabIndex={-1}>
@@ -956,18 +1002,24 @@ function RemoteWorkspaceDrawer({
           </section>
         </div>
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
-        <div className="drawer-footer"><button className="secondary-button" type="button" onClick={guardedClose.requestClose}>Cancel</button><button className="primary-button" type="button" disabled={!valid || busy || (profile !== null && !dirty)} title={!valid ? "Complete the required server fields" : profile && !dirty ? "No unsaved changes" : "Save remote workspace"} onClick={() => void onSave({
-          name: name.trim(),
-          host: host.trim(),
-          port: parsedPort,
-          user: user.trim(),
-          authentication_kind: authenticationKind,
-          proxy: {
-            http_url: httpProxy.trim() || null,
-            https_url: httpsProxy.trim() || null,
-            no_proxy: noProxy.split(",").map((value) => value.trim()).filter(Boolean),
-          },
-        }, saveActionId.current).then((result) => { if (result.replaceActionId) saveActionId.current = newActionId(); })}><Save size={15} /> {busy ? "Saving..." : "Save workspace"}</button></div>
+        <div className="drawer-footer"><button className="secondary-button" type="button" onClick={guardedClose.requestClose}>Cancel</button><button className="primary-button" type="button" disabled={!valid || busy || streamEpoch === null || (profile !== null && !dirty)} title={!valid ? "Complete the required server fields" : streamEpoch === null ? "Refresh this view before saving" : profile && !dirty ? "No unsaved changes" : "Save remote workspace"} onClick={() => {
+          const input: ProfileCreateV1 = {
+            name: name.trim(),
+            host: host.trim(),
+            port: parsedPort,
+            user: user.trim(),
+            authentication_kind: authenticationKind,
+            proxy: {
+              http_url: httpProxy.trim() || null,
+              https_url: httpsProxy.trim() || null,
+              no_proxy: noProxy.split(",").map((value) => value.trim()).filter(Boolean),
+            },
+          };
+          const pending = pendingSaveIntent.current;
+          const intent = pending?.canonicalPayload === canonicalProfilePayload(input) ? pending : createSaveIntent(input);
+          pendingSaveIntent.current = intent;
+          void onSave(intent).then((result) => { pendingSaveIntent.current = result.pendingIntent; });
+        }}><Save size={15} /> {busy ? "Saving..." : "Save workspace"}</button></div>
       </aside>
     </div>
   );
@@ -1295,9 +1347,58 @@ function subscriptionExecution(codexModel: string): ProjectV1["execution"] {
   };
 }
 
+function profileSaveIntent(snapshot: DesktopProductSnapshot, profile: RemoteProfileV1 | null, input: ProfileCreateV1): ProfileSaveIntent {
+  const canonicalPayload = canonicalProfilePayload(input);
+  return profile
+    ? {
+        canonicalPayload,
+        input,
+        route: {
+          kind: "update",
+          profileId: profile.profile_id,
+          intent: resourceIntent(snapshot, profile.etag),
+        },
+      }
+    : {
+        canonicalPayload,
+        input,
+        route: { kind: "create", intent: mutationIntent(snapshot) },
+      };
+}
+
+function canonicalProfilePayload(input: ProfileCreateV1): string {
+  return JSON.stringify({
+    name: input.name,
+    host: input.host,
+    port: input.port ?? 22,
+    user: input.user,
+    authentication_kind: input.authentication_kind ?? "ssh_agent",
+    proxy: {
+      http_url: input.proxy?.http_url ?? null,
+      https_url: input.proxy?.https_url ?? null,
+      no_proxy: input.proxy?.no_proxy ?? [],
+    },
+  });
+}
+
+function canonicalProfile(profile: RemoteProfileV1): string {
+  return canonicalProfilePayload({
+    name: profile.name,
+    host: profile.host,
+    port: profile.port,
+    user: profile.user,
+    authentication_kind: profile.authentication_kind,
+    proxy: profile.proxy,
+  });
+}
+
+function matchingProfile(snapshot: DesktopProductSnapshot | null, canonicalPayload: string): RemoteProfileV1 | null {
+  return snapshot?.profiles.find((profile) => canonicalProfile(profile) === canonicalPayload) ?? null;
+}
+
 function selectedArtifactsForRevision(artifacts: readonly ArtifactV1[], revisionId: string): ArtifactV1[] {
   return artifacts
-    .filter((artifact) => artifact.selected && artifact.artifact_type !== "parametric_memory" && artifact.revision_ids.includes(revisionId))
+    .filter((artifact) => artifact.selected && artifact.revision_ids.includes(revisionId))
     .sort((left, right) => {
       const time = Date.parse(right.created_at) - Date.parse(left.created_at);
       return time || left.artifact_id.localeCompare(right.artifact_id);

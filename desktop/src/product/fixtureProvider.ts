@@ -88,6 +88,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private failProjectSaveWithUnknownError = false;
   private failProfileSaveWithUnknownError = false;
   private failProfileCreateWithUnknownError = false;
+  private loseProfileCreateResponseAfterCommit = false;
   private failProjectCreateWithUnknownError = false;
   private failRefresh = false;
   private restoreCapabilitiesOnRefresh: ProjectCapabilitiesV1 | null = null;
@@ -230,6 +231,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       },
     });
     this.emit();
+    if (this.loseProfileCreateResponseAfterCommit) {
+      this.loseProfileCreateResponseAfterCommit = false;
+      throw new Error("profile response was lost after commit");
+    }
     return structuredClone(profile);
   }
 
@@ -654,6 +659,16 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         target_id: "agent_system",
         display_name: "Agent guidance",
         summary: "Updated operating guidance for the next session.",
+      },
+      {
+        artifact_type: "parametric_memory" as const,
+        release_enabled: false as const,
+        adapter_id: `adapter-fixture-${generation}`,
+        base_model_id: "fixture-model",
+        adapter_format: "lora",
+        target_id: "parametric_memory",
+        display_name: "Parametric memory",
+        summary: "Selected adapter state for the next session.",
       },
     ];
 
@@ -1336,6 +1351,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.projects = [{ ...project, current_revision_id: "revision-fixture-4" }, ...this.projects.slice(1)];
     this.createArtifacts(runId, 4);
     const times: Record<string, string> = {
+      parametric_memory: "2026-07-14T12:04:00Z",
       skill_bundle: "2026-07-14T12:03:00Z",
       text_memory: "2026-07-14T12:02:00Z",
       agent_system: "2026-07-14T12:01:00Z",
@@ -1401,6 +1417,14 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   failNextProfileCreateWithUnknownError(): void {
     this.failProfileCreateWithUnknownError = true;
+  }
+
+  loseNextProfileCreateResponseAfterCommit(): void {
+    this.loseProfileCreateResponseAfterCommit = true;
+  }
+
+  emitAuthoritativeRefresh(): void {
+    this.emit();
   }
 
   failNextProfileSaveWithUnknownError(): void {

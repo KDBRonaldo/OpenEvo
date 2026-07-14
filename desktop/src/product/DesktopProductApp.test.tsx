@@ -349,9 +349,10 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Revision 4");
     expect(screenText()).not.toContain("Unselected newer artifact");
     const artifactNames = Array.from(document.querySelectorAll(".artifact-list-item strong"), (item) => item.textContent);
-    expect(artifactNames).toEqual(["Skills", "Text memory", "Text memory", "Agent guidance"]);
+    expect(artifactNames).toEqual(["Parametric memory", "Skills", "Text memory", "Text memory", "Agent guidance"]);
     const artifactSummaries = Array.from(document.querySelectorAll(".artifact-list-item small"), (item) => item.textContent);
     expect(artifactSummaries).toEqual([
+      "Selected adapter state for the next session.",
       "Reusable analysis and validation routines.",
       "Additional selected memory",
       "Durable findings and constraints from this session.",
@@ -468,8 +469,11 @@ describe("DesktopProductApp", () => {
     setInput("User name", "researcher");
     provider.failNextProfileCreateWithUnknownError();
     await clickButton("Save workspace");
+    provider.emitAuthoritativeRefresh();
+    await flush();
     await clickButton("Save workspace");
     expect(provider.profileCreateActionIds()[0]).toBe(provider.profileCreateActionIds()[1]);
+    expect(provider.profileUpdateActionIds()).toHaveLength(0);
 
     await clickAria("Create project");
     setInput("Objective", "Keep one project create identity.");
@@ -477,6 +481,23 @@ describe("DesktopProductApp", () => {
     await clickButton("Save");
     await clickButton("Save");
     expect(provider.projectCreateActionIds()[0]).toBe(provider.projectCreateActionIds()[1]);
+  });
+
+  it("adopts a profile created before its response was lost without replaying it as an update", async () => {
+    provider = createFixtureDesktopProductProvider({ newUser: true });
+    root = await renderProduct(provider);
+
+    await clickButton("Add workspace");
+    setInput("Server address", "lab.example.test");
+    setInput("User name", "researcher");
+    provider.loseNextProfileCreateResponseAfterCommit();
+    await clickButton("Save workspace");
+    await flush();
+
+    expect(provider.profileCreateActionIds()).toHaveLength(1);
+    expect(provider.profileUpdateActionIds()).toHaveLength(0);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(screenText()).toContain("Research server");
   });
 
   it("marks segmented controls as tabs with an explicit selected state", async () => {

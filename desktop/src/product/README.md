@@ -63,16 +63,22 @@ rewriting a terminal attempt. HTTP 409, 410, and 412 responses trigger an
 authoritative snapshot reload; an expired cursor is reset before reload.
 Re-admission is offered only for an allowlisted retryable admission conflict
 when the refreshed snapshot has no equivalent active or pending run. Drawer
-drafts retain their action identity after an uncertain response. The identity
-changes only when draft content changes or a 409/412 refresh establishes a new
-request precondition. Drafts survive reloads and require confirmation before
-Escape, overlay, or close-button dismissal.
+drafts retain a pending mutation intent after an uncertain response. A profile
+intent binds its create/update route, canonical payload, action identity,
+stream epoch, and update ETag. An authoritative refresh that returns a profile
+matching a pending create proves the create succeeded, so the renderer adopts
+the resource and closes the drawer without issuing an update. If no matching
+profile appears, an unchanged draft retries the original create intent. Editing
+the draft or establishing a new update precondition creates a new
+route-appropriate intent. Drafts survive reloads and require confirmation
+before Escape, overlay, or close-button dismissal.
 
 Revision generation is shown only when `ProjectV1.current_revision_id` has a
 consistent active revision reference. Artifact lists use selected artifacts
-whose explicit revision membership includes that revision, sorted by
-`created_at` and then `artifact_id`; multiple selected members for one target
-remain visible. The provider marks the collection complete only after all
-cursor pages have been aggregated. Partial collections and missing or
-conflicting revision evidence are shown as unknown with a refetch action rather
-than inferred from list order or a loaded run.
+whose explicit revision membership includes that revision, without excluding
+any authoritative artifact type, and sort them by `created_at` and then
+`artifact_id`. This includes `parametric_memory`; multiple selected members for
+one target remain visible. The provider marks the collection complete only
+after all cursor pages have been aggregated. Partial collections and missing
+or conflicting revision evidence are shown as unknown with a refetch action
+rather than inferred from list order or a loaded run.
