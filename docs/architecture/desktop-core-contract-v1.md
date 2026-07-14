@@ -67,10 +67,14 @@ pre-adopted workspace import ownership to `WorkspaceImportStore.resolve`, whose
 unlinked read-only snapshot is the sole archive stream. No adapter exposes a
 host path.
 
-This module is not instantiated by the release provider in this change.
-Release app composition, local operation routing, bridge persistence, and
-provider-owned adopted-import binding remain separate work; unavailable routes
-must continue to fail closed until all of those owners are injected together.
+The packaged `release_runtime.py` instantiates this adapter together with the
+durable bridge store, strict Core bridge, adopted-import source, event broker,
+event relay, and `DesktopReleaseProvider`. Composition is all-or-nothing before
+the Local API advertises the complete release feature set. Project activation
+publishes the generation-bound Core session used by Core-owned routes; missing
+or stale session authority fails those routes closed. Local doctor, repair,
+workspace-sync, and Local operation log/cancellation workflows remain separate
+provider operations and are not inferred from bridge availability.
 
 Core owns durable projects, immutable task/workspace snapshots, capabilities,
 validation, services, runs and attempts, transcript capture, datasets,

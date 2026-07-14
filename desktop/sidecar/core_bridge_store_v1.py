@@ -818,8 +818,6 @@ _MAPPING_KEYS = frozenset(
         "immutable_authority",
         "mutable_authority",
         "predecessor_request_sha256",
-        "immutable_authority",
-        "mutable_authority",
     }
 )
 

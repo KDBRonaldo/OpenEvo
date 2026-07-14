@@ -791,22 +791,22 @@ bridge method exposes only `DesktopCoreBridgeErrorV1`: exact Core `ApiErrorV1`
 values are retained, strict-client local errors become closed `ApiErrorV1`
 values, and deferred event-iterator failures use the same boundary.
 
-The bridge and `DesktopCoreBridgeStoreV1` are not yet wired into
-`DesktopReleaseProvider` or `DesktopProviderStore`. The release app still has no
-complete production composition of the host service, tunnel factory, adopted
-archive source, bridge, and dedicated bridge-state root. Consequently the
-provider routes above intentionally remain typed 503 and the release feature
-flags remain unchanged. Conformance tests inject the real durable store while
-the remaining adapters use `httpx.MockTransport`; that composition is not a
-release provider.
+The bridge and `DesktopCoreBridgeStoreV1` are wired into the packaged release by
+`release_runtime.py`. That composition owns the host service, production SSH
+and HTTP tunnel adapters, adopted archive source, event broker/relay, and the
+dedicated bridge-state root. It is attached to `DesktopReleaseProvider` before
+the Local API advertises the complete release feature set. Missing composition
+or a project without an active, generation-matched tunnel fails the affected
+Core-owned route closed; startup never substitutes a mock transport, fixture,
+local method table, or shared backend URL.
 
 ### Provider extension
 
 `DesktopLocalApiProviderV1.invoke()` receives the canonical OpenAPI
 `operation_id` and the already validated endpoint arguments. The release
 provider has a small handler map only for implemented operations; unknown
-operations fail closed. Later SSH and Core providers should add verified
-handlers behind this interface while keeping the decorators and signatures in
+operations fail closed. New provider operations must add verified handlers
+behind this interface while keeping the decorators and signatures in
 `contracts/v1/app.py` authoritative.
 
 Provider and request-validation failures are normalized by `release_app.py`.
