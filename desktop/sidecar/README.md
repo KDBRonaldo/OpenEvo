@@ -81,10 +81,14 @@ ingest. Their reconciliation reservation covers root and child enumeration,
 maximum metadata bytes, two full archive hash passes, deterministic-corruption
 cleanup, and one interrupted publish temporary directory. Startup reconciliation
 therefore remains bounded without increasing its 300,000-node/64-GiB budgets.
-It removes only recognized temporary/unknown entries and deterministically proven
-structural or content corruption without following symlinks. Filesystem and xattr
-`OSError` failures are treated as infrastructure failures: reconciliation keeps
-the observed entry and fails closed for a later retry.
+Release startup defers destructive reconciliation until the provider has obtained
+the exact durable project-reference snapshot. It validates every referenced import
+before removing any orphan; a missing or corrupt reference preserves all observed
+state and fails startup closed. Only after that phase succeeds does it remove
+recognized temporary/unknown entries and deterministically proven unreferenced
+corruption without following symlinks. Filesystem and xattr `OSError` failures are
+treated as infrastructure failures: reconciliation keeps the observed entry and
+fails closed for a later retry.
 
 The only ingest result is the existing closed contract model:
 
@@ -127,11 +131,14 @@ import ownership is reproducible from project identity and archive digest. A new
 project created from a native import receives a deterministic project ID derived
 from the opaque import ID; an existing project supplies its own ID privately.
 The release provider verifies the exact import and ownership before persisting a
-native project source. Replacing or deleting a committed project source releases
-its exact verified private import after the database commit. Startup then
-reconciles the private store against all durable project references, retaining
-only exact reference/ownership matches and removing abandoned picker imports.
-Core upload consumption remains the next integration step.
+native project source. Project reference mutations and import cleanup use one
+fixed lock order: provider reference guard, then import-store root lock. A source
+patch compares `import_ref` identity rather than display metadata. Post-commit
+cleanup reacquires the guard, rereads the complete durable reference snapshot,
+and releases the old exact import only if its ID is still unreferenced. Startup
+uses the same coordinated snapshot and retains only exact reference/ownership
+matches while removing abandoned picker imports. Core upload consumption remains
+the next integration step.
 
 ## Release Local Provider
 

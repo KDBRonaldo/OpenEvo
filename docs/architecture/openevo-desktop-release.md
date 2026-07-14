@@ -283,11 +283,15 @@ equal-length rewrite windows at the store's verification boundaries.
 
 Project persistence and private import storage are separate durable authorities.
 After a successful source replacement or project deletion, the release provider
-removes the previous exact import without changing the already-committed project
-result if cleanup must be retried. On every sidecar start, a bounded reconciliation
-derives the complete retained set from durable project rows, verifies each exact
-reference and ownership, removes unreferenced picker snapshots, and fails closed
-when a referenced import is missing or corrupt.
+uses a fixed provider-reference-lock then import-root-lock order. It compares
+`import_ref` identity rather than display metadata, rereads the complete durable
+reference set under that guard after commit, and removes the previous exact import
+only when its ID remains unreferenced. Cleanup retry does not change the committed
+project result. On every sidecar start, bounded reconciliation is deferred until
+the same guard yields the exact durable reference set. It first verifies every
+referenced import and ownership without deleting anything; only a successful first
+phase removes unreferenced picker snapshots. Missing or corrupt references preserve
+the observed store and fail startup closed.
 
 This is not an OS isolation boundary against an arbitrary process running as
 the same UID. Such a process can read the durable authentication key and can
@@ -309,17 +313,21 @@ final identity mismatch, scans the complete tree twice around archive creation,
 and checks every reopened entry against its first-scan identity. It accepts only
 NFC UTF-8 regular files and directories within the frozen entry, path, depth,
 file, extracted-byte, and archive-byte budgets. Symlinks and special files fail
-closed. The deterministic tar is an unlinked mode-`0600` temporary regular file
-before `WorkspaceImportStore.ingest` sees it.
+closed. Non-empty regular files must expose a complete no-hole extent through
+`SEEK_DATA`/`SEEK_HOLE`; unavailable or inconsistent extent queries fail closed,
+including allocated unwritten extents that `st_blocks` rounding cannot detect.
+The deterministic tar is an unlinked mode-`0600` temporary regular file before
+`WorkspaceImportStore.ingest` sees it.
 
 The private action deterministically selects the opaque import ID, so an exact
 retry with the same folder bytes converges and a changed body conflicts. A new
 project ID derives from that opaque import ID; existing-project replacement
 passes the saved project ID only on the private native boundary. Ownership is
 then reproducible from project ID and archive digest for verification and later
-Core upload. The private route is excluded from OpenAPI, uses the process-owned
-Desktop session token, bounds the JSON request before parsing, and returns only
-the frozen path-free `ProjectSourceV1` shape.
+Core upload. The private route is excluded from OpenAPI, uses the separate
+process-owned native handoff credential rather than the renderer's Desktop session
+token, bounds the JSON request before parsing, and returns only the frozen
+path-free `ProjectSourceV1` shape.
 
 The child calls `setsid`, so its PID is also the ID of a new session and process
 group. Before exec, it forks a minimal watchdog in that group. The native host

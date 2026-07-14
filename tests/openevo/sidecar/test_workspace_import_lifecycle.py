@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from fastapi.testclient import TestClient
+from httpx import Response as HttpResponse
+import pytest
 
 from desktop.server import launcher as desktop_launcher
+from desktop.sidecar.workspace_imports import WorkspaceImportIntegrityError
 
 
 SESSION_TOKEN = "7c" * 32
@@ -169,6 +173,110 @@ def test_project_source_replacement_and_delete_release_committed_imports(
         assert not second_directory.exists()
 
 
+def test_project_source_display_name_change_retains_same_import_ref(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    static_root = _static_root(tmp_path / "static")
+    source_root = tmp_path / "research"
+    source_root.mkdir()
+    (source_root / "results.csv").write_text("sample,value\na,4\n", encoding="utf-8")
+
+    with TestClient(_app(config_root, static_root)) as client:
+        profile = _create_profile(client)
+        source = _import_source(
+            client,
+            source_root,
+            action_id="native-source-display-name-0001",
+        )
+        project = _create_project(client, str(profile["profile_id"]), source)
+        import_directory = _import_directory(config_root, source)
+        renamed_source = dict(source)
+        renamed_source["display_name"] = "Renamed research workspace"
+
+        renamed = client.patch(
+            f"/desktop/v1/projects/{project['project_id']}",
+            headers={**SESSION_HEADERS, "If-Match": str(project["etag"])},
+            json={"source": renamed_source},
+        )
+
+        assert renamed.status_code == 200
+        assert renamed.json()["source"] == renamed_source
+        assert import_directory.is_dir()
+
+
+def test_post_commit_cleanup_rechecks_references_against_concurrent_patch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_root = tmp_path / "config"
+    static_root = _static_root(tmp_path / "static")
+    source_root = tmp_path / "research"
+    source_root.mkdir()
+    (source_root / "notes.txt").write_text("observation", encoding="utf-8")
+    app = _app(config_root, static_root)
+
+    with TestClient(app) as client:
+        profile = _create_profile(client)
+        source = _import_source(
+            client,
+            source_root,
+            action_id="native-source-concurrent-patch-0001",
+        )
+        project = _create_project(client, str(profile["profile_id"]), source)
+        import_directory = _import_directory(config_root, source)
+        provider = app.state.desktop_release_provider
+        original_release = provider._release_project_source
+        cleanup_entered = threading.Event()
+        continue_cleanup = threading.Event()
+
+        def delayed_release(source_to_release, *, project_id: str) -> None:
+            if source_to_release.kind == "native_folder_snapshot":
+                cleanup_entered.set()
+                assert continue_cleanup.wait(timeout=5)
+            original_release(source_to_release, project_id=project_id)
+
+        monkeypatch.setattr(provider, "_release_project_source", delayed_release)
+        responses: list[HttpResponse] = []
+
+        def replace_with_scratch() -> None:
+            responses.append(
+                client.patch(
+                    f"/desktop/v1/projects/{project['project_id']}",
+                    headers={**SESSION_HEADERS, "If-Match": str(project["etag"])},
+                    json={"source": {"kind": "scratch", "display_name": "Temporary"}},
+                )
+            )
+
+        worker = threading.Thread(target=replace_with_scratch)
+        worker.start()
+        try:
+            assert cleanup_entered.wait(timeout=5)
+            interim = client.get(
+                f"/desktop/v1/projects/{project['project_id']}",
+                headers=SESSION_HEADERS,
+            )
+            assert interim.status_code == 200
+            restored = client.patch(
+                f"/desktop/v1/projects/{project['project_id']}",
+                headers={**SESSION_HEADERS, "If-Match": str(interim.json()["etag"])},
+                json={"source": source},
+            )
+            assert restored.status_code == 200
+        finally:
+            continue_cleanup.set()
+            worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert len(responses) == 1
+        assert responses[0].status_code == 200
+        assert import_directory.is_dir()
+        current = client.get(
+            f"/desktop/v1/projects/{project['project_id']}",
+            headers=SESSION_HEADERS,
+        )
+        assert current.status_code == 200
+        assert current.json()["source"] == source
+
+
 def test_startup_reconciliation_discards_orphans_and_retains_project_sources(
     tmp_path: Path,
 ) -> None:
@@ -207,3 +315,42 @@ def test_startup_reconciliation_discards_orphans_and_retains_project_sources(
         assert fetched.json()["source"] == retained
         assert retained_directory.is_dir()
         assert not orphan_directory.exists()
+
+
+def test_startup_preserves_corrupt_referenced_import_and_fails_closed(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    static_root = _static_root(tmp_path / "static")
+    source_root = tmp_path / "research"
+    source_root.mkdir()
+    (source_root / "notes.txt").write_text("observation", encoding="utf-8")
+
+    with TestClient(_app(config_root, static_root)) as client:
+        profile = _create_profile(client)
+        source = _import_source(
+            client,
+            source_root,
+            action_id="native-source-corrupt-startup-0001",
+        )
+        project = _create_project(client, str(profile["profile_id"]), source)
+        import_directory = _import_directory(config_root, source)
+        (source_root / "later.txt").write_text("unreferenced", encoding="utf-8")
+        orphan = _import_source(
+            client,
+            source_root,
+            action_id="native-source-corrupt-orphan-0001",
+            project_id=str(project["project_id"]),
+        )
+        orphan_directory = _import_directory(config_root, orphan)
+
+    archive = import_directory / "archive.tar"
+    with archive.open("r+b") as stream:
+        stream.seek(0)
+        stream.write(b"X")
+        stream.flush()
+
+    with pytest.raises(WorkspaceImportIntegrityError, match="referenced workspace import"):
+        _app(config_root, static_root)
+
+    assert import_directory.is_dir()
+    assert archive.is_file()
+    assert orphan_directory.is_dir()

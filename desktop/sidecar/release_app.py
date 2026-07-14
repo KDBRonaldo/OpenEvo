@@ -262,7 +262,10 @@ def create_release_desktop_local_api_app(
     store = DesktopProviderStore(state_root, clock=clock)
     workspace_import_store: WorkspaceImportStore | None = None
     try:
-        workspace_import_store = WorkspaceImportStore(store.state_root / "workspace-imports")
+        workspace_import_store = WorkspaceImportStore(
+            store.state_root / "workspace-imports",
+            reconcile_on_open=False,
+        )
         provider = DesktopReleaseProvider(
             store,
             workspace_import_store,

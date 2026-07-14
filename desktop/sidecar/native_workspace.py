@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -171,6 +172,45 @@ def _same_identity(value: os.stat_result, expected: _Identity) -> bool:
     return _Identity.from_stat(value) == expected
 
 
+def _seek_extent(descriptor: int, offset: int, whence: int) -> int:
+    while True:
+        try:
+            return os.lseek(descriptor, offset, whence)
+        except InterruptedError:
+            continue
+
+
+def _require_non_sparse_file(descriptor: int, size: int) -> None:
+    if size == 0:
+        return
+    seek_data = getattr(os, "SEEK_DATA", None)
+    seek_hole = getattr(os, "SEEK_HOLE", None)
+    if type(seek_data) is not int or type(seek_hole) is not int:
+        raise NativeWorkspaceArchiveError(
+            "workspace sparse-file detection is unavailable on this platform"
+        )
+    try:
+        first_data = _seek_extent(descriptor, 0, seek_data)
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:
+            raise NativeWorkspaceArchiveError("workspace sparse files are unsupported") from None
+        raise NativeWorkspaceArchiveError(
+            "workspace sparse-file detection failed closed"
+        ) from exc
+    if first_data != 0:
+        raise NativeWorkspaceArchiveError("workspace sparse files are unsupported")
+    try:
+        first_hole = _seek_extent(descriptor, 0, seek_hole)
+    except OSError as exc:
+        raise NativeWorkspaceArchiveError(
+            "workspace sparse-file detection failed closed"
+        ) from exc
+    if first_hole != size:
+        if 0 <= first_hole < size:
+            raise NativeWorkspaceArchiveError("workspace sparse files are unsupported")
+        raise NativeWorkspaceArchiveError("workspace sparse-file extent map is invalid")
+
+
 def _open_selected_root(
     selected_path: str,
     *,
@@ -274,8 +314,18 @@ def _scan_directory(
                 raise NativeWorkspaceArchiveError("workspace files must have one link")
             if value.st_size < 0 or value.st_size > _MAX_FILE_BYTES:
                 raise NativeWorkspaceArchiveError("workspace file exceeds its size limit")
-            if value.st_blocks * _BLOCK_SIZE < value.st_size:
-                raise NativeWorkspaceArchiveError("workspace sparse files are unsupported")
+            try:
+                file_descriptor = os.open(name, _FILE_FLAGS, dir_fd=descriptor)
+            except OSError as exc:
+                raise NativeWorkspaceArchiveError("workspace file changed") from exc
+            try:
+                if not _same_identity(os.fstat(file_descriptor), identity):
+                    raise NativeWorkspaceArchiveError("workspace file changed")
+                _require_non_sparse_file(file_descriptor, value.st_size)
+                if not _same_identity(os.fstat(file_descriptor), identity):
+                    raise NativeWorkspaceArchiveError("workspace file changed")
+            finally:
+                os.close(file_descriptor)
             if value.st_size > MAX_WORKSPACE_UPLOAD_BYTES - extracted_bytes[0]:
                 raise NativeWorkspaceArchiveError("workspace extracted-byte budget exceeded")
             extracted_bytes[0] += value.st_size

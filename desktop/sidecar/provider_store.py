@@ -802,6 +802,14 @@ class DesktopProviderStore:
             if not self._closed:
                 self._close_resources()
 
+    @contextmanager
+    def workspace_import_reference_guard(self) -> Iterator[None]:
+        """Serialize durable project references before taking the import-store lock."""
+
+        with self._transaction_lock:
+            self._verify_storage_files()
+            yield
+
     def _close_resources(self) -> None:
         connection = getattr(self, "_connection", None)
         if connection is not None:

@@ -25,10 +25,15 @@ from desktop.sidecar.contracts.v1.models import (
     RemoteProfilePatchV1,
     RemoteProfileV1,
     VersionV1,
+    WorkspaceImportRefV1,
 )
 from desktop.sidecar.provider_store import DesktopProviderStore
 from desktop.sidecar.workspace_identity import ownership_for_native_import
-from desktop.sidecar.workspace_imports import WorkspaceImportError, WorkspaceImportStore
+from desktop.sidecar.workspace_imports import (
+    WorkspaceImportError,
+    WorkspaceImportOwnership,
+    WorkspaceImportStore,
+)
 
 
 NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
@@ -201,11 +206,12 @@ class DesktopReleaseProvider:
 
     def _create_project(self, arguments: Mapping[str, object]) -> Response:
         request = cast(ProjectCreateV1, arguments["request"])
-        self._verify_project_source(request.source, project_id=None)
-        project = self._store.create_project(
-            request,
-            idempotency_key=cast(str, arguments["idempotency_key"]),
-        )
+        with self._store.workspace_import_reference_guard():
+            self._verify_project_source(request.source, project_id=None)
+            project = self._store.create_project(
+                request,
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
         return self._resource_response(project, status_code=201)
 
     def _get_project(self, arguments: Mapping[str, object]) -> Response:
@@ -215,25 +221,27 @@ class DesktopReleaseProvider:
     def _update_project(self, arguments: Mapping[str, object]) -> Response:
         project_id = cast(str, arguments["project_id"])
         request = cast(ProjectPatchV1, arguments["request"])
-        previous = self._store.get_project(project_id)
-        if request.source is not None:
-            self._verify_project_source(request.source, project_id=project_id)
-        project = self._store.patch_project(
-            project_id,
-            request,
-            if_match=cast(str, arguments["if_match"]),
-        )
-        if previous.source != project.source:
+        with self._store.workspace_import_reference_guard():
+            previous = self._store.get_project(project_id)
+            if request.source is not None:
+                self._verify_project_source(request.source, project_id=project_id)
+            project = self._store.patch_project(
+                project_id,
+                request,
+                if_match=cast(str, arguments["if_match"]),
+            )
+        if previous.source.import_ref != project.source.import_ref:
             self._release_project_source(previous.source, project_id=project_id)
         return self._resource_response(project)
 
     def _delete_project(self, arguments: Mapping[str, object]) -> Response:
         project_id = cast(str, arguments["project_id"])
-        project = self._store.get_project(project_id)
-        self._store.delete_project(
-            project_id,
-            if_match=cast(str, arguments["if_match"]),
-        )
+        with self._store.workspace_import_reference_guard():
+            project = self._store.get_project(project_id)
+            self._store.delete_project(
+                project_id,
+                if_match=cast(str, arguments["if_match"]),
+            )
         self._release_project_source(project.source, project_id=project_id)
         return Response(status_code=204)
 
@@ -259,7 +267,14 @@ class DesktopReleaseProvider:
         )
 
     def _reconcile_workspace_imports(self) -> None:
-        references = {}
+        with self._store.workspace_import_reference_guard():
+            references = self._workspace_import_references()
+            self._workspace_import_store.reconcile_references(references)
+
+    def _workspace_import_references(
+        self,
+    ) -> dict[str, tuple[WorkspaceImportRefV1, WorkspaceImportOwnership]]:
+        references: dict[str, tuple[WorkspaceImportRefV1, WorkspaceImportOwnership]] = {}
         for project_id, source in self._store.native_workspace_sources():
             import_ref = source.import_ref
             if import_ref is None:
@@ -270,19 +285,23 @@ class DesktopReleaseProvider:
                 import_ref,
                 ownership_for_native_import(import_ref, project_id=project_id),
             )
-        self._workspace_import_store.reconcile_references(references)
+        return references
 
     def _release_project_source(self, source: ProjectSourceV1, *, project_id: str) -> None:
         if source.kind != "native_folder_snapshot" or source.import_ref is None:
             return
         try:
-            self._workspace_import_store.release(
-                source.import_ref,
-                ownership=ownership_for_native_import(
+            with self._store.workspace_import_reference_guard():
+                references = self._workspace_import_references()
+                if source.import_ref.import_id in references:
+                    return
+                self._workspace_import_store.release(
                     source.import_ref,
-                    project_id=project_id,
-                ),
-            )
+                    ownership=ownership_for_native_import(
+                        source.import_ref,
+                        project_id=project_id,
+                    ),
+                )
         except (OSError, WorkspaceImportError):
             # The project transaction is already durable. Startup reconciliation
             # retries cleanup and fails closed if referenced storage is damaged.

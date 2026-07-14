@@ -136,6 +136,42 @@ def test_native_workspace_rejects_links_special_files_and_noncanonical_names(
                 pass
 
 
+def test_native_workspace_rejects_4096_byte_unwritten_sparse_extent(tmp_path: Path) -> None:
+    if not hasattr(os, "posix_fallocate"):
+        pytest.skip("platform cannot create an allocated unwritten sparse extent")
+    source = tmp_path / "sparse"
+    source.mkdir()
+    sparse_file = source / "sparse.bin"
+    with sparse_file.open("w+b") as stream:
+        os.posix_fallocate(stream.fileno(), 0, 4096)
+    status = sparse_file.stat()
+    if status.st_blocks * 512 < status.st_size:
+        pytest.skip("filesystem did not allocate the unwritten extent")
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o700)
+
+    with pytest.raises(NativeWorkspaceArchiveError, match="sparse"):
+        with _prepare(source, private_root, "native-source-sparse-extent-0001"):
+            pass
+
+
+def test_native_workspace_fails_closed_without_extent_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "research"
+    source.mkdir()
+    (source / "notes.txt").write_text("observation", encoding="utf-8")
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o700)
+    monkeypatch.delattr(os, "SEEK_DATA", raising=False)
+    monkeypatch.delattr(os, "SEEK_HOLE", raising=False)
+
+    with pytest.raises(NativeWorkspaceArchiveError, match="detection is unavailable"):
+        with _prepare(source, private_root, "native-source-no-extent-query-0001"):
+            pass
+
+
 def test_native_workspace_detects_inventory_change_before_handoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
