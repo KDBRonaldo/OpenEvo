@@ -33,6 +33,15 @@ from desktop.sidecar.config import (
     load_desktop_project_config,
     save_desktop_project_config,
 )
+from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
+from desktop.sidecar.workspace_imports import (
+    WorkspaceArchiveValidationError,
+    WorkspaceImportError,
+    WorkspaceImportIntegrityError,
+    WorkspaceImportNotFoundError,
+    WorkspaceImportStore,
+    WorkspaceImportStoreConfigurationError,
+)
 from openevo.deployment.profile import (
     ProxySettings,
     RemoteProfileConfig,
@@ -74,6 +83,13 @@ __all__ = [
     "SidecarSciencePlan",
     "WorkspacePreparationAction",
     "WorkspacePreparationPlan",
+    "WorkspaceArchiveValidationError",
+    "WorkspaceImportError",
+    "WorkspaceImportIntegrityError",
+    "WorkspaceImportNotFoundError",
+    "WorkspaceImportRefV1",
+    "WorkspaceImportStore",
+    "WorkspaceImportStoreConfigurationError",
     "build_desktop_project_configs",
     "build_sidecar_science_plan",
     "build_desktop_shell_status",
