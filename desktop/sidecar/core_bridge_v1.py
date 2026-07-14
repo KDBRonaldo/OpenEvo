@@ -1102,6 +1102,56 @@ class DesktopCoreBridgeV1:
                 raise _bridge_client_error(exc) from None
             raise
 
+    def commit_local_activation(self, project: local_v1.ProjectV1) -> None:
+        """Bind the durable post-activation Desktop projection to the live session."""
+
+        session, generation = self._session()
+        deadline = time.monotonic() + self._timeout
+
+        def commit() -> None:
+            self._ensure_generation(session, generation)
+            self._ensure_local_activation_projection(session, project)
+            with self._lock:
+                self._ensure_generation(session, generation)
+                session.local_project_etag = project.etag
+
+        self._core_external(session.token, deadline, commit)
+
+    def deactivate_project(self, local_project_id: str) -> None:
+        """Retire one published project session without closing the bridge."""
+
+        deadline = time.monotonic() + self._timeout
+        self._acquire_transition(deadline)
+        try:
+            with self._lock:
+                if self._closed or self._close_requested:
+                    raise _bridge_error(
+                        "desktop_core_bridge_closed",
+                        "The Desktop Core bridge is closed.",
+                    )
+                if self._candidate is not None:
+                    raise _bridge_error(
+                        "active_project_transition_in_progress",
+                        "The active project transition is still in progress.",
+                        status=409,
+                        retryable=True,
+                    )
+                session = self._active
+                if session is None:
+                    return
+                if session.local_project_id != local_project_id:
+                    raise _bridge_error(
+                        "active_project_mismatch",
+                        "The requested project does not own the active Core session.",
+                        status=409,
+                    )
+                token = session.token
+            self._retire_token(token, deadline=deadline)
+            with self._lock:
+                self._generation += 1
+        finally:
+            self._transition_lock.release()
+
     def capabilities(self, project: local_v1.ProjectV1) -> core_v1.CapabilitiesResponseV1:
         def call(
             session: DesktopCoreActiveSessionV1,
@@ -2576,6 +2626,33 @@ class DesktopCoreBridgeV1:
             raise _bridge_error(
                 "active_local_project_version_mismatch",
                 "The saved local project changed after this Core session was activated.",
+                status=409,
+            )
+
+    @staticmethod
+    def _ensure_local_activation_projection(
+        session: DesktopCoreActiveSessionV1,
+        project: local_v1.ProjectV1,
+    ) -> None:
+        remote = project.remote
+        intent_sha256 = _model_digest(map_project_create_v1(project))
+        if (
+            project.project_id != session.local_project_id
+            or project.profile_id != session.profile_id
+            or project.state != "active"
+            or intent_sha256 != session.local_project_intent_sha256
+            or remote is None
+            or remote.status != "ready"
+            or remote.core_project_id != session.project.id
+            or remote.active_revision != session.project.active_revision
+            or remote.registry_digest != session.capabilities.registry_digest
+            or remote.registry_digest != session.project.registry_digest
+            or remote.model_preparation != session.project.model_preparation
+            or remote.etag != session.project.etag
+        ):
+            raise _bridge_error(
+                "local_activation_projection_mismatch",
+                "The durable Desktop project does not match the active Core session.",
                 status=409,
             )
 

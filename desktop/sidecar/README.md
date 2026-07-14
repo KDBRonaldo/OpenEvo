@@ -293,6 +293,15 @@ session replacement cannot race a successful precheck into an old-tunnel
 request. Project-ID drift and Local-version drift return distinct typed 409
 errors before transport.
 
+Activation starts from the pre-operation Local ETag, while the provider's
+durable activation transaction publishes a new project ETag and observed
+remote projection. `commit_local_activation()` is the only bridge transition
+that may advance that Local ETag without changing mapped intent. It accepts
+only an active Local project whose Core project ID, revision, registry, model
+preparation, and Core ETag exactly match the published session, then updates
+the binding under the same generation lease. A partial or substituted
+projection leaves the pre-operation binding unchanged.
+
 Cheap project/profile/ETag checks run before canonical mapping. A Local model
 that cannot satisfy Core's narrower project or archive constraints returns the
 closed `invalid_local_project` 422; no public bridge method exposes a Pydantic
@@ -398,6 +407,12 @@ still running remains owned by the cancelled generation. Successful close or
 switch waits for that work and all resources; if bounded retirement cannot
 prove completion, it returns a typed retryable error instead of announcing the
 transition.
+
+`deactivate_project()` uses that serialized retirement path without
+permanently closing the bridge. It is idempotent when no session exists,
+rejects a different project owner or an in-progress candidate, and closes the
+published client and tunnel before a later activation may start. Desktop uses
+this transition when editing an active project returns it to draft.
 
 The renderer-facing run contract accepts only the active local project ID; the
 later release-routing adapter must load its ETag-selected saved `ProjectV1` and

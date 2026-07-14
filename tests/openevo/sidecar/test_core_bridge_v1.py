@@ -128,6 +128,30 @@ def _local_project(*, imported: bool = False) -> local_v1.ProjectV1:
     )
 
 
+def _committed_local_activation(
+    project: local_v1.ProjectV1,
+    activation: bridge_module.CoreActivationV1,
+    *,
+    etag: str = ETAG_B,
+) -> local_v1.ProjectV1:
+    core_project = activation.core_project
+    return project.model_copy(
+        update={
+            "state": "active",
+            "remote": local_v1.RemoteProjectStateV1(
+                core_project_id=core_project.id,
+                status="ready",
+                active_revision=core_project.active_revision,
+                registry_digest=core_project.registry_digest,
+                model_preparation=core_project.model_preparation,
+                observed_at=NOW,
+                etag=core_project.etag,
+            ),
+            "etag": etag,
+        }
+    )
+
+
 def _core_create(local_project: local_v1.ProjectV1) -> core_v1.ProjectCreateV1:
     return map_project_create_v1(local_project)
 
@@ -917,6 +941,91 @@ def test_activate_then_create_run_uses_real_strict_clients_and_core_authority() 
             ),
         )
     ]
+
+
+def test_durable_activation_projection_rebinds_the_live_local_etag() -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    activation = bridge.activate_project(
+        local_project,
+        idempotency_key="activate-local-rebind-0001",
+    )
+    committed = _committed_local_activation(local_project, activation)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as stale:
+        bridge.capabilities(committed)
+    assert stale.value.error.code == "active_local_project_version_mismatch"
+
+    bridge.commit_local_activation(committed)
+
+    assert bridge.capabilities(committed) == activation.capabilities
+    assert bridge._active is not None
+    assert bridge._active.local_project_etag == committed.etag
+    bridge.commit_local_activation(committed)
+    bridge.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["core_etag", "registry", "intent", "state"],
+)
+def test_local_activation_rebind_rejects_a_mismatched_projection(mutation: str) -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    activation = bridge.activate_project(
+        local_project,
+        idempotency_key="activate-local-rebind-0002",
+    )
+    committed = _committed_local_activation(local_project, activation)
+    remote = committed.remote
+    assert remote is not None
+    if mutation == "core_etag":
+        committed = committed.model_copy(
+            update={
+                "remote": remote.model_copy(update={"etag": '"' + "d" * 64 + '"'})
+            }
+        )
+    elif mutation == "registry":
+        committed = committed.model_copy(
+            update={"remote": remote.model_copy(update={"registry_digest": "9" * 64})}
+        )
+    elif mutation == "intent":
+        committed = committed.model_copy(update={"name": "Changed after activation"})
+    else:
+        committed = committed.model_copy(update={"state": "draft"})
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.commit_local_activation(committed)
+
+    assert exc_info.value.error.code == "local_activation_projection_mismatch"
+    assert bridge._active is not None
+    assert bridge._active.local_project_etag == local_project.etag
+    assert bridge.capabilities(local_project) == activation.capabilities
+    bridge.close()
+
+
+def test_deactivate_retires_only_the_named_session_and_bridge_can_reactivate() -> None:
+    local_project = _local_project()
+    bridge, _, _, tunnels = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-before-retire-0001")
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as mismatch:
+        bridge.deactivate_project("another-local-project")
+    assert mismatch.value.error.code == "active_project_mismatch"
+    assert tunnels.handles[-1].closed is False
+
+    bridge.deactivate_project(local_project.project_id)
+
+    assert tunnels.handles[-1].closed is True
+    with pytest.raises(DesktopCoreBridgeErrorV1) as unavailable:
+        bridge.capabilities(local_project)
+    assert unavailable.value.error.code == "active_project_session_unavailable"
+    bridge.deactivate_project(local_project.project_id)
+
+    bridge.activate_project(local_project, idempotency_key="activate-after-retire-0002")
+    assert tunnels.handles[-1].closed is False
+    assert bridge.capabilities(local_project).registry_digest == REGISTRY_DIGEST
+    bridge.close()
 
 
 def test_create_get_rejects_project_created_at_drift_before_mutation() -> None:

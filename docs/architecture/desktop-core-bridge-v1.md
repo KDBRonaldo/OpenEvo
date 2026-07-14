@@ -134,6 +134,14 @@ project ID fails with `active_project_mismatch`; profile, ETag, or mapped-intent
 drift fails with `active_local_project_version_mismatch`. Both are typed 409
 errors raised before Core transport.
 
+The Local provider publishes activation state in a separate durable
+transaction, so the resulting `ProjectV1` has a new Local ETag and a
+`RemoteProjectStateV1`. It must then call `commit_local_activation()` with that
+exact object. The bridge verifies the Local ID, profile, mapped intent, active
+state, Core project ID, active revision, registry digest, model preparation,
+and Core ETag before advancing the session's Local ETag under the generation
+lease. This is a post-commit acknowledgement, not a general ETag bypass.
+
 The inexpensive project/profile/Local-ETag comparison precedes canonical
 mapping. If an otherwise valid Local model cannot satisfy the narrower Core
 mapping contract, including archive declaration invariants, the mapper and all
@@ -170,6 +178,12 @@ while only an actual callback exception clears the future for a new callback
 attempt. Deadline expiry while computing the wait immediately after submission
 also retains that future; retry waits for the same callback instead of invoking
 it twice.
+
+An active project config edit uses `deactivate_project()` rather than closing
+the bridge permanently. The transition rejects a different Local project and
+an in-flight candidate, retires all generation resources through the same
+bounded path, and leaves the bridge available for later activation of the new
+draft intent.
 
 The forward activation path uses one finite wall-clock deadline across host
 attach, tunnel open, version negotiation, capabilities, project create/read,
