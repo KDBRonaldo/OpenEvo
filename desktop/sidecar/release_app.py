@@ -34,12 +34,19 @@ from desktop.sidecar.release_provider import (
     InvalidNativeChallengeError,
     ProviderCapabilityUnavailableError,
 )
+from desktop.sidecar.remote_lifecycle import (
+    DesktopRemoteLifecycle,
+    RemoteCredentialUnavailableError,
+    RemoteLifecycleError,
+    RemoteLifecycleSupersededError,
+)
 from openevo import __version__ as OPENEVO_VERSION
 from openevo.backend.contracts.v1.models import (
     ErrorCategory as CoreErrorCategory,
     ErrorSeverity,
     RepairAction,
 )
+from openevo.deployment.host_keys import ProviderKnownHostStore
 
 
 ErrorCategory = Literal[
@@ -243,6 +250,7 @@ def create_release_desktop_local_api_app(
     build_version: str = OPENEVO_VERSION,
     build_channel: Literal["release", "development", "test"] = "release",
     clock: Callable[[], datetime] | None = None,
+    remote_lifecycle: DesktopRemoteLifecycle | None = None,
 ) -> FastAPI:
     """Create the release Desktop Local API v1 app and own its durable store."""
 
@@ -254,7 +262,15 @@ def create_release_desktop_local_api_app(
         raise ValueError("Desktop session token must be 32-4096 characters without controls")
     encoded_session_token = session_token.encode("utf-8")
     store = DesktopProviderStore(state_root, clock=clock)
+    lifecycle = remote_lifecycle
     try:
+        if lifecycle is None:
+            lifecycle = DesktopRemoteLifecycle(
+                ProviderKnownHostStore(
+                    store.state_root / "ssh-host-keys",
+                    secure_ancestor=store.state_root,
+                )
+            )
         provider = DesktopReleaseProvider(
             store,
             build_version=build_version,
@@ -262,10 +278,13 @@ def create_release_desktop_local_api_app(
             build_channel=build_channel,
             instance_id=instance_id,
             readiness_key=readiness_key,
+            remote_lifecycle=lifecycle,
             clock=clock,
         )
         app = create_contract_app(provider)
     except BaseException:
+        if lifecycle is not None:
+            lifecycle.close()
         store.close()
         raise
     app.state.desktop_release_provider = provider
@@ -315,6 +334,42 @@ def create_release_desktop_local_api_app(
             code="native_challenge_invalid",
             message="The native readiness challenge is missing or invalid.",
             category="authentication",
+        )
+
+    @app.exception_handler(RemoteLifecycleError)
+    async def handle_remote_lifecycle(
+        request: Request, exc: RemoteLifecycleError
+    ) -> JSONResponse:
+        if isinstance(exc, RemoteCredentialUnavailableError):
+            return _error_response(
+                request,
+                status_code=409,
+                code="ssh_credential_unavailable",
+                message="The selected SSH credential is not available to OpenEvo Desktop.",
+                category="connection",
+                repair_action="user_input_required",
+                next_action="Choose SSH agent authentication or configure the native credential.",
+            )
+        if isinstance(exc, RemoteLifecycleSupersededError):
+            return _error_response(
+                request,
+                status_code=409,
+                code="connection_operation_superseded",
+                message="A newer connection action replaced this SSH operation.",
+                category="connection",
+                retryable=True,
+                repair_action="openevo_can_retry",
+                next_action="Reload the connection state before retrying.",
+            )
+        return _error_response(
+            request,
+            status_code=503,
+            code="ssh_connection_failed",
+            message="OpenEvo Desktop could not establish the SSH connection.",
+            category="connection",
+            retryable=True,
+            repair_action="openevo_can_retry",
+            next_action="Check the server and SSH settings, then retry.",
         )
 
     @app.exception_handler(RequestValidationError)

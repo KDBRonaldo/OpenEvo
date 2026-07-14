@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 from pathlib import Path
+from typing import cast
 
 from fastapi.testclient import TestClient
 import pytest
@@ -17,6 +18,13 @@ from desktop.sidecar.contracts.v1 import (
 from desktop.sidecar.provider_store import DesktopProviderStore, ProviderDataCorruptionError
 import desktop.sidecar.release_app as release_app_module
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
+from desktop.sidecar.remote_lifecycle import (
+    DesktopRemoteLifecycle,
+    RemoteConnectionFailedError,
+    RemoteConnectionResult,
+    RemoteLifecycleSnapshot,
+)
+from openevo.deployment.host_keys import HostKeyCandidate
 
 
 SESSION_TOKEN = "desktop-session-token-0000000000000001"
@@ -34,7 +42,64 @@ class MutableClock:
         return self.now
 
 
-def _app(state_root: Path, *, clock: MutableClock | None = None):
+class FakeRemoteLifecycle(DesktopRemoteLifecycle):
+    def __init__(self) -> None:
+        self.candidate = HostKeyCandidate(
+            algorithm="ssh-ed25519",
+            public_key="AAAAC3NzaC1lZDI1NTE5AAAAITest",
+            fingerprint="SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        self.current = RemoteLifecycleSnapshot(None, "disconnected")
+        self.connect_calls = 0
+        self.accept_calls = 0
+        self.disconnect_calls = 0
+        self.closed = False
+        self.connect_error: RemoteConnectionFailedError | None = None
+
+    def snapshot(self) -> RemoteLifecycleSnapshot:
+        return self.current
+
+    def connect(self, profile) -> RemoteConnectionResult:
+        self.connect_calls += 1
+        if self.connect_error is not None:
+            self.current = RemoteLifecycleSnapshot(
+                profile.profile_id, "failed", failure_code="ssh_connection_failed"
+            )
+            raise self.connect_error
+        self.current = RemoteLifecycleSnapshot(
+            profile.profile_id,
+            "host_key_required",
+            host_key_candidate=self.candidate,
+        )
+        return RemoteConnectionResult(
+            profile.profile_id,
+            "host_key_required",
+            host_key_candidate=self.candidate,
+        )
+
+    def accept_host_key(self, profile, request) -> RemoteConnectionResult:
+        self.accept_calls += 1
+        assert request.algorithm == self.candidate.algorithm
+        assert request.fingerprint == self.candidate.fingerprint
+        self.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+        return RemoteConnectionResult(profile.profile_id, "connected")
+
+    def disconnect(self, profile_id: str | None = None) -> None:
+        self.disconnect_calls += 1
+        assert profile_id is None or self.current.profile_id in {None, profile_id}
+        self.current = RemoteLifecycleSnapshot(None, "disconnected")
+
+    def close(self) -> None:
+        self.closed = True
+        self.current = RemoteLifecycleSnapshot(None, "disconnected")
+
+
+def _app(
+    state_root: Path,
+    *,
+    clock: MutableClock | None = None,
+    remote_lifecycle: FakeRemoteLifecycle | None = None,
+):
     return create_release_desktop_local_api_app(
         state_root=state_root,
         session_token=SESSION_TOKEN,
@@ -43,6 +108,7 @@ def _app(state_root: Path, *, clock: MutableClock | None = None):
         source_commit=SOURCE_COMMIT,
         build_channel="test",
         clock=clock,
+        remote_lifecycle=cast(DesktopRemoteLifecycle | None, remote_lifecycle),
     )
 
 
@@ -220,6 +286,161 @@ def test_profile_and_project_crud_preserve_idempotency_and_etags(tmp_path: Path)
             headers={**SESSION_HEADERS, "If-Match": profile["etag"]},
         )
         assert deleted_profile.status_code == 204
+
+
+def test_remote_connection_lifecycle_is_etag_bound_and_idempotent(tmp_path: Path) -> None:
+    lifecycle = FakeRemoteLifecycle()
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        created = _create_profile(client, name="Remote", key="profile-connect-create-0001")
+        profile = created.json()
+        profile_id = profile["profile_id"]
+
+        renamed = client.patch(
+            f"/desktop/v1/profiles/{profile_id}",
+            headers={**SESSION_HEADERS, "If-Match": profile["etag"]},
+            json={"name": "Remote renamed"},
+        ).json()
+        stale = client.post(
+            f"/desktop/v1/profiles/{profile_id}/connect",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": profile["etag"],
+                "Idempotency-Key": "profile-connect-stale-0001",
+            },
+        )
+        assert stale.status_code == 412
+        assert lifecycle.connect_calls == 0
+
+        connect_headers = {
+            **SESSION_HEADERS,
+            "If-Match": renamed["etag"],
+            "Idempotency-Key": "profile-connect-action-0001",
+        }
+        connected = client.post(
+            f"/desktop/v1/profiles/{profile_id}/connect", headers=connect_headers
+        )
+        replay = client.post(
+            f"/desktop/v1/profiles/{profile_id}/connect", headers=connect_headers
+        )
+        assert connected.status_code == replay.status_code == 202
+        assert connected.json() == replay.json()
+        assert connected.json()["state"] == "succeeded"
+        assert connected.json()["result"]["connection_state"] == "host_key_required"
+        assert lifecycle.connect_calls == 1
+
+        review_state = client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()["core"]
+        assert review_state == {
+            "state": "host_key_review",
+            "profile_id": profile_id,
+            "active_tunnel": False,
+            "operation_id": connected.json()["operation_id"],
+            "host_key_review": {
+                "algorithm": lifecycle.candidate.algorithm,
+                "fingerprint": lifecycle.candidate.fingerprint,
+            },
+            "core": None,
+            "failure": None,
+        }
+        reviewed_profile = client.get(
+            f"/desktop/v1/profiles/{profile_id}", headers=SESSION_HEADERS
+        ).json()
+        assert reviewed_profile["connection_state"] == "host_key_required"
+        assert reviewed_profile["host_key_fingerprint"] == lifecycle.candidate.fingerprint
+
+        blocked_patch = client.patch(
+            f"/desktop/v1/profiles/{profile_id}",
+            headers={**SESSION_HEADERS, "If-Match": reviewed_profile["etag"]},
+            json={"name": "Must not change"},
+        )
+        assert blocked_patch.status_code == 409
+        assert blocked_patch.json()["code"] == "resource_in_use"
+
+        accept_headers = {
+            **SESSION_HEADERS,
+            "If-Match": reviewed_profile["etag"],
+            "Idempotency-Key": "profile-host-key-accept-0001",
+        }
+        acceptance = {
+            "algorithm": lifecycle.candidate.algorithm,
+            "fingerprint": lifecycle.candidate.fingerprint,
+        }
+        accepted = client.post(
+            f"/desktop/v1/profiles/{profile_id}/host-key/accept",
+            headers=accept_headers,
+            json=acceptance,
+        )
+        accepted_replay = client.post(
+            f"/desktop/v1/profiles/{profile_id}/host-key/accept",
+            headers=accept_headers,
+            json=acceptance,
+        )
+        assert accepted.status_code == accepted_replay.status_code == 202
+        assert accepted.json() == accepted_replay.json()
+        assert lifecycle.accept_calls == 1
+        online_profile = client.get(
+            f"/desktop/v1/profiles/{profile_id}", headers=SESSION_HEADERS
+        ).json()
+        assert online_profile["connection_state"] == "connected"
+        core_state = client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()["core"]
+        assert core_state["state"] == "offline"
+        assert core_state["failure"]["code"] == "core_not_started"
+
+        disconnect_headers = {
+            **SESSION_HEADERS,
+            "If-Match": online_profile["etag"],
+            "Idempotency-Key": "profile-disconnect-action-0001",
+        }
+        disconnected = client.post(
+            f"/desktop/v1/profiles/{profile_id}/disconnect",
+            headers=disconnect_headers,
+        )
+        disconnected_replay = client.post(
+            f"/desktop/v1/profiles/{profile_id}/disconnect",
+            headers=disconnect_headers,
+        )
+        assert disconnected.status_code == disconnected_replay.status_code == 202
+        assert disconnected.json() == disconnected_replay.json()
+        assert lifecycle.disconnect_calls == 1
+        assert (
+            client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()["core"]["state"]
+            == "disconnected"
+        )
+
+    assert lifecycle.closed
+
+
+def test_remote_connection_failure_is_typed_and_does_not_persist_details(
+    tmp_path: Path,
+) -> None:
+    lifecycle = FakeRemoteLifecycle()
+    lifecycle.connect_error = RemoteConnectionFailedError(
+        "ssh failed with secret at /Users/researcher/.ssh/id_ed25519"
+    )
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client, name="Failing remote", key="profile-failure-create-0001"
+        ).json()
+        failed = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": profile["etag"],
+                "Idempotency-Key": "profile-connect-failure-0001",
+            },
+        )
+        assert failed.status_code == 503
+        assert failed.json()["code"] == "ssh_connection_failed"
+        assert "secret" not in failed.text.lower()
+        assert "/users/" not in failed.text.lower()
+        unchanged = client.get(
+            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+        ).json()
+        assert unchanged == profile
+        core_state = client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()["core"]
+        assert core_state["state"] == "offline"
+        assert core_state["failure"]["code"] == "ssh_connection_failed"
 
 
 def test_pagination_cursor_and_typed_contract_errors(tmp_path: Path) -> None:

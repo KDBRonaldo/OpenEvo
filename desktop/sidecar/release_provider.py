@@ -5,26 +5,41 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import re
-from typing import NoReturn, cast
+from threading import Lock
+from typing import Literal, NoReturn, cast
 
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
 from desktop.sidecar.contracts.v1.canonical import DESKTOP_OPENAPI_SHA256
 from desktop.sidecar.contracts.v1.models import (
     ActiveProjectStateV1,
+    ConnectionFailureV1,
+    ConnectionOperationResultV1,
     ContractNegotiationV1,
     CoreConnectionStateV1,
     DesktopStateV1,
     HealthV1,
+    HostKeyAcceptV1,
+    HostKeyReviewV1,
+    LocalOperationV1,
     ProjectCreateV1,
     ProjectPatchV1,
     ProjectV1,
     RemoteProfileCreateV1,
     RemoteProfilePatchV1,
     RemoteProfileV1,
+    ResourceRefV1,
     VersionV1,
 )
-from desktop.sidecar.provider_store import DesktopProviderStore
+from desktop.sidecar.provider_store import DesktopProviderStore, ResourceInUseError
+from desktop.sidecar.remote_lifecycle import (
+    DesktopRemoteLifecycle,
+    RemoteConnectionFailedError,
+    RemoteCredentialUnavailableError,
+    RemoteLifecycleError,
+    RemoteLifecycleSupersededError,
+)
 
 
 NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
@@ -43,6 +58,8 @@ class InvalidNativeChallengeError(Exception):
 
 
 OperationHandler = Callable[[Mapping[str, object]], object]
+ProfileRuntimeState = Literal["connected", "disconnected", "host_key_required"]
+ConnectionAction = Callable[[RemoteProfileV1], tuple[ProfileRuntimeState, str | None]]
 
 
 class DesktopReleaseProvider:
@@ -57,6 +74,7 @@ class DesktopReleaseProvider:
         build_channel: str,
         instance_id: str,
         readiness_key: bytes,
+        remote_lifecycle: DesktopRemoteLifecycle,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if re.fullmatch(r"[0-9a-f]{32}", instance_id) is None:
@@ -64,6 +82,9 @@ class DesktopReleaseProvider:
         if type(readiness_key) is not bytes or len(readiness_key) != 32:
             raise ValueError("native readiness key must contain exactly 32 bytes")
         self._store = store
+        self._remote_lifecycle = remote_lifecycle
+        self._connection_state_lock = Lock()
+        self._core_state = CoreConnectionStateV1(state="disconnected", active_tunnel=False)
         self._instance_id = instance_id
         self._readiness_key = readiness_key
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -84,6 +105,9 @@ class DesktopReleaseProvider:
             "getRemoteProfile": self._get_profile,
             "updateRemoteProfile": self._update_profile,
             "deleteRemoteProfile": self._delete_profile,
+            "connectRemoteProfile": self._connect_profile,
+            "disconnectRemoteProfile": self._disconnect_profile,
+            "acceptRemoteHostKey": self._accept_host_key,
             "listProjects": self._list_projects,
             "createProject": self._create_project,
             "getProject": self._get_project,
@@ -92,7 +116,10 @@ class DesktopReleaseProvider:
         }
 
     def close(self) -> None:
-        self._store.close()
+        try:
+            self._remote_lifecycle.close()
+        finally:
+            self._store.close()
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handler = self._handlers.get(operation_id)
@@ -129,6 +156,8 @@ class DesktopReleaseProvider:
                 profile_id=project.profile_id,
                 connection_state="offline",
             )
+        with self._connection_state_lock:
+            core_state = self._core_state
         return DesktopStateV1(
             observed_at=self._timestamp(),
             contract=ContractNegotiationV1(
@@ -137,7 +166,7 @@ class DesktopReleaseProvider:
                 core_openapi_sha256=None,
                 compatible=True,
             ),
-            core=CoreConnectionStateV1(state="disconnected", active_tunnel=False),
+            core=core_state,
             active_project=active_project,
             pending_operation_ids=(),
         )
@@ -162,6 +191,7 @@ class DesktopReleaseProvider:
         return self._resource_response(profile)
 
     def _update_profile(self, arguments: Mapping[str, object]) -> Response:
+        self._require_profile_not_connected(cast(str, arguments["profile_id"]))
         profile = self._store.patch_profile(
             cast(str, arguments["profile_id"]),
             cast(RemoteProfilePatchV1, arguments["request"]),
@@ -170,11 +200,221 @@ class DesktopReleaseProvider:
         return self._resource_response(profile)
 
     def _delete_profile(self, arguments: Mapping[str, object]) -> Response:
+        self._require_profile_not_connected(cast(str, arguments["profile_id"]))
         self._store.delete_profile(
             cast(str, arguments["profile_id"]),
             if_match=cast(str, arguments["if_match"]),
         )
         return Response(status_code=204)
+
+    def _connect_profile(self, arguments: Mapping[str, object]) -> LocalOperationV1:
+        profile_id = cast(str, arguments["profile_id"])
+        if_match = cast(str, arguments["if_match"])
+        idempotency_key = cast(str, arguments["idempotency_key"])
+
+        def connect(profile: RemoteProfileV1) -> tuple[ProfileRuntimeState, str | None]:
+            result = self._remote_lifecycle.connect(profile)
+            fingerprint = (
+                result.host_key_candidate.fingerprint
+                if result.host_key_candidate is not None
+                else profile.host_key_fingerprint
+            )
+            return result.state, fingerprint
+
+        return self._execute_connection_action(
+            route=f"/desktop/v1/profiles/{profile_id}/connect",
+            operation_kind="profile_connect",
+            profile_id=profile_id,
+            if_match=if_match,
+            idempotency_key=idempotency_key,
+            request_body={},
+            action=connect,
+        )
+
+    def _accept_host_key(self, arguments: Mapping[str, object]) -> LocalOperationV1:
+        profile_id = cast(str, arguments["profile_id"])
+        if_match = cast(str, arguments["if_match"])
+        idempotency_key = cast(str, arguments["idempotency_key"])
+        request = cast(HostKeyAcceptV1, arguments["request"])
+
+        def accept(profile: RemoteProfileV1) -> tuple[ProfileRuntimeState, str | None]:
+            result = self._remote_lifecycle.accept_host_key(profile, request)
+            return result.state, request.fingerprint
+
+        return self._execute_connection_action(
+            route=f"/desktop/v1/profiles/{profile_id}/host-key/accept",
+            operation_kind="host_key_accept",
+            profile_id=profile_id,
+            if_match=if_match,
+            idempotency_key=idempotency_key,
+            request_body=request,
+            action=accept,
+        )
+
+    def _disconnect_profile(self, arguments: Mapping[str, object]) -> LocalOperationV1:
+        profile_id = cast(str, arguments["profile_id"])
+        if_match = cast(str, arguments["if_match"])
+        idempotency_key = cast(str, arguments["idempotency_key"])
+
+        def disconnect(profile: RemoteProfileV1) -> tuple[ProfileRuntimeState, str | None]:
+            self._remote_lifecycle.disconnect(profile.profile_id)
+            return "disconnected", profile.host_key_fingerprint
+
+        return self._execute_connection_action(
+            route=f"/desktop/v1/profiles/{profile_id}/disconnect",
+            operation_kind="profile_disconnect",
+            profile_id=profile_id,
+            if_match=if_match,
+            idempotency_key=idempotency_key,
+            request_body={},
+            action=disconnect,
+        )
+
+    def _execute_connection_action(
+        self,
+        *,
+        route: str,
+        operation_kind: str,
+        profile_id: str,
+        if_match: str,
+        idempotency_key: str,
+        request_body: BaseModel | Mapping[str, object],
+        action: ConnectionAction,
+    ) -> LocalOperationV1:
+        def mutation(transaction):
+            profile = transaction.require_profile_authority(profile_id, if_match=if_match)
+            connection_state, host_key_fingerprint = action(profile)
+            updated = transaction.set_profile_runtime_state(
+                profile_id,
+                if_match=if_match,
+                connection_state=connection_state,
+                credential_slots=profile.credential_slots,
+                host_key_fingerprint=host_key_fingerprint,
+            )
+            return 202, transaction.create_local_operation(
+                operation_kind=operation_kind,
+                resource=ResourceRefV1(
+                    resource_type="profile", resource_id=profile_id
+                ),
+                state="succeeded",
+                result=ConnectionOperationResultV1(
+                    profile_id=profile_id,
+                    connection_state=updated.connection_state,
+                ),
+            )
+
+        try:
+            stored = self._store.execute_idempotent_action(
+                route=route,
+                resource_scope=profile_id,
+                key=idempotency_key,
+                body=request_body,
+                if_match=if_match,
+                semantic_headers={},
+                response_model=LocalOperationV1,
+                mutation=mutation,
+            )
+        except RemoteLifecycleError as exc:
+            self._set_core_state(self._connection_failure_state(profile_id, exc))
+            raise
+        operation = LocalOperationV1.model_validate_json(stored.response_bytes)
+        self._sync_core_state(profile_id, operation.operation_id)
+        return operation
+
+    def _require_profile_not_connected(self, profile_id: str) -> None:
+        snapshot = self._remote_lifecycle.snapshot()
+        if snapshot.profile_id == profile_id and snapshot.state != "disconnected":
+            raise ResourceInUseError("profile", profile_id)
+
+    def _sync_core_state(self, profile_id: str, operation_id: str) -> None:
+        snapshot = self._remote_lifecycle.snapshot()
+        if snapshot.profile_id not in {None, profile_id}:
+            return
+        if snapshot.state == "disconnected":
+            state = CoreConnectionStateV1(state="disconnected", active_tunnel=False)
+        elif snapshot.state == "host_key_required":
+            candidate = snapshot.host_key_candidate
+            if candidate is None:
+                state = self._connection_failure_state(
+                    profile_id,
+                    RemoteConnectionFailedError("SSH host-key review state is incomplete."),
+                )
+            else:
+                state = CoreConnectionStateV1(
+                    state="host_key_review",
+                    profile_id=profile_id,
+                    active_tunnel=False,
+                    operation_id=operation_id,
+                    host_key_review=HostKeyReviewV1(
+                        algorithm=candidate.algorithm,
+                        fingerprint=candidate.fingerprint,
+                    ),
+                )
+        elif snapshot.state == "connected":
+            state = self._core_not_started_state(profile_id)
+        elif snapshot.state == "connecting":
+            state = CoreConnectionStateV1(
+                state="connecting",
+                profile_id=profile_id,
+                active_tunnel=False,
+                operation_id=operation_id,
+            )
+        else:
+            state = self._connection_failure_state(
+                profile_id,
+                RemoteConnectionFailedError("The SSH connection is unavailable."),
+            )
+        self._set_core_state(state)
+
+    def _set_core_state(self, state: CoreConnectionStateV1) -> None:
+        with self._connection_state_lock:
+            self._core_state = state
+
+    @staticmethod
+    def _connection_failure_state(
+        profile_id: str,
+        error: RemoteLifecycleError,
+    ) -> CoreConnectionStateV1:
+        if isinstance(error, RemoteCredentialUnavailableError):
+            code = "ssh_credential_unavailable"
+            message = "The selected SSH credential is not available to OpenEvo Desktop."
+            retryable = False
+            next_action = "Choose SSH agent authentication or configure the native credential."
+        elif isinstance(error, RemoteLifecycleSupersededError):
+            code = "connection_operation_superseded"
+            message = "A newer connection action replaced this SSH operation."
+            retryable = True
+            next_action = "Reload the connection state before retrying."
+        else:
+            code = "ssh_connection_failed"
+            message = "OpenEvo Desktop could not establish the SSH connection."
+            retryable = True
+            next_action = "Check the server and SSH settings, then retry."
+        return CoreConnectionStateV1(
+            state="offline",
+            profile_id=profile_id,
+            active_tunnel=False,
+            failure=ConnectionFailureV1(
+                code=code,
+                message=message,
+                retryable=retryable,
+                next_action=next_action,
+            ),
+        )
+
+    @staticmethod
+    def _core_not_started_state(profile_id: str) -> CoreConnectionStateV1:
+        return CoreConnectionStateV1(
+            state="offline",
+            profile_id=profile_id,
+            active_tunnel=False,
+            failure=ConnectionFailureV1(
+                code="core_not_started",
+                message="SSH is connected; OpenEvo Core has not been started for a project.",
+                retryable=True,
+                next_action="Create or activate a project to prepare OpenEvo Core.",
+            ),
+        )
 
     def _list_projects(self, arguments: Mapping[str, object]) -> object:
         return self._store.list_projects(

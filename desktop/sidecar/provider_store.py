@@ -521,6 +521,21 @@ class ProviderMutation:
                 "action mutation If-Match differs from its idempotency envelope"
             )
 
+    def require_profile_authority(
+        self,
+        profile_id: str,
+        *,
+        if_match: str,
+    ) -> RemoteProfileV1:
+        """Validate profile authority before an external idempotent action."""
+
+        self._store._validate_resource_id(profile_id)
+        self._store._validate_if_match(if_match)
+        self._require_bound_if_match(if_match)
+        row = self._store._require_profile_row(self._connection, profile_id)
+        self._store._require_etag("profile", profile_id, row, if_match)
+        return self._store._profile_from_row(row)
+
     def set_project_state(
         self,
         project_id: str,

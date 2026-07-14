@@ -350,9 +350,25 @@ does not infer it from environment variables or Git, and release startup rejects
 an all-zero placeholder. Development and test apps must inject their source
 commit and non-release channel explicitly. There is no direct-backend fallback.
 
-This phase does not implement a macOS Keychain secret broker. In particular,
-`password_ref` and `passphrase_ref` cannot yet be resolved for SSH operations,
-and the native command surface exposes no placeholder Keychain operation. These
+The release sidecar now owns the initial SSH lifecycle behind the frozen Local
+API profile routes. A connect action first validates its idempotency envelope
+and profile ETag, then either loads an exact profile/host/port/fingerprint trust
+binding or performs a non-mutating `ssh-keyscan`. A new key is returned only as
+an explicit `host_key_review` state. Acceptance repeats the probe, requires the
+same algorithm and fingerprint, publishes the private known-host binding, and
+runs a bounded SSH connectivity check. Connect, accept, and disconnect commit
+their profile state and terminal local operation in the same provider
+transaction; an exact replay does not repeat the remote action. Process restart
+resets persisted runtime connection state to disconnected and does not claim a
+surviving tunnel. SSH success alone reports `core_not_started`, not an online
+Core.
+
+This phase does not implement a macOS Keychain secret broker. The production
+resolver therefore supports `ssh_agent` only; native private-key and password
+profiles fail closed with a typed credential-unavailable response. Secret
+material, local key paths, raw SSH commands, and trust-store paths never enter
+the Local API models, idempotency envelope, error response, or renderer state.
+The native command surface exposes no placeholder Keychain operation. These
 native-host changes and Linux/macOS externalBin combination smokes do not prove
 code signing, notarization, closure of the same-UID pathname TOCTOU described
 above, mounted/copied macOS application launch, first-run
