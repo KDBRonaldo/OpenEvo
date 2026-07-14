@@ -3,6 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProjectSourceV1 } from "../api/v1/schemas";
 import { DesktopProductApp } from "./DesktopProductApp";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./fixtureProvider";
 import type { DesktopProductSnapshot } from "./provider";
@@ -690,6 +691,8 @@ describe("DesktopProductApp", () => {
 
   it("keeps create action identities when profile and project responses are uncertain", async () => {
     provider = createFixtureDesktopProductProvider({ newUser: true });
+    const selectSource = vi.spyOn(provider, "selectProjectSource");
+    const settleSource = vi.spyOn(provider, "settleProjectSource");
     root = await renderProduct(provider);
 
     await clickButton("Add workspace");
@@ -705,8 +708,11 @@ describe("DesktopProductApp", () => {
 
     await clickAria("Create project");
     setInput("Objective", "Keep one project create identity.");
+    await clickButton("Folder snapshot");
+    const pendingAction = selectSource.mock.calls[0]?.[0].actionId;
     provider.failNextProjectCreateWithUnknownError();
     await clickButton("Save");
+    expect(settleSource).toHaveBeenCalledWith(pendingAction, "discard");
     await clickButton("Save");
     expect(provider.projectCreateActionIds()[0]).toBe(provider.projectCreateActionIds()[1]);
   });
@@ -790,13 +796,20 @@ describe("DesktopProductApp", () => {
 
   it("selects and syncs a native folder through opaque source references", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const selectSource = vi.spyOn(provider, "selectProjectSource");
+    const settleSource = vi.spyOn(provider, "settleProjectSource");
     root = await renderProduct(provider);
 
     await clickAria("Project settings");
     await clickButton("Folder snapshot");
+    expect(selectSource).toHaveBeenCalledWith(expect.objectContaining({ projectId: "project-fixture-1" }));
     expect(screenText()).toContain("Selected research folder");
     expect(document.querySelector('input[type="file"]')).toBeNull();
     await clickButton("Save");
+    expect(settleSource).toHaveBeenCalledWith(
+      selectSource.mock.calls[0]?.[0].actionId,
+      "adopt",
+    );
     await clickAria("Project settings");
     await clickButton("Sync snapshot");
     await clickAria("Close settings");
@@ -808,6 +821,168 @@ describe("DesktopProductApp", () => {
       display_name: "Selected research folder",
       import_ref: { import_id: "source-fixture-1" },
     });
+  });
+
+  it("discards pending picker imports on close, reselection, and save failure", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const selectSource = vi.spyOn(provider, "selectProjectSource");
+    const settleSource = vi.spyOn(provider, "settleProjectSource");
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    await clickButton("Folder snapshot");
+    const closedAction = selectSource.mock.calls[0]?.[0].actionId;
+    await clickAria("Close settings");
+    await clickButton("Discard changes");
+    await flush();
+    expect(settleSource).toHaveBeenCalledWith(closedAction, "discard");
+
+    await clickAria("Project settings");
+    await clickButton("Folder snapshot");
+    const replacedAction = selectSource.mock.calls[1]?.[0].actionId;
+    await clickButton("Folder snapshot");
+    expect(settleSource).toHaveBeenCalledWith(replacedAction, "discard");
+
+    provider.failNextProjectSave();
+    const failedAction = selectSource.mock.calls[2]?.[0].actionId;
+    await clickButton("Save");
+    await flush();
+    expect(settleSource).toHaveBeenCalledWith(failedAction, "discard");
+    expect(screenText()).toContain("New workspace");
+  });
+
+  it("keeps the source and dirty state when the native picker is cancelled", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const selectSource = vi.spyOn(provider, "selectProjectSource");
+    selectSource.mockRejectedValueOnce({
+      code: "workspace_selection_cancelled",
+      message: "No research folder was selected.",
+    });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    setInput("Objective", "Keep this dirty draft after cancellation.");
+    expect(button("Save").disabled).toBe(false);
+    await clickButton("Folder snapshot");
+
+    expect(screenText()).toContain("New workspace");
+    expect(screenText()).toContain("Keep this dirty draft after cancellation.");
+    expect(document.querySelector(".form-error")).toBeNull();
+    expect(button("Save").disabled).toBe(false);
+
+    selectSource.mockRejectedValueOnce({
+      code: "workspace_selection_invalid",
+      message: "workspace_selection_cancelled",
+    });
+    await clickButton("Folder snapshot");
+    expect(document.querySelector(".form-error")?.textContent).toBe("The request could not be completed.");
+  });
+
+  it("allows only one native picker request while selection is in flight", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const initialSource = await provider.selectProjectSource({
+      kind: "native_folder_snapshot",
+      projectId: "project-fixture-1",
+      actionId: "source-test-seed",
+      streamEpoch: 1,
+    });
+    root = await renderProduct(provider);
+    await clickAria("Project settings");
+    await clickButton("Folder snapshot");
+    await clickButton("Save");
+    await clickAria("Project settings");
+    setInput("Objective", "Keep controls locked during selection.");
+
+    const pending = deferred<ProjectSourceV1>();
+    const selectSource = vi.spyOn(provider, "selectProjectSource").mockImplementation(() => pending.promise);
+    const folderButton = button("Folder snapshot");
+    await act(async () => {
+      folderButton.click();
+      folderButton.click();
+      await Promise.resolve();
+    });
+
+    expect(selectSource).toHaveBeenCalledTimes(1);
+    expect(button("Scratch").disabled).toBe(true);
+    expect(folderButton.disabled).toBe(true);
+    expect(button("Save").disabled).toBe(true);
+    expect(button("Sync snapshot").disabled).toBe(true);
+    expect(button("Undo").disabled).toBe(true);
+
+    await act(async () => pending.resolve({ ...initialSource, display_name: "Replacement research folder" }));
+    await flush();
+    expect(screenText()).toContain("Replacement research folder");
+    expect(button("Save").disabled).toBe(false);
+  });
+
+  it("cancels an in-flight native ingest and closes without waiting for its original promise", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const pending = deferred<ProjectSourceV1>();
+    const selectSource = vi.spyOn(provider, "selectProjectSource").mockImplementation(() => pending.promise);
+    const cancelSource = vi.spyOn(provider, "cancelProjectSource").mockImplementation(async () => {
+      pending.reject({
+        code: "workspace_selection_cancelled",
+        message: "No research folder was selected.",
+      });
+    });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    setInput("Objective", "Cancel this in-flight snapshot.");
+    await clickElement(button("Folder snapshot"));
+    const actionId = selectSource.mock.calls[0]?.[0].actionId;
+    await clickAria("Close settings");
+    expect(cancelSource).toHaveBeenCalledWith(actionId);
+    await clickButton("Discard changes");
+    await flush();
+
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("ignores a picker completion after a close request and a later selection wins", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const first = deferred<ProjectSourceV1>();
+    const selected = await provider.selectProjectSource({
+      kind: "native_folder_snapshot",
+      projectId: "project-fixture-1",
+      actionId: "source-test-stale",
+      streamEpoch: 1,
+    });
+    const selectSource = vi.spyOn(provider, "selectProjectSource")
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValueOnce({ ...selected, display_name: "Current research folder" });
+    const settleSource = vi.spyOn(provider, "settleProjectSource");
+    const cancelSource = vi.spyOn(provider, "cancelProjectSource");
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    setInput("Objective", "Keep editing after invalidating the first picker.");
+    const folderButton = button("Folder snapshot");
+    await clickElement(folderButton);
+    await clickAria("Close settings");
+    expect(screenText()).toContain("Discard unsaved changes?");
+    expect(cancelSource).toHaveBeenCalledWith(selectSource.mock.calls[0]?.[0].actionId);
+    await clickButton("Keep editing");
+
+    expect(folderButton.disabled).toBe(true);
+    await clickElement(folderButton);
+    expect(selectSource).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("Keep editing after invalidating the first picker.");
+    expect(screenText()).toContain("New workspace");
+    expect(document.querySelector(".form-error")).toBeNull();
+
+    await act(async () => first.resolve({ ...selected, display_name: "Stale research folder" }));
+    await flush();
+    expect(screenText()).not.toContain("Stale research folder");
+    expect(settleSource).toHaveBeenCalledWith(
+      selectSource.mock.calls[0]?.[0].actionId,
+      "discard",
+    );
+
+    expect(folderButton.disabled).toBe(false);
+    await clickButton("Folder snapshot");
+    expect(screenText()).toContain("Current research folder");
+    expect(selectSource).toHaveBeenCalledTimes(2);
   });
 
   it("keeps dirty drawer drafts until Escape, overlay, or close is confirmed", async () => {
@@ -1002,10 +1177,13 @@ function relabelLogs(
 function deferred<T>(): {
   readonly promise: Promise<T>;
   readonly resolve: (value: T) => void;
+  readonly reject: (reason?: unknown) => void;
 } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
-    resolve = done;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }

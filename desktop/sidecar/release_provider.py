@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import logging
 import re
 import sqlite3
 from threading import Lock
@@ -27,11 +28,13 @@ from desktop.sidecar.contracts.v1.models import (
     LocalOperationV1,
     ProjectCreateV1,
     ProjectPatchV1,
+    ProjectSourceV1,
     ProjectV1,
     RemoteProfileCreateV1,
     RemoteProfilePatchV1,
     RemoteProfileV1,
     VersionV1,
+    WorkspaceImportRefV1,
 )
 from desktop.sidecar.provider_store import (
     DesktopProviderStore,
@@ -48,9 +51,16 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteLifecycleSupersededError,
 )
 from openevo.backend.contracts.v1.models import ErrorCategory, ErrorSeverity, RepairAction
+from desktop.sidecar.workspace_identity import ownership_for_native_import
+from desktop.sidecar.workspace_imports import (
+    WorkspaceImportError,
+    WorkspaceImportOwnership,
+    WorkspaceImportStore,
+)
 
 
 NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProviderCapabilityUnavailableError(Exception):
@@ -91,6 +101,7 @@ class DesktopReleaseProvider:
     def __init__(
         self,
         store: DesktopProviderStore,
+        workspace_import_store: WorkspaceImportStore,
         *,
         build_version: str,
         source_commit: str,
@@ -105,6 +116,7 @@ class DesktopReleaseProvider:
         if type(readiness_key) is not bytes or len(readiness_key) != 32:
             raise ValueError("native readiness key must contain exactly 32 bytes")
         self._store = store
+        self._workspace_import_store = workspace_import_store
         self._remote_lifecycle = remote_lifecycle
         self._connection_state_lock = Lock()
         self._connection_generation = 0
@@ -116,6 +128,7 @@ class DesktopReleaseProvider:
         self._instance_id = instance_id
         self._readiness_key = readiness_key
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._reconcile_workspace_imports()
         self._version = VersionV1(
             openapi_sha256=DESKTOP_OPENAPI_SHA256,
             build_version=build_version,
@@ -147,7 +160,14 @@ class DesktopReleaseProvider:
         try:
             self._remote_lifecycle.close()
         finally:
-            self._store.close()
+            try:
+                self._store.close()
+            finally:
+                self._workspace_import_store.close()
+
+    @property
+    def workspace_import_store(self) -> WorkspaceImportStore:
+        return self._workspace_import_store
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handler = self._handlers.get(operation_id)
@@ -737,10 +757,14 @@ class DesktopReleaseProvider:
         )
 
     def _create_project(self, arguments: Mapping[str, object]) -> Response:
-        project = self._store.create_project(
-            cast(ProjectCreateV1, arguments["request"]),
-            idempotency_key=cast(str, arguments["idempotency_key"]),
-        )
+        request = cast(ProjectCreateV1, arguments["request"])
+        with self._store.workspace_import_reference_guard():
+            self._verify_project_source(request.source, project_id=None)
+            project = self._store.create_project(
+                request,
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
+            self._adopt_project_source(project.source, project_id=project.project_id)
         return self._resource_response(project, status_code=201)
 
     def _get_project(self, arguments: Mapping[str, object]) -> Response:
@@ -748,18 +772,31 @@ class DesktopReleaseProvider:
         return self._resource_response(project)
 
     def _update_project(self, arguments: Mapping[str, object]) -> Response:
-        project = self._store.patch_project(
-            cast(str, arguments["project_id"]),
-            cast(ProjectPatchV1, arguments["request"]),
-            if_match=cast(str, arguments["if_match"]),
-        )
+        project_id = cast(str, arguments["project_id"])
+        request = cast(ProjectPatchV1, arguments["request"])
+        with self._store.workspace_import_reference_guard():
+            previous = self._store.get_project(project_id)
+            if request.source is not None:
+                self._verify_project_source(request.source, project_id=project_id)
+            project = self._store.patch_project(
+                project_id,
+                request,
+                if_match=cast(str, arguments["if_match"]),
+            )
+            self._adopt_project_source(project.source, project_id=project_id)
+        if previous.source.import_ref != project.source.import_ref:
+            self._release_project_source(previous.source, project_id=project_id)
         return self._resource_response(project)
 
     def _delete_project(self, arguments: Mapping[str, object]) -> Response:
-        self._store.delete_project(
-            cast(str, arguments["project_id"]),
-            if_match=cast(str, arguments["if_match"]),
-        )
+        project_id = cast(str, arguments["project_id"])
+        with self._store.workspace_import_reference_guard():
+            project = self._store.get_project(project_id)
+            self._store.delete_project(
+                project_id,
+                if_match=cast(str, arguments["if_match"]),
+            )
+        self._release_project_source(project.source, project_id=project_id)
         return Response(status_code=204)
 
     def _timestamp(self) -> str:
@@ -768,6 +805,107 @@ class DesktopReleaseProvider:
             raise ValueError("provider clock must return a timezone-aware datetime")
         return (
             now.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        )
+
+    def _verify_project_source(
+        self, source: ProjectSourceV1, *, project_id: str | None
+    ) -> None:
+        if source.kind != "native_folder_snapshot":
+            return
+        import_ref = source.import_ref
+        if import_ref is None:
+            raise ValueError("native folder source requires an import reference")
+        self._workspace_import_store.verify(
+            import_ref,
+            ownership=ownership_for_native_import(import_ref, project_id=project_id),
+        )
+
+    def _reconcile_workspace_imports(self) -> None:
+        with self._store.workspace_import_reference_guard():
+            references = self._workspace_import_references()
+            self._workspace_import_store.reconcile_references(references)
+
+    def discard_pending_workspace_import(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        *,
+        project_id: str | None,
+        lease_token: str,
+    ) -> None:
+        """Discard one native picker lease unless durable project state references it."""
+
+        requested_ownership = ownership_for_native_import(
+            import_ref,
+            project_id=project_id,
+        )
+        with self._store.workspace_import_reference_guard():
+            references = self._workspace_import_references()
+            durable = references.get(import_ref.import_id)
+            if durable is not None:
+                durable_ref, durable_ownership = durable
+                if durable_ref != import_ref or durable_ownership != requested_ownership:
+                    raise WorkspaceImportError(
+                        "workspace import durable reference conflicts with pending lease"
+                    )
+                self._workspace_import_store.adopt_pending(
+                    durable_ref,
+                    ownership=durable_ownership,
+                )
+                return
+            self._workspace_import_store.discard_pending(
+                import_ref,
+                ownership=requested_ownership,
+                lease_token=lease_token,
+            )
+
+    def _workspace_import_references(
+        self,
+    ) -> dict[str, tuple[WorkspaceImportRefV1, WorkspaceImportOwnership]]:
+        references: dict[str, tuple[WorkspaceImportRefV1, WorkspaceImportOwnership]] = {}
+        for project_id, source in self._store.native_workspace_sources():
+            import_ref = source.import_ref
+            if import_ref is None:
+                raise ValueError("native folder source requires an import reference")
+            if import_ref.import_id in references:
+                raise ValueError("workspace import is referenced by multiple projects")
+            references[import_ref.import_id] = (
+                import_ref,
+                ownership_for_native_import(import_ref, project_id=project_id),
+            )
+        return references
+
+    def _release_project_source(self, source: ProjectSourceV1, *, project_id: str) -> None:
+        if source.kind != "native_folder_snapshot" or source.import_ref is None:
+            return
+        try:
+            with self._store.workspace_import_reference_guard():
+                references = self._workspace_import_references()
+                if source.import_ref.import_id in references:
+                    return
+                self._workspace_import_store.release(
+                    source.import_ref,
+                    ownership=ownership_for_native_import(
+                        source.import_ref,
+                        project_id=project_id,
+                    ),
+                )
+        except (OSError, WorkspaceImportError):
+            # The project transaction is already durable. Startup reconciliation
+            # retries cleanup and fails closed if referenced storage is damaged.
+            _LOGGER.warning(
+                "deferred workspace import cleanup after committed project mutation",
+                extra={"project_id": project_id},
+            )
+
+    def _adopt_project_source(self, source: ProjectSourceV1, *, project_id: str) -> None:
+        if source.kind != "native_folder_snapshot" or source.import_ref is None:
+            return
+        self._workspace_import_store.adopt_pending(
+            source.import_ref,
+            ownership=ownership_for_native_import(
+                source.import_ref,
+                project_id=project_id,
+            ),
         )
 
     @staticmethod

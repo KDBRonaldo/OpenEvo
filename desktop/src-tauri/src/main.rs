@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
@@ -20,6 +21,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
 use tempfile::TempDir;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -32,7 +34,11 @@ const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
+const NATIVE_WORKSPACE_IMPORT_ROUTE: &str = "/openevo-native/workspace-imports";
+const NATIVE_WORKSPACE_CANCEL_ROUTE: &str = "/openevo-native/workspace-imports/cancel";
+const NATIVE_WORKSPACE_DISCARD_ROUTE: &str = "/openevo-native/workspace-imports/discard";
 const NATIVE_SESSION_HEADER: &str = "X-OpenEvo-Desktop-Session";
+const NATIVE_HANDOFF_HEADER: &str = "X-OpenEvo-Native-Handoff";
 const NATIVE_EXECUTABLE_FD_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_FD";
 const NATIVE_EXECUTABLE_PATH_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_PATH";
 const PYINSTALLER_PRIVATE_ENV_PREFIX: &[u8] = b"_PYI_";
@@ -42,11 +48,20 @@ const INHERITED_EXECUTABLE_FD: libc::c_int = 4;
 const INSTANCE_ID_BYTES: usize = 16;
 const READINESS_KEY_BYTES: usize = 32;
 const SESSION_TOKEN_BYTES: usize = 32;
+const HANDOFF_TOKEN_BYTES: usize = 32;
+const WORKSPACE_CANCELLATION_TOKEN_BYTES: usize = 32;
 const NATIVE_INSTANCE_FRAME_MAX_BYTES: usize = 512;
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SIDECAR_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const SIDECAR_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
+const NATIVE_WORKSPACE_RESPONSE_MAX_BYTES: usize = 8192;
+const NATIVE_WORKSPACE_IMPORT_TIMEOUT: Duration = Duration::from_secs(300);
+const NATIVE_WORKSPACE_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
+const NATIVE_WORKSPACE_CANCEL_GRACE: Duration = Duration::from_secs(3);
+const NATIVE_WORKSPACE_IO_POLL: Duration = Duration::from_millis(50);
+const MAX_PENDING_WORKSPACE_IMPORTS: usize = 64;
+const MAX_CANCELLED_PICKER_ACTIONS: usize = 64;
 const SIDECAR_TERM_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -428,6 +443,7 @@ struct NativeInstanceCredential {
     instance_id: [u8; INSTANCE_ID_BYTES],
     readiness_key: [u8; READINESS_KEY_BYTES],
     session_token: [u8; SESSION_TOKEN_BYTES],
+    handoff_token: [u8; HANDOFF_TOKEN_BYTES],
 }
 
 struct EncodedSecret(String);
@@ -456,6 +472,7 @@ struct NativeInstanceFrame<'a> {
     instance_id: &'a str,
     readiness_key: &'a str,
     session_token: &'a str,
+    handoff_token: &'a str,
 }
 
 impl NativeInstanceCredential {
@@ -463,6 +480,7 @@ impl NativeInstanceCredential {
         let mut instance_id = [0_u8; INSTANCE_ID_BYTES];
         let mut readiness_key = [0_u8; READINESS_KEY_BYTES];
         let mut session_token = [0_u8; SESSION_TOKEN_BYTES];
+        let mut handoff_token = [0_u8; HANDOFF_TOKEN_BYTES];
         OsRng
             .try_fill_bytes(&mut instance_id)
             .map_err(|_| instance_credential_error())?;
@@ -472,10 +490,14 @@ impl NativeInstanceCredential {
         OsRng
             .try_fill_bytes(&mut session_token)
             .map_err(|_| instance_credential_error())?;
+        OsRng
+            .try_fill_bytes(&mut handoff_token)
+            .map_err(|_| instance_credential_error())?;
         Ok(Self {
             instance_id,
             readiness_key,
             session_token,
+            handoff_token,
         })
     }
 
@@ -488,11 +510,13 @@ impl NativeInstanceCredential {
         let instance_id = self.instance_id_hex();
         let readiness_key = EncodedSecret::new(&self.readiness_key);
         let session_token = EncodedSecret::new(&self.session_token);
+        let handoff_token = EncodedSecret::new(&self.handoff_token);
         let frame = NativeInstanceFrame {
             protocol: NATIVE_SIDECAR_PROTOCOL,
             instance_id: &instance_id,
             readiness_key: readiness_key.expose(),
             session_token: session_token.expose(),
+            handoff_token: handoff_token.expose(),
         };
         let mut encoded = serde_json::to_vec(&frame).map_err(|_| instance_channel_error())?;
         encoded.push(b'\n');
@@ -511,6 +535,13 @@ impl NativeInstanceCredential {
             [0_u8; SESSION_TOKEN_BYTES],
         ))
     }
+
+    fn take_handoff_credential(&mut self) -> HandoffCredential {
+        HandoffCredential(std::mem::replace(
+            &mut self.handoff_token,
+            [0_u8; HANDOFF_TOKEN_BYTES],
+        ))
+    }
 }
 
 impl Drop for NativeInstanceCredential {
@@ -518,11 +549,13 @@ impl Drop for NativeInstanceCredential {
         self.instance_id.fill(0);
         self.readiness_key.fill(0);
         self.session_token.fill(0);
+        self.handoff_token.fill(0);
     }
 }
 
 struct SessionCredential([u8; SESSION_TOKEN_BYTES]);
 struct ReadinessCredential([u8; READINESS_KEY_BYTES]);
+struct HandoffCredential([u8; HANDOFF_TOKEN_BYTES]);
 
 impl SessionCredential {
     fn expose(&self) -> String {
@@ -537,6 +570,18 @@ impl Drop for SessionCredential {
 }
 
 impl Drop for ReadinessCredential {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+impl HandoffCredential {
+    fn expose(&self) -> EncodedSecret {
+        EncodedSecret::new(&self.0)
+    }
+}
+
+impl Drop for HandoffCredential {
     fn drop(&mut self) {
         self.0.fill(0);
     }
@@ -576,6 +621,120 @@ struct HostStatus {
     state: String,
 }
 
+#[derive(Debug, Serialize)]
+struct NativeWorkspaceImportRequest<'a> {
+    schema_version: &'static str,
+    kind: &'static str,
+    action_id: &'a str,
+    selected_path: &'a str,
+    selected_device: u64,
+    selected_inode: u64,
+    cancellation_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeWorkspaceCancelRequestV1<'a> {
+    schema_version: &'static str,
+    action_id: &'a str,
+    cancellation_token: &'a str,
+}
+
+struct NativeWorkspaceSelection<'a> {
+    kind: &'a str,
+    action_id: &'a str,
+    selected_path: &'a Path,
+    selected_device: u64,
+    selected_inode: u64,
+    project_id: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeWorkspaceImportRefV1 {
+    import_id: String,
+    content_sha256: String,
+    byte_size: u64,
+    entry_count: u64,
+    extracted_byte_size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeProjectSourceV1 {
+    kind: String,
+    display_name: String,
+    import_ref: NativeWorkspaceImportRefV1,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeWorkspaceImportResponseV1 {
+    schema_version: String,
+    source: NativeProjectSourceV1,
+    lease_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeWorkspaceDiscardRequestV1<'a> {
+    schema_version: &'static str,
+    action_id: &'a str,
+    import_ref: &'a NativeWorkspaceImportRefV1,
+    lease_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingNativeWorkspaceImport {
+    sidecar_instance: [u8; INSTANCE_ID_BYTES],
+    action_id: String,
+    project_id: Option<String>,
+    source: NativeProjectSourceV1,
+    lease_token: String,
+}
+
+struct NativePickerOperation {
+    sidecar_instance: [u8; INSTANCE_ID_BYTES],
+    action_id: String,
+    cancellation_token: [u8; WORKSPACE_CANCELLATION_TOKEN_BYTES],
+    cancelled: AtomicBool,
+}
+
+impl NativePickerOperation {
+    fn generate(sidecar_instance: [u8; INSTANCE_ID_BYTES], action_id: String) -> HostResult<Self> {
+        let mut cancellation_token = [0_u8; WORKSPACE_CANCELLATION_TOKEN_BYTES];
+        OsRng
+            .try_fill_bytes(&mut cancellation_token)
+            .map_err(|_| workspace_import_error())?;
+        Ok(Self {
+            sidecar_instance,
+            action_id,
+            cancellation_token,
+            cancelled: AtomicBool::new(false),
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn encoded_cancellation_token(&self) -> EncodedSecret {
+        EncodedSecret::new(&self.cancellation_token)
+    }
+}
+
+impl Drop for NativePickerOperation {
+    fn drop(&mut self) {
+        self.cancellation_token.fill(0);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct LifecycleStatus {
     state: String,
@@ -587,6 +746,7 @@ struct LifecycleStatus {
 struct SidecarBootstrapState {
     session_credential: SessionCredential,
     readiness_credential: ReadinessCredential,
+    handoff_credential: HandoffCredential,
     negotiated_contract: NegotiatedContractV1,
 }
 
@@ -676,6 +836,9 @@ struct DesktopHostStateInner {
     cancellation_epoch: AtomicU64,
     launch_state: AtomicU64,
     shutdown_requested: AtomicBool,
+    active_picker: Mutex<Option<Arc<NativePickerOperation>>>,
+    cancelled_picker_actions: Mutex<VecDeque<String>>,
+    pending_workspace_imports: Mutex<HashMap<String, PendingNativeWorkspaceImport>>,
 }
 
 #[derive(Clone)]
@@ -699,6 +862,9 @@ impl Default for DesktopHostState {
             cancellation_epoch: AtomicU64::new(0),
             launch_state: AtomicU64::new(encode_launch_state(0, LaunchPhase::Idle)),
             shutdown_requested: AtomicBool::new(false),
+            active_picker: Mutex::new(None),
+            cancelled_picker_actions: Mutex::new(VecDeque::new()),
+            pending_workspace_imports: Mutex::new(HashMap::new()),
         }))
     }
 }
@@ -766,6 +932,97 @@ impl Drop for StartupClaim<'_> {
     fn drop(&mut self) {
         self.in_progress.store(false, Ordering::Release);
     }
+}
+
+struct PickerClaim {
+    state: DesktopHostState,
+    operation: Arc<NativePickerOperation>,
+}
+
+impl PickerClaim {
+    fn acquire(
+        state: &DesktopHostState,
+        action_id: String,
+        sidecar_instance: [u8; INSTANCE_ID_BYTES],
+    ) -> HostResult<Self> {
+        if !is_valid_native_text(&action_id) || action_id.len() < 16 {
+            return Err(workspace_selection_error());
+        }
+        let mut active = state
+            .active_picker
+            .lock()
+            .map_err(|_| workspace_import_error())?;
+        if active.is_some() {
+            return Err(NativeHostError::new(
+                "workspace_selection_in_progress",
+                "OpenEvo Desktop is already selecting a research folder.",
+            ));
+        }
+        let mut cancelled = state
+            .cancelled_picker_actions
+            .lock()
+            .map_err(|_| workspace_import_error())?;
+        if let Some(index) = cancelled.iter().position(|pending| pending == &action_id) {
+            cancelled.remove(index);
+            return Err(workspace_selection_cancelled_error());
+        }
+        let operation = Arc::new(NativePickerOperation::generate(
+            sidecar_instance,
+            action_id,
+        )?);
+        *active = Some(operation.clone());
+        Ok(Self {
+            state: state.clone(),
+            operation,
+        })
+    }
+}
+
+impl Drop for PickerClaim {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active_picker.lock() {
+            if active
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.operation))
+            {
+                *active = None;
+            }
+        }
+    }
+}
+
+fn cancel_active_picker(
+    state: &DesktopHostState,
+    action_id: &str,
+) -> HostResult<Option<Arc<NativePickerOperation>>> {
+    if !is_valid_native_text(action_id) || action_id.len() < 16 {
+        return Err(workspace_selection_error());
+    }
+    let mut active = state
+        .active_picker
+        .lock()
+        .map_err(|_| workspace_import_error())?;
+    if active
+        .as_ref()
+        .is_some_and(|operation| operation.action_id == action_id)
+    {
+        let operation = active
+            .take()
+            .expect("active picker disappeared while locked");
+        operation.cancel();
+        return Ok(Some(operation));
+    }
+    let mut cancelled = state
+        .cancelled_picker_actions
+        .lock()
+        .map_err(|_| workspace_import_error())?;
+    if !cancelled.iter().any(|pending| pending == action_id) {
+        if cancelled.len() == MAX_CANCELLED_PICKER_ACTIONS {
+            cancelled.pop_front();
+        }
+        cancelled.push_back(action_id.to_string());
+    }
+    Ok(None)
 }
 
 #[derive(Deserialize)]
@@ -2136,9 +2393,22 @@ fn pre_exec_error() -> std::io::Error {
     std::io::Error::from_raw_os_error(libc::EIO)
 }
 
+#[derive(Debug)]
 struct LoopbackHttpResponse {
     status: u16,
     body: String,
+}
+
+struct ActiveSidecarConnection {
+    stream: TcpStream,
+    handoff_token: EncodedSecret,
+}
+
+struct SelectedDirectory {
+    _descriptor: File,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
 fn loopback_http_get(
@@ -2146,38 +2416,246 @@ fn loopback_http_get(
     path: &str,
     header: Option<(&str, &str)>,
 ) -> HostResult<LoopbackHttpResponse> {
+    loopback_http_request(
+        port,
+        "GET",
+        path,
+        header,
+        None,
+        SIDECAR_HEALTH_CONNECT_TIMEOUT,
+        SIDECAR_HEALTH_RESPONSE_MAX_BYTES,
+    )
+}
+
+fn loopback_http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    header: Option<(&str, &str)>,
+    body: Option<&[u8]>,
+    timeout: Duration,
+    response_limit: usize,
+) -> HostResult<LoopbackHttpResponse> {
+    if !matches!(method, "GET" | "POST")
+        || !path.starts_with('/')
+        || path.contains(['\r', '\n'])
+        || header.is_some_and(|(name, value)| {
+            name.is_empty() || name.contains([':', '\r', '\n']) || value.contains(['\r', '\n'])
+        })
+        || response_limit == 0
+    {
+        return Err(sidecar_health_error());
+    }
+    let deadline = Instant::now() + timeout;
+    let mut stream = connect_loopback_until(port, deadline)?;
+    loopback_http_request_on_stream(
+        &mut stream,
+        method,
+        path,
+        header,
+        body,
+        deadline,
+        response_limit,
+    )
+}
+
+fn connect_loopback_until(port: u16, deadline: Instant) -> HostResult<TcpStream> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, SIDECAR_HEALTH_CONNECT_TIMEOUT)
-        .map_err(|_| sidecar_health_error())?;
-    stream
-        .set_read_timeout(Some(SIDECAR_HEALTH_CONNECT_TIMEOUT))
-        .map_err(|_| sidecar_health_error())?;
-    stream
-        .set_write_timeout(Some(SIDECAR_HEALTH_CONNECT_TIMEOUT))
-        .map_err(|_| sidecar_health_error())?;
+    TcpStream::connect_timeout(&addr, remaining_deadline(deadline)?)
+        .map_err(|_| sidecar_health_error())
+}
+
+fn remaining_deadline(deadline: Instant) -> HostResult<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(sidecar_health_error)
+}
+
+fn cancellation_aware_timeout(
+    deadline: Instant,
+    operation: Option<&NativePickerOperation>,
+    cancellation_deadline: &mut Option<Instant>,
+) -> HostResult<Duration> {
+    if operation.is_some_and(NativePickerOperation::is_cancelled) && cancellation_deadline.is_none()
+    {
+        *cancellation_deadline = Some(Instant::now() + NATIVE_WORKSPACE_CANCEL_GRACE);
+    }
+    let effective_deadline = cancellation_deadline
+        .map(|cancelled| deadline.min(cancelled))
+        .unwrap_or(deadline);
+    let remaining = remaining_deadline(effective_deadline)?;
+    Ok(if operation.is_some() {
+        remaining.min(NATIVE_WORKSPACE_IO_POLL)
+    } else {
+        remaining
+    })
+}
+
+fn write_all_until_with_cancellation(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    operation: Option<&NativePickerOperation>,
+    cancellation_deadline: &mut Option<Instant>,
+) -> HostResult<()> {
+    while !bytes.is_empty() {
+        stream
+            .set_write_timeout(Some(cancellation_aware_timeout(
+                deadline,
+                operation,
+                cancellation_deadline,
+            )?))
+            .map_err(|_| sidecar_health_error())?;
+        let written = match stream.write(bytes) {
+            Ok(written) => written,
+            Err(error)
+                if operation.is_some()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                continue;
+            }
+            Err(_) => return Err(sidecar_health_error()),
+        };
+        if written == 0 {
+            return Err(sidecar_health_error());
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+fn read_until_with_cancellation(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    operation: Option<&NativePickerOperation>,
+    cancellation_deadline: &mut Option<Instant>,
+) -> HostResult<usize> {
+    loop {
+        stream
+            .set_read_timeout(Some(cancellation_aware_timeout(
+                deadline,
+                operation,
+                cancellation_deadline,
+            )?))
+            .map_err(|_| sidecar_health_error())?;
+        match stream.read(buffer) {
+            Ok(read) => return Ok(read),
+            Err(error)
+                if operation.is_some()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+            Err(_) => return Err(sidecar_health_error()),
+        }
+    }
+}
+
+fn loopback_http_request_on_stream(
+    stream: &mut TcpStream,
+    method: &str,
+    path: &str,
+    header: Option<(&str, &str)>,
+    body: Option<&[u8]>,
+    deadline: Instant,
+    response_limit: usize,
+) -> HostResult<LoopbackHttpResponse> {
+    loopback_http_request_on_stream_with_cancellation(
+        stream,
+        method,
+        path,
+        header,
+        body,
+        deadline,
+        response_limit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loopback_http_request_on_stream_with_cancellation(
+    stream: &mut TcpStream,
+    method: &str,
+    path: &str,
+    header: Option<(&str, &str)>,
+    body: Option<&[u8]>,
+    deadline: Instant,
+    response_limit: usize,
+    operation: Option<&NativePickerOperation>,
+) -> HostResult<LoopbackHttpResponse> {
+    if !matches!(method, "GET" | "POST")
+        || !path.starts_with('/')
+        || path.contains(['\r', '\n'])
+        || header.is_some_and(|(name, value)| {
+            name.is_empty() || name.contains([':', '\r', '\n']) || value.contains(['\r', '\n'])
+        })
+        || response_limit == 0
+    {
+        return Err(sidecar_health_error());
+    }
     let extra_header = header
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .unwrap_or_default();
+    let body = body.unwrap_or_default();
+    let content_headers = if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_header}Connection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_header}{content_headers}Connection: close\r\n\r\n"
     );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|_| sidecar_health_error())?;
-    let mut response = Vec::new();
-    stream
-        .take((SIDECAR_HEALTH_RESPONSE_MAX_BYTES + 1) as u64)
-        .read_to_end(&mut response)
-        .map_err(|_| sidecar_health_error())?;
-    if response.len() > SIDECAR_HEALTH_RESPONSE_MAX_BYTES {
-        return Err(sidecar_health_error());
+    let mut cancellation_deadline = None;
+    write_all_until_with_cancellation(
+        stream,
+        request.as_bytes(),
+        deadline,
+        operation,
+        &mut cancellation_deadline,
+    )?;
+    if !body.is_empty() {
+        write_all_until_with_cancellation(
+            stream,
+            body,
+            deadline,
+            operation,
+            &mut cancellation_deadline,
+        )?;
     }
-    let response = String::from_utf8(response).map_err(|_| sidecar_health_error())?;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(sidecar_health_error)?;
-    let mut status_fields = headers
-        .lines()
+
+    let mut response = Vec::with_capacity(response_limit.min(4096));
+    let header_end = loop {
+        if let Some(index) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+        if response.len() >= response_limit {
+            return Err(sidecar_health_error());
+        }
+        let mut chunk = [0_u8; 1024];
+        let read = read_until_with_cancellation(
+            stream,
+            &mut chunk,
+            deadline,
+            operation,
+            &mut cancellation_deadline,
+        )?;
+        if read == 0 || response.len().saturating_add(read) > response_limit {
+            return Err(sidecar_health_error());
+        }
+        response.extend_from_slice(&chunk[..read]);
+    };
+    let headers =
+        std::str::from_utf8(&response[..header_end - 4]).map_err(|_| sidecar_health_error())?;
+    let mut lines = headers.split("\r\n");
+    let mut status_fields = lines
         .next()
         .ok_or_else(sidecar_health_error)?
         .split_whitespace();
@@ -2189,9 +2667,56 @@ fn loopback_http_get(
     if protocol != "HTTP/1.1" && protocol != "HTTP/1.0" {
         return Err(sidecar_health_error());
     }
+
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line.split_once(':').ok_or_else(sidecar_health_error)?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(sidecar_health_error());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() || value.trim().is_empty() {
+                return Err(sidecar_health_error());
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| sidecar_health_error())?,
+            );
+        }
+    }
+    let content_length = match content_length {
+        Some(content_length) => content_length,
+        None if status == 204 => 0,
+        None => return Err(sidecar_health_error()),
+    };
+    if content_length > response_limit.saturating_sub(header_end) {
+        return Err(sidecar_health_error());
+    }
+    let mut response_body = response.split_off(header_end);
+    if response_body.len() > content_length {
+        return Err(sidecar_health_error());
+    }
+    while response_body.len() < content_length {
+        let remaining = content_length - response_body.len();
+        let mut chunk = [0_u8; 1024];
+        let chunk_limit = remaining.min(chunk.len());
+        let read = read_until_with_cancellation(
+            stream,
+            &mut chunk[..chunk_limit],
+            deadline,
+            operation,
+            &mut cancellation_deadline,
+        )?;
+        if read == 0 {
+            return Err(sidecar_health_error());
+        }
+        response_body.extend_from_slice(&chunk[..read]);
+    }
     Ok(LoopbackHttpResponse {
         status,
-        body: body.to_string(),
+        body: String::from_utf8(response_body).map_err(|_| sidecar_health_error())?,
     })
 }
 
@@ -2324,6 +2849,303 @@ fn check_sidecar_session_binding(port: u16, session_token: &str) -> HostResult<(
     Ok(())
 }
 
+fn register_native_workspace_source(
+    stream: &mut TcpStream,
+    handoff_token: &str,
+    selection: NativeWorkspaceSelection<'_>,
+    operation: &NativePickerOperation,
+) -> HostResult<NativeWorkspaceImportResponseV1> {
+    if selection.kind != "native_folder_snapshot"
+        || selection.action_id.len() < 16
+        || selection.action_id.len() > 256
+        || selection.action_id.trim() != selection.action_id
+        || selection
+            .action_id
+            .chars()
+            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+        || selection.selected_inode == 0
+        || selection
+            .project_id
+            .is_some_and(|value| !is_valid_native_text(value))
+        || selection.action_id != operation.action_id
+    {
+        return Err(workspace_selection_error());
+    }
+    let selected_path = selection
+        .selected_path
+        .to_str()
+        .ok_or_else(workspace_selection_error)?;
+    let cancellation_token = operation.encoded_cancellation_token();
+    let request = NativeWorkspaceImportRequest {
+        schema_version: "1",
+        kind: "native_folder_snapshot",
+        action_id: selection.action_id,
+        selected_path,
+        selected_device: selection.selected_device,
+        selected_inode: selection.selected_inode,
+        cancellation_token: cancellation_token.expose(),
+        project_id: selection.project_id,
+    };
+    let body = serde_json::to_vec(&request).map_err(|_| workspace_import_error())?;
+    let response = loopback_http_request_on_stream_with_cancellation(
+        stream,
+        "POST",
+        NATIVE_WORKSPACE_IMPORT_ROUTE,
+        Some((NATIVE_HANDOFF_HEADER, handoff_token)),
+        Some(&body),
+        Instant::now() + NATIVE_WORKSPACE_IMPORT_TIMEOUT,
+        NATIVE_WORKSPACE_RESPONSE_MAX_BYTES,
+        Some(operation),
+    )
+    .map_err(|_| {
+        if operation.is_cancelled() {
+            workspace_selection_cancelled_error()
+        } else {
+            workspace_import_error()
+        }
+    })?;
+    if response.status != 201 {
+        return Err(if operation.is_cancelled() {
+            workspace_selection_cancelled_error()
+        } else {
+            workspace_import_error()
+        });
+    }
+    let pending: NativeWorkspaceImportResponseV1 =
+        serde_json::from_str(&response.body).map_err(|_| workspace_import_error())?;
+    if pending.schema_version != "1"
+        || pending.lease_token.len() != 64
+        || !pending.lease_token.bytes().all(is_lower_hex)
+    {
+        return Err(workspace_import_error());
+    }
+    validate_native_project_source(&pending.source)?;
+    Ok(pending)
+}
+
+fn cancel_native_workspace_operation(
+    stream: &mut TcpStream,
+    handoff_token: &str,
+    operation: &NativePickerOperation,
+) -> HostResult<()> {
+    let cancellation_token = operation.encoded_cancellation_token();
+    let body = serde_json::to_vec(&NativeWorkspaceCancelRequestV1 {
+        schema_version: "1",
+        action_id: &operation.action_id,
+        cancellation_token: cancellation_token.expose(),
+    })
+    .map_err(|_| workspace_import_error())?;
+    let response = loopback_http_request_on_stream(
+        stream,
+        "POST",
+        NATIVE_WORKSPACE_CANCEL_ROUTE,
+        Some((NATIVE_HANDOFF_HEADER, handoff_token)),
+        Some(&body),
+        Instant::now() + NATIVE_WORKSPACE_CANCEL_TIMEOUT,
+        NATIVE_WORKSPACE_RESPONSE_MAX_BYTES,
+    )
+    .map_err(|_| workspace_import_error())?;
+    if response.status != 204 || !response.body.is_empty() {
+        return Err(workspace_import_error());
+    }
+    Ok(())
+}
+
+fn discard_native_workspace_source(
+    stream: &mut TcpStream,
+    handoff_token: &str,
+    pending: &PendingNativeWorkspaceImport,
+) -> HostResult<()> {
+    let body = serde_json::to_vec(&NativeWorkspaceDiscardRequestV1 {
+        schema_version: "1",
+        action_id: &pending.action_id,
+        import_ref: &pending.source.import_ref,
+        lease_token: &pending.lease_token,
+        project_id: pending.project_id.as_deref(),
+    })
+    .map_err(|_| workspace_import_error())?;
+    let response = loopback_http_request_on_stream(
+        stream,
+        "POST",
+        NATIVE_WORKSPACE_DISCARD_ROUTE,
+        Some((NATIVE_HANDOFF_HEADER, handoff_token)),
+        Some(&body),
+        Instant::now() + NATIVE_WORKSPACE_IMPORT_TIMEOUT,
+        NATIVE_WORKSPACE_RESPONSE_MAX_BYTES,
+    )
+    .map_err(|_| workspace_import_error())?;
+    if response.status != 204 || !response.body.is_empty() {
+        return Err(workspace_import_error());
+    }
+    Ok(())
+}
+
+fn validate_native_project_source(source: &NativeProjectSourceV1) -> HostResult<()> {
+    let import = &source.import_ref;
+    let import_suffix = import
+        .import_id
+        .strip_prefix("workspace-import-")
+        .ok_or_else(workspace_import_error)?;
+    if source.kind != "native_folder_snapshot"
+        || source.display_name.is_empty()
+        || source.display_name.len() > 256
+        || source.display_name.trim() != source.display_name
+        || matches!(source.display_name.as_str(), "." | "..")
+        || source.display_name.contains(['/', '\\'])
+        || source
+            .display_name
+            .chars()
+            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+        || import_suffix.len() != 48
+        || !import_suffix.bytes().all(is_lower_hex)
+        || import.content_sha256.len() != 64
+        || !import.content_sha256.bytes().all(is_lower_hex)
+        || !(1024..=16 * 1024 * 1024 * 1024).contains(&import.byte_size)
+        || !import.byte_size.is_multiple_of(512)
+        || import.entry_count > 100_000
+        || import.extracted_byte_size > 16 * 1024 * 1024 * 1024
+        || (import.entry_count == 0 && import.extracted_byte_size != 0)
+    {
+        return Err(workspace_import_error());
+    }
+    Ok(())
+}
+
+fn remember_pending_workspace_import(
+    state: &DesktopHostState,
+    pending: PendingNativeWorkspaceImport,
+) -> HostResult<()> {
+    let mut imports = state
+        .pending_workspace_imports
+        .lock()
+        .map_err(|_| workspace_import_error())?;
+    imports.retain(|_, value| value.sidecar_instance == pending.sidecar_instance);
+    if let Some(existing) = imports.get(&pending.action_id) {
+        return if existing == &pending {
+            Ok(())
+        } else {
+            Err(workspace_import_error())
+        };
+    }
+    if imports.len() >= MAX_PENDING_WORKSPACE_IMPORTS {
+        return Err(workspace_import_error());
+    }
+    imports.insert(pending.action_id.clone(), pending);
+    Ok(())
+}
+
+fn take_pending_workspace_import(
+    state: &DesktopHostState,
+    action_id: &str,
+) -> HostResult<Option<PendingNativeWorkspaceImport>> {
+    if !is_valid_native_text(action_id) || action_id.len() < 16 {
+        return Err(workspace_selection_error());
+    }
+    let pending = state
+        .pending_workspace_imports
+        .lock()
+        .map_err(|_| workspace_import_error())?
+        .remove(action_id);
+    Ok(pending)
+}
+
+fn restore_pending_workspace_import(
+    state: &DesktopHostState,
+    pending: PendingNativeWorkspaceImport,
+) {
+    if let Ok(mut imports) = state.pending_workspace_imports.lock() {
+        if imports.len() < MAX_PENDING_WORKSPACE_IMPORTS {
+            imports.entry(pending.action_id.clone()).or_insert(pending);
+        }
+    }
+}
+
+fn is_valid_native_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value
+            .chars()
+            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+}
+
+fn active_sidecar_instance(state: &DesktopHostState) -> HostResult<[u8; INSTANCE_ID_BYTES]> {
+    let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
+    if managed.lifecycle != ManagedLifecycle::Running {
+        return Err(sidecar_state_error());
+    }
+    Ok(managed.instance_id)
+}
+
+fn active_sidecar_connection(
+    state: &DesktopHostState,
+    expected_instance: [u8; INSTANCE_ID_BYTES],
+) -> HostResult<ActiveSidecarConnection> {
+    let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
+    if managed.lifecycle != ManagedLifecycle::Running || managed.instance_id != expected_instance {
+        return Err(sidecar_state_error());
+    }
+    let port = managed.status.port.ok_or_else(sidecar_state_error)?;
+    let bootstrap = managed.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
+    let stream = connect_loopback_until(port, Instant::now() + SIDECAR_HEALTH_CONNECT_TIMEOUT)?;
+    Ok(ActiveSidecarConnection {
+        stream,
+        handoff_token: bootstrap.handoff_credential.expose(),
+    })
+}
+
+fn open_selected_directory(selected: &Path) -> HostResult<SelectedDirectory> {
+    let descriptor = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(selected)
+        .map_err(|_| workspace_selection_error())?;
+    let metadata = descriptor
+        .metadata()
+        .map_err(|_| workspace_selection_error())?;
+    if !metadata.is_dir() {
+        return Err(workspace_selection_error());
+    }
+    let path = path_for_open_directory(&descriptor)?;
+    let current = fs::symlink_metadata(&path).map_err(|_| workspace_selection_error())?;
+    if !current.is_dir()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+        || path.parent().is_none()
+    {
+        return Err(workspace_selection_error());
+    }
+    Ok(SelectedDirectory {
+        _descriptor: descriptor,
+        path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn path_for_open_directory(descriptor: &File) -> HostResult<PathBuf> {
+    fs::canonicalize(PathBuf::from("/proc/self/fd").join(descriptor.as_raw_fd().to_string()))
+        .map_err(|_| workspace_selection_error())
+}
+
+#[cfg(target_os = "macos")]
+fn path_for_open_directory(descriptor: &File) -> HostResult<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+
+    let mut buffer = [0_i8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+        return Err(workspace_selection_error());
+    }
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+    if bytes.is_empty() {
+        return Err(workspace_selection_error());
+    }
+    Ok(PathBuf::from(OsStr::from_bytes(bytes)))
+}
+
 fn readiness_hmac_domain(instance_id: &str, challenge: &str) -> String {
     format!("{NATIVE_SIDECAR_PROTOCOL}\0{instance_id}\0{challenge}")
 }
@@ -2423,6 +3245,27 @@ fn sidecar_contract_incompatible_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_contract_incompatible",
         "The OpenEvo Desktop sidecar does not match the frozen Local API contract.",
+    )
+}
+
+fn workspace_selection_error() -> NativeHostError {
+    NativeHostError::new(
+        "workspace_selection_invalid",
+        "OpenEvo Desktop could not use the selected research folder.",
+    )
+}
+
+fn workspace_selection_cancelled_error() -> NativeHostError {
+    NativeHostError::new(
+        "workspace_selection_cancelled",
+        "No research folder was selected.",
+    )
+}
+
+fn workspace_import_error() -> NativeHostError {
+    NativeHostError::new(
+        "workspace_import_failed",
+        "OpenEvo Desktop could not prepare the selected research folder.",
     )
 }
 
@@ -3555,6 +4398,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
             &mut credential.readiness_key,
             [0_u8; READINESS_KEY_BYTES],
         )),
+        handoff_credential: credential.take_handoff_credential(),
         negotiated_contract,
     };
     match publish_sidecar_gated(state, startup_epoch, bootstrap) {
@@ -3611,6 +4455,167 @@ fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostSta
     stop_sidecar_inner(&state)
 }
 
+#[tauri::command(rename_all = "camelCase")]
+async fn select_project_source(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopHostState>,
+    kind: String,
+    action_id: String,
+    project_id: Option<String>,
+) -> HostResult<NativeProjectSourceV1> {
+    if kind != "native_folder_snapshot" {
+        return Err(workspace_selection_error());
+    }
+    let expected_instance = active_sidecar_instance(&state)?;
+    let picker_claim = PickerClaim::acquire(&state, action_id.clone(), expected_instance)?;
+    let operation = picker_claim.operation.clone();
+    let selected =
+        tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
+            .await
+            .map_err(|_| workspace_selection_error())?
+            .ok_or_else(workspace_selection_cancelled_error)?;
+    if operation.is_cancelled() {
+        return Err(workspace_selection_cancelled_error());
+    }
+    let selected = selected
+        .into_path()
+        .map_err(|_| workspace_selection_error())?;
+    let selected = open_selected_directory(&selected)?;
+    let ActiveSidecarConnection {
+        mut stream,
+        handoff_token,
+    } = active_sidecar_connection(&state, expected_instance)?;
+    let pending_action_id = action_id.clone();
+    let pending_project_id = project_id.clone();
+    let request_operation = operation.clone();
+    let response = tauri::async_runtime::spawn_blocking(move || {
+        register_native_workspace_source(
+            &mut stream,
+            handoff_token.expose(),
+            NativeWorkspaceSelection {
+                kind: &kind,
+                action_id: &action_id,
+                selected_path: &selected.path,
+                selected_device: selected.device,
+                selected_inode: selected.inode,
+                project_id: project_id.as_deref(),
+            },
+            &request_operation,
+        )
+    })
+    .await
+    .map_err(|_| workspace_import_error())??;
+    let pending = PendingNativeWorkspaceImport {
+        sidecar_instance: expected_instance,
+        action_id: pending_action_id,
+        project_id: pending_project_id,
+        source: response.source.clone(),
+        lease_token: response.lease_token,
+    };
+    if let Err(error) = remember_pending_workspace_import(&state, pending.clone()) {
+        if let Ok(ActiveSidecarConnection {
+            mut stream,
+            handoff_token,
+        }) = active_sidecar_connection(&state, expected_instance)
+        {
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                discard_native_workspace_source(&mut stream, handoff_token.expose(), &pending)
+            })
+            .await;
+        }
+        return Err(error);
+    }
+    if operation.is_cancelled() {
+        if let Ok(ActiveSidecarConnection {
+            mut stream,
+            handoff_token,
+        }) = active_sidecar_connection(&state, expected_instance)
+        {
+            let pending_to_discard = pending.clone();
+            let discard_result = tauri::async_runtime::spawn_blocking(move || {
+                discard_native_workspace_source(
+                    &mut stream,
+                    handoff_token.expose(),
+                    &pending_to_discard,
+                )
+            })
+            .await;
+            if matches!(discard_result, Ok(Ok(()))) {
+                let _ = take_pending_workspace_import(&state, &pending.action_id);
+            }
+        }
+        return Err(workspace_selection_cancelled_error());
+    }
+    Ok(response.source)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn cancel_project_source(
+    state: tauri::State<'_, DesktopHostState>,
+    action_id: String,
+) -> HostResult<()> {
+    let Some(operation) = cancel_active_picker(&state, &action_id)? else {
+        return Ok(());
+    };
+    let ActiveSidecarConnection {
+        mut stream,
+        handoff_token,
+    } = match active_sidecar_connection(&state, operation.sidecar_instance) {
+        Ok(connection) => connection,
+        Err(_) => return Ok(()),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        cancel_native_workspace_operation(&mut stream, handoff_token.expose(), &operation)
+    })
+    .await
+    .map_err(|_| workspace_import_error())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn settle_project_source(
+    state: tauri::State<'_, DesktopHostState>,
+    action_id: String,
+    outcome: String,
+) -> HostResult<()> {
+    if !matches!(outcome.as_str(), "adopt" | "discard") {
+        return Err(workspace_selection_error());
+    }
+    let Some(pending) = take_pending_workspace_import(&state, &action_id)? else {
+        return Ok(());
+    };
+    if outcome == "adopt" {
+        return Ok(());
+    }
+    let current_instance = match active_sidecar_instance(&state) {
+        Ok(instance) => instance,
+        Err(_) => return Ok(()),
+    };
+    if current_instance != pending.sidecar_instance {
+        return Ok(());
+    }
+    let ActiveSidecarConnection {
+        mut stream,
+        handoff_token,
+    } = match active_sidecar_connection(&state, pending.sidecar_instance) {
+        Ok(connection) => connection,
+        Err(error) => {
+            restore_pending_workspace_import(&state, pending);
+            return Err(error);
+        }
+    };
+    let (pending, result) = tauri::async_runtime::spawn_blocking(move || {
+        let result = discard_native_workspace_source(&mut stream, handoff_token.expose(), &pending);
+        (pending, result)
+    })
+    .await
+    .map_err(|_| workspace_import_error())?;
+    if let Err(error) = result {
+        restore_pending_workspace_import(&state, pending);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn sidecar_state_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_state_unavailable",
@@ -3627,11 +4632,15 @@ fn sidecar_inspection_error() -> NativeHostError {
 
 fn main() {
     let app = match tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(DesktopHostState::default())
         .invoke_handler(tauri::generate_handler![
             host_status,
             start_sidecar,
-            stop_sidecar
+            stop_sidecar,
+            select_project_source,
+            cancel_project_source,
+            settle_project_source
         ])
         .build(tauri::generate_context!())
     {
@@ -3751,11 +4760,13 @@ mod tests {
         let instance_id = credential.instance_id_hex();
         let readiness_key = encode_hex(&credential.readiness_key);
         let session_token = encode_hex(&credential.session_token);
+        let handoff_token = encode_hex(&credential.handoff_token);
         let frame = serde_json::to_value(NativeInstanceFrame {
             protocol: NATIVE_SIDECAR_PROTOCOL,
             instance_id: &instance_id,
             readiness_key: &readiness_key,
             session_token: &session_token,
+            handoff_token: &handoff_token,
         })
         .unwrap();
 
@@ -3766,9 +4777,16 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>(),
-            ["instance_id", "protocol", "readiness_key", "session_token"]
+            [
+                "handoff_token",
+                "instance_id",
+                "protocol",
+                "readiness_key",
+                "session_token"
+            ]
         );
         assert_eq!(session_token.len(), SESSION_TOKEN_BYTES * 2);
+        assert_eq!(handoff_token.len(), HANDOFF_TOKEN_BYTES * 2);
     }
 
     #[test]
@@ -4548,6 +5566,383 @@ mod tests {
     }
 
     #[test]
+    fn loopback_http_uses_one_total_deadline_for_trickled_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let started = Instant::now();
+
+        let error = loopback_http_request(
+            port,
+            "GET",
+            "/health",
+            None,
+            None,
+            Duration::from_millis(60),
+            1024,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "sidecar_health_unavailable");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn loopback_http_accepts_a_204_without_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+
+        let response = loopback_http_get(port, "/openevo-native/session", None).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(response.status, 204);
+        assert!(response.body.is_empty());
+    }
+
+    #[test]
+    fn native_workspace_request_stays_bound_to_the_pre_restart_listener() {
+        let state = DesktopHostState::default();
+        let (managed, _private_root, old_port) = managed_test_sidecar();
+        let old_listener = managed._listener.try_clone().unwrap();
+        let expected_instance = managed.instance_id;
+        *state.sidecar.lock().unwrap() = Some(managed);
+
+        let ActiveSidecarConnection {
+            mut stream,
+            handoff_token,
+        } = active_sidecar_connection(&state, expected_instance).unwrap();
+
+        let replacement = TcpListener::bind("127.0.0.1:0").unwrap();
+        let replacement_port = replacement.local_addr().unwrap().port();
+        let replacement_probe = replacement.try_clone().unwrap();
+        replacement_probe.set_nonblocking(true).unwrap();
+        {
+            let mut sidecar = state.sidecar.lock().unwrap();
+            let managed = sidecar.as_mut().unwrap();
+            managed.status.port = Some(replacement_port);
+            managed.status.url = Some(format!("http://127.0.0.1:{replacement_port}/openevo"));
+            managed._listener = replacement;
+        }
+        let old_server = thread::spawn(move || {
+            let (mut accepted, _) = old_listener.accept().unwrap();
+            let (headers, _) = read_http_request_with_body(&mut accepted);
+            assert!(headers.contains(NATIVE_WORKSPACE_IMPORT_ROUTE));
+            write_json_response(
+                &mut accepted,
+                201,
+                serde_json::json!({
+                    "schema_version": "1",
+                    "lease_token": "3c".repeat(32),
+                    "source": {
+                        "kind": "native_folder_snapshot",
+                        "display_name": "study",
+                        "import_ref": {
+                            "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                            "content_sha256": "2b".repeat(32),
+                            "byte_size": 1024,
+                            "entry_count": 1,
+                            "extracted_byte_size": 4,
+                        }
+                    },
+                }),
+            );
+        });
+
+        let operation = test_picker_operation("native-source-action-pinned-0001");
+        let source = register_native_workspace_source(
+            &mut stream,
+            handoff_token.expose(),
+            NativeWorkspaceSelection {
+                kind: "native_folder_snapshot",
+                action_id: "native-source-action-pinned-0001",
+                selected_path: Path::new("/private/study"),
+                selected_device: 17,
+                selected_inode: 29,
+                project_id: None,
+            },
+            &operation,
+        )
+        .unwrap();
+        old_server.join().unwrap();
+
+        assert_eq!(source.source.display_name, "study");
+        assert_eq!(old_port, stream.peer_addr().unwrap().port());
+        assert!(matches!(
+            replacement_probe.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        let mut managed = state.sidecar.lock().unwrap().take().unwrap();
+        if let Some(mut child) = managed.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    #[test]
+    fn native_workspace_cancel_releases_the_action_scoped_picker_claim() {
+        let state = DesktopHostState::default();
+        let first = PickerClaim::acquire(
+            &state,
+            "native-picker-first-action-0001".to_string(),
+            [0x11; INSTANCE_ID_BYTES],
+        )
+        .unwrap();
+
+        let error = PickerClaim::acquire(
+            &state,
+            "native-picker-second-action-0001".to_string(),
+            [0x11; INSTANCE_ID_BYTES],
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "workspace_selection_in_progress");
+
+        let cancelled = cancel_active_picker(&state, "native-picker-first-action-0001")
+            .unwrap()
+            .unwrap();
+        assert!(cancelled.is_cancelled());
+        let second = PickerClaim::acquire(
+            &state,
+            "native-picker-second-action-0001".to_string(),
+            [0x11; INSTANCE_ID_BYTES],
+        )
+        .unwrap();
+        drop(first);
+        assert!(state.active_picker.lock().unwrap().is_some());
+        drop(second);
+        assert!(state.active_picker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn native_workspace_cancel_before_select_consumes_a_bounded_tombstone() {
+        let state = DesktopHostState::default();
+        let action_id = "native-picker-cancel-before-select-0001";
+
+        assert!(cancel_active_picker(&state, action_id).unwrap().is_none());
+        let error = PickerClaim::acquire(&state, action_id.to_string(), [0x11; INSTANCE_ID_BYTES])
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "workspace_selection_cancelled");
+        assert!(state.cancelled_picker_actions.lock().unwrap().is_empty());
+
+        let replay =
+            PickerClaim::acquire(&state, action_id.to_string(), [0x11; INSTANCE_ID_BYTES]).unwrap();
+        drop(replay);
+    }
+
+    #[test]
+    fn native_workspace_cancel_uses_only_the_hidden_operation_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handoff_token = "8d".repeat(HANDOFF_TOKEN_BYTES);
+        let expected_handoff = handoff_token.clone();
+        let operation = test_picker_operation("native-picker-cancel-route-0001");
+        operation.cancel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, body) = read_http_request_with_body(&mut stream);
+            assert!(headers.starts_with(&format!(
+                "POST {NATIVE_WORKSPACE_CANCEL_ROUTE} HTTP/1.1\r\n"
+            )));
+            assert!(headers
+                .lines()
+                .any(|line| line == format!("{NATIVE_HANDOFF_HEADER}: {expected_handoff}")));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({
+                    "schema_version": "1",
+                    "action_id": "native-picker-cancel-route-0001",
+                    "cancellation_token": "4d".repeat(32),
+                })
+            );
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        cancel_native_workspace_operation(&mut stream, &handoff_token, &operation).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn native_workspace_cancel_bounds_an_unresponsive_import_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request_with_body(&mut stream);
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) != 0 {}
+        });
+        let operation = Arc::new(test_picker_operation(
+            "native-picker-cancel-bounded-read-0001",
+        ));
+        let cancellation = operation.clone();
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancellation.cancel();
+        });
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let started = Instant::now();
+
+        let error = register_native_workspace_source(
+            &mut stream,
+            &"8d".repeat(HANDOFF_TOKEN_BYTES),
+            NativeWorkspaceSelection {
+                kind: "native_folder_snapshot",
+                action_id: "native-picker-cancel-bounded-read-0001",
+                selected_path: Path::new("/private/study"),
+                selected_device: 17,
+                selected_inode: 29,
+                project_id: None,
+            },
+            &operation,
+        )
+        .unwrap_err();
+        drop(stream);
+        cancel_thread.join().unwrap();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "workspace_selection_cancelled");
+        assert!(started.elapsed() < NATIVE_WORKSPACE_CANCEL_GRACE + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn native_workspace_pending_handoffs_have_a_fixed_capacity() {
+        let state = DesktopHostState::default();
+        for index in 0..MAX_PENDING_WORKSPACE_IMPORTS {
+            let action_id = format!("native-pending-action-{index:04}");
+            remember_pending_workspace_import(
+                &state,
+                PendingNativeWorkspaceImport {
+                    sidecar_instance: [0x11; INSTANCE_ID_BYTES],
+                    action_id,
+                    project_id: None,
+                    source: NativeProjectSourceV1 {
+                        kind: "native_folder_snapshot".to_string(),
+                        display_name: "study".to_string(),
+                        import_ref: NativeWorkspaceImportRefV1 {
+                            import_id: format!("workspace-import-{:048x}", index),
+                            content_sha256: format!("{:064x}", index),
+                            byte_size: 1024,
+                            entry_count: 1,
+                            extracted_byte_size: 4,
+                        },
+                    },
+                    lease_token: format!("{:064x}", index),
+                },
+            )
+            .unwrap();
+        }
+        let overflow = PendingNativeWorkspaceImport {
+            sidecar_instance: [0x11; INSTANCE_ID_BYTES],
+            action_id: "native-pending-action-overflow".to_string(),
+            project_id: None,
+            source: state
+                .pending_workspace_imports
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .source
+                .clone(),
+            lease_token: "ff".repeat(32),
+        };
+
+        assert!(remember_pending_workspace_import(&state, overflow).is_err());
+        assert_eq!(
+            state.pending_workspace_imports.lock().unwrap().len(),
+            MAX_PENDING_WORKSPACE_IMPORTS
+        );
+    }
+
+    #[test]
+    fn native_workspace_discard_uses_the_hidden_lease_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handoff_token = "8d".repeat(HANDOFF_TOKEN_BYTES);
+        let expected_token = handoff_token.clone();
+        let pending = PendingNativeWorkspaceImport {
+            sidecar_instance: [0x11; INSTANCE_ID_BYTES],
+            action_id: "native-pending-action-discard-0001".to_string(),
+            project_id: Some("project-existing-1".to_string()),
+            source: NativeProjectSourceV1 {
+                kind: "native_folder_snapshot".to_string(),
+                display_name: "study".to_string(),
+                import_ref: NativeWorkspaceImportRefV1 {
+                    import_id: format!("workspace-import-{}", "1a".repeat(24)),
+                    content_sha256: "2b".repeat(32),
+                    byte_size: 1024,
+                    entry_count: 1,
+                    extracted_byte_size: 4,
+                },
+            },
+            lease_token: "3c".repeat(32),
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, body) = read_http_request_with_body(&mut stream);
+            assert!(headers.starts_with(&format!(
+                "POST {NATIVE_WORKSPACE_DISCARD_ROUTE} HTTP/1.1\r\n"
+            )));
+            assert!(headers
+                .lines()
+                .any(|line| line == format!("{NATIVE_HANDOFF_HEADER}: {expected_token}")));
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["lease_token"], "3c".repeat(32));
+            assert_eq!(body["action_id"], "native-pending-action-discard-0001");
+            assert!(body.get("selected_path").is_none());
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        discard_native_workspace_source(&mut stream, &handoff_token, &pending).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn native_workspace_picker_rejects_a_restarted_sidecar_instance() {
+        let state = DesktopHostState::default();
+        let (managed, _private_root, _port) = managed_test_sidecar();
+        let expected_instance = managed.instance_id;
+        *state.sidecar.lock().unwrap() = Some(managed);
+        state.sidecar.lock().unwrap().as_mut().unwrap().instance_id = [0x44; INSTANCE_ID_BYTES];
+
+        let error = active_sidecar_connection(&state, expected_instance)
+            .err()
+            .unwrap();
+
+        assert_eq!(error.code, "sidecar_state_unavailable");
+        let mut managed = state.sidecar.lock().unwrap().take().unwrap();
+        if let Some(mut child) = managed.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    #[test]
     fn health_challenge_hmac_binds_readiness_to_the_instance_credential() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -4583,6 +5978,163 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(error.code, "sidecar_session_unavailable");
+    }
+
+    #[test]
+    fn native_workspace_registration_keeps_the_selected_path_out_of_renderer_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handoff_token = "8d".repeat(HANDOFF_TOKEN_BYTES);
+        let expected_token = handoff_token.clone();
+        let selected_path = PathBuf::from("/Users/researcher/private/study");
+        let expected_path = selected_path.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, body) = read_http_request_with_body(&mut stream);
+            assert!(headers.starts_with(&format!(
+                "POST {NATIVE_WORKSPACE_IMPORT_ROUTE} HTTP/1.1\r\n"
+            )));
+            assert!(headers
+                .lines()
+                .any(|line| { line == format!("{NATIVE_HANDOFF_HEADER}: {expected_token}") }));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({
+                    "schema_version": "1",
+                    "kind": "native_folder_snapshot",
+                    "action_id": "native-source-action-0001",
+                    "selected_path": expected_path.to_str().unwrap(),
+                    "selected_device": 17,
+                    "selected_inode": 29,
+                    "cancellation_token": "4d".repeat(32),
+                    "project_id": "project-existing-1",
+                })
+            );
+            write_json_response(
+                &mut stream,
+                201,
+                serde_json::json!({
+                    "schema_version": "1",
+                    "lease_token": "3c".repeat(32),
+                    "source": {
+                        "kind": "native_folder_snapshot",
+                        "display_name": "study",
+                        "import_ref": {
+                            "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                            "content_sha256": "2b".repeat(32),
+                            "byte_size": 1024,
+                            "entry_count": 1,
+                            "extracted_byte_size": 4,
+                        }
+                    },
+                }),
+            );
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let operation = test_picker_operation("native-source-action-0001");
+        let source = register_native_workspace_source(
+            &mut stream,
+            &handoff_token,
+            NativeWorkspaceSelection {
+                kind: "native_folder_snapshot",
+                action_id: "native-source-action-0001",
+                selected_path: &selected_path,
+                selected_device: 17,
+                selected_inode: 29,
+                project_id: Some("project-existing-1"),
+            },
+            &operation,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let renderer_data = serde_json::to_string(&source.source).unwrap();
+        assert_eq!(source.source.display_name, "study");
+        assert!(!renderer_data.contains(&source.lease_token));
+        assert!(!renderer_data.contains("/Users"));
+        assert!(!renderer_data.contains("private"));
+        assert!(!renderer_data.contains("selected_path"));
+    }
+
+    #[test]
+    fn native_workspace_registration_rejects_open_or_malformed_responses() {
+        for body in [
+            serde_json::json!({
+                "schema_version": "1",
+                "lease_token": "3c".repeat(32),
+                "source": {
+                    "kind": "native_folder_snapshot",
+                    "display_name": "study",
+                    "selected_path": "/private/study",
+                    "import_ref": {
+                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                        "content_sha256": "2b".repeat(32),
+                        "byte_size": 1024,
+                        "entry_count": 1,
+                        "extracted_byte_size": 4,
+                    }
+                },
+            }),
+            serde_json::json!({
+                "schema_version": "1",
+                "lease_token": "3c".repeat(32),
+                "source": {
+                    "kind": "native_folder_snapshot",
+                    "display_name": "study",
+                    "import_ref": {
+                        "import_id": "workspace-import-not-opaque",
+                        "content_sha256": "2b".repeat(32),
+                        "byte_size": 1024,
+                        "entry_count": 1,
+                        "extracted_byte_size": 4,
+                    }
+                },
+            }),
+            serde_json::json!({
+                "schema_version": "1",
+                "lease_token": "3c".repeat(32),
+                "source": {
+                    "kind": "native_folder_snapshot",
+                    "display_name": "/Users/researcher/private/study",
+                    "import_ref": {
+                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                        "content_sha256": "2b".repeat(32),
+                        "byte_size": 1024,
+                        "entry_count": 1,
+                        "extracted_byte_size": 4,
+                    }
+                },
+            }),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_http_request_with_body(&mut stream);
+                write_json_response(&mut stream, 201, body);
+            });
+
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let operation = test_picker_operation("native-source-action-0002");
+            let error = register_native_workspace_source(
+                &mut stream,
+                &"7c".repeat(SESSION_TOKEN_BYTES),
+                NativeWorkspaceSelection {
+                    kind: "native_folder_snapshot",
+                    action_id: "native-source-action-0002",
+                    selected_path: Path::new("/private/study"),
+                    selected_device: 17,
+                    selected_inode: 29,
+                    project_id: None,
+                },
+                &operation,
+            )
+            .unwrap_err();
+            server.join().unwrap();
+
+            assert_eq!(error.code, "workspace_import_failed");
+        }
     }
 
     #[test]
@@ -4842,6 +6394,7 @@ mod tests {
             bootstrap: Some(SidecarBootstrapState {
                 session_credential: SessionCredential([0x11; SESSION_TOKEN_BYTES]),
                 readiness_credential: ReadinessCredential([0x11; READINESS_KEY_BYTES]),
+                handoff_credential: HandoffCredential([0x11; HANDOFF_TOKEN_BYTES]),
                 negotiated_contract: test_bootstrap_state().negotiated_contract,
             }),
             lifecycle: ManagedLifecycle::Running,
@@ -4892,6 +6445,7 @@ mod tests {
         replacement.bootstrap = Some(SidecarBootstrapState {
             session_credential: SessionCredential([0x22; SESSION_TOKEN_BYTES]),
             readiness_credential: ReadinessCredential([0x22; READINESS_KEY_BYTES]),
+            handoff_credential: HandoffCredential([0x22; HANDOFF_TOKEN_BYTES]),
             negotiated_contract: test_bootstrap_state().negotiated_contract,
         });
         let probe_listener = replacement._listener.try_clone().unwrap();
@@ -6090,6 +7644,25 @@ mod tests {
         String::from_utf8(request).unwrap()
     }
 
+    fn read_http_request_with_body(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut headers = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+            assert!(headers.len() <= 8192);
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0_u8; content_length];
+        stream.read_exact(&mut body).unwrap();
+        (headers, body)
+    }
+
     fn write_json_response(stream: &mut TcpStream, status: u16, body: serde_json::Value) {
         let body = serde_json::to_string(&body).unwrap();
         let reason = match status {
@@ -6237,6 +7810,16 @@ mod tests {
             instance_id: [0x1a; INSTANCE_ID_BYTES],
             readiness_key: [0x5a; READINESS_KEY_BYTES],
             session_token: [0x7c; SESSION_TOKEN_BYTES],
+            handoff_token: [0x8d; HANDOFF_TOKEN_BYTES],
+        }
+    }
+
+    fn test_picker_operation(action_id: &str) -> NativePickerOperation {
+        NativePickerOperation {
+            sidecar_instance: [0x11; INSTANCE_ID_BYTES],
+            action_id: action_id.to_string(),
+            cancellation_token: [0x4d; WORKSPACE_CANCELLATION_TOKEN_BYTES],
+            cancelled: AtomicBool::new(false),
         }
     }
 
@@ -6244,6 +7827,7 @@ mod tests {
         SidecarBootstrapState {
             session_credential: SessionCredential([0x7c; SESSION_TOKEN_BYTES]),
             readiness_credential: ReadinessCredential([0x5a; READINESS_KEY_BYTES]),
+            handoff_credential: HandoffCredential([0x8d; HANDOFF_TOKEN_BYTES]),
             negotiated_contract: NegotiatedContractV1 {
                 major: 1,
                 openapi_sha256: DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),

@@ -274,6 +274,128 @@ renderer-visible or reusable launch path.
 Debug-only override and source-launcher code is absent under production cfg;
 the Desktop workflow compiles, lints, and tests both debug and release cfg.
 
+### Workspace import store trust boundary
+
+The Rust host holds the selected directory open with no-follow directory flags
+for the complete archive handoff and revalidates the path against that descriptor's
+device/inode identity. Only one OS picker may be physically active at a time. A
+selection captures the current sidecar instance before opening the picker and is
+rejected if that instance restarts before handoff. The renderer-visible Desktop
+session credential cannot call the hidden import route; Rust uses a separate
+per-instance native handoff credential delivered only through the inherited child
+channel.
+
+The private workspace import store uses a store authentication key that is a
+separate raw 256-bit file in the root's parent directory. The key is not stored
+in the root marker, archive xattr, or self-describing import metadata. A
+domain-separated HMAC authenticates the durable parent/root binding marker and
+each import's exact reference, ownership/idempotency fields, directory,
+archive, and metadata inode identities, and archive generation token. Legacy
+unauthenticated markers or
+metadata are not adopted. A missing key for existing state, an invalid MAC, or
+a replaced key that no longer authenticates the state fails closed.
+
+Each process retains no-follow descriptors for the key, parent, and root and
+checks their inode/path bindings at every locked operation. Ingest reopens and
+verifies the actual archive and authenticated metadata after both files and the
+directory have been fsynced, immediately before atomic no-replace publication,
+and again after publication before returning the reference. It records a new
+temporary directory's device/inode identity immediately after creation, and all
+pre-publication rollback cleanup is conditional on that exact pathname binding;
+replacement or unprovable state is retained for bounded startup reconciliation.
+Resolve copies to
+an inode-bound private snapshot, reopens and hashes that snapshot, unlinks the
+verified pathname, then hashes the unlinked read-only descriptor again before
+yielding it. These checks close the previously identified replacement and
+equal-length rewrite windows at the store's verification boundaries.
+
+Project persistence and private import storage are separate durable authorities.
+After a successful source replacement or project deletion, the release provider
+uses a fixed provider-reference-lock then import-root-lock order. It compares
+`import_ref` identity rather than display metadata, rereads the complete durable
+reference set under that guard after commit, and removes the previous exact import
+only when its ID remains unreferenced. Cleanup retry does not change the committed
+project result. On every sidecar start, bounded reconciliation is deferred until
+the same guard yields the exact durable reference set. It first verifies every
+referenced import and ownership without deleting anything; only a successful first
+phase removes unreferenced picker snapshots. Missing or corrupt references preserve
+the observed store and fail startup closed.
+
+Picker snapshots have an explicit pending lease before they become project
+authority. The lease is persisted as a keyed, one-way archive-xattr marker and
+the raw token exists only in the hidden sidecar response and Rust host memory.
+Rust caps that map at 64 entries and exposes only action-ID
+`cancel`/`adopt`/`discard` commands to React. A create or patch adopts only after
+its provider transaction is durable. Drawer close, reset, source replacement,
+stale completion, and save failure all request discard. Discard takes the provider reference guard first,
+rereads the full durable reference set, and then takes the import lock; a
+concurrent commit therefore either retains/adopts the exact import or fails its
+own pre-commit verification after an earlier discard. Startup adopts referenced
+pending markers and removes unreferenced ones within the retained and pending
+count/byte capacities.
+
+Picker cancellation is a separate hidden action lifecycle. Rust generates a
+per-action secret, releases the active claim immediately, and calls the private
+cancel route; neither the secret nor route enters the renderer contract. Bounded
+cancel-before-start tombstones close command-order races in both native host and
+sidecar. The import HTTP reader polls cancellation and stops waiting within a
+three-second grace period instead of retaining the 300-second import deadline.
+Python checks the same operation identity during scan, archive I/O, hashing,
+validation, and cancellable acquisition of both in-process and cross-process
+store locks. The atomic no-replace publish is the linearization point. Before it,
+cancellation quarantines/removes only the known temporary inode; after it, ingest
+returns the recoverable lease so Rust can remember it before guarded discard.
+
+This is not an OS isolation boundary against an arbitrary process running as
+the same UID. Such a process can read the durable authentication key and can
+write an already-open regular-file inode despite mode `0600`; no portable file
+permission or HMAC construction can prevent that. During one sidecar process
+lifetime, held descriptors provide replacement detection at operation
+boundaries, not protection from a hostile same-UID writer between the final
+check and consumption. Across an offline/restart boundary, replacement of the
+root, marker, or xattr is detected only while the separate authentication key
+remains uncompromised; an attacker that also reads/replaces that key can forge
+the store. Stronger same-UID isolation requires a platform credential boundary
+such as a separately entitled key service and is outside this store module.
+
+The release native-folder bridge does not send a path to React or to any public
+Local API operation. Rust records the selected directory's device and inode and
+sends those values with the path only over the authenticated private loopback
+route. The sidecar opens every absolute component with `O_NOFOLLOW`, rejects a
+final identity mismatch, scans the complete tree twice around archive creation,
+and checks every reopened entry against its first-scan identity. It accepts only
+NFC UTF-8 regular files and directories within the frozen entry, path, depth,
+file, extracted-byte, and archive-byte budgets. Symlinks and special files fail
+closed. Directory names are charged to one global entry budget when enumerated,
+before recursive processing; each `scandir` materializes at most the remaining
+budget plus one before rejection and sorting. Non-empty regular files must have
+POSIX 512-byte `st_blocks` allocation covering their logical size and expose a
+complete no-hole extent through `SEEK_DATA`/`SEEK_HOLE`. This rejects a low-block
+sparse file even when the filesystem returns the standard's minimal `0,size`
+extent map. Unavailable or inconsistent allocation/extent evidence fails closed,
+including allocated unwritten extents. Fully allocated ordinary APFS files are
+accepted under minimal extent semantics; compressed, dataless, or other files
+whose reported allocation is smaller than logical size are explicitly unsupported
+because the bridge cannot prove them non-sparse.
+The deterministic tar is an unlinked mode-`0600` temporary regular file before
+`WorkspaceImportStore.ingest_pending` sees it.
+The macOS workflow executes the focused scanner/store/lifecycle suite on APFS,
+including a fully allocated ordinary file and an 8-MiB logical sparse file with
+only one 4-KiB write; Linux continues to run the same portable suite and its
+existing extent semantics.
+
+The private action deterministically selects the opaque import ID, so an exact
+retry with the same folder bytes converges and a changed body conflicts. A new
+project ID derives from that opaque import ID; existing-project replacement
+passes the saved project ID only on the private native boundary. Ownership is
+then reproducible from the project/import owner, opaque import ID, and archive
+digest for verification and later Core upload. This lets distinct projects own
+identical archives without sharing operation/idempotency authority while exact
+same-action replay converges across restart. The private route is excluded from
+OpenAPI, uses the separate process-owned native handoff credential rather than
+the renderer's Desktop session token, bounds the JSON request before parsing,
+and returns only the frozen path-free `ProjectSourceV1` shape.
+
 The child calls `setsid`, so its PID is also the ID of a new session and process
 group. Before exec, it forks a minimal watchdog in that group. The native host
 installs the writer of a close-on-exec parent-liveness channel in state before

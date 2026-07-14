@@ -37,6 +37,7 @@ from desktop.sidecar.contracts.v1.models import (
     ProjectOperationResultV1,
     ProjectPageV1,
     ProjectPatchV1,
+    ProjectSourceV1,
     ProjectV1,
     RemoteProfileCreateV1,
     RemoteProfilePageV1,
@@ -44,6 +45,7 @@ from desktop.sidecar.contracts.v1.models import (
     RemoteProfileV1,
     ResourceRefV1,
 )
+from desktop.sidecar.workspace_identity import project_id_for_native_import
 
 
 SCHEMA_VERSION = 2
@@ -781,7 +783,12 @@ class ProviderMutation:
 
     def _create_project(self, request: ProjectCreateV1) -> ProjectV1:
         self._store._require_profile_row(self._connection, request.profile_id)
-        project_id = self._store._new_id()
+        project_id = (
+            project_id_for_native_import(request.source.import_ref.import_id)
+            if request.source.kind == "native_folder_snapshot"
+            and request.source.import_ref is not None
+            else self._store._new_id()
+        )
         timestamp = self._store._timestamp()
         self._connection.execute(
             """
@@ -874,6 +881,14 @@ class DesktopProviderStore:
         with self._transaction_lock:
             if not self._closed:
                 self._close_resources()
+
+    @contextmanager
+    def workspace_import_reference_guard(self) -> Iterator[None]:
+        """Serialize durable project references before taking the import-store lock."""
+
+        with self._transaction_lock:
+            self._verify_storage_files()
+            yield
 
     def _close_resources(self) -> None:
         connection = getattr(self, "_connection", None)
@@ -1818,6 +1833,25 @@ class DesktopProviderStore:
         self._validate_resource_id(project_id)
         with self._transaction(write=False) as connection:
             return self._project_from_row(self._require_project_row(connection, project_id))
+
+    def native_workspace_sources(self) -> tuple[tuple[str, ProjectSourceV1], ...]:
+        """Return the bounded persisted source set used for private-store recovery."""
+
+        with self._transaction(write=False) as connection:
+            rows = connection.execute(
+                "SELECT * FROM projects ORDER BY project_id ASC LIMIT ?",
+                (MAX_RECOVERY_ROWS + 1,),
+            ).fetchall()
+            if len(rows) > MAX_RECOVERY_ROWS:
+                raise ProviderDataCorruptionError(
+                    "project recovery row count exceeds the startup limit"
+                )
+            sources = []
+            for row in rows:
+                project = self._project_from_row(row)
+                if project.source.kind == "native_folder_snapshot":
+                    sources.append((project.project_id, project.source))
+            return tuple(sources)
 
     def get_local_operation(self, operation_id: str) -> LocalOperationV1:
         self._validate_resource_id(operation_id)

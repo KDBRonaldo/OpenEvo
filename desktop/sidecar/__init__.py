@@ -44,8 +44,17 @@ from desktop.sidecar.core_client_v1 import (
     CoreSseStreamV1,
     CoreTunnelConnectionV1,
 )
+from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import DesktopReleaseProvider
+from desktop.sidecar.workspace_imports import (
+    WorkspaceArchiveValidationError,
+    WorkspaceImportError,
+    WorkspaceImportIntegrityError,
+    WorkspaceImportNotFoundError,
+    WorkspaceImportStore,
+    WorkspaceImportStoreConfigurationError,
+)
 from openevo.deployment.profile import (
     ProxySettings,
     RemoteProfileConfig,
@@ -97,6 +106,13 @@ __all__ = [
     "SidecarSciencePlan",
     "WorkspacePreparationAction",
     "WorkspacePreparationPlan",
+    "WorkspaceArchiveValidationError",
+    "WorkspaceImportError",
+    "WorkspaceImportIntegrityError",
+    "WorkspaceImportNotFoundError",
+    "WorkspaceImportRefV1",
+    "WorkspaceImportStore",
+    "WorkspaceImportStoreConfigurationError",
     "build_desktop_project_configs",
     "build_sidecar_science_plan",
     "build_desktop_shell_status",

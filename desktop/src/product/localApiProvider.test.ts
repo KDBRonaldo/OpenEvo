@@ -361,6 +361,8 @@ describe("LocalApiDesktopProductProvider", () => {
         display_name: "Selected source",
         import_ref: CONTRACT_FIXTURE_V1.workspaceImport,
       }),
+      cancelProjectSource: vi.fn(),
+      settleProjectSource: vi.fn(),
       configureCredential: vi.fn().mockResolvedValue(profile()),
     };
     const provider = new LocalApiDesktopProductProvider({ client, native, fetch: vi.fn<FetchLike>() });
@@ -377,6 +379,8 @@ describe("LocalApiDesktopProductProvider", () => {
       display_name: "Selected source",
       import_ref: CONTRACT_FIXTURE_V1.workspaceImport,
     }));
+    await provider.cancelProjectSource("renderer-action-source-0001");
+    expect(native.cancelProjectSource).toHaveBeenCalledWith("renderer-action-source-0001");
 
     const next = await provider.refresh();
     if (next.status !== "fresh") throw new Error("expected a fresh fixture");
@@ -526,6 +530,8 @@ function createProvider(client: DesktopApiClientV1, fetch: FetchLike = vi.fn<Fet
     client,
     native: {
       selectProjectSource: vi.fn(),
+      cancelProjectSource: vi.fn(),
+      settleProjectSource: vi.fn(),
       configureCredential: vi.fn(),
     },
     fetch,

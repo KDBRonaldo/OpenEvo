@@ -128,6 +128,7 @@ export class ProductRefreshOrder {
 
 export interface ProjectSourceSelectionIntent extends ProductMutationIntent {
   readonly kind: "native_folder_snapshot";
+  readonly projectId?: string;
 }
 
 export interface DesktopProductProvider {
@@ -144,6 +145,8 @@ export interface DesktopProductProvider {
   activateProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   syncProjectWorkspace(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
+  cancelProjectSource(actionId: string): Promise<void>;
+  settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
   startRun(intent: ProductRunIntent): Promise<RunV1>;
   cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
   getRunLogs(runId: string): Promise<readonly LogEntryV1[]>;
@@ -187,6 +190,8 @@ export const unavailableDesktopProductProvider: DesktopProductProvider = {
   activateProject: unavailable,
   syncProjectWorkspace: unavailable,
   selectProjectSource: unavailable,
+  cancelProjectSource: unavailable,
+  settleProjectSource: unavailable,
   startRun: unavailable,
   cancelRun: unavailable,
   getRunLogs: unavailable,

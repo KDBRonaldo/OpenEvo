@@ -16,6 +16,8 @@ export interface ReleaseNativeBridge {
   bootstrap(): Promise<unknown>;
   stop(): Promise<unknown>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
+  cancelProjectSource(actionId: string): Promise<unknown>;
+  settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
   configureCredential(
     profileId: string,
     slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
@@ -28,6 +30,8 @@ export interface ReleaseProviderAdapterContext {
   readonly client: DesktopApiClientV1;
   readonly native: {
     selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
+    cancelProjectSource(actionId: string): Promise<void>;
+    settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
     configureCredential(
       profileId: string,
       slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
@@ -46,7 +50,16 @@ export interface ReleaseProviderFactoryDependencies {
 const tauriNativeBridge: ReleaseNativeBridge = {
   bootstrap: () => invoke<DesktopBootstrapContextV1>("start_sidecar"),
   stop: () => invoke("stop_sidecar"),
-  selectProjectSource: (intent) => invoke("select_project_source", { kind: intent.kind, actionId: intent.actionId }),
+  selectProjectSource: (intent) => invoke("select_project_source", {
+    kind: intent.kind,
+    actionId: intent.actionId,
+    ...(intent.projectId === undefined ? {} : { projectId: intent.projectId }),
+  }),
+  cancelProjectSource: (actionId) => invoke("cancel_project_source", { actionId }),
+  settleProjectSource: (actionId, outcome) => invoke("settle_project_source", {
+    actionId,
+    outcome,
+  }),
   configureCredential: (profileId, slotKind, etag, actionId) => invoke("configure_credential", {
     profileId,
     slotKind,
@@ -87,6 +100,12 @@ export async function createReleaseDesktopProductProvider(
           throw new DesktopContractError("Native project source does not match the requested kind");
         }
         return source;
+      },
+      cancelProjectSource: async (actionId) => {
+        await native.cancelProjectSource(actionId);
+      },
+      settleProjectSource: async (actionId, outcome) => {
+        await native.settleProjectSource(actionId, outcome);
       },
       configureCredential: async (profileId, slotKind, etag, actionId) => {
         const profile = remoteProfileV1Schema.parse(

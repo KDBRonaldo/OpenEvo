@@ -31,10 +31,26 @@ matching records and separates agent, evolution, and system streams; SSE
 snapshot epochs trigger an authoritative output refresh while a session runs.
 
 The release adapter deliberately has no fallback for those native calls. The
-Tauri commands `select_project_source` and `configure_credential` are required
-release integration dependencies and are not implemented by the current Rust
-host yet. Release-native integration must add those commands before this flow
-can ship; the provider must continue to fail closed until they exist.
+Rust host implements `select_project_source` with the operating-system folder
+picker. It canonicalizes the selected directory, records its device and inode,
+and sends the path plus that identity only through the authenticated private
+loopback route to the process-owned sidecar. The sidecar reopens the
+identity-bound directory with no-follow traversal and builds the canonical
+archive before returning a validated opaque workspace-import reference. The
+private response also contains a pending lease token retained only by Rust;
+React receives the source and later settles it by non-secret action ID. Drawer
+close and source invalidation also send that action ID to a native cancel command.
+Rust binds cancellation to a private random token, promptly releases the picker
+claim, and lets Python stop traversal, archive, and store work at bounded
+checkpoints. A lease published concurrently with cancellation is retained by Rust
+before guarded discard, so the renderer never owns recovery authority. Source
+replacement, reset, stale completion, and failed save paths discard, while a
+successful create/patch settles as adopted only after the sidecar has durably
+committed the project reference. Only the opaque source reference enters the
+renderer DTO or public Desktop Local API. The
+remaining `configure_credential` command is still a required release
+integration dependency; the provider continues to fail closed until it is
+implemented.
 
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation

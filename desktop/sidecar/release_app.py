@@ -40,6 +40,12 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteLifecycleError,
     RemoteLifecycleSupersededError,
 )
+from desktop.sidecar.workspace_imports import (
+    WorkspaceImportError,
+    WorkspaceImportIntegrityError,
+    WorkspaceImportNotFoundError,
+    WorkspaceImportStore,
+)
 from openevo import __version__ as OPENEVO_VERSION
 from openevo.backend.contracts.v1.models import (
     ErrorCategory as CoreErrorCategory,
@@ -263,6 +269,7 @@ def create_release_desktop_local_api_app(
     encoded_session_token = session_token.encode("utf-8")
     store = DesktopProviderStore(state_root, clock=clock)
     lifecycle = remote_lifecycle
+    workspace_import_store: WorkspaceImportStore | None = None
     try:
         if lifecycle is None:
             lifecycle = DesktopRemoteLifecycle(
@@ -271,8 +278,13 @@ def create_release_desktop_local_api_app(
                     secure_ancestor=store.state_root,
                 )
             )
+        workspace_import_store = WorkspaceImportStore(
+            store.state_root / "workspace-imports",
+            reconcile_on_open=False,
+        )
         provider = DesktopReleaseProvider(
             store,
+            workspace_import_store,
             build_version=build_version,
             source_commit=source_commit,
             build_channel=build_channel,
@@ -285,6 +297,8 @@ def create_release_desktop_local_api_app(
     except BaseException:
         if lifecycle is not None:
             lifecycle.close()
+        if workspace_import_store is not None:
+            workspace_import_store.close()
         store.close()
         raise
     app.state.desktop_release_provider = provider
@@ -400,6 +414,31 @@ def create_release_desktop_local_api_app(
     @app.exception_handler(ProviderStoreError)
     async def handle_store_error(request: Request, exc: ProviderStoreError) -> JSONResponse:
         return _store_error_response(request, exc)
+
+    @app.exception_handler(WorkspaceImportError)
+    async def handle_workspace_import_error(
+        request: Request, exc: WorkspaceImportError
+    ) -> JSONResponse:
+        invalid_reference = isinstance(
+            exc,
+            (WorkspaceImportIntegrityError, WorkspaceImportNotFoundError),
+        )
+        return _error_response(
+            request,
+            status_code=422 if invalid_reference else 503,
+            code="workspace_import_invalid"
+            if invalid_reference
+            else "local_provider_unavailable",
+            message="The selected workspace snapshot is unavailable."
+            if invalid_reference
+            else "The local Desktop provider is unavailable.",
+            category="project" if invalid_reference else "service",
+            retryable=False,
+            repair_action="user_input_required" if invalid_reference else "none",
+            next_action="Select the research folder again before saving the project."
+            if invalid_reference
+            else None,
+        )
 
     @app.exception_handler(sqlite3.Error)
     async def handle_sqlite_error(request: Request, exc: sqlite3.Error) -> JSONResponse:
