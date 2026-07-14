@@ -2,7 +2,8 @@
 
 > Pre-release status: the current repository contains Tauri packaging
 > scaffolding, but the External Beta release workflow is intentionally disabled.
-> No current workflow builds, uploads, or publishes a release-ready DMG.
+> The manual Desktop candidate workflow builds and smokes an unsigned DMG as a
+> short-lived Actions artifact; it does not upload or publish a GitHub Release.
 
 The canonical release requirements live in
 `docs/maintainer/productization/spec.md`. This document defines the packaging
@@ -39,10 +40,17 @@ The repository currently provides:
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;
+- `.github/workflows/openevo-desktop-candidate.yml`, a manual macOS candidate
+  job that uses locked inputs, clean-installs the exact embedded Core wheel,
+  runs renderer and release-mode Rust checks, builds the unsigned DMG, mounts
+  and copies its app bundle, smokes the copied sidecar, validates canonical
+  names/checksums, and retains the candidate for 14 days as an Actions artifact;
 - a disabled `.github/workflows/openevo-release-artifact.yml` placeholder that
   publishes nothing.
 
-This scaffolding is not DMG release evidence. The executable sidecar smoke proves
+The candidate workflow is packaging feedback, not DMG release evidence: it does
+not complete the ordinary science E2E, create/redownload a draft GitHub Release,
+or authorize a public tag. The executable sidecar smoke proves
 its local health/static-asset path, discovery of the embedded Core wheel plus
 framework lock, and its token-protected capability proxy against a real backend.
 It does not prove that a mounted and copied macOS app starts or completes the
@@ -492,8 +500,9 @@ The replacement workflow must:
    a clean directory, and revalidate names, versions, commits, and checksums;
 8. publish the already-validated draft without rebuilding any bytes.
 
-The workflow remains disabled until these steps and their failure paths are
-implemented.
+The publishing workflow remains disabled until these steps and their failure
+paths are implemented. The candidate workflow deliberately stops after the
+mounted/copied package smoke and Actions upload.
 
 ## Packaged Runtime Rules
 

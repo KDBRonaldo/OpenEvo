@@ -5,6 +5,7 @@ on:
     types: [opened, edited, synchronize, reopened, ready_for_review]
     paths:
       - ".github/workflows/openevo-desktop.yml"
+      - ".github/workflows/openevo-desktop-candidate.yml"
       - "pyproject.toml"
       - "uv.lock"
       - "desktop/**"

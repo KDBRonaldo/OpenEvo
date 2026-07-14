@@ -752,6 +752,52 @@ def test_pre_external_beta_release_artifact_workflow_is_disabled() -> None:
     assert "desktop-dmg-artifact:" not in text
 
 
+def test_desktop_candidate_workflow_builds_and_smokes_unsigned_dmg_without_publishing() -> None:
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml")
+
+    text = workflow.read_text(encoding="utf-8")
+
+    for marker in (
+        "workflow_dispatch:",
+        "runs-on: macos-14",
+        "timeout-minutes:",
+        "uv sync --frozen --group dev",
+        "tests/ci/test_build_sidecar.py",
+        "scripts/ci/audit_openevo_identity.py",
+        "npm ci",
+        "npm audit --audit-level=high",
+        "npm test -- --run",
+        "npm run typecheck",
+        "packaging/build_sidecar.py",
+        "--core-wheel-output-dir",
+        "smoke_openevo_remote_capabilities.py",
+        "cargo fmt --check",
+        "cargo clippy --locked --release --all-targets -- -D warnings",
+        "cargo test --locked --release",
+        "npm run tauri:build -- --ci",
+        "hdiutil attach",
+        "smoke_openevo_desktop_bundle.py",
+        "scripts/ci/write_sha256.py",
+        "scripts/ci/check_openevo_release.py",
+        "actions/upload-artifact@v4",
+        "retention-days: 14",
+        "unsigned and not notarized",
+    ):
+        assert marker in text
+
+    assert text.index("npm ci") < text.index("npm run tauri:build -- --ci")
+    assert text.index("hdiutil attach") < text.index("actions/upload-artifact@v4")
+    assert "contents: write" not in text
+    assert "gh release" not in text
+    assert "softprops/action-gh-release" not in text
+    assert "tags:" not in text
+
+    desktop_checks = Path(".github/workflows/openevo-desktop.yml").read_text(
+        encoding="utf-8"
+    )
+    assert '".github/workflows/openevo-desktop-candidate.yml"' in desktop_checks
+
+
 def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> None:
     package = json.loads(Path("desktop/package.json").read_text(encoding="utf-8"))
 

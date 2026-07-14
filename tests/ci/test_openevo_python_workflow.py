@@ -10,6 +10,7 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
 
     assert "name: OpenEvo Core Backend checks" in text
     assert '".github/workflows/openevo-desktop.yml"' in text
+    assert '".github/workflows/openevo-desktop-candidate.yml"' in text
     assert '".github/workflows/openevo-release-artifact.yml"' in text
     assert '".github/workflows/openevo-publish-pypi.yml"' in text
     assert '"src/openevo/**"' in text

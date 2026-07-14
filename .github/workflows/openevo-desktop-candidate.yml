@@ -1,0 +1,226 @@
+name: OpenEvo Desktop unsigned candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_label:
+        description: Short label shown on the Actions artifact
+        required: false
+        default: exhibition
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openevo-desktop-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  desktop-dmg-candidate:
+    name: Build and smoke unsigned macOS DMG candidate
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate candidate label
+        env:
+          CANDIDATE_LABEL: ${{ inputs.candidate_label }}
+        run: |
+          if [[ ! "$CANDIDATE_LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]; then
+            echo "candidate_label must be a short filename-safe identifier" >&2
+            exit 1
+          fi
+
+      - name: Install locked build dependencies
+        run: |
+          uv sync --frozen --group dev
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Test packaging contracts and release identity
+        run: |
+          uv run python -m pytest \
+            tests/ci/test_build_sidecar.py \
+            tests/ci/test_check_openevo_release.py \
+            -q
+          uv run python scripts/ci/audit_openevo_identity.py
+
+      - name: Verify product versions
+        run: |
+          version="$($GITHUB_WORKSPACE/.venv/bin/python - <<'PY'
+          import json
+          import tomllib
+          from pathlib import Path
+
+          root = Path.cwd()
+          with (root / "pyproject.toml").open("rb") as handle:
+              version = tomllib.load(handle)["project"]["version"]
+          package_version = json.loads(
+              (root / "desktop/package.json").read_text(encoding="utf-8")
+          )["version"]
+          tauri_version = json.loads(
+              (root / "desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8")
+          )["version"]
+          if package_version != version or tauri_version != version:
+              raise SystemExit("Core, renderer, and Tauri versions do not match")
+          print(version)
+          PY
+          )"
+          echo "OPENEVO_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Test and build renderer
+        working-directory: desktop
+        run: |
+          npm ci
+          npm audit --audit-level=high
+          npm test -- --run
+          npm run typecheck
+          npm run build:openevo
+
+      - name: Build packaged sidecar and exact remote Core wheel
+        working-directory: desktop
+        run: |
+          mkdir "$GITHUB_WORKSPACE/.candidate-remote-wheel"
+          python packaging/build_sidecar.py \
+            --core-wheel-output-dir "$GITHUB_WORKSPACE/.candidate-remote-wheel"
+          sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
+          test -x "$sidecar"
+          echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
+
+      - name: Clean-install and smoke exact remote Core wheel
+        run: |
+          test "$(find .candidate-remote-wheel -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          python -m venv "$RUNNER_TEMP/openevo-core-smoke"
+          "$RUNNER_TEMP/openevo-core-smoke/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/openevo-core-smoke/bin/python" -m pip install .candidate-remote-wheel/openevo-*.whl
+          PYTHONPATH= "$RUNNER_TEMP/openevo-core-smoke/bin/openevo-backend" --help
+          PYTHONPATH= "$RUNNER_TEMP/openevo-core-smoke/bin/python" \
+            scripts/ci/smoke_evolution_framework_wheel.py \
+            --wheel .candidate-remote-wheel/openevo-*.whl
+          PYTHONPATH= "$RUNNER_TEMP/openevo-core-smoke/bin/python" \
+            scripts/ci/smoke_openevo_remote_capabilities.py \
+            --wheel .candidate-remote-wheel/openevo-*.whl \
+            --sidecar "$OPENEVO_PACKAGED_SIDECAR_PATH" \
+            --timeout-seconds 60
+
+      - name: Check release-mode Tauri host
+        working-directory: desktop/src-tauri
+        run: |
+          cargo metadata --locked --format-version 1
+          cargo fmt --check
+          cargo check --locked --release --all-targets
+          cargo clippy --locked --release --all-targets -- -D warnings
+          cargo test --locked --release
+          cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
+
+      - name: Build unsigned Desktop DMG
+        working-directory: desktop
+        run: npm run tauri:build -- --ci
+
+      - name: Assemble canonical candidate artifacts
+        run: |
+          mkdir candidate-artifacts
+          triple="$(rustc --print host-tuple)"
+          case "$triple" in
+            aarch64-apple-darwin) dmg_target="aarch64" ;;
+            x86_64-apple-darwin) dmg_target="x64" ;;
+            *) echo "Unsupported macOS target: $triple" >&2; exit 1 ;;
+          esac
+          dmg_count="$(find desktop/src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')"
+          test "$dmg_count" = 1
+          dmg_source="$(find desktop/src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print)"
+          dmg_name="OpenEvo-Desktop-${OPENEVO_VERSION}-${dmg_target}.dmg"
+          cp "$dmg_source" "candidate-artifacts/$dmg_name"
+          echo "OPENEVO_CANDIDATE_DMG=$GITHUB_WORKSPACE/candidate-artifacts/$dmg_name" >> "$GITHUB_ENV"
+          echo "OPENEVO_DMG_TARGET=$dmg_target" >> "$GITHUB_ENV"
+
+      - name: Smoke app bundle before disk-image copy
+        run: |
+          python scripts/ci/smoke_openevo_desktop_bundle.py \
+            "desktop/src-tauri/target/release/bundle/macos/OpenEvo Desktop.app" \
+            --timeout-seconds 60
+
+      - name: Mount, copy, detach, and smoke DMG contents
+        run: |
+          mount_dir="$(mktemp -d)"
+          copy_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_dir" -quiet || true
+            rm -rf "$mount_dir" "$copy_dir"
+          }
+          trap cleanup EXIT
+          hdiutil attach "$OPENEVO_CANDIDATE_DMG" \
+            -mountpoint "$mount_dir" -nobrowse -readonly
+          test -d "$mount_dir/OpenEvo Desktop.app"
+          ditto "$mount_dir/OpenEvo Desktop.app" "$copy_dir/OpenEvo Desktop.app"
+          hdiutil detach "$mount_dir" -quiet
+          python scripts/ci/smoke_openevo_desktop_bundle.py \
+            "$copy_dir/OpenEvo Desktop.app" --timeout-seconds 60
+
+      - name: Build distributable Core wheel around the exact remote wheel
+        run: |
+          outer_source="$(mktemp -d)"
+          trap 'rm -rf "$outer_source"' EXIT
+          cp pyproject.toml README.md LICENSE "$outer_source/"
+          mkdir -p "$outer_source/src"
+          rsync -a \
+            --exclude 'wheels/' \
+            --exclude '*.egg-info/' \
+            --exclude '__pycache__/' \
+            src/ "$outer_source/src/"
+          mkdir -p "$outer_source/src/openevo/wheels"
+          cp .candidate-remote-wheel/openevo-*.whl "$outer_source/src/openevo/wheels/"
+          python -m build --wheel --no-isolation \
+            --outdir "$GITHUB_WORKSPACE/candidate-artifacts" "$outer_source"
+
+      - name: Write candidate notes, checksums, and validate inventory
+        run: |
+          cat > candidate-artifacts/release-notes.md <<EOF
+          # OpenEvo Desktop ${OPENEVO_VERSION} candidate
+
+          Source commit: ${GITHUB_SHA}
+          Architecture: ${OPENEVO_DMG_TARGET}
+
+          This exhibition candidate is unsigned and not notarized. macOS users must
+          manually allow OpenEvo Desktop in Privacy & Security after the first launch.
+          It is an Actions build candidate, not a published GitHub Release.
+          EOF
+          python scripts/ci/write_sha256.py \
+            candidate-artifacts/openevo-*.whl \
+            candidate-artifacts/OpenEvo-Desktop-*.dmg
+          python scripts/ci/check_openevo_release.py \
+            --wheel candidate-artifacts/openevo-*.whl \
+            --artifact candidate-artifacts/*
+
+      - name: Upload short-lived unsigned candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: openevo-desktop-${{ inputs.candidate_label }}-${{ github.sha }}
+          path: candidate-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove generated build inventory
+        if: always()
+        run: |
+          if [ -n "${OPENEVO_PACKAGED_SIDECAR_PATH:-}" ]; then
+            rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"
+          fi
+          rm -rf \
+            .candidate-remote-wheel \
+            desktop/packaging/sidecar-build \
+            desktop/packaging/sidecar-dist
