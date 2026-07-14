@@ -31,6 +31,8 @@ const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
+const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
+const NATIVE_SESSION_HEADER: &str = "X-OpenEvo-Desktop-Session";
 const NATIVE_EXECUTABLE_FD_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_FD";
 const PYINSTALLER_PRIVATE_ENV_PREFIX: &[u8] = b"_PYI_";
 const PYINSTALLER_RESET_ENVIRONMENT: &str = "PYINSTALLER_RESET_ENVIRONMENT";
@@ -2040,6 +2042,24 @@ fn check_sidecar_contract(port: u16) -> HostResult<NegotiatedContractV1> {
     })
 }
 
+fn check_sidecar_session_binding(port: u16, session_token: &str) -> HostResult<()> {
+    let authenticated = loopback_http_get(
+        port,
+        NATIVE_SESSION_PROBE_ROUTE,
+        Some((NATIVE_SESSION_HEADER, session_token)),
+    )
+    .map_err(|_| sidecar_session_error())?;
+    if authenticated.status != 204 || !authenticated.body.is_empty() {
+        return Err(sidecar_session_error());
+    }
+    let unauthenticated = loopback_http_get(port, NATIVE_SESSION_PROBE_ROUTE, None)
+        .map_err(|_| sidecar_session_error())?;
+    if unauthenticated.status != 403 {
+        return Err(sidecar_session_error());
+    }
+    Ok(())
+}
+
 fn readiness_hmac_domain(instance_id: &str, challenge: &str) -> String {
     format!("{NATIVE_SIDECAR_PROTOCOL}\0{instance_id}\0{challenge}")
 }
@@ -2106,7 +2126,10 @@ fn wait_for_sidecar_ready_with_inspection(
             ));
         }
         if check_sidecar_health(port, credential).is_ok() {
-            return check_sidecar_contract(port);
+            let contract = check_sidecar_contract(port)?;
+            let session_token = EncodedSecret::new(&credential.session_token);
+            check_sidecar_session_binding(port, session_token.expose())?;
+            return Ok(contract);
         }
         if Instant::now() >= deadline {
             return Err(NativeHostError::new(
@@ -2122,6 +2145,13 @@ fn sidecar_health_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_health_unavailable",
         "The OpenEvo Desktop sidecar did not prove its native instance identity.",
+    )
+}
+
+fn sidecar_session_error() -> NativeHostError {
+    NativeHostError::new(
+        "sidecar_session_unavailable",
+        "The OpenEvo Desktop sidecar did not prove its private session binding.",
     )
 }
 
@@ -3137,7 +3167,19 @@ fn start_sidecar_inner_with<C: ProcessControl>(
             return Err(sidecar_start_in_progress_error());
         }
         match control.leader_exited(managed.child_mut()?) {
-            Ok(false) => return managed.bootstrap_context(),
+            Ok(false) => {
+                let port = managed.status.port.ok_or_else(sidecar_state_error)?;
+                let bootstrap = managed.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
+                let session_token = EncodedSecret::new(&bootstrap.session_credential.0);
+                if check_sidecar_session_binding(port, session_token.expose()).is_ok() {
+                    return managed.bootstrap_context();
+                }
+                managed.mark_cleanup_pending();
+                if cleanup_managed_sidecar_with(control, managed).is_err() {
+                    return Err(sidecar_stop_error());
+                }
+                remove_cleaned_sidecar(state, &mut sidecar)?;
+            }
             Ok(true) => {
                 if cleanup_managed_sidecar_with(control, managed).is_err() {
                     return Err(sidecar_stop_error());
@@ -4144,6 +4186,30 @@ mod tests {
     }
 
     #[test]
+    fn session_probe_proves_token_acceptance_and_missing_token_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "7c".repeat(SESSION_TOKEN_BYTES);
+        let server = thread::spawn(move || serve_session_probe(&listener, false));
+
+        check_sidecar_session_binding(port, &token).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn session_probe_rejects_a_sidecar_that_accepts_missing_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "7c".repeat(SESSION_TOKEN_BYTES);
+        let server = thread::spawn(move || serve_session_probe(&listener, true));
+
+        let error = check_sidecar_session_binding(port, &token).unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "sidecar_session_unavailable");
+    }
+
+    #[test]
     fn health_response_rejects_unknown_fields() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -4300,6 +4366,35 @@ mod tests {
     }
 
     #[test]
+    fn readiness_rejects_identity_and_contract_without_session_binding() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let credential = test_credential();
+        let instance_id = credential.instance_id;
+        let readiness_key = credential.readiness_key;
+        let server = thread::spawn(move || {
+            serve_health_on_listener(&listener, instance_id, readiness_key, None, false);
+            let (requests_tx, _) = mpsc::channel();
+            serve_contract_response(&listener, valid_version_response(), 404, requests_tx);
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_empty_response(&mut stream, 403);
+        });
+
+        let error = wait_for_sidecar_ready_with_inspection(
+            port,
+            &credential,
+            Duration::from_secs(1),
+            || false,
+            || Ok(false),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "sidecar_session_unavailable");
+    }
+
+    #[test]
     fn explicit_stop_escalation_kills_the_entire_sidecar_process_group() {
         let fixture = SidecarFixture::directory();
         let descendant_pid_path = fixture.path().join("descendant.pid");
@@ -4420,6 +4515,8 @@ mod tests {
             session_credential: SessionCredential([0x22; SESSION_TOKEN_BYTES]),
             negotiated_contract: test_bootstrap_state().negotiated_contract,
         });
+        let probe_listener = replacement._listener.try_clone().unwrap();
+        let probe_server = thread::spawn(move || serve_session_probe(&probe_listener, false));
         *state.sidecar.lock().unwrap() = Some(replacement);
         state.launch_state.store(
             encode_launch_state(0, LaunchPhase::Published),
@@ -4427,6 +4524,7 @@ mod tests {
         );
 
         let replacement_context = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap();
+        probe_server.join().unwrap();
 
         assert_eq!(
             replacement_context.endpoint,
@@ -4436,6 +4534,26 @@ mod tests {
         assert_ne!(replacement_context.session_token, old_token);
         stop_sidecar_inner(&state).unwrap();
         assert!(!replacement_root.exists());
+    }
+
+    #[test]
+    fn live_but_unhealthy_sidecar_is_cleaned_before_restart_attempt() {
+        let state = DesktopHostState::default();
+        let (managed, private_root, old_port) = managed_test_sidecar();
+        let old_process_group = managed.process_group;
+        *state.sidecar.lock().unwrap() = Some(managed);
+        state.launch_state.store(
+            encode_launch_state(0, LaunchPhase::Published),
+            Ordering::Release,
+        );
+
+        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+
+        assert_eq!(error.code, "bundled_sidecar_missing");
+        assert!(state.sidecar.lock().unwrap().is_none());
+        assert!(!private_root.exists());
+        assert!(!process_group_exists(old_process_group).unwrap());
+        assert_ne!(error.message, format!("http://127.0.0.1:{old_port}"));
     }
 
     #[test]
@@ -5517,6 +5635,23 @@ mod tests {
         write_json_response(&mut stream, 200, body);
     }
 
+    fn serve_session_probe(listener: &TcpListener, accept_missing: bool) {
+        let (mut authenticated, _) = listener.accept().unwrap();
+        let authenticated_request = read_http_request(&mut authenticated);
+        assert!(authenticated_request
+            .lines()
+            .any(|line| line.starts_with(&format!("{NATIVE_SESSION_HEADER}: "))));
+        write_empty_response(&mut authenticated, 204);
+        drop(authenticated);
+
+        let (mut unauthenticated, _) = listener.accept().unwrap();
+        let unauthenticated_request = read_http_request(&mut unauthenticated);
+        assert!(!unauthenticated_request
+            .lines()
+            .any(|line| line.starts_with(&format!("{NATIVE_SESSION_HEADER}: "))));
+        write_empty_response(&mut unauthenticated, if accept_missing { 204 } else { 403 });
+    }
+
     fn serve_contract_response(
         listener: &TcpListener,
         version: serde_json::Value,
@@ -5564,6 +5699,12 @@ mod tests {
             "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
+        stream.write_all(response.as_bytes()).unwrap();
+    }
+
+    fn write_empty_response(stream: &mut TcpStream, status: u16) {
+        let response =
+            format!("HTTP/1.1 {status} Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         stream.write_all(response.as_bytes()).unwrap();
     }
 

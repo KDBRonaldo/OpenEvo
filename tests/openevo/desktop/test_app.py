@@ -216,6 +216,7 @@ def _native_instance_frame(
     *,
     instance_id: str = "1a" * 16,
     readiness_key: str = "5a" * 32,
+    session_token: str = "7c" * 32,
     protocol: str = desktop_launcher.NATIVE_SIDECAR_PROTOCOL,
 ) -> bytes:
     return (
@@ -224,6 +225,7 @@ def _native_instance_frame(
                 "protocol": protocol,
                 "instance_id": instance_id,
                 "readiness_key": readiness_key,
+                "session_token": session_token,
             },
             separators=(",", ":"),
         ).encode("ascii")
@@ -240,11 +242,31 @@ def test_launcher_reads_exact_bounded_native_instance_frame(
         _BinaryStdin(_native_instance_frame()),
     )
 
-    instance = desktop_launcher._read_native_instance_frame()
+    frame = desktop_launcher._read_native_instance_frame()
 
-    assert instance.instance_id == "1a" * 16
-    assert instance.readiness_key == bytes.fromhex("5a" * 32)
-    assert "5a" * 32 not in repr(instance)
+    assert frame.native_instance.instance_id == "1a" * 16
+    assert frame.native_instance.readiness_key == bytes.fromhex("5a" * 32)
+    assert frame.session_token == "7c" * 32
+    assert desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES == 512
+    assert "5a" * 32 not in repr(frame)
+    assert "7c" * 32 not in repr(frame)
+
+
+def test_launcher_accepts_native_frame_at_rust_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact = _native_instance_frame()
+    padded = (
+        compact[:-1]
+        + b" " * (desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES - len(compact))
+        + b"\n"
+    )
+    assert len(padded) == desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES
+    monkeypatch.setattr(desktop_launcher.sys, "stdin", _BinaryStdin(padded))
+
+    frame = desktop_launcher._read_native_instance_frame()
+
+    assert frame.session_token == "7c" * 32
 
 
 @pytest.mark.parametrize(
@@ -265,6 +287,8 @@ def test_launcher_reads_exact_bounded_native_instance_frame(
         _native_instance_frame(protocol="openevo-native-sidecar-v2"),
         _native_instance_frame(instance_id="1A" * 16),
         _native_instance_frame(readiness_key="5a" * 31),
+        _native_instance_frame(session_token="7c" * 31),
+        _native_instance_frame(session_token="7C" * 32),
         _native_instance_frame()[:-2] + b',"unknown":true}\n',
         b"x" * (desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES + 1) + b"\n",
     ],
@@ -288,6 +312,7 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
     port = listener.getsockname()[1]
     instance_id = "1a" * 16
     secret = bytes.fromhex("5a" * 32)
+    session_token = "7c" * 32
     process = subprocess.Popen(
         [
             sys.executable,
@@ -313,7 +338,12 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
     )
     try:
         assert process.stdin is not None
-        process.stdin.write(_native_instance_frame(instance_id=instance_id))
+        process.stdin.write(
+            _native_instance_frame(
+                instance_id=instance_id,
+                session_token=session_token,
+            )
+        )
         process.stdin.close()
         process.stdin = None
         listener.close()
@@ -352,6 +382,43 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
                 hashlib.sha256,
             ).hexdigest(),
         }
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request(
+            "GET",
+            "/openevo-native/session",
+            headers={desktop_launcher.NATIVE_SESSION_HEADER: session_token},
+        )
+        assert connection.getresponse().status == 204
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request("GET", "/openevo-native/session")
+        assert connection.getresponse().status == 403
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request(
+            "GET",
+            "/openevo-api/desktop/run",
+            headers={desktop_launcher.NATIVE_SESSION_HEADER: session_token},
+        )
+        assert connection.getresponse().status == 409
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request(
+            "GET",
+            "/openevo-api/desktop/run",
+            headers={"X-OpenEvo-Sidecar-Token": session_token},
+        )
+        assert connection.getresponse().status == 403
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request("GET", "/openevo-api/desktop/shell")
+        assert connection.getresponse().status == 404
+        connection.close()
     finally:
         listener.close()
         if process.poll() is None:

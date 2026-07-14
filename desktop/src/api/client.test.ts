@@ -12,6 +12,7 @@ const SESSION_TOKEN = "s".repeat(32);
 
 describe("OpenEvo API client host routing", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.clearAllMocks();
     vi.restoreAllMocks();
     resetOpenEvoSidecarForTests();
@@ -94,6 +95,46 @@ describe("OpenEvo API client host routing", () => {
       "http://127.0.0.1:49152/openevo-api/desktop/projects",
       "http://127.0.0.1:49153/openevo-api/desktop/projects",
     ]);
+    expect(
+      new Headers(fetchMock.mock.calls[1][1]?.headers).get(
+        "X-OpenEvo-Desktop-Session",
+      ),
+    ).toBe(replacementToken);
+  });
+
+  it("times out an ordinary request and reboots through native startup", async () => {
+    vi.useFakeTimers();
+    window.__TAURI_INTERNALS__ = {};
+    const replacementToken = "t".repeat(32);
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(bootstrapContext(49152, SESSION_TOKEN))
+      .mockResolvedValueOnce(bootstrapContext(49153, replacementToken));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementationOnce((_input, init) => {
+        const signal = init?.signal;
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      })
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    const firstRequest = api.get("/openevo-api/desktop/projects");
+    const timedOut = expect(firstRequest).rejects.toMatchObject({
+      name: "TimeoutError",
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await timedOut;
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([
+      "http://127.0.0.1:49152/openevo-api/desktop/projects",
+      "http://127.0.0.1:49153/openevo-api/desktop/projects",
+    ]);
+    expect(fetchMock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
     expect(
       new Headers(fetchMock.mock.calls[1][1]?.headers).get(
         "X-OpenEvo-Desktop-Session",

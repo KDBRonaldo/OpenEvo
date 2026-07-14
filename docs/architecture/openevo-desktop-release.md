@@ -138,6 +138,13 @@ the child's stdin and then closes the pipe. Its exact keys are `protocol`,
 `openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and both credentials
 are independently generated 256-bit values. Duplicate, missing, unknown,
 malformed, or trailing input is rejected by the strict sidecar integration.
+The packaged Python launcher applies the same 512-byte bound, requires the
+closed four-key object and lowercase fixed-width hex values, and passes the
+decoded session token directly as the sidecar mutation credential. In native
+mode an ASGI boundary accepts only `X-OpenEvo-Desktop-Session`, removes the
+legacy mutation header before translating the renderer credential internally,
+and makes the legacy shell route unavailable. The frame and translated secret
+are not logged or included in exception text.
 None of these values is placed in argv, environment, or a file. The readiness
 key and Desktop session token are never returned by HTTP discovery, native
 status, or logs; only `start_sidecar` returns the session token directly to the
@@ -158,8 +165,12 @@ OpenAPI digest. Exact bootstrap and version tests consume that same native
 constant.
 Native readiness also requires `GET /openevo-api/desktop/shell` to return 404,
 so the old shell token route cannot remain in a release sidecar inventory.
-Contract, digest, provider, feature, or route mismatch triggers owned child-group
-cleanup and startup fails closed.
+It then calls the hidden no-side-effect native session probe with
+`X-OpenEvo-Desktop-Session` and requires an empty 204 response, repeats the same
+probe without the header, and requires 403. Only after both results prove the
+sidecar is bound to the frame token may native code publish endpoint and token
+to the renderer. Contract, digest, provider, feature, route, or session-binding
+mismatch triggers owned child-group cleanup and startup fails closed.
 
 `start_sidecar` and lifecycle status are separate renderer contracts.
 `start_sidecar` returns exactly `DesktopBootstrapContextV1` with keys
@@ -170,10 +181,20 @@ exactly `major`, `openapi_sha256`, `provider_kind`, and `feature_flags`.
 port, URL, endpoint, command, or credential. Internal lifecycle snapshots retain
 the process data required for ownership but are not serializable renderer DTOs.
 The renderer caches this bootstrap context while requests can reach the endpoint.
-Only a network-level `fetch` rejection invalidates that exact cached promise; the
-next request invokes `start_sidecar` again for the current native endpoint and
-token. HTTP status failures, authentication failures, and response-contract
-parsing failures preserve the cache and cannot cause a blind restart loop.
+Ordinary request/response calls have a 15-second bound covering both `fetch` and
+response-body consumption. A network `TypeError` or this internally generated
+timeout invalidates only the exact cached promise used by the failed request;
+the next request invokes `start_sidecar` again. HTTP status failures, external
+request cancellation, authentication failures, and response-contract parsing
+failures preserve the cache and cannot cause a blind restart loop. Long-lived
+SSE uses the separate `fetchEventSource` path and is not subject to the ordinary
+request timeout.
+
+Before `start_sidecar` reuses a managed process that is still alive, native code
+repeats the authenticated and unauthenticated session probes using the retained
+credential. A failed probe marks the old process cleanup-pending, performs the
+bounded TERM/KILL group cleanup, removes the old endpoint and credential, and
+continues through a fresh launch. It never returns the stale bootstrap context.
 
 Release policy does not read `OPENEVO_DESKTOP_SIDECAR_COMMAND`,
 `OPENEVO_DESKTOP_SIDECAR_PROGRAM`,
@@ -283,16 +304,14 @@ raw-log buffer and no `app_logs` Tauri command, so renderer JavaScript cannot
 receive child output; sidecar status also omits command, path, argv, credential,
 and backend details.
 
-The native half of this bootstrap protocol is implemented here. The Python
-sidecar currently present on this branch still implements the legacy shell
-surface and the three-key native frame. It is intentionally not accepted by the
-new release handshake. The remaining integration point is a strict Local API v1
-sidecar that consumes the four-key frame, uses `session_token` exclusively for
-`X-OpenEvo-Desktop-Session`, reports the final frozen `/version` metadata, and
-omits the legacy shell route. There is no legacy-token or direct-backend
-fallback while that integration is pending; the ignored packaged externalBin
-smoke becomes passing evidence only after the strict sidecar is merged and the
-single digest constant is updated.
+The native host and packaged Python launcher now share the four-key frame and
+session-header boundary described above. The remaining integration point is the
+strict Local API v1 release inventory and its final frozen `/version` metadata;
+the Python sidecar implementation outside the launcher still contains legacy
+surfaces, which the native launcher boundary hides rather than treating as a
+fallback. There is no direct-backend fallback while that integration is pending;
+the ignored packaged externalBin smoke becomes passing evidence only after the
+strict sidecar inventory is merged and the single digest constant is updated.
 
 This phase does not implement a macOS Keychain secret broker. In particular,
 `password_ref` and `passphrase_ref` cannot yet be resolved for SSH operations,

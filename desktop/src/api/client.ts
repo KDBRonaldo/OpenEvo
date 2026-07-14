@@ -30,6 +30,8 @@ declare global {
 }
 
 let sidecarStartPromise: Promise<DesktopBootstrapContextV1> | null = null;
+// Long-lived SSE uses api/sse.ts and intentionally bypasses this bound.
+const ORDINARY_REQUEST_TIMEOUT_MS = 15_000;
 
 async function request<T>(
   method: string,
@@ -50,40 +52,48 @@ async function request<T>(
   if (resolved.sessionToken) {
     requestHeaders.set("X-OpenEvo-Desktop-Session", resolved.sessionToken);
   }
-  let response: Response;
+  const timeoutController = new AbortController();
+  const timeoutId = globalThis.setTimeout(() => {
+    timeoutController.abort(
+      new DOMException("The Desktop request timed out.", "TimeoutError"),
+    );
+  }, ORDINARY_REQUEST_TIMEOUT_MS);
+  init.signal = timeoutController.signal;
   try {
-    response = await fetch(resolved.url, init);
+    const response = await fetch(resolved.url, init);
+    if (!response.ok) {
+      let detail: any;
+      try {
+        detail = await response.json();
+      } catch {
+        detail = await response.text();
+      }
+      const error = new Error(
+        `HTTP ${response.status} ${response.statusText}: ${
+          typeof detail === "string" ? detail : JSON.stringify(detail)
+        }`,
+      );
+      (error as any).status = response.status;
+      (error as any).detail = detail;
+      throw error;
+    }
+    const contentType = response.headers.get("Content-Type") || "";
+    if (contentType.includes("application/json")) {
+      return (await response.json()) as T;
+    }
+    return (await response.text()) as unknown as T;
   } catch (error) {
     if (
-      error instanceof TypeError &&
+      (error instanceof TypeError || timeoutController.signal.aborted) &&
       resolved.bootstrapPromise &&
       sidecarStartPromise === resolved.bootstrapPromise
     ) {
       sidecarStartPromise = null;
     }
     throw error;
+  } finally {
+    globalThis.clearTimeout(timeoutId);
   }
-  if (!response.ok) {
-    let detail: any;
-    try {
-      detail = await response.json();
-    } catch {
-      detail = await response.text();
-    }
-    const error = new Error(
-      `HTTP ${response.status} ${response.statusText}: ${
-        typeof detail === "string" ? detail : JSON.stringify(detail)
-      }`,
-    );
-    (error as any).status = response.status;
-    (error as any).detail = detail;
-    throw error;
-  }
-  const contentType = response.headers.get("Content-Type") || "";
-  if (contentType.includes("application/json")) {
-    return (await response.json()) as T;
-  }
-  return (await response.text()) as unknown as T;
 }
 
 async function resolveRequest(
