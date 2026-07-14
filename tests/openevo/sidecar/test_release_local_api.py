@@ -4,7 +4,8 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 from pathlib import Path
-from typing import cast
+from threading import Event, Lock, Thread
+from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
@@ -92,6 +93,29 @@ class FakeRemoteLifecycle(DesktopRemoteLifecycle):
     def close(self) -> None:
         self.closed = True
         self.current = RemoteLifecycleSnapshot(None, "disconnected")
+
+
+class RacingRemoteLifecycle(FakeRemoteLifecycle):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_started = Event()
+        self.release_first = Event()
+        self.second_finished = Event()
+        self._lock = Lock()
+
+    def connect(self, profile) -> RemoteConnectionResult:
+        if profile.name == "A":
+            self.first_started.set()
+            assert self.release_first.wait(5)
+            with self._lock:
+                self.current = RemoteLifecycleSnapshot(
+                    profile.profile_id, "failed", failure_code="ssh_connection_failed"
+                )
+            raise RemoteConnectionFailedError("late A failure")
+        with self._lock:
+            self.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+        self.second_finished.set()
+        return RemoteConnectionResult(profile.profile_id, "connected")
 
 
 def _app(
@@ -325,6 +349,8 @@ def test_remote_connection_lifecycle_is_etag_bound_and_idempotent(tmp_path: Path
         )
         assert connected.status_code == replay.status_code == 202
         assert connected.json() == replay.json()
+        assert connected.headers["etag"] == connected.json()["etag"]
+        assert replay.headers["etag"] == replay.json()["etag"]
         assert connected.json()["state"] == "succeeded"
         assert connected.json()["result"]["connection_state"] == "host_key_required"
         assert lifecycle.connect_calls == 1
@@ -346,7 +372,7 @@ def test_remote_connection_lifecycle_is_etag_bound_and_idempotent(tmp_path: Path
             f"/desktop/v1/profiles/{profile_id}", headers=SESSION_HEADERS
         ).json()
         assert reviewed_profile["connection_state"] == "host_key_required"
-        assert reviewed_profile["host_key_fingerprint"] == lifecycle.candidate.fingerprint
+        assert reviewed_profile["host_key_fingerprint"] is None
 
         blocked_patch = client.patch(
             f"/desktop/v1/profiles/{profile_id}",
@@ -377,6 +403,8 @@ def test_remote_connection_lifecycle_is_etag_bound_and_idempotent(tmp_path: Path
         )
         assert accepted.status_code == accepted_replay.status_code == 202
         assert accepted.json() == accepted_replay.json()
+        assert accepted.headers["etag"] == accepted.json()["etag"]
+        assert accepted_replay.headers["etag"] == accepted_replay.json()["etag"]
         assert lifecycle.accept_calls == 1
         online_profile = client.get(
             f"/desktop/v1/profiles/{profile_id}", headers=SESSION_HEADERS
@@ -401,6 +429,8 @@ def test_remote_connection_lifecycle_is_etag_bound_and_idempotent(tmp_path: Path
         )
         assert disconnected.status_code == disconnected_replay.status_code == 202
         assert disconnected.json() == disconnected_replay.json()
+        assert disconnected.headers["etag"] == disconnected.json()["etag"]
+        assert disconnected_replay.headers["etag"] == disconnected_replay.json()["etag"]
         assert lifecycle.disconnect_calls == 1
         assert (
             client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()["core"]["state"]
@@ -408,6 +438,51 @@ def test_remote_connection_lifecycle_is_etag_bound_and_idempotent(tmp_path: Path
         )
 
     assert lifecycle.closed
+
+
+def test_late_failure_cannot_overwrite_newer_profile_connection(tmp_path: Path) -> None:
+    lifecycle = RacingRemoteLifecycle()
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        first = _create_profile(client, name="A", key="profile-race-create-a").json()
+        second = _create_profile(client, name="B", key="profile-race-create-b").json()
+        responses: dict[str, Any] = {}
+
+        def connect(name: str, profile: dict[str, object]) -> None:
+            responses[name] = client.post(
+                f"/desktop/v1/profiles/{profile['profile_id']}/connect",
+                headers={
+                    **SESSION_HEADERS,
+                    "If-Match": cast(str, profile["etag"]),
+                    "Idempotency-Key": f"profile-race-connect-{name.lower()}",
+                },
+            )
+
+        first_thread = Thread(target=connect, args=("A", first))
+        second_thread = Thread(target=connect, args=("B", second))
+        first_thread.start()
+        assert lifecycle.first_started.wait(2)
+        second_thread.start()
+        try:
+            assert lifecycle.second_finished.wait(2)
+        finally:
+            lifecycle.release_first.set()
+        first_thread.join(5)
+        second_thread.join(5)
+
+        assert responses["A"].status_code == 503
+        assert responses["B"].status_code == 202
+        state = client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()["core"]
+        assert state["profile_id"] == second["profile_id"]
+        assert state["failure"]["code"] == "core_not_started"
+        stored_first = client.get(
+            f"/desktop/v1/profiles/{first['profile_id']}", headers=SESSION_HEADERS
+        ).json()
+        stored_second = client.get(
+            f"/desktop/v1/profiles/{second['profile_id']}", headers=SESSION_HEADERS
+        ).json()
+        assert stored_first["connection_state"] == "disconnected"
+        assert stored_second["connection_state"] == "connected"
 
 
 def test_remote_connection_failure_is_typed_and_does_not_persist_details(

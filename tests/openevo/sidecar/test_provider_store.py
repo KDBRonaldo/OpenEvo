@@ -23,6 +23,7 @@ from desktop.sidecar.contracts.v1.models import (
     ProjectOperationResultV1,
     ProjectPatchV1,
     RemoteProfilePatchV1,
+    RemoteProfileV1,
     ResourceRefV1,
 )
 from desktop.sidecar.provider_store import (
@@ -795,6 +796,99 @@ def test_profile_runtime_state_is_closed_and_recovered_on_restart(
         profile_id=profile.profile_id,
         connection_state="disconnected",
     )
+
+
+def test_connecting_second_profile_atomically_displaces_first_profile(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    first = _create_profile(store, name="First", key="profile-create-first")
+    second = _create_profile(store, name="Second", key="profile-create-second")
+
+    def connect(profile: RemoteProfileV1, key: str) -> LocalOperationV1:
+        def mutation(transaction: ProviderMutation):
+            updated = transaction.set_profile_runtime_state(
+                profile.profile_id,
+                if_match=profile.etag,
+                connection_state="connected",
+                credential_slots=(),
+                host_key_fingerprint="SHA256:verified",
+            )
+            return 202, transaction.create_local_operation(
+                operation_kind="profile_connect",
+                resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
+                state="succeeded",
+                result=ConnectionOperationResultV1(
+                    profile_id=profile.profile_id,
+                    connection_state=updated.connection_state,
+                ),
+            )
+
+        result = store.execute_idempotent_action(
+            route=f"/desktop/v1/profiles/{profile.profile_id}/connect",
+            resource_scope=profile.profile_id,
+            key=key,
+            body={},
+            if_match=profile.etag,
+            semantic_headers={},
+            response_model=LocalOperationV1,
+            mutation=mutation,
+        )
+        return LocalOperationV1.model_validate_json(result.response_bytes)
+
+    first_operation = connect(first, "profile-connect-first")
+    second_operation = connect(second, "profile-connect-second")
+
+    assert store.get_profile(first.profile_id).connection_state == "disconnected"
+    assert store.get_profile(second.profile_id).connection_state == "connected"
+    displaced = store.get_local_operation(first_operation.operation_id)
+    assert displaced.state == "cancelled"
+    assert displaced.result == ConnectionOperationResultV1(
+        profile_id=first.profile_id,
+        connection_state="disconnected",
+    )
+    assert store.get_local_operation(second_operation.operation_id) == second_operation
+
+
+def test_startup_discards_unconfirmed_host_key_fingerprint(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+
+    def review(transaction: ProviderMutation):
+        reviewed = transaction.set_profile_runtime_state(
+            profile.profile_id,
+            if_match=profile.etag,
+            connection_state="host_key_required",
+            credential_slots=(),
+            host_key_fingerprint="SHA256:unconfirmed-candidate",
+        )
+        return 202, transaction.create_local_operation(
+            operation_kind="profile_connect",
+            resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
+            state="succeeded",
+            result=ConnectionOperationResultV1(
+                profile_id=profile.profile_id,
+                connection_state=reviewed.connection_state,
+            ),
+        )
+
+    store.execute_idempotent_action(
+        route=f"/desktop/v1/profiles/{profile.profile_id}/connect",
+        resource_scope=profile.profile_id,
+        key="profile-review-unconfirmed",
+        body={},
+        if_match=profile.etag,
+        semantic_headers={},
+        response_model=LocalOperationV1,
+        mutation=review,
+    )
+    store.close()
+
+    reopened = DesktopProviderStore(root)
+    recovered = reopened.get_profile(profile.profile_id)
+    assert recovered.connection_state == "disconnected"
+    assert recovered.host_key_fingerprint is None
 
 
 def test_deleted_profile_action_replay_cannot_return_connected(tmp_path: Path) -> None:

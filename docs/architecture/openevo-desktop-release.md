@@ -218,6 +218,17 @@ failures preserve the cache and cannot cause a blind restart loop. Long-lived
 SSE uses the separate `fetchEventSource` path and is not subject to the ordinary
 request timeout.
 
+Release SSH profile actions reserve three seconds of that renderer deadline for
+HTTP and response handling. Host-key confirmation, including its repeated
+untrusted probe, and the subsequent trusted SSH connectivity check share one
+12-second monotonic deadline rather than receiving independent timeouts.
+Connection ownership is generation-bound: replacing A with B persists A as
+disconnected and cancels A's obsolete local operation, while every success or
+failure state commit is conditional on the same current owner generation.
+Unconfirmed host-key candidates are process-only review data and are never a
+verified profile fingerprint. Connect, host-key accept, and disconnect return
+the frozen operation ETag in the response header as well as the body.
+
 Before `start_sidecar` reuses a managed process that is still alive, native code
 repeats the authenticated and unauthenticated session probes using the retained
 credential. A failed probe marks the old process cleanup-pending, performs the

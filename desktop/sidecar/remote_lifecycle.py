@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
+import time
 from typing import Literal, Protocol
 
 from desktop.sidecar.contracts.v1.models import HostKeyAcceptV1, RemoteProfileV1
@@ -67,6 +68,7 @@ class _RemoteTransport(Protocol):
 
 AuthResolver = Callable[[RemoteProfileV1], SSHAuthConfig]
 TransportFactory = Callable[[RemoteProfileConfig, TrustedKnownHostsBinding], _RemoteTransport]
+_MAX_CONNECTION_DEADLINE_SECONDS = 12.0
 
 
 @dataclass(frozen=True)
@@ -135,14 +137,16 @@ class DesktopRemoteLifecycle:
         *,
         auth_resolver: AuthResolver = ssh_auth_from_native_credentials,
         transport_factory: TransportFactory = _default_transport_factory,
-        connection_timeout_seconds: float = 10.0,
+        connection_timeout_seconds: float = _MAX_CONNECTION_DEADLINE_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not 0 < connection_timeout_seconds <= 60:
-            raise ValueError("connection timeout must be between zero and 60 seconds")
+        if not 0 < connection_timeout_seconds <= _MAX_CONNECTION_DEADLINE_SECONDS:
+            raise ValueError("connection timeout must be between zero and 12 seconds")
         self._host_keys: _HostKeyStore = host_keys
         self._auth_resolver = auth_resolver
         self._transport_factory = transport_factory
         self._connection_timeout_seconds = connection_timeout_seconds
+        self._monotonic = monotonic
         self._lock = Lock()
         self._generation = 0
         self._snapshot = RemoteLifecycleSnapshot(None, "disconnected")
@@ -161,15 +165,14 @@ class DesktopRemoteLifecycle:
             return active.transport
 
     def connect(self, profile: RemoteProfileV1) -> RemoteConnectionResult:
+        deadline = self._deadline()
         config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
         generation, displaced = self._begin(profile.profile_id)
         self._close_remote(displaced)
         try:
             binding = self._load_binding(config, profile.host_key_fingerprint)
             if binding is None:
-                pending = self._host_keys.probe(
-                    config, timeout_seconds=self._connection_timeout_seconds
-                )
+                pending = self._host_keys.probe(config, timeout_seconds=self._remaining(deadline))
                 candidate = self._preferred_candidate(pending)
                 self._publish_pending(generation, config, pending, candidate)
                 return RemoteConnectionResult(
@@ -177,7 +180,7 @@ class DesktopRemoteLifecycle:
                     state="host_key_required",
                     host_key_candidate=candidate,
                 )
-            return self._connect_with_binding(generation, config, binding)
+            return self._connect_with_binding(generation, config, binding, deadline=deadline)
         except RemoteLifecycleSupersededError:
             raise
         except Exception as exc:
@@ -193,6 +196,7 @@ class DesktopRemoteLifecycle:
         profile: RemoteProfileV1,
         request: HostKeyAcceptV1,
     ) -> RemoteConnectionResult:
+        deadline = self._deadline()
         config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
         with self._lock:
             pending_entry = self._pending.get(profile.profile_id)
@@ -210,9 +214,9 @@ class DesktopRemoteLifecycle:
                 profile=config,
                 algorithm=request.algorithm,
                 fingerprint=request.fingerprint,
-                timeout_seconds=self._connection_timeout_seconds,
+                timeout_seconds=self._remaining(deadline),
             )
-            return self._connect_with_binding(generation, config, binding)
+            return self._connect_with_binding(generation, config, binding, deadline=deadline)
         except RemoteLifecycleSupersededError:
             raise
         except Exception as exc:
@@ -290,10 +294,12 @@ class DesktopRemoteLifecycle:
         generation: int,
         profile: RemoteProfileConfig,
         binding: TrustedKnownHostsBinding,
+        *,
+        deadline: float,
     ) -> RemoteConnectionResult:
         transport = self._transport_factory(profile, binding)
         try:
-            result = transport.run("true", timeout_seconds=self._connection_timeout_seconds)
+            result = transport.run("true", timeout_seconds=self._remaining(deadline))
             if not result.ok:
                 raise RemoteConnectionFailedError("The SSH connectivity check failed.")
             active = _ActiveRemote(profile=profile, binding=binding, transport=transport)
@@ -306,6 +312,15 @@ class DesktopRemoteLifecycle:
         except BaseException:
             self._close_transport(transport)
             raise
+
+    def _deadline(self) -> float:
+        return self._monotonic() + self._connection_timeout_seconds
+
+    def _remaining(self, deadline: float) -> float:
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise RemoteConnectionFailedError("The SSH connection deadline expired.")
+        return remaining
 
     def _publish_failure(self, generation: int, profile_id: str, code: str) -> None:
         with self._lock:

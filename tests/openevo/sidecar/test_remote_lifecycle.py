@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Event, Thread
-from typing import cast
+from typing import Callable, cast
 
 import pytest
 
@@ -114,10 +114,12 @@ class FakeTransport:
         return_code: int = 0,
         started: Event | None = None,
         release: Event | None = None,
+        advance: Callable[[], None] | None = None,
     ) -> None:
         self.return_code = return_code
         self.started = started
         self.release = release
+        self.advance = advance
         self.commands: list[tuple[str, float]] = []
         self.closed = False
 
@@ -131,6 +133,8 @@ class FakeTransport:
     ) -> RemoteCommandResult:
         assert cwd is None and env is None
         self.commands.append((command, timeout_seconds))
+        if self.advance is not None:
+            self.advance()
         if self.started is not None:
             self.started.set()
         if self.release is not None:
@@ -184,11 +188,50 @@ def test_host_key_acceptance_connects_and_preserves_proxy_config() -> None:
     assert result.state == "connected"
     assert lifecycle.snapshot().state == "connected"
     assert lifecycle.active_transport(profile.profile_id) is transport
-    assert transport.commands == [("true", 10.0)]
+    assert transport.commands[0][0] == "true"
+    assert 0 < transport.commands[0][1] <= 12.0
     config = seen[0]
     assert config.proxy.http_proxy == "http://127.0.0.1:7890"
     assert config.proxy.no_proxy == "127.0.0.1,localhost"
     assert seen[1] is binding
+
+
+def test_host_key_acceptance_shares_one_deadline_with_the_ssh_check() -> None:
+    candidate = _candidate()
+    now = [100.0]
+
+    class DeadlineHostKeys(FakeHostKeys):
+        def confirm(self, *args, timeout_seconds: float = 10.0, **kwargs):
+            assert timeout_seconds == pytest.approx(12.0)
+            now[0] += 7.0
+            return super().confirm(*args, timeout_seconds=timeout_seconds, **kwargs)
+
+    host_keys = DeadlineHostKeys((candidate,), loaded=object())
+    transport = FakeTransport(advance=lambda: now.__setitem__(0, now[0] + 4.0))
+    lifecycle = DesktopRemoteLifecycle(
+        cast(object, host_keys),
+        transport_factory=lambda *_: transport,
+        connection_timeout_seconds=12.0,
+        monotonic=lambda: now[0],
+    )
+    profile = _profile()
+    lifecycle.connect(profile)
+
+    lifecycle.accept_host_key(
+        profile,
+        HostKeyAcceptV1(algorithm=candidate.algorithm, fingerprint=candidate.fingerprint),
+    )
+
+    assert transport.commands == [("true", pytest.approx(5.0))]
+    assert now[0] - 100.0 == 11.0
+
+
+def test_connection_deadline_cannot_consume_the_desktop_request_margin() -> None:
+    with pytest.raises(ValueError, match="between zero and 12 seconds"):
+        DesktopRemoteLifecycle(
+            cast(object, FakeHostKeys((_candidate(),))),
+            connection_timeout_seconds=12.001,
+        )
 
 
 def test_existing_trust_connects_without_a_new_probe() -> None:

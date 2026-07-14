@@ -604,6 +604,8 @@ class ProviderMutation:
             raise ContractValidationError("profile connection state is not a Desktop v1 state")
         row = self._store._require_profile_row(self._connection, profile_id)
         self._store._require_etag("profile", profile_id, row, if_match)
+        if connection_state in {"connecting", "host_key_required", "connected"}:
+            self.disconnect_other_profiles(profile_id)
         timestamp = self._store._timestamp()
         current = self._store._profile_from_row(row)
         proposed = _validate_model(
@@ -637,9 +639,38 @@ class ProviderMutation:
                 profile_id,
             ),
         )
+        if connection_state == "disconnected":
+            self._store._reconcile_profile_operations(self._connection, profile_id)
         return self._store._profile_from_row(
             self._store._require_profile_row(self._connection, profile_id)
         )
+
+    def disconnect_other_profiles(self, owner_profile_id: str) -> None:
+        self._store._validate_resource_id(owner_profile_id)
+        rows = self._connection.execute(
+            """
+            SELECT profile_id
+            FROM remote_profiles
+            WHERE profile_id != ? AND connection_state != 'disconnected'
+            ORDER BY profile_id
+            """,
+            (owner_profile_id,),
+        ).fetchall()
+        if not rows:
+            return
+        timestamp = self._store._timestamp()
+        profile_ids = [cast(str, row["profile_id"]) for row in rows]
+        self._connection.execute(
+            """
+            UPDATE remote_profiles
+            SET connection_state = 'disconnected',
+                resource_version = resource_version + 1, updated_at = ?
+            WHERE profile_id != ? AND connection_state != 'disconnected'
+            """,
+            (timestamp, owner_profile_id),
+        )
+        for profile_id in profile_ids:
+            self._store._reconcile_profile_operations(self._connection, profile_id)
 
     def create_local_operation(
         self,
@@ -1310,6 +1341,11 @@ class DesktopProviderStore:
                 """
                 UPDATE remote_profiles
                 SET connection_state = 'disconnected',
+                    host_key_fingerprint = CASE
+                        WHEN connection_state IN ('connecting', 'host_key_required', 'failed')
+                            THEN NULL
+                        ELSE host_key_fingerprint
+                    END,
                     resource_version = resource_version + 1, updated_at = ?
                 WHERE connection_state != 'disconnected'
                 """,
@@ -1811,6 +1847,45 @@ class DesktopProviderStore:
             bound_if_match=if_match,
             mutation=mutation,
         )
+
+    def prepare_profile_runtime_action(
+        self,
+        profile_id: str,
+        *,
+        if_match: str,
+        displace_existing: bool,
+    ) -> RemoteProfileV1:
+        """Validate action authority and persist any immediately displaced owner."""
+
+        if type(displace_existing) is not bool:
+            raise ContractValidationError("displace_existing must be a boolean")
+        with self._transaction(write=True) as connection:
+            transaction = ProviderMutation(self, connection, if_match=if_match)
+            profile = transaction.require_profile_authority(profile_id, if_match=if_match)
+            if displace_existing:
+                transaction.disconnect_other_profiles(profile_id)
+            return profile
+
+    def fail_profile_runtime_action(
+        self,
+        profile_id: str,
+        *,
+        if_match: str,
+    ) -> RemoteProfileV1:
+        """Converge the current failed lifecycle owner to disconnected."""
+
+        with self._transaction(write=True) as connection:
+            transaction = ProviderMutation(self, connection, if_match=if_match)
+            profile = transaction.require_profile_authority(profile_id, if_match=if_match)
+            if profile.connection_state == "disconnected":
+                return profile
+            return transaction.set_profile_runtime_state(
+                profile_id,
+                if_match=if_match,
+                connection_state="disconnected",
+                credential_slots=profile.credential_slots,
+                host_key_fingerprint=profile.host_key_fingerprint,
+            )
 
     def _execute_idempotent(
         self,
@@ -2326,6 +2401,37 @@ class DesktopProviderStore:
             ),
         )
         return reconciled
+
+    def _reconcile_profile_operations(
+        self,
+        connection: sqlite3.Connection,
+        profile_id: str,
+    ) -> None:
+        after_operation_id = ""
+        while True:
+            operation_ids = connection.execute(
+                """
+                SELECT operation_id
+                FROM local_operations
+                WHERE resource_type = 'profile' AND resource_id = ?
+                  AND operation_id > ?
+                ORDER BY operation_id
+                LIMIT ?
+                """,
+                (profile_id, after_operation_id, STARTUP_OPERATION_BATCH_ROWS),
+            ).fetchall()
+            if not operation_ids:
+                return
+            for operation_id_row in operation_ids:
+                operation_id = cast(str, operation_id_row["operation_id"])
+                self._reconcile_operation_with_authority(
+                    connection,
+                    self._require_operation_row(connection, operation_id),
+                    force_cancel_nonterminal=True,
+                )
+                after_operation_id = operation_id
+            if len(operation_ids) < STARTUP_OPERATION_BATCH_ROWS:
+                return
 
     def _reconcile_operations_at_startup(self, connection: sqlite3.Connection) -> None:
         after_operation_id = ""

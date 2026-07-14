@@ -25,14 +25,21 @@ The current provider implements:
   and restart recovery;
 - profile connect/disconnect plus explicit SSH host-key review and acceptance.
   The sidecar probes without trusting, repeats the probe before confirmation,
-  stores only the verified fingerprint in Local API resources, and owns the
-  trusted known-host file under its private state root.
+  gives confirmation plus the trusted SSH check one shared 12-second deadline,
+  stores only the confirmed fingerprint in Local API resources, and owns the
+  trusted known-host file under its private state root. Unconfirmed candidates
+  remain only in the process-owned review state and restart recovery removes any
+  candidate persisted by an older interrupted implementation.
 
-Connection mutations validate the profile ETag inside the same durable
-idempotency transaction that records the terminal local operation. A replay
-therefore returns the stored operation without probing, accepting, connecting,
-or disconnecting again. SSH failures roll back the profile mutation and are
-returned as bounded `ApiErrorV1` values without commands, paths, or credentials.
+Connection mutations preflight idempotency and profile ETag authority before
+external SSH work, then commit profile and terminal-operation state under the
+same process owner generation. Replacing profile A with B durably disconnects A
+and cancels A's obsolete operation before B can become authoritative; a delayed
+A result cannot change B's profile or Core state. Replays do not probe, accept,
+connect, or disconnect again. Connect, host-key accept, and disconnect responses
+carry the operation ETag in both the frozen body and `ETag` header. SSH failures
+are returned as bounded `ApiErrorV1` values without commands, paths, or
+credentials.
 
 The production credential resolver currently supports `ssh_agent`. Profiles
 that select native private-key or password authentication fail closed with

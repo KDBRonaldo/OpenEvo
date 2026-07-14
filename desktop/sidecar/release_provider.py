@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -59,7 +60,28 @@ class InvalidNativeChallengeError(Exception):
 
 OperationHandler = Callable[[Mapping[str, object]], object]
 ProfileRuntimeState = Literal["connected", "disconnected", "host_key_required"]
-ConnectionAction = Callable[[RemoteProfileV1], tuple[ProfileRuntimeState, str | None]]
+
+
+@dataclass(frozen=True)
+class _ConnectionOutcome:
+    state: ProfileRuntimeState
+    host_key_fingerprint: str | None
+    host_key_review: HostKeyReviewV1 | None = None
+
+
+ConnectionAction = Callable[[RemoteProfileV1], _ConnectionOutcome]
+
+
+class _ConnectionActionRequired(Exception):
+    def __init__(self, profile: RemoteProfileV1) -> None:
+        super().__init__("connection action requires external execution")
+        self.profile = profile
+
+
+@dataclass
+class _ConnectionActionGate:
+    lock: Lock
+    users: int = 0
 
 
 class DesktopReleaseProvider:
@@ -84,6 +106,10 @@ class DesktopReleaseProvider:
         self._store = store
         self._remote_lifecycle = remote_lifecycle
         self._connection_state_lock = Lock()
+        self._connection_generation = 0
+        self._connection_owner: str | None = None
+        self._connection_gate_lock = Lock()
+        self._connection_gates: dict[tuple[str, str, str], _ConnectionActionGate] = {}
         self._core_state = CoreConnectionStateV1(state="disconnected", active_tunnel=False)
         self._instance_id = instance_id
         self._readiness_key = readiness_key
@@ -207,19 +233,26 @@ class DesktopReleaseProvider:
         )
         return Response(status_code=204)
 
-    def _connect_profile(self, arguments: Mapping[str, object]) -> LocalOperationV1:
+    def _connect_profile(self, arguments: Mapping[str, object]) -> Response:
         profile_id = cast(str, arguments["profile_id"])
         if_match = cast(str, arguments["if_match"])
         idempotency_key = cast(str, arguments["idempotency_key"])
 
-        def connect(profile: RemoteProfileV1) -> tuple[ProfileRuntimeState, str | None]:
+        def connect(profile: RemoteProfileV1) -> _ConnectionOutcome:
             result = self._remote_lifecycle.connect(profile)
-            fingerprint = (
-                result.host_key_candidate.fingerprint
+            review = (
+                HostKeyReviewV1(
+                    algorithm=result.host_key_candidate.algorithm,
+                    fingerprint=result.host_key_candidate.fingerprint,
+                )
                 if result.host_key_candidate is not None
-                else profile.host_key_fingerprint
+                else None
             )
-            return result.state, fingerprint
+            return _ConnectionOutcome(
+                result.state,
+                profile.host_key_fingerprint,
+                host_key_review=review,
+            )
 
         return self._execute_connection_action(
             route=f"/desktop/v1/profiles/{profile_id}/connect",
@@ -231,15 +264,15 @@ class DesktopReleaseProvider:
             action=connect,
         )
 
-    def _accept_host_key(self, arguments: Mapping[str, object]) -> LocalOperationV1:
+    def _accept_host_key(self, arguments: Mapping[str, object]) -> Response:
         profile_id = cast(str, arguments["profile_id"])
         if_match = cast(str, arguments["if_match"])
         idempotency_key = cast(str, arguments["idempotency_key"])
         request = cast(HostKeyAcceptV1, arguments["request"])
 
-        def accept(profile: RemoteProfileV1) -> tuple[ProfileRuntimeState, str | None]:
+        def accept(profile: RemoteProfileV1) -> _ConnectionOutcome:
             result = self._remote_lifecycle.accept_host_key(profile, request)
-            return result.state, request.fingerprint
+            return _ConnectionOutcome(result.state, request.fingerprint)
 
         return self._execute_connection_action(
             route=f"/desktop/v1/profiles/{profile_id}/host-key/accept",
@@ -251,14 +284,14 @@ class DesktopReleaseProvider:
             action=accept,
         )
 
-    def _disconnect_profile(self, arguments: Mapping[str, object]) -> LocalOperationV1:
+    def _disconnect_profile(self, arguments: Mapping[str, object]) -> Response:
         profile_id = cast(str, arguments["profile_id"])
         if_match = cast(str, arguments["if_match"])
         idempotency_key = cast(str, arguments["idempotency_key"])
 
-        def disconnect(profile: RemoteProfileV1) -> tuple[ProfileRuntimeState, str | None]:
+        def disconnect(profile: RemoteProfileV1) -> _ConnectionOutcome:
             self._remote_lifecycle.disconnect(profile.profile_id)
-            return "disconnected", profile.host_key_fingerprint
+            return _ConnectionOutcome("disconnected", profile.host_key_fingerprint)
 
         return self._execute_connection_action(
             route=f"/desktop/v1/profiles/{profile_id}/disconnect",
@@ -280,22 +313,85 @@ class DesktopReleaseProvider:
         idempotency_key: str,
         request_body: BaseModel | Mapping[str, object],
         action: ConnectionAction,
-    ) -> LocalOperationV1:
-        def mutation(transaction):
+    ) -> Response:
+        gate_key = (route, profile_id, idempotency_key)
+        gate = self._acquire_connection_gate(gate_key)
+        try:
+            return self._execute_connection_action_once(
+                route=route,
+                operation_kind=operation_kind,
+                profile_id=profile_id,
+                if_match=if_match,
+                idempotency_key=idempotency_key,
+                request_body=request_body,
+                action=action,
+            )
+        finally:
+            self._release_connection_gate(gate_key, gate)
+
+    def _execute_connection_action_once(
+        self,
+        *,
+        route: str,
+        operation_kind: str,
+        profile_id: str,
+        if_match: str,
+        idempotency_key: str,
+        request_body: BaseModel | Mapping[str, object],
+        action: ConnectionAction,
+    ) -> Response:
+        def preflight(transaction):
             profile = transaction.require_profile_authority(profile_id, if_match=if_match)
-            connection_state, host_key_fingerprint = action(profile)
+            raise _ConnectionActionRequired(profile)
+
+        try:
+            replay = self._store.execute_idempotent_action(
+                route=route,
+                resource_scope=profile_id,
+                key=idempotency_key,
+                body=request_body,
+                if_match=if_match,
+                semantic_headers={},
+                response_model=LocalOperationV1,
+                mutation=preflight,
+            )
+        except _ConnectionActionRequired as required:
+            profile = required.profile
+        else:
+            operation = LocalOperationV1.model_validate_json(replay.response_bytes)
+            return self._operation_response(operation)
+
+        with self._connection_state_lock:
+            self._connection_generation += 1
+            generation = self._connection_generation
+            self._connection_owner = profile_id
+            profile = self._store.prepare_profile_runtime_action(
+                profile_id,
+                if_match=if_match,
+                displace_existing=operation_kind != "profile_disconnect",
+            )
+
+        try:
+            outcome = action(profile)
+        except RemoteLifecycleError as exc:
+            with self._connection_state_lock:
+                if self._owns_connection_locked(generation, profile_id):
+                    self._store.fail_profile_runtime_action(profile_id, if_match=if_match)
+                    self._core_state = self._connection_failure_state(profile_id, exc)
+            raise
+
+        def mutation(transaction):
+            current = transaction.require_profile_authority(profile_id, if_match=if_match)
             updated = transaction.set_profile_runtime_state(
                 profile_id,
                 if_match=if_match,
-                connection_state=connection_state,
-                credential_slots=profile.credential_slots,
-                host_key_fingerprint=host_key_fingerprint,
+                connection_state=outcome.state,
+                credential_slots=current.credential_slots,
+                host_key_fingerprint=outcome.host_key_fingerprint,
             )
             return 202, transaction.create_local_operation(
                 operation_kind=operation_kind,
-                resource=ResourceRefV1(
-                    resource_type="profile", resource_id=profile_id
-                ),
+                resource=ResourceRefV1(resource_type="profile", resource_id=profile_id),
                 state="succeeded",
                 result=ConnectionOperationResultV1(
                     profile_id=profile_id,
@@ -303,7 +399,11 @@ class DesktopReleaseProvider:
                 ),
             )
 
-        try:
+        with self._connection_state_lock:
+            if not self._owns_connection_locked(generation, profile_id):
+                raise RemoteLifecycleSupersededError(
+                    "A newer remote lifecycle operation superseded this result."
+                )
             stored = self._store.execute_idempotent_action(
                 route=route,
                 resource_scope=profile_id,
@@ -314,61 +414,76 @@ class DesktopReleaseProvider:
                 response_model=LocalOperationV1,
                 mutation=mutation,
             )
-        except RemoteLifecycleError as exc:
-            self._set_core_state(self._connection_failure_state(profile_id, exc))
-            raise
-        operation = LocalOperationV1.model_validate_json(stored.response_bytes)
-        self._sync_core_state(profile_id, operation.operation_id)
-        return operation
+            operation = LocalOperationV1.model_validate_json(stored.response_bytes)
+            self._core_state = self._core_state_for_outcome(
+                profile_id,
+                operation.operation_id,
+                outcome,
+            )
+        return self._operation_response(operation)
+
+    def _acquire_connection_gate(
+        self,
+        key: tuple[str, str, str],
+    ) -> _ConnectionActionGate:
+        with self._connection_gate_lock:
+            gate = self._connection_gates.get(key)
+            if gate is None:
+                gate = _ConnectionActionGate(lock=Lock())
+                self._connection_gates[key] = gate
+            gate.users += 1
+        gate.lock.acquire()
+        return gate
+
+    def _release_connection_gate(
+        self,
+        key: tuple[str, str, str],
+        gate: _ConnectionActionGate,
+    ) -> None:
+        gate.lock.release()
+        with self._connection_gate_lock:
+            gate.users -= 1
+            if gate.users == 0:
+                del self._connection_gates[key]
 
     def _require_profile_not_connected(self, profile_id: str) -> None:
         snapshot = self._remote_lifecycle.snapshot()
         if snapshot.profile_id == profile_id and snapshot.state != "disconnected":
             raise ResourceInUseError("profile", profile_id)
 
-    def _sync_core_state(self, profile_id: str, operation_id: str) -> None:
-        snapshot = self._remote_lifecycle.snapshot()
-        if snapshot.profile_id not in {None, profile_id}:
-            return
-        if snapshot.state == "disconnected":
-            state = CoreConnectionStateV1(state="disconnected", active_tunnel=False)
-        elif snapshot.state == "host_key_required":
-            candidate = snapshot.host_key_candidate
-            if candidate is None:
-                state = self._connection_failure_state(
+    def _owns_connection_locked(self, generation: int, profile_id: str) -> bool:
+        return generation == self._connection_generation and self._connection_owner == profile_id
+
+    def _core_state_for_outcome(
+        self,
+        profile_id: str,
+        operation_id: str,
+        outcome: _ConnectionOutcome,
+    ) -> CoreConnectionStateV1:
+        if outcome.state == "disconnected":
+            return CoreConnectionStateV1(state="disconnected", active_tunnel=False)
+        if outcome.state == "host_key_required":
+            if outcome.host_key_review is None:
+                return self._connection_failure_state(
                     profile_id,
                     RemoteConnectionFailedError("SSH host-key review state is incomplete."),
                 )
-            else:
-                state = CoreConnectionStateV1(
-                    state="host_key_review",
-                    profile_id=profile_id,
-                    active_tunnel=False,
-                    operation_id=operation_id,
-                    host_key_review=HostKeyReviewV1(
-                        algorithm=candidate.algorithm,
-                        fingerprint=candidate.fingerprint,
-                    ),
-                )
-        elif snapshot.state == "connected":
-            state = self._core_not_started_state(profile_id)
-        elif snapshot.state == "connecting":
-            state = CoreConnectionStateV1(
-                state="connecting",
+            return CoreConnectionStateV1(
+                state="host_key_review",
                 profile_id=profile_id,
                 active_tunnel=False,
                 operation_id=operation_id,
+                host_key_review=outcome.host_key_review,
             )
-        else:
-            state = self._connection_failure_state(
-                profile_id,
-                RemoteConnectionFailedError("The SSH connection is unavailable."),
-            )
-        self._set_core_state(state)
+        return self._core_not_started_state(profile_id)
 
-    def _set_core_state(self, state: CoreConnectionStateV1) -> None:
-        with self._connection_state_lock:
-            self._core_state = state
+    @staticmethod
+    def _operation_response(operation: LocalOperationV1) -> JSONResponse:
+        return JSONResponse(
+            status_code=202,
+            content=operation.model_dump(mode="json"),
+            headers={"ETag": operation.etag},
+        )
 
     @staticmethod
     def _connection_failure_state(
