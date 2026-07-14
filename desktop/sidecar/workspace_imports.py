@@ -1340,6 +1340,7 @@ class WorkspaceImportStore:
             )
         import_id = f"{_IMPORT_ID_PREFIX}{secrets.token_hex(24)}"
         temporary_name = f"{_TEMP_PREFIX}{secrets.token_hex(24)}"
+        temporary_identity: tuple[int, int] | None = None
         published = False
         with self._locked_root() as root_descriptor:
             retained, existing_ref = self._retained_usage(
@@ -1363,6 +1364,15 @@ class WorkspaceImportStore:
                 retained.archive_bytes + before.st_size,
             )
             os.mkdir(temporary_name, 0o700, dir_fd=root_descriptor)
+            created_temporary = os.stat(
+                temporary_name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            temporary_identity = (
+                created_temporary.st_dev,
+                created_temporary.st_ino,
+            )
             temporary_descriptor: int | None = None
             archive_descriptor: int | None = None
             try:
@@ -1372,8 +1382,22 @@ class WorkspaceImportStore:
                     dir_fd=root_descriptor,
                 )
                 os.fchmod(temporary_descriptor, 0o700)
+                opened_temporary = os.fstat(temporary_descriptor)
                 self._require_private_directory(
-                    os.fstat(temporary_descriptor), label="temporary workspace import"
+                    opened_temporary, label="temporary workspace import"
+                )
+                if (
+                    opened_temporary.st_dev,
+                    opened_temporary.st_ino,
+                ) != temporary_identity:
+                    raise WorkspaceImportIntegrityError(
+                        "temporary workspace import changed after creation"
+                    )
+                self._verify_directory_binding(
+                    root_descriptor,
+                    temporary_name,
+                    temporary_descriptor,
+                    label="temporary workspace import",
                 )
                 archive_descriptor = os.open(
                     _ARCHIVE_NAME,
@@ -1517,8 +1541,13 @@ class WorkspaceImportStore:
                     os.close(archive_descriptor)
                 if temporary_descriptor is not None:
                     os.close(temporary_descriptor)
-                if not published:
-                    self._discard_flat_directory(root_descriptor, temporary_name, missing_ok=True)
+                if not published and temporary_identity is not None:
+                    self._discard_flat_directory(
+                        root_descriptor,
+                        temporary_name,
+                        missing_ok=True,
+                        expected_identity=temporary_identity,
+                    )
 
     def _require_retained_capacity(self, import_count: int, archive_bytes: int) -> None:
         if import_count > self._max_retained_imports:
@@ -2236,7 +2265,7 @@ class WorkspaceImportStore:
         name: str,
         *,
         missing_ok: bool,
-        expected_identity: tuple[int, int] | None = None,
+        expected_identity: tuple[int, int],
         budget: _ScanBudget | None = None,
     ) -> None:
         try:
@@ -2248,10 +2277,7 @@ class WorkspaceImportStore:
         opened = os.fstat(descriptor)
         quarantine_name: str | None = None
         try:
-            if (
-                expected_identity is not None
-                and (opened.st_dev, opened.st_ino) != expected_identity
-            ):
+            if (opened.st_dev, opened.st_ino) != expected_identity:
                 raise WorkspaceImportIntegrityError(
                     "workspace import changed before directory cleanup"
                 )

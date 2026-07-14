@@ -22,22 +22,30 @@ budgets, body padding, checksum, and exact terminator. Neither the archive nor a
 archive file body is buffered in full.
 
 Initialization opens every absolute ancestor component with no-follow directory
-semantics and retains stable parent/root descriptors. A canonical mode-`0600`
-marker in the parent binds a random store token to the parent and root inode; the
+semantics and retains stable parent/root descriptors. A separate mode-`0600`
+authentication key signs the canonical parent/root binding marker and import
+metadata. The marker binds a random store token to the parent and root inode; the
 same token is stored as a durable root xattr. Fresh creation uses a durable
 pending marker, fsyncs the new parent entry, fsyncs the root token, publishes the
 final marker, and only then removes the pending marker. Every operation reopens
-the ancestor chain and verifies the marker, parent, root pathname, held root FD,
-and xattr. Replacing an ancestor or root therefore fails closed, including after
-restart, and reconciliation never adopts the replacement.
+the ancestor chain and verifies the key, marker, parent, root pathname, held root
+FD, and xattr. During one process lifetime, held descriptors detect replacement
+at operation boundaries. After restart, missing keys and keys that no longer
+authenticate existing state fail closed; ancestor/root/marker/xattr replacement
+is detected while the separate key remains confidential and unmodified and the
+owner-only state directory has retained its integrity.
 
 The store root and import directories are mode `0700`; archive and closed
 metadata files are mode `0600` and link-count one. A random opaque import ID is
 independent of the source name and content digest. Archive plus metadata publish
-as one fsynced directory through an atomic no-replace rename. Metadata binds the
-exact `WorkspaceImportRefV1`, private storage identity, random archive generation
-token, and a store-internal `WorkspaceImportOwnership` containing the Desktop
-`project_id`, workspace-sync `operation_id`, and request idempotency key. The
+as one fsynced directory through an atomic no-replace rename. Ingest records the
+temporary directory's device/inode identity immediately after creation. Every
+pre-publish rollback supplies that identity to quarantine cleanup; a missing or
+same-name replacement binding is preserved for bounded startup reconciliation.
+Metadata binds the exact `WorkspaceImportRefV1`, private storage identity, random
+archive generation token, and a store-internal `WorkspaceImportOwnership`
+containing the Desktop `project_id`, workspace-sync `operation_id`, and request
+idempotency key. The
 native/provider adapter must pass that exact ownership to `ingest`, `resolve`,
 and `release`; these fields are not added to the frozen HTTP DTO. Retrying ingest
 with the same ownership and content returns the already-published reference,
@@ -82,6 +90,13 @@ first moves the observed inode to a random quarantine name, verifies the binding
 and only then removes flat no-follow contents. Tamper, replacement, unsafe root
 state, unavailable atomic rename/xattr support, and reconciliation budget
 exhaustion all fail closed.
+
+This owner-only filesystem store is not an isolation boundary against an
+arbitrary process running as the same UID. Such a writer can read or replace the
+authentication key and can mutate an already-open regular-file inode. The
+restart and replacement guarantees above therefore require that the key has not
+leaked and that the private state directory has not been compromised. Stronger
+same-UID isolation requires a platform credential boundary outside this module.
 
 The native descriptor transport, picker lifecycle, Local HTTP/provider wiring,
 and Core upload consumer remain future integration work. The provider owns the

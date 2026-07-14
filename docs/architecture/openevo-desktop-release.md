@@ -137,7 +137,11 @@ Each process retains no-follow descriptors for the key, parent, and root and
 checks their inode/path bindings at every locked operation. Ingest reopens and
 verifies the actual archive and authenticated metadata after both files and the
 directory have been fsynced, immediately before atomic no-replace publication,
-and again after publication before returning the reference. Resolve copies to
+and again after publication before returning the reference. It records a new
+temporary directory's device/inode identity immediately after creation, and all
+pre-publication rollback cleanup is conditional on that exact pathname binding;
+replacement or unprovable state is retained for bounded startup reconciliation.
+Resolve copies to
 an inode-bound private snapshot, reopens and hashes that snapshot, unlinks the
 verified pathname, then hashes the unlinked read-only descriptor again before
 yielding it. These checks close the previously identified replacement and

@@ -661,6 +661,43 @@ def test_fault_before_publish_cleans_private_temp(
     assert list((tmp_path / "imports").iterdir()) == []
 
 
+def test_ingest_rollback_preserves_same_name_temporary_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    preserved_original = root / "preserved-original"
+    replacement_marker_name = "replacement-marker"
+
+    def replace_temporary_then_fail(*_args: object) -> None:
+        temporary = next(root.iterdir())
+        temporary.rename(preserved_original)
+        temporary.mkdir(mode=0o700)
+        (temporary / replacement_marker_name).write_text(
+            "preserve replacement",
+            encoding="ascii",
+        )
+        raise OSError("injected fault after temporary replacement")
+
+    monkeypatch.setattr(
+        workspace_imports_module,
+        "_before_import_publish",
+        replace_temporary_then_fail,
+    )
+
+    with pytest.raises(WorkspaceImportIntegrityError, match="changed before directory cleanup"):
+        _ingest(store, tmp_path, _simple_archive())
+
+    temporary_replacement = next(
+        entry for entry in root.iterdir() if entry.name.startswith(".workspace-import-tmp-")
+    )
+    assert (temporary_replacement / replacement_marker_name).read_text(
+        encoding="ascii"
+    ) == "preserve replacement"
+    assert (preserved_original / workspace_imports_module._ARCHIVE_NAME).is_file()
+
+
 def test_fault_after_publish_preserves_complete_recoverable_import(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1147,6 +1184,46 @@ def test_restart_rejects_forged_root_marker_and_xattr_after_offline_replacement(
         WorkspaceImportStore(root)
     assert original.is_dir()
     assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("key_mutation", ["missing", "replacement"])
+@pytest.mark.parametrize("with_import", [False, True])
+def test_restart_fails_closed_when_authentication_key_is_missing_or_replaced(
+    tmp_path: Path,
+    key_mutation: str,
+    with_import: bool,
+) -> None:
+    parent = tmp_path / "state"
+    root = parent / "imports"
+    parent.mkdir(mode=0o700)
+    store = WorkspaceImportStore(root)
+    if with_import:
+        import_ref = _ingest(store, tmp_path, _simple_archive())
+    key_path = parent / store._auth_key_name
+    original_key = key_path.read_bytes()
+    store.close()
+
+    if key_mutation == "missing":
+        key_path.unlink()
+        expected_error = "no authentication key"
+    else:
+        replacement_key = os.urandom(workspace_imports_module._AUTH_KEY_BYTES)
+        while replacement_key == original_key:
+            replacement_key = os.urandom(workspace_imports_module._AUTH_KEY_BYTES)
+        key_path.unlink()
+        key_path.write_bytes(replacement_key)
+        os.chmod(key_path, 0o600)
+        expected_error = "authentication"
+
+    with pytest.raises(WorkspaceImportStoreConfigurationError, match=expected_error):
+        WorkspaceImportStore(root)
+
+    if key_mutation == "replacement":
+        assert key_path.read_bytes() != original_key
+    if with_import:
+        assert _stored_directory(root, import_ref).is_dir()
+    else:
+        assert list(root.iterdir()) == []
 
 
 def test_ancestor_replacement_and_symlinked_ancestor_fail_closed(tmp_path: Path) -> None:
