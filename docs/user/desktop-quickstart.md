@@ -10,7 +10,8 @@
 4. Configure proxy, pip index, and Hugging Face mirror settings if needed.
 5. Run remote doctor/bootstrap from Desktop.
 6. Start the remote OpenEvo Core Backend.
-7. Choose Codex subscription transcript or self-deployed reference mode.
+7. Use the default Codex subscription transcript mode, or explicitly choose the
+   self-deployed reference mode when that remote runtime is available.
 8. Start the science run and monitor its timeline, logs, and artifacts.
 
 Desktop must show setup-required or typed error states until a real sidecar and

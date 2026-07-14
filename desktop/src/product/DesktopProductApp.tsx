@@ -69,6 +69,9 @@ type ProductEvolutionTargets = ProjectV1["evolution"]["targets"];
 type EvolutionCapabilitiesV1 = ProjectCapabilitiesV1["capabilities"];
 type RevisionRefV1 = NonNullable<NonNullable<ProjectV1["remote"]>["active_revision"]>;
 
+const DEFAULT_CODEX_MODEL = "gpt-5.1-codex-mini";
+const DEFAULT_HF_MODEL = "Qwen/Qwen3-8B";
+
 type Workspace = "research" | "evolution" | "system";
 type AsyncState = "idle" | "working";
 type ActionRecovery = { readonly kind: "readmit_run"; readonly projectId: string } | null;
@@ -399,7 +402,7 @@ export function DesktopProductApp({
                     profile_id: profile.profile_id,
                     task: input.task ?? { title: "Research task", objective: "Describe the research objective." },
                     source: input.source ?? { kind: "scratch", display_name: "New workspace" },
-                    execution: input.execution ?? selfDeployedExecution("Qwen/Qwen3-8B"),
+                    execution: input.execution ?? subscriptionExecution(DEFAULT_CODEX_MODEL),
                     evolution: input.evolution ?? { targets: {} },
                   }, mutationIntent(snapshot, actionId));
                   pending = { projectId: created.project_id, activationActionId: `${actionId}-activate` };
@@ -1291,9 +1294,9 @@ function SettingsDrawer({
   const [source, setSource] = useState<ProjectSourceV1>(project?.source ?? { kind: "scratch", display_name: "New workspace", import_ref: null });
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [selectingSource, setSelectingSource] = useState(false);
-  const [mode, setMode] = useState(project?.execution.mode ?? "self-deployed");
-  const [hfModel, setHfModel] = useState(project?.execution.hf_model ?? "Qwen/Qwen3-8B");
-  const [codexModel, setCodexModel] = useState(project?.execution.codex_model ?? "Codex");
+  const [mode, setMode] = useState(project?.execution.mode ?? "codex_subscription_transcript");
+  const [hfModel, setHfModel] = useState(project?.execution.hf_model ?? DEFAULT_HF_MODEL);
+  const [codexModel, setCodexModel] = useState(project?.execution.codex_model ?? DEFAULT_CODEX_MODEL);
   const [evolution, setEvolution] = useState<ProductEvolutionTargets>(project?.evolution.targets ?? defaultEvolution(capabilities));
   const [dirty, setDirty] = useState(false);
   const [retryingCapabilities, setRetryingCapabilities] = useState(false);
@@ -1352,9 +1355,9 @@ function SettingsDrawer({
     setTitle(project?.task.title ?? "Research task");
     setObjective(project?.task.objective ?? "");
     setSource(project?.source ?? { kind: "scratch", display_name: "New workspace", import_ref: null });
-    setMode(project?.execution.mode ?? "self-deployed");
-    setHfModel(project?.execution.hf_model ?? "Qwen/Qwen3-8B");
-    setCodexModel(project?.execution.codex_model ?? "Codex");
+    setMode(project?.execution.mode ?? "codex_subscription_transcript");
+    setHfModel(project?.execution.hf_model ?? DEFAULT_HF_MODEL);
+    setCodexModel(project?.execution.codex_model ?? DEFAULT_CODEX_MODEL);
     setEvolution(project?.evolution.targets ?? defaultEvolution(capabilities));
     setDirty(false);
     setSourceError(null);

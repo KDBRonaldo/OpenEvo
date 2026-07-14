@@ -206,11 +206,18 @@ describe("DesktopProductApp", () => {
     setInput("Project name", "Catalyst study");
     setInput("Task title", "Compare catalyst candidates");
     setInput("Objective", "Rank candidates using reproducible evidence.");
-    setInput("Hugging Face model", "Qwen/Qwen3-8B");
+    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.1-codex-mini");
+    expect(screenText()).not.toContain("Hugging Face model");
     await clickButton("Save");
     expect(screenText()).toContain("Compare catalyst candidates");
     expect(button("Start session").title).toBe("Start a new research session");
     expect(button("Start session").disabled).toBe(false);
+    const snapshot = await provider.refresh();
+    if (snapshot.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    expect(snapshot.snapshot.projects[0]?.execution).toMatchObject({
+      mode: "codex_subscription_transcript",
+      codex_model: "gpt-5.1-codex-mini",
+    });
   });
 
   it("lets an older unsupported credential profile migrate to SSH agent", async () => {

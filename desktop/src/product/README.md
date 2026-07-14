@@ -54,6 +54,11 @@ default native bridge rejects those calls without invoking a nonexistent Tauri
 command. They must not appear as usable release controls until the native broker
 is implemented and reviewed.
 
+New projects default to the Core-owned Codex subscription transcript profile and
+its `gpt-5.1-codex-mini` model default. Self-deployed inference remains an
+explicit user selection; the renderer does not route a first-time user into that
+path before its remote service lifecycle is ready.
+
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation
 all succeed. Native transitions are serialized through Tauri: initial startup,
