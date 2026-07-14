@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import socket
 from typing import Any, Literal
@@ -102,14 +103,19 @@ class EvolutionEventExportConfig(_StrictModel):
     timeout_seconds: float = Field(default=10.0, gt=0)
     fail_open: bool = True
 
+    @field_validator("timeout_seconds")
+    @classmethod
+    def _require_finite_timeout(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("evolution.event_export.timeout_seconds must be finite and positive")
+        return value
+
 
 class EvolutionConfig(_StrictModel):
     enabled: bool = False
     backend_url: str = "http://127.0.0.1:8200"
     context: EvolutionContextConfig = Field(default_factory=EvolutionContextConfig)
-    event_export: EvolutionEventExportConfig = Field(
-        default_factory=EvolutionEventExportConfig
-    )
+    event_export: EvolutionEventExportConfig = Field(default_factory=EvolutionEventExportConfig)
 
     @field_validator("backend_url")
     @classmethod

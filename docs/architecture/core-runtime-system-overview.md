@@ -165,13 +165,19 @@ Evolution context 的临时源位于 agent 不可挂载的 Core 临时目录，�
 
 Codex subscription 的 `HOME`、`PATH` 和 `CODEX_HOME` 都由 Core 固定，agent、runtime
 和 action env 不能覆盖；Codex 使用镜像内固定绝对路径启动，不能被 workspace `PATH`
-shadow。Gateway 在创建 runtime 前，从绝对 filesystem anchor 逐组件固定并复核宿主机
-`~/.codex/auth.json`，先把 bytes 写入同 filesystem、容器不可见的随机 `0700` sibling
-staging root。在这里完成 no-follow、owner、mode、regular、link-count-one、size、digest、
-UTF-8 JSON、redactor 和全路径 identity 校验后，才用 Linux
+shadow。Gateway 在创建 runtime 前，先 durable journal 私有 credential root，再从绝对
+filesystem anchor 逐组件固定并复核宿主机 `~/.codex/auth.json`，把 bytes 写入该受管 root
+内随机 `0700` staging child。在这里完成 no-follow、owner、mode、regular、link-count-one、
+size、digest、UTF-8 JSON、redactor 和全路径 identity 校验后，才用 Linux
 `renameat2(RENAME_NOREPLACE)` 把完整 `0600` inode 原子发布为私有 credential root 的最终
-`auth.json`。发布后再次绑定 destination/inode；任一校验、竞态或平台原语失败都会在
-runtime create/mount/start 前 fail closed，且不会删除竞态 replacement。
+`auth.json`。Gateway 把 root/auth exact identity 交给 runtime；DockerRuntime no-follow
+重开并复核两者、持有两个 FD 到 container absence。Docker 只先启动 trusted inert command，
+随后 Core 在任何 prepare/agent command 前，对 exact container ID 内已经 adopted 的 root/auth
+执行 stat，将 device/inode/mode/owner/link-count/size 与 held authority 精确比较，并在前后绑定
+container ID、PID、start time、running state 和 restart count。Docker 若在验证后采用了替换
+pathname，identity mismatch 会先 stop container 再 fail closed。SIGKILL 或 staging cleanup
+fault 留下的内容仍在 journaled credential root 内；最终发布成功后的空 staging-child cleanup
+fault 不会把成功误报为不可恢复。
 
 Subscription post-run 先结束所有仍可访问 credential 的进程，并按 `docker create` 返回的
 container ID 执行 remove + absence inspect。只有 absence proof 成功、最终 fd-relative
@@ -190,7 +196,11 @@ identities 外，还保存显式 recovery phase、闭集且已脱敏的
 request/agent terminal/optional result/pending status/timer finalization authority，以及 canonical
 result digest 和单调的 export/callback success proof；agent terminal state 必须先 fsync 该
 authority 再落入 live memory，不保存 auth bytes。Required evolution export 还绑定 normalized
-backend URL、timeout、fail-open policy 及其 canonical identity digest。Evolution export 由稳定
+backend URL、finite positive timeout、fail-open policy 及其 canonical identity digest。
+Journal transition 使用 durable pending marker、candidate fsync、atomic replace 和 directory
+fsync；全部成功后才 copy-on-write 发布 live phase/proof。replace/fsync 失败会回滚旧 journal 并
+保留 pending marker，restart 因而不能把不确定 terminal transition 当成删除 completion/root 的
+授权，live exact retry 成功后才清 marker。Evolution export 由稳定
 source event identity 去重，callback 带稳定 result digest/idempotency key；响应失败或未知保持
 pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当前 evolution config/client
 缺失、禁用、destination/config identity 漂移时，必须保留 transcript、event/callback authority
@@ -198,6 +208,8 @@ pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当�
 credential root 重新验证并构造 redactor（仅在仍需重建 transcript 时），证明容器 absent 后
 只重试 pending phase。两项 required proof 都持久成功后才删除 completion storage、session、
 credential、log roots 和 journal；无法证明时 authority 持续保留。
+Credential-capable init、agent postprocess、finalization 和 teardown 异常日志只记录经
+`CredentialRedactor` 处理的 exception text，不附带原始 traceback。
 
 ## 主要模块
 

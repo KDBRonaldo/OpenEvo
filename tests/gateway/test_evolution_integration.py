@@ -30,6 +30,7 @@ from openevo.gateway.node import (
 from openevo.gateway.session import SessionRegistry
 from openevo.gateway.storage import SessionStore
 from openevo.gateway import session_files
+from openevo.gateway import node as node_module
 from openevo.gateway.session_files import capture_session_root_identity
 from openevo.rollout.models import (
     SessionDispatchRequest,
@@ -257,9 +258,7 @@ async def test_gateway_rejects_subscription_before_image_user_runtime_or_auth_st
     assert managed.runtime is None
     assert managed.final_result is not None
     assert managed.final_result.status == SessionStatus.ERROR
-    assert "runtime.container_user='host'" in (
-        managed.final_result.error or ""
-    )
+    assert "runtime.container_user='host'" in (managed.final_result.error or "")
     assert not (session_dir / ".codex").exists()
 
 
@@ -457,6 +456,152 @@ async def test_invalid_subscription_auth_fails_before_runtime_creation(
     assert managed.pending_status == SessionStatus.ERROR
     assert managed.credential_dir is not None
     assert not (managed.credential_dir / "auth.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_subscription_initialization_exception_log_redacts_credential_canary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "initialization-secret-canary"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    (session_dir / "artifacts").mkdir()
+    request = SessionDispatchRequest(
+        session_id="initialization-log-canary",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "gateway-test"
+    manager.default_runtime = None
+    manager._cleanup_retries = {}
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    manager._docker_ownership_root = tmp_path / "docker-ownership"
+
+    def stage_auth(_request, credential_dir, _identity):
+        auth = credential_dir / "auth.json"
+        auth.write_text(f'{{"access_token":"{secret}"}}\n', encoding="utf-8")
+        auth.chmod(0o600)
+        state = auth.stat(follow_symlinks=False)
+        return session_files.StagedCodexCredential(
+            redactor=session_files.CredentialRedactor.from_auth_json(auth.read_bytes()),
+            auth_identity=(
+                state.st_dev,
+                state.st_ino,
+                state.st_mode,
+                state.st_uid,
+                state.st_nlink,
+                state.st_size,
+                state.st_mtime_ns,
+                state.st_ctime_ns,
+            ),
+        )
+
+    monkeypatch.setattr(manager, "_stage_codex_subscription_auth", stage_auth)
+    monkeypatch.setattr(
+        node_module,
+        "create_runtime",
+        Mock(side_effect=RuntimeError(f"runtime rejected {secret}")),
+    )
+
+    with caplog.at_level("ERROR", logger="openevo.gateway.node"):
+        await manager._handle_init(managed)
+
+    assert secret not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "[REDACTED: Codex credential]" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_subscription_postprocess_exception_log_redacts_credential_canary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "postprocess-secret-canary"
+
+    class FailingPostprocessHarness(RunStepHarness):
+        def run_steps(self, instruction: str) -> list[ExecInput]:
+            del instruction
+            return []
+
+        async def postprocess(self, runtime, result) -> None:
+            del runtime, result
+            raise RuntimeError(f"postprocess exposed {secret}")
+
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    log_dir = tmp_path / "logs"
+    for root in (session_dir, credential_dir, log_dir):
+        root.mkdir(mode=0o700)
+    auth = credential_dir / "auth.json"
+    auth.write_text(f'{{"access_token":"{secret}"}}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    request = SessionDispatchRequest(
+        session_id="postprocess-log-canary",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+    runtime = BindMountRuntime(session_dir)
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+        log_authority_dir=log_dir,
+        log_authority_identity=capture_session_root_identity(log_dir),
+        credential_dir=credential_dir,
+        credential_root_identity=capture_session_root_identity(credential_dir),
+        credential_redactor=session_files.CredentialRedactor.from_auth_json(auth.read_bytes()),
+        runtime=runtime,
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "gateway-test"
+    manager.gateway_url = "http://gateway.test"
+    manager.evolution = EvolutionConfig(enabled=False)
+    manager.evolution_client = None
+    manager._cleanup_retries = {}
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    harness = FailingPostprocessHarness(request.agent)
+    monkeypatch.setattr(manager, "_resolve_agent_harness", lambda _request: harness)
+
+    with caplog.at_level("ERROR", logger="openevo.gateway.node"):
+        await manager._handle_run(managed)
+
+    assert secret not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "[REDACTED: Codex credential]" in caplog.text
 
 
 @pytest.mark.parametrize("env_name", ["HOME", "PATH", "CODEX_HOME"])
@@ -836,9 +981,7 @@ async def test_subscription_stops_runtime_and_redacts_background_output_before_r
     manager.builders = default_builder_registry()
     manager.node_id = "node-a"
     secret = "access-canary"
-    redactor = session_files.CredentialRedactor.from_auth_json(
-        b'{"access_token":"access-canary"}'
-    )
+    redactor = session_files.CredentialRedactor.from_auth_json(b'{"access_token":"access-canary"}')
     log_dir = tmp_path / "logs" / "agent"
     log_dir.mkdir(parents=True)
     log_path = log_dir / "step.00.stdout.log"
@@ -911,9 +1054,7 @@ def test_subscription_capture_redaction_never_modifies_workspace_files(
         root.mkdir()
     workspace_file = session_dir / "workspace" / "research-output.bin"
     workspace_file.parent.mkdir()
-    original = secret.encode() + b"\n" + b"x" * (
-        session_files._CAPTURE_REDACTION_MAX_BYTES + 1
-    )
+    original = secret.encode() + b"\n" + b"x" * (session_files._CAPTURE_REDACTION_MAX_BYTES + 1)
     workspace_file.write_bytes(original)
     authority_log = log_dir / "logs" / "agent" / "step.00.stdout.log"
     authority_log.parent.mkdir(parents=True)
@@ -1102,6 +1243,95 @@ async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation
 
 
 @pytest.mark.asyncio
+async def test_restart_removes_journaled_credential_staging_crash_window(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    session_dir.mkdir(mode=0o700)
+    credential_dir.mkdir(mode=0o700)
+    abandoned_stage = credential_dir / ".openevo-credential-staging-crashed"
+    abandoned_stage.mkdir(mode=0o700)
+    secret = abandoned_stage / "auth.json"
+    secret.write_text('{"access_token":"sigkill-canary"}\n', encoding="utf-8")
+    secret.chmod(0o600)
+
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="stage-crash"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.credential_dir = credential_dir
+    managed.credential_root_identity = capture_session_root_identity(credential_dir)
+    first = GatewayNodeManager.__new__(GatewayNodeManager)
+    first._cleanup_retries = {}
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed)
+
+    restarted = GatewayNodeManager.__new__(GatewayNodeManager)
+    restarted._cleanup_retries = {}
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+    await restarted._reconcile_cleanup_retries()
+
+    assert not credential_dir.exists()
+    assert not session_dir.exists()
+    assert list(journal_dir.glob("*.json")) == []
+
+
+@pytest.mark.asyncio
+async def test_credential_cleanup_fault_remains_journaled_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    session_dir.mkdir(mode=0o700)
+    credential_dir.mkdir(mode=0o700)
+    auth = credential_dir / "auth.json"
+    auth.write_text('{"access_token":"cleanup-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="credential-cleanup-fault"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.credential_dir = credential_dir
+    managed.credential_root_identity = capture_session_root_identity(credential_dir)
+    first = GatewayNodeManager.__new__(GatewayNodeManager)
+    first._cleanup_retries = {}
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed)
+
+    restarted = GatewayNodeManager.__new__(GatewayNodeManager)
+    restarted._cleanup_retries = {}
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+    original_remove = restarted._remove_credential_dir_best_effort
+    attempts = 0
+
+    async def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        return await original_remove(*args, **kwargs)
+
+    monkeypatch.setattr(restarted, "_remove_credential_dir_best_effort", fail_once)
+
+    await restarted._reconcile_cleanup_retries()
+    assert credential_dir.exists()
+    assert auth.exists()
+    assert list(journal_dir.glob("*.json"))
+
+    await restarted._reconcile_cleanup_retries()
+    assert not credential_dir.exists()
+    assert list(journal_dir.glob("*.json")) == []
+
+
+@pytest.mark.asyncio
 async def test_subscription_finalization_journal_recovers_terminal_result_after_restart(
     tmp_path: Path,
 ) -> None:
@@ -1178,9 +1408,7 @@ async def test_subscription_finalization_journal_recovers_terminal_result_after_
     assert info is not None
     assert info.status == SessionStatus.COMPLETED
     assert info.result is None  # callback delivery releases only the in-memory payload
-    assert recovered_calls.index("callback_push") < recovered_calls.index(
-        "remove_session_dir"
-    )
+    assert recovered_calls.index("callback_push") < recovered_calls.index("remove_session_dir")
     assert list(journal_dir.glob("*.json")) == []
 
 
@@ -1240,9 +1468,7 @@ async def test_terminal_agent_result_is_durable_before_postprocess_and_recovers_
         log_authority_identity=capture_session_root_identity(log_authority_dir),
         credential_dir=credential_dir,
         credential_root_identity=capture_session_root_identity(credential_dir),
-        credential_redactor=session_files.CredentialRedactor.from_auth_json(
-            auth.read_bytes()
-        ),
+        credential_redactor=session_files.CredentialRedactor.from_auth_json(auth.read_bytes()),
         runtime=TerminalRuntime(),
     )
     first = _postrun_manager(calls=[])
@@ -1342,9 +1568,7 @@ async def test_subscription_finalization_rebuilds_transcript_after_restart(
         log_authority_identity=log_identity,
         credential_dir=credential_dir,
         credential_root_identity=capture_session_root_identity(credential_dir),
-        credential_redactor=session_files.CredentialRedactor.from_auth_json(
-            auth.read_bytes()
-        ),
+        credential_redactor=session_files.CredentialRedactor.from_auth_json(auth.read_bytes()),
         runtime=JournalRuntime(),
         agent_result=AgentRunResult(
             status="completed",
@@ -1443,9 +1667,7 @@ async def test_handle_postrun_fail_closed_export_error_skips_delete_and_callback
         evolution_client=client,
     )
 
-    await manager._handle_postrun(
-        _managed_postrun_session(tmp_path, _session_result())
-    )
+    await manager._handle_postrun(_managed_postrun_session(tmp_path, _session_result()))
 
     assert calls == [
         "postrun_steps",
@@ -1513,6 +1735,82 @@ async def test_terminal_delivery_restart_skips_export_after_durable_success(
     assert calls.count("export") == 1
     assert not journal_path.exists()
     assert restarted.storage.deleted == [managed.session_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    ["replace", "directory_fsync", "final_directory_fsync"],
+)
+async def test_terminal_delivery_publish_failure_blocks_recovery_until_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    result = _session_result(session_id="delivery-journal-fault")
+    managed = _managed_postrun_session(session_dir, result)
+    managed.final_result = None
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+    manager._register_cleanup_retry(managed)
+    journal_path = next(journal_dir.glob("*.json"))
+    original_journal = journal_path.read_bytes()
+
+    if fault == "replace":
+        original_replace = node_module.os.replace
+        failed = False
+
+        def fail_once(source, destination):
+            nonlocal failed
+            if not failed and Path(destination) == journal_path:
+                failed = True
+                raise OSError("injected journal replace failure")
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(node_module.os, "replace", fail_once)
+    else:
+        original_fsync = manager._fsync_cleanup_journal_directory
+        calls = 0
+
+        def fail_after_replace(path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            failure_call = 1 if fault == "directory_fsync" else 2
+            if calls == failure_call:
+                raise OSError("injected journal directory fsync failure")
+            original_fsync(path)
+
+        monkeypatch.setattr(manager, "_fsync_cleanup_journal_directory", fail_after_replace)
+
+    with pytest.raises(OSError, match="injected journal"):
+        await manager._deliver_terminal_result(managed, result)
+
+    assert managed.final_result is None
+    assert manager._cleanup_retries[managed.session_id].phase == "runtime_active"
+    assert manager.storage.deleted == []
+    assert journal_path.read_bytes() == original_journal
+    assert list(journal_dir.glob("*.pending"))
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="incomplete update"):
+        restarted._load_cleanup_retries()
+    assert restarted.storage.deleted == []
+    assert session_dir.exists()
+
+    if fault == "replace":
+        monkeypatch.setattr(node_module.os, "replace", original_replace)
+    else:
+        monkeypatch.setattr(manager, "_fsync_cleanup_journal_directory", original_fsync)
+
+    assert await manager._deliver_terminal_result(managed, result) is True
+    assert managed.final_result is not None
+    assert manager.storage.deleted == [managed.session_id]
+    assert list(journal_dir.glob("*.pending")) == []
 
 
 @pytest.mark.asyncio
@@ -1710,6 +2008,41 @@ async def test_terminal_delivery_journal_rejects_result_digest_tampering(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [float("nan"), float("inf"), float("-inf"), 0.0, -1.0],
+)
+async def test_terminal_delivery_restart_rejects_invalid_export_timeout(
+    tmp_path: Path,
+    timeout_seconds: float,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    client = FakeEvolutionClient(export_error=RuntimeError("backend unavailable"))
+    manager = _postrun_manager(
+        calls=[],
+        evolution=EvolutionConfig(enabled=True),
+        evolution_client=client,
+    )
+    manager._cleanup_journal_dir = journal_dir
+    managed = _managed_postrun_session(session_dir, _session_result())
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+
+    assert await manager._deliver_terminal_result(managed, managed.final_result) is False
+    journal_path = next(journal_dir.glob("*.json"))
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    payload["terminal_delivery"]["export_authority"]["timeout_seconds"] = timeout_seconds
+    journal_path.write_text(json.dumps(payload), encoding="utf-8")
+    journal_path.chmod(0o600)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="cleanup ownership journal is invalid"):
+        restarted._load_cleanup_retries()
+
+
+@pytest.mark.asyncio
 async def test_callback_retries_use_stable_result_idempotency_proof() -> None:
     manager = GatewayNodeManager.__new__(GatewayNodeManager)
     response = Mock()
@@ -1831,12 +2164,16 @@ async def test_write_evolution_context_files(tmp_path):
         json.loads(runtime.uploads["/openevo/session/evolution/context.json"])["context_id"]
         == "ctx_1"
     )
-    assert runtime.uploads["/openevo/session/evolution/memory.md"] == ("Remember parser precedence.")
+    assert runtime.uploads["/openevo/session/evolution/memory.md"] == (
+        "Remember parser precedence."
+    )
     assert runtime.uploads["/openevo/session/evolution/agent_system.md"] == (
         "Prefer repository-local conventions."
     )
     assert not (tmp_path / ".openevo" / "evolution_upload").exists()
-    assert runtime.uploads["/openevo/session/AGENTS.md"] == ("Prefer repository-local conventions.")
+    assert runtime.uploads["/openevo/session/AGENTS.md"] == (
+        "Prefer repository-local conventions."
+    )
     assert (
         json.loads(runtime.uploads["/openevo/session/evolution/adapters.json"])["merge_mode"]
         == "reference_only"
@@ -1963,9 +2300,7 @@ async def test_resolved_store_context_stages_all_text_artifacts(tmp_path):
     assert (staged_skill / "SKILL.md").read_text(encoding="utf-8") == skill_text
     assert env["OPENEVO_MEMORY_FILE"] == "/openevo/session/evolution/memory.md"
     assert env["OPENEVO_SKILLS_DIR"] == "/openevo/session/evolution/skills"
-    assert env["OPENEVO_AGENT_SYSTEM_FILE"] == (
-        "/openevo/session/evolution/agent_system.md"
-    )
+    assert env["OPENEVO_AGENT_SYSTEM_FILE"] == ("/openevo/session/evolution/agent_system.md")
     assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == "/openevo/session/AGENTS.md"
     assert env["OPENEVO_AGENTS_MD"] == "/openevo/session/AGENTS.md"
 
@@ -2032,7 +2367,9 @@ async def test_write_evolution_context_files_avoids_bind_mount_same_file(tmp_pat
     )
     assert (tmp_path / "evolution" / "skills").is_dir()
     assert env["OPENEVO_EVOLUTION_CONTEXT"] == "/openevo/session/evolution/context.json"
-    assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == ("/openevo/session/.openhands/microagents/repo.md")
+    assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == (
+        "/openevo/session/.openhands/microagents/repo.md"
+    )
     assert json.loads(env["OPENEVO_AGENT_SYSTEM_TARGETS"]) == [
         "/openevo/session/.openhands/microagents/repo.md"
     ]
@@ -2384,7 +2721,8 @@ async def test_handle_run_passes_evolution_env_to_runtime_exec(tmp_path, monkeyp
     assert managed.agent_result.status == "completed"
     assert runtime.exec_envs[-1]["EXISTING"] == "1"
     assert (
-        runtime.exec_envs[-1]["OPENEVO_EVOLUTION_CONTEXT"] == "/openevo/session/evolution/context.json"
+        runtime.exec_envs[-1]["OPENEVO_EVOLUTION_CONTEXT"]
+        == "/openevo/session/evolution/context.json"
     )
     assert runtime.exec_envs[-1]["OPENEVO_MEMORY_FILE"] == ("/openevo/session/evolution/memory.md")
     assert request.agent.env["OPENEVO_SKILLS_DIR"] == "/openevo/session/evolution/skills"
@@ -2452,10 +2790,7 @@ async def test_handle_run_codex_subscription_auth_mode_unsets_openevo_proxy_env(
 
 @pytest.mark.asyncio
 async def test_subscription_stdout_and_transcript_redact_auth_canaries(tmp_path) -> None:
-    auth = (
-        b'{"tokens":{"access_token":"access-canary",'
-        b'"refresh_token":"refresh-canary"}}'
-    )
+    auth = b'{"tokens":{"access_token":"access-canary","refresh_token":"refresh-canary"}}'
     redactor = session_files.CredentialRedactor.from_auth_json(auth)
     runtime = BindMountRuntime(tmp_path)
     runtime.exec_results = [
@@ -2512,10 +2847,13 @@ async def test_subscription_stdout_and_transcript_redact_auth_canaries(tmp_path)
     )
     trajectory = await AgentTranscriptBuilder().build(completion)
 
-    persisted = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (managed.log_authority_dir / "logs" / "agent").iterdir()
-    ) + trajectory.model_dump_json()
+    persisted = (
+        "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (managed.log_authority_dir / "logs" / "agent").iterdir()
+        )
+        + trajectory.model_dump_json()
+    )
     assert "access-canary" not in persisted
     assert "refresh-canary" not in persisted
     assert auth.decode() not in persisted

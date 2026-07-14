@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Final, Literal
 
 from openevo.runtime.base import BaseRuntime
-from openevo.runtime.managed import MANAGED_CODEX_HOME, managed_runtime_image_release
+from openevo.runtime.managed import (
+    MANAGED_CODEX_HOME,
+    ManagedCredentialMount,
+    managed_runtime_image_release,
+)
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
 logger = logging.getLogger(__name__)
@@ -73,11 +77,7 @@ def _unlink_if_same_identity(
 
 def _open_private_ownership_directory(path: Path) -> int:
     parts = path.parts
-    if (
-        not parts
-        or parts[0] != os.sep
-        or any(part in {"", ".", ".."} for part in parts[1:])
-    ):
+    if not parts or parts[0] != os.sep or any(part in {"", ".", ".."} for part in parts[1:]):
         raise RuntimeError("docker ownership directory is not private")
     descriptor = os.open(os.sep, _DIRECTORY_FLAGS)
     try:
@@ -155,10 +155,11 @@ class DockerRuntime(BaseRuntime):
         session_id: str,
         session_dir: Path,
         *,
-        credential_dir: Path | None = None,
+        credential_mount: ManagedCredentialMount | None = None,
         ownership_root: Path | None = None,
     ) -> None:
         super().__init__(spec, session_id, session_dir)
+        credential_dir = credential_mount.root if credential_mount is not None else None
         if credential_dir is not None:
             if not credential_dir.is_absolute():
                 raise ValueError("credential_dir must be absolute")
@@ -169,6 +170,9 @@ class DockerRuntime(BaseRuntime):
             else:
                 raise ValueError("credential_dir must be outside the session tree")
         self._credential_dir = credential_dir
+        self._credential_mount = credential_mount
+        self._credential_root_fd = -1
+        self._credential_auth_fd = -1
         # Use enough of the session_id to preserve the "-eval" suffix used by
         # fresh evaluator runtimes, avoiding collisions with the agent runtime.
         safe_name = session_id.replace("/", "-")[:55]
@@ -232,11 +236,94 @@ class DockerRuntime(BaseRuntime):
     def supports_memory_limits(self) -> bool:
         return True
 
+    def _pin_credential_mount(self) -> None:
+        authority = self._credential_mount
+        if authority is None:
+            return
+        if self._credential_root_fd >= 0 or self._credential_auth_fd >= 0:
+            raise RuntimeError("managed credential mount is already pinned")
+
+        root_fd = -1
+        auth_fd = -1
+        try:
+            root_fd = _open_private_ownership_directory(authority.root)
+            root_state = os.fstat(root_fd)
+            if (
+                root_state.st_dev,
+                root_state.st_ino,
+                root_state.st_uid,
+            ) != authority.root_identity:
+                raise RuntimeError("managed credential root identity changed")
+            named_auth = os.stat(
+                "auth.json",
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            auth_fd = os.open(
+                "auth.json",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=root_fd,
+            )
+            opened_auth = os.fstat(auth_fd)
+            if (
+                _full_file_identity(named_auth) != authority.auth_identity
+                or _full_file_identity(opened_auth) != authority.auth_identity
+                or not stat.S_ISREG(opened_auth.st_mode)
+                or opened_auth.st_uid != os.geteuid()
+                or opened_auth.st_nlink != 1
+                or stat.S_IMODE(opened_auth.st_mode) != 0o600
+            ):
+                raise RuntimeError("managed credential file identity changed")
+            self._credential_root_fd = root_fd
+            self._credential_auth_fd = auth_fd
+            root_fd = -1
+            auth_fd = -1
+            self._verify_credential_mount_pins()
+        except OSError as exc:
+            raise RuntimeError("managed credential mount could not be pinned") from exc
+        finally:
+            if auth_fd >= 0:
+                os.close(auth_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+
+    def _verify_credential_mount_pins(self) -> None:
+        authority = self._credential_mount
+        if authority is None or self._credential_root_fd < 0 or self._credential_auth_fd < 0:
+            raise RuntimeError("managed credential mount authority is incomplete")
+        root_state = os.fstat(self._credential_root_fd)
+        auth_state = os.fstat(self._credential_auth_fd)
+        named_auth = os.stat(
+            "auth.json",
+            dir_fd=self._credential_root_fd,
+            follow_symlinks=False,
+        )
+        if (
+            (root_state.st_dev, root_state.st_ino, root_state.st_uid) != authority.root_identity
+            or stat.S_IMODE(root_state.st_mode) != 0o700
+            or _full_file_identity(auth_state) != authority.auth_identity
+            or _full_file_identity(named_auth) != authority.auth_identity
+        ):
+            raise RuntimeError("managed credential mount authority changed")
+
+    def _release_credential_mount_pins(self) -> None:
+        for name in ("_credential_auth_fd", "_credential_root_fd"):
+            descriptor = getattr(self, name)
+            if descriptor >= 0:
+                os.close(descriptor)
+                setattr(self, name, -1)
+
     async def start(self) -> None:
         if self._destroyed:
             raise RuntimeError("docker runtime was already destroyed")
         create_image = await self._verified_create_image()
-        self._prepare_create_ownership()
+        if self._credential_mount is not None:
+            self._pin_credential_mount()
+        try:
+            self._prepare_create_ownership()
+        except Exception:
+            self._release_credential_mount_pins()
+            raise
         create_args = [
             "docker",
             "create",
@@ -258,7 +345,12 @@ class DockerRuntime(BaseRuntime):
         if self.spec.memory_mb is not None:
             create_args.extend(["--memory", f"{self.spec.memory_mb}m"])
         create_args.extend(["-v", f"{self.session_dir}:{self.runtime_session_dir}"])
-        if self._credential_dir is not None:
+        if self._credential_mount is not None:
+            try:
+                self._verify_credential_mount_pins()
+            except Exception:
+                self._mark_no_ownership()
+                raise
             create_args.extend(["-v", f"{self._credential_dir}:{MANAGED_CODEX_HOME}"])
         # Additional volumes from kwargs (e.g., Docker socket for agents that need DinD)
         for vol in self.spec.kwargs.get("volumes", []):
@@ -305,6 +397,14 @@ class DockerRuntime(BaseRuntime):
         if rc != 0:
             await self.stop()
             raise RuntimeError(f"docker start failed with exit code {rc}: {stderr}")
+        if self._credential_mount is not None:
+            try:
+                await self._verify_adopted_credential_mount()
+            except Exception as exc:
+                await self.stop()
+                raise RuntimeError(
+                    "docker did not adopt the verified credential mount authority"
+                ) from exc
         # Skip the chmod when container and host UIDs match — recursive chmod
         # over a large session dir can be expensive and is only needed when the
         # container user can't write to host-owned bind-mounted files.
@@ -358,8 +458,7 @@ class DockerRuntime(BaseRuntime):
                 (
                     item
                     for item in repo_digests
-                    if isinstance(item, str)
-                    and item.endswith(f"@{release.trusted_digest}")
+                    if isinstance(item, str) and item.endswith(f"@{release.trusted_digest}")
                 ),
                 None,
             )
@@ -371,6 +470,90 @@ class DockerRuntime(BaseRuntime):
         if matched_reference is not None:
             return matched_reference
         raise RuntimeError("managed runtime image digest mismatch")
+
+    async def _verify_adopted_credential_mount(self) -> None:
+        authority = self._credential_mount
+        if authority is None:
+            return
+        self._verify_credential_mount_pins()
+        first = await self._credential_container_process_identity()
+        rc, stdout, _ = await self._run_local_command(
+            "docker",
+            "exec",
+            self._container_ref,
+            "/usr/bin/stat",
+            "-Lc",
+            "%d %i %f %u %h %s",
+            MANAGED_CODEX_HOME,
+            f"{MANAGED_CODEX_HOME}/auth.json",
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
+        )
+        lines = str(stdout or "").strip().splitlines()
+        if rc != 0 or len(lines) != 2:
+            raise RuntimeError("managed credential mount stat failed")
+        try:
+            root_fields = lines[0].split()
+            auth_fields = lines[1].split()
+            if len(root_fields) != 6 or len(auth_fields) != 6:
+                raise ValueError("unexpected stat field count")
+            root_identity = (
+                int(root_fields[0]),
+                int(root_fields[1]),
+                int(root_fields[2], 16),
+                int(root_fields[3]),
+            )
+            auth_identity = (
+                int(auth_fields[0]),
+                int(auth_fields[1]),
+                int(auth_fields[2], 16),
+                int(auth_fields[3]),
+                int(auth_fields[4]),
+                int(auth_fields[5]),
+            )
+        except ValueError as exc:
+            raise RuntimeError("managed credential mount stat is invalid") from exc
+        if (
+            root_identity
+            != (
+                authority.root_identity[0],
+                authority.root_identity[1],
+                stat.S_IFDIR | 0o700,
+                authority.root_identity[2],
+            )
+            or auth_identity != authority.auth_identity[:6]
+        ):
+            raise RuntimeError("managed credential mount identity changed")
+        self._verify_credential_mount_pins()
+        if await self._credential_container_process_identity() != first:
+            raise RuntimeError("managed credential container process changed")
+
+    async def _credential_container_process_identity(
+        self,
+    ) -> tuple[str, int, str, bool, int]:
+        rc, stdout, _ = await self._run_local_command(
+            "docker",
+            "container",
+            "inspect",
+            "--format",
+            "{{.Id}}|{{.State.Pid}}|{{.State.StartedAt}}|{{.State.Running}}|{{.RestartCount}}",
+            self._container_ref,
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
+        )
+        fields = str(stdout or "").strip().split("|")
+        if (
+            rc != 0
+            or len(fields) != 5
+            or fields[0] != self._container_ref
+            or not fields[1].isdigit()
+            or int(fields[1]) <= 0
+            or not fields[2]
+            or fields[3] != "true"
+            or not fields[4].isdigit()
+        ):
+            raise RuntimeError("managed credential container process is invalid")
+        return fields[0], int(fields[1]), fields[2], True, int(fields[4])
 
     _START_TIMEOUT = 600.0  # seconds for docker create / start under high rollout load
     _STOP_TIMEOUT = 30.0  # seconds per cleanup command
@@ -535,8 +718,7 @@ class DockerRuntime(BaseRuntime):
         try:
             if (
                 self._ownership_root_identity is None
-                or _object_identity(os.fstat(directory_fd))
-                != self._ownership_root_identity
+                or _object_identity(os.fstat(directory_fd)) != self._ownership_root_identity
             ):
                 raise RuntimeError("docker ownership directory identity changed")
             before = os.stat(
@@ -615,9 +797,7 @@ class DockerRuntime(BaseRuntime):
         except FileNotFoundError as exc:
             if not cidfile_observed:
                 raise
-            raise RuntimeError(
-                "docker ownership cidfile disappeared during verification"
-            ) from exc
+            raise RuntimeError("docker ownership cidfile disappeared during verification") from exc
         except OSError as exc:
             raise RuntimeError("docker ownership cidfile is invalid") from exc
         finally:
@@ -783,9 +963,7 @@ class DockerRuntime(BaseRuntime):
         opened_directory_fd = directory_fd
         if opened_directory_fd is None:
             try:
-                opened_directory_fd = _open_private_ownership_directory(
-                    self._ownership_dir
-                )
+                opened_directory_fd = _open_private_ownership_directory(self._ownership_dir)
                 if (
                     self._ownership_root_identity is None
                     or _object_identity(os.fstat(opened_directory_fd))
@@ -819,12 +997,18 @@ class DockerRuntime(BaseRuntime):
                 os.close(self._ownership_lock_fd)
                 self._ownership_lock_fd = -1
             self._cidfile_identity = None
+            self._release_credential_mount_pins()
 
     async def _detect_chmod_needed(self) -> bool:
         """True unless the container's effective UID matches the host's."""
         rc, stdout, _ = await self._run_local_command(
-            "docker", "exec", self._container_ref, "id", "-u",
-            capture=True, timeout=self._STOP_TIMEOUT,
+            "docker",
+            "exec",
+            self._container_ref,
+            "id",
+            "-u",
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
         )
         if rc != 0:
             return True
@@ -851,9 +1035,7 @@ class DockerRuntime(BaseRuntime):
         shell_exports = []
         for key in ("HOME", "PATH"):
             if key in effective_env:
-                shell_exports.append(
-                    f"export {key}={shlex.quote(str(effective_env[key]))};"
-                )
+                shell_exports.append(f"export {key}={shlex.quote(str(effective_env[key]))};")
         wrapped_command = " ".join([*shell_exports, command])
         args.extend([self._container_ref, "bash", "-lc", wrapped_command])
         rc, stdout, stderr = await self._run_local_command(
@@ -866,9 +1048,7 @@ class DockerRuntime(BaseRuntime):
             await self._make_runtime_path_writable(remote_path, recursive=False)
             return
         parent = str(Path(remote_path).parent)
-        await self._run_local_command(
-            "docker", "exec", self._container_ref, "mkdir", "-p", parent
-        )
+        await self._run_local_command("docker", "exec", self._container_ref, "mkdir", "-p", parent)
         rc, _, _ = await self._run_local_command(
             "docker", "cp", local_path, f"{self._container_ref}:{remote_path}"
         )
@@ -890,9 +1070,7 @@ class DockerRuntime(BaseRuntime):
             raise RuntimeError(f"docker cp upload_dir failed with exit code {rc}")
         await self._make_runtime_path_writable(remote_path, recursive=True)
 
-    async def _make_runtime_path_writable(
-        self, remote_path: str, *, recursive: bool
-    ) -> None:
+    async def _make_runtime_path_writable(self, remote_path: str, *, recursive: bool) -> None:
         if self._chmod_needed is False:
             return
         chmod_args = ["chmod"]
@@ -900,9 +1078,14 @@ class DockerRuntime(BaseRuntime):
             chmod_args.append("-R")
         chmod_args.extend(["a+rwX", remote_path])
         rc, _, stderr = await self._run_local_command(
-            "docker", "exec", "--user", "root",
-            self._container_ref, *chmod_args,
-            capture=True, timeout=self._STOP_TIMEOUT,
+            "docker",
+            "exec",
+            "--user",
+            "root",
+            self._container_ref,
+            *chmod_args,
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
         )
         if rc != 0:
             raise RuntimeError(

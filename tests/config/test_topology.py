@@ -244,13 +244,31 @@ evolution:
     assert topology.evolution.event_export.timeout_seconds == 4
 
 
+@pytest.mark.parametrize(
+    "timeout",
+    [float("nan"), float("inf"), float("-inf"), 0.0, -1.0],
+)
+def test_evolution_export_timeout_must_be_finite_and_positive(
+    tmp_path: Path,
+    timeout: float,
+) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "gateway": {"nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]},
+            "evolution": {"event_export": {"timeout_seconds": timeout}},
+        },
+    )
+
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        TopologyConfig.load(path)
+
+
 def test_invalid_evolution_backend_url_is_rejected(tmp_path: Path) -> None:
     path = _write_yaml(
         tmp_path / "topology.yaml",
         {
-            "gateway": {
-                "nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]
-            },
+            "gateway": {"nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]},
             "evolution": {"backend_url": "not-a-url"},
         },
     )
@@ -263,9 +281,7 @@ def test_blank_evolution_context_target_dir_is_rejected(tmp_path: Path) -> None:
     path = _write_yaml(
         tmp_path / "topology.yaml",
         {
-            "gateway": {
-                "nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]
-            },
+            "gateway": {"nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]},
             "evolution": {"context": {"target_dir": "   "}},
         },
     )
@@ -278,9 +294,7 @@ def test_unknown_evolution_context_key_is_rejected(tmp_path: Path) -> None:
     path = _write_yaml(
         tmp_path / "topology.yaml",
         {
-            "gateway": {
-                "nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]
-            },
+            "gateway": {"nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]},
             "evolution": {"context": {"unexpected": True}},
         },
     )

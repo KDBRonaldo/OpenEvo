@@ -15,7 +15,11 @@ import pytest
 
 from openevo.runtime.base import RuntimePathSecurityError
 from openevo.runtime.docker import DockerRuntime
-from openevo.runtime.managed import MANAGED_CODEX_HOME, MANAGED_RUNTIME_RELEASES
+from openevo.runtime.managed import (
+    MANAGED_CODEX_HOME,
+    MANAGED_RUNTIME_RELEASES,
+    ManagedCredentialMount,
+)
 from openevo.runtime.models import RuntimeSpec
 
 
@@ -50,6 +54,40 @@ def _write_mock_cidfile(
     cidfile.chmod(mode)
 
 
+def _credential_mount(root: Path) -> ManagedCredentialMount:
+    root.mkdir(mode=0o700)
+    auth = root / "auth.json"
+    auth.write_text('{"access_token":"runtime-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    root_state = root.stat(follow_symlinks=False)
+    auth_state = auth.stat(follow_symlinks=False)
+    return ManagedCredentialMount(
+        root=root,
+        root_identity=(root_state.st_dev, root_state.st_ino, root_state.st_uid),
+        auth_identity=(
+            auth_state.st_dev,
+            auth_state.st_ino,
+            auth_state.st_mode,
+            auth_state.st_uid,
+            auth_state.st_nlink,
+            auth_state.st_size,
+            auth_state.st_mtime_ns,
+            auth_state.st_ctime_ns,
+        ),
+    )
+
+
+def _credential_stat_output(authority: ManagedCredentialMount) -> str:
+    root = authority.root.stat(follow_symlinks=False)
+    auth = (authority.root / "auth.json").stat(follow_symlinks=False)
+    return (
+        f"{root.st_dev} {root.st_ino} {root.st_mode:x} {root.st_uid} "
+        f"{root.st_nlink} {root.st_size}\n"
+        f"{auth.st_dev} {auth.st_ino} {auth.st_mode:x} {auth.st_uid} "
+        f"{auth.st_nlink} {auth.st_size}\n"
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["upload", "download"])
 async def test_bind_copy_security_failure_never_falls_back_to_docker_cp(
@@ -68,9 +106,7 @@ async def test_bind_copy_security_failure_never_falls_back_to_docker_cp(
         monkeypatch.setattr(
             runtime,
             "_copy_to_bind_mount",
-            lambda *args: (_ for _ in ()).throw(
-                RuntimePathSecurityError("unsafe bind target")
-            ),
+            lambda *args: (_ for _ in ()).throw(RuntimePathSecurityError("unsafe bind target")),
         )
         operation_call = runtime.upload_file(
             str(tmp_path / "source.txt"),
@@ -80,9 +116,7 @@ async def test_bind_copy_security_failure_never_falls_back_to_docker_cp(
         monkeypatch.setattr(
             runtime,
             "_copy_from_bind_mount",
-            lambda *args: (_ for _ in ()).throw(
-                RuntimePathSecurityError("unsafe bind source")
-            ),
+            lambda *args: (_ for _ in ()).throw(RuntimePathSecurityError("unsafe bind source")),
         )
         operation_call = runtime.download_file(
             "/openevo/session/source.txt",
@@ -292,7 +326,6 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
 
     run_command = AsyncMock(side_effect=run_command_impl)
     monkeypatch.setattr(runtime, "_run_local_command", run_command)
-
     await runtime.start()
 
     create = run_command.await_args_list[0].args
@@ -312,17 +345,13 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
 
     execute = run_command.await_args_list[-1].args
     assert "HOME=/openevo/session/home" in execute
-    assert (
-        "PATH=/home/openevo/.local/bin:/usr/local/bin:/usr/bin:/bin" in execute
-    )
+    assert "PATH=/home/openevo/.local/bin:/usr/local/bin:/usr/bin:/bin" in execute
     assert execute[-3:-1] == ("bash", "-lc")
     assert execute[-1].startswith(
         "export HOME=/openevo/session/home; "
         "export PATH=/home/openevo/.local/bin:/usr/local/bin:/usr/bin:/bin; "
     )
-    assert execute[-1].endswith(
-        "command -v codex && mkdir -p $HOME/.agents/skills"
-    )
+    assert execute[-1].endswith("command -v codex && mkdir -p $HOME/.agents/skills")
 
     await runtime.stop()
 
@@ -378,7 +407,7 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     session_dir = tmp_path / "session"
     credential_dir = tmp_path / "credentials"
     session_dir.mkdir()
-    credential_dir.mkdir(mode=0o700)
+    credential_mount = _credential_mount(credential_dir)
     runtime = DockerRuntime(
         RuntimeSpec(
             profile="managed_science",
@@ -387,7 +416,7 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
         ),
         "science-session",
         session_dir,
-        credential_dir=credential_dir,
+        credential_mount=credential_mount,
     )
 
     async def run_command_impl(*args, **kwargs):
@@ -399,22 +428,80 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
             _write_mock_cidfile(args, container_id)
             return 0, container_id + "\n", None
         if args[1:3] == ("container", "inspect"):
+            if any("State.Pid" in str(value) for value in args):
+                return 0, f"{container_id}|1234|started-at|true|0\n", None
             return 0, container_id + "\n", None
+        if args[1] == "exec" and "/usr/bin/stat" in args:
+            return 0, _credential_stat_output(credential_mount), None
         return 0, None, None
 
     run_command = AsyncMock(side_effect=run_command_impl)
     monkeypatch.setattr(runtime, "_run_local_command", run_command)
-
     await runtime.start()
 
-    create = next(
-        call.args for call in run_command.await_args_list if call.args[1] == "create"
-    )
-    assert ("-v", f"{credential_dir}:{MANAGED_CODEX_HOME}") in zip(
-        create,
-        create[1:],
-    )
+    create = next(call.args for call in run_command.await_args_list if call.args[1] == "create")
+    volumes = [create[index + 1] for index, value in enumerate(create) if value == "-v"]
+    credential_volumes = [volume for volume in volumes if MANAGED_CODEX_HOME in volume]
+    assert credential_volumes == [f"{credential_dir}:{MANAGED_CODEX_HOME}"]
     assert not credential_dir.is_relative_to(session_dir)
+
+
+@pytest.mark.asyncio
+async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "6" * 64
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    displaced = tmp_path / "displaced-credentials"
+    session_dir.mkdir()
+    authority = _credential_mount(credential_dir)
+    runtime = DockerRuntime(
+        RuntimeSpec(
+            profile="managed_science",
+            image="openevo/science-runtime:0.1.0",
+            container_user="host",
+        ),
+        "credential-race-session",
+        session_dir,
+        credential_mount=authority,
+    )
+    container_present = True
+    replacement: ManagedCredentialMount | None = None
+
+    async def run_command_impl(*args, **kwargs):
+        nonlocal container_present, replacement
+        del kwargs
+        if args[1:3] == ("image", "inspect"):
+            digest = MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+            return 0, f'[{{"Id":"{digest}","RepoDigests":[]}}]', None
+        if args[1] == "create":
+            credential_dir.rename(displaced)
+            replacement = _credential_mount(credential_dir)
+            assert replacement.root_identity != authority.root_identity
+            assert f"{credential_dir}:{MANAGED_CODEX_HOME}" in args
+            _write_mock_cidfile(args, container_id)
+            return 0, container_id, None
+        if args[1:3] == ("container", "inspect"):
+            if container_present:
+                if any("State.Pid" in str(value) for value in args):
+                    return 0, f"{container_id}|5678|started-at|true|0\n", None
+                return 0, container_id, None
+            return 1, None, f"Error: No such object: {container_id}"
+        if args[1] == "exec" and "/usr/bin/stat" in args:
+            assert replacement is not None
+            return 0, _credential_stat_output(replacement), None
+        if args[1] == "rm":
+            container_present = False
+        return 0, None, None
+
+    monkeypatch.setattr(runtime, "_run_local_command", AsyncMock(side_effect=run_command_impl))
+    with pytest.raises(RuntimeError, match="did not adopt"):
+        await runtime.start()
+
+    assert runtime._credential_root_fd == -1
+    assert runtime._credential_auth_fd == -1
 
 
 @pytest.mark.asyncio
@@ -427,7 +514,7 @@ async def test_managed_image_drift_fails_before_credential_mount_or_create(
     session_dir = tmp_path / "session"
     credential_dir = tmp_path / "credentials"
     session_dir.mkdir()
-    credential_dir.mkdir(mode=0o700)
+    credential_mount = _credential_mount(credential_dir)
     runtime = DockerRuntime(
         RuntimeSpec(
             profile="managed_science",
@@ -436,7 +523,7 @@ async def test_managed_image_drift_fails_before_credential_mount_or_create(
         ),
         "drifted-science-session",
         session_dir,
-        credential_dir=credential_dir,
+        credential_mount=credential_mount,
     )
     inspected = {
         "Id": "sha256:" + "c" * 64,
@@ -448,9 +535,7 @@ async def test_managed_image_drift_fails_before_credential_mount_or_create(
     with pytest.raises(RuntimeError, match="image digest mismatch"):
         await runtime.start()
 
-    assert [call.args[1:3] for call in run_command.await_args_list] == [
-        ("image", "inspect")
-    ]
+    assert [call.args[1:3] for call in run_command.await_args_list] == [("image", "inspect")]
     assert str(credential_dir) not in repr(run_command.await_args_list)
 
 
@@ -498,9 +583,7 @@ async def test_managed_repo_digest_is_the_immutable_docker_create_target(
 
     await runtime.start()
 
-    create = next(
-        call.args for call in run_command.await_args_list if call.args[1] == "create"
-    )
+    create = next(call.args for call in run_command.await_args_list if call.args[1] == "create")
     assert release.immutable_reference in create
     assert release.image not in create
 

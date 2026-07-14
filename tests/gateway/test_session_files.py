@@ -290,12 +290,8 @@ def test_auth_staging_final_path_recheck_detects_new_hardlink(
         label: str,
     ) -> None:
         nonlocal raced
-        is_selected = (
-            race_target == "source" and label == "Codex subscription auth"
-        ) or (
-            race_target == "target"
-            and label == "staged Codex auth"
-            and target.exists()
+        is_selected = (race_target == "source" and label == "Codex subscription auth") or (
+            race_target == "target" and label == "staged Codex auth" and target.exists()
         )
         if is_selected and not raced:
             raced = True
@@ -387,6 +383,34 @@ def test_auth_publication_fails_closed_without_atomic_noreplace(
     assert list(tmp_path.glob(".openevo-credential-staging-*")) == []
 
 
+def test_published_auth_survives_recoverable_staging_cleanup_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_auth(tmp_path, '{"access_token":"published-canary"}\n')
+    root, identity = _session_root(tmp_path)
+
+    def fail_cleanup(*args, **kwargs) -> None:
+        del args, kwargs
+        raise OSError("injected staging cleanup failure")
+
+    monkeypatch.setattr(session_files, "_remove_pinned_private_staging", fail_cleanup)
+
+    staged = stage_codex_subscription_auth(
+        source=source,
+        session_dir=root,
+        session_identity=identity,
+        target_home_parts=("home", ".codex"),
+    )
+
+    target = root / "home" / ".codex" / "auth.json"
+    assert target.read_bytes() == source.read_bytes()
+    assert staged.redactor.redact("published-canary") != "published-canary"
+    staging_roots = list(root.glob(".openevo-credential-staging-*"))
+    assert len(staging_roots) == 1
+    assert list(staging_roots[0].iterdir()) == []
+
+
 def test_credential_redactor_redacts_auth_json_and_nested_sensitive_leaves() -> None:
     auth = (
         b'{"tokens":{"access_token":"access-canary",'
@@ -411,9 +435,7 @@ def test_credential_redactor_redacts_auth_json_and_nested_sensitive_leaves() -> 
 
 
 def test_credential_redactor_fails_closed_for_oversized_capture() -> None:
-    redactor = session_files.CredentialRedactor.from_auth_json(
-        b'{"access_token":"access-canary"}'
-    )
+    redactor = session_files.CredentialRedactor.from_auth_json(b'{"access_token":"access-canary"}')
 
     redacted = redactor.redact("x" * (session_files._CAPTURE_REDACTION_MAX_BYTES + 1))
 
@@ -440,9 +462,7 @@ def test_core_capture_tree_redaction_covers_owned_logs(
     session_files.redact_core_capture_tree(root, identity, redactor)
 
     persisted = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in root.rglob("*")
-        if path.is_file()
+        path.read_text(encoding="utf-8") for path in root.rglob("*") if path.is_file()
     )
     assert "access-canary" not in persisted
     assert "account-canary" not in persisted
@@ -453,9 +473,7 @@ def test_core_capture_tree_redaction_covers_owned_logs(
 def test_capture_tree_redaction_rejects_oversized_file_without_changing_bytes(
     tmp_path: Path,
 ) -> None:
-    redactor = session_files.CredentialRedactor.from_auth_json(
-        b'{"access_token":"access-canary"}'
-    )
+    redactor = session_files.CredentialRedactor.from_auth_json(b'{"access_token":"access-canary"}')
     root, identity = _session_root(tmp_path)
     capture = root / "workspace" / "large.bin"
     capture.parent.mkdir()
@@ -471,9 +489,7 @@ def test_capture_tree_redaction_rejects_oversized_file_without_changing_bytes(
 def test_capture_tree_redaction_preflights_total_limit_before_changing_any_file(
     tmp_path: Path,
 ) -> None:
-    redactor = session_files.CredentialRedactor.from_auth_json(
-        b'{"access_token":"access-canary"}'
-    )
+    redactor = session_files.CredentialRedactor.from_auth_json(b'{"access_token":"access-canary"}')
     root, identity = _session_root(tmp_path)
     first = root / "logs" / "first.log"
     second = root / "logs" / "second.log"
@@ -497,9 +513,7 @@ def test_capture_tree_redaction_rechecks_recursive_directory_path_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    redactor = session_files.CredentialRedactor.from_auth_json(
-        b'{"access_token":"access-canary"}'
-    )
+    redactor = session_files.CredentialRedactor.from_auth_json(b'{"access_token":"access-canary"}')
     root, identity = _session_root(tmp_path)
     nested = root / "workspace" / "nested"
     nested.mkdir(parents=True)

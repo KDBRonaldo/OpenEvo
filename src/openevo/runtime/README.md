@@ -153,14 +153,22 @@ stable source event identity; callback retries carry a stable result-derived
 idempotency key. A restarted Gateway skips a durably successful phase, retries
 an unknown/failed phase, and removes storage and owned roots only after both
 required phases are fsynced successful. Missing phase/finalization authority or
-export config drift retains the journal and all transcript/session roots.
+export config drift retains the journal and all transcript/session roots. An
+incomplete journal update also retains a durable pending marker and blocks
+restart cleanup until the exact transition is successfully retried.
 
 Subscription auth bytes are validated before `DockerRuntime` is created. Core
-uses an unmounted sibling `0700` staging root, verifies the complete source and
-staged file identities, digest, bounded JSON, and redactor, then publishes the
-`0600` inode into the credential root with Linux atomic no-replace rename. Only
-the verified final path can subsequently enter Docker's credential bind; a
-publication race, symlink, owner/mode/link mismatch, or unavailable rename
-primitive fails before container creation.
+uses a random `0700` staging child inside the already journaled private
+credential root, verifies the complete source and staged file identities,
+digest, bounded JSON, and redactor, then publishes the `0600` inode with Linux
+atomic no-replace rename. `ManagedCredentialMount` binds the root and auth-file
+identities. DockerRuntime reopens both no-follow, revalidates them, and retains
+both descriptors through runtime absence. After Docker starts only the trusted
+inert command, Core stats the adopted directory and auth file inside the exact
+container ID and compares their full mount identities before any prepare or
+agent command. Stable container ID/PID/start/restart state brackets that check.
+A pathname replacement adopted by Docker therefore mismatches and the container
+is stopped. A publication race, symlink, owner/mode/link mismatch, or unavailable
+rename primitive fails before agent execution.
 Workspace and artifact files are not redaction write targets; files larger than
 the Core capture scan limit retain their exact bytes.

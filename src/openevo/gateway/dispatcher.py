@@ -20,6 +20,7 @@ from openevo.gateway.session_files import CredentialRedactor
 from openevo.rollout.models import SessionDispatchRequest, SessionResult, SessionStatus
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
+from openevo.runtime.managed import ManagedCredentialMount
 from openevo.runtime.models import ExecInput
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ class ManagedSession:
     log_authority_identity: tuple[int, int, int] | None = None
     credential_dir: Path | None = None
     credential_root_identity: tuple[int, int, int] | None = None
+    credential_mount: ManagedCredentialMount | None = None
     credential_redactor: CredentialRedactor | None = None
     runtime: BaseRuntime | None = None
     agent_result: AgentRunResult | None = None
@@ -130,7 +132,10 @@ class SessionDispatcher:
         self._workers = [
             *(asyncio.create_task(self._init_worker()) for _ in range(self.max_init_workers)),
             *(asyncio.create_task(self._run_worker()) for _ in range(self.max_run_workers)),
-            *(asyncio.create_task(self._postrun_worker()) for _ in range(self.max_postrun_workers)),
+            *(
+                asyncio.create_task(self._postrun_worker())
+                for _ in range(self.max_postrun_workers)
+            ),
         ]
         self._started = True
 
@@ -367,7 +372,11 @@ class SessionDispatcher:
                 acquire_task.cancel()
         # If we managed to acquire the semaphore despite cancellation, release it
         # so it doesn't leak to a later session.
-        acquired = acquire_task in done and not acquire_task.cancelled() and acquire_task.exception() is None
+        acquired = (
+            acquire_task in done
+            and not acquire_task.cancelled()
+            and acquire_task.exception() is None
+        )
         if managed.cancel_event.is_set() or managed.has_terminal_outcome:
             if acquired:
                 self._ready_slots.release()

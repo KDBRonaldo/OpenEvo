@@ -12,7 +12,7 @@ import re
 import shlex
 import shutil
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any
@@ -31,6 +31,7 @@ from openevo.gateway.session import SessionRegistry
 from openevo.gateway.session_files import (
     CredentialRedactor,
     SessionFileSecurityError,
+    StagedCodexCredential,
     VerifiedSessionTranscript,
     capture_session_root_identity,
     create_session_log_authority,
@@ -64,6 +65,7 @@ from openevo.runtime.factory import create_runtime
 from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.managed import (
     MANAGED_SUBSCRIPTION_ENV,
+    ManagedCredentialMount,
     reject_managed_subscription_env,
     require_managed_runtime_binding,
     require_managed_subscription_runtime,
@@ -105,7 +107,7 @@ class GatewayExecutionTimeout(TimeoutError):
     """Raised when a session exhausts its shared gateway execution budget."""
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class SubscriptionFinalizationState:
     """Private redacted authority needed to resume terminal publication."""
 
@@ -193,9 +195,7 @@ async def write_evolution_context_files(
         agent_system_text = _agent_system_rendered_text(context)
         agent_system_env: dict[str, str] = {}
         if agent_system_text:
-            agent_system_env["OPENEVO_AGENT_SYSTEM_FILE"] = (
-                f"{target_dir}/agent_system.md"
-            )
+            agent_system_env["OPENEVO_AGENT_SYSTEM_FILE"] = f"{target_dir}/agent_system.md"
             agent_system_env.update(
                 await _stage_evolution_agent_system(
                     runtime=runtime,
@@ -553,19 +553,11 @@ class GatewayNodeManager:
         self._cleanup_retry_task: asyncio.Task[None] | None = None
         self._cleanup_reconcile_lock = asyncio.Lock()
         self._cleanup_retries: dict[str, CleanupRetryOwnership] = {}
-        cleanup_base = (
-            Path(session_base_dir).absolute() if session_base_dir else Path("/tmp")
-        )
+        cleanup_base = Path(session_base_dir).absolute() if session_base_dir else Path("/tmp")
         node_key = hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:24]
-        self._cleanup_journal_dir = (
-            cleanup_base / ".openevo-gateway-cleanup" / node_key
-        )
-        self._docker_ownership_root = (
-            cleanup_base / ".openevo-gateway-docker-ownership" / node_key
-        )
-        self._log_authority_root = (
-            cleanup_base / ".openevo-gateway-log-authority" / node_key
-        )
+        self._cleanup_journal_dir = cleanup_base / ".openevo-gateway-cleanup" / node_key
+        self._docker_ownership_root = cleanup_base / ".openevo-gateway-docker-ownership" / node_key
+        self._log_authority_root = cleanup_base / ".openevo-gateway-log-authority" / node_key
 
     async def start(self) -> None:
         await DockerRuntime.recover_ownership_root(self._docker_ownership_root)
@@ -601,9 +593,7 @@ class GatewayNodeManager:
             self._register_cleanup_retry(
                 managed,
                 eval_runtime=eval_runtime or managed.eval_runtime,
-                finalize_subscription=_is_codex_subscription_agent(
-                    managed.request.agent
-                ),
+                finalize_subscription=_is_codex_subscription_agent(managed.request.agent),
             )
         await self._reconcile_cleanup_retries()
         if self.evolution_client is not None:
@@ -717,11 +707,9 @@ class GatewayNodeManager:
             artifacts_dir = session_dir / "artifacts"
             artifacts_dir.mkdir()
             session_root_identity = capture_session_root_identity(session_dir)
-            log_authority_dir, log_authority_identity = (
-                create_session_log_authority(
-                    self._log_authority_root,
-                    session_id,
-                )
+            log_authority_dir, log_authority_identity = create_session_log_authority(
+                self._log_authority_root,
+                session_id,
             )
             managed = ManagedSession(
                 request=request,
@@ -801,16 +789,18 @@ class GatewayNodeManager:
                     )
                 )
                 managed.credential_dir = credential_dir
-                managed.credential_root_identity = capture_session_root_identity(
-                    credential_dir
-                )
-                self._persist_cleanup_ownership(
-                    self._cleanup_ownership_for(managed)
-                )
-                managed.credential_redactor = self._stage_codex_subscription_auth(
+                managed.credential_root_identity = capture_session_root_identity(credential_dir)
+                self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
+                staged_credential = self._stage_codex_subscription_auth(
                     request,
                     managed.credential_dir,
                     managed.credential_root_identity,
+                )
+                managed.credential_redactor = staged_credential.redactor
+                managed.credential_mount = ManagedCredentialMount(
+                    root=managed.credential_dir,
+                    root_identity=managed.credential_root_identity,
+                    auth_identity=staged_credential.auth_identity,
                 )
             if managed.credential_dir is None:
                 runtime = create_runtime(
@@ -824,7 +814,7 @@ class GatewayNodeManager:
                     runtime_spec,
                     request.session_id,
                     managed.session_dir,
-                    credential_dir=managed.credential_dir,
+                    credential_mount=managed.credential_mount,
                     docker_ownership_root=self._docker_ownership_root,
                 )
             managed.runtime = runtime
@@ -843,13 +833,19 @@ class GatewayNodeManager:
         except Exception as exc:
             if managed.cancel_requested:
                 logger.info("Initialization cancelled for session %s", request.session_id)
+            elif _is_codex_subscription_agent(request.agent):
+                self._log_credential_safe_exception(
+                    managed,
+                    "Initialization failed",
+                    exc,
+                )
             else:
                 logger.exception("Initialization failed for session %s", request.session_id)
-                self._set_terminal_failure(
-                    managed,
-                    SessionStatus.ERROR,
-                    f"runtime initialization failed: {exc}",
-                )
+            self._set_terminal_failure(
+                managed,
+                SessionStatus.ERROR,
+                f"runtime initialization failed: {exc}",
+            )
         finally:
             managed.timer.mark("init", "finished")
 
@@ -874,12 +870,9 @@ class GatewayNodeManager:
                 backend=runtime_spec.backend,
                 container_user=runtime_spec.container_user,
             )
-            if is_managed and (
-                runtime_spec.import_path is not None or runtime_spec.kwargs
-            ):
+            if is_managed and (runtime_spec.import_path is not None or runtime_spec.kwargs):
                 raise ValueError(
-                    "Core-managed runtime profiles forbid custom runtime loaders "
-                    "and options"
+                    "Core-managed runtime profiles forbid custom runtime loaders and options"
                 )
         except ValueError as exc:
             raise RuntimeError(f"runtime admission failed: {exc}") from exc
@@ -887,11 +880,15 @@ class GatewayNodeManager:
         try:
             root_state = managed.session_dir.stat(follow_symlinks=False)
             expected = managed.session_root_identity
-            if expected is not None and (
-                root_state.st_dev,
-                root_state.st_ino,
-                root_state.st_uid,
-            ) != expected:
+            if (
+                expected is not None
+                and (
+                    root_state.st_dev,
+                    root_state.st_ino,
+                    root_state.st_uid,
+                )
+                != expected
+            ):
                 raise RuntimePathSecurityError("session root identity changed")
             full_identity = (
                 root_state.st_dev,
@@ -924,13 +921,11 @@ class GatewayNodeManager:
         request: SessionDispatchRequest,
         credential_dir: Path,
         credential_root_identity: tuple[int, int, int] | None = None,
-    ) -> CredentialRedactor:
+    ) -> StagedCodexCredential:
         if not _is_codex_subscription_agent(request.agent):
             raise RuntimeError("credential staging requires a Codex subscription agent")
 
-        identity = credential_root_identity or capture_session_root_identity(
-            credential_dir
-        )
+        identity = credential_root_identity or capture_session_root_identity(credential_dir)
         try:
             return stage_codex_subscription_auth(
                 source=Path.home() / ".codex" / "auth.json",
@@ -954,9 +949,7 @@ class GatewayNodeManager:
                 "managed subscription execution currently requires the Codex harness"
             )
         if request.agent.settings.get("capture_mode") != "transcript":
-            raise RuntimeError(
-                "subscription execution requires capture_mode='transcript'"
-            )
+            raise RuntimeError("subscription execution requires capture_mode='transcript'")
         try:
             reject_managed_subscription_env(request.agent.env, owner="agent")
             reject_managed_subscription_env(
@@ -984,9 +977,7 @@ class GatewayNodeManager:
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         if runtime_spec.import_path is not None or runtime_spec.kwargs:
-            raise RuntimeError(
-                "subscription execution forbids custom runtime loaders and options"
-            )
+            raise RuntimeError("subscription execution forbids custom runtime loaders and options")
 
         auth_path = (Path.home() / ".codex" / "auth.json").resolve()
         protected_paths = (auth_path, session_dir.resolve())
@@ -1014,22 +1005,13 @@ class GatewayNodeManager:
             redact_core_capture_tree(root, identity, redactor)
 
     def _ensure_log_authority(self, managed: ManagedSession) -> Path:
-        if (
-            managed.log_authority_dir is not None
-            and managed.log_authority_identity is not None
-        ):
+        if managed.log_authority_dir is not None and managed.log_authority_identity is not None:
             return managed.log_authority_dir
-        if (
-            managed.log_authority_dir is not None
-            or managed.log_authority_identity is not None
-        ):
+        if managed.log_authority_dir is not None or managed.log_authority_identity is not None:
             raise SessionFileSecurityError("session log authority is incomplete")
         authority_root = getattr(self, "_log_authority_root", None)
         if authority_root is None:
-            authority_root = (
-                managed.session_dir.parent
-                / ".openevo-gateway-log-authority-direct"
-            )
+            authority_root = managed.session_dir.parent / ".openevo-gateway-log-authority-direct"
         (
             managed.log_authority_dir,
             managed.log_authority_identity,
@@ -1148,6 +1130,17 @@ class GatewayNodeManager:
         except Exception as exc:
             if managed.cancel_requested:
                 logger.info("Agent execution cancelled for session %s", request.session_id)
+            elif _is_codex_subscription_agent(request.agent):
+                self._log_credential_safe_exception(
+                    managed,
+                    "Agent setup, execution, or postprocess failed",
+                    exc,
+                )
+                self._set_terminal_failure(
+                    managed,
+                    SessionStatus.ERROR,
+                    f"agent execution failed: {exc}",
+                )
             else:
                 logger.exception("Agent execution failed for session %s", request.session_id)
                 self._set_terminal_failure(
@@ -1261,11 +1254,7 @@ class GatewayNodeManager:
 
     def _current_export_authority(self) -> EvolutionExportAuthority | None:
         evolution = self.evolution
-        if (
-            evolution is None
-            or not evolution.enabled
-            or not evolution.event_export.enabled
-        ):
+        if evolution is None or not evolution.enabled or not evolution.event_export.enabled:
             return None
         backend_url = evolution.backend_url.rstrip("/")
         timeout_seconds = float(evolution.event_export.timeout_seconds)
@@ -1412,15 +1401,18 @@ class GatewayNodeManager:
                 eval_runtime=managed.eval_runtime,
                 finalize_subscription=True,
             )
-            retries[managed.session_id] = ownership
-        ownership.managed = managed
-        ownership.phase = _RECOVERY_PHASE_TERMINAL_FINALIZATION
-        ownership.finalize_subscription = True
-        ownership.finalization_state = self._subscription_finalization_state(
-            managed,
-            agent_result=agent_result,
+        updated = replace(
+            ownership,
+            managed=managed,
+            phase=_RECOVERY_PHASE_TERMINAL_FINALIZATION,
+            finalize_subscription=True,
+            finalization_state=self._subscription_finalization_state(
+                managed,
+                agent_result=agent_result,
+            ),
         )
-        self._persist_cleanup_ownership(ownership)
+        self._persist_cleanup_ownership(updated)
+        retries[managed.session_id] = updated
 
     # ------------------------------------------------------------------
     # Evaluator runtime prewarm
@@ -1550,7 +1542,14 @@ class GatewayNodeManager:
         except GatewayExecutionTimeout as exc:
             result = self._timeout_result(request, managed.timer, str(exc))
         except Exception as exc:
-            logger.exception("Post-run handling failed for session %s", request.session_id)
+            if _is_codex_subscription_agent(request.agent):
+                self._log_credential_safe_exception(
+                    managed,
+                    "Post-run handling failed",
+                    exc,
+                )
+            else:
+                logger.exception("Post-run handling failed for session %s", request.session_id)
             result = self._error_result(request, managed.timer, f"post-run failed: {exc}")
         finally:
             managed.timer.mark("postrun", "finished")
@@ -1569,10 +1568,7 @@ class GatewayNodeManager:
                     f"credential capture redaction failed: {exc}",
                 )
             stop_tasks = []
-            eval_runtime = (
-                await self._drain_eval_prewarm_task(managed)
-                or managed.eval_runtime
-            )
+            eval_runtime = await self._drain_eval_prewarm_task(managed) or managed.eval_runtime
             if eval_runtime is not None:
                 stop_tasks.append(
                     self._stop_runtime_best_effort(
@@ -1625,10 +1621,7 @@ class GatewayNodeManager:
         managed.timer.mark("postrun", "started")
         await self._run_postrun_steps(managed)
         managed.timer.mark("teardown", "started")
-        eval_runtime = (
-            await self._drain_eval_prewarm_task(managed)
-            or managed.eval_runtime
-        )
+        eval_runtime = await self._drain_eval_prewarm_task(managed) or managed.eval_runtime
         stop_targets = [
             (eval_runtime, "eval runtime"),
             (managed.runtime, "runtime"),
@@ -1719,9 +1712,10 @@ class GatewayNodeManager:
                 elif result is None:
                     result = await self._build_session_result(managed)
         except Exception as exc:
-            logger.exception(
-                "Subscription finalization failed for session %s",
-                request.session_id,
+            self._log_credential_safe_exception(
+                managed,
+                "Subscription finalization failed",
+                exc,
             )
             result = self._error_result(
                 request,
@@ -1754,8 +1748,8 @@ class GatewayNodeManager:
             }
         )
         normalized = self._redact_in_memory_result(managed, normalized)
-        managed.final_result = normalized
         ownership = self._prepare_terminal_delivery(managed, normalized)
+        managed.final_result = normalized
         return await self._resume_terminal_delivery(ownership)
 
     async def _build_session_result(self, managed: ManagedSession) -> SessionResult:
@@ -1772,11 +1766,7 @@ class GatewayNodeManager:
         managed.timer.mark("build", "started")
         try:
             verified_transcript: VerifiedSessionTranscript | None = None
-            runtime_spec = (
-                managed.runtime.spec
-                if managed.runtime is not None
-                else request.runtime
-            )
+            runtime_spec = managed.runtime.spec if managed.runtime is not None else request.runtime
             verified_authority_capture = transcript_capture_enabled(
                 request.agent.settings.get("capture_mode")
             ) and (
@@ -1790,13 +1780,8 @@ class GatewayNodeManager:
                 else self._await_with_budget
             )
             if not allow_transcript_path_open:
-                if (
-                    managed.log_authority_dir is None
-                    or managed.log_authority_identity is None
-                ):
-                    raise RuntimeError(
-                        "managed transcript requires a pinned log authority"
-                    )
+                if managed.log_authority_dir is None or managed.log_authority_identity is None:
+                    raise RuntimeError("managed transcript requires a pinned log authority")
                 step_index = _transcript_step_index(agent_result)
                 if step_index is not None:
                     verified_transcript = await await_build(
@@ -2076,9 +2061,7 @@ class GatewayNodeManager:
             runtime_env = dict(runtime.spec.env)
         agent_env = dict(request.agent.env) if include_agent_env else {}
         credential_env = (
-            MANAGED_SUBSCRIPTION_ENV
-            if _is_codex_subscription_agent(request.agent)
-            else {}
+            MANAGED_SUBSCRIPTION_ENV if _is_codex_subscription_agent(request.agent) else {}
         )
         return {
             "ANTHROPIC_BASE_URL": self.gateway_url,
@@ -2221,9 +2204,7 @@ class GatewayNodeManager:
         status: SessionStatus,
         error: str,
     ) -> SessionResult:
-        trajectory = result.trajectory.model_copy(
-            update={"status": status, "error": error}
-        )
+        trajectory = result.trajectory.model_copy(update={"status": status, "error": error})
         return result.model_copy(
             update={"status": status, "trajectory": trajectory, "error": error}
         )
@@ -2312,9 +2293,7 @@ class GatewayNodeManager:
         try:
             return await asyncio.wait_for(awaitable, timeout=remaining)
         except asyncio.TimeoutError as exc:
-            raise GatewayExecutionTimeout(
-                "session transcript finalization timeout"
-            ) from exc
+            raise GatewayExecutionTimeout("session transcript finalization timeout") from exc
 
     @staticmethod
     def _start_execution_deadline(managed: ManagedSession) -> None:
@@ -2352,12 +2331,19 @@ class GatewayNodeManager:
                     result.stdout,
                     result.stderr,
                 )
-            except Exception:
-                logger.debug(
-                    "Teardown step failed for session %s",
-                    managed.request.session_id,
-                    exc_info=True,
-                )
+            except Exception as exc:
+                if _is_codex_subscription_agent(managed.request.agent):
+                    self._log_credential_safe_exception(
+                        managed,
+                        "Teardown step failed",
+                        exc,
+                    )
+                else:
+                    logger.debug(
+                        "Teardown step failed for session %s",
+                        managed.request.session_id,
+                        exc_info=True,
+                    )
 
     async def _stop_runtime_best_effort(
         self,
@@ -2394,14 +2380,25 @@ class GatewayNodeManager:
             if isinstance(value, tuple):
                 return tuple(redact(item) for item in value)
             if isinstance(value, dict):
-                return {
-                    redactor.redact(str(key)): redact(item)
-                    for key, item in value.items()
-                }
+                return {redactor.redact(str(key)): redact(item) for key, item in value.items()}
             return value
 
-        return SessionResult.model_validate(
-            redact(result.model_dump(mode="python"))
+        return SessionResult.model_validate(redact(result.model_dump(mode="python")))
+
+    @staticmethod
+    def _log_credential_safe_exception(
+        managed: ManagedSession,
+        message: str,
+        exc: Exception,
+    ) -> None:
+        rendered = str(exc)
+        if managed.credential_redactor is not None:
+            rendered = managed.credential_redactor.redact(rendered)
+        logger.error(
+            "%s for session %s: %s",
+            message,
+            managed.session_id,
+            rendered,
         )
 
     async def _remove_owned_roots(self, managed: ManagedSession) -> bool:
@@ -2429,7 +2426,9 @@ class GatewayNodeManager:
                 )
             )
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-        return all(outcome is not False and not isinstance(outcome, BaseException) for outcome in outcomes)
+        return all(
+            outcome is not False and not isinstance(outcome, BaseException) for outcome in outcomes
+        )
 
     def _register_cleanup_retry(
         self,
@@ -2457,27 +2456,32 @@ class GatewayNodeManager:
                 ownership.finalize_subscription = previous.finalize_subscription
                 if previous.finalization_state is not None:
                     ownership.phase = previous.phase
-        retries[managed.session_id] = ownership
         self._persist_cleanup_ownership(ownership)
+        retries[managed.session_id] = ownership
 
     def _record_cleanup_runtimes_absent(self, managed: ManagedSession) -> None:
         ownership = self._cleanup_retries.get(managed.session_id)
         if ownership is not None:
-            self._record_cleanup_ownership_runtimes_absent(ownership)
+            ownership = self._record_cleanup_ownership_runtimes_absent(ownership)
         managed.runtime = None
         managed.eval_runtime = None
 
     def _record_cleanup_ownership_runtimes_absent(
         self,
         ownership: CleanupRetryOwnership,
-    ) -> None:
-        ownership.runtime_id = None
-        ownership.container_id = None
-        ownership.eval_runtime_id = None
-        ownership.eval_container_id = None
-        ownership.runtime = None
-        ownership.eval_runtime = None
-        self._persist_cleanup_ownership(ownership)
+    ) -> CleanupRetryOwnership:
+        updated = replace(
+            ownership,
+            runtime_id=None,
+            container_id=None,
+            eval_runtime_id=None,
+            eval_container_id=None,
+            runtime=None,
+            eval_runtime=None,
+        )
+        self._persist_cleanup_ownership(updated)
+        self._cleanup_retries[ownership.session_id] = updated
+        return updated
 
     def _prepare_terminal_delivery(
         self,
@@ -2490,14 +2494,11 @@ class GatewayNodeManager:
             ownership = self._cleanup_ownership_for(
                 managed,
                 eval_runtime=managed.eval_runtime,
-                finalize_subscription=_is_codex_subscription_agent(
-                    managed.request.agent
-                ),
+                finalize_subscription=_is_codex_subscription_agent(managed.request.agent),
             )
-            retries[managed.session_id] = ownership
-        ownership.managed = managed
-        if ownership.finalization_state is not None:
-            ownership.finalization_state.final_result = result
+        finalization_state = ownership.finalization_state
+        if finalization_state is not None:
+            finalization_state = replace(finalization_state, final_result=result)
 
         result_digest = self._terminal_result_digest(result)
         state = ownership.delivery_state
@@ -2515,12 +2516,18 @@ class GatewayNodeManager:
                 callback_required=callback_required,
                 callback_succeeded=not callback_required,
             )
-            ownership.delivery_state = state
         elif state.result_digest != result_digest or state.result != result:
             raise RuntimeError("terminal delivery result identity changed")
-        ownership.phase = _RECOVERY_PHASE_TERMINAL_DELIVERY
-        self._persist_cleanup_ownership(ownership)
-        return ownership
+        updated = replace(
+            ownership,
+            managed=managed,
+            finalization_state=finalization_state,
+            delivery_state=state,
+            phase=_RECOVERY_PHASE_TERMINAL_DELIVERY,
+        )
+        self._persist_cleanup_ownership(updated)
+        retries[managed.session_id] = updated
+        return updated
 
     async def _resume_terminal_delivery(
         self,
@@ -2563,21 +2570,23 @@ class GatewayNodeManager:
                 )
                 return False
             if exported:
-                state = self._advance_terminal_delivery(
+                ownership = self._advance_terminal_delivery(
                     ownership,
                     export_succeeded=True,
                 )
+                state = ownership.delivery_state
+                assert state is not None
             else:
                 export_failed_open = True
 
-        if not state.callback_succeeded and (
-            state.export_succeeded or export_failed_open
-        ):
+        if not state.callback_succeeded and (state.export_succeeded or export_failed_open):
             if await self._push_result(state.callback_url, result):
-                state = self._advance_terminal_delivery(
+                ownership = self._advance_terminal_delivery(
                     ownership,
                     callback_succeeded=True,
                 )
+                state = ownership.delivery_state
+                assert state is not None
 
         if state.callback_required and state.callback_succeeded:
             self.session_registry.clear_result_payload(session_id)
@@ -2593,7 +2602,7 @@ class GatewayNodeManager:
         *,
         export_succeeded: bool = False,
         callback_succeeded: bool = False,
-    ) -> TerminalDeliveryState:
+    ) -> CleanupRetryOwnership:
         state = ownership.delivery_state
         if state is None:
             raise RuntimeError("terminal delivery authority is missing")
@@ -2607,9 +2616,10 @@ class GatewayNodeManager:
             callback_required=state.callback_required,
             callback_succeeded=state.callback_succeeded or callback_succeeded,
         )
-        ownership.delivery_state = updated
-        self._persist_cleanup_ownership(ownership)
-        return updated
+        updated_ownership = replace(ownership, delivery_state=updated)
+        self._persist_cleanup_ownership(updated_ownership)
+        self._cleanup_retries[ownership.session_id] = updated_ownership
+        return updated_ownership
 
     @staticmethod
     def _redact_finalization_value(
@@ -2622,8 +2632,7 @@ class GatewayNodeManager:
             return redactor.redact(value)
         if isinstance(value, list):
             return [
-                GatewayNodeManager._redact_finalization_value(item, redactor)
-                for item in value
+                GatewayNodeManager._redact_finalization_value(item, redactor) for item in value
             ]
         if isinstance(value, dict):
             return {
@@ -2689,9 +2698,7 @@ class GatewayNodeManager:
             credential_root_identity=managed.credential_root_identity,
             runtime_id=(str(getattr(runtime, "runtime_id", "")) or None),
             container_id=getattr(runtime, "container_id", None),
-            eval_runtime_id=(
-                str(getattr(eval_runtime, "runtime_id", "")) or None
-            ),
+            eval_runtime_id=(str(getattr(eval_runtime, "runtime_id", "")) or None),
             eval_container_id=getattr(eval_runtime, "container_id", None),
             runtime=runtime,
             phase=(
@@ -2765,9 +2772,7 @@ class GatewayNodeManager:
                         else state.final_result.model_dump(mode="json")
                     ),
                     "pending_status": (
-                        None
-                        if state.pending_status is None
-                        else str(state.pending_status)
+                        None if state.pending_status is None else str(state.pending_status)
                     ),
                     "pending_error": state.pending_error,
                     "cancel_requested": state.cancel_requested,
@@ -2807,15 +2812,24 @@ class GatewayNodeManager:
         if len(encoded) > _CLEANUP_JOURNAL_MAX_BYTES:
             raise RuntimeError("cleanup ownership journal exceeds the byte limit")
         destination = self._cleanup_journal_path(ownership.session_id)
-        temporary = destination.with_name(
-            f".{destination.name}.{os.getpid()}.{id(ownership)}.tmp"
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{id(ownership)}.tmp")
+        pending = destination.with_suffix(".pending")
+        rollback = destination.with_name(f".{destination.name}.rollback.tmp")
+        previous = self._read_private_cleanup_file(
+            destination,
+            max_bytes=_CLEANUP_JOURNAL_MAX_BYTES,
+            allow_missing=True,
         )
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
-        )
+        replaced = False
+        descriptor = -1
         try:
+            self._ensure_cleanup_pending_marker(pending, journal_dir)
+
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
             offset = 0
             while offset < len(encoded):
                 written = os.write(descriptor, encoded[offset:])
@@ -2824,14 +2838,156 @@ class GatewayNodeManager:
                 offset += written
             os.fchmod(descriptor, 0o600)
             os.fsync(descriptor)
-        finally:
             os.close(descriptor)
-        os.replace(temporary, destination)
-        directory_fd = os.open(journal_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            descriptor = -1
+            os.replace(temporary, destination)
+            replaced = True
+            self._fsync_cleanup_journal_directory(journal_dir)
+            pending.unlink()
+            self._fsync_cleanup_journal_directory(journal_dir)
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+                descriptor = -1
+            if replaced:
+                try:
+                    if previous is None:
+                        destination.unlink(missing_ok=True)
+                    else:
+                        rollback_fd = os.open(
+                            rollback,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                            0o600,
+                        )
+                        try:
+                            offset = 0
+                            while offset < len(previous):
+                                written = os.write(rollback_fd, previous[offset:])
+                                if written <= 0:
+                                    raise RuntimeError(
+                                        "cleanup ownership journal rollback made no progress"
+                                    )
+                                offset += written
+                            os.fsync(rollback_fd)
+                        finally:
+                            os.close(rollback_fd)
+                        os.replace(rollback, destination)
+                    self._fsync_cleanup_journal_directory(journal_dir)
+                except Exception:
+                    logger.error(
+                        "Cleanup ownership journal rollback could not be proven for %s",
+                        ownership.session_id,
+                    )
+            try:
+                self._ensure_cleanup_pending_marker(pending, journal_dir)
+            except OSError:
+                logger.error(
+                    "Cleanup ownership journal pending marker could not be proven for %s",
+                    ownership.session_id,
+                )
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            for leftover in (temporary, rollback):
+                try:
+                    leftover.unlink()
+                except FileNotFoundError:
+                    pass
+
+    @staticmethod
+    def _fsync_cleanup_journal_directory(journal_dir: Path) -> None:
+        directory_fd = os.open(
+            journal_dir,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+
+    @classmethod
+    def _ensure_cleanup_pending_marker(
+        cls,
+        pending: Path,
+        journal_dir: Path,
+    ) -> None:
+        descriptor = -1
+        try:
+            try:
+                descriptor = os.open(
+                    pending,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                )
+                marker = b"pending\n"
+                if os.write(descriptor, marker) != len(marker):
+                    raise RuntimeError(
+                        "cleanup ownership journal pending marker write was incomplete"
+                    )
+            except FileExistsError:
+                descriptor = os.open(
+                    pending,
+                    os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                )
+                state = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(state.st_mode)
+                    or state.st_uid != os.geteuid()
+                    or state.st_nlink != 1
+                    or stat.S_IMODE(state.st_mode) != 0o600
+                    or state.st_size not in {len(b"pending\n"), len(b"blocked\n")}
+                ):
+                    raise RuntimeError("cleanup ownership journal pending marker is invalid")
+                content = os.read(descriptor, state.st_size)
+                if content not in {b"pending\n", b"blocked\n"} or os.read(descriptor, 1):
+                    raise RuntimeError("cleanup ownership journal pending marker is invalid")
+            os.fsync(descriptor)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        cls._fsync_cleanup_journal_directory(journal_dir)
+
+    @staticmethod
+    def _read_private_cleanup_file(
+        path: Path,
+        *,
+        max_bytes: int,
+        allow_missing: bool,
+    ) -> bytes | None:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+        except FileNotFoundError:
+            if allow_missing:
+                return None
+            raise
+        try:
+            state = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(state.st_mode)
+                or state.st_uid != os.geteuid()
+                or state.st_nlink != 1
+                or stat.S_IMODE(state.st_mode) != 0o600
+                or state.st_size <= 0
+                or state.st_size > max_bytes
+            ):
+                raise RuntimeError("cleanup ownership journal file is not private")
+            chunks: list[bytes] = []
+            remaining = state.st_size
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if remaining or os.read(descriptor, 1):
+                raise RuntimeError("cleanup ownership journal changed during read")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
 
     def _load_cleanup_retries(self) -> None:
         journal_dir = getattr(self, "_cleanup_journal_dir", None)
@@ -2844,6 +3000,8 @@ class GatewayNodeManager:
             or directory_stat.st_mode & 0o077
         ):
             raise RuntimeError("cleanup ownership journal directory is not private")
+        if next(journal_dir.glob("*.pending"), None) is not None:
+            raise RuntimeError("cleanup ownership journal has an incomplete update")
         for path in sorted(journal_dir.glob("*.json")):
             opened_fd = os.open(
                 path,
@@ -2906,9 +3064,7 @@ class GatewayNodeManager:
             expected_keys.add("phase")
         if set(payload) != expected_keys:
             raise ValueError("cleanup ownership payload is not closed")
-        if version not in {1, 2, 3, 4, 5} or not isinstance(
-            payload["session_id"], str
-        ):
+        if version not in {1, 2, 3, 4, 5} or not isinstance(payload["session_id"], str):
             raise ValueError("cleanup ownership identity is invalid")
         phase = payload.get("phase")
         if version == 5 and phase not in _RECOVERY_PHASES:
@@ -2997,33 +3153,23 @@ class GatewayNodeManager:
                 raise ValueError("subscription finalization timer is invalid")
             pending_status_payload = finalization_payload["pending_status"]
             pending_status = (
-                None
-                if pending_status_payload is None
-                else SessionStatus(pending_status_payload)
+                None if pending_status_payload is None else SessionStatus(pending_status_payload)
             )
             if pending_status is not None and pending_status not in {
                 SessionStatus.ERROR,
                 SessionStatus.TIMEOUT,
             }:
                 raise ValueError("subscription pending status is invalid")
-            request = SessionDispatchRequest.model_validate(
-                finalization_payload["request"]
-            )
-            if request.session_id != session_id or not _is_codex_subscription_agent(
-                request.agent
-            ):
+            request = SessionDispatchRequest.model_validate(finalization_payload["request"])
+            if request.session_id != session_id or not _is_codex_subscription_agent(request.agent):
                 raise ValueError("subscription finalization request is invalid")
             agent_payload = finalization_payload["agent_result"]
             result_payload = finalization_payload["final_result"]
             agent_result = (
-                None
-                if agent_payload is None
-                else AgentRunResult.model_validate(agent_payload)
+                None if agent_payload is None else AgentRunResult.model_validate(agent_payload)
             )
             final_result = (
-                None
-                if result_payload is None
-                else SessionResult.model_validate(result_payload)
+                None if result_payload is None else SessionResult.model_validate(result_payload)
             )
             if final_result is not None and final_result.session_id != session_id:
                 raise ValueError("subscription terminal result identity is invalid")
@@ -3054,10 +3200,7 @@ class GatewayNodeManager:
                 not isinstance(delivery_payload, dict)
                 or set(delivery_payload) != delivery_keys
                 or not isinstance(delivery_payload["result_digest"], str)
-                or re.fullmatch(
-                    r"[0-9a-f]{64}", delivery_payload["result_digest"]
-                )
-                is None
+                or re.fullmatch(r"[0-9a-f]{64}", delivery_payload["result_digest"]) is None
                 or (
                     delivery_payload["callback_url"] is not None
                     and not isinstance(delivery_payload["callback_url"], str)
@@ -3096,9 +3239,7 @@ class GatewayNodeManager:
                     or not isinstance(authority_payload["backend_url"], str)
                     or not authority_payload["backend_url"]
                     or isinstance(authority_payload["timeout_seconds"], bool)
-                    or not isinstance(
-                        authority_payload["timeout_seconds"], (int, float)
-                    )
+                    or not isinstance(authority_payload["timeout_seconds"], (int, float))
                     or not math.isfinite(float(authority_payload["timeout_seconds"]))
                     or float(authority_payload["timeout_seconds"]) <= 0
                     or not isinstance(authority_payload["fail_open"], bool)
@@ -3248,10 +3389,7 @@ class GatewayNodeManager:
         state = ownership.finalization_state
         if state is None:
             raise RuntimeError("subscription finalization authority is missing")
-        if (
-            ownership.credential_dir is None
-            or ownership.credential_root_identity is None
-        ):
+        if ownership.credential_dir is None or ownership.credential_root_identity is None:
             raise RuntimeError("subscription credential authority is missing")
         redactor = load_staged_codex_subscription_redactor(
             ownership.credential_dir,
@@ -3311,9 +3449,8 @@ class GatewayNodeManager:
                 runtime_id is not None or container_id is not None
                 for container_id, runtime_id in recovered_targets
             )
-            if (
-                len(recovered_outcomes) != expected_runtime_count
-                or not all(outcome is True for outcome in recovered_outcomes)
+            if len(recovered_outcomes) != expected_runtime_count or not all(
+                outcome is True for outcome in recovered_outcomes
             ):
                 return
             if ownership.phase is None:
@@ -3391,7 +3528,7 @@ class GatewayNodeManager:
                 session_id,
             )
             return
-        self._record_cleanup_ownership_runtimes_absent(ownership)
+        ownership = self._record_cleanup_ownership_runtimes_absent(ownership)
         if ownership.phase == _RECOVERY_PHASE_TERMINAL_DELIVERY:
             delivered = await self._resume_terminal_delivery(ownership)
             if not delivered:
@@ -3433,9 +3570,7 @@ class GatewayNodeManager:
         credential_root_identity: tuple[int, int, int] | None = None,
     ) -> bool:
         try:
-            identity = credential_root_identity or capture_session_root_identity(
-                credential_dir
-            )
+            identity = credential_root_identity or capture_session_root_identity(credential_dir)
             await asyncio.to_thread(remove_session_tree, credential_dir, identity)
             return True
         except FileNotFoundError:
@@ -3455,9 +3590,7 @@ class GatewayNodeManager:
         log_authority_identity: tuple[int, int, int] | None = None,
     ) -> bool:
         try:
-            identity = log_authority_identity or capture_session_root_identity(
-                log_authority_dir
-            )
+            identity = log_authority_identity or capture_session_root_identity(log_authority_dir)
             await asyncio.to_thread(
                 remove_session_tree,
                 log_authority_dir,

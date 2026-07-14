@@ -8,6 +8,7 @@ from openevo._imports import import_subclass
 from openevo.runtime.apptainer import ApptainerRuntime
 from openevo.runtime.base import BaseRuntime
 from openevo.runtime.docker import DockerRuntime
+from openevo.runtime.managed import ManagedCredentialMount
 from openevo.runtime.models import RuntimeSpec
 
 _BUILTIN_BACKENDS: dict[str, type[BaseRuntime]] = {
@@ -21,7 +22,7 @@ def create_runtime(
     session_id: str,
     session_dir: Path,
     *,
-    credential_dir: Path | None = None,
+    credential_mount: ManagedCredentialMount | None = None,
     docker_ownership_root: Path | None = None,
 ) -> BaseRuntime:
     """Instantiate a runtime from a RuntimeSpec.
@@ -30,7 +31,7 @@ def create_runtime(
     Falls back to ``spec.import_path`` for plugin runtimes.
     """
     if spec.import_path:
-        if credential_dir is not None:
+        if credential_mount is not None:
             raise ValueError("managed credentials cannot be passed to a plugin runtime")
         cls = _import_runtime_class(spec.import_path)
         runtime = cls(spec, session_id, session_dir)
@@ -44,11 +45,11 @@ def create_runtime(
             spec,
             session_id,
             session_dir,
-            credential_dir=credential_dir,
+            credential_mount=credential_mount,
             ownership_root=docker_ownership_root,
         )
     else:
-        if credential_dir is not None:
+        if credential_mount is not None:
             raise ValueError("managed credentials require the Docker runtime")
         runtime = cls(spec, session_id, session_dir)
     _validate_runtime_capabilities(runtime)
@@ -72,11 +73,8 @@ def _validate_runtime_capabilities(runtime: BaseRuntime) -> None:
         raise ValueError(f"runtime backend {backend!r} does not support storage limits")
     if not spec.allow_internet:
         if not runtime.can_disable_internet:
-            raise ValueError(
-                f"runtime backend {backend!r} cannot disable internet access"
-            )
+            raise ValueError(f"runtime backend {backend!r} cannot disable internet access")
         if spec.network not in (None, "", "host", "none"):
             raise ValueError(
-                "runtime.network must be unset, 'host', or 'none' when "
-                "allow_internet=false"
+                "runtime.network must be unset, 'host', or 'none' when allow_internet=false"
             )

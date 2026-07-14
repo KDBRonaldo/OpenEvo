@@ -28,20 +28,12 @@ _TRANSCRIPT_MAX_BYTES: Final[int] = 4 * 1024 * 1024
 EXEC_LOG_MAX_BYTES: Final[int] = _TRANSCRIPT_MAX_BYTES
 _CLEANUP_MAX_DEPTH: Final[int] = 64
 _CLEANUP_MAX_NODES: Final[int] = 100_000
-CAPTURE_REDACTION_LIMIT_MARKER: Final[str] = (
-    "[REDACTED: capture exceeded credential scan limit]"
-)
+CAPTURE_REDACTION_LIMIT_MARKER: Final[str] = "[REDACTED: capture exceeded credential scan limit]"
 _CREDENTIAL_REDACTION_MARKER: Final[bytes] = b"[REDACTED: Codex credential]"
-_DIRECTORY_FLAGS: Final[int] = (
-    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
-)
-_PATH_FLAGS: Final[int] = (
-    getattr(os, "O_PATH", os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
-)
+_DIRECTORY_FLAGS: Final[int] = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+_PATH_FLAGS: Final[int] = getattr(os, "O_PATH", os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
 _LEAF_PIN_FLAGS: Final[int] = (
-    getattr(os, "O_PATH", os.O_RDONLY | os.O_NONBLOCK)
-    | os.O_CLOEXEC
-    | os.O_NOFOLLOW
+    getattr(os, "O_PATH", os.O_RDONLY | os.O_NONBLOCK) | os.O_CLOEXEC | os.O_NOFOLLOW
 )
 _RENAME_NOREPLACE: Final[int] = 1
 
@@ -56,6 +48,14 @@ class VerifiedSessionTranscript:
 
     path: Path
     content: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class StagedCodexCredential:
+    """Validated redactor and exact published auth-file identity."""
+
+    redactor: CredentialRedactor
+    auth_identity: tuple[int, int, int, int, int, int, int, int]
 
 
 @dataclass(slots=True)
@@ -303,16 +303,12 @@ def write_verified_session_log(
                 pass
             before = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
             if not stat.S_ISDIR(before.st_mode) or before.st_uid != session_identity[2]:
-                raise SessionFileSecurityError(
-                    "session log ancestor is not an owned directory"
-                )
+                raise SessionFileSecurityError("session log ancestor is not an owned directory")
             child_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent_fd)
             opened = os.fstat(child_fd)
             if _auth_identity(before) != _auth_identity(opened):
                 os.close(child_fd)
-                raise SessionFileSecurityError(
-                    "session log ancestor changed while it was opened"
-                )
+                raise SessionFileSecurityError("session log ancestor changed while it was opened")
             _fchmod_stable(child_fd, 0o700, label="session log directory")
             directory_fds.append(child_fd)
             directory_identities.append(_full_object_identity(os.fstat(child_fd)))
@@ -391,9 +387,7 @@ def write_verified_session_log(
         if _read_fd_exact(temporary_fd, len(encoded)) != encoded:
             raise SessionFileSecurityError("session log bytes changed after publication")
 
-        for index, (descriptor, expected) in enumerate(
-            zip(directory_fds, directory_identities)
-        ):
+        for index, (descriptor, expected) in enumerate(zip(directory_fds, directory_identities)):
             if _full_object_identity(os.fstat(descriptor)) != expected:
                 raise SessionFileSecurityError("session log ancestor descriptor changed")
             if index:
@@ -411,9 +405,7 @@ def write_verified_session_log(
         )
         return session_dir.joinpath(*directory_parts, leaf_name)
     except FileExistsError as exc:
-        raise SessionFileSecurityError(
-            "session log destination already exists"
-        ) from exc
+        raise SessionFileSecurityError("session log destination already exists") from exc
     except SessionFileSecurityError:
         raise
     except OSError as exc:
@@ -582,8 +574,8 @@ def stage_codex_subscription_auth(
     session_dir: Path,
     session_identity: SessionRootIdentity,
     target_home_parts: tuple[str, ...],
-) -> CredentialRedactor:
-    """Validate auth in an unmounted private root, then atomically publish it."""
+) -> StagedCodexCredential:
+    """Validate auth inside a managed private root, then atomically publish it."""
 
     source_parent_fd = -1
     source_name = source.name
@@ -614,23 +606,23 @@ def stage_codex_subscription_auth(
         _require_private_auth(source_before)
         source_fd = os.open(
             source_name,
-            os.O_RDONLY
-            | os.O_CLOEXEC
-            | os.O_NOFOLLOW
-            | os.O_NONBLOCK,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=source_parent_fd,
         )
         source_opened = os.fstat(source_fd)
         _require_private_auth(source_opened)
         if _auth_identity(source_before) != _auth_identity(source_opened):
-            raise SessionFileSecurityError(
-                "Codex subscription auth changed while it was opened"
-            )
+            raise SessionFileSecurityError("Codex subscription auth changed while it was opened")
+
+        target_pin = _pin_absolute_directory(session_dir)
+        target_pin.verify(label="credential root")
+        _require_session_identity(os.fstat(target_pin.descriptor), session_identity)
+        _fchmod_stable(target_pin.descriptor, 0o700, label="credential root")
 
         staging_dir = Path(
             mkdtemp(
                 prefix=".openevo-credential-staging-",
-                dir=session_dir.parent,
+                dir=session_dir,
             )
         )
         staging_root_identity = capture_session_root_identity(staging_dir)
@@ -648,11 +640,7 @@ def stage_codex_subscription_auth(
 
         staged_fd = os.open(
             "auth.json",
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_CLOEXEC
-            | os.O_NOFOLLOW,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
             dir_fd=staging_pin.descriptor,
         )
@@ -675,9 +663,7 @@ def stage_codex_subscription_auth(
             )
         source_after = os.fstat(source_fd)
         if _auth_identity(source_opened) != _auth_identity(source_after):
-            raise SessionFileSecurityError(
-                "Codex subscription auth changed while it was copied"
-            )
+            raise SessionFileSecurityError("Codex subscription auth changed while it was copied")
         _require_private_auth(source_after)
         _require_path_identity(
             source_parent_fd,
@@ -711,9 +697,7 @@ def stage_codex_subscription_auth(
                 "Codex subscription auth changed during final verification"
             )
         if _auth_identity(staged_after) != _auth_identity(staged_final):
-            raise SessionFileSecurityError(
-                "staged Codex auth changed during final verification"
-            )
+            raise SessionFileSecurityError("staged Codex auth changed during final verification")
         _require_path_identity(
             source_parent_fd,
             source_name,
@@ -729,7 +713,6 @@ def stage_codex_subscription_auth(
         source_pin.verify(label="Codex subscription auth source")
         staging_pin.verify(label="credential staging root")
 
-        target_pin = _pin_absolute_directory(session_dir)
         target_pin.verify(label="credential root")
         _require_session_identity(os.fstat(target_pin.descriptor), session_identity)
         _fchmod_stable(target_pin.descriptor, 0o700, label="credential root")
@@ -761,9 +744,7 @@ def stage_codex_subscription_auth(
                 "staged Codex auth path changed during publication"
             ) from exc
         if _object_identity(target_named) != _object_identity(staged_final):
-            raise SessionFileSecurityError(
-                "staged Codex auth path changed during publication"
-            )
+            raise SessionFileSecurityError("staged Codex auth path changed during publication")
         target_final = os.fstat(staged_fd)
         _require_private_staged_auth(
             target_final,
@@ -771,9 +752,7 @@ def stage_codex_subscription_auth(
             expected_size=source_opened.st_size,
         )
         if _auth_identity(staged_final)[:-1] != _auth_identity(target_final)[:-1]:
-            raise SessionFileSecurityError(
-                "staged Codex auth changed during publication"
-            )
+            raise SessionFileSecurityError("staged Codex auth changed during publication")
         _require_path_identity(
             target_parent_fd,
             "auth.json",
@@ -782,13 +761,16 @@ def stage_codex_subscription_auth(
         )
         target_pin.verify(label="credential root")
         staging_pin.verify(label="credential staging root")
-        return redactor
+        return StagedCodexCredential(
+            redactor=redactor,
+            auth_identity=_auth_identity(target_final),
+        )
     except FileNotFoundError as exc:
         _scrub_staged_auth(staged_fd, staged_file_identity)
         _unlink_if_same_identity(
-            target_parent_fd if published else (
-                staging_pin.descriptor if staging_pin is not None else -1
-            ),
+            target_parent_fd
+            if published
+            else (staging_pin.descriptor if staging_pin is not None else -1),
             "auth.json",
             staged_file_identity,
         )
@@ -799,9 +781,9 @@ def stage_codex_subscription_auth(
     except SessionFileSecurityError:
         _scrub_staged_auth(staged_fd, staged_file_identity)
         _unlink_if_same_identity(
-            target_parent_fd if published else (
-                staging_pin.descriptor if staging_pin is not None else -1
-            ),
+            target_parent_fd
+            if published
+            else (staging_pin.descriptor if staging_pin is not None else -1),
             "auth.json",
             staged_file_identity,
         )
@@ -809,9 +791,9 @@ def stage_codex_subscription_auth(
     except (OSError, ValueError) as exc:
         _scrub_staged_auth(staged_fd, staged_file_identity)
         _unlink_if_same_identity(
-            target_parent_fd if published else (
-                staging_pin.descriptor if staging_pin is not None else -1
-            ),
+            target_parent_fd
+            if published
+            else (staging_pin.descriptor if staging_pin is not None else -1),
             "auth.json",
             staged_file_identity,
         )
@@ -835,7 +817,10 @@ def stage_codex_subscription_auth(
             except (OSError, SessionFileSecurityError):
                 cleanup_failed = True
             staging_pin.close()
-            if cleanup_failed and sys.exc_info()[0] is None:
+            # The staging root is inside the already journaled credential
+            # authority. After publication it is empty, so a cleanup fault is
+            # recoverable with the credential root and must not negate success.
+            if cleanup_failed and sys.exc_info()[0] is None and not published:
                 raise SessionFileSecurityError(
                     "credential staging root could not be removed safely"
                 )
@@ -868,9 +853,7 @@ def load_staged_codex_subscription_redactor(
         content = _read_fd_exact(descriptor, opened.st_size)
         after = os.fstat(descriptor)
         if _auth_identity(opened) != _auth_identity(after):
-            raise SessionFileSecurityError(
-                "staged Codex auth changed during recovery read"
-            )
+            raise SessionFileSecurityError("staged Codex auth changed during recovery read")
         _require_path_identity(
             root_pin.descriptor,
             "auth.json",
@@ -882,9 +865,7 @@ def load_staged_codex_subscription_redactor(
     except SessionFileSecurityError:
         raise
     except (OSError, ValueError) as exc:
-        raise SessionFileSecurityError(
-            "staged Codex auth could not be recovered safely"
-        ) from exc
+        raise SessionFileSecurityError("staged Codex auth could not be recovered safely") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -1033,12 +1014,8 @@ def _open_absolute_directory(path: Path) -> int:
 
 def _pin_absolute_directory(path: Path) -> _AbsoluteDirectoryPin:
     parts = path.parts
-    if not parts or parts[0] != os.sep or any(
-        part in {"", ".", ".."} for part in parts[1:]
-    ):
-        raise SessionFileSecurityError(
-            "private session path must be absolute and canonical"
-        )
+    if not parts or parts[0] != os.sep or any(part in {"", ".", ".."} for part in parts[1:]):
+        raise SessionFileSecurityError("private session path must be absolute and canonical")
     descriptors = [os.open(os.sep, _DIRECTORY_FLAGS)]
     identities = [_full_object_identity(os.fstat(descriptors[0]))]
     try:
@@ -1060,12 +1037,13 @@ def _pin_absolute_directory(path: Path) -> _AbsoluteDirectoryPin:
 
 def _pin_or_create_absolute_directory(path: Path) -> _AbsoluteDirectoryPin:
     parts = path.parts
-    if not parts or parts[0] != os.sep or any(
-        part in {"", ".", ".."} for part in parts[1:]
-    ) or len(parts) < 2:
-        raise SessionFileSecurityError(
-            "private session path must be absolute and canonical"
-        )
+    if (
+        not parts
+        or parts[0] != os.sep
+        or any(part in {"", ".", ".."} for part in parts[1:])
+        or len(parts) < 2
+    ):
+        raise SessionFileSecurityError("private session path must be absolute and canonical")
     descriptors = [os.open(os.sep, _DIRECTORY_FLAGS)]
     identities = [_full_object_identity(os.fstat(descriptors[0]))]
     try:
@@ -1076,16 +1054,12 @@ def _pin_or_create_absolute_directory(path: Path) -> _AbsoluteDirectoryPin:
                 pass
             before = os.stat(part, dir_fd=descriptors[-1], follow_symlinks=False)
             if not stat.S_ISDIR(before.st_mode):
-                raise SessionFileSecurityError(
-                    "private session path contains a non-directory"
-                )
+                raise SessionFileSecurityError("private session path contains a non-directory")
             descriptor = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptors[-1])
             opened = os.fstat(descriptor)
             if _full_object_identity(before) != _full_object_identity(opened):
                 os.close(descriptor)
-                raise SessionFileSecurityError(
-                    "private session path changed while it was opened"
-                )
+                raise SessionFileSecurityError("private session path changed while it was opened")
             if index == len(parts[1:]) - 1:
                 _require_owned_directory(opened, label="private authority root")
                 os.fchmod(descriptor, 0o700)
@@ -1203,9 +1177,7 @@ def _copy_exact(source_fd: int, target_fd: int, expected_size: int) -> None:
     while remaining:
         chunk = os.read(source_fd, min(64 * 1024, remaining))
         if not chunk:
-            raise SessionFileSecurityError(
-                "Codex subscription auth changed while it was copied"
-            )
+            raise SessionFileSecurityError("Codex subscription auth changed while it was copied")
         view = memoryview(chunk)
         while view:
             written = os.write(target_fd, view)
@@ -1214,9 +1186,7 @@ def _copy_exact(source_fd: int, target_fd: int, expected_size: int) -> None:
             view = view[written:]
         remaining -= len(chunk)
     if os.read(source_fd, 1):
-        raise SessionFileSecurityError(
-            "Codex subscription auth changed while it was copied"
-        )
+        raise SessionFileSecurityError("Codex subscription auth changed while it was copied")
 
 
 def _read_fd_exact(descriptor: int, expected_size: int) -> bytes:
@@ -1290,9 +1260,7 @@ def _remove_directory_contents(
             for entry in entries:
                 names.append(entry.name)
                 if len(names) > budget[0]:
-                    raise SessionFileSecurityError(
-                        "session cleanup exceeds the node limit"
-                    )
+                    raise SessionFileSecurityError("session cleanup exceeds the node limit")
     except OSError as exc:
         raise SessionFileSecurityError("session directory could not be inventoried") from exc
     names.sort()
@@ -1303,16 +1271,12 @@ def _remove_directory_contents(
             raise SessionFileSecurityError("session cleanup exceeds the node limit")
         before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if before.st_uid != expected_owner:
-            raise SessionFileSecurityError(
-                "session cleanup found an entry owned by another user"
-            )
+            raise SessionFileSecurityError("session cleanup found an entry owned by another user")
         entry_fd = os.open(name, _PATH_FLAGS, dir_fd=directory_fd)
         try:
             opened = os.fstat(entry_fd)
             if _full_object_identity(before) != _full_object_identity(opened):
-                raise SessionFileSecurityError(
-                    "session cleanup entry changed while it was opened"
-                )
+                raise SessionFileSecurityError("session cleanup entry changed while it was opened")
             if stat.S_ISDIR(opened.st_mode):
                 _fchmod_stable(entry_fd, 0o700, label="session directory")
                 child_fd = _open_readable_directory(
@@ -1368,9 +1332,7 @@ def _redact_directory_contents(
             for entry in entries:
                 names.append(entry.name)
                 if len(names) > budget[0]:
-                    raise SessionFileSecurityError(
-                        "credential scan exceeds the node limit"
-                    )
+                    raise SessionFileSecurityError("credential scan exceeds the node limit")
     except OSError as exc:
         raise SessionFileSecurityError(
             "session capture directory could not be inventoried"
@@ -1383,9 +1345,7 @@ def _redact_directory_contents(
             raise SessionFileSecurityError("credential scan exceeds the node limit")
         before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if before.st_uid != expected_owner:
-            raise SessionFileSecurityError(
-                "credential scan found an entry owned by another user"
-            )
+            raise SessionFileSecurityError("credential scan found an entry owned by another user")
         if stat.S_ISLNK(before.st_mode):
             continue
         if stat.S_ISDIR(before.st_mode):
@@ -1432,18 +1392,12 @@ def _redact_directory_contents(
         try:
             opened = os.fstat(descriptor)
             if _auth_identity(before) != _auth_identity(opened):
-                raise SessionFileSecurityError(
-                    "credential scan file changed while it was opened"
-                )
+                raise SessionFileSecurityError("credential scan file changed while it was opened")
             original_size = opened.st_size
             if original_size > _CAPTURE_REDACTION_MAX_BYTES:
-                raise SessionFileSecurityError(
-                    "credential scan exceeds the per-file byte limit"
-                )
+                raise SessionFileSecurityError("credential scan exceeds the per-file byte limit")
             if original_size > budget[1]:
-                raise SessionFileSecurityError(
-                    "credential scan exceeds the total byte limit"
-                )
+                raise SessionFileSecurityError("credential scan exceeds the total byte limit")
             budget[1] -= original_size
             if not apply_redaction:
                 _require_path_identity(
@@ -1453,9 +1407,7 @@ def _redact_directory_contents(
                     label="session capture file",
                 )
                 continue
-            redacted = redactor.redact_bytes(
-                _read_fd_exact(descriptor, original_size)
-            )
+            redacted = redactor.redact_bytes(_read_fd_exact(descriptor, original_size))
             if len(redacted) != original_size or (
                 redacted != _read_fd_exact(descriptor, original_size)
             ):
@@ -1500,7 +1452,9 @@ def _open_readable_directory(path_fd: int, *, label: str) -> int:
     try:
         descriptor = os.open(".", _DIRECTORY_FLAGS, dir_fd=path_fd)
     except OSError as exc:
-        raise SessionFileSecurityError(f"{label} could not be opened after permission recovery") from exc
+        raise SessionFileSecurityError(
+            f"{label} could not be opened after permission recovery"
+        ) from exc
     if _object_identity(os.fstat(descriptor)) != _object_identity(os.fstat(path_fd)):
         os.close(descriptor)
         raise SessionFileSecurityError(f"{label} changed while it was reopened")
@@ -1526,9 +1480,7 @@ def _require_private_auth(value: os.stat_result) -> None:
             "Codex subscription auth must be private and owner-readable"
         )
     if value.st_size <= 0 or value.st_size > _AUTH_MAX_BYTES:
-        raise SessionFileSecurityError(
-            "Codex subscription auth has an invalid or excessive size"
-        )
+        raise SessionFileSecurityError("Codex subscription auth has an invalid or excessive size")
 
 
 def _require_private_staged_auth(
@@ -1560,9 +1512,7 @@ def _require_private_log_file(
         or stat.S_IMODE(value.st_mode) != 0o600
         or value.st_size != expected_size
     ):
-        raise SessionFileSecurityError(
-            "session log must be a private single-link regular file"
-        )
+        raise SessionFileSecurityError("session log must be a private single-link regular file")
 
 
 def _require_owned_directory(

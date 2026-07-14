@@ -69,16 +69,22 @@ artifact, or log tree.
 The gateway pins every component from the absolute filesystem anchor to the
 remote user's `~/.codex/auth.json` and the private credential root, opens the
 leaf with `O_NOFOLLOW`, and requires a user-owned, link-count-one regular file
-with private permissions and a bounded size. Before runtime creation, it copies
-the bytes into a random sibling `0700` staging root that is not mounted into any
-container. Size, digest, UTF-8 JSON, redactor construction, owner, mode, link
-count, inode, and source/staging path chains are all verified there. Linux
+with private permissions and a bounded size. Before runtime creation, it first
+durably journals the private credential root, then copies the bytes into a
+random `0700` staging child inside that managed root. Size, digest, UTF-8 JSON,
+redactor construction, owner, mode, link count, inode, and source/staging path
+chains are all verified there. Linux
 `renameat2(RENAME_NOREPLACE)` then publishes the complete `0600` inode as the
-credential root's final `auth.json`; the destination and held inode are
-rechecked before Docker can mount or start it. A mismatch scrubs only the pinned
-staged/published inode, preserves a raced replacement, and aborts without
-logging credential contents. Unsupported atomic no-replace publication fails
-closed.
+credential root's final `auth.json`. DockerRuntime reopens and revalidates the
+resulting root and file identities and keeps both descriptors alive through
+mount adoption. Docker starts only the trusted inert container command, then,
+before any prepare or agent command, stats the adopted root/auth mount inside
+the exact container ID and compares device, inode, mode, owner, link count, and
+size with the held authority. Container ID, PID, start time, running state, and
+restart count are stable across this check. A mismatch stops the container and
+fails closed. Crash and bounded staging-cleanup windows remain covered by the
+journaled credential-root cleanup authority; an empty staging-child cleanup
+fault after publication does not negate success.
 
 Verified auth JSON supplies a bounded set of exact sensitive leaf values. The
 gateway redacts those values from stdout/stderr and transcript logs and performs
@@ -88,6 +94,8 @@ write targets. The scanner preflights the complete per-file, aggregate-byte,
 node, and depth budgets before changing a Core capture; a limit breach fails
 finalization explicitly and leaves all original bytes unchanged. Result objects
 receive a separate recursive in-memory redaction before persistence or delivery.
+Credential-capable initialization, execution/postprocess, finalization, and
+teardown exception logs contain only redacted exception text and no raw traceback.
 The Codex harness remains a necessary trusted consumer of the credential.
 OpenEvo cannot prevent that process from actively transforming or transmitting a
 secret; that behavior is outside this boundary.
@@ -132,7 +140,13 @@ authority before it becomes the live in-memory terminal state. Once a result
 exists, the journal also stores its canonical digest and monotonic
 `export_succeeded`/`callback_succeeded` proofs. A required evolution export binds
 the normalized backend URL, timeout, fail-open policy, and their canonical
-identity digest. It does not contain auth bytes.
+identity digest; the timeout must be finite and positive before entering the
+canonical journal. It does not contain auth bytes. Journal transitions are
+copy-on-write: a durable pending marker, candidate fsync, atomic replace, and
+directory fsync complete before the new phase or proof enters live memory.
+Replace/fsync failures roll back the old authority and retain the pending marker,
+so restart cannot treat an uncertain transition as permission to delete storage
+or roots; an exact live retry can finish the transition and clear the marker.
 Evolution export uses the stable session source-event identity, and callbacks
 carry a result-derived `Idempotency-Key` and digest header. A failed or unknown
 response leaves that phase pending; a successful phase is fsynced before the

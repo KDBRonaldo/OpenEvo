@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 import re
 from typing import Final, Literal, TypeAlias
 
@@ -43,16 +44,21 @@ class ManagedRuntimeImageRelease:
         return f"{self.repository}@{self.trusted_digest}"
 
 
+@dataclass(frozen=True, slots=True)
+class ManagedCredentialMount:
+    """Identity-bound host authority adopted by a managed runtime."""
+
+    root: Path
+    root_identity: tuple[int, int, int]
+    auth_identity: tuple[int, int, int, int, int, int, int, int]
+
+
 # The profile aliases remain internal compiler/runtime wiring. Trust comes only
 # from these full release digests; a tag is never accepted as image identity.
-MANAGED_RUNTIME_RELEASES: Final[
-    dict[ManagedRuntimeProfile, ManagedRuntimeImageRelease]
-] = {
+MANAGED_RUNTIME_RELEASES: Final[dict[ManagedRuntimeProfile, ManagedRuntimeImageRelease]] = {
     profile: ManagedRuntimeImageRelease(
         image=image,
-        trusted_digest=(
-            "sha256:16837a0db8af654383ea9af8af4f81a1175fbb0add74b98d7692cbaa87f44a5c"
-        ),
+        trusted_digest=("sha256:16837a0db8af654383ea9af8af4f81a1175fbb0add74b98d7692cbaa87f44a5c"),
     )
     for profile, image in MANAGED_RUNTIME_IMAGES.items()
 }
@@ -60,17 +66,14 @@ MANAGED_HOME: Final[str] = "/openevo/session/home"
 MANAGED_CODEX_HOME: Final[str] = "/openevo/credentials/codex"
 MANAGED_CODEX_BINARY: Final[str] = "/home/openevo/.local/bin/codex"
 MANAGED_PATH: Final[str] = (
-    "/home/openevo/.local/bin:/usr/local/sbin:/usr/local/bin:"
-    "/usr/sbin:/usr/bin:/sbin:/bin"
+    "/home/openevo/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 MANAGED_SUBSCRIPTION_ENV: Final[dict[str, str]] = {
     "HOME": MANAGED_HOME,
     "PATH": MANAGED_PATH,
     "CODEX_HOME": MANAGED_CODEX_HOME,
 }
-MANAGED_SUBSCRIPTION_ENV_KEYS: Final[frozenset[str]] = frozenset(
-    MANAGED_SUBSCRIPTION_ENV
-)
+MANAGED_SUBSCRIPTION_ENV_KEYS: Final[frozenset[str]] = frozenset(MANAGED_SUBSCRIPTION_ENV)
 
 
 def reject_managed_subscription_env(
@@ -87,9 +90,7 @@ def reject_managed_subscription_env(
         if name in env:
             if allow_exact and env[name] == MANAGED_SUBSCRIPTION_ENV[name]:
                 continue
-            raise ValueError(
-                f"subscription {owner} {name} is Core-owned and must be omitted"
-            )
+            raise ValueError(f"subscription {owner} {name} is Core-owned and must be omitted")
 
 
 def require_exact_managed_runtime_binding(
@@ -102,9 +103,7 @@ def require_exact_managed_runtime_binding(
     if profile is None:
         return False
     if profile not in MANAGED_RUNTIME_IMAGES:
-        raise ValueError(
-            f"runtime profile/image binding is not Core-managed: {profile!r}"
-        )
+        raise ValueError(f"runtime profile/image binding is not Core-managed: {profile!r}")
     expected_image = MANAGED_RUNTIME_IMAGES[profile]
     if image != expected_image:
         raise ValueError(
@@ -137,9 +136,7 @@ def require_managed_subscription_runtime(
     """Require the exact Core-managed Docker runtime used for subscription auth."""
 
     if profile not in MANAGED_RUNTIME_IMAGES:
-        raise ValueError(
-            "subscription execution requires a managed runtime profile"
-        )
+        raise ValueError("subscription execution requires a managed runtime profile")
     try:
         require_exact_managed_runtime_binding(profile=profile, image=image)
     except ValueError as exc:
@@ -150,9 +147,7 @@ def require_managed_subscription_runtime(
     if backend != "docker":
         raise ValueError("subscription execution requires the managed Docker runtime")
     if container_user != "host":
-        raise ValueError(
-            "subscription credentials require runtime.container_user='host'"
-        )
+        raise ValueError("subscription credentials require runtime.container_user='host'")
 
 
 def require_managed_runtime_binding(
@@ -170,9 +165,7 @@ def require_managed_runtime_binding(
     if backend != "docker":
         raise ValueError("Core-managed runtime profiles require the Docker runtime")
     if container_user != "host":
-        raise ValueError(
-            "Core-managed runtime profiles require runtime.container_user='host'"
-        )
+        raise ValueError("Core-managed runtime profiles require runtime.container_user='host'")
     return True
 
 
@@ -187,6 +180,7 @@ __all__ = [
     "MANAGED_SUBSCRIPTION_ENV_KEYS",
     "ManagedRuntimeProfile",
     "ManagedRuntimeImageRelease",
+    "ManagedCredentialMount",
     "managed_runtime_image_release",
     "reject_managed_subscription_env",
     "require_exact_managed_runtime_binding",
