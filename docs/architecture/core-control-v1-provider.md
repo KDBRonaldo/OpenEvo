@@ -64,7 +64,8 @@ workspace-snapshots/<snapshot-id>/...
 ```
 
 SQLite stores closed project and upload documents, resource versions,
-idempotency responses, a persistent cursor/event signing key, and SSE frames.
+idempotency responses, publication-owner audit bindings, pending managed-file
+cleanup intents, a persistent cursor/event signing key, and SSE frames.
 Persisted documents are revalidated against their exact v1 models at startup.
 The store uses full synchronous commits and WAL journaling. It does not persist
 the bearer, host paths in API resources, model credentials, commands, or open
@@ -88,13 +89,19 @@ cannot admit a second owner while the original parent-anchored owner is alive.
 Recovery reuses the held owner-verified private root FDs, validates every project
 publication against its finalized upload and the exact published tree, and fails
 startup when a referenced archive or snapshot is missing, replaced, or corrupt.
-One publication identity, workspace snapshot ID, and content ID may have only
-one project owner; a second persisted owner is corruption regardless of row
-order.
-Unreferenced upload files, temporary
-publications, and snapshots left by a crash after publish rename but before the
-SQLite commit are removed relative to those held FDs without following
-symlinks; cleanup never traverses outside the managed roots.
+Each publication identity, workspace snapshot ID, and content ID is bound to
+exactly one project/upload pair by a signed private owner row; a second
+persisted owner is corruption regardless of row order. Owner rows remain only
+while a live upload or retained idempotency response needs the audit binding.
+
+After validating database authority and deriving the complete live upload and
+snapshot name sets, startup reconciles unreferenced upload files, temporary
+publications, quarantine entries, and snapshots left by a crash. One cumulative
+node/name-byte budget covers both managed roots and every recursive cleanup;
+budget exhaustion leaves the remaining orphan for a later startup or exact
+operation replay but does not count it as live quota. Managed disk quota is
+then evaluated only over database-owned live entries. Unsafe or unrecognized
+entry metadata still fails closed.
 
 The main SQLite database authority FD, WAL, and SHM are opened no-follow
 relative to the held provider-root FD and retained for the store lifetime.
@@ -146,7 +153,8 @@ also receive an immutable empty workspace snapshot. Imported projects remain
 draft until their declared archive is finalized. The provider does not invent
 an active revision, so projects cannot become `ready` in this phase.
 Snapshot and publication content IDs are deterministic HMAC identities over
-their canonical digest, timestamp, and publication fields. Startup recomputes
+their canonical digest, timestamp, publication fields, and, for imported
+workspace publications, the exact project/upload owner pair. Startup recomputes
 task, project, scratch-workspace, published-workspace, and content identities;
 project/upload rows also carry a signing-key-bound identity HMAC.
 Project validation constructs the framework execution profile from the exact
@@ -187,25 +195,36 @@ trailing bytes are rejected as typed `workspace_archive_invalid` conflicts.
 Archive parsing hashes the exact bytes used to create the snapshot and then
 rehashes the same held file while rechecking its inode and metadata before any
 rename. Same-inode, same-size mutation therefore fails closed. Verified files
-are written descriptor-relative under a private temporary snapshot directory,
-`fsync`ed, and renamed relative to the held snapshot-root FD. A final SQLite
-transaction rechecks both mutable resources, stores one `WorkspacePublicationV1`,
-signs a new project snapshot, updates the project and upload, and appends the
-project event. Recovery verifies the published owner, modes, link counts, exact
-entry set, sizes, and bytes against the retained canonical archive before
-serving projects. No run consumes this snapshot until the later run-owner phase.
+are written descriptor-relative under a private temporary snapshot directory
+and `fsync`ed. Linux `renameat2(RENAME_NOREPLACE)` publishes the owner-scoped
+snapshot without replacing an existing name. A final SQLite transaction
+rechecks both mutable resources, inserts the unique signed project/upload owner
+row, stores one `WorkspacePublicationV1`, signs a new project snapshot, updates
+the project and upload, and appends the project event. Recovery verifies the
+published owner, modes, link counts, exact entry set, sizes, and bytes against
+the retained canonical archive before serving projects. No run consumes this
+snapshot until the later run-owner phase.
 Recovery additionally requires the finalized source upload to belong to the
 same project that references the publication.
 
 Upload creation retains the new file descriptor until the transaction outcome
-is known and removes that exact inode only after a proven rollback. Finalize
-retains an inode receipt for the published snapshot and applies the same rule to
-the publication transaction; unknown or committed outcomes preserve the tree
-for startup recovery. Project deletion removes its uploads and owned snapshot
-after the database commit using no-follow, inode-bound traversal. Aborted
-uploads no longer reserve managed archive bytes. Cleanup failure after a
-committed mutation is a post-commit store failure; the durable idempotency result
-remains authoritative.
+is known and cleans it only after a proven rollback. Finalize retains an inode
+receipt for the published snapshot and applies the same rule to the publication
+transaction; unknown or committed outcomes preserve the tree for startup
+recovery. Cleanup first revalidates the observed inode, atomically renames it to
+a random no-replace quarantine name, `fsync`s the owning directory, revalidates
+the quarantine binding, and only then unlinks or recursively removes that
+quarantine name. It never verifies one inode and deletes the original pathname
+after a replacement race.
+
+Abort and project-delete transactions persist signed cleanup intents tied by a
+foreign key to their successful idempotency record. Post-commit cleanup removes
+an intent only after a complete bounded reconciliation. Cleanup failure returns
+a post-commit store error while preserving both the success and intent; an exact
+same-key replay must retry reconciliation before returning that success, and
+startup uses the same convergent protocol. Aborted uploads no longer reserve
+managed archive bytes. This protocol requires Linux `renameat2`; unsupported
+platforms fail closed rather than falling back to a replacing rename.
 
 ## SSE Recovery
 

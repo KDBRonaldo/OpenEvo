@@ -71,7 +71,12 @@ mode, and harness ID. SQLite/workspace recovery is descriptor-bound and
 quota-limited across every persisted TEXT/BLOB value. The Linux provider opens
 SQLite through its held `/proc/self/fd` authority path and verifies the resolved
 managed path around connection setup. Workspace publication ownership is unique
-per project, and rollback/delete cleanup is no-follow and inode-bound.
+to one project/upload pair and is enforced by a signed, transactionally inserted
+private owner row. Abort/delete success persists cleanup intents; exact replay
+and startup must converge them before dropping those intents. Linux cleanup uses random
+atomic no-replace quarantine names, revalidates the first observed inode after
+rename, and applies one cumulative recovery budget before quota is checked over
+live owned entries only.
 Synchronous store work runs on a bounded executor rather than the ASGI event
 loop.
 

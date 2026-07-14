@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import os
 from pathlib import Path
 import re
 import stat
+import sys
 import unicodedata
 import uuid
 
@@ -16,6 +19,7 @@ _ZERO_BLOCK = b"\0" * _BLOCK_SIZE
 _OCTAL_7 = re.compile(rb"^[0-7]{7}\0$")
 _OCTAL_11 = re.compile(rb"^[0-7]{11}\0$")
 _CHECKSUM = re.compile(rb"^[0-7]{6}\0 $")
+_RENAME_NOREPLACE = 1
 
 
 class WorkspaceArchiveError(ValueError):
@@ -68,11 +72,10 @@ def verify_and_materialize_workspace(
             entry_name=archive_name,
         )
         _require_entry_binding(workspace_root_fd, temporary_name, temporary_identity)
-        os.rename(
+        _rename_noreplace(
             temporary_name,
             snapshot_name,
-            src_dir_fd=workspace_root_fd,
-            dst_dir_fd=workspace_root_fd,
+            directory_fd=workspace_root_fd,
         )
         published = True
         os.fsync(workspace_root_fd)
@@ -711,21 +714,109 @@ def _remove_tree_at(
         raise WorkspaceArchiveError("temporary workspace root is unsafe") from exc
     try:
         current_identity = os.fstat(entry_fd)
+        if not stat.S_ISDIR(current_identity.st_mode) or current_identity.st_uid != os.geteuid():
+            raise WorkspaceArchiveError("workspace cleanup root is unsafe")
         if expected_identity is not None and not _same_identity(
             current_identity, expected_identity
         ):
             raise WorkspaceArchiveError("temporary workspace root binding changed")
         _require_entry_binding(parent_fd, name, current_identity)
+        quarantine_name = _quarantine_entry_noreplace(parent_fd, name)
+        os.fsync(parent_fd)
+        _require_entry_binding(parent_fd, quarantine_name, current_identity)
+        if not _same_identity(os.fstat(entry_fd), current_identity):
+            raise WorkspaceArchiveError("quarantined workspace root binding changed")
         for child_name in os.listdir(entry_fd):
-            metadata = os.stat(child_name, dir_fd=entry_fd, follow_symlinks=False)
-            if stat.S_ISDIR(metadata.st_mode):
-                _remove_tree_at(entry_fd, child_name)
-            else:
-                os.unlink(child_name, dir_fd=entry_fd)
+            _remove_entry_at(entry_fd, child_name)
+        os.fsync(entry_fd)
+        _require_entry_binding(parent_fd, quarantine_name, current_identity)
     finally:
         os.close(entry_fd)
-    os.rmdir(name, dir_fd=parent_fd)
+    os.rmdir(quarantine_name, dir_fd=parent_fd)
     os.fsync(parent_fd)
+
+
+def _remove_entry_at(parent_fd: int, name: str) -> None:
+    try:
+        identity = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise WorkspaceArchiveError("workspace cleanup entry is unreadable") from exc
+    if identity.st_uid != os.geteuid():
+        raise WorkspaceArchiveError("workspace cleanup entry has the wrong owner")
+    if stat.S_ISDIR(identity.st_mode):
+        _remove_tree_at(parent_fd, name, expected_identity=identity)
+        return
+    entry_fd: int | None = None
+    if stat.S_ISREG(identity.st_mode):
+        try:
+            entry_fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise WorkspaceArchiveError("workspace cleanup file is unsafe") from exc
+        current = os.fstat(entry_fd)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or current.st_nlink != 1
+            or not _same_identity(current, identity)
+        ):
+            os.close(entry_fd)
+            raise WorkspaceArchiveError("workspace cleanup file is unsafe")
+    elif not stat.S_ISLNK(identity.st_mode):
+        raise WorkspaceArchiveError("workspace cleanup entry type is invalid")
+    try:
+        _require_entry_binding(parent_fd, name, identity)
+        quarantine_name = _quarantine_entry_noreplace(parent_fd, name)
+        os.fsync(parent_fd)
+        _require_entry_binding(parent_fd, quarantine_name, identity)
+        if entry_fd is not None and not _same_identity(os.fstat(entry_fd), identity):
+            raise WorkspaceArchiveError("quarantined workspace file binding changed")
+        os.unlink(quarantine_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if entry_fd is not None:
+            os.close(entry_fd)
+
+
+def _quarantine_entry_noreplace(parent_fd: int, name: str) -> str:
+    for _attempt in range(128):
+        quarantine_name = f".quarantine-{uuid.uuid4().hex}"
+        try:
+            _rename_noreplace(name, quarantine_name, directory_fd=parent_fd)
+        except FileExistsError:
+            continue
+        return quarantine_name
+    raise WorkspaceArchiveError("could not allocate a workspace quarantine entry")
+
+
+def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
+    if sys.platform != "linux":
+        raise OSError(errno.ENOSYS, "safe no-replace rename requires Linux renameat2")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "safe no-replace rename requires renameat2")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        directory_fd,
+        os.fsencode(source),
+        directory_fd,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
 
 
 __all__ = [

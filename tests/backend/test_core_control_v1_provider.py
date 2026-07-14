@@ -742,6 +742,389 @@ def test_aborted_upload_releases_reserved_managed_byte_capacity(
         assert second_upload.status_code == 201, second_upload.text
 
 
+def test_abort_cleanup_failure_persists_intent_and_exact_replay_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _workspace_archive()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("do not delete", encoding="utf-8")
+    with TestClient(_app(tmp_path)) as client:
+        project, etag = _create_project(client, _project_create(archive=archive))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "abort-cleanup-begin",
+                "If-Match": etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        assert upload.status_code == 201
+        upload_name = f"{upload.json()['id']}.part"
+        upload_root = tmp_path / "core-control-v1" / "workspace-uploads"
+        displaced = upload_root / ".reviewer-displaced-upload"
+        raced = False
+
+        def replace_after_observe(root_kind, parent_fd, name, identity):
+            nonlocal raced
+            del parent_fd, identity
+            if raced or root_kind != "upload" or name != upload_name:
+                return
+            raced = True
+            (upload_root / name).rename(displaced)
+            (upload_root / name).symlink_to(outside)
+
+        monkeypatch.setattr(
+            store_module,
+            "_after_cleanup_entry_observed",
+            replace_after_observe,
+            raising=False,
+        )
+        abort_headers = {
+            **AUTH,
+            "Idempotency-Key": "abort-cleanup-replay",
+            "If-Match": upload.headers["etag"],
+        }
+        abort_body = {"schema_version": "1", "reason": "reviewer race"}
+        failed = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/abort",
+            headers=abort_headers,
+            json=abort_body,
+        )
+        assert failed.status_code == 500
+        assert raced
+        assert outside.read_text(encoding="utf-8") == "do not delete"
+        assert (upload_root / upload_name).is_symlink()
+        assert displaced.is_file()
+        with sqlite3.connect(tmp_path / "core-control-v1" / "provider.sqlite3") as connection:
+            assert (
+                connection.execute("SELECT COUNT(*) FROM managed_cleanup_intents").fetchone()[0]
+                == 1
+            )
+
+        monkeypatch.setattr(
+            store_module,
+            "_after_cleanup_entry_observed",
+            lambda *args: None,
+            raising=False,
+        )
+        replay = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/abort",
+            headers=abort_headers,
+            json=abort_body,
+        )
+        assert replay.status_code == 200, replay.text
+        assert outside.read_text(encoding="utf-8") == "do not delete"
+        assert list(upload_root.iterdir()) == []
+        with sqlite3.connect(tmp_path / "core-control-v1" / "provider.sqlite3") as connection:
+            assert (
+                connection.execute("SELECT COUNT(*) FROM managed_cleanup_intents").fetchone()[0]
+                == 0
+            )
+
+
+def test_delete_cleanup_crash_recovers_before_live_quota_and_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finalized = _finalize_workspace(tmp_path, _workspace_archive(), key_suffix="delete-crash")
+    project = finalized["project"]
+    crashed = False
+
+    def crash_after_quarantine(root_kind, parent_fd, original_name, quarantine_name):
+        nonlocal crashed
+        del root_kind, parent_fd, original_name, quarantine_name
+        if not crashed:
+            crashed = True
+            raise OSError("injected crash after quarantine")
+
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        monkeypatch.setattr(
+            store_module,
+            "_after_managed_quarantine",
+            crash_after_quarantine,
+            raising=False,
+        )
+        headers = {
+            **AUTH,
+            "Idempotency-Key": "delete-cleanup-crash",
+            "If-Match": project["etag"],
+        }
+        failed = client.delete(f"/v1/projects/{project['id']}", headers=headers)
+        assert failed.status_code == 500
+        assert crashed
+        managed_names = {
+            path.name
+            for root_name in ("workspace-uploads", "workspace-snapshots")
+            for path in (tmp_path / "core-control-v1" / root_name).iterdir()
+        }
+        assert any(name.startswith(".quarantine-") for name in managed_names)
+
+    monkeypatch.setattr(
+        store_module,
+        "_after_managed_quarantine",
+        lambda *args: None,
+        raising=False,
+    )
+    monkeypatch.setattr(store_module, "_MAX_MANAGED_WORKSPACE_BYTES", 0)
+    with TestClient(_app(tmp_path)) as restarted:
+        replay = restarted.delete(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "delete-cleanup-crash",
+                "If-Match": project["etag"],
+            },
+        )
+        assert replay.status_code == 204, replay.text
+        assert list((tmp_path / "core-control-v1" / "workspace-uploads").iterdir()) == []
+        assert list((tmp_path / "core-control-v1" / "workspace-snapshots").iterdir()) == []
+
+
+def test_delete_cleanup_never_removes_replacement_directory_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finalized = _finalize_workspace(
+        tmp_path,
+        _workspace_archive(),
+        key_suffix="delete-directory-race",
+    )
+    project = finalized["project"]
+    snapshot_name = finalized["publication"]["workspace_snapshot"]["id"]
+    snapshot_root = tmp_path / "core-control-v1" / "workspace-snapshots"
+    displaced = snapshot_root / ".reviewer-displaced-snapshot"
+    outside = tmp_path / "outside-directory"
+    outside.mkdir()
+    outside_file = outside / "keep.txt"
+    outside_file.write_text("keep", encoding="utf-8")
+    raced = False
+
+    def replace_after_observe(root_kind, parent_fd, name, identity):
+        nonlocal raced
+        del parent_fd, identity
+        if raced or root_kind != "workspace" or name != snapshot_name:
+            return
+        raced = True
+        (snapshot_root / name).rename(displaced)
+        (snapshot_root / name).symlink_to(outside, target_is_directory=True)
+
+    headers = {
+        **AUTH,
+        "Idempotency-Key": "delete-directory-race",
+        "If-Match": project["etag"],
+    }
+    with TestClient(_app(tmp_path)) as client:
+        monkeypatch.setattr(
+            store_module,
+            "_after_cleanup_entry_observed",
+            replace_after_observe,
+            raising=False,
+        )
+        failed = client.delete(f"/v1/projects/{project['id']}", headers=headers)
+        assert failed.status_code == 500
+        assert raced
+        assert displaced.is_dir()
+        assert (snapshot_root / snapshot_name).is_symlink()
+        assert outside_file.read_text(encoding="utf-8") == "keep"
+
+        monkeypatch.setattr(
+            store_module,
+            "_after_cleanup_entry_observed",
+            lambda *args: None,
+            raising=False,
+        )
+        replay = client.delete(f"/v1/projects/{project['id']}", headers=headers)
+        assert replay.status_code == 204, replay.text
+        assert list(snapshot_root.iterdir()) == []
+        assert outside_file.read_text(encoding="utf-8") == "keep"
+
+
+def test_cleanup_budget_is_cumulative_and_orphans_do_not_block_live_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = CoreControlStoreV1(tmp_path)
+    store.close()
+    upload_root = tmp_path / "core-control-v1" / "workspace-uploads"
+    upload_orphan = upload_root / "orphan.part"
+    upload_orphan.write_bytes(b"x" * 32)
+    upload_orphan.chmod(0o600)
+    snapshot_root = tmp_path / "core-control-v1" / "workspace-snapshots"
+    snapshot_orphan = snapshot_root / "workspace-snapshot-orphan"
+    snapshot_orphan.mkdir(mode=0o700)
+
+    monkeypatch.setattr(store_module, "_MAX_RECOVERY_CLEANUP_NODES", 1, raising=False)
+    monkeypatch.setattr(store_module, "_MAX_MANAGED_WORKSPACE_BYTES", 0)
+    limited = CoreControlStoreV1(tmp_path)
+    limited.close()
+    assert list(upload_root.iterdir()) == []
+    assert snapshot_orphan.is_dir()
+
+    monkeypatch.setattr(store_module, "_MAX_RECOVERY_CLEANUP_NODES", 128, raising=False)
+    converged = CoreControlStoreV1(tmp_path)
+    converged.close()
+    assert list(upload_root.iterdir()) == []
+    assert list(snapshot_root.iterdir()) == []
+
+
+def test_same_archive_and_clock_publish_distinct_project_owned_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixed = "2026-07-14T12:00:00.000000Z"
+    monkeypatch.setattr(CoreControlStoreV1, "_timestamp", lambda self: fixed)
+    archive = b"\0" * 1024
+    payload = _project_create(
+        archive=archive,
+        archive_entry_count=0,
+        extracted_byte_size=0,
+    )
+
+    publications = []
+    with TestClient(_app(tmp_path)) as client:
+        for index in range(2):
+            project, project_etag = _create_project(
+                client,
+                payload,
+                idempotency_key=f"owner-project-{index}",
+            )
+            upload = client.post(
+                f"/v1/projects/{project['id']}/workspace-uploads",
+                headers={
+                    **AUTH,
+                    "Idempotency-Key": f"owner-upload-{index}",
+                    "If-Match": project_etag,
+                },
+                json={
+                    "schema_version": "1",
+                    "project_snapshot": project["current_project_snapshot"],
+                    "archive": project["workspace"]["archive"],
+                    "base_workspace_snapshot": None,
+                },
+            )
+            chunk = client.put(
+                f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+                headers={
+                    **AUTH,
+                    "Idempotency-Key": f"owner-chunk-{index}",
+                    "If-Match": upload.headers["etag"],
+                },
+                json=_chunk(archive, offset=0),
+            )
+            finalized = client.post(
+                f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/finalize",
+                headers={
+                    **AUTH,
+                    "Idempotency-Key": f"owner-finalize-{index}",
+                    "If-Match": chunk.headers["etag"],
+                    "If-Project-Match": project_etag,
+                },
+                json={
+                    "schema_version": "1",
+                    "content_sha256": hashlib.sha256(archive).hexdigest(),
+                },
+            )
+            assert finalized.status_code == 201, finalized.text
+            publications.append(finalized.json()["publication"])
+
+    assert (
+        publications[0]["workspace_snapshot"]["id"]
+        != (publications[1]["workspace_snapshot"]["id"])
+    )
+    assert (
+        publications[0]["content_ref"]["content_id"]
+        != (publications[1]["content_ref"]["content_id"])
+    )
+    with sqlite3.connect(tmp_path / "core-control-v1" / "provider.sqlite3") as connection:
+        owners = connection.execute(
+            "SELECT snapshot_id, content_id, project_id, upload_id "
+            "FROM workspace_publication_owners"
+        ).fetchall()
+    assert len(owners) == 2
+    assert {row[0] for row in owners} == {
+        publication["workspace_snapshot"]["id"] for publication in publications
+    }
+    assert {row[1] for row in owners} == {
+        publication["content_ref"]["content_id"] for publication in publications
+    }
+    assert len({row[2] for row in owners}) == 2
+    assert len({row[3] for row in owners}) == 2
+    restarted = CoreControlStoreV1(tmp_path)
+    restarted.close()
+
+
+def test_workspace_publication_no_replace_preserves_competing_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixed = "2026-07-14T12:00:00.000000Z"
+    monkeypatch.setattr(CoreControlStoreV1, "_timestamp", lambda self: fixed)
+    archive = _workspace_archive()
+    with TestClient(_app(tmp_path)) as client:
+        project, project_etag = _create_project(
+            client,
+            _project_create(archive=archive),
+            idempotency_key="no-replace-project",
+        )
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "no-replace-upload",
+                "If-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "no-replace-chunk",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+        store = client.app.state.core_control_provider.store
+        snapshot = store_module._workspace_publication_snapshot(
+            store._signing_key,
+            project_id=project["id"],
+            upload_id=upload.json()["id"],
+            archive_sha256=hashlib.sha256(archive).hexdigest(),
+            now=fixed,
+        )
+        competing = tmp_path / "core-control-v1" / "workspace-snapshots" / snapshot.id
+        competing.mkdir(mode=0o700)
+        marker = competing / "keep.txt"
+        marker.write_text("competing inode", encoding="utf-8")
+
+        finalized = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/finalize",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "no-replace-finalize",
+                "If-Match": chunk.headers["etag"],
+                "If-Project-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "content_sha256": hashlib.sha256(archive).hexdigest(),
+            },
+        )
+        assert finalized.status_code == 500
+        assert marker.read_text(encoding="utf-8") == "competing inode"
+
+    recovered = CoreControlStoreV1(tmp_path)
+    recovered.close()
+    assert list((tmp_path / "core-control-v1" / "workspace-snapshots").iterdir()) == []
+
+
 def test_workspace_chunk_handles_short_writes_before_advancing_offset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

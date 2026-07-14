@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Mapping
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -13,6 +15,7 @@ from pathlib import Path
 import secrets
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from typing import Any, Literal, TypeVar
@@ -35,7 +38,7 @@ _CURSOR_TTL_SECONDS = 15 * 60
 _MAX_DATABASE_BYTES = 256 * 1024 * 1024
 _MAX_WAL_BYTES = 64 * 1024 * 1024
 _MAX_MANAGED_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024
-_MAX_STARTUP_ROWS = 50_000
+_MAX_STARTUP_ROWS = 128_000
 _MAX_STARTUP_BLOB_BYTES = 128 * 1024 * 1024
 _MAX_STARTUP_VALUE_BYTES = 16 * 1024 * 1024
 _MAX_METADATA_BYTES = 4096
@@ -43,6 +46,11 @@ _MAX_SCHEMA_BYTES = 256 * 1024
 _RECOVERY_PAGE_SIZE = 256
 _MAX_PROJECTS = 10_000
 _MAX_UPLOADS = 20_000
+_MAX_PUBLICATION_OWNERS = _MAX_UPLOADS + _IDEMPOTENCY_LIMIT
+_MAX_CLEANUP_INTENTS = _MAX_PROJECTS + (2 * _MAX_UPLOADS)
+_MAX_RECOVERY_CLEANUP_NODES = 100_000
+_MAX_RECOVERY_CLEANUP_NAME_BYTES = 16 * 1024 * 1024
+_RENAME_NOREPLACE = 1
 _IDEMPOTENCY_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
     model.__name__: model
     for model in (
@@ -187,6 +195,20 @@ class _WorkspaceChunkCommitExpectation:
     result: StoredResult
 
 
+@dataclass
+class _ManagedCleanupBudget:
+    nodes_remaining: int
+    name_bytes_remaining: int
+
+    def consume(self, name: str) -> bool:
+        encoded_size = len(os.fsencode(name))
+        if self.nodes_remaining < 1 or self.name_bytes_remaining < encoded_size:
+            return False
+        self.nodes_remaining -= 1
+        self.name_bytes_remaining -= encoded_size
+        return True
+
+
 _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS metadata (
@@ -218,6 +240,17 @@ _SCHEMA = (
     ) STRICT
     """,
     """
+    CREATE TABLE IF NOT EXISTS workspace_publication_owners (
+        snapshot_id TEXT PRIMARY KEY,
+        content_id TEXT NOT NULL UNIQUE,
+        publication_sha256 TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        upload_id TEXT NOT NULL UNIQUE,
+        identity_hmac TEXT NOT NULL,
+        published_at TEXT NOT NULL
+    ) STRICT
+    """,
+    """
     CREATE TABLE IF NOT EXISTS idempotency_records (
         operation_id TEXT NOT NULL,
         resource_scope TEXT NOT NULL,
@@ -232,6 +265,36 @@ _SCHEMA = (
         created_at_epoch INTEGER NOT NULL,
         expires_at_epoch INTEGER NOT NULL,
         PRIMARY KEY (operation_id, resource_scope, idempotency_key)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS managed_cleanup_intents (
+        cleanup_id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL,
+        resource_scope TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        root_kind TEXT NOT NULL CHECK (root_kind IN ('upload', 'workspace')),
+        entry_name TEXT NOT NULL,
+        expected_dev INTEGER NOT NULL CHECK (expected_dev >= 0),
+        expected_ino INTEGER NOT NULL CHECK (expected_ino > 0),
+        expected_mode INTEGER NOT NULL CHECK (expected_mode > 0),
+        expected_uid INTEGER NOT NULL CHECK (expected_uid >= 0),
+        expected_nlink INTEGER NOT NULL CHECK (expected_nlink > 0),
+        identity_hmac TEXT NOT NULL,
+        created_at_epoch INTEGER NOT NULL,
+        UNIQUE (
+            operation_id,
+            resource_scope,
+            idempotency_key,
+            root_kind,
+            entry_name
+        ),
+        FOREIGN KEY (operation_id, resource_scope, idempotency_key)
+            REFERENCES idempotency_records(
+                operation_id,
+                resource_scope,
+                idempotency_key
+            ) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
     ) STRICT
     """,
     """
@@ -484,47 +547,103 @@ class CoreControlStoreV1:
         envelope = _idempotency_envelope(
             "deleteCoreProjectV1", project_id, None, {"if-match": if_match}
         )
-        upload_files: list[str] = []
-        snapshot_name: str | None = None
-        with self._mutex, self._transaction():
-            replay = self._idempotency_replay(
-                "deleteCoreProjectV1", project_id, idempotency_key, envelope, None
+        operation_id = "deleteCoreProjectV1"
+        with self._mutex:
+            with self._transaction():
+                replay = self._idempotency_replay(
+                    operation_id, project_id, idempotency_key, envelope, None
+                )
+                if replay is None:
+                    _, current = self._project_row(project_id)
+                    self._require_etag(current.etag, if_match, "project")
+                    upload_cursor = self._connection.execute(
+                        "SELECT upload_id, file_name, document_json FROM workspace_uploads "
+                        "WHERE project_id = ? ORDER BY upload_id LIMIT ?",
+                        (project_id, _MAX_UPLOADS + 1),
+                    )
+                    upload_rows = upload_cursor.fetchmany(_MAX_UPLOADS + 1)
+                    if len(upload_rows) > _MAX_UPLOADS or upload_cursor.fetchone() is not None:
+                        raise StoreCorruptionError("project upload cleanup quota is exceeded")
+
+                    cleanup_entries: dict[
+                        tuple[Literal["upload", "workspace"], str], os.stat_result
+                    ] = {}
+                    for upload_row in upload_rows:
+                        upload = _validate_bytes(
+                            m.WorkspaceUploadSessionV1,
+                            upload_row["document_json"],
+                        )
+                        if (
+                            upload.id != upload_row["upload_id"]
+                            or upload.project_id != project_id
+                            or upload_row["file_name"] != f"{upload.id}.part"
+                        ):
+                            raise StoreCorruptionError(
+                                "project upload cleanup identity is invalid"
+                            )
+                        upload_identity = _managed_entry_identity(
+                            self._upload_root_fd,
+                            upload_row["file_name"],
+                            expected_type="file",
+                            required=upload.status
+                            in {
+                                m.WorkspaceUploadStatus.OPEN,
+                                m.WorkspaceUploadStatus.FINALIZED,
+                            },
+                        )
+                        if upload_identity is not None:
+                            cleanup_entries[("upload", upload_row["file_name"])] = upload_identity
+                        if upload.publication is not None:
+                            self._validate_publication_identity(
+                                upload.publication,
+                                project_id=project_id,
+                                upload_id=upload.id,
+                            )
+                            snapshot_name = upload.publication.workspace_snapshot.id
+                            snapshot_identity = _managed_entry_identity(
+                                self._workspace_root_fd,
+                                snapshot_name,
+                                expected_type="directory",
+                                required=True,
+                            )
+                            assert snapshot_identity is not None
+                            existing = cleanup_entries.setdefault(
+                                ("workspace", snapshot_name), snapshot_identity
+                            )
+                            if not _same_identity(existing, snapshot_identity):
+                                raise StoreCorruptionError(
+                                    "project workspace cleanup identity is ambiguous"
+                                )
+
+                    self._connection.execute(
+                        "DELETE FROM projects WHERE project_id = ?", (project_id,)
+                    )
+                    result = StoredResult(204, None)
+                    self._store_idempotency(
+                        operation_id,
+                        project_id,
+                        idempotency_key,
+                        envelope,
+                        result,
+                    )
+                    for (root_kind, entry_name), identity in cleanup_entries.items():
+                        self._store_cleanup_intent(
+                            operation_id=operation_id,
+                            scope=project_id,
+                            idempotency_key=idempotency_key,
+                            root_kind=root_kind,
+                            entry_name=entry_name,
+                            identity=identity,
+                        )
+                else:
+                    result = replay
+            self._reconcile_cleanup_operation(
+                operation_id,
+                project_id,
+                idempotency_key,
+                error_message="committed project deletion could not reconcile managed state",
             )
-            if replay is not None:
-                return replay
-            _, current = self._project_row(project_id)
-            self._require_etag(current.etag, if_match, "project")
-            if current.workspace_publication is not None:
-                snapshot_name = current.workspace_publication.workspace_snapshot.id
-            upload_cursor = self._connection.execute(
-                "SELECT file_name FROM workspace_uploads WHERE project_id = ? "
-                "ORDER BY upload_id LIMIT ?",
-                (project_id, _MAX_UPLOADS + 1),
-            )
-            upload_files = [row["file_name"] for row in upload_cursor.fetchmany(_MAX_UPLOADS + 1)]
-            if len(upload_files) > _MAX_UPLOADS or upload_cursor.fetchone() is not None:
-                raise StoreCorruptionError("project upload cleanup quota is exceeded")
-            self._connection.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
-            result = StoredResult(204, None)
-            self._store_idempotency(
-                "deleteCoreProjectV1", project_id, idempotency_key, envelope, result
-            )
-        try:
-            with self._mutex:
-                for path in upload_files:
-                    self._verify_lifecycle_storage()
-                    _remove_entry_at(self._upload_root_fd, path)
-                    self._verify_lifecycle_storage()
-                if snapshot_name is not None:
-                    _remove_entry_at(self._workspace_root_fd, snapshot_name)
-                    self._verify_lifecycle_storage()
-                os.fsync(self._upload_root_fd)
-                os.fsync(self._workspace_root_fd)
-        except Exception as exc:
-            raise PostCommitStoreError(
-                "committed project deletion could not reconcile managed state"
-            ) from exc
-        return result
+            return result
 
     def create_upload(
         self,
@@ -661,6 +780,7 @@ class CoreControlStoreV1:
                         file_name,
                         file_fd,
                         file_identity,
+                        root_kind="upload",
                     )
                     os.fsync(self._upload_root_fd)
                 raise
@@ -848,11 +968,12 @@ class CoreControlStoreV1:
                 archive_name = upload_row["file_name"]
 
             now = self._timestamp()
-            workspace_snapshot = _snapshot(
+            workspace_snapshot = _workspace_publication_snapshot(
                 self._signing_key,
-                m.SnapshotKind.WORKSPACE,
-                {"archive_sha256": upload.archive.content_sha256},
-                now,
+                project_id=project_id,
+                upload_id=upload_id,
+                archive_sha256=upload.archive.content_sha256,
+                now=now,
             )
             snapshot_fd: int | None = None
             snapshot_identity: os.stat_result | None = None
@@ -905,6 +1026,8 @@ class CoreControlStoreV1:
                             self._signing_key,
                             "workspace-content",
                             {
+                                "project_id": project_id,
+                                "upload_id": upload_id,
                                 "sha256": upload.archive.content_sha256,
                                 "byte_size": upload.archive.byte_size,
                                 "published_at": now,
@@ -918,6 +1041,11 @@ class CoreControlStoreV1:
                         content_ref=content_ref,
                         workspace_snapshot=workspace_snapshot,
                         published_at=now,
+                    )
+                    self._store_publication_owner(
+                        project_id=project_id,
+                        upload_id=upload_id,
+                        publication=publication,
                     )
                     project_version = int(project_row["resource_version"]) + 1
                     project_data = project.model_dump(
@@ -989,6 +1117,7 @@ class CoreControlStoreV1:
                         workspace_snapshot.id,
                         snapshot_fd,
                         snapshot_identity,
+                        root_kind="workspace",
                     )
                     os.fsync(self._workspace_root_fd)
                 raise
@@ -1009,44 +1138,59 @@ class CoreControlStoreV1:
         envelope = _idempotency_envelope(
             "abortCoreWorkspaceUploadV1", scope, request, {"if-match": if_match}
         )
-        with self._mutex, self._transaction():
-            replay = self._idempotency_replay(
-                "abortCoreWorkspaceUploadV1",
+        operation_id = "abortCoreWorkspaceUploadV1"
+        with self._mutex:
+            with self._transaction():
+                replay = self._idempotency_replay(
+                    operation_id,
+                    scope,
+                    idempotency_key,
+                    envelope,
+                    m.WorkspaceUploadSessionV1,
+                )
+                if replay is None:
+                    row, upload = self._upload_row(project_id, upload_id)
+                    self._require_etag(upload.etag, if_match, "workspace_upload")
+                    if upload.status is not m.WorkspaceUploadStatus.OPEN:
+                        raise ResourceConflictError(
+                            "workspace_upload_not_open", "The workspace upload is not open."
+                        )
+                    file_identity = _managed_entry_identity(
+                        self._upload_root_fd,
+                        row["file_name"],
+                        expected_type="file",
+                        required=True,
+                    )
+                    assert file_identity is not None
+                    now = self._timestamp()
+                    version = int(row["resource_version"]) + 1
+                    data = upload.model_dump(mode="python", exclude={"etag"})
+                    data.update(status=m.WorkspaceUploadStatus.ABORTED, updated_at=now)
+                    updated = _model_with_etag(m.WorkspaceUploadSessionV1, data, version=version)
+                    self._connection.execute(
+                        "UPDATE workspace_uploads SET document_json = ?, resource_version = ?, "
+                        "updated_at = ? WHERE upload_id = ?",
+                        (_model_bytes(updated), version, now, upload_id),
+                    )
+                    result = StoredResult(200, updated, updated.etag)
+                    self._store_idempotency(operation_id, scope, idempotency_key, envelope, result)
+                    self._store_cleanup_intent(
+                        operation_id=operation_id,
+                        scope=scope,
+                        idempotency_key=idempotency_key,
+                        root_kind="upload",
+                        entry_name=row["file_name"],
+                        identity=file_identity,
+                    )
+                else:
+                    result = replay
+            self._reconcile_cleanup_operation(
+                operation_id,
                 scope,
                 idempotency_key,
-                envelope,
-                m.WorkspaceUploadSessionV1,
+                error_message="committed upload abort could not reconcile managed state",
             )
-            if replay is not None:
-                return replay
-            row, upload = self._upload_row(project_id, upload_id)
-            self._require_etag(upload.etag, if_match, "workspace_upload")
-            if upload.status is not m.WorkspaceUploadStatus.OPEN:
-                raise ResourceConflictError(
-                    "workspace_upload_not_open", "The workspace upload is not open."
-                )
-            now = self._timestamp()
-            version = int(row["resource_version"]) + 1
-            data = upload.model_dump(mode="python", exclude={"etag"})
-            data.update(status=m.WorkspaceUploadStatus.ABORTED, updated_at=now)
-            updated = _model_with_etag(m.WorkspaceUploadSessionV1, data, version=version)
-            self._connection.execute(
-                "UPDATE workspace_uploads SET document_json = ?, resource_version = ?, "
-                "updated_at = ? WHERE upload_id = ?",
-                (_model_bytes(updated), version, now, upload_id),
-            )
-            result = StoredResult(200, updated, updated.etag)
-            self._store_idempotency(
-                "abortCoreWorkspaceUploadV1", scope, idempotency_key, envelope, result
-            )
-        with self._mutex:
-            try:
-                self._verify_lifecycle_storage()
-                os.unlink(row["file_name"], dir_fd=self._upload_root_fd)
-            except FileNotFoundError:
-                pass
-            self._verify_lifecycle_storage()
-        return result
+            return result
 
     def store_validation_result(
         self,
@@ -1253,7 +1397,12 @@ class CoreControlStoreV1:
         data["current_project_snapshot"] = project_snapshot
         return _model_with_etag(m.ProjectV1, data, version=1)
 
-    def _validate_project_snapshot_closure(self, project: m.ProjectV1) -> None:
+    def _validate_project_snapshot_closure(
+        self,
+        project: m.ProjectV1,
+        *,
+        publication_owner: tuple[str, str] | None = None,
+    ) -> None:
         expected_task = _snapshot(
             self._signing_key,
             m.SnapshotKind.TASK,
@@ -1278,7 +1427,13 @@ class CoreControlStoreV1:
             if project.current_workspace_snapshot is not None:
                 raise StoreCorruptionError("unpublished workspace snapshot binding is invalid")
         else:
-            self._validate_publication_identity(project.workspace_publication)
+            if publication_owner is None or publication_owner[0] != project.id:
+                raise StoreCorruptionError("workspace publication owner is invalid")
+            self._validate_publication_identity(
+                project.workspace_publication,
+                project_id=project.id,
+                upload_id=publication_owner[1],
+            )
             if (
                 project.current_workspace_snapshot
                 != project.workspace_publication.workspace_snapshot
@@ -1297,17 +1452,26 @@ class CoreControlStoreV1:
         if project.current_project_snapshot != expected_project:
             raise StoreCorruptionError("project snapshot binding is invalid")
 
-    def _validate_publication_identity(self, publication: m.WorkspacePublicationV1) -> None:
-        expected_workspace = _snapshot(
+    def _validate_publication_identity(
+        self,
+        publication: m.WorkspacePublicationV1,
+        *,
+        project_id: str,
+        upload_id: str,
+    ) -> None:
+        expected_workspace = _workspace_publication_snapshot(
             self._signing_key,
-            m.SnapshotKind.WORKSPACE,
-            {"archive_sha256": publication.archive.content_sha256},
-            publication.workspace_snapshot.created_at,
+            project_id=project_id,
+            upload_id=upload_id,
+            archive_sha256=publication.archive.content_sha256,
+            now=publication.workspace_snapshot.created_at,
         )
         expected_content_id = _core_owned_id(
             self._signing_key,
             "workspace-content",
             {
+                "project_id": project_id,
+                "upload_id": upload_id,
                 "sha256": publication.archive.content_sha256,
                 "byte_size": publication.archive.byte_size,
                 "published_at": publication.published_at,
@@ -1318,6 +1482,94 @@ class CoreControlStoreV1:
             or publication.content_ref.content_id != expected_content_id
         ):
             raise StoreCorruptionError("workspace publication Core identity is invalid")
+
+    def _store_publication_owner(
+        self,
+        *,
+        project_id: str,
+        upload_id: str,
+        publication: m.WorkspacePublicationV1,
+    ) -> None:
+        self._prune_expired_idempotency_records(int(time.time()))
+        owner_count = int(
+            self._connection.execute(
+                "SELECT COUNT(*) FROM workspace_publication_owners"
+            ).fetchone()[0]
+        )
+        if owner_count >= _MAX_PUBLICATION_OWNERS:
+            raise IdempotencyCapacityError("workspace publication ownership capacity is exhausted")
+        publication_sha256 = hashlib.sha256(_model_bytes(publication)).hexdigest()
+        values = {
+            "snapshot_id": publication.workspace_snapshot.id,
+            "content_id": publication.content_ref.content_id,
+            "publication_sha256": publication_sha256,
+            "project_id": project_id,
+            "upload_id": upload_id,
+            "published_at": publication.published_at,
+        }
+        identity_hmac = hmac.new(
+            self._signing_key,
+            _canonical_bytes({"domain": "workspace-publication-owner.v1", "values": values}),
+            hashlib.sha256,
+        ).hexdigest()
+        try:
+            self._connection.execute(
+                "INSERT INTO workspace_publication_owners("
+                "snapshot_id, content_id, publication_sha256, project_id, upload_id, "
+                "identity_hmac, published_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    publication.workspace_snapshot.id,
+                    publication.content_ref.content_id,
+                    publication_sha256,
+                    project_id,
+                    upload_id,
+                    identity_hmac,
+                    publication.published_at,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise StoreCorruptionError("workspace publication ownership is not unique") from exc
+
+    def _validate_publication_owner_row(
+        self,
+        row: sqlite3.Row,
+    ) -> tuple[str, str]:
+        values = {
+            "snapshot_id": row["snapshot_id"],
+            "content_id": row["content_id"],
+            "publication_sha256": row["publication_sha256"],
+            "project_id": row["project_id"],
+            "upload_id": row["upload_id"],
+            "published_at": row["published_at"],
+        }
+        expected_hmac = hmac.new(
+            self._signing_key,
+            _canonical_bytes({"domain": "workspace-publication-owner.v1", "values": values}),
+            hashlib.sha256,
+        ).hexdigest()
+        if (
+            not _is_managed_resource_id(row["snapshot_id"], "workspace-snapshot")
+            or not _is_managed_resource_id(row["content_id"], "workspace-content")
+            or not _is_sha256(row["publication_sha256"])
+            or not _is_managed_resource_id(row["project_id"], "project")
+            or not _is_managed_resource_id(row["upload_id"], "upload")
+            or not _is_timestamp(row["published_at"])
+            or not hmac.compare_digest(row["identity_hmac"], expected_hmac)
+        ):
+            raise StoreCorruptionError("workspace publication owner row is invalid")
+        return row["project_id"], row["upload_id"]
+
+    def _publication_owner_for_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> tuple[str, str] | None:
+        row = self._connection.execute(
+            "SELECT * FROM workspace_publication_owners WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._validate_publication_owner_row(row)
 
     def _patched_project(
         self,
@@ -1463,7 +1715,11 @@ class CoreControlStoreV1:
             or bytes(row["semantic_headers_json"]) != envelope.semantic_headers_json
         ):
             raise IdempotencyConflictError("idempotency key was reused")
-        model = _validate_idempotency_row(row, signing_key=self._signing_key)
+        model = _validate_idempotency_row(
+            row,
+            signing_key=self._signing_key,
+            publication_owner_lookup=self._publication_owner_for_snapshot,
+        )
         if response_model is not None and not isinstance(model, response_model):
             raise StoreCorruptionError("idempotency response type is invalid")
         if response_model is None and model is not None:
@@ -1479,9 +1735,7 @@ class CoreControlStoreV1:
         result: StoredResult,
     ) -> None:
         now = int(time.time())
-        self._connection.execute(
-            "DELETE FROM idempotency_records WHERE expires_at_epoch <= ?", (now,)
-        )
+        self._prune_expired_idempotency_records(now)
         count = self._connection.execute(
             "SELECT COUNT(*) AS count FROM idempotency_records"
         ).fetchone()["count"]
@@ -1511,6 +1765,256 @@ class CoreControlStoreV1:
                 now + _IDEMPOTENCY_RETENTION_SECONDS,
             ),
         )
+
+    def _prune_expired_idempotency_records(self, now: int) -> None:
+        self._connection.execute(
+            "DELETE FROM idempotency_records AS records WHERE expires_at_epoch <= ? "
+            "AND NOT EXISTS (SELECT 1 FROM managed_cleanup_intents AS cleanup "
+            "WHERE cleanup.operation_id = records.operation_id "
+            "AND cleanup.resource_scope = records.resource_scope "
+            "AND cleanup.idempotency_key = records.idempotency_key)",
+            (now,),
+        )
+        self._connection.execute(
+            "DELETE FROM workspace_publication_owners AS owners "
+            "WHERE NOT EXISTS (SELECT 1 FROM workspace_uploads AS uploads "
+            "WHERE uploads.upload_id = owners.upload_id) "
+            "AND NOT EXISTS (SELECT 1 FROM idempotency_records AS records "
+            "WHERE records.response_json IS NOT NULL AND ("
+            "json_extract(CAST(records.response_json AS TEXT), "
+            "'$.workspace_publication.workspace_snapshot.id') = owners.snapshot_id OR "
+            "json_extract(CAST(records.response_json AS TEXT), "
+            "'$.publication.workspace_snapshot.id') = owners.snapshot_id OR "
+            "json_extract(CAST(records.response_json AS TEXT), "
+            "'$.project.workspace_publication.workspace_snapshot.id') "
+            "= owners.snapshot_id OR "
+            "json_extract(CAST(records.response_json AS TEXT), "
+            "'$.upload.publication.workspace_snapshot.id') = owners.snapshot_id))"
+        )
+
+    def _store_cleanup_intent(
+        self,
+        *,
+        operation_id: str,
+        scope: str,
+        idempotency_key: str,
+        root_kind: Literal["upload", "workspace"],
+        entry_name: str,
+        identity: os.stat_result,
+    ) -> None:
+        if not _is_safe_managed_entry_name(entry_name):
+            raise StoreCorruptionError("managed cleanup entry name is invalid")
+        cleanup_id = _new_id("cleanup")
+        created_at_epoch = int(time.time())
+        values = {
+            "cleanup_id": cleanup_id,
+            "operation_id": operation_id,
+            "resource_scope": scope,
+            "idempotency_key": idempotency_key,
+            "root_kind": root_kind,
+            "entry_name": entry_name,
+            "expected_dev": int(identity.st_dev),
+            "expected_ino": int(identity.st_ino),
+            "expected_mode": int(identity.st_mode),
+            "expected_uid": int(identity.st_uid),
+            "expected_nlink": int(identity.st_nlink),
+            "created_at_epoch": created_at_epoch,
+        }
+        if any(
+            value < 0 or value > (2**63 - 1)
+            for key, value in values.items()
+            if key.startswith("expected_") and isinstance(value, int)
+        ):
+            raise StoreCorruptionError("managed cleanup entry identity is invalid")
+        identity_hmac = self._managed_cleanup_hmac(values)
+        self._connection.execute(
+            "INSERT INTO managed_cleanup_intents("
+            "cleanup_id, operation_id, resource_scope, idempotency_key, root_kind, "
+            "entry_name, expected_dev, expected_ino, expected_mode, expected_uid, "
+            "expected_nlink, identity_hmac, created_at_epoch) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                cleanup_id,
+                operation_id,
+                scope,
+                idempotency_key,
+                root_kind,
+                entry_name,
+                identity.st_dev,
+                identity.st_ino,
+                identity.st_mode,
+                identity.st_uid,
+                identity.st_nlink,
+                identity_hmac,
+                created_at_epoch,
+            ),
+        )
+
+    def _managed_cleanup_hmac(self, values: Mapping[str, object]) -> str:
+        return hmac.new(
+            self._signing_key,
+            _canonical_bytes({"domain": "managed-cleanup-intent.v1", "values": values}),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _validate_cleanup_intent_row(self, row: sqlite3.Row) -> None:
+        values = {
+            "cleanup_id": row["cleanup_id"],
+            "operation_id": row["operation_id"],
+            "resource_scope": row["resource_scope"],
+            "idempotency_key": row["idempotency_key"],
+            "root_kind": row["root_kind"],
+            "entry_name": row["entry_name"],
+            "expected_dev": int(row["expected_dev"]),
+            "expected_ino": int(row["expected_ino"]),
+            "expected_mode": int(row["expected_mode"]),
+            "expected_uid": int(row["expected_uid"]),
+            "expected_nlink": int(row["expected_nlink"]),
+            "created_at_epoch": int(row["created_at_epoch"]),
+        }
+        operation_id = row["operation_id"]
+        if (
+            not _is_managed_resource_id(row["cleanup_id"], "cleanup")
+            or operation_id not in {"abortCoreWorkspaceUploadV1", "deleteCoreProjectV1"}
+            or row["root_kind"] not in {"upload", "workspace"}
+            or not _is_safe_managed_entry_name(row["entry_name"])
+            or row["expected_dev"] < 0
+            or row["expected_ino"] <= 0
+            or row["expected_uid"] != os.geteuid()
+            or row["expected_nlink"] <= 0
+            or row["created_at_epoch"] < 0
+            or not hmac.compare_digest(row["identity_hmac"], self._managed_cleanup_hmac(values))
+        ):
+            raise StoreCorruptionError("managed cleanup intent identity is invalid")
+        expected_mode = int(row["expected_mode"])
+        expected_type = stat.S_IFMT(expected_mode)
+        if row["root_kind"] == "upload":
+            if (
+                expected_type != stat.S_IFREG
+                or stat.S_IMODE(expected_mode) != 0o600
+                or not _is_managed_upload_file_name(row["entry_name"])
+                or operation_id not in {"abortCoreWorkspaceUploadV1", "deleteCoreProjectV1"}
+            ):
+                raise StoreCorruptionError("managed upload cleanup intent is invalid")
+        elif (
+            expected_type != stat.S_IFDIR
+            or stat.S_IMODE(expected_mode) != 0o700
+            or not _is_managed_resource_id(row["entry_name"], "workspace-snapshot")
+            or operation_id != "deleteCoreProjectV1"
+        ):
+            raise StoreCorruptionError("managed workspace cleanup intent is invalid")
+
+    def _live_managed_entry_names(self) -> tuple[set[str], set[str]]:
+        upload_names: set[str] = set()
+        snapshot_names: set[str] = set()
+        cursor = self._connection.execute(
+            "SELECT upload_id, project_id, file_name, document_json FROM workspace_uploads "
+            "ORDER BY upload_id LIMIT ?",
+            (_MAX_UPLOADS + 1,),
+        )
+        rows = cursor.fetchmany(_MAX_UPLOADS + 1)
+        if len(rows) > _MAX_UPLOADS or cursor.fetchone() is not None:
+            raise StoreCorruptionError("managed workspace live-state quota is exceeded")
+        for row in rows:
+            upload = _validate_bytes(m.WorkspaceUploadSessionV1, row["document_json"])
+            if (
+                upload.id != row["upload_id"]
+                or upload.project_id != row["project_id"]
+                or row["file_name"] != f"{upload.id}.part"
+            ):
+                raise StoreCorruptionError("managed workspace live-state identity is invalid")
+            if upload.status in {
+                m.WorkspaceUploadStatus.OPEN,
+                m.WorkspaceUploadStatus.FINALIZED,
+            }:
+                upload_names.add(row["file_name"])
+            if upload.status is m.WorkspaceUploadStatus.FINALIZED:
+                if upload.publication is None:
+                    raise StoreCorruptionError("finalized managed workspace has no publication")
+                self._validate_publication_identity(
+                    upload.publication,
+                    project_id=upload.project_id,
+                    upload_id=upload.id,
+                )
+                snapshot_names.add(upload.publication.workspace_snapshot.id)
+        return upload_names, snapshot_names
+
+    def _reconcile_cleanup_operation(
+        self,
+        operation_id: str,
+        scope: str,
+        idempotency_key: str,
+        *,
+        error_message: str,
+    ) -> None:
+        try:
+            converged = False
+            with self._transaction():
+                rows = self._connection.execute(
+                    "SELECT * FROM managed_cleanup_intents WHERE operation_id = ? "
+                    "AND resource_scope = ? AND idempotency_key = ? ORDER BY cleanup_id "
+                    "LIMIT ?",
+                    (operation_id, scope, idempotency_key, _MAX_CLEANUP_INTENTS + 1),
+                ).fetchmany(_MAX_CLEANUP_INTENTS + 1)
+                if len(rows) > _MAX_CLEANUP_INTENTS:
+                    raise StoreCorruptionError("managed cleanup intent quota is exceeded")
+                if not rows:
+                    return
+                for row in rows:
+                    self._validate_cleanup_intent_row(row)
+                live_uploads, live_snapshots = self._live_managed_entry_names()
+                for row in rows:
+                    live_names = live_uploads if row["root_kind"] == "upload" else live_snapshots
+                    if row["entry_name"] in live_names:
+                        raise StoreCorruptionError(
+                            "managed cleanup intent overlaps live owned state"
+                        )
+                budget = _ManagedCleanupBudget(
+                    nodes_remaining=_MAX_RECOVERY_CLEANUP_NODES,
+                    name_bytes_remaining=_MAX_RECOVERY_CLEANUP_NAME_BYTES,
+                )
+                converged = self._reconcile_managed_orphans(
+                    live_uploads,
+                    live_snapshots,
+                    budget=budget,
+                )
+                if converged:
+                    self._connection.execute(
+                        "DELETE FROM managed_cleanup_intents WHERE operation_id = ? "
+                        "AND resource_scope = ? AND idempotency_key = ?",
+                        (operation_id, scope, idempotency_key),
+                    )
+            if not converged:
+                raise PostCommitStoreError(error_message)
+        except PostCommitStoreError:
+            raise
+        except Exception as exc:
+            raise PostCommitStoreError(error_message) from exc
+
+    def _reconcile_managed_orphans(
+        self,
+        live_uploads: set[str],
+        live_snapshots: set[str],
+        *,
+        budget: _ManagedCleanupBudget,
+    ) -> bool:
+        self._verify_lifecycle_storage()
+        uploads_complete = _reconcile_orphan_entries_at(
+            "upload",
+            self._upload_root_fd,
+            live_uploads,
+            budget=budget,
+        )
+        if not uploads_complete:
+            return False
+        snapshots_complete = _reconcile_orphan_entries_at(
+            "workspace",
+            self._workspace_root_fd,
+            live_snapshots,
+            budget=budget,
+        )
+        self._verify_lifecycle_storage()
+        return snapshots_complete
 
     def _append_project_event(self, project: m.ProjectV1, *, now: str) -> None:
         sequence = self._reserve_event_sequence()
@@ -1614,7 +2118,9 @@ class CoreControlStoreV1:
         table: Literal[
             "projects",
             "workspace_uploads",
+            "workspace_publication_owners",
             "idempotency_records",
+            "managed_cleanup_intents",
             "failed_idempotency_records",
             "events",
             "metadata",
@@ -1700,16 +2206,37 @@ class CoreControlStoreV1:
                 or bytes(metadata_rows[0]["value"]) != self._signing_key
             ):
                 raise StoreCorruptionError("Core Control metadata is invalid")
-            _verify_managed_disk_quota(
-                self._upload_root_fd,
-                max_entries=_MAX_UPLOADS + 256,
-                max_bytes=_MAX_MANAGED_WORKSPACE_BYTES,
-            )
-            _verify_managed_disk_quota(
-                self._workspace_root_fd,
-                max_entries=100_000 + _MAX_UPLOADS,
-                max_bytes=_MAX_MANAGED_WORKSPACE_BYTES,
-            )
+            publication_owner_rows: dict[str, sqlite3.Row] = {}
+            publication_owner_uploads: dict[str, str] = {}
+            for row in self._recovery_rows(
+                "workspace_publication_owners",
+                columns=(
+                    "snapshot_id",
+                    "content_id",
+                    "publication_sha256",
+                    "project_id",
+                    "upload_id",
+                    "identity_hmac",
+                    "published_at",
+                ),
+                bounded_columns=(
+                    "snapshot_id",
+                    "content_id",
+                    "publication_sha256",
+                    "project_id",
+                    "upload_id",
+                    "identity_hmac",
+                    "published_at",
+                ),
+                max_rows=_MAX_PUBLICATION_OWNERS,
+            ):
+                project_id, upload_id = self._validate_publication_owner_row(row)
+                if row["snapshot_id"] in publication_owner_rows:
+                    raise StoreCorruptionError("workspace publication snapshot owner is ambiguous")
+                if upload_id in publication_owner_uploads:
+                    raise StoreCorruptionError("workspace publication upload owner is ambiguous")
+                publication_owner_rows[row["snapshot_id"]] = row
+                publication_owner_uploads[upload_id] = project_id
             project_publications: dict[str, m.WorkspacePublicationV1] = {}
             publication_projects: dict[str, str] = {}
             publication_owners: dict[tuple[str, str], str] = {}
@@ -1746,11 +2273,31 @@ class CoreControlStoreV1:
                     )
                 ):
                     raise StoreCorruptionError("project row identity is invalid")
-                self._validate_project_snapshot_closure(project)
+                publication_owner: tuple[str, str] | None = None
+                if project.workspace_publication is not None:
+                    owner_row = publication_owner_rows.get(
+                        project.workspace_publication.workspace_snapshot.id
+                    )
+                    if owner_row is not None:
+                        publication_owner = (
+                            owner_row["project_id"],
+                            owner_row["upload_id"],
+                        )
+                self._validate_project_snapshot_closure(
+                    project,
+                    publication_owner=publication_owner,
+                )
                 if project.workspace_publication is not None:
                     publication = project.workspace_publication
+                    assert publication_owner is not None
                     expected_digest = hashlib.sha256(
-                        _canonical_bytes({"archive_sha256": publication.archive.content_sha256})
+                        _canonical_bytes(
+                            {
+                                "project_id": project.id,
+                                "upload_id": publication_owner[1],
+                                "archive_sha256": publication.archive.content_sha256,
+                            }
+                        )
                     ).hexdigest()
                     if publication.workspace_snapshot.content_sha256 != expected_digest:
                         raise StoreCorruptionError("workspace snapshot digest binding is invalid")
@@ -1835,12 +2382,35 @@ class CoreControlStoreV1:
                     if publication is None:
                         raise StoreCorruptionError("finalized workspace upload has no publication")
                     snapshot_id = publication.workspace_snapshot.id
-                    self._validate_publication_identity(publication)
+                    owner_row = publication_owner_rows.get(snapshot_id)
+                    if owner_row is not None and owner_row["project_id"] != upload.project_id:
+                        raise StoreCorruptionError(
+                            "workspace publication is not bound to an upload from the same project"
+                        )
+                    self._validate_publication_identity(
+                        publication,
+                        project_id=upload.project_id,
+                        upload_id=upload.id,
+                    )
+                    if (
+                        owner_row is None
+                        or owner_row["project_id"] != upload.project_id
+                        or owner_row["upload_id"] != upload.id
+                        or owner_row["content_id"] != publication.content_ref.content_id
+                        or owner_row["publication_sha256"]
+                        != hashlib.sha256(_model_bytes(publication)).hexdigest()
+                        or owner_row["published_at"] != publication.published_at
+                    ):
+                        raise StoreCorruptionError(
+                            "workspace publication owner binding is invalid"
+                        )
                     existing = snapshot_sources.setdefault(
                         snapshot_id, (publication, file_name, upload.project_id)
                     )
                     if existing[0] != publication or existing[2] != upload.project_id:
                         raise StoreCorruptionError("workspace snapshot source is ambiguous")
+            if not set(snapshot_sources).issubset(publication_owner_rows):
+                raise StoreCorruptionError("workspace publication owner inventory is incomplete")
             for snapshot_id, publication in project_publications.items():
                 source = snapshot_sources.get(snapshot_id)
                 if source is None or source[0] != publication:
@@ -1871,6 +2441,7 @@ class CoreControlStoreV1:
                 if cursor_sequence != int(row["sequence"]):
                     raise StoreCorruptionError("event cursor sequence is invalid")
             valid_successes: set[tuple[str, str, str]] = set()
+            idempotency_publications: set[str] = set()
             for row in self._recovery_rows(
                 "idempotency_records",
                 columns=(
@@ -1900,7 +2471,19 @@ class CoreControlStoreV1:
                 ),
                 max_rows=_IDEMPOTENCY_LIMIT,
             ):
-                _validate_idempotency_row(row, signing_key=self._signing_key)
+                idempotency_model = _validate_idempotency_row(
+                    row,
+                    signing_key=self._signing_key,
+                    publication_owner_lookup=lambda snapshot_id: (
+                        (
+                            publication_owner_rows[snapshot_id]["project_id"],
+                            publication_owner_rows[snapshot_id]["upload_id"],
+                        )
+                        if snapshot_id in publication_owner_rows
+                        else None
+                    ),
+                )
+                idempotency_publications.update(_publication_snapshot_ids(idempotency_model))
                 valid_successes.add(
                     (row["operation_id"], row["resource_scope"], row["idempotency_key"])
                 )
@@ -1948,6 +2531,60 @@ class CoreControlStoreV1:
                 if not _is_sha256(row["request_digest"]):
                     raise StoreCorruptionError("failed idempotency request digest is invalid")
 
+            retained_publication_owners = set(snapshot_sources) | idempotency_publications
+            unknown_publication_owners = set(publication_owner_rows) - retained_publication_owners
+            for snapshot_id in unknown_publication_owners:
+                self._connection.execute(
+                    "DELETE FROM workspace_publication_owners WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                )
+
+            cleanup_intent_count = 0
+            for row in self._recovery_rows(
+                "managed_cleanup_intents",
+                columns=(
+                    "cleanup_id",
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "root_kind",
+                    "entry_name",
+                    "expected_dev",
+                    "expected_ino",
+                    "expected_mode",
+                    "expected_uid",
+                    "expected_nlink",
+                    "identity_hmac",
+                    "created_at_epoch",
+                ),
+                bounded_columns=(
+                    "cleanup_id",
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "root_kind",
+                    "entry_name",
+                    "identity_hmac",
+                ),
+                max_rows=_MAX_CLEANUP_INTENTS,
+            ):
+                self._validate_cleanup_intent_row(row)
+                success_identity = (
+                    row["operation_id"],
+                    row["resource_scope"],
+                    row["idempotency_key"],
+                )
+                if success_identity not in valid_successes:
+                    raise StoreCorruptionError(
+                        "managed cleanup intent has no durable success record"
+                    )
+                live_names = (
+                    referenced_files if row["root_kind"] == "upload" else set(snapshot_sources)
+                )
+                if row["entry_name"] in live_names:
+                    raise StoreCorruptionError("managed cleanup intent overlaps live owned state")
+                cleanup_intent_count += 1
+
             upload_root_fd = self._upload_root_fd
             workspace_root_fd = self._workspace_root_fd
             for file_name in referenced_files:
@@ -1964,9 +2601,6 @@ class CoreControlStoreV1:
                         file_name,
                         accepted_offset=upload.accepted_offset,
                     )
-            for name in _bounded_directory_names(upload_root_fd, _MAX_UPLOADS + 256):
-                if name not in referenced_files:
-                    _remove_entry_at(upload_root_fd, name)
             for snapshot_id, (publication, archive_name, _project_id) in snapshot_sources.items():
                 try:
                     archive_fd = os.open(
@@ -1995,9 +2629,29 @@ class CoreControlStoreV1:
                     raise StoreCorruptionError(
                         "published workspace snapshot is missing or invalid"
                     ) from exc
-            for name in _bounded_directory_names(workspace_root_fd, _MAX_UPLOADS + 256):
-                if name not in snapshot_sources:
-                    _remove_entry_at(workspace_root_fd, name)
+            cleanup_budget = _ManagedCleanupBudget(
+                nodes_remaining=_MAX_RECOVERY_CLEANUP_NODES,
+                name_bytes_remaining=_MAX_RECOVERY_CLEANUP_NAME_BYTES,
+            )
+            cleanup_converged = self._reconcile_managed_orphans(
+                referenced_files,
+                set(snapshot_sources),
+                budget=cleanup_budget,
+            )
+            if cleanup_converged and cleanup_intent_count:
+                self._connection.execute("DELETE FROM managed_cleanup_intents")
+            _verify_managed_disk_quota(
+                upload_root_fd,
+                referenced_files,
+                max_entries=_MAX_UPLOADS,
+                max_bytes=_MAX_MANAGED_WORKSPACE_BYTES,
+            )
+            _verify_managed_disk_quota(
+                workspace_root_fd,
+                set(snapshot_sources),
+                max_entries=100_000 + _MAX_UPLOADS,
+                max_bytes=_MAX_MANAGED_WORKSPACE_BYTES,
+            )
 
     def _recover_open_upload(
         self,
@@ -2720,6 +3374,26 @@ def _snapshot_from_digest(
     )
 
 
+def _workspace_publication_snapshot(
+    signing_key: bytes,
+    *,
+    project_id: str,
+    upload_id: str,
+    archive_sha256: str,
+    now: str,
+) -> m.ImmutableSnapshotRefV1:
+    return _snapshot(
+        signing_key,
+        m.SnapshotKind.WORKSPACE,
+        {
+            "project_id": project_id,
+            "upload_id": upload_id,
+            "archive_sha256": archive_sha256,
+        },
+        now,
+    )
+
+
 def _core_owned_id(signing_key: bytes, prefix: str, payload: object) -> str:
     digest = hmac.new(
         signing_key,
@@ -2872,6 +3546,7 @@ def _validate_idempotency_row(
     row: sqlite3.Row | Mapping[str, Any],
     *,
     signing_key: bytes | None = None,
+    publication_owner_lookup: Callable[[str], tuple[str, str] | None] | None = None,
 ) -> BaseModel | None:
     operation_id = row["operation_id"]
     operation_spec = _IDEMPOTENCY_OPERATION_SPECS.get(operation_id)
@@ -2914,16 +3589,25 @@ def _validate_idempotency_row(
     if row["etag"] != expected_etag:
         raise StoreCorruptionError("idempotency response ETag is invalid")
     if signing_key is not None:
-        _validate_response_core_owned_ids(model, signing_key)
+        _validate_response_core_owned_ids(
+            model,
+            signing_key,
+            publication_owner_lookup=publication_owner_lookup,
+        )
     _validate_idempotency_response_semantics(
         operation_id, resource_scope, request, semantic_headers, model
     )
     return model
 
 
-def _validate_response_core_owned_ids(model: BaseModel, signing_key: bytes) -> None:
+def _validate_response_core_owned_ids(
+    model: BaseModel,
+    signing_key: bytes,
+    *,
+    publication_owner_lookup: Callable[[str], tuple[str, str] | None] | None,
+) -> None:
     snapshots: list[m.ImmutableSnapshotRefV1] = []
-    publications: list[m.WorkspacePublicationV1] = []
+    publications: list[tuple[m.WorkspacePublicationV1, str, str]] = []
     if isinstance(model, m.ProjectV1):
         expected_task = _snapshot(
             signing_key,
@@ -2957,17 +3641,34 @@ def _validate_response_core_owned_ids(model: BaseModel, signing_key: bytes) -> N
         if model.current_workspace_snapshot is not None:
             snapshots.append(model.current_workspace_snapshot)
         if model.workspace_publication is not None:
-            publications.append(model.workspace_publication)
+            if publication_owner_lookup is None:
+                raise StoreCorruptionError("idempotency publication owner lookup is unavailable")
+            owner = publication_owner_lookup(model.workspace_publication.workspace_snapshot.id)
+            if owner is None or owner[0] != model.id:
+                raise StoreCorruptionError("idempotency publication owner is invalid")
+            publications.append((model.workspace_publication, owner[0], owner[1]))
     elif isinstance(model, m.WorkspaceUploadSessionV1):
         snapshots.append(model.project_snapshot)
         if model.base_workspace_snapshot is not None:
             snapshots.append(model.base_workspace_snapshot)
         if model.publication is not None:
-            publications.append(model.publication)
+            if publication_owner_lookup is not None:
+                owner = publication_owner_lookup(model.publication.workspace_snapshot.id)
+                if owner != (model.project_id, model.id):
+                    raise StoreCorruptionError("idempotency publication owner is invalid")
+            publications.append((model.publication, model.project_id, model.id))
     elif isinstance(model, m.WorkspaceUploadFinalizeResponseV1):
-        _validate_response_core_owned_ids(model.project, signing_key)
-        _validate_response_core_owned_ids(model.upload, signing_key)
-        publications.append(model.publication)
+        _validate_response_core_owned_ids(
+            model.project,
+            signing_key,
+            publication_owner_lookup=publication_owner_lookup,
+        )
+        _validate_response_core_owned_ids(
+            model.upload,
+            signing_key,
+            publication_owner_lookup=publication_owner_lookup,
+        )
+        publications.append((model.publication, model.project_id, model.upload.id))
     elif isinstance(model, m.ProjectValidationResponseV1):
         return
     for snapshot in snapshots:
@@ -2978,17 +3679,20 @@ def _validate_response_core_owned_ids(model: BaseModel, signing_key: bytes) -> N
             snapshot.created_at,
         ):
             raise StoreCorruptionError("idempotency snapshot Core identity is invalid")
-    for publication in publications:
-        expected = _snapshot(
+    for publication, project_id, upload_id in publications:
+        expected = _workspace_publication_snapshot(
             signing_key,
-            m.SnapshotKind.WORKSPACE,
-            {"archive_sha256": publication.archive.content_sha256},
-            publication.workspace_snapshot.created_at,
+            project_id=project_id,
+            upload_id=upload_id,
+            archive_sha256=publication.archive.content_sha256,
+            now=publication.workspace_snapshot.created_at,
         )
         content_id = _core_owned_id(
             signing_key,
             "workspace-content",
             {
+                "project_id": project_id,
+                "upload_id": upload_id,
                 "sha256": publication.archive.content_sha256,
                 "byte_size": publication.archive.byte_size,
                 "published_at": publication.published_at,
@@ -2999,6 +3703,19 @@ def _validate_response_core_owned_ids(model: BaseModel, signing_key: bytes) -> N
             or publication.content_ref.content_id != content_id
         ):
             raise StoreCorruptionError("idempotency publication Core identity is invalid")
+
+
+def _publication_snapshot_ids(model: BaseModel | None) -> set[str]:
+    snapshot_ids: set[str] = set()
+    if isinstance(model, m.ProjectV1) and model.workspace_publication is not None:
+        snapshot_ids.add(model.workspace_publication.workspace_snapshot.id)
+    elif isinstance(model, m.WorkspaceUploadSessionV1) and model.publication is not None:
+        snapshot_ids.add(model.publication.workspace_snapshot.id)
+    elif isinstance(model, m.WorkspaceUploadFinalizeResponseV1):
+        snapshot_ids.add(model.publication.workspace_snapshot.id)
+        snapshot_ids.update(_publication_snapshot_ids(model.project))
+        snapshot_ids.update(_publication_snapshot_ids(model.upload))
+    return snapshot_ids
 
 
 def _validate_request_core_owned_ids(request: BaseModel | None, signing_key: bytes) -> None:
@@ -3184,6 +3901,9 @@ def _validate_idempotency_response_semantics(
             and _project_response_has_core_identity(model.project)
             and _upload_response_matches_scope(model.upload, scope, require_upload_id=True)
             and model.upload.status is m.WorkspaceUploadStatus.FINALIZED
+            and model.project.workspace_publication == model.publication
+            and model.upload.publication == model.publication
+            and model.project.current_workspace_snapshot == model.publication.workspace_snapshot
             and model.publication.published_at == model.upload.updated_at
             and model.project.updated_at == model.upload.updated_at
             and model.publication.workspace_snapshot.created_at == model.upload.updated_at
@@ -3319,6 +4039,39 @@ def _is_sha256(value: object) -> bool:
     )
 
 
+def _is_timestamp(value: object) -> bool:
+    if type(value) is not str or len(value.encode("utf-8")) > 64 or not value.endswith("Z"):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timezone.utc.utcoffset(parsed)
+
+
+def _is_safe_managed_entry_name(value: object) -> bool:
+    if type(value) is not str or value in {"", ".", ".."}:
+        return False
+    try:
+        encoded = os.fsencode(value)
+    except UnicodeEncodeError:
+        return False
+    return (
+        len(encoded) <= 255
+        and b"/" not in encoded
+        and b"\0" not in encoded
+        and os.path.basename(value) == value
+    )
+
+
+def _is_managed_upload_file_name(value: object) -> bool:
+    return (
+        type(value) is str
+        and value.endswith(".part")
+        and _is_managed_resource_id(value[: -len(".part")], "upload")
+    )
+
+
 def _is_etag(value: object) -> bool:
     return (
         type(value) is str
@@ -3421,97 +4174,275 @@ def _remove_bound_entry_at(
     name: str,
     entry_fd: int,
     expected_identity: os.stat_result,
+    *,
+    root_kind: Literal["upload", "workspace"],
 ) -> None:
     current = os.fstat(entry_fd)
     _require_same_identity(current, expected_identity, "managed cleanup entry")
     _require_entry_binding(parent_fd, name, expected_identity)
-    _remove_entry_at(parent_fd, name, expected_identity=expected_identity)
+    _quarantine_and_remove_entry_at(
+        root_kind,
+        parent_fd,
+        name,
+        expected_identity=expected_identity,
+        expected_fd=entry_fd,
+        budget=None,
+    )
 
 
-def _remove_entry_at(
+def _managed_entry_identity(
     parent_fd: int,
     name: str,
     *,
-    expected_identity: os.stat_result | None = None,
-) -> None:
+    expected_type: Literal["file", "directory"],
+    required: bool,
+) -> os.stat_result | None:
     try:
         metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return
+        if required:
+            raise StoreCorruptionError("Core Control managed cleanup entry is missing")
+        return None
     except OSError as exc:
-        raise StoreCorruptionError("Core Control managed orphan is unreadable") from exc
-    if metadata.st_uid != os.geteuid():
-        raise StoreCorruptionError("Core Control managed orphan has the wrong owner")
-    if expected_identity is not None and not _same_identity(metadata, expected_identity):
-        raise StoreCorruptionError("Core Control managed cleanup entry identity changed")
-    if not stat.S_ISDIR(metadata.st_mode):
-        if stat.S_ISLNK(metadata.st_mode):
-            _require_entry_binding(parent_fd, name, metadata)
-        elif stat.S_ISREG(metadata.st_mode):
-            try:
-                entry_fd = os.open(
-                    name,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=parent_fd,
-                )
-            except OSError as exc:
-                raise StoreCorruptionError("Core Control managed orphan file is unsafe") from exc
-            try:
-                current = os.fstat(entry_fd)
-                if (
-                    not stat.S_ISREG(current.st_mode)
-                    or current.st_uid != os.geteuid()
-                    or current.st_nlink != 1
-                ):
-                    raise StoreCorruptionError("Core Control managed orphan file is unsafe")
-                _require_same_identity(current, metadata, "managed orphan file")
-                _require_entry_binding(parent_fd, name, metadata)
-            finally:
-                os.close(entry_fd)
+        raise StoreCorruptionError("Core Control managed cleanup entry is unreadable") from exc
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if expected_type == "directory":
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    elif expected_type != "file":
+        raise AssertionError("unsupported managed entry type")
+    try:
+        entry_fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise StoreCorruptionError("Core Control managed cleanup entry is unsafe") from exc
+    try:
+        current = os.fstat(entry_fd)
+        if expected_type == "file":
+            _require_private_regular_metadata(current)
         else:
-            raise StoreCorruptionError("Core Control managed orphan type is invalid")
-        try:
-            os.unlink(name, dir_fd=parent_fd)
-        except OSError as exc:
-            raise StoreCorruptionError("Core Control managed orphan could not be removed") from exc
-        return
-
-    try:
-        child_fd = os.open(
-            name,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent_fd,
-        )
-    except OSError as exc:
-        raise StoreCorruptionError("Core Control managed orphan directory is unsafe") from exc
-    try:
-        if not _same_identity(os.fstat(child_fd), metadata):
-            raise StoreCorruptionError("Core Control managed orphan binding changed")
-        for child_name in _bounded_directory_names(child_fd, 100_000):
-            _remove_entry_at(child_fd, child_name)
+            _require_private_directory_metadata(current)
+        _require_same_identity(current, metadata, "managed cleanup entry")
         _require_entry_binding(parent_fd, name, metadata)
     finally:
-        os.close(child_fd)
+        os.close(entry_fd)
+    return metadata
+
+
+def _reconcile_orphan_entries_at(
+    root_kind: Literal["upload", "workspace"],
+    root_fd: int,
+    live_names: set[str],
+    *,
+    budget: _ManagedCleanupBudget,
+) -> bool:
+    while True:
+        orphan_name: str | None = None
+        try:
+            with os.scandir(root_fd) as entries:
+                for entry in entries:
+                    if not budget.consume(entry.name):
+                        return False
+                    if entry.name not in live_names:
+                        orphan_name = entry.name
+                        break
+        except OSError as exc:
+            raise StoreCorruptionError("Core Control managed orphan scan failed") from exc
+        if orphan_name is None:
+            os.fsync(root_fd)
+            return True
+        if not _quarantine_and_remove_entry_at(
+            root_kind,
+            root_fd,
+            orphan_name,
+            expected_identity=None,
+            expected_fd=None,
+            budget=budget,
+        ):
+            return False
+
+
+def _quarantine_and_remove_entry_at(
+    root_kind: Literal["upload", "workspace"],
+    parent_fd: int,
+    name: str,
+    *,
+    expected_identity: os.stat_result | None,
+    expected_fd: int | None,
+    budget: _ManagedCleanupBudget | None,
+) -> bool:
+    if not _is_safe_managed_entry_name(name):
+        raise StoreCorruptionError("Core Control managed orphan name is invalid")
     try:
-        os.rmdir(name, dir_fd=parent_fd)
+        first_identity = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
     except OSError as exc:
-        raise StoreCorruptionError(
-            "Core Control managed orphan directory could not be removed"
-        ) from exc
+        raise StoreCorruptionError("Core Control managed orphan is unreadable") from exc
+    if first_identity.st_uid != os.geteuid():
+        raise StoreCorruptionError("Core Control managed orphan has the wrong owner")
+    if expected_identity is not None and not _same_identity(first_identity, expected_identity):
+        raise StoreCorruptionError("Core Control managed cleanup entry identity changed")
+
+    entry_fd: int | None = None
+    entry_type: Literal["file", "directory", "symlink"]
+    if stat.S_ISREG(first_identity.st_mode):
+        entry_type = "file"
+        try:
+            entry_fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise StoreCorruptionError("Core Control managed orphan file is unsafe") from exc
+        current = os.fstat(entry_fd)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or current.st_nlink != 1
+        ):
+            os.close(entry_fd)
+            raise StoreCorruptionError("Core Control managed orphan file is unsafe")
+        _require_same_identity(current, first_identity, "managed orphan file")
+    elif stat.S_ISDIR(first_identity.st_mode):
+        entry_type = "directory"
+        try:
+            entry_fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise StoreCorruptionError("Core Control managed orphan directory is unsafe") from exc
+        current = os.fstat(entry_fd)
+        if not stat.S_ISDIR(current.st_mode) or current.st_uid != os.geteuid():
+            os.close(entry_fd)
+            raise StoreCorruptionError("Core Control managed orphan directory is unsafe")
+        _require_same_identity(current, first_identity, "managed orphan directory")
+    elif stat.S_ISLNK(first_identity.st_mode):
+        entry_type = "symlink"
+    else:
+        raise StoreCorruptionError("Core Control managed orphan type is invalid")
+
+    try:
+        if expected_fd is not None:
+            _require_same_identity(os.fstat(expected_fd), first_identity, "managed cleanup entry")
+        _after_cleanup_entry_observed(root_kind, parent_fd, name, first_identity)
+        _require_entry_binding(parent_fd, name, first_identity)
+        quarantine_name = _quarantine_entry_noreplace(parent_fd, name)
+        os.fsync(parent_fd)
+        _after_managed_quarantine(
+            root_kind,
+            parent_fd,
+            name,
+            quarantine_name,
+        )
+        _require_entry_binding(parent_fd, quarantine_name, first_identity)
+        if entry_fd is not None:
+            _require_same_identity(os.fstat(entry_fd), first_identity, "managed quarantined entry")
+
+        if entry_type == "directory":
+            assert entry_fd is not None
+            while True:
+                with os.scandir(entry_fd) as children:
+                    child = next(children, None)
+                if child is None:
+                    break
+                if budget is not None and not budget.consume(child.name):
+                    return False
+                if not _quarantine_and_remove_entry_at(
+                    root_kind,
+                    entry_fd,
+                    child.name,
+                    expected_identity=None,
+                    expected_fd=None,
+                    budget=budget,
+                ):
+                    return False
+            os.fsync(entry_fd)
+            _require_same_identity(
+                os.fstat(entry_fd), first_identity, "managed quarantined directory"
+            )
+            _require_entry_binding(parent_fd, quarantine_name, first_identity)
+            try:
+                os.rmdir(quarantine_name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise StoreCorruptionError(
+                    "Core Control managed orphan directory could not be removed"
+                ) from exc
+        else:
+            _require_entry_binding(parent_fd, quarantine_name, first_identity)
+            try:
+                os.unlink(quarantine_name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise StoreCorruptionError(
+                    "Core Control managed orphan could not be removed"
+                ) from exc
+        os.fsync(parent_fd)
+        return True
+    finally:
+        if entry_fd is not None:
+            os.close(entry_fd)
 
 
-def _bounded_directory_names(directory_fd: int, limit: int):
-    count = 0
-    with os.scandir(directory_fd) as entries:
-        for entry in entries:
-            count += 1
-            if count > limit:
-                raise StoreCorruptionError("Core Control managed directory quota is exceeded")
-            yield entry.name
+def _quarantine_entry_noreplace(parent_fd: int, name: str) -> str:
+    for _attempt in range(128):
+        quarantine_name = f".quarantine-{secrets.token_hex(24)}"
+        try:
+            _rename_noreplace(name, quarantine_name, directory_fd=parent_fd)
+        except FileExistsError:
+            continue
+        return quarantine_name
+    raise StoreCorruptionError("Core Control could not allocate a quarantine entry")
+
+
+def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
+    if sys.platform != "linux":
+        raise OSError(errno.ENOSYS, "safe no-replace rename requires Linux renameat2")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "safe no-replace rename requires renameat2")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        directory_fd,
+        os.fsencode(source),
+        directory_fd,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
+def _after_cleanup_entry_observed(
+    root_kind: Literal["upload", "workspace"],
+    parent_fd: int,
+    name: str,
+    identity: os.stat_result,
+) -> None:
+    del root_kind, parent_fd, name, identity
+
+
+def _after_managed_quarantine(
+    root_kind: Literal["upload", "workspace"],
+    parent_fd: int,
+    original_name: str,
+    quarantine_name: str,
+) -> None:
+    del root_kind, parent_fd, original_name, quarantine_name
 
 
 def _verify_managed_disk_quota(
     root_fd: int,
+    live_names: set[str],
     *,
     max_entries: int,
     max_bytes: int,
@@ -3519,45 +4450,59 @@ def _verify_managed_disk_quota(
     entries_seen = 0
     bytes_seen = 0
 
-    def visit(directory_fd: int) -> None:
+    def visit_entry(directory_fd: int, name: str) -> None:
         nonlocal entries_seen, bytes_seen
-        with os.scandir(directory_fd) as entries:
-            for entry in entries:
-                entries_seen += 1
-                if entries_seen > max_entries:
-                    raise StoreCorruptionError("Core Control managed disk entry quota is exceeded")
-                metadata = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
-                if metadata.st_uid != os.geteuid():
-                    raise StoreCorruptionError("Core Control managed disk owner is invalid")
-                bytes_seen += max(metadata.st_size, metadata.st_blocks * 512)
-                if bytes_seen > max_bytes:
-                    raise StoreCorruptionError("Core Control managed disk byte quota is exceeded")
-                if stat.S_ISLNK(metadata.st_mode):
-                    continue
-                if stat.S_ISREG(metadata.st_mode):
-                    if metadata.st_nlink != 1:
-                        raise StoreCorruptionError(
-                            "Core Control managed disk file has multiple links"
-                        )
-                    continue
-                if not stat.S_ISDIR(metadata.st_mode):
-                    raise StoreCorruptionError("Core Control managed disk entry type is invalid")
-                child_fd = os.open(
-                    entry.name,
-                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=directory_fd,
-                )
-                try:
-                    if not _same_identity(os.fstat(child_fd), metadata):
-                        raise StoreCorruptionError(
-                            "Core Control managed disk directory binding changed"
-                        )
-                    visit(child_fd)
-                    _require_entry_binding(directory_fd, entry.name, metadata)
-                finally:
-                    os.close(child_fd)
+        entries_seen += 1
+        if entries_seen > max_entries:
+            raise StoreCorruptionError("Core Control managed disk entry quota is exceeded")
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if metadata.st_uid != os.geteuid():
+            raise StoreCorruptionError("Core Control managed disk owner is invalid")
+        bytes_seen += max(metadata.st_size, metadata.st_blocks * 512)
+        if bytes_seen > max_bytes:
+            raise StoreCorruptionError("Core Control managed disk byte quota is exceeded")
+        if stat.S_ISREG(metadata.st_mode):
+            if metadata.st_nlink != 1:
+                raise StoreCorruptionError("Core Control managed disk file has multiple links")
+            entry_fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                _require_same_identity(os.fstat(entry_fd), metadata, "managed disk file")
+                _require_entry_binding(directory_fd, name, metadata)
+            finally:
+                os.close(entry_fd)
+            return
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise StoreCorruptionError("Core Control managed disk entry type is invalid")
+        child_fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        try:
+            if not _same_identity(os.fstat(child_fd), metadata):
+                raise StoreCorruptionError("Core Control managed disk directory binding changed")
+            with os.scandir(child_fd) as children:
+                for child in children:
+                    visit_entry(child_fd, child.name)
+            _require_entry_binding(directory_fd, name, metadata)
+        finally:
+            os.close(child_fd)
 
-    visit(root_fd)
+    if len(live_names) > max_entries:
+        raise StoreCorruptionError("Core Control managed disk entry quota is exceeded")
+    for live_name in sorted(live_names):
+        if not _is_safe_managed_entry_name(live_name):
+            raise StoreCorruptionError("Core Control managed live entry name is invalid")
+        try:
+            visit_entry(root_fd, live_name)
+        except OSError as exc:
+            raise StoreCorruptionError(
+                "Core Control managed live entry is missing or unsafe"
+            ) from exc
 
 
 __all__ = [
