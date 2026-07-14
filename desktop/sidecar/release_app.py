@@ -35,6 +35,11 @@ from desktop.sidecar.release_provider import (
     ProviderCapabilityUnavailableError,
 )
 from openevo import __version__ as OPENEVO_VERSION
+from openevo.backend.contracts.v1.models import (
+    ErrorCategory as CoreErrorCategory,
+    ErrorSeverity,
+    RepairAction,
+)
 
 
 ErrorCategory = Literal[
@@ -76,15 +81,44 @@ def _error_response(
 
         request_id = secrets.token_hex(16)
         request.state.request_id = request_id
+    category_value = {
+        "contract": CoreErrorCategory.CONTRACT,
+        "authentication": CoreErrorCategory.AUTHENTICATION,
+        "profile": CoreErrorCategory.PROJECT,
+        "connection": CoreErrorCategory.AUTHENTICATION,
+        "project": CoreErrorCategory.PROJECT,
+        "capability": CoreErrorCategory.PROJECT,
+        "operation": CoreErrorCategory.PROJECT,
+        "run": CoreErrorCategory.RUN,
+        "artifact": CoreErrorCategory.ARTIFACT,
+        "service": CoreErrorCategory.SERVICE,
+        "diagnostic": CoreErrorCategory.SERVICE,
+        "maintenance": CoreErrorCategory.SERVICE,
+    }[category]
+    repair_action_value = {
+        "none": RepairAction.UNSUPPORTED,
+        "openevo_can_retry": RepairAction.OPENEVO_CAN_RETRY,
+        "user_input_required": RepairAction.USER_ACTION_REQUIRED,
+        "reconnect_required": RepairAction.OPENEVO_CAN_RECONFIGURE,
+        "upgrade_required": RepairAction.USER_ACTION_REQUIRED,
+    }[repair_action]
+    if next_action is None:
+        next_action = {
+            "none": "Review the error before retrying this operation.",
+            "openevo_can_retry": "Retry this operation from OpenEvo Desktop.",
+            "user_input_required": "Review and correct the request before retrying.",
+            "reconnect_required": "Reconnect the Desktop session before retrying.",
+            "upgrade_required": "Install a compatible OpenEvo Desktop release.",
+        }[repair_action]
     error = ApiErrorV1(
         request_id=request_id,
         code=code,
         http_status=status_code,
         message=message,
-        severity="blocking",
-        category=category,
+        severity=ErrorSeverity.BLOCKING,
+        category=category_value,
         retryable=retryable,
-        repair_action=repair_action,
+        repair_action=repair_action_value,
         next_action=next_action,
     )
     return JSONResponse(status_code=status_code, content=error.model_dump(mode="json"))
