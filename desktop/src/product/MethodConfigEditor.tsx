@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import {
+  effectiveEvolutionConfig,
   EvolutionConfigSchemaError,
   parseEvolutionConfigSchema,
   validateEvolutionConfigOverride,
@@ -11,29 +12,35 @@ import {
 
 interface MethodConfigEditorProps {
   readonly schema: OpenEvoJsonObject;
+  readonly defaultConfig: OpenEvoJsonObject;
   readonly value: OpenEvoJsonObject;
   readonly disabled: boolean;
   readonly onChange: (value: OpenEvoJsonObject) => void;
 }
 
-export function MethodConfigEditor({ schema: rawSchema, value, disabled, onChange }: MethodConfigEditorProps) {
+export function MethodConfigEditor({ schema: rawSchema, defaultConfig, value, disabled, onChange }: MethodConfigEditorProps) {
   const parsed = useMemo(() => parseMethodConfigSchema(rawSchema), [rawSchema]);
   if (!parsed.schema) {
     return <p className="form-error" role="alert">{parsed.error}</p>;
   }
   if (Object.keys(parsed.schema.properties).length === 0) return null;
+  const effectiveValue = effectiveEvolutionConfig(parsed.schema, defaultConfig, value);
   return (
     <fieldset className="method-config" disabled={disabled}>
       <legend>Method configuration</legend>
-      <ObjectFields schema={parsed.schema} value={value} path="config" onChange={onChange} />
+      <ObjectFields schema={parsed.schema} effectiveValue={effectiveValue} overrideValue={value} path="config" onChange={onChange} />
     </fieldset>
   );
 }
 
-export function methodConfigErrors(rawSchema: OpenEvoJsonObject, value: OpenEvoJsonObject): readonly string[] {
+export function methodConfigErrors(
+  rawSchema: OpenEvoJsonObject,
+  defaultConfig: OpenEvoJsonObject,
+  value: OpenEvoJsonObject,
+): readonly string[] {
   const parsed = parseMethodConfigSchema(rawSchema);
   if (!parsed.schema) return [parsed.error ?? "The remote method schema is unavailable."];
-  return validateEvolutionConfigOverride(parsed.schema, {}, value).errors.map((error) => `${error.path}: ${error.message}`);
+  return validateEvolutionConfigOverride(parsed.schema, defaultConfig, value).errors.map((error) => `${error.path}: ${error.message}`);
 }
 
 function parseMethodConfigSchema(rawSchema: OpenEvoJsonObject): { schema: OpenEvoObjectSchema | null; error: string | null } {
@@ -47,12 +54,14 @@ function parseMethodConfigSchema(rawSchema: OpenEvoJsonObject): { schema: OpenEv
 
 function ObjectFields({
   schema,
-  value,
+  effectiveValue,
+  overrideValue,
   path,
   onChange,
 }: {
   schema: OpenEvoObjectSchema;
-  value: OpenEvoJsonObject;
+  effectiveValue: OpenEvoJsonObject;
+  overrideValue: OpenEvoJsonObject;
   path: string;
   onChange: (value: OpenEvoJsonObject) => void;
 }) {
@@ -60,11 +69,12 @@ function ObjectFields({
     <div className="schema-object-fields">
       {Object.entries(schema.properties).map(([name, child]) => {
         const required = schema.required.includes(name);
-        const present = Object.hasOwn(value, name);
+        const effectivePresent = Object.hasOwn(effectiveValue, name);
+        const overridePresent = Object.hasOwn(overrideValue, name);
         const label = child.title ?? humanize(name);
-        const setValue = (next: OpenEvoJsonValue) => onChange({ ...value, [name]: next });
+        const setValue = (next: OpenEvoJsonValue) => onChange({ ...overrideValue, [name]: next });
         const removeValue = () => {
-          const next = { ...value };
+          const next = { ...overrideValue };
           delete next[name];
           onChange(next);
         };
@@ -74,17 +84,20 @@ function ObjectFields({
               <label className="schema-optional-toggle">
                 <input
                   type="checkbox"
-                  checked={present}
-                  onChange={(event) => event.currentTarget.checked ? setValue(defaultValue(child)) : removeValue()}
+                  checked={overridePresent}
+                  onChange={(event) => event.currentTarget.checked
+                    ? setValue(effectivePresent ? structuredClone(effectiveValue[name]) : defaultValue(child))
+                    : removeValue()}
                 />
                 <span>Configure {label}</span>
               </label>
             ) : null}
-            {required || present ? (
+            {required || effectivePresent || overridePresent ? (
               <SchemaField
                 schema={child}
                 label={label}
-                value={present ? value[name] : defaultValue(child)}
+                value={effectivePresent ? effectiveValue[name] : defaultValue(child)}
+                overrideValue={overridePresent ? overrideValue[name] : undefined}
                 path={`${path}.${name}`}
                 onChange={setValue}
               />
@@ -100,12 +113,14 @@ function SchemaField({
   schema,
   label,
   value,
+  overrideValue,
   path,
   onChange,
 }: {
   schema: OpenEvoConfigSchema;
   label: string;
   value: OpenEvoJsonValue | undefined;
+  overrideValue: OpenEvoJsonValue | undefined;
   path: string;
   onChange: (value: OpenEvoJsonValue) => void;
 }) {
@@ -117,7 +132,7 @@ function SchemaField({
           <input type="checkbox" checked={!isNull} onChange={(event) => onChange(event.currentTarget.checked ? defaultValue(schema.valueSchema) : null)} />
           <span>Set {label}</span>
         </label>
-        {!isNull ? <SchemaField schema={schema.valueSchema} label={label} value={value} path={path} onChange={onChange} /> : null}
+        {!isNull ? <SchemaField schema={schema.valueSchema} label={label} value={value} overrideValue={overrideValue} path={path} onChange={onChange} /> : null}
       </div>
     );
   }
@@ -126,11 +141,12 @@ function SchemaField({
   }
   if (schema.kind === "object") {
     const objectValue = isJsonObject(value) ? value : {};
+    const objectOverride = isJsonObject(overrideValue) ? overrideValue : {};
     return (
       <fieldset className="schema-group">
         <legend>{label}</legend>
         {schema.description ? <p>{schema.description}</p> : null}
-        <ObjectFields schema={schema} value={objectValue} path={path} onChange={onChange} />
+        <ObjectFields schema={schema} effectiveValue={objectValue} overrideValue={objectOverride} path={path} onChange={onChange} />
       </fieldset>
     );
   }

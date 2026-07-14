@@ -33,6 +33,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DesktopApiError } from "../api/v1/client";
 import type { OpenEvoJsonObject } from "../api/evolutionConfigSchema";
 import type {
+  ApiErrorV1,
   ArtifactContentV1,
   ArtifactDiffV1,
   ArtifactV1,
@@ -51,6 +52,7 @@ import {
   type DesktopProductProvider,
   type DesktopProductSnapshot,
   type ProductMutationIntent,
+  type ProductArtifactCollectionState,
   type ProductResourceMutationIntent,
   ProductRefreshOrder,
   unavailableDesktopProductProvider,
@@ -61,7 +63,13 @@ type ProductEvolutionTargets = ProjectV1["evolution"]["targets"];
 
 type Workspace = "research" | "evolution" | "system";
 type AsyncState = "idle" | "working";
-type ActionRecovery = "readmit_run" | null;
+type ActionRecovery = { readonly kind: "readmit_run"; readonly projectId: string } | null;
+type ActionAttemptResult = {
+  readonly saved: boolean;
+  readonly error: unknown | null;
+  readonly refreshedSnapshot: DesktopProductSnapshot | null;
+};
+type SaveAttemptResult = { readonly saved: boolean; readonly replaceActionId: boolean };
 
 export interface DesktopProductAppProps {
   provider?: DesktopProductProvider;
@@ -82,15 +90,15 @@ export function DesktopProductApp({
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
   const refreshOrder = useRef(new ProductRefreshOrder());
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<DesktopProductSnapshot | null> => {
     const sequence = refreshOrder.current.begin();
     try {
       const result = await provider.refresh();
-      if (!refreshOrder.current.isCurrent(sequence)) return;
+      if (!refreshOrder.current.isCurrent(sequence)) return null;
       if (result.status !== "fresh") {
         setSnapshot((current) => current ? { ...current, stream: result.stream } : current);
         if (result.status === "error") setLoadError(userMessage(result.stream.error));
-        return;
+        return null;
       }
       const next = result.snapshot;
       setSnapshot(next);
@@ -101,6 +109,7 @@ export function DesktopProductApp({
         }
         return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
       });
+      return next;
     } catch (error) {
       if (refreshOrder.current.isCurrent(sequence)) {
         setSnapshot((current) => current ? {
@@ -109,6 +118,7 @@ export function DesktopProductApp({
         } : current);
         setLoadError(userMessage(error));
       }
+      return null;
     }
   }, [provider]);
 
@@ -148,26 +158,27 @@ export function DesktopProductApp({
   const projectRuns = stableRunOrder(snapshot?.runs.filter((run) => run.project_id === project?.project_id) ?? []);
   const activeRun = projectRuns.find((run) => !isTerminal(run.state)) ?? null;
 
-  const act = useCallback(async (action: () => Promise<unknown>, conflictRecovery: ActionRecovery = null): Promise<boolean> => {
+  const act = useCallback(async (action: () => Promise<unknown>, conflictRecovery: ActionRecovery = null): Promise<ActionAttemptResult> => {
     setActionState("working");
     setActionError(null);
     setActionRecovery(null);
     try {
       await action();
-      await refresh();
-      return true;
+      const refreshedSnapshot = await refresh();
+      return { saved: true, error: null, refreshedSnapshot };
     } catch (error) {
+      let refreshedSnapshot: DesktopProductSnapshot | null = null;
       if (error instanceof DesktopApiError && [409, 410, 412].includes(error.apiError.http_status)) {
         if (error.apiError.http_status === 410) {
           setSnapshot((current) => current ? { ...current, stream: { status: "cursor_reset", epoch: current.stream.epoch, resumeFromEventId: null } } : current);
         }
-        await refresh();
-        if (error.apiError.http_status === 409 && error.apiError.category === "run") {
+        refreshedSnapshot = await refresh();
+        if (conflictRecovery && canReadmitRun(error.apiError, refreshedSnapshot, conflictRecovery.projectId)) {
           setActionRecovery(conflictRecovery);
         }
       }
       setActionError(userMessage(error));
-      return false;
+      return { saved: false, error, refreshedSnapshot };
     } finally {
       setActionState("idle");
     }
@@ -250,9 +261,9 @@ export function DesktopProductApp({
             title="Action could not be completed"
             detail={actionError}
             onDismiss={() => { setActionError(null); setActionRecovery(null); }}
-            actionLabel={actionRecovery === "readmit_run" ? "Re-admit session" : undefined}
-            onAction={actionRecovery === "readmit_run" && project
-              ? () => void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), "readmit_run")
+            actionLabel={actionRecovery?.kind === "readmit_run" ? "Re-admit session" : undefined}
+            onAction={actionRecovery?.kind === "readmit_run" && project && actionRecovery.projectId === project.project_id
+              ? () => void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), actionRecovery)
               : undefined}
           /> : null}
           <ConnectionGate
@@ -285,7 +296,7 @@ export function DesktopProductApp({
               canStart={canStart}
               startReason={startReason}
               busy={actionState === "working"}
-              onStart={() => project && void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), "readmit_run")}
+              onStart={() => project && void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), { kind: "readmit_run", projectId: project.project_id })}
               onCancel={() => activeRun && void act(() => provider.cancelRun(activeRun.run_id, resourceIntent(snapshot, activeRun.etag)))}
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
               onOpenEvolution={() => setWorkspace("evolution")}
@@ -298,6 +309,7 @@ export function DesktopProductApp({
               project={project}
               runs={projectRuns}
               artifacts={snapshot.artifacts.filter((artifact) => artifact.project_id === project?.project_id)}
+              artifactCollection={snapshot.artifactCollection}
               provider={provider}
               onRefresh={() => void refresh()}
             />
@@ -330,7 +342,9 @@ export function DesktopProductApp({
           onClose={() => setSettingsOpen(false)}
           onRetryCapabilities={() => refresh()}
           onSave={async (input, actionId) => {
-            const saved = await act(async () => {
+            const requestEpoch = snapshot.stream.epoch;
+            const requestEtag = project && !creatingProject ? project.etag : null;
+            const result = await act(async () => {
               if (project && !creatingProject) {
                 await provider.updateProject(project.project_id, input, resourceIntent(snapshot, project.etag, actionId));
               } else {
@@ -347,11 +361,14 @@ export function DesktopProductApp({
                 setSelectedProjectId(created.project_id);
               }
             });
-            if (saved) setSettingsOpen(false);
-            return saved;
+            if (result.saved) setSettingsOpen(false);
+            return {
+              saved: result.saved,
+              replaceActionId: requestPreconditionChanged(result, requestEpoch, requestEtag === null ? null : { kind: "project", id: project!.project_id, etag: requestEtag }),
+            };
           }}
           onSelectSource={() => provider.selectProjectSource({ ...mutationIntent(snapshot), kind: "native_folder_snapshot" })}
-          onSyncSource={project?.source.kind === "native_folder_snapshot" ? () => act(() => provider.syncProjectWorkspace(project.project_id, resourceIntent(snapshot, project.etag))) : undefined}
+          onSyncSource={project?.source.kind === "native_folder_snapshot" ? () => act(() => provider.syncProjectWorkspace(project.project_id, resourceIntent(snapshot, project.etag))).then((result) => result.saved) : undefined}
         />
       ) : null}
       {connectionSettingsOpen ? (
@@ -360,11 +377,16 @@ export function DesktopProductApp({
           busy={actionState === "working"}
           onClose={() => setConnectionSettingsOpen(false)}
           onSave={async (input, actionId) => {
-            const saved = await act(() => profile
+            const requestEpoch = snapshot.stream.epoch;
+            const requestEtag = profile?.etag ?? null;
+            const result = await act(() => profile
               ? provider.updateProfile(profile.profile_id, input, resourceIntent(snapshot, profile.etag, actionId))
               : provider.createProfile(input, mutationIntent(snapshot, actionId)));
-            if (saved) setConnectionSettingsOpen(false);
-            return saved;
+            if (result.saved) setConnectionSettingsOpen(false);
+            return {
+              saved: result.saved,
+              replaceActionId: requestPreconditionChanged(result, requestEpoch, requestEtag === null ? null : { kind: "profile", id: profile!.profile_id, etag: requestEtag }),
+            };
           }}
           onConfigureCredential={(slotKind) => profile
             ? act(() => provider.configureCredential(profile.profile_id, slotKind, resourceIntent(snapshot, profile.etag))).then(() => undefined)
@@ -706,9 +728,11 @@ function RunOutcomeSummary({ run, onOpenEvolution, recovery }: { run: RunV1; onO
   );
 }
 
-function EvolutionWorkspace({ project, runs, artifacts, provider, onRefresh }: { project: ProjectV1 | null; runs: readonly RunV1[]; artifacts: readonly ArtifactV1[]; provider: DesktopProductProvider; onRefresh: () => void }) {
+function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, provider, onRefresh }: { project: ProjectV1 | null; runs: readonly RunV1[]; artifacts: readonly ArtifactV1[]; artifactCollection: ProductArtifactCollectionState; provider: DesktopProductProvider; onRefresh: () => void }) {
   const activeRevision = project ? authoritativeActiveRevision(project, runs) : null;
-  const orderedArtifacts = activeRevision ? selectedArtifactsForRevision(artifacts, activeRevision.revision_id) : [];
+  const orderedArtifacts = activeRevision && artifactCollection.status === "complete"
+    ? selectedArtifactsForRevision(artifacts, activeRevision.revision_id)
+    : [];
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(orderedArtifacts[0]?.artifact_id ?? null);
   const [view, setView] = useState<"content" | "diff">("content");
   const [content, setContent] = useState<ArtifactContentV1 | null>(null);
@@ -717,9 +741,9 @@ function EvolutionWorkspace({ project, runs, artifacts, provider, onRefresh }: {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!selectedArtifactId || artifacts.some((artifact) => artifact.artifact_id === selectedArtifactId)) return;
+    if (!selectedArtifactId || orderedArtifacts.some((artifact) => artifact.artifact_id === selectedArtifactId)) return;
     setSelectedArtifactId(orderedArtifacts[0]?.artifact_id ?? null);
-  }, [artifacts, selectedArtifactId]);
+  }, [artifactCollection.status, artifacts, selectedArtifactId]);
   useEffect(() => {
     if (!selectedArtifactId && orderedArtifacts[0]) setSelectedArtifactId(orderedArtifacts[0].artifact_id);
   }, [artifacts, selectedArtifactId]);
@@ -752,6 +776,8 @@ function EvolutionWorkspace({ project, runs, artifacts, provider, onRefresh }: {
       </section>
       {!activeRevision ? (
         <EmptyState icon={RefreshCw} title="Revision relation is unknown" detail="Refetch before inspecting selected artifacts for the next session." action="Refetch revision" actionIcon={RefreshCw} onAction={onRefresh} />
+      ) : artifactCollection.status !== "complete" ? (
+        <EmptyState icon={RefreshCw} title="Artifact collection is incomplete" detail="Refetch all artifact pages before inspecting revision membership." action="Refetch artifacts" actionIcon={RefreshCw} onAction={onRefresh} />
       ) : orderedArtifacts.length === 0 ? (
         <EmptyState icon={MemoryStick} title="No evolved artifacts yet" detail="Complete a session to create memory, skills, and agent guidance for the next revision." />
       ) : (
@@ -885,7 +911,7 @@ function RemoteWorkspaceDrawer({
   profile: RemoteProfileV1 | null;
   busy: boolean;
   onClose: () => void;
-  onSave: (input: ProfileCreateV1, actionId: string) => Promise<boolean>;
+  onSave: (input: ProfileCreateV1, actionId: string) => Promise<SaveAttemptResult>;
   onConfigureCredential: (slotKind: RemoteProfileV1["credential_slots"][number]["kind"]) => Promise<unknown>;
 }) {
   const [name, setName] = useState(profile?.name ?? "Research server");
@@ -941,7 +967,7 @@ function RemoteWorkspaceDrawer({
             https_url: httpsProxy.trim() || null,
             no_proxy: noProxy.split(",").map((value) => value.trim()).filter(Boolean),
           },
-        }, saveActionId.current).then((saved) => { if (!saved) saveActionId.current = newActionId(); })}><Save size={15} /> {busy ? "Saving..." : "Save workspace"}</button></div>
+        }, saveActionId.current).then((result) => { if (result.replaceActionId) saveActionId.current = newActionId(); })}><Save size={15} /> {busy ? "Saving..." : "Save workspace"}</button></div>
       </aside>
     </div>
   );
@@ -970,7 +996,7 @@ function SettingsDrawer({
   busy: boolean;
   onClose: () => void;
   onRetryCapabilities: () => Promise<unknown>;
-  onSave: (input: ProjectPatchV1, actionId: string) => Promise<boolean>;
+  onSave: (input: ProjectPatchV1, actionId: string) => Promise<SaveAttemptResult>;
   onSelectSource: () => Promise<ProjectSourceV1>;
   onSyncSource?: () => Promise<boolean>;
 }) {
@@ -1071,13 +1097,14 @@ function SettingsDrawer({
                 <select aria-label={`${row.displayName} method`} value={row.selection.method ?? ""} disabled={!row.capability || !row.selection.enabled} onChange={(event) => {
                   const selected = row.choices.find((choice) => choice.id === event.currentTarget.value);
                   if (!selected?.selectable) return;
-                  setEvolution((current) => ({ ...current, [row.targetId]: { enabled: row.selection.enabled, method: selected.id, config: selected.defaultConfig } }));
+                  setEvolution((current) => ({ ...current, [row.targetId]: { enabled: row.selection.enabled, method: selected.id, config: {} } }));
                   markDirty();
                 }}>
                   {row.choices.map((choice) => <option key={`${choice.kind}-${choice.id}`} value={choice.id ?? ""} disabled={!choice.selectable}>{choice.label}{choice.supported ? "" : " (unavailable)"}</option>)}
                 </select>
                 {row.selection.enabled && row.selectedChoice?.configSchema ? <MethodConfigEditor
                   schema={row.selectedChoice.configSchema}
+                  defaultConfig={row.selectedChoice.defaultConfig as OpenEvoJsonObject}
                   value={row.selection.config as OpenEvoJsonObject}
                   disabled={busy}
                   onChange={(config) => {
@@ -1098,7 +1125,7 @@ function SettingsDrawer({
           source,
           execution: mode === "self-deployed" ? selfDeployedExecution(activeModel.trim()) : subscriptionExecution(activeModel.trim()),
           evolution: { targets: evolution },
-        }, saveActionId.current).then((saved) => { if (!saved) saveActionId.current = newActionId(); })}><Save size={15} /> {busy ? "Saving..." : "Save"}</button></div>
+        }, saveActionId.current).then((result) => { if (result.replaceActionId) saveActionId.current = newActionId(); })}><Save size={15} /> {busy ? "Saving..." : "Save"}</button></div>
       </aside>
     </div>
   );
@@ -1204,8 +1231,11 @@ function evolutionTargetRows(
     }
     const selectedChoice = choices.find((choice) => choice.id === selection.method);
     const defaultChoice = choices.find((choice) => choice.id === capability?.effective_default_method_id && choice.kind === "method" && choice.supported);
-    const configErrors = selectedChoice?.configSchema ? methodConfigErrors(selectedChoice.configSchema, selection.config as OpenEvoJsonObject) : [];
+    const configErrors = selectedChoice?.configSchema
+      ? methodConfigErrors(selectedChoice.configSchema, selectedChoice.defaultConfig as OpenEvoJsonObject, selection.config as OpenEvoJsonObject)
+      : [];
     const valid = !selection.enabled || Boolean(selectedChoice?.supported && configErrors.length === 0);
+    const supportedSelection = Boolean(selectedChoice?.supported && selection.method !== null);
     return {
       targetId,
       displayName: capability?.display_name ?? artifactTypeLabel(targetId),
@@ -1215,14 +1245,14 @@ function evolutionTargetRows(
       choices,
       selectedChoice: selectedChoice ?? null,
       valid,
-      canEnable: capability?.effective_default_method_id !== null && Boolean((selectedChoice?.supported && selection.method) || defaultChoice),
+      canEnable: Boolean(supportedSelection || defaultChoice),
       reason: capability
-        ? capability.effective_default_method_id === null
-          ? "No supported default is available from the remote registry."
-          : selection.method === null
+        ? supportedSelection
+          ? configErrors[0] ?? ""
+          : selection.method === null && capability.effective_default_method_id === null
+            ? "No supported default is available from the remote registry."
+            : selection.method === null
             ? "Choose a supported method before running."
-          : selectedChoice?.supported
-            ? configErrors[0] ?? ""
             : "The saved method is unsupported for this project and mode. Disable the target or choose a supported method."
         : "This target is unavailable in the remote registry. Disable it before running.",
     };
@@ -1234,14 +1264,14 @@ function enableTarget(row: EvolutionTargetConfigRow): ProductEvolutionTargets[st
   if (selected?.supported && row.selection.method !== null) return { ...row.selection, enabled: true };
   const defaultChoice = row.choices.find((choice) => choice.id === row.capability?.effective_default_method_id && choice.kind === "method" && choice.supported);
   if (!defaultChoice?.id) return row.selection;
-  return { enabled: true, method: defaultChoice.id, config: structuredClone(defaultChoice.defaultConfig) };
+  return { enabled: true, method: defaultChoice.id, config: {} };
 }
 
 function defaultEvolution(capabilities: ProjectCapabilitiesV1 | null): ProductEvolutionTargets {
   return Object.fromEntries((capabilities?.targets ?? []).filter((target) => target.release_enabled && target.effective_default_method_id !== null).map((target) => [target.target_id, {
     enabled: true,
     method: target.effective_default_method_id,
-    config: target.methods.find((method) => method.method_id === target.effective_default_method_id)?.default_config ?? {},
+    config: {},
   }])) as ProductEvolutionTargets;
 }
 
@@ -1266,18 +1296,12 @@ function subscriptionExecution(codexModel: string): ProjectV1["execution"] {
 }
 
 function selectedArtifactsForRevision(artifacts: readonly ArtifactV1[], revisionId: string): ArtifactV1[] {
-  const seen = new Set<string>();
-  const ordered = artifacts
+  return artifacts
     .filter((artifact) => artifact.selected && artifact.artifact_type !== "parametric_memory" && artifact.revision_ids.includes(revisionId))
     .sort((left, right) => {
       const time = Date.parse(right.created_at) - Date.parse(left.created_at);
       return time || left.artifact_id.localeCompare(right.artifact_id);
     });
-  return ordered.filter((artifact) => {
-    if (seen.has(artifact.target_id) || artifact.artifact_type === "parametric_memory") return false;
-    seen.add(artifact.target_id);
-    return true;
-  });
 }
 
 function currentGeneration(project: ProjectV1, runs: readonly RunV1[]): number | null {
@@ -1372,6 +1396,35 @@ function formatTime(timestamp: string): string {
 
 function isTerminal(state: RunV1["state"]): boolean {
   return state === "succeeded" || state === "failed" || state === "cancelled";
+}
+
+function canReadmitRun(
+  error: ApiErrorV1,
+  snapshot: DesktopProductSnapshot | null,
+  projectId: string,
+): boolean {
+  return error.http_status === 409
+    && error.category === "run"
+    && error.code === "run_admission_conflict"
+    && error.retryable
+    && error.repair_action === "openevo_can_retry"
+    && snapshot?.stream.status === "fresh"
+    && !snapshot.runs.some((run) => run.project_id === projectId && !isTerminal(run.state));
+}
+
+function requestPreconditionChanged(
+  result: ActionAttemptResult,
+  requestEpoch: number,
+  resource: { readonly kind: "profile" | "project"; readonly id: string; readonly etag: string } | null,
+): boolean {
+  if (!(result.error instanceof DesktopApiError) || ![409, 412].includes(result.error.apiError.http_status)) return false;
+  const refreshed = result.refreshedSnapshot;
+  if (!refreshed || refreshed.stream.status !== "fresh") return false;
+  if (!resource) return refreshed.stream.epoch !== requestEpoch;
+  const current = resource.kind === "profile"
+    ? refreshed.profiles.find((profile) => profile.profile_id === resource.id)
+    : refreshed.projects.find((project) => project.project_id === resource.id);
+  return refreshed.stream.epoch !== requestEpoch || current?.etag !== resource.etag;
 }
 
 function userMessage(error: unknown): string {

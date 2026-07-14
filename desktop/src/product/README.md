@@ -22,21 +22,30 @@ folder selection must eventually return only `ProjectSourceV1` with an opaque
 The renderer treats capability payloads as project-and-execution-mode scoped.
 An unavailable payload has an explicit retry action and never falls back to a
 local method table. Visible method configuration is rendered from the remote
-closed JSON schema; a target with no effective remote default cannot be
-enabled. Existing hidden accepted methods and Core-owned selection resolvers
-remain distinct from visible choices.
+closed JSON schema. The editor deterministically deep-merges a method's
+`default_config` with the project's partial override for display and
+validation, while persisting only the user override. A target with no effective
+remote default can still be re-enabled when it retains a supported explicit
+method; an empty or invalid selection requires an effective default. Existing
+hidden accepted methods and Core-owned selection resolvers remain distinct
+from visible choices.
 
 Run outcomes are rendered from their typed states. Queued reasons and failed
 run errors remain visible, and recovery creates a fresh admission instead of
 rewriting a terminal attempt. HTTP 409, 410, and 412 responses trigger an
-authoritative snapshot reload; an expired cursor is reset before reload, and
-an uncertain mutation is never replayed automatically. Drawer drafts survive
-these reloads and require confirmation before Escape, overlay, or close-button
-dismissal.
+authoritative snapshot reload; an expired cursor is reset before reload.
+Re-admission is offered only for an allowlisted retryable admission conflict
+when the refreshed snapshot has no equivalent active or pending run. Drawer
+drafts retain their action identity after an uncertain response. The identity
+changes only when draft content changes or a 409/412 refresh establishes a new
+request precondition. Drafts survive reloads and require confirmation before
+Escape, overlay, or close-button dismissal.
 
 Revision generation is shown only when `ProjectV1.current_revision_id` has a
 consistent active revision reference. Artifact lists use selected artifacts
 whose explicit revision membership includes that revision, sorted by
-`created_at` and then `artifact_id`. Missing or conflicting evidence is shown as
-unknown with a refetch action rather than inferred from list order or a loaded
-run.
+`created_at` and then `artifact_id`; multiple selected members for one target
+remain visible. The provider marks the collection complete only after all
+cursor pages have been aggregated. Partial collections and missing or
+conflicting revision evidence are shown as unknown with a refetch action rather
+than inferred from list order or a loaded run.

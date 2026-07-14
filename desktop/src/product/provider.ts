@@ -66,6 +66,10 @@ export type ProjectValidationState =
   | { readonly status: "unavailable"; readonly projectId: string; readonly executionMode: ProjectV1["execution"]["mode"]; readonly projectEtag: string; readonly error: ApiErrorV1 | null }
   | { readonly status: "ready"; readonly projectId: string; readonly executionMode: ProjectV1["execution"]["mode"]; readonly projectEtag: string; readonly value: ProjectValidationV1 };
 
+export type ProductArtifactCollectionState =
+  | { readonly status: "complete" }
+  | { readonly status: "incomplete"; readonly reason: "pagination_pending" | "refresh_failed" };
+
 export interface DesktopProductSnapshot {
   readonly state: DesktopStateV1;
   readonly profiles: readonly RemoteProfileV1[];
@@ -73,6 +77,7 @@ export interface DesktopProductSnapshot {
   readonly runs: readonly RunV1[];
   readonly timelines: Readonly<Record<string, readonly TimelineEntryV1[]>>;
   readonly artifacts: readonly ArtifactV1[];
+  readonly artifactCollection: ProductArtifactCollectionState;
   readonly services: readonly ServiceV1[];
   readonly capability: ProjectCapabilityState | null;
   readonly validation: ProjectValidationState | null;

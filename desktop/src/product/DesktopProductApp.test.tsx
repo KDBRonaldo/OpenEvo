@@ -273,9 +273,43 @@ describe("DesktopProductApp", () => {
     });
   });
 
-  it("does not enable a target when the remote effective default is null", async () => {
+  it("deep-merges method defaults for display while saving only the partial user override", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useEditableMethodSchemaWithPartialOverride();
+    root = await renderProduct(provider);
+    await clickAria("Project settings");
+
+    expect(labelledControl<HTMLInputElement>("Reflection prompt", "input").value).toBe("Keep durable findings.");
+    expect(labelledControl<HTMLInputElement>("Iterations", "input").value).toBe("5");
+    expect(labelledControl<HTMLInputElement>("Minimum score", "input").value).toBe("0.5");
+    setInput("Minimum score", "0.8");
+    await clickButton("Save");
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
+    expect(refreshed.snapshot.projects[0]?.evolution.targets.text_memory?.config).toEqual({
+      iterations: 5,
+      advanced: { minimum_score: 0.8 },
+    });
+  });
+
+  it("re-enables a supported saved method without an effective default", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useNullEffectiveDefault();
+    root = await renderProduct(provider);
+    await clickAria("Project settings");
+
+    const toggle = document.querySelector<HTMLInputElement>('.target-toggle[data-target-id="text_memory"] input[role="switch"]');
+    expect(toggle?.checked).toBe(false);
+    expect(toggle?.disabled).toBe(false);
+    await act(async () => toggle?.click());
+    expect(toggle?.checked).toBe(true);
+    expect(document.querySelector<HTMLSelectElement>('select[aria-label="Text memory method"]')?.value).toBe("reference_text_memory");
+  });
+
+  it("requires an effective default when a disabled target has no saved method", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useNullEffectiveDefaultWithoutSavedMethod();
     root = await renderProduct(provider);
     await clickAria("Project settings");
 
@@ -305,7 +339,7 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Preparing the remote workspace.");
   });
 
-  it("uses selected revision membership and stable time/id ordering for artifacts", async () => {
+  it("shows every selected revision member, including multiple artifacts for one target, in stable order", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useAuthoritativeArtifactOrderingScenario();
     root = await renderProduct(provider);
@@ -315,12 +349,31 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Revision 4");
     expect(screenText()).not.toContain("Unselected newer artifact");
     const artifactNames = Array.from(document.querySelectorAll(".artifact-list-item strong"), (item) => item.textContent);
-    expect(artifactNames).toEqual(["Skills", "Text memory", "Agent guidance"]);
+    expect(artifactNames).toEqual(["Skills", "Text memory", "Text memory", "Agent guidance"]);
+    const artifactSummaries = Array.from(document.querySelectorAll(".artifact-list-item small"), (item) => item.textContent);
+    expect(artifactSummaries).toEqual([
+      "Reusable analysis and validation routines.",
+      "Additional selected memory",
+      "Durable findings and constraints from this session.",
+      "Updated operating guidance for the next session.",
+    ]);
 
     provider.makeRevisionEvidenceUnknown();
     await flush();
     expect(screenText()).toContain("Revision unknown");
     expect(button("Refetch revision").disabled).toBe(false);
+  });
+
+  it("does not present a partial paginated artifact collection as complete revision membership", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useAuthoritativeArtifactOrderingScenario();
+    provider.markArtifactCollectionIncomplete();
+    root = await renderProduct(provider);
+    await clickButton("Evolution");
+
+    expect(screenText()).toContain("Artifact collection is incomplete");
+    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(0);
+    expect(button("Refetch artifacts").disabled).toBe(false);
   });
 
   it("reloads typed 409/410/412 failures without replaying stale mutations", async () => {
@@ -350,6 +403,80 @@ describe("DesktopProductApp", () => {
     expect(provider.runStartAttempts()).toBe(3);
     expect(provider.refreshCount()).toBeGreaterThanOrEqual(4);
     expect(screenText()).toContain("The event cursor expired.");
+  });
+
+  it("offers re-admission only for an explicitly retryable admission conflict with no equivalent run", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+
+    provider.failNextRunStartWithConflict({
+      code: "idempotency_key_reused",
+      retryable: false,
+      repairAction: "none",
+    });
+    await clickButton("Start session");
+    expect(screenText()).toContain("That action identity belongs to another request.");
+    expect(optionalButton("Re-admit session")).toBeNull();
+
+    provider.failNextRunStartWithConflict({
+      code: "run_admission_conflict",
+      retryable: true,
+      repairAction: "openevo_can_retry",
+      addEquivalentRun: true,
+    });
+    await clickButton("Start session");
+    expect(screenText()).toContain("The original session is already queued.");
+    expect(screenText()).toContain("Active session");
+    expect(optionalButton("Re-admit session")).toBeNull();
+  });
+
+  it("keeps update action identities across uncertain responses and replaces them after a changed precondition", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    setInput("Objective", "Keep one project update identity.");
+    provider.failNextProjectSaveWithUnknownError();
+    await clickButton("Save");
+    await clickButton("Save");
+    const uncertainIds = provider.projectUpdateActionIds();
+    expect(uncertainIds[0]).toBe(uncertainIds[1]);
+
+    await clickAria("Project settings");
+    setInput("Objective", "Use a new identity after editing.");
+    provider.failNextProjectSaveWithStatus(412);
+    await clickButton("Save");
+    await clickButton("Save");
+    const allIds = provider.projectUpdateActionIds();
+    expect(allIds[2]).not.toBe(allIds[1]);
+    expect(allIds[3]).not.toBe(allIds[2]);
+
+    await clickAria("Remote workspace settings");
+    setInput("Workspace name", "Keep one profile update identity.");
+    provider.failNextProfileSaveWithUnknownError();
+    await clickButton("Save workspace");
+    await clickButton("Save workspace");
+    expect(provider.profileUpdateActionIds()[0]).toBe(provider.profileUpdateActionIds()[1]);
+  });
+
+  it("keeps create action identities when profile and project responses are uncertain", async () => {
+    provider = createFixtureDesktopProductProvider({ newUser: true });
+    root = await renderProduct(provider);
+
+    await clickButton("Add workspace");
+    setInput("Server address", "lab.example.test");
+    setInput("User name", "researcher");
+    provider.failNextProfileCreateWithUnknownError();
+    await clickButton("Save workspace");
+    await clickButton("Save workspace");
+    expect(provider.profileCreateActionIds()[0]).toBe(provider.profileCreateActionIds()[1]);
+
+    await clickAria("Create project");
+    setInput("Objective", "Keep one project create identity.");
+    provider.failNextProjectCreateWithUnknownError();
+    await clickButton("Save");
+    await clickButton("Save");
+    expect(provider.projectCreateActionIds()[0]).toBe(provider.projectCreateActionIds()[1]);
   });
 
   it("marks segmented controls as tabs with an explicit selected state", async () => {
@@ -502,6 +629,11 @@ function button(label: string): HTMLButtonElement {
   const target = enabled ?? matches[0];
   if (!target) throw new Error(`Button ${label} was not found.`);
   return target;
+}
+
+function optionalButton(label: string): HTMLButtonElement | null {
+  return Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+    .find((item) => item.textContent?.trim() === label) ?? null;
 }
 
 function setInput(label: string, value: string): void {

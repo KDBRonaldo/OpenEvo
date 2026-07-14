@@ -53,6 +53,7 @@ const B = "b".repeat(64);
 const C = "c".repeat(64);
 const D = "d".repeat(64);
 const ETAG_A = `"${A}"`;
+const ETAG_B = `"${B}"`;
 const ETAG_D = `"${D}"`;
 const NOW = "2026-07-14T12:00:00Z";
 
@@ -77,6 +78,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private runs: RunV1[] = [];
   private timelines: Record<string, TimelineEntryV1[]> = {};
   private artifacts: ArtifactV1[] = [];
+  private artifactCollection: DesktopProductSnapshot["artifactCollection"] = { status: "complete" };
   private services: ServiceV1[];
   private capabilities: ProjectCapabilitiesV1 | null;
   private validation: ProjectValidationV1 | null;
@@ -84,14 +86,28 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private readonly actionSignatures = new Map<string, string>();
   private failProjectSave = false;
   private failProjectSaveWithUnknownError = false;
+  private failProfileSaveWithUnknownError = false;
+  private failProfileCreateWithUnknownError = false;
+  private failProjectCreateWithUnknownError = false;
   private failRefresh = false;
   private restoreCapabilitiesOnRefresh: ProjectCapabilitiesV1 | null = null;
   private capabilityRefreshesBeforeRestore = 0;
   private nextProjectSaveStatus: 412 | null = null;
   private nextRunStartStatus: 409 | 410 | null = null;
+  private nextRunStartConflict: {
+    code: string;
+    message: string;
+    retryable: boolean;
+    repairAction: "none" | "openevo_can_retry" | "user_input_required" | "reconnect_required" | "upgrade_required";
+    addEquivalentRun: boolean;
+  } | null = null;
   private refreshAttempts = 0;
   private projectSaveAttempts = 0;
   private runAdmissionAttempts = 0;
+  private readonly profileCreateActions: string[] = [];
+  private readonly profileUpdateActions: string[] = [];
+  private readonly projectCreateActions: string[] = [];
+  private readonly projectUpdateActions: string[] = [];
   private diagnostic: DiagnosticReportV1 | null;
   private activeOperation: LocalOperationV1 | null = null;
   private readonly contents = new Map<string, ArtifactContentV1>();
@@ -166,6 +182,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       runs: this.runs,
       timelines: this.timelines,
       artifacts: this.artifacts,
+      artifactCollection: this.artifactCollection,
       services: this.services,
       capability,
       validation,
@@ -181,7 +198,12 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   async createProfile(input: ProfileCreateV1, intent: ProductMutationIntent): Promise<RemoteProfileV1> {
+    this.profileCreateActions.push(intent.actionId);
     this.checkIntent(intent, "profile:create");
+    if (this.failProfileCreateWithUnknownError) {
+      this.failProfileCreateWithUnknownError = false;
+      throw new Error("profile response was lost");
+    }
     const credentialKinds = credentialKindsForProfile(input.authentication_kind ?? "ssh_agent", input.proxy);
     const profile = remoteProfileV1Schema.parse({
       schema_version: "1",
@@ -212,8 +234,13 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   async updateProfile(profileId: string, input: ProfilePatchV1, intent: ProductResourceMutationIntent): Promise<RemoteProfileV1> {
+    this.profileUpdateActions.push(intent.actionId);
     const current = this.requireProfile(profileId);
     this.checkIntent(intent, `profile:update:${profileId}`, current.etag);
+    if (this.failProfileSaveWithUnknownError) {
+      this.failProfileSaveWithUnknownError = false;
+      throw new Error("profile response was lost");
+    }
     const authenticationKind = input.authentication_kind ?? current.authentication_kind;
     const proxy = input.proxy ?? current.proxy;
     const requiredKinds = credentialKindsForProfile(authenticationKind, proxy);
@@ -307,7 +334,12 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   async createProject(input: ProjectCreateV1, intent: ProductMutationIntent): Promise<ProjectV1> {
+    this.projectCreateActions.push(intent.actionId);
     this.checkIntent(intent, "project:create");
+    if (this.failProjectCreateWithUnknownError) {
+      this.failProjectCreateWithUnknownError = false;
+      throw new Error("project response was lost");
+    }
     const project = projectV1Schema.parse({
       schema_version: "1",
       project_id: `project-fixture-${this.projects.length + 1}`,
@@ -329,11 +361,17 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   async updateProject(projectId: string, input: ProjectPatchV1, intent: ProductResourceMutationIntent): Promise<ProjectV1> {
     this.projectSaveAttempts += 1;
+    this.projectUpdateActions.push(intent.actionId);
     const current = this.requireProject(projectId);
     this.checkIntent(intent, `project:update:${projectId}`, current.etag);
     if (this.nextProjectSaveStatus) {
       const status = this.nextProjectSaveStatus;
       this.nextProjectSaveStatus = null;
+      const changed = projectV1Schema.parse({ ...current, etag: ETAG_B, updated_at: NOW });
+      this.projects = this.projects.map((project) => project.project_id === projectId ? changed : project);
+      if (this.state.active_project?.project_id === projectId) {
+        this.state = desktopStateV1Schema.parse({ ...this.state, active_project: { ...this.state.active_project, project_etag: changed.etag } });
+      }
       throw this.apiError(status, "etag_precondition_failed", "The project changed remotely.", "project");
     }
     if (this.failProjectSave) {
@@ -395,6 +433,15 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   async startRun(intent: ProductRunIntent): Promise<RunV1> {
     this.runAdmissionAttempts += 1;
+    if (this.nextRunStartConflict) {
+      const conflict = this.nextRunStartConflict;
+      this.nextRunStartConflict = null;
+      if (conflict.addEquivalentRun) this.addEquivalentQueuedRun(intent.projectId);
+      throw this.apiError(409, conflict.code, conflict.message, "run", {
+        retryable: conflict.retryable,
+        repairAction: conflict.repairAction,
+      });
+    }
     if (this.nextRunStartStatus) {
       const status = this.nextRunStartStatus;
       this.nextRunStartStatus = null;
@@ -954,6 +1001,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     code: string,
     message: string,
     category: "project" | "run",
+    options: {
+      retryable?: boolean;
+      repairAction?: "none" | "openevo_can_retry" | "user_input_required" | "reconnect_required" | "upgrade_required";
+    } = {},
   ): DesktopApiError {
     return new DesktopApiError(apiErrorV1Schema.parse({
       schema_version: "1",
@@ -963,12 +1014,42 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       message,
       severity: "blocking",
       category,
-      retryable: true,
-      repair_action: "openevo_can_retry",
+      retryable: options.retryable ?? true,
+      repair_action: options.repairAction ?? "openevo_can_retry",
       next_action: httpStatus === 412 ? "Review the refreshed project and save again." : "Reload the current snapshot before retrying.",
       details: {},
       logs_ref: null,
     }));
+  }
+
+  private addEquivalentQueuedRun(projectId: string): void {
+    const project = this.requireProject(projectId);
+    const base = structuredClone(CONTRACT_FIXTURE_V1.run);
+    const run = runV1Schema.parse({
+      ...base,
+      run_id: "run-equivalent-pending",
+      project_id: projectId,
+      state: "queued",
+      queued_reason: {
+        code: "project_activation_pending",
+        summary: "The original session is already queued.",
+        retry_after_seconds: null,
+      },
+      pinned_revision: this.revision(this.currentGeneration(project), "active"),
+      successor_revision: null,
+      latest_attempt: {
+        ...base.latest_attempt,
+        attempt_id: "attempt-equivalent-pending",
+        state: "queued",
+        started_at: null,
+        finished_at: null,
+      },
+      created_at: NOW,
+      updated_at: NOW,
+      error: null,
+    });
+    this.runs = [run, ...this.runs];
+    this.timelines[run.run_id] = [this.timeline(1, "admission", "queued", "Session admitted", "The original session is already queued.")];
   }
 
   private revision(generation: number, state: "active" | "queued" | "preparing" | "cancelled") {
@@ -1133,6 +1214,23 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.validation = this.makeValidation(updated, this.capabilities);
   }
 
+  useEditableMethodSchemaWithPartialOverride(): void {
+    this.useEditableMethodSchema();
+    const project = this.projects[0];
+    if (!project || !this.capabilities) return;
+    const updated = projectV1Schema.parse({
+      ...project,
+      evolution: {
+        targets: {
+          ...project.evolution.targets,
+          text_memory: { enabled: true, method: "reference_text_memory", config: { iterations: 5 } },
+        },
+      },
+    });
+    this.projects = [updated, ...this.projects.slice(1)];
+    this.validation = this.makeValidation(updated, this.capabilities);
+  }
+
   useNullEffectiveDefault(): void {
     const project = this.projects[0];
     const capabilities = this.capabilities;
@@ -1149,6 +1247,23 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         targets: {
           ...project.evolution.targets,
           text_memory: { enabled: false, method: "reference_text_memory", config: {} },
+        },
+      },
+    });
+    this.projects = [updated, ...this.projects.slice(1)];
+    this.validation = this.makeValidation(updated, this.capabilities);
+  }
+
+  useNullEffectiveDefaultWithoutSavedMethod(): void {
+    this.useNullEffectiveDefault();
+    const project = this.projects[0];
+    if (!project || !this.capabilities) return;
+    const updated = projectV1Schema.parse({
+      ...project,
+      evolution: {
+        targets: {
+          ...project.evolution.targets,
+          text_memory: { enabled: false, method: null, config: {} },
         },
       },
     });
@@ -1230,14 +1345,28 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       : artifact);
     const source = this.artifacts.find((artifact) => artifact.target_id === "text_memory" && artifact.revision_ids.includes("revision-fixture-4"));
     if (source) {
+      const additionalSelected = artifactV1Schema.parse({
+        ...source,
+        artifact_id: "artifact-selected-additional-memory",
+        display_name: "Additional selected memory",
+        summary: "Additional selected memory",
+        selected: true,
+        created_at: "2026-07-14T12:02:00Z",
+      });
+      this.contents.set(additionalSelected.artifact_id, this.makeContent(additionalSelected, 4));
+      this.diffs.set(additionalSelected.artifact_id, this.makeDiff(additionalSelected, source, 4));
       this.artifacts = [artifactV1Schema.parse({
         ...source,
         artifact_id: "artifact-unselected-newer",
         display_name: "Unselected newer artifact",
         selected: false,
         created_at: "2026-07-14T12:04:00Z",
-      }), ...this.artifacts];
+      }), additionalSelected, ...this.artifacts];
     }
+  }
+
+  markArtifactCollectionIncomplete(): void {
+    this.artifactCollection = { status: "incomplete", reason: "pagination_pending" };
   }
 
   makeRevisionEvidenceUnknown(): void {
@@ -1255,12 +1384,55 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.nextRunStartStatus = status;
   }
 
+  failNextRunStartWithConflict(options: {
+    code: string;
+    retryable: boolean;
+    repairAction: "none" | "openevo_can_retry" | "user_input_required" | "reconnect_required" | "upgrade_required";
+    addEquivalentRun?: boolean;
+  }): void {
+    this.nextRunStartConflict = {
+      ...options,
+      message: options.addEquivalentRun
+        ? "The original session is already queued."
+        : "That action identity belongs to another request.",
+      addEquivalentRun: options.addEquivalentRun ?? false,
+    };
+  }
+
+  failNextProfileCreateWithUnknownError(): void {
+    this.failProfileCreateWithUnknownError = true;
+  }
+
+  failNextProfileSaveWithUnknownError(): void {
+    this.failProfileSaveWithUnknownError = true;
+  }
+
+  failNextProjectCreateWithUnknownError(): void {
+    this.failProjectCreateWithUnknownError = true;
+  }
+
   refreshCount(): number {
     return this.refreshAttempts;
   }
 
   projectUpdateAttempts(): number {
     return this.projectSaveAttempts;
+  }
+
+  profileCreateActionIds(): readonly string[] {
+    return [...this.profileCreateActions];
+  }
+
+  profileUpdateActionIds(): readonly string[] {
+    return [...this.profileUpdateActions];
+  }
+
+  projectCreateActionIds(): readonly string[] {
+    return [...this.projectCreateActions];
+  }
+
+  projectUpdateActionIds(): readonly string[] {
+    return [...this.projectUpdateActions];
   }
 
   runStartAttempts(): number {
