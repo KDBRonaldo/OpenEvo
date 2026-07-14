@@ -352,14 +352,27 @@ class DesktopReleaseProvider:
             )
             if reservation.replayed:
                 return self._operation_response(reservation.operation)
-            self._connection_generation += 1
-            generation = self._connection_generation
-            self._connection_owner = profile_id
+            owner_error: RemoteConnectionFailedError | None = None
+            snapshot = self._remote_lifecycle.snapshot()
+            if (
+                operation_kind == "profile_disconnect"
+                and snapshot.profile_id not in {None, profile_id}
+            ):
+                generation = None
+                owner_error = RemoteConnectionFailedError(
+                    "Another remote profile owns the connection."
+                )
+            else:
+                self._connection_generation += 1
+                generation = self._connection_generation
+                self._connection_owner = profile_id
         profile = reservation.profile
         if profile is None:
             raise ProviderStoreError("new profile runtime reservation has no profile snapshot")
 
         try:
+            if owner_error is not None:
+                raise owner_error
             outcome = action(profile)
         except RemoteLifecycleError as exc:
             error = self._remote_action_error(reservation, exc)
@@ -373,12 +386,12 @@ class DesktopReleaseProvider:
                 error=error,
             )
             with self._connection_state_lock:
-                if self._owns_connection_locked(generation, profile_id):
+                if generation is not None and self._owns_connection_locked(generation, profile_id):
                     self._core_state = self._connection_failure_state(profile_id, exc)
             return self._operation_response(operation)
 
         with self._connection_state_lock:
-            if not self._owns_connection_locked(generation, profile_id):
+            if generation is None or not self._owns_connection_locked(generation, profile_id):
                 superseded = RemoteLifecycleSupersededError(
                     "A newer remote lifecycle operation superseded this result."
                 )

@@ -69,6 +69,12 @@ MAX_SCHEMA_OBJECTS = 40
 MAX_SCHEMA_BYTES = 98_304
 STARTUP_OPERATION_BATCH_ROWS = 128
 MAX_STARTUP_OPERATION_ROW_BYTES = MAX_DOCUMENT_BYTES + 16_384
+# Profile reservations always have empty progress/checks; this bounds their largest
+# success, cancellation, or bounded ApiErrorV1 terminal document with ample margin.
+PROFILE_RUNTIME_TERMINAL_SLOT_BYTES = 1_048_576
+PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES = (
+    2 * PROFILE_RUNTIME_TERMINAL_SLOT_BYTES + 16_384
+)
 DEFAULT_IDEMPOTENCY_RECORD_LIMIT = 10_000
 DEFAULT_CURSOR_RECORD_LIMIT = 10_000
 DEFAULT_IDEMPOTENCY_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -1390,6 +1396,7 @@ class DesktopProviderStore:
                 (timestamp,),
             )
             self._reconcile_operations_at_startup(connection)
+            self._validate_write_budget(connection)
             self._verify_storage_files()
             connection.commit()
         except ProviderStoreError:
@@ -1403,7 +1410,7 @@ class DesktopProviderStore:
             raise
 
     @staticmethod
-    def _validate_recovery_budget(connection: sqlite3.Connection) -> None:
+    def _recovery_usage(connection: sqlite3.Connection) -> tuple[int, int]:
         total_rows = 0
         total_bytes = 0
         specifications = (
@@ -1443,8 +1450,42 @@ class DesktopProviderStore:
             ).fetchone()
             total_rows += cast(int, row[0])
             total_bytes += cast(int, row[1])
-            if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
-                raise ProviderDataCorruptionError("provider recovery budget exceeded")
+        return total_rows, total_bytes
+
+    @classmethod
+    def _validate_recovery_budget(cls, connection: sqlite3.Connection) -> None:
+        total_rows, total_bytes = cls._recovery_usage(connection)
+        if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
+            raise ProviderDataCorruptionError("provider recovery budget exceeded")
+
+    @classmethod
+    def _validate_write_budget(cls, connection: sqlite3.Connection) -> None:
+        total_rows, total_bytes = cls._recovery_usage(connection)
+        reservations = cast(
+            int,
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM local_operations AS operation
+                WHERE operation.operation_kind IN (
+                    'profile_connect', 'profile_disconnect', 'host_key_accept'
+                ) AND operation.state IN ('queued', 'running', 'cancelling')
+                  AND EXISTS (
+                    SELECT 1
+                    FROM idempotency_records AS idempotency
+                    WHERE idempotency.response_type = 'LocalOperationV1'
+                      AND idempotency.response_bytes = operation.document_json
+                  )
+                """
+            ).fetchone()[0],
+        )
+        reserved_bytes = reservations * PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES
+        if (
+            total_rows > MAX_RECOVERY_ROWS
+            or total_bytes > MAX_RECOVERY_BYTES
+            or reserved_bytes > MAX_RECOVERY_BYTES - total_bytes
+        ):
+            raise ProviderDataCorruptionError("provider recovery budget exceeded")
 
     def _validate_migration_rows(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
@@ -1589,7 +1630,7 @@ class DesktopProviderStore:
                 connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
                 yield connection
                 if write:
-                    self._validate_recovery_budget(connection)
+                    self._validate_write_budget(connection)
                     self._verify_storage_files()
                 connection.commit()
             except BaseException:
@@ -1916,16 +1957,17 @@ class DesktopProviderStore:
 
             transaction = ProviderMutation(self, connection, if_match=if_match)
             profile = transaction.require_profile_authority(profile_id, if_match=if_match)
-            if displace_existing:
-                transaction.disconnect_other_profiles(profile_id)
             transaction.cancel_nonterminal_profile_operations(profile_id)
-            transaction.set_profile_runtime_state(
-                profile_id,
-                if_match=if_match,
-                connection_state="connecting",
-                credential_slots=profile.credential_slots,
-                host_key_fingerprint=profile.host_key_fingerprint,
-            )
+            if operation_kind != "profile_disconnect":
+                if displace_existing:
+                    transaction.disconnect_other_profiles(profile_id)
+                transaction.set_profile_runtime_state(
+                    profile_id,
+                    if_match=if_match,
+                    connection_state="connecting",
+                    credential_slots=profile.credential_slots,
+                    host_key_fingerprint=profile.host_key_fingerprint,
+                )
             operation = transaction.create_local_operation(
                 operation_kind=operation_kind,
                 resource=ResourceRefV1(resource_type="profile", resource_id=profile_id),
@@ -2152,6 +2194,8 @@ class DesktopProviderStore:
         )
         self._validate_operation_authority(connection, finished)
         response_bytes = _canonical_json_bytes(finished.model_dump(mode="json"))
+        if len(response_bytes) > PROFILE_RUNTIME_TERMINAL_SLOT_BYTES:
+            raise ProviderStoreError("profile runtime terminal response exceeds its reserved slot")
         connection.execute(
             """
             UPDATE local_operations
@@ -2653,7 +2697,7 @@ class DesktopProviderStore:
         force_cancel_nonterminal: bool,
     ) -> LocalOperationV1:
         operation = self._operation_from_row(row)
-        if operation.state == "failed":
+        if operation.state in {"succeeded", "failed", "cancelled"}:
             return operation
         authoritative_result = self._authoritative_operation_result(connection, operation)
         nonterminal = operation.state not in {"succeeded", "failed", "cancelled"}
@@ -2674,6 +2718,15 @@ class DesktopProviderStore:
                 "etag": self._etag("operation", operation.operation_id, version),
             },
         )
+        response_bytes = _canonical_json_bytes(reconciled.model_dump(mode="json"))
+        if (
+            operation.operation_kind in _PROFILE_OPERATION_KINDS
+            and len(response_bytes) > PROFILE_RUNTIME_TERMINAL_SLOT_BYTES
+        ):
+            raise ProviderDataCorruptionError(
+                "profile runtime cancellation exceeds its reserved slot"
+            )
+        previous_bytes = bytes(row["document_json"])
         connection.execute(
             """
             UPDATE local_operations
@@ -2682,11 +2735,19 @@ class DesktopProviderStore:
             WHERE operation_id = ?
             """,
             (
-                _canonical_json_bytes(reconciled.model_dump(mode="json")),
+                response_bytes,
                 version,
                 reconciled.finished_at,
                 reconciled.operation_id,
             ),
+        )
+        connection.execute(
+            """
+            UPDATE idempotency_records
+            SET response_bytes = ?
+            WHERE response_type = 'LocalOperationV1' AND response_bytes = ?
+            """,
+            (response_bytes, previous_bytes),
         )
         return reconciled
 

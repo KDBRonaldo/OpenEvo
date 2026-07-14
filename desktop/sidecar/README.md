@@ -32,18 +32,24 @@ The current provider implements:
   remain only in the process-owned review state and restart recovery removes any
   candidate persisted by an older interrupted implementation.
 
-Connection mutations atomically reserve idempotency capacity, profile action
+Connection mutations atomically reserve idempotency capacity, two fixed terminal
+response slots for the operation and idempotency documents, profile action
 ownership, and a running operation before external SSH work. Replacing profile A
-with B durably disconnects A, cancels A's obsolete operation, closes A's
-transport before resolving B's credential, and records B as the current failed
-owner if synchronous resolution fails. Success or failure finalizes the reserved
-operation without another capacity or request-ETag check. A final persistence
-error closes the successful transport and compensates the reservation to
-failed/disconnected, including the case where SQLite committed before reporting
-an error. Failed operations retain their bounded `ApiErrorV1`, so exact replays
-return the same error and do not probe, accept, connect, or disconnect again.
-Successful connect, host-key accept, and disconnect responses carry the
-operation ETag in both the frozen body and `ETag` header.
+with B durably disconnects A, cancels A's obsolete nonterminal operation, closes
+A's transport before resolving B's credential, and records B as the current
+failed owner if synchronous resolution fails. Disconnect is non-displacing: its
+reservation does not publish `connecting` or alter another profile, and the
+sidecar rejects a profile that does not own the process lifecycle before calling
+the transport. Success, error, and recovery cancellation finalize within the
+reserved slots without another capacity or request-ETag check. A final
+persistence error closes the successful transport and compensates the
+reservation to failed/disconnected, including the case where SQLite committed
+before reporting an error. Failed operations retain their bounded `ApiErrorV1`,
+so exact replays return the same error and do not probe, accept, connect, or
+disconnect again. Once any operation is terminal, its body and ETag are frozen;
+restart resets ephemeral profile connection authority but only cancels truly
+nonterminal reservations, updating their operation and idempotency documents in
+the same recovery transaction.
 
 The production credential resolver currently supports `ssh_agent`. Profiles
 that select native private-key or password authentication fail closed with

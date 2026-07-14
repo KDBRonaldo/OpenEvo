@@ -17,6 +17,7 @@ from desktop.sidecar.contracts.v1 import (
     contract_app,
     create_contract_app,
 )
+import desktop.sidecar.provider_store as provider_store_module
 from desktop.sidecar.provider_store import DesktopProviderStore, ProviderDataCorruptionError
 import desktop.sidecar.release_app as release_app_module
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
@@ -500,6 +501,66 @@ def test_late_failure_cannot_overwrite_newer_profile_connection(tmp_path: Path) 
         assert stored_second["connection_state"] == "connected"
 
 
+def test_disconnect_of_non_owner_does_not_displace_actual_owner(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    lifecycle = FakeRemoteLifecycle()
+
+    def connect(profile) -> RemoteConnectionResult:
+        lifecycle.connect_calls += 1
+        lifecycle.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+        return RemoteConnectionResult(profile.profile_id, "connected")
+
+    lifecycle.connect = connect  # type: ignore[method-assign]
+    app = _app(root, remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        owner = _create_profile(client, name="Owner A", key="profile-owner-a-create").json()
+        other = _create_profile(client, name="Other B", key="profile-other-b-create").json()
+        connected = client.post(
+            f"/desktop/v1/profiles/{owner['profile_id']}/connect",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": owner["etag"],
+                "Idempotency-Key": "profile-owner-a-connect",
+            },
+        )
+        assert connected.status_code == 202
+
+        headers = {
+            **SESSION_HEADERS,
+            "If-Match": other["etag"],
+            "Idempotency-Key": "profile-other-b-disconnect",
+        }
+        failed = client.post(
+            f"/desktop/v1/profiles/{other['profile_id']}/disconnect", headers=headers
+        )
+        replay = client.post(
+            f"/desktop/v1/profiles/{other['profile_id']}/disconnect", headers=headers
+        )
+
+        assert failed.status_code == replay.status_code == 503
+        assert failed.content == replay.content
+        assert lifecycle.disconnect_calls == 0
+        assert lifecycle.current == RemoteLifecycleSnapshot(owner["profile_id"], "connected")
+        assert client.get(
+            f"/desktop/v1/profiles/{owner['profile_id']}", headers=SESSION_HEADERS
+        ).json()["connection_state"] == "connected"
+        assert client.get(
+            f"/desktop/v1/profiles/{other['profile_id']}", headers=SESSION_HEADERS
+        ).json()["connection_state"] == "disconnected"
+        state = client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()["core"]
+        assert state["profile_id"] == owner["profile_id"]
+
+    restarted_lifecycle = FakeRemoteLifecycle()
+    restarted = _app(root, remote_lifecycle=restarted_lifecycle)
+    with TestClient(restarted) as client:
+        restarted_replay = client.post(
+            f"/desktop/v1/profiles/{other['profile_id']}/disconnect", headers=headers
+        )
+        assert restarted_replay.status_code == 503
+        assert restarted_replay.content == failed.content
+        assert restarted_lifecycle.disconnect_calls == 0
+
+
 def test_remote_connection_failure_is_typed_and_does_not_persist_details(
     tmp_path: Path,
 ) -> None:
@@ -566,17 +627,19 @@ def test_remote_connection_failure_is_typed_and_does_not_persist_details(
         assert restarted_lifecycle.connect_calls == 0
 
 
-def test_reserved_action_survives_idempotency_capacity_filling_during_ssh(
-    tmp_path: Path,
+def test_reserved_action_keeps_terminal_byte_slots_during_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    root = tmp_path / "state"
     lifecycle = BlockingRemoteLifecycle()
-    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    app = _app(root, remote_lifecycle=lifecycle)
+    response_body = b""
+    response_etag = ""
     with TestClient(app) as client:
         profile = _create_profile(
             client, name="Capacity owner", key="profile-capacity-create-0001"
         ).json()
         store = app.state.desktop_release_provider._store
-        store._max_idempotency_records = 2
         responses: list[Any] = []
 
         def connect() -> None:
@@ -595,6 +658,13 @@ def test_reserved_action_survives_idempotency_capacity_filling_during_ssh(
         thread.start()
         assert lifecycle.started.wait(2)
         try:
+            with store._transaction(write=False) as connection:
+                _, used_bytes = store._recovery_usage(connection)
+            monkeypatch.setattr(
+                provider_store_module,
+                "MAX_RECOVERY_BYTES",
+                used_bytes + provider_store_module.PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES,
+            )
             saturated = _create_profile(
                 client, name="Capacity contender", key="profile-capacity-create-0002"
             )
@@ -609,6 +679,64 @@ def test_reserved_action_survives_idempotency_capacity_filling_during_ssh(
         assert responses[0].status_code == 202
         assert responses[0].json()["state"] == "succeeded"
         assert lifecycle.connect_calls == 1
+        response_body = responses[0].content
+        response_etag = responses[0].headers["etag"]
+
+    restarted_lifecycle = FakeRemoteLifecycle()
+    restarted = _app(root, remote_lifecycle=restarted_lifecycle)
+    with TestClient(restarted) as client:
+        replay = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": profile["etag"],
+                "Idempotency-Key": "profile-capacity-connect-0001",
+            },
+        )
+        assert replay.status_code == 202
+        assert replay.content == response_body
+        assert replay.headers["etag"] == response_etag
+        assert restarted_lifecycle.connect_calls == 0
+
+
+def test_succeeded_connection_replay_is_exact_across_restart(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    lifecycle = FakeRemoteLifecycle()
+
+    def connect(profile) -> RemoteConnectionResult:
+        lifecycle.connect_calls += 1
+        lifecycle.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+        return RemoteConnectionResult(profile.profile_id, "connected")
+
+    lifecycle.connect = connect  # type: ignore[method-assign]
+    app = _app(root, remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client, name="Frozen success", key="profile-frozen-create-0001"
+        ).json()
+        headers = {
+            **SESSION_HEADERS,
+            "If-Match": profile["etag"],
+            "Idempotency-Key": "profile-frozen-connect-0001",
+        }
+        succeeded = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+        )
+        assert succeeded.status_code == 202
+        assert succeeded.json()["state"] == "succeeded"
+        frozen_body = succeeded.content
+        frozen_etag = succeeded.headers["etag"]
+
+    restarted_lifecycle = FakeRemoteLifecycle()
+    restarted = _app(root, remote_lifecycle=restarted_lifecycle)
+    with TestClient(restarted) as client:
+        replay = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+        )
+        assert replay.status_code == 202
+        assert replay.content == frozen_body
+        assert replay.headers["etag"] == frozen_etag
+        assert restarted_lifecycle.connect_calls == 0
 
 
 @pytest.mark.parametrize("failure_timing", ["before_commit", "after_commit"])

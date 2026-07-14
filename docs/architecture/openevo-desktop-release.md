@@ -363,22 +363,29 @@ commit and non-release channel explicitly. There is no direct-backend fallback.
 
 The release sidecar now owns the initial SSH lifecycle behind the frozen Local
 API profile routes. A connect action atomically validates its idempotency
-envelope and profile ETag, reserves live idempotency capacity, publishes the
-profile as the current `connecting` owner, and creates a running local operation
-before external work. It then either loads an exact
+envelope and profile ETag, reserves live idempotency capacity plus fixed-size
+terminal slots for both persisted response copies, publishes the profile as the
+current `connecting` owner, and creates a running local operation before
+external work. It then either loads an exact
 profile/host/port/fingerprint trust binding or performs a non-mutating
 `ssh-keyscan`. A new key is returned only as an explicit `host_key_review` state.
 Acceptance repeats the probe, requires the same algorithm and fingerprint,
 publishes the private known-host binding, and runs a bounded SSH connectivity
-check. Success and failure update the reserved profile, operation, and
-idempotency response in one transaction, so concurrent capacity consumption and
-the request's now-stale ETag cannot break finalization. A final persistence error
-closes the transport and compensates both pre-commit and ambiguous post-commit
-outcomes to one failed/disconnected authority. The failed operation embeds the
-exact API error used by later replays; an exact replay never repeats the remote
-action. Process restart resets persisted runtime connection state to disconnected
-and does not claim a surviving tunnel. SSH success alone reports
-`core_not_started`, not an online Core.
+check. Success, failure, and crash cancellation update the reserved profile,
+operation, and idempotency response in one transaction, so concurrent capacity
+consumption and the request's now-stale ETag cannot break finalization.
+Disconnect reservations are non-displacing and do not publish `connecting`; the
+sidecar checks the process lifecycle owner before invoking disconnect, so a
+request for profile B cannot rewrite profile A or close A's transport. A final
+persistence error closes the transport and compensates both pre-commit and
+ambiguous post-commit outcomes to one failed/disconnected authority. The failed
+operation embeds the exact API error used by later replays; an exact replay never
+repeats the remote action. Process restart resets persisted runtime connection
+state to disconnected and does not claim a surviving tunnel. It only reconciles
+nonterminal reservations, writing their cancelled operation and idempotency
+response together. Existing terminal operation bodies and ETags remain frozen
+even when their historical result differs from the reset profile authority. SSH
+success alone reports `core_not_started`, not an online Core.
 
 This phase does not implement a macOS Keychain secret broker. The production
 resolver therefore supports `ssh_agent` only; native private-key and password

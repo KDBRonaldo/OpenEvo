@@ -407,6 +407,23 @@ def test_disconnect_supersedes_a_late_connect_and_closes_its_transport() -> None
     assert transport.closed
 
 
+def test_disconnect_rejects_non_owner_without_closing_active_transport() -> None:
+    transport = FakeTransport()
+    lifecycle = DesktopRemoteLifecycle(
+        cast(object, FakeHostKeys((_candidate(),), loaded=object())),
+        transport_factory=lambda *_: transport,
+    )
+    lifecycle.connect(_profile(fingerprint=_candidate().fingerprint))
+
+    with pytest.raises(RemoteConnectionFailedError, match="Another remote profile"):
+        lifecycle.disconnect("profile-2")
+
+    assert lifecycle.snapshot().profile_id == "profile-1"
+    assert lifecycle.snapshot().state == "connected"
+    assert lifecycle.active_transport("profile-1") is transport
+    assert not transport.closed
+
+
 def test_failed_connect_does_not_publish_an_active_transport() -> None:
     transport = FakeTransport(return_code=255)
     host_keys = FakeHostKeys((_candidate(),), loaded=object())
