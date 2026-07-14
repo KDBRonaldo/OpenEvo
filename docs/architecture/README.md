@@ -55,6 +55,11 @@ DMG release gates. Older Desktop foundation notes remain implementation history.
 
 ## Core Backend Internals
 
+- [Core Internal Service Supervisor](core-service-supervisor.md)
+  - Host-global Core ownership of evolution, rollout, gateway, and worker
+    subprocess groups; ephemeral internal authentication, secure stale-group
+    recovery, service/run-readiness separation, typed status/log projection,
+    and the fail-closed self-deployed model-preparation boundary.
 - [OpenEvo Core Runtime System Overview](core-runtime-system-overview.md)
   - Rollout, gateway, runtime, proxy, and transcript/proxy capture data paths.
 - [PR Process Checks](pr-process-checks.md)

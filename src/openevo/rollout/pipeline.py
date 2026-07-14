@@ -42,6 +42,7 @@ class Pipeline:
         dispatch_poll_interval_seconds: float = 1.0,
         callback_grace_seconds: float = 180.0,
         event_bus: EventBus | None = None,
+        internal_headers: dict[str, str] | None = None,
     ) -> None:
         self.callback_url = callback_url.rstrip("/")
         self.save_dir = Path(save_dir) if save_dir else None
@@ -49,6 +50,7 @@ class Pipeline:
         self.dispatch_poll_interval_seconds = dispatch_poll_interval_seconds
         self.callback_grace_seconds = callback_grace_seconds
         self.event_bus = event_bus
+        self._internal_headers = dict(internal_headers or {})
 
         self._client: httpx.AsyncClient | None = None
         self._started = False
@@ -64,7 +66,11 @@ class Pipeline:
         async with self._lifecycle_lock:
             if self._started:
                 return
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(
+                timeout=30.0,
+                headers=self._internal_headers,
+                trust_env=False,
+            )
             self._started = True
 
     async def close(self) -> None:

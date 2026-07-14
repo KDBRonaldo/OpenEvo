@@ -24,6 +24,17 @@ from openevo.rollout.models import (
     TaskStatus,
 )
 from openevo.rollout.pipeline import Pipeline
+from openevo.internal_auth import (
+    GenerationBoundRunAdmissionVerifier,
+    INTERNAL_SERVICE_HEADER,
+    InternalServiceIdentity,
+    RunAdmissionOperation,
+    health_identity_payload,
+    inherited_listen_fd,
+    install_internal_auth,
+    read_internal_service_identity,
+    require_generation_bound_run_admission,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,15 +53,25 @@ class RolloutState:
     pipeline: Pipeline
     manager: RolloutManager
     event_bus: EventBus
+    registered_nodes: set[str]
 
 
 _state: RolloutState | None = None
 _configured_topology_path: str | None = None
+_internal_identity: InternalServiceIdentity | None = None
+_run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None
 
 
-def configure_server(topology_path: str = "topology.yaml") -> None:
-    global _configured_topology_path, _state
+def configure_server(
+    topology_path: str = "topology.yaml",
+    *,
+    internal_identity: InternalServiceIdentity | None = None,
+    run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None,
+) -> None:
+    global _configured_topology_path, _internal_identity, _run_admission_verifier, _state
     _configured_topology_path = topology_path
+    _internal_identity = internal_identity
+    _run_admission_verifier = run_admission_verifier
     _state = None
 
 
@@ -65,6 +86,9 @@ def _build_state(topology: TopologyConfig) -> RolloutState:
         dispatch_poll_interval_seconds=rollout.dispatch_poll_interval_seconds,
         callback_grace_seconds=rollout.callback_grace_seconds,
         event_bus=event_bus,
+        internal_headers=(
+            _internal_identity.request_headers() if _internal_identity is not None else None
+        ),
     )
     manager = RolloutManager(pipeline=pipeline, scheduler=scheduler, event_bus=event_bus)
     return RolloutState(
@@ -74,6 +98,7 @@ def _build_state(topology: TopologyConfig) -> RolloutState:
         pipeline=pipeline,
         manager=manager,
         event_bus=event_bus,
+        registered_nodes=set(),
     )
 
 
@@ -99,12 +124,29 @@ async def _lifespan(_: FastAPI):
 
 
 app = FastAPI(title="OpenEvo Rollout", version="0.1.0", lifespan=_lifespan)
+install_internal_auth(app, lambda: _internal_identity)
 
 
 @app.get("/health")
 async def health():
     state = get_state()
-    return {"status": "ok", "nodes": len(state.scheduler.list_nodes())}
+    node = state.scheduler.get_node("core-gateway")
+    registered = "core-gateway" in state.registered_nodes
+    schedulable = bool(
+        registered and node is not None and node.healthy and not node.draining
+    )
+    payload = {
+        "status": "ok",
+        "nodes": len(state.scheduler.list_nodes()),
+        "gateway_registration": {
+            "gateway_url": node.gateway_url if node is not None and registered else None,
+            "node_id": "core-gateway",
+            "registered": registered,
+            "schedulable": schedulable,
+        },
+    }
+    payload.update(health_identity_payload(_internal_identity))
+    return payload
 
 
 @app.post("/rollout/task/submit")
@@ -113,6 +155,14 @@ async def submit_task_async(request: TaskRequest):
 
     Poll ``GET /rollout/task/{task_id}`` until status becomes terminal.
     """
+    await require_generation_bound_run_admission(
+        identity=_internal_identity,
+        verifier=_run_admission_verifier,
+        operation=RunAdmissionOperation.ROLLOUT_TASK_SUBMIT,
+        payload=request.model_dump(mode="json"),
+        task_id=request.task_id,
+        session_id=None,
+    )
     state = get_state()
     try:
         task_id = await state.manager.submit_task(request)
@@ -135,14 +185,32 @@ async def rollout_status():
 
 
 @app.post("/nodes/register", response_model=GatewayNodeInfo)
-async def register_node(request: NodeRegistrationRequest):
-    return get_state().scheduler.register_node(request)
+async def register_node(request: NodeRegistrationRequest, http_request: Request):
+    if _internal_identity is not None and http_request.headers.get(
+        INTERNAL_SERVICE_HEADER
+    ) != "gateway":
+        raise HTTPException(status_code=403, detail="gateway caller identity mismatch")
+    state = get_state()
+    node = state.scheduler.register_node(request)
+    state.registered_nodes.add(request.node_id)
+    return node
 
 
 @app.post("/nodes/{node_id}/heartbeat", response_model=GatewayNodeInfo)
-async def node_heartbeat(node_id: str, request: NodeHeartbeatRequest):
+async def node_heartbeat(
+    node_id: str,
+    request: NodeHeartbeatRequest,
+    http_request: Request,
+):
+    if _internal_identity is not None and http_request.headers.get(
+        INTERNAL_SERVICE_HEADER
+    ) != "gateway":
+        raise HTTPException(status_code=403, detail="gateway caller identity mismatch")
+    state = get_state()
+    if node_id not in state.registered_nodes:
+        raise HTTPException(status_code=404, detail="Node has not registered")
     try:
-        return get_state().scheduler.heartbeat(node_id, metrics=request.metrics)
+        return state.scheduler.heartbeat(node_id, metrics=request.metrics)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -169,7 +237,11 @@ async def drain_node(node_id: str):
 
 
 @app.post("/callbacks/session_result")
-async def session_result_callback(result: SessionResult):
+async def session_result_callback(result: SessionResult, request: Request):
+    if _internal_identity is not None and request.headers.get(
+        INTERNAL_SERVICE_HEADER
+    ) != "gateway":
+        raise HTTPException(status_code=403, detail="gateway caller identity mismatch")
     await get_state().pipeline.accept_callback_result(result)
     return {"status": "accepted"}
 
@@ -224,14 +296,21 @@ async def stream_events(request: Request):
 def serve(topology_path: str = "topology.yaml", *, log_level: str = "info") -> None:
     import uvicorn
 
-    configure_server(topology_path)
-    state = get_state()
-    uvicorn.run(
-        app,
-        host=state.rollout.host,
-        port=state.rollout.port,
-        log_level=log_level,
+    internal_identity = read_internal_service_identity(
+        required=False,
+        expected_service_id="rollout",
     )
+    configure_server(topology_path, internal_identity=internal_identity)
+    state = get_state()
+    listen_fd = inherited_listen_fd()
+    if internal_identity is not None and listen_fd is None:
+        raise RuntimeError("release-owned rollout requires an inherited listener")
+    kwargs = {"app": app, "log_level": log_level}
+    if listen_fd is None:
+        kwargs.update(host=state.rollout.host, port=state.rollout.port)
+    else:
+        kwargs["fd"] = listen_fd
+    uvicorn.run(**kwargs)
 
 
 def main() -> None:

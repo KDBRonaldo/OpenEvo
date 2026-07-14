@@ -407,6 +407,7 @@ class GatewayNodeManager:
         model_served: str | None = None,
         evolution: EvolutionConfig | None = None,
         evolution_client: EvolutionClient | None = None,
+        internal_headers: dict[str, str] | None = None,
     ) -> None:
         self.node_id = node_id
         self.gateway_url = gateway_url.rstrip("/")
@@ -422,7 +423,12 @@ class GatewayNodeManager:
         self.model_served = model_served
         self.evolution = evolution
         self.evolution_client = evolution_client
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._internal_headers = dict(internal_headers or {})
+        self._client = httpx.AsyncClient(
+            timeout=30.0,
+            headers=self._internal_headers,
+            trust_env=False,
+        )
         self._dispatcher = SessionDispatcher(
             max_init_workers=max_init_workers,
             max_run_workers=max_run_workers,
@@ -437,12 +443,16 @@ class GatewayNodeManager:
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._control_client: httpx.AsyncClient | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._rollout_registered = False
 
     async def start(self) -> None:
         await self._dispatcher.start()
         if self._rollout_server_url is not None:
             self._control_client = httpx.AsyncClient(
-                base_url=self._rollout_server_url, timeout=15.0
+                base_url=self._rollout_server_url,
+                timeout=15.0,
+                headers=self._internal_headers,
+                trust_env=False,
             )
             await self._register_with_rollout_server()
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -477,7 +487,15 @@ class GatewayNodeManager:
                 ).model_dump(mode="json"),
             )
             response.raise_for_status()
+            payload = response.json()
+            self._rollout_registered = bool(
+                payload.get("node_id") == self.node_id
+                and payload.get("gateway_url") == self.gateway_url
+                and payload.get("healthy") is True
+                and payload.get("draining") is False
+            )
         except Exception:
+            self._rollout_registered = False
             logger.warning("Node registration failed", exc_info=True)
 
     async def _heartbeat_loop(self) -> None:
@@ -494,10 +512,33 @@ class GatewayNodeManager:
                     await self._register_with_rollout_server()
                     continue
                 response.raise_for_status()
+                self._rollout_registered = True
             except asyncio.CancelledError:
                 raise
             except Exception:
+                self._rollout_registered = False
                 logger.warning("Node heartbeat failed", exc_info=True)
+
+    async def internal_rollout_readiness(self) -> tuple[bool, str]:
+        if self._control_client is None or not self._rollout_registered:
+            return False, "gateway is not registered with rollout"
+        try:
+            response = await self._control_client.get("/health")
+            response.raise_for_status()
+            payload = response.json()
+            registration = payload.get("gateway_registration")
+            if not isinstance(registration, dict):
+                return False, "rollout health lacks gateway registration"
+            if (
+                registration.get("node_id") != self.node_id
+                or registration.get("gateway_url") != self.gateway_url
+                or registration.get("registered") is not True
+                or registration.get("schedulable") is not True
+            ):
+                return False, "gateway is not schedulable in rollout"
+            return True, "gateway is registered and schedulable"
+        except Exception:
+            return False, "gateway could not authenticate rollout health"
 
     async def dispatch(self, request: SessionDispatchRequest) -> None:
         session_id = request.session_id

@@ -9,6 +9,14 @@ from openevo.evolution.framework import load_verified_framework_registry
 from openevo.evolution.methods import METHOD_REGISTRY
 from openevo.evolution.server import create_app
 from openevo.evolution.worker import EvolutionWorkerClient, run_once
+from openevo.internal_auth import (
+    inherited_listen_fd,
+    read_internal_service_identity,
+    verified_private_file_sha256,
+)
+
+
+_MAX_FRAMEWORK_LOCK_BYTES = 4 * 1024 * 1024
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,12 +48,37 @@ def main(argv: list[str] | None = None) -> int:
         import uvicorn
 
         registry = load_verified_framework_registry(args.framework_lock)
-        app = create_app(
-            db_path=Path(args.db),
-            artifact_root=Path(args.artifact_root),
-            executable_registry=registry,
+        internal_identity = read_internal_service_identity(
+            required=False,
+            expected_service_id="evolution-backend",
         )
-        uvicorn.run(app, host=args.host, port=args.port)
+        if (
+            internal_identity is not None
+            and (
+                internal_identity.registry_digest != registry.snapshot.registry_digest
+                or internal_identity.framework_lock_digest
+                != verified_private_file_sha256(
+                    args.framework_lock,
+                    max_bytes=_MAX_FRAMEWORK_LOCK_BYTES,
+                )
+            )
+        ):
+            raise RuntimeError("loaded framework lock/registry does not match the service generation")
+        app_kwargs = {
+            "db_path": Path(args.db),
+            "artifact_root": Path(args.artifact_root),
+            "executable_registry": registry,
+        }
+        if internal_identity is not None:
+            app_kwargs["internal_identity"] = internal_identity
+        app = create_app(**app_kwargs)
+        listen_fd = inherited_listen_fd()
+        if internal_identity is not None and listen_fd is None:
+            raise RuntimeError("release-owned evolution backend requires an inherited listener")
+        if listen_fd is None:
+            uvicorn.run(app, host=args.host, port=args.port)
+        else:
+            uvicorn.run(app, fd=listen_fd)
         return 0
 
     capabilities = _parse_capabilities(args.capability)
@@ -55,7 +88,35 @@ def main(argv: list[str] | None = None) -> int:
         if args.framework_lock is not None
         else None
     )
-    with EvolutionWorkerClient(args.base_url) as client:
+    internal_identity = read_internal_service_identity(
+        required=False,
+        expected_service_id="evolution-worker",
+        actual_registry_digest=(
+            registry.snapshot.registry_digest if registry is not None else None
+        ),
+    )
+    if internal_identity is not None:
+        if args.framework_lock is None:
+            raise RuntimeError("release-owned worker requires a framework lock")
+        if (
+            internal_identity.framework_lock_digest
+            != verified_private_file_sha256(
+                args.framework_lock,
+                max_bytes=_MAX_FRAMEWORK_LOCK_BYTES,
+            )
+        ):
+            raise RuntimeError("worker framework lock does not match the service generation")
+    with EvolutionWorkerClient(
+        args.base_url,
+        headers=(internal_identity.request_headers() if internal_identity is not None else None),
+    ) as client:
+        if internal_identity is not None:
+            client.register_internal_worker(
+                worker_id=args.worker_id,
+                framework_lock_digest=internal_identity.framework_lock_digest,
+                generation_digest=internal_identity.generation_digest,
+                registry_digest=internal_identity.registry_digest,
+            )
         while True:
             claimed = run_once(
                 client,

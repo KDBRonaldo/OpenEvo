@@ -44,6 +44,16 @@ from openevo.platform.events import SSE_HEADERS, EventBus
 from openevo.rollout.models import SessionDispatchRequest, SessionDispatchResponse, SessionStatus
 from openevo.trajectory.registry import default_builder_registry, default_evaluator_registry
 from openevo.evolution.client import EvolutionClient
+from openevo.internal_auth import (
+    GenerationBoundRunAdmissionVerifier,
+    InternalServiceIdentity,
+    RunAdmissionOperation,
+    health_identity_payload,
+    inherited_listen_fd,
+    install_internal_auth,
+    read_internal_service_identity,
+    require_generation_bound_run_admission,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,12 +80,23 @@ class GatewayState:
 _state: GatewayState | None = None
 _configured_topology_path: str | None = None
 _configured_node_id: str | None = None
+_internal_identity: InternalServiceIdentity | None = None
+_run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None
 
 
-def configure_server(topology_path: str = "topology.yaml", *, node_id: str | None = None) -> None:
-    global _configured_topology_path, _configured_node_id, _state
+def configure_server(
+    topology_path: str = "topology.yaml",
+    *,
+    node_id: str | None = None,
+    internal_identity: InternalServiceIdentity | None = None,
+    run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None,
+) -> None:
+    global _configured_topology_path, _configured_node_id
+    global _internal_identity, _run_admission_verifier, _state
     _configured_topology_path = topology_path
     _configured_node_id = node_id
+    _internal_identity = internal_identity
+    _run_admission_verifier = run_admission_verifier
     _state = None
 
 
@@ -117,9 +138,17 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
             EvolutionClient(
                 topology.evolution.backend_url,
                 timeout_seconds=topology.evolution.context.timeout_seconds,
+                headers=(
+                    _internal_identity.request_headers()
+                    if _internal_identity is not None
+                    else None
+                ),
             )
             if topology.evolution is not None and topology.evolution.enabled
             else None
+        ),
+        internal_headers=(
+            _internal_identity.request_headers() if _internal_identity is not None else None
         ),
     )
     return GatewayState(
@@ -204,6 +233,18 @@ async def _lifespan(_: FastAPI):
 
 
 app = FastAPI(title="OpenEvo Gateway", version="0.1.0", lifespan=_lifespan)
+install_internal_auth(
+    app,
+    lambda: _internal_identity,
+    protected_path=lambda path: (
+        path == "/health"
+        or path == "/events"
+        or path == "/v1/models"
+        or path.startswith("/admin/")
+        or path == "/sessions"
+        or path.startswith("/sessions/")
+    ),
+)
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -420,6 +461,18 @@ async def list_models():
 async def health():
     state = get_state()
     metrics = await state.node_manager.stage_metrics()
+    if _internal_identity is not None:
+        rollout_ready, rollout_message = await state.node_manager.internal_rollout_readiness()
+        payload = {
+            "status": "ok" if rollout_ready else "not_ready",
+            "capture_mode": "transcript",
+            "direct_model_api": False,
+            "rollout_connected": rollout_ready,
+            "rollout_message": rollout_message,
+            "token_level_metrics_available": False,
+        }
+        payload.update(health_identity_payload(_internal_identity))
+        return JSONResponse(payload, status_code=200 if rollout_ready else 503)
     try:
         upstream = await state.inference.health()
     except Exception as exc:
@@ -532,13 +585,21 @@ async def stream_events(request: Request):
 
 @app.post("/sessions", response_model=SessionCreateResponse | SessionDispatchResponse)
 async def create_session(request: Request):
-    state = get_state()
     try:
         body = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if "agent" in body and "session_id" in body:
         dispatch_request = SessionDispatchRequest.model_validate(body)
+        await require_generation_bound_run_admission(
+            identity=_internal_identity,
+            verifier=_run_admission_verifier,
+            operation=RunAdmissionOperation.GATEWAY_SESSION_DISPATCH,
+            payload=dispatch_request.model_dump(mode="json"),
+            task_id=dispatch_request.task_id,
+            session_id=dispatch_request.session_id,
+        )
+        state = get_state()
         try:
             await state.node_manager.dispatch(dispatch_request)
         except ValueError as exc:
@@ -557,6 +618,16 @@ async def create_session(request: Request):
         session_id = clean_session_id(create_request.session_id) or generate_session_id()
     except InvalidSessionIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    effective_request = create_request.model_copy(update={"session_id": session_id})
+    await require_generation_bound_run_admission(
+        identity=_internal_identity,
+        verifier=_run_admission_verifier,
+        operation=RunAdmissionOperation.GATEWAY_SESSION_CREATE,
+        payload=effective_request.model_dump(mode="json"),
+        task_id=create_request.task_id,
+        session_id=session_id,
+    )
+    state = get_state()
 
     info = state.session_registry.register(
         session_id,
@@ -860,14 +931,25 @@ def serve(
 ) -> None:
     import uvicorn
 
-    configure_server(topology_path, node_id=node_id)
-    state = get_state()
-    uvicorn.run(
-        app,
-        host=state.node.host,
-        port=state.node.port,
-        log_level=log_level,
+    internal_identity = read_internal_service_identity(
+        required=False,
+        expected_service_id="gateway",
     )
+    configure_server(
+        topology_path,
+        node_id=node_id,
+        internal_identity=internal_identity,
+    )
+    state = get_state()
+    listen_fd = inherited_listen_fd()
+    if internal_identity is not None and listen_fd is None:
+        raise RuntimeError("release-owned gateway requires an inherited listener")
+    kwargs = {"app": app, "log_level": log_level}
+    if listen_fd is None:
+        kwargs.update(host=state.node.host, port=state.node.port)
+    else:
+        kwargs["fd"] = listen_fd
+    uvicorn.run(**kwargs)
 
 
 def main() -> None:
