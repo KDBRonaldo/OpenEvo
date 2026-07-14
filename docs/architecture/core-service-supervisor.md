@@ -245,14 +245,20 @@ It does not receive the credential, raw instruction, runtime, environment, or an
 open request object. Request fields such as `run_ready` or `admission` have no
 authority and are excluded by validation before the canonical digest is built.
 
-There is no production verifier in this slice. Release-owned submissions
-therefore return HTTP 503 with typed code
-`run_admission_authority_unavailable` before manager dispatch or session
-registration. A later provider/run owner may inject the async verifier only after
-it can validate that exact generation-bound payload against its authoritative
-admission pin. Verifier failures remain closed typed errors; they never fall back
-to the service snapshot's `run_ready` field, legacy context, or caller-provided
-instruction/runtime data.
+The supervisor now binds each release child to the host-global Core daemon's
+fixed loopback-only private verifier endpoint. Rollout and Gateway forward only
+the closed digest check over that channel, using their ephemeral generation
+credential. The supervisor separately issues an in-memory `ServiceRunBinding`
+to the trusted run owner; it contains the exact generation and service URLs plus
+request headers whose credential is excluded from repr and durable state.
+
+The private endpoint is installed only when a real run control owner is injected.
+Without that owner, release-owned submissions still return a fail-closed typed
+error before manager dispatch or session registration. The endpoint is excluded
+from OpenAPI, accepts at most 4096 bytes, validates a closed JSON object, and
+authenticates it against the supervisor's current generation before invoking the
+authority. Verifier failures never fall back to `run_ready`, legacy context, or
+caller-provided instruction/runtime data.
 
 ## Self-Deployed Boundary
 
@@ -317,6 +323,5 @@ Residual integration risks remain explicit:
   path; other platforms need an equivalent verified backend before support;
 - automatic crash restart is intentionally absent; Core reports failure and a
   caller performs an idempotent restart;
-- provider, tunnel-only transport, run owner, admission/revision readiness,
-  model preparation, Desktop forwarding, and release E2E are not connected by
-  this change.
+- durable run execution, revision readiness, model preparation, Desktop run
+  forwarding, and release E2E remain downstream integration work.

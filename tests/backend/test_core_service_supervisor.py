@@ -275,6 +275,9 @@ def _supervisor(
         health_checker=health,
         port_probe=ports or FakePortProbe(),
         managed_runtime_probe=runtime_probe,
+        run_admission_url=(
+            "http://127.0.0.1:19000/internal/v1/run-admissions/verify"
+        ),
         startup_timeout=startup_timeout,
         stop_timeout=stop_timeout,
         max_log_entries=max_log_entries,
@@ -339,6 +342,19 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         assert all(spec.argv[1] == "-I" for spec in backend.spawned)
         assert all("PYTHONPATH" not in spec.env for spec in backend.spawned)
         assert all("PYTHONHOME" not in spec.env for spec in backend.spawned)
+        assert all(
+            spec.env["OPENEVO_CORE_RUN_ADMISSION_URL"]
+            == "http://127.0.0.1:19000/internal/v1/run-admissions/verify"
+            for spec in backend.spawned
+        )
+        binding = supervisor.run_binding()
+        assert binding.generation_digest == snapshot.generation_digest
+        assert binding.registry_digest == REGISTRY_DIGEST
+        assert binding.rollout_url.startswith("http://127.0.0.1:")
+        assert binding.evolution_backend_url.startswith("http://127.0.0.1:")
+        assert binding.gateway_url.startswith("http://127.0.0.1:")
+        assert supervisor.authenticates_run_service(binding.request_headers()) is True
+        assert "credential" not in repr(binding).lower()
         child_cwd = tmp_path / "core-services" / "child-cwd"
         assert all(spec.cwd == os.fspath(child_cwd) for spec in backend.spawned)
         assert child_cwd.stat().st_mode & 0o777 == 0o700

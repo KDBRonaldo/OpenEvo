@@ -1499,6 +1499,7 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
                     name="pmem_calc",
                     uri="file:///tmp/adapter",
                     manifest={"base_model": "Qwen/Qwen3.6-27B", "adapter_format": "lora"},
+                    lineage={"openevo_execution": {"job_id": job.job_id}},
                     compatibility={"base_model": "Qwen/Qwen3.6-27B"},
                     promoted=True,
                 )
@@ -1508,6 +1509,12 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
 
     assert complete["state"] == "succeeded"
     assert complete["artifact_ids"][0].startswith("art_")
+    assert store.get_internal_job_result(job.job_id) == {
+        "artifact_ids": complete["artifact_ids"],
+        "error": None,
+        "job_id": job.job_id,
+        "state": "succeeded",
+    }
     with store.connect() as conn:
         row = conn.execute(
             "SELECT state, error FROM jobs WHERE job_id = ?",
@@ -1527,6 +1534,41 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
         (lineage["parent_artifact_id"], lineage["child_artifact_id"], lineage["relation"])
         for lineage in lineage_rows
     ] == [(dataset.artifact_id, complete["artifact_ids"][0], "job_input")]
+
+
+def test_internal_job_result_does_not_expose_worker_error_text(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(
+            method="mock_lora",
+            job_type="parametric_memory_train",
+            config={"base_model": "Qwen/Qwen3.6-27B"},
+        )
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["parametric_memory_train"],
+            lease_seconds=60,
+        )
+    )
+    assert claim.job is not None
+    store.fail_job(
+        job.job_id,
+        WorkerFailRequest(
+            lease_id=claim.job.lease_id,
+            error="private worker failure at /srv/secret",
+            retryable=False,
+        ),
+    )
+
+    assert store.get_internal_job_result(job.job_id) == {
+        "artifact_ids": [],
+        "error": "evolution_job_failed",
+        "job_id": job.job_id,
+        "state": "failed",
+    }
 
 
 def test_complete_job_honors_unpromoted_job_config(tmp_path):

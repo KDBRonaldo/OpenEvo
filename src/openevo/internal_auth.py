@@ -12,9 +12,11 @@ import os
 import re
 import stat
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+import httpx
 
 
 INTERNAL_CREDENTIAL_FD_ENV = "OPENEVO_INTERNAL_CREDENTIAL_FD"
@@ -24,6 +26,7 @@ INTERNAL_AUTHORIZATION_HEADER = "authorization"
 INTERNAL_GENERATION_HEADER = "x-openevo-internal-generation"
 INTERNAL_REGISTRY_HEADER = "x-openevo-internal-registry"
 INTERNAL_SERVICE_HEADER = "x-openevo-internal-service"
+CORE_RUN_ADMISSION_URL_ENV = "OPENEVO_CORE_RUN_ADMISSION_URL"
 _MAX_CREDENTIAL_PAYLOAD_BYTES = 4096
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _SERVICE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -71,6 +74,75 @@ class GenerationBoundRunAdmissionVerifier(Protocol):
     async def verify(self, check: GenerationBoundRunAdmissionCheck) -> None: ...
 
 
+class CoreRunAdmissionHttpVerifier:
+    """Ask the host-global Core run owner to authorize an exact service request."""
+
+    def __init__(
+        self,
+        identity: InternalServiceIdentity,
+        endpoint: str,
+        *,
+        timeout_seconds: float = 5.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        if timeout_seconds <= 0 or timeout_seconds > 30:
+            raise ValueError("run admission timeout is outside the supported bounds")
+        self._identity = identity
+        self._endpoint = _validated_run_admission_endpoint(endpoint)
+        self._timeout = timeout_seconds
+        self._transport = transport
+
+    async def verify(self, check: GenerationBoundRunAdmissionCheck) -> None:
+        payload = {
+            "framework_lock_digest": check.framework_lock_digest,
+            "generation_digest": check.generation_digest,
+            "operation": check.operation.value,
+            "payload_sha256": check.payload_sha256,
+            "registry_digest": check.registry_digest,
+            "session_id": check.session_id,
+            "task_id": check.task_id,
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout,
+                trust_env=False,
+                transport=self._transport,
+            ) as client:
+                response = await client.post(
+                    self._endpoint,
+                    headers=self._identity.request_headers(),
+                    json=payload,
+                )
+        except httpx.HTTPError as exc:
+            raise RunAdmissionError(
+                "run_admission_authority_unavailable",
+                "Core run admission authority could not be reached.",
+                status_code=503,
+                retryable=True,
+            ) from exc
+        if response.status_code == 204:
+            return
+        raise RunAdmissionError(
+            "run_admission_denied",
+            "Core run admission authority rejected the service request.",
+            status_code=(
+                response.status_code if 400 <= response.status_code <= 599 else 503
+            ),
+            retryable=response.status_code >= 500,
+        )
+
+
+def configured_run_admission_verifier(
+    identity: InternalServiceIdentity | None,
+) -> GenerationBoundRunAdmissionVerifier | None:
+    if identity is None:
+        return None
+    endpoint = os.environ.get(CORE_RUN_ADMISSION_URL_ENV)
+    if endpoint is None:
+        return None
+    return CoreRunAdmissionHttpVerifier(identity, endpoint)
+
+
 class RunAdmissionError(RuntimeError):
     def __init__(
         self,
@@ -84,6 +156,27 @@ class RunAdmissionError(RuntimeError):
         self.code = code
         self.status_code = status_code
         self.retryable = retryable
+
+
+def _validated_run_admission_endpoint(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("run admission endpoint is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or port is None
+        or not 1 <= port <= 65535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/internal/v1/run-admissions/verify"
+    ):
+        raise ValueError("run admission endpoint must be the Core loopback verifier")
+    return f"http://127.0.0.1:{port}/internal/v1/run-admissions/verify"
 
 
 @dataclass(frozen=True, slots=True)

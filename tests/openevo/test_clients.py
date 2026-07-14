@@ -5,6 +5,7 @@ import httpx
 from openevo import experiments
 
 RolloutHttpClient = experiments.RolloutHttpClient
+EvolutionHttpClient = experiments.EvolutionHttpClient
 
 
 def test_rollout_http_client_url_encodes_task_id_path_segment() -> None:
@@ -43,3 +44,41 @@ def test_rollout_http_client_rejects_non_object_submit_response() -> None:
         assert "rollout submit response was not a JSON object" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_internal_clients_attach_generation_bound_headers_to_every_request() -> None:
+    captured: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(dict(request.headers))
+        if request.url.path == "/rollout/task/task-a":
+            return httpx.Response(200, json={"task_id": "task-a", "status": "completed"})
+        return httpx.Response(200, json={"artifact_id": "artifact-a"})
+
+    headers = {
+        "Authorization": "Bearer private-generation-credential",
+        "X-OpenEvo-Internal-Generation": "a" * 64,
+        "X-OpenEvo-Internal-Registry": "b" * 64,
+        "X-OpenEvo-Internal-Service": "core-control",
+    }
+    transport = httpx.MockTransport(handler)
+    rollout = RolloutHttpClient(
+        "http://127.0.0.1:18100",
+        headers=headers,
+        transport=transport,
+    )
+    evolution = EvolutionHttpClient(
+        "http://127.0.0.1:18200",
+        headers=headers,
+        transport=transport,
+    )
+
+    rollout.get_task("task-a")
+    evolution.get_artifact("artifact-a")
+
+    assert len(captured) == 2
+    assert all(
+        item["authorization"] == "Bearer private-generation-credential"
+        and item["x-openevo-internal-service"] == "core-control"
+        for item in captured
+    )

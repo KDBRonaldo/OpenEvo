@@ -28,6 +28,7 @@ from openevo.internal_auth import (
     GenerationBoundRunAdmissionVerifier,
     INTERNAL_SERVICE_HEADER,
     InternalServiceIdentity,
+    configured_run_admission_verifier,
     RunAdmissionOperation,
     health_identity_payload,
     inherited_listen_fd,
@@ -300,7 +301,11 @@ def serve(topology_path: str = "topology.yaml", *, log_level: str = "info") -> N
         required=False,
         expected_service_id="rollout",
     )
-    configure_server(topology_path, internal_identity=internal_identity)
+    configure_server(
+        topology_path,
+        internal_identity=internal_identity,
+        run_admission_verifier=configured_run_admission_verifier(internal_identity),
+    )
     state = get_state()
     listen_fd = inherited_listen_fd()
     if internal_identity is not None and listen_fd is None:

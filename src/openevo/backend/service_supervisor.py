@@ -31,10 +31,12 @@ import threading
 import time
 from typing import Protocol
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from openevo.backend.service_control import CoreServiceControlError
 from openevo.backend.contracts.v1.models import (
     ApiErrorV1,
     ErrorCategory,
@@ -54,6 +56,7 @@ from openevo.internal_auth import (
     INTERNAL_CREDENTIAL_FD_ENV,
     INTERNAL_LISTEN_FD_ENV,
     INTERNAL_OWNERSHIP_ENV,
+    CORE_RUN_ADMISSION_URL_ENV,
     InternalServiceIdentity,
 )
 
@@ -118,7 +121,7 @@ def _state_digest(value: str) -> str:
     return value
 
 
-class SupervisorError(RuntimeError):
+class SupervisorError(CoreServiceControlError):
     """Base class for internal supervisor failures."""
 
 
@@ -662,6 +665,22 @@ class ServiceGroupSnapshot:
             if service.id == service_id:
                 return service
         raise KeyError(service_id)
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceRunBinding:
+    """Ephemeral trusted connection from the run owner to one service generation."""
+
+    generation_digest: str
+    registry_digest: str
+    framework_lock_digest: str
+    rollout_url: str
+    evolution_backend_url: str
+    gateway_url: str
+    _identity: InternalServiceIdentity = field(repr=False, compare=False)
+
+    def request_headers(self) -> dict[str, str]:
+        return self._identity.request_headers()
 
 
 class _StrictStateModel(BaseModel):
@@ -1457,6 +1476,7 @@ class CoreServiceSupervisor:
         framework_lock: Path,
         release_identity: ServiceReleaseIdentity | None = None,
         verified_registry: object | None = None,
+        run_admission_url: str | None = None,
         python_executable: str | None = None,
         process_backend: ProcessBackend | None = None,
         health_checker: HealthChecker | None = None,
@@ -1506,6 +1526,11 @@ class CoreServiceSupervisor:
             self._managed_framework_lock = self._root.path / "framework-lock.json"
             self._launch_mode = launch_mode
             self._verified_registry = verified_registry
+            self._run_admission_url = (
+                _validated_run_admission_url(run_admission_url)
+                if run_admission_url is not None
+                else None
+            )
             self._release_identity = resolved_release_identity
             self._python = python_executable or sys.executable
             self._process_backend = process_backend or RealSubprocessBackend()
@@ -1791,6 +1816,59 @@ class CoreServiceSupervisor:
             self._refresh_process_state()
             return tuple(self._summary(record) for record in self._ledger.services)
 
+    def run_binding(self) -> ServiceRunBinding:
+        with self._mutex:
+            self._require_open()
+            self._verify_release_installation()
+            self._refresh_process_state()
+            snapshot = self._group_snapshot()
+            credential = self._active_credential
+            if not snapshot.services_available or credential is None:
+                raise SupervisorStateError("managed service group is not ready for a run")
+            specs = self._specs
+            required = {"evolution-backend", "rollout", "gateway"}
+            if not required.issubset(specs):
+                raise SupervisorStateError("managed run service endpoints are unavailable")
+            ports = {service_id: specs[service_id].port for service_id in required}
+            if any(port is None for port in ports.values()):
+                raise SupervisorStateError("managed run service ports are unavailable")
+            identity = InternalServiceIdentity(
+                service_id="core-control",
+                generation_digest=snapshot.generation_digest,
+                registry_digest=self._release_identity.registry_digest,
+                framework_lock_digest=self._framework_lock_digest,
+                credential=credential,
+            )
+            return ServiceRunBinding(
+                generation_digest=snapshot.generation_digest,
+                registry_digest=self._release_identity.registry_digest,
+                framework_lock_digest=self._framework_lock_digest,
+                rollout_url=f"http://127.0.0.1:{ports['rollout']}",
+                evolution_backend_url=(
+                    f"http://127.0.0.1:{ports['evolution-backend']}"
+                ),
+                gateway_url=f"http://127.0.0.1:{ports['gateway']}",
+                _identity=identity,
+            )
+
+    def authenticates_run_service(self, headers: Mapping[str, str]) -> bool:
+        with self._mutex:
+            if self._closed:
+                return False
+            credential = self._active_credential
+            generation = self._ledger.generation_digest
+            if credential is None or generation is None:
+                return False
+            identity = InternalServiceIdentity(
+                service_id="core-control",
+                generation_digest=generation,
+                registry_digest=self._release_identity.registry_digest,
+                framework_lock_digest=self._framework_lock_digest,
+                credential=credential,
+            )
+            normalized = {str(key).lower(): str(value) for key, value in headers.items()}
+            return identity.authenticates(normalized)
+
     def get(self, service_id: str) -> SupervisorServiceSummary:
         with self._mutex:
             self._require_open()
@@ -1947,6 +2025,8 @@ class CoreServiceSupervisor:
             },
         }
         base_env = _controlled_environment()
+        if self._run_admission_url is not None:
+            base_env[CORE_RUN_ADMISSION_URL_ENV] = self._run_admission_url
         plans = (
             (
                 "evolution-backend",
@@ -2781,6 +2861,27 @@ def _contract_kind(component: ServiceComponent) -> ServiceKind:
     return ServiceKind.CONTROL
 
 
+def _validated_run_admission_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("run admission URL is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or port is None
+        or not 1 <= port <= 65535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/internal/v1/run-admissions/verify"
+    ):
+        raise ValueError("run admission URL must be the Core loopback verifier")
+    return f"http://127.0.0.1:{port}/internal/v1/run-admissions/verify"
+
+
 def _private_file_metadata_identity(path: Path) -> str:
     fd = _open_absolute_nofollow_file(path, "Codex auth")
     try:
@@ -3256,6 +3357,7 @@ __all__ = [
     "ServiceExecutionMode",
     "ServiceLaunchMode",
     "ServiceGroupSnapshot",
+    "ServiceRunBinding",
     "ServiceHealthProbe",
     "ServiceProcessSpec",
     "ServiceReleaseIdentity",

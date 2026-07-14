@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import TracebackType
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -52,6 +53,7 @@ class RolloutHttpClient:
         base_url: str,
         *,
         timeout_seconds: float | None = None,
+        headers: Mapping[str, str] | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         timeout = (
@@ -60,7 +62,12 @@ class RolloutHttpClient:
             else httpx.Timeout(None, connect=30.0)
         )
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.Client(timeout=timeout, trust_env=False, transport=transport)
+        self._client = httpx.Client(
+            timeout=timeout,
+            trust_env=False,
+            headers=dict(headers or {}),
+            transport=transport,
+        )
 
     def __enter__(self) -> RolloutHttpClient:
         return self
@@ -103,12 +110,14 @@ class EvolutionHttpClient:
         base_url: str,
         *,
         timeout_seconds: float = 30.0,
+        headers: Mapping[str, str] | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout_seconds, connect=10.0),
             trust_env=False,
+            headers=dict(headers or {}),
             transport=transport,
         )
 
@@ -157,6 +166,17 @@ class EvolutionHttpClient:
         result = response.json()
         if not isinstance(result, dict):
             raise ValueError("evolution artifact response was not a JSON object")
+        return result
+
+    def get_internal_job_result(self, job_id: str) -> dict[str, Any]:
+        encoded_job_id = quote(job_id, safe="")
+        response = self._client.get(
+            f"{self.base_url}/v1/internal/jobs/{encoded_job_id}"
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("evolution job result was not a JSON object")
         return result
 
     def update_artifact_promotion(

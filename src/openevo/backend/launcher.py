@@ -99,6 +99,9 @@ def _serve_core_control(args: argparse.Namespace) -> int:
         service_root=args.service_root / "managed-services",
         framework_lock=args.framework_lock,
         verified_registry=registry,
+        run_admission_url=(
+            f"http://127.0.0.1:{port}/internal/v1/run-admissions/verify"
+        ),
     )
     try:
         app = create_core_control_app(

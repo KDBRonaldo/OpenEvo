@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -24,6 +25,7 @@ from openevo.backend.contracts.v1 import (
     create_core_control_app,
     openapi_sha256,
 )
+from openevo.backend.contracts.v1 import models as m
 from openevo.backend.contracts.v1.models import (
     ApiErrorV1,
     SseFrameV1,
@@ -37,6 +39,7 @@ from openevo.backend.contracts.v1.store import (
     CoreControlStoreV1,
     StoreCorruptionError,
 )
+from openevo.backend.run_control import CoreRunControlError
 from openevo.backend.service_supervisor import (
     ServiceComponent,
     ServiceStatus,
@@ -176,6 +179,7 @@ def _app(
     *,
     registry=None,
     service_supervisor=None,
+    run_control=None,
     event_replay_limit: int = 10_000,
 ):
     return create_core_control_app(
@@ -186,6 +190,7 @@ def _app(
         build_channel="test",
         evolution_registry=registry,
         service_supervisor=service_supervisor,
+        run_control=run_control,
         event_replay_limit=event_replay_limit,
     )
 
@@ -4448,6 +4453,46 @@ class _FailingServiceSupervisor(_RecordingServiceSupervisor):
         raise SupervisorError("managed service state is unavailable")
 
 
+class _RecordingRunControl:
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self.invocations: list[tuple[str, Mapping[str, object]]] = []
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self.invocations.append((operation_id, arguments))
+        if operation_id == "listCoreRunsV1":
+            return m.RunPageV1(items=[], next_cursor=None, has_more=False)
+        raise AssertionError(operation_id)
+
+    def counts(self) -> tuple[int, int]:
+        return (2, 3)
+
+    async def verify(self, _check) -> None:
+        return None
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FailingRunControl(_RecordingRunControl):
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        del operation_id, arguments
+        raise CoreRunControlError(
+            "run_owner_unavailable",
+            "The managed run owner is unavailable.",
+            http_status=503,
+            retryable=True,
+        )
+
+    def counts(self) -> tuple[int, int]:
+        raise CoreRunControlError(
+            "run_owner_unavailable",
+            "The managed run owner is unavailable.",
+            http_status=503,
+            retryable=True,
+        )
+
+
 def test_injected_service_supervisor_is_projected_and_closed(tmp_path: Path) -> None:
     supervisor = _RecordingServiceSupervisor()
     app = _app(tmp_path, service_supervisor=supervisor)
@@ -4475,6 +4520,39 @@ def test_service_supervisor_failure_is_typed_and_retryable(tmp_path: Path) -> No
     assert response.status_code == 503
     assert response.json()["code"] == "core_service_supervisor_failed"
     assert response.json()["retryable"] is True
+
+
+def test_injected_run_control_owns_frozen_routes_and_status_counts(tmp_path: Path) -> None:
+    run_control = _RecordingRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    with TestClient(app) as client:
+        response = client.get("/v1/runs", headers=AUTH)
+        status = client.get("/v1/status", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": "1",
+        "items": [],
+        "next_cursor": None,
+        "has_more": False,
+    }
+    assert run_control.invocations[0][0] == "listCoreRunsV1"
+    assert status.json()["active_runs"] == 2
+    assert status.json()["queued_runs"] == 3
+    assert run_control.close_calls == 1
+
+
+def test_run_control_failures_use_the_frozen_typed_error_contract(tmp_path: Path) -> None:
+    run_control = _FailingRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    with TestClient(app) as client:
+        runs = client.get("/v1/runs", headers=AUTH)
+        status = client.get("/v1/status", headers=AUTH)
+
+    for response in (runs, status):
+        assert response.status_code == 503
+        assert response.json()["code"] == "run_owner_unavailable"
+        assert response.json()["retryable"] is True
 
 
 def test_event_replay_is_ordered_durable_and_expires(tmp_path: Path) -> None:

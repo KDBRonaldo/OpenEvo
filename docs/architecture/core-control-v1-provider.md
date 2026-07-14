@@ -352,3 +352,11 @@ Provider coverage is in
 schema bytes and digests. This owner does not implement run admission,
 evolution-produced queued successors, serving preparation, or cross-session
 activation; those remain fail closed behind their existing routes and owners.
+
+The provider accepts an optional internal `CoreRunControl` dependency. When it
+is absent, every frozen run route remains the same typed unavailable response.
+When present, the provider delegates the complete run route family and status
+counts to that owner and installs the private generation-authenticated admission
+endpoint; it does not compile experiments or inspect method logic itself. This
+dependency boundary is wired before the durable run implementation so the
+public OpenAPI and Desktop client remain unchanged while run ownership evolves.

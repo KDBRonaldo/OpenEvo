@@ -384,13 +384,17 @@ def test_supervised_launcher_builds_release_core_control_app(
     assert create["evolution_registry"] is registry
     assert create["service_supervisor"] is service_supervisor
     assert len(create["bearer_token"]) == 64
+    server = calls["server"]
     assert calls["service_supervisor"] == {
         "launch_mode": launcher.ServiceLaunchMode.RELEASE,
         "service_root": service_root / "managed-services",
         "framework_lock": tmp_path / "framework-lock.json",
         "verified_registry": registry,
+        "run_admission_url": (
+            f"http://127.0.0.1:{server['socket'][1]}"
+            "/internal/v1/run-admissions/verify"
+        ),
     }
-    server = calls["server"]
     assert server["app"] is app
     assert server["socket"][0] == "127.0.0.1"
     assert server["ready_payload"]["release_identity"] == release.digest

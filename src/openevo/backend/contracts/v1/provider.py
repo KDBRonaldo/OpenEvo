@@ -14,7 +14,13 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from openevo import __version__
-from openevo.backend.service_supervisor import CoreServiceSupervisor, SupervisorError
+from openevo.backend.service_control import CoreServiceControl, CoreServiceControlError
+from openevo.backend.run_admission import install_core_run_admission_endpoint
+from openevo.backend.run_control import (
+    RUN_OPERATION_IDS,
+    CoreRunControl,
+    CoreRunControlError,
+)
 from openevo.evolution.framework import (
     CapabilityAudience,
     EvolutionExecutionProfile,
@@ -90,6 +96,26 @@ _UNAVAILABLE_OPERATIONS = frozenset(
 )
 
 
+def _run_control_http_error(exc: CoreRunControlError) -> CoreControlHTTPError:
+    return _error(
+        exc.http_status,
+        code=exc.code,
+        message=str(exc),
+        category=m.ErrorCategory.RUN,
+        retryable=exc.retryable,
+        repair_action=(
+            m.RepairAction.OPENEVO_CAN_RETRY
+            if exc.retryable
+            else m.RepairAction.USER_ACTION_REQUIRED
+        ),
+        next_action=(
+            "Retry the run operation after Core reports readiness."
+            if exc.retryable
+            else "Reload the run and project state before continuing."
+        ),
+    )
+
+
 class _PostCommitHTTPError(CoreControlHTTPError):
     """Fail closed without overwriting a transaction's committed idempotency result."""
 
@@ -106,7 +132,8 @@ class CoreControlProviderV1:
         source_commit: str,
         build_channel: m.BuildChannel | str,
         evolution_registry: VerifiedExecutableRegistry | None = None,
-        service_supervisor: CoreServiceSupervisor | None = None,
+        service_supervisor: CoreServiceControl | None = None,
+        run_control: CoreRunControl | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         try:
@@ -126,6 +153,7 @@ class CoreControlProviderV1:
         self._authorization = b"Bearer " + token_bytes
         self._registry = evolution_registry
         self._service_supervisor = service_supervisor
+        self._run_control = run_control
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._started_at = self._timestamp()
         self._version = m.VersionResponseV1(
@@ -168,6 +196,9 @@ class CoreControlProviderV1:
         with self._close_lock:
             if self._closed:
                 return
+            if self._run_control is not None:
+                self._run_control.close()
+                self._run_control = None
             if self._service_supervisor is not None:
                 self._service_supervisor.close()
                 self._service_supervisor = None
@@ -209,6 +240,11 @@ class CoreControlProviderV1:
         return await loop.run_in_executor(self._executor, self.invoke, operation_id, arguments)
 
     def _invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        if operation_id in RUN_OPERATION_IDS and self._run_control is not None:
+            try:
+                return self._run_control.invoke(operation_id, arguments)
+            except CoreRunControlError as exc:
+                raise _run_control_http_error(exc) from exc
         if operation_id in _UNAVAILABLE_OPERATIONS:
             self._unavailable(operation_id)
         handler = self._handlers.get(operation_id)
@@ -218,6 +254,8 @@ class CoreControlProviderV1:
             return handler(arguments)
         except CoreControlHTTPError:
             raise
+        except CoreRunControlError as exc:
+            raise _run_control_http_error(exc) from exc
         except ResourceNotFoundError as exc:
             raise _error(
                 404,
@@ -319,7 +357,7 @@ class CoreControlProviderV1:
                 repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
                 next_action="Inspect Core diagnostics before retrying.",
             ) from exc
-        except SupervisorError as exc:
+        except CoreServiceControlError as exc:
             raise _error(
                 503,
                 code="core_service_supervisor_failed",
@@ -347,6 +385,9 @@ class CoreControlProviderV1:
         del arguments
         services = self._services()
         verified = self._registry is not None
+        active_runs, queued_runs = (
+            self._run_control.counts() if self._run_control is not None else (0, 0)
+        )
         return m.CoreStatusV1(
             status=m.HealthStatus.OK if verified else m.HealthStatus.DEGRADED,
             registry_status=(
@@ -355,8 +396,8 @@ class CoreControlProviderV1:
             registry_digest=(
                 self._registry.snapshot.registry_digest if self._registry is not None else None
             ),
-            active_runs=0,
-            queued_runs=0,
+            active_runs=active_runs,
+            queued_runs=queued_runs,
             services=services,
             checked_at=self._timestamp(),
         )
@@ -673,7 +714,8 @@ def create_core_control_app(
     source_commit: str = "0" * 40,
     build_channel: m.BuildChannel | str = m.BuildChannel.DEVELOPMENT,
     evolution_registry: VerifiedExecutableRegistry | None = None,
-    service_supervisor: CoreServiceSupervisor | None = None,
+    service_supervisor: CoreServiceControl | None = None,
+    run_control: CoreRunControl | None = None,
     event_replay_limit: int = 10_000,
 ) -> FastAPI:
     """Create a provider-backed app without adding a second route table."""
@@ -689,6 +731,7 @@ def create_core_control_app(
             build_channel=build_channel,
             evolution_registry=evolution_registry,
             service_supervisor=service_supervisor,
+            run_control=run_control,
         )
         app = create_core_control_contract_app(provider)
         contract_operation_ids = frozenset(
@@ -698,6 +741,8 @@ def create_core_control_app(
         )
         if provider.operation_ids != contract_operation_ids:
             raise RuntimeError("Core Control provider ownership does not cover the frozen routes")
+        if run_control is not None and service_supervisor is not None:
+            install_core_run_admission_endpoint(app, service_supervisor, run_control)
     except Exception:
         if provider is None:
             store.close()

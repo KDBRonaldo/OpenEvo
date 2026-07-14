@@ -6828,6 +6828,39 @@ class EvolutionStore:
             "artifact_ids": registered_artifact_ids,
         }
 
+    def get_internal_job_result(self, job_id: str) -> dict[str, object]:
+        """Return the closed terminal observation used by Core's managed run owner."""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT job_id, state, error FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown job: {job_id}")
+            artifacts = conn.execute(
+                """
+                SELECT artifact_id
+                FROM artifacts
+                WHERE state = ?
+                  AND json_extract(
+                        lineage_json,
+                        '$.openevo_execution.job_id'
+                      ) = ?
+                ORDER BY created_at ASC, artifact_id ASC
+                LIMIT 1025
+                """,
+                (str(ArtifactState.ACTIVE), job_id),
+            ).fetchall()
+        if len(artifacts) > 1024:
+            raise ValueError("job output artifact count exceeds the internal bound")
+        return {
+            "artifact_ids": [str(item["artifact_id"]) for item in artifacts],
+            "error": "evolution_job_failed" if row["error"] is not None else None,
+            "job_id": str(row["job_id"]),
+            "state": str(row["state"]),
+        }
+
     def _materialize_feedback_applications_for_artifact(
         self,
         conn: sqlite3.Connection,

@@ -47,6 +47,7 @@ from openevo.evolution.client import EvolutionClient
 from openevo.internal_auth import (
     GenerationBoundRunAdmissionVerifier,
     InternalServiceIdentity,
+    configured_run_admission_verifier,
     RunAdmissionOperation,
     health_identity_payload,
     inherited_listen_fd,
@@ -948,6 +949,7 @@ def serve(
         topology_path,
         node_id=node_id,
         internal_identity=internal_identity,
+        run_admission_verifier=configured_run_admission_verifier(internal_identity),
     )
     state = get_state()
     listen_fd = inherited_listen_fd()

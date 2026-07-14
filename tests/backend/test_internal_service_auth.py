@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -7,16 +8,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import httpx
+from fastapi import FastAPI
 
 from openevo.evolution.server import create_app
 from openevo.gateway import server as gateway_server
 from openevo.internal_auth import (
     GenerationBoundRunAdmissionCheck,
+    CoreRunAdmissionHttpVerifier,
     INTERNAL_CREDENTIAL_FD_ENV,
     InternalServiceIdentity,
     RunAdmissionOperation,
     read_internal_service_identity,
 )
+from openevo.backend.run_admission import install_core_run_admission_endpoint
 from openevo.rollout.models import SessionDispatchRequest
 from openevo.rollout import server as rollout_server
 
@@ -57,6 +62,110 @@ def test_internal_identity_is_consumed_from_fd_and_never_repr_visible(monkeypatc
     assert INTERNAL_CREDENTIAL_FD_ENV not in os.environ
 
 
+def test_http_run_admission_verifier_sends_only_bound_check_and_internal_auth() -> None:
+    received: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received["headers"] = dict(request.headers)
+        received["payload"] = json.loads(request.content)
+        return httpx.Response(204)
+
+    identity = _identity("rollout")
+    verifier = CoreRunAdmissionHttpVerifier(
+        identity,
+        "http://127.0.0.1:19000/internal/v1/run-admissions/verify",
+        transport=httpx.MockTransport(handler),
+    )
+    check = GenerationBoundRunAdmissionCheck(
+        operation=RunAdmissionOperation.ROLLOUT_TASK_SUBMIT,
+        generation_digest=GENERATION,
+        registry_digest=REGISTRY,
+        framework_lock_digest=FRAMEWORK_LOCK,
+        payload_sha256="d" * 64,
+        task_id="release-task",
+        session_id=None,
+    )
+
+    asyncio.run(verifier.verify(check))
+
+    assert received["payload"] == {
+        "framework_lock_digest": FRAMEWORK_LOCK,
+        "generation_digest": GENERATION,
+        "operation": "rollout_task_submit",
+        "payload_sha256": "d" * 64,
+        "registry_digest": REGISTRY,
+        "session_id": None,
+        "task_id": "release-task",
+    }
+    headers = received["headers"]
+    assert isinstance(headers, dict)
+    assert headers["authorization"] == f"Bearer {CREDENTIAL}"
+    assert headers["x-openevo-internal-service"] == "rollout"
+
+
+def test_core_run_admission_endpoint_is_private_bounded_and_generation_authenticated() -> None:
+    class ServiceControl:
+        def authenticates_run_service(self, headers) -> bool:
+            return _identity("core-control").authenticates(
+                {str(key).lower(): str(value) for key, value in headers.items()}
+            )
+
+    class Authority:
+        def __init__(self) -> None:
+            self.checks: list[GenerationBoundRunAdmissionCheck] = []
+
+        async def verify(self, check: GenerationBoundRunAdmissionCheck) -> None:
+            self.checks.append(check)
+
+    authority = Authority()
+    app = FastAPI()
+    install_core_run_admission_endpoint(app, ServiceControl(), authority)
+    client = TestClient(app)
+    payload = {
+        "framework_lock_digest": FRAMEWORK_LOCK,
+        "generation_digest": GENERATION,
+        "operation": "rollout_task_submit",
+        "payload_sha256": "d" * 64,
+        "registry_digest": REGISTRY,
+        "session_id": None,
+        "task_id": "release-task",
+    }
+
+    assert client.post("/internal/v1/run-admissions/verify", json=payload).status_code == 401
+    response = client.post(
+        "/internal/v1/run-admissions/verify",
+        headers=_identity("rollout").request_headers(),
+        json=payload,
+    )
+
+    assert response.status_code == 204
+    assert authority.checks == [
+        GenerationBoundRunAdmissionCheck(
+            operation=RunAdmissionOperation.ROLLOUT_TASK_SUBMIT,
+            generation_digest=GENERATION,
+            registry_digest=REGISTRY,
+            framework_lock_digest=FRAMEWORK_LOCK,
+            payload_sha256="d" * 64,
+            task_id="release-task",
+            session_id=None,
+        )
+    ]
+    assert all(
+        route.path != "/internal/v1/run-admissions/verify"
+        for route in app.routes
+        if getattr(route, "include_in_schema", False)
+    )
+    oversized = b"{" + b" " * 5000 + b"}"
+    assert (
+        client.post(
+            "/internal/v1/run-admissions/verify",
+            headers=_identity("rollout").request_headers(),
+            content=oversized,
+        ).status_code
+        == 413
+    )
+
+
 def test_evolution_internal_surface_fails_closed_and_registers_exact_worker(tmp_path) -> None:
     identity = _identity()
     app = create_app(
@@ -66,6 +175,7 @@ def test_evolution_internal_surface_fails_closed_and_registers_exact_worker(tmp_
     )
     with TestClient(app) as client:
         assert client.get("/v1/health").status_code == 401
+        assert client.get("/v1/internal/jobs/missing-job").status_code == 401
         wrong = identity.request_headers()
         wrong["Authorization"] = "Bearer wrong-credential-value-that-is-long-enough"
         assert client.get("/v1/health", headers=wrong).status_code == 401
@@ -74,6 +184,13 @@ def test_evolution_internal_surface_fails_closed_and_registers_exact_worker(tmp_
         assert health.status_code == 200
         assert health.json()["internal_identity"] == identity.health_identity()
         assert "artifact_root" not in health.json()
+        assert (
+            client.get(
+                "/v1/internal/jobs/missing-job",
+                headers=identity.request_headers(),
+            ).status_code
+            == 404
+        )
 
         registration = {
             "framework_lock_digest": FRAMEWORK_LOCK,
