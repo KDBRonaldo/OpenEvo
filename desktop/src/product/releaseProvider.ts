@@ -75,10 +75,23 @@ export async function createReleaseDesktopProductProvider(
   const context: ReleaseProviderAdapterContext = {
     client,
     native: {
-      selectProjectSource: async (intent) => projectSourceV1Schema.parse(await native.selectProjectSource(intent)),
-      configureCredential: async (profileId, slotKind, etag, actionId) => remoteProfileV1Schema.parse(
-        await native.configureCredential(profileId, slotKind, etag, actionId),
-      ),
+      selectProjectSource: async (intent) => {
+        const source = projectSourceV1Schema.parse(await native.selectProjectSource(intent));
+        if (source.kind !== intent.kind || source.import_ref === null) {
+          throw new DesktopContractError("Native project source does not match the requested kind");
+        }
+        return source;
+      },
+      configureCredential: async (profileId, slotKind, etag, actionId) => {
+        const profile = remoteProfileV1Schema.parse(
+          await native.configureCredential(profileId, slotKind, etag, actionId),
+        );
+        if (profile.profile_id !== profileId
+          || !profile.credential_slots.some((slot) => slot.kind === slotKind)) {
+          throw new DesktopContractError("Native credential response does not match the requested profile slot");
+        }
+        return profile;
+      },
     },
   };
   const provider = dependencies.adapterFactory

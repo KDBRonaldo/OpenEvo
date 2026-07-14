@@ -4,6 +4,8 @@ import { DesktopApiError } from "../api/v1/client";
 import { CONTRACT_FIXTURE_V1 } from "../api/v1/fixtures";
 import {
   apiErrorV1Schema,
+  artifactContentV1Schema,
+  artifactDiffV1Schema,
   artifactV1Schema,
   desktopStateV1Schema,
   localOperationV1Schema,
@@ -17,8 +19,9 @@ import {
   serviceV1Schema,
   timelineEntryV1Schema,
   type ArtifactV1,
+  type LocalOperationV1,
 } from "../api/v1/schemas";
-import { createLocalApiDesktopProductProvider } from "./localApiProvider";
+import { LocalApiDesktopProductProvider } from "./localApiProvider";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -34,7 +37,7 @@ describe("LocalApiDesktopProductProvider", () => {
       id: "service-gateway-fixture-2",
       kind: "gateway",
     });
-    client.state = vi.fn().mockResolvedValue(onlineState(["operation-z", "operation-a"]));
+    client.state = vi.fn().mockResolvedValue(onlineState(["operation-z", "operation-a", "operation-z"]));
     client.listProfiles = pagedMock([[profile()], [profile({ profile_id: "profile-fixture-2" })]]);
     client.listProjects = pagedMock([[project()]]);
     client.listRuns = pagedMock([[CONTRACT_FIXTURE_V1.runSummary], []]);
@@ -64,6 +67,7 @@ describe("LocalApiDesktopProductProvider", () => {
     expect(result.snapshot.artifactCollection).toEqual({ status: "complete" });
     expect(result.snapshot.services).toHaveLength(2);
     expect(result.snapshot.activeOperation?.operation_id).toBe("operation-a");
+    expect(vi.mocked(client.getOperation).mock.calls.map(([operationId]) => operationId)).toEqual(["operation-a", "operation-z"]);
     expect(result.snapshot.capability?.status).toBe("ready");
     expect(result.snapshot.validation?.status).toBe("ready");
     expect(client.getRun).toHaveBeenCalledWith(CONTRACT_FIXTURE_V1.run.id);
@@ -94,6 +98,79 @@ describe("LocalApiDesktopProductProvider", () => {
     if (partialResult.status !== "fresh") return;
     expect(partialResult.snapshot.artifacts).toEqual([]);
     expect(partialResult.snapshot.artifactCollection).toEqual({ status: "incomplete", reason: "refresh_failed" });
+  });
+
+  it("checks the deduplicated pending-operation budget before issuing any operation request", async () => {
+    const client = mockClient();
+    client.state = vi.fn().mockResolvedValue(onlineState(
+      Array.from({ length: 20_001 }, (_, index) => `pending-operation-${index}`),
+    ));
+
+    const first = await createProvider(client).refresh();
+    const second = await createProvider(client).refresh();
+
+    expect(first.status).toBe("error");
+    expect(second.status).toBe("error");
+    expect(client.getOperation).not.toHaveBeenCalled();
+  });
+
+  it("rejects schema-valid refresh resources with cross-wired collection or parent identities", async () => {
+    const duplicateProfile = mockClient();
+    duplicateProfile.listProfiles = vi.fn().mockResolvedValue(page([profile(), profile()]));
+    expect((await createProvider(duplicateProfile).refresh()).status).toBe("error");
+
+    const unknownProfile = mockClient();
+    unknownProfile.listProjects = vi.fn().mockResolvedValue(page([project({ profile_id: "profile-outside-page" })]));
+    expect((await createProvider(unknownProfile).refresh()).status).toBe("error");
+
+    const mismatchedDetail = mockClient();
+    mismatchedDetail.getRun = vi.fn().mockResolvedValue(run({ updated_at: "2026-07-14T12:00:01Z" }));
+    expect((await createProvider(mismatchedDetail).refresh()).status).toBe("error");
+
+    const unknownRunProject = mockClient();
+    const foreignRun = runForProject("project-outside-page");
+    unknownRunProject.listRuns = vi.fn().mockResolvedValue(page([runSummary(foreignRun)]));
+    unknownRunProject.getRun = vi.fn().mockResolvedValue(foreignRun);
+    expect((await createProvider(unknownRunProject).refresh()).status).toBe("error");
+
+    const duplicateService = mockClient();
+    duplicateService.listServices = vi.fn().mockResolvedValue(page([
+      serviceV1Schema.parse(CONTRACT_FIXTURE_V1.service),
+      serviceV1Schema.parse(CONTRACT_FIXTURE_V1.service),
+    ]));
+    expect((await createProvider(duplicateService).refresh()).status).toBe("error");
+  });
+
+  it("rejects schema-valid timeline entries outside the requested run, attempt, service, or artifact parent", async () => {
+    const cases = [
+      timelineEntryV1Schema.parse({ ...CONTRACT_FIXTURE_V1.timeline, run_id: "run-cross-wired" }),
+      timelineEntryV1Schema.parse({ ...CONTRACT_FIXTURE_V1.timeline, attempt_id: "attempt-cross-wired" }),
+      timelineEntryV1Schema.parse({ ...CONTRACT_FIXTURE_V1.timeline, service_id: "service-cross-wired" }),
+      timelineEntryV1Schema.parse({ ...CONTRACT_FIXTURE_V1.timeline, artifact_ids: ["artifact-cross-wired"] }),
+    ];
+    for (const entry of cases) {
+      const client = mockClient();
+      client.runTimeline = vi.fn().mockResolvedValue(page([entry]));
+      expect((await createProvider(client).refresh()).status).toBe("error");
+    }
+  });
+
+  it("requires every artifact page item to belong to the requested run and project", async () => {
+    const withoutRun = mockClient();
+    withoutRun.runArtifacts = vi.fn().mockResolvedValue(page([
+      artifactV1Schema.parse({ ...CONTRACT_FIXTURE_V1.artifacts[0], run_id: null }),
+    ]));
+    expect((await createProvider(withoutRun).refresh()).status).toBe("error");
+
+    const otherRun = mockClient();
+    otherRun.runArtifacts = vi.fn().mockResolvedValue(page([
+      artifactV1Schema.parse({ ...CONTRACT_FIXTURE_V1.artifacts[0], run_id: "run-cross-wired" }),
+    ]));
+    expect((await createProvider(otherRun).refresh()).status).toBe("error");
+
+    const otherProject = mockClient();
+    otherProject.runArtifacts = vi.fn().mockResolvedValue(page([artifactForProject("project-cross-wired")]));
+    expect((await createProvider(otherProject).refresh()).status).toBe("error");
   });
 
   it("does not let an older refresh overwrite a newer snapshot", async () => {
@@ -166,6 +243,64 @@ describe("LocalApiDesktopProductProvider", () => {
     expect(unknown.createRun).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects schema-valid cross-wired mutation, action, content, and diff responses", async () => {
+    const client = mockClient();
+    const provider = createProvider(client);
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("expected a fresh fixture");
+    const resourceIntent = { actionId: "renderer-attack-action-0001", streamEpoch: refreshed.snapshot.stream.epoch, etag: ETAG_A };
+    const createIntent = { actionId: "renderer-attack-create-0001", streamEpoch: refreshed.snapshot.stream.epoch };
+
+    client.createProfile = vi.fn().mockResolvedValue(profile({ name: "Cross-wired profile" }));
+    await expect(provider.createProfile(profileInput(), createIntent)).rejects.toThrow(/does not match the request/i);
+    client.updateProfile = vi.fn().mockResolvedValue(profile({ profile_id: "profile-cross-wired" }));
+    await expect(provider.updateProfile("profile-fixture-1", { name: "Updated" }, resourceIntent)).rejects.toThrow(/wrong profile/i);
+
+    client.createProject = vi.fn().mockResolvedValue(project({ name: "Cross-wired project" }));
+    await expect(provider.createProject(projectInput(), createIntent)).rejects.toThrow(/does not match the request/i);
+    client.updateProject = vi.fn().mockResolvedValue(project({ project_id: "project-cross-wired" }));
+    await expect(provider.updateProject("project-fixture-1", { name: "Updated" }, resourceIntent)).rejects.toThrow(/wrong project/i);
+
+    client.createRun = vi.fn().mockResolvedValue(runForProject("project-cross-wired"));
+    await expect(provider.startRun({ ...resourceIntent, projectId: "project-fixture-1" })).rejects.toThrow(/another project/i);
+    client.cancelRun = vi.fn().mockResolvedValue(runWithId("run-cross-wired"));
+    await expect(provider.cancelRun("run-fixture-1", resourceIntent)).rejects.toThrow(/wrong run/i);
+    client.cancelRun = vi.fn().mockResolvedValue(runForProject("project-cross-wired"));
+    await expect(provider.cancelRun("run-fixture-1", resourceIntent)).rejects.toThrow(/wrong run/i);
+    client.retryRun = vi.fn().mockResolvedValue(runWithId("run-cross-wired"));
+    await expect(provider.retryRun("run-fixture-1", resourceIntent)).rejects.toThrow(/wrong run/i);
+    client.retryRun = vi.fn().mockResolvedValue(runForProject("project-cross-wired"));
+    await expect(provider.retryRun("run-fixture-1", resourceIntent)).rejects.toThrow(/wrong run/i);
+
+    client.connectProfile = vi.fn().mockResolvedValue(localOperation("profile_connect", "profile", "profile-cross-wired"));
+    await expect(provider.connectProfile("profile-fixture-1", resourceIntent)).rejects.toThrow(/another resource/i);
+    client.connectProfile = vi.fn().mockResolvedValue(crossWiredProfileOperationResult());
+    await expect(provider.connectProfile("profile-fixture-1", resourceIntent)).rejects.toThrow(/result does not match/i);
+    client.acceptProfileHostKey = vi.fn().mockResolvedValue(localOperation("host_key_accept", "profile", "profile-cross-wired"));
+    await expect(provider.acceptHostKey("profile-fixture-1", {
+      algorithm: "ssh-ed25519",
+      fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    }, resourceIntent)).rejects.toThrow(/another resource/i);
+    client.activateProject = vi.fn().mockResolvedValue(localOperation("project_activate", "project", "project-cross-wired"));
+    await expect(provider.activateProject("project-fixture-1", resourceIntent)).rejects.toThrow(/another resource/i);
+    client.syncProjectWorkspace = vi.fn().mockResolvedValue(localOperation("workspace_sync", "project", "project-cross-wired"));
+    await expect(provider.syncProjectWorkspace("project-fixture-1", resourceIntent)).rejects.toThrow(/another resource/i);
+    client.repairProject = vi.fn().mockResolvedValue(localOperation("project_repair", "project", "project-cross-wired"));
+    await expect(provider.repairProject("project-fixture-1", resourceIntent)).rejects.toThrow(/another resource/i);
+    client.cancelOperation = vi.fn().mockResolvedValue(localOperation("project_repair", "project", "project-fixture-1", "operation-cross-wired"));
+    await expect(provider.cancelOperation("operation-fixture-1", resourceIntent)).rejects.toThrow(/wrong operation/i);
+
+    client.restartService = vi.fn().mockResolvedValue(serviceRestartOperation("service-cross-wired"));
+    await expect(provider.restartService("service-control-fixture-1", resourceIntent)).rejects.toThrow(/another service/i);
+    client.artifactContent = vi.fn().mockResolvedValue(artifactContentV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.artifactContent,
+      artifact_id: "artifact-cross-wired",
+    }));
+    await expect(provider.getArtifactContent("artifact-memory-fixture-1")).rejects.toThrow(/wrong artifact/i);
+    client.artifactDiff = vi.fn().mockResolvedValue(emptyArtifactDiff("artifact-cross-wired"));
+    await expect(provider.getArtifactDiff("artifact-memory-fixture-1")).rejects.toThrow(/wrong artifact/i);
+  });
+
   it("uses only strict native source and credential bridge results", async () => {
     const client = mockClient();
     const native = {
@@ -176,7 +311,7 @@ describe("LocalApiDesktopProductProvider", () => {
       }),
       configureCredential: vi.fn().mockResolvedValue(profile()),
     };
-    const provider = createLocalApiDesktopProductProvider({ client, native, fetch: vi.fn<FetchLike>() });
+    const provider = new LocalApiDesktopProductProvider({ client, native, fetch: vi.fn<FetchLike>() });
     const refreshed = await provider.refresh();
     if (refreshed.status !== "fresh") throw new Error("expected a fresh fixture");
     const epoch = refreshed.snapshot.stream.epoch;
@@ -207,9 +342,8 @@ describe("LocalApiDesktopProductProvider", () => {
 
     native.selectProjectSource.mockResolvedValueOnce({
       kind: "scratch",
-      display_name: "Unsafe",
+      display_name: "Cross-wired scratch source",
       import_ref: null,
-      path: "/private/source",
     });
     const finalRefresh = await provider.refresh();
     if (finalRefresh.status !== "fresh") throw new Error("expected a fresh fixture");
@@ -218,6 +352,15 @@ describe("LocalApiDesktopProductProvider", () => {
       actionId: "renderer-action-source-0002",
       streamEpoch: finalRefresh.snapshot.stream.epoch,
     })).rejects.toThrow();
+
+    native.configureCredential.mockResolvedValueOnce(profile({
+      credential_slots: [{ kind: "ssh_password", status: "stored", updated_at: NOW }],
+    }));
+    await expect(provider.configureCredential("profile-fixture-1", "ssh_private_key", {
+      actionId: "renderer-action-credential-0002",
+      streamEpoch: finalRefresh.snapshot.stream.epoch,
+      etag: ETAG_A,
+    })).rejects.toThrow(/credential slot/i);
   });
 
   it("treats duplicate events as safe and an out-of-order sequence as a reload gap", async () => {
@@ -316,6 +459,8 @@ function mockClient(): DesktopApiClientV1 & Record<string, ReturnType<typeof vi.
     activateProject: vi.fn().mockResolvedValue(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation)),
     syncProjectWorkspace: vi.fn().mockResolvedValue(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation)),
     cancelRun: vi.fn().mockResolvedValue(runV1Schema.parse(CONTRACT_FIXTURE_V1.run)),
+    retryRun: vi.fn().mockResolvedValue(runV1Schema.parse(CONTRACT_FIXTURE_V1.run)),
+    cancelOperation: vi.fn().mockResolvedValue(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation)),
     artifactContent: vi.fn().mockResolvedValue(CONTRACT_FIXTURE_V1.artifactContent),
     artifactDiff: vi.fn().mockResolvedValue(CONTRACT_FIXTURE_V1.artifactDiff),
     repairProject: vi.fn().mockResolvedValue(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation)),
@@ -324,7 +469,7 @@ function mockClient(): DesktopApiClientV1 & Record<string, ReturnType<typeof vi.
 }
 
 function createProvider(client: DesktopApiClientV1, fetch: FetchLike = vi.fn<FetchLike>()) {
-  return createLocalApiDesktopProductProvider({
+  return new LocalApiDesktopProductProvider({
     client,
     native: {
       selectProjectSource: vi.fn(),
@@ -368,8 +513,124 @@ function profile(overrides: Record<string, unknown> = {}) {
   return remoteProfileV1Schema.parse({ ...CONTRACT_FIXTURE_V1.profile, ...overrides });
 }
 
-function project() {
-  return projectV1Schema.parse(CONTRACT_FIXTURE_V1.project);
+function project(overrides: Record<string, unknown> = {}) {
+  return projectV1Schema.parse({ ...CONTRACT_FIXTURE_V1.project, ...overrides });
+}
+
+function profileInput() {
+  const value = profile();
+  return {
+    name: value.name,
+    host: value.host,
+    port: value.port,
+    user: value.user,
+    authentication_kind: value.authentication_kind,
+    proxy: value.proxy,
+  };
+}
+
+function projectInput() {
+  const value = project();
+  return {
+    name: value.name,
+    profile_id: value.profile_id,
+    task: value.task,
+    source: value.source,
+    execution: value.execution,
+    evolution: value.evolution,
+  };
+}
+
+function run(overrides: Record<string, unknown> = {}) {
+  return runV1Schema.parse({ ...CONTRACT_FIXTURE_V1.run, ...overrides });
+}
+
+function runWithId(id: string) {
+  const value = run();
+  const attempts = value.attempts.map((attempt) => ({ ...attempt, run_id: id }));
+  return runV1Schema.parse({
+    ...value,
+    id,
+    attempts,
+    current_attempt: attempts.at(-1) ?? null,
+  });
+}
+
+function runForProject(projectId: string) {
+  const value = run();
+  const revision = { ...value.required_revision.revision, project_id: projectId };
+  return runV1Schema.parse({
+    ...value,
+    project_id: projectId,
+    pinned_revision: revision,
+    required_revision: { ...value.required_revision, revision },
+  });
+}
+
+function runSummary(value: ReturnType<typeof run>) {
+  const { attempts: _attempts, ...summary } = value;
+  return summary;
+}
+
+function artifactForProject(projectId: string) {
+  const value = artifactV1Schema.parse(CONTRACT_FIXTURE_V1.artifacts[0]);
+  return artifactV1Schema.parse({
+    ...value,
+    project_id: projectId,
+    produced_revision: { ...value.produced_revision, project_id: projectId },
+    membership_revisions: value.membership_revisions.map((revision) => ({ ...revision, project_id: projectId })),
+  });
+}
+
+function localOperation(
+  operationKind: LocalOperationV1["operation_kind"],
+  resourceType: "profile" | "project",
+  resourceId: string,
+  operationId = "operation-fixture-1",
+) {
+  return localOperationV1Schema.parse({
+    ...CONTRACT_FIXTURE_V1.operation,
+    operation_id: operationId,
+    operation_kind: operationKind,
+    resource: { resource_type: resourceType, resource_id: resourceId },
+  });
+}
+
+function crossWiredProfileOperationResult() {
+  return localOperationV1Schema.parse({
+    ...CONTRACT_FIXTURE_V1.operation,
+    operation_kind: "profile_connect",
+    state: "succeeded",
+    resource: { resource_type: "profile", resource_id: "profile-fixture-1" },
+    result: { kind: "connection", profile_id: "profile-cross-wired", connection_state: "connected" },
+    started_at: NOW,
+    finished_at: NOW,
+  });
+}
+
+function serviceRestartOperation(serviceId: string) {
+  return operationV1Schema.parse({
+    ...CONTRACT_FIXTURE_V1.serviceOperation,
+    request: {
+      ...CONTRACT_FIXTURE_V1.serviceOperation.request,
+      service_id: serviceId,
+    },
+  });
+}
+
+function emptyArtifactDiff(artifactId: string) {
+  return artifactDiffV1Schema.parse({
+    schema_version: "1",
+    artifact_id: artifactId,
+    artifact_content_sha256: A,
+    previous_artifact_id: "artifact-previous-fixture-1",
+    previous_artifact_content_sha256: B,
+    document_changes: [],
+    total_document_changes: 0,
+    total_hunks: 0,
+    total_lines: 0,
+    truncated: false,
+  });
 }
 
 function page<T>(items: readonly T[], nextCursor: string | null = null) {

@@ -19,6 +19,12 @@ folder and credential operations remain native-host calls whose results are
 strictly parsed as `ProjectSourceV1` and `RemoteProfileV1`; renderer file inputs,
 raw paths, and secret values are not accepted.
 
+The release adapter deliberately has no fallback for those native calls. The
+Tauri commands `select_project_source` and `configure_credential` are required
+release integration dependencies and are not implemented by the current Rust
+host yet. Release-native integration must add those commands before this flow
+can ship; the provider must continue to fail closed until they exist.
+
 The remaining bootstrap-retry integration point is `App.tsx`. It currently
 replaces a failed `createReleaseDesktopProductProvider` call with the unavailable
 provider. A later startup-state change must expose an explicit retry that calls

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { FetchLike } from "../api/v1/client";
+import { CONTRACT_FIXTURE_V1 } from "../api/v1/fixtures";
 import {
   ProductRefreshOrder,
   defineDesktopProductReleaseContract,
@@ -108,7 +109,7 @@ describe("Desktop product provider boundary", () => {
     expect(adapterFactory).not.toHaveBeenCalled();
   });
 
-  it("rejects native source responses that expose fields outside ProjectSourceV1", async () => {
+  it("rejects native source responses outside ProjectSourceV1 or cross-wired to another source kind", async () => {
     const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
     const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
     await expect(createReleaseDesktopProductProvider({
@@ -134,6 +135,49 @@ describe("Desktop product provider boundary", () => {
         return unavailableDesktopProductProvider;
       },
     })).rejects.toThrow();
+
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native: {
+        bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        selectProjectSource: vi.fn().mockResolvedValue({
+          kind: "scratch",
+          display_name: "Cross-wired scratch source",
+          import_ref: null,
+        }),
+        configureCredential: vi.fn(),
+      },
+      adapterFactory: async ({ native }) => {
+        await native.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0003", streamEpoch: 1 });
+        return unavailableDesktopProductProvider;
+      },
+    })).rejects.toThrow(/requested kind/i);
+  });
+
+  it("rejects a native credential response cross-wired to another profile or slot", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native: {
+        bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        selectProjectSource: vi.fn(),
+        configureCredential: vi.fn().mockResolvedValue({
+          ...CONTRACT_FIXTURE_V1.profile,
+          profile_id: "profile-cross-wired",
+          credential_slots: [{ kind: "ssh_password", status: "stored", updated_at: "2026-07-14T12:00:00Z" }],
+        }),
+      },
+      adapterFactory: async ({ native }) => {
+        await native.configureCredential(
+          "profile-fixture-1",
+          "ssh_private_key",
+          `"${"a".repeat(64)}"`,
+          "credential-action-0001",
+        );
+        return unavailableDesktopProductProvider;
+      },
+    })).rejects.toThrow(/profile slot/i);
   });
 
   it("rejects an older refresh result after a newer refresh has started", () => {
