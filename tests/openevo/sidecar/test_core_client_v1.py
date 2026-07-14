@@ -13,15 +13,19 @@ import pytest
 
 from desktop.sidecar.core_client_v1 import (
     CORE_OPENAPI_SHA256,
+    CoreBootstrapTunnelConnectionV1,
     CoreClientErrorV1,
     CoreClientLocalErrorCodeV1,
     CoreClientLocalErrorV1,
     CoreControlClientV1,
+    CoreProjectBootstrapClientV1,
+    CoreProjectBootstrapResultV1,
     CoreSseStreamV1,
     CoreTunnelConnectionV1,
     MAX_CORE_JSON_RESPONSE_BYTES,
     MAX_CORE_SSE_FRAME_BYTES,
     MAX_CORE_SSE_RESPONSE_BYTES,
+    _ensure_project_create_response,
 )
 from openevo.backend.contracts.v1 import models as v1
 from openevo.evolution.framework import (
@@ -49,6 +53,14 @@ def _connection(*, token: str | None = None) -> CoreTunnelConnectionV1:
         endpoint="http://127.0.0.1:48765",
         bearer_token=token or _token(),
         project_id=PROJECT_ID,
+        session_id=SESSION_ID,
+    )
+
+
+def _bootstrap_connection(*, token: str | None = None) -> CoreBootstrapTunnelConnectionV1:
+    return CoreBootstrapTunnelConnectionV1(
+        endpoint="http://127.0.0.1:48765",
+        bearer_token=token or _token(),
         session_id=SESSION_ID,
     )
 
@@ -380,6 +392,17 @@ def _project(
     )
 
 
+def _project_create_request() -> v1.ProjectCreateV1:
+    project = _project()
+    return v1.ProjectCreateV1(
+        name=project.name,
+        description=project.description,
+        spec=project.spec,
+        task=project.task,
+        workspace=project.workspace,
+    )
+
+
 def _upload(
     *,
     accepted_offset: int = 0,
@@ -636,6 +659,343 @@ def test_v1_authorization_is_sent_only_to_fixed_origin_and_redirect_is_rejected(
     assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.REDIRECT_REJECTED
     assert token not in str(exc_info.value)
     assert "attacker" not in str(exc_info.value)
+
+
+def test_project_bootstrap_negotiates_then_binds_the_core_generated_project_id() -> None:
+    connection = _bootstrap_connection()
+    request = _project_create_request()
+    created = _project().model_copy(update={"id": "project-created-by-core"})
+    seen: list[httpx.Request] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        seen.append(http_request)
+        if http_request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        assert http_request.url.path == "/v1/projects"
+        return httpx.Response(201, json=created.model_dump(mode="json"))
+
+    client = CoreProjectBootstrapClientV1(
+        connection,
+        transport=httpx.MockTransport(handler),
+    )
+    assert client.version().openapi_sha256 == CORE_OPENAPI_SHA256
+    result = client.create_project(request, idempotency_key="bootstrap-project-0001")
+
+    assert result == CoreProjectBootstrapResultV1(
+        project=created,
+        connection=connection.bind(created.id),
+    )
+    assert seen[1].headers["authorization"] == f"Bearer {connection.bearer_token}"
+    assert seen[1].headers["idempotency-key"] == "bootstrap-project-0001"
+    assert json.loads(seen[1].content) == request.model_dump(mode="json")
+    assert connection.bearer_token not in repr(result)
+
+    # A delivered success is replayed locally and cannot create a second Core project.
+    assert client.create_project(request, idempotency_key="bootstrap-project-0001") == result
+    assert len(seen) == 2
+    client.close()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "session_id"),
+    (
+        (None, SESSION_ID),
+        ("http://127.0.0.1:48765", None),
+        ("http://127.0.0.1:48765", "invalid-\ud800-session"),
+    ),
+)
+def test_project_bootstrap_connection_rejects_invalid_identity_without_raw_errors(
+    endpoint: object,
+    session_id: object,
+) -> None:
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        CoreBootstrapTunnelConnectionV1(
+            endpoint=endpoint,  # type: ignore[arg-type]
+            bearer_token=_token(),
+            session_id=session_id,  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_CONNECTION
+
+
+def test_project_bootstrap_requires_version_negotiation_before_create_transport() -> None:
+    create_called = False
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        nonlocal create_called
+        create_called = True
+        return httpx.Response(201, json=_project().model_dump(mode="json"))
+
+    client = CoreProjectBootstrapClientV1(
+        _bootstrap_connection(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.create_project(
+            _project_create_request(),
+            idempotency_key="bootstrap-without-version-0001",
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_CONNECTION
+    assert create_called is False
+    client.close()
+
+
+def test_project_bootstrap_lock_wait_uses_the_public_operation_deadline() -> None:
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        assert http_request.url.path == "/version"
+        return httpx.Response(200, json=_version_payload())
+
+    client = CoreProjectBootstrapClientV1(
+        _bootstrap_connection(),
+        transport=httpx.MockTransport(handler),
+        timeout=0.05,
+    )
+    client.version()
+    assert client._create_lock.acquire(timeout=1)
+    started = time.monotonic()
+    try:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.create_project(
+                _project_create_request(),
+                idempotency_key="bootstrap-lock-deadline-0001",
+            )
+    finally:
+        client._create_lock.release()
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.CONNECTION_FAILED
+    assert time.monotonic() - started < 0.5
+    client.close()
+
+
+def test_bound_client_rejects_project_creation_before_transport() -> None:
+    called = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(201, json=_project().model_dump(mode="json"))
+
+    client = _client(handler)
+    called = False  # Ignore the version negotiation performed by _client.
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.create_project(
+            _project_create_request(),
+            idempotency_key="bound-create-forbidden-0001",
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+    assert called is False
+
+
+def test_project_bootstrap_rejects_cross_wired_response_and_can_retry() -> None:
+    connection = _bootstrap_connection()
+    request = _project_create_request()
+    valid = _project().model_copy(update={"id": "project-created-by-core"})
+    invalid = valid.model_copy(update={"name": "Another project"})
+    project_responses = iter((invalid, valid))
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        if http_request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        return httpx.Response(
+            201,
+            json=next(project_responses).model_dump(mode="json"),
+        )
+
+    client = CoreProjectBootstrapClientV1(
+        connection,
+        transport=httpx.MockTransport(handler),
+    )
+    client.version()
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.create_project(request, idempotency_key="bootstrap-project-0002")
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+    result = client.create_project(request, idempotency_key="bootstrap-project-0002")
+    assert result.project == valid
+    assert result.connection.project_id == valid.id
+    client.close()
+
+
+def test_project_bootstrap_retries_unknown_transport_outcome_with_same_identity() -> None:
+    connection = _bootstrap_connection()
+    request = _project_create_request()
+    created = _project().model_copy(update={"id": "project-created-after-retry"})
+    create_attempts = 0
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        nonlocal create_attempts
+        if http_request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        create_attempts += 1
+        if create_attempts == 1:
+            raise httpx.ConnectError("unknown outcome", request=http_request)
+        return httpx.Response(201, json=created.model_dump(mode="json"))
+
+    client = CoreProjectBootstrapClientV1(
+        connection,
+        transport=httpx.MockTransport(handler),
+    )
+    client.version()
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.create_project(request, idempotency_key="bootstrap-project-0003")
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.CONNECTION_FAILED
+
+    result = client.create_project(request, idempotency_key="bootstrap-project-0003")
+    assert result.project == created
+    assert create_attempts == 2
+    client.close()
+
+
+def test_project_bootstrap_freezes_request_identity_before_unknown_transport_outcome() -> None:
+    connection = _bootstrap_connection()
+    request = _project_create_request()
+    create_attempts = 0
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        nonlocal create_attempts
+        if http_request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        create_attempts += 1
+        raise httpx.ConnectError("unknown outcome", request=http_request)
+
+    client = CoreProjectBootstrapClientV1(
+        connection,
+        transport=httpx.MockTransport(handler),
+    )
+    client.version()
+    with pytest.raises(CoreClientErrorV1):
+        client.create_project(request, idempotency_key="bootstrap-project-frozen-0001")
+
+    with pytest.raises(CoreClientErrorV1) as changed_request:
+        client.create_project(
+            request.model_copy(update={"name": "Different project"}),
+            idempotency_key="bootstrap-project-frozen-0001",
+        )
+    with pytest.raises(CoreClientErrorV1) as changed_key:
+        client.create_project(request, idempotency_key="bootstrap-project-frozen-other")
+
+    assert changed_request.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+    assert changed_key.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+    assert create_attempts == 1
+    client.close()
+
+
+def test_project_bootstrap_close_seals_validation_and_result_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _bootstrap_connection()
+    request = _project_create_request()
+    created = _project().model_copy(update={"id": "project-created-before-close"})
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    original_validate = _ensure_project_create_response
+
+    def pause_validation(
+        submitted: v1.ProjectCreateV1,
+        response: v1.ProjectV1,
+    ) -> None:
+        original_validate(submitted, response)
+        validation_started.set()
+        assert release_validation.wait(timeout=5)
+
+    monkeypatch.setattr(
+        "desktop.sidecar.core_client_v1._ensure_project_create_response",
+        pause_validation,
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        if http_request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        return httpx.Response(201, json=created.model_dump(mode="json"))
+
+    client = CoreProjectBootstrapClientV1(
+        connection,
+        transport=httpx.MockTransport(handler),
+    )
+    client.version()
+    delivered: list[CoreProjectBootstrapResultV1] = []
+    failures: list[CoreClientErrorV1] = []
+
+    def create() -> None:
+        try:
+            delivered.append(
+                client.create_project(
+                    request,
+                    idempotency_key="bootstrap-close-delivery-0001",
+                )
+            )
+        except CoreClientErrorV1 as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=create)
+    thread.start()
+    assert validation_started.wait(timeout=5)
+    client.close()
+    release_validation.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert delivered == []
+    assert len(failures) == 1
+    assert failures[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+
+
+def test_project_bootstrap_rejects_a_previously_published_workspace() -> None:
+    connection = _bootstrap_connection()
+    request = _project_create_request()
+    publication = _publication()
+    stale = _project(publication=publication).model_copy(
+        update={"id": "project-stale-published-workspace"}
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        if http_request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        return httpx.Response(201, json=stale.model_dump(mode="json"))
+
+    client = CoreProjectBootstrapClientV1(
+        connection,
+        transport=httpx.MockTransport(handler),
+    )
+    client.version()
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.create_project(request, idempotency_key="bootstrap-stale-workspace-0001")
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+    client.close()
+
+
+def test_project_bootstrap_refuses_a_different_request_after_success() -> None:
+    connection = _bootstrap_connection()
+    request = _project_create_request()
+    created = _project().model_copy(update={"id": "project-created-by-core"})
+    create_calls = 0
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        nonlocal create_calls
+        if http_request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        create_calls += 1
+        return httpx.Response(201, json=created.model_dump(mode="json"))
+
+    client = CoreProjectBootstrapClientV1(
+        connection,
+        transport=httpx.MockTransport(handler),
+    )
+    client.version()
+    client.create_project(request, idempotency_key="bootstrap-project-0004")
+
+    changed = request.model_copy(update={"name": "Changed request"})
+    with pytest.raises(CoreClientErrorV1) as changed_request:
+        client.create_project(changed, idempotency_key="bootstrap-project-0004")
+    with pytest.raises(CoreClientErrorV1) as changed_key:
+        client.create_project(request, idempotency_key="bootstrap-project-other")
+    assert changed_request.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+    assert changed_key.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+    assert create_calls == 1
+    client.close()
 
 
 def test_client_disables_environment_transport_and_redirects() -> None:
