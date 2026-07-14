@@ -64,17 +64,21 @@ values to the managed home, managed binary path, and
 `/openevo/credentials/codex`; subscription Codex is invoked as the fixed
 `/home/openevo/.local/bin/codex` absolute path. The credential mount is backed
 by a dedicated private host directory that is not below the session, workspace,
-artifact, or log tree. Runtime prepare and workspace upload finish while this
-directory is still empty.
+artifact, or log tree.
 
 The gateway pins every component from the absolute filesystem anchor to the
 remote user's `~/.codex/auth.json` and the private credential root, opens the
 leaf with `O_NOFOLLOW`, and requires a user-owned, link-count-one regular file
-with private permissions and a bounded size. It creates `auth.json` exclusively
-as `0600` under the private `0700` credential root. Source and target path
-chains, size, digest, identity, link count, and change times are rechecked before
-and after publication. A mismatch scrubs the staged inode before cleanup and
-aborts without logging credential contents.
+with private permissions and a bounded size. Before runtime creation, it copies
+the bytes into a random sibling `0700` staging root that is not mounted into any
+container. Size, digest, UTF-8 JSON, redactor construction, owner, mode, link
+count, inode, and source/staging path chains are all verified there. Linux
+`renameat2(RENAME_NOREPLACE)` then publishes the complete `0600` inode as the
+credential root's final `auth.json`; the destination and held inode are
+rechecked before Docker can mount or start it. A mismatch scrubs only the pinned
+staged/published inode, preserves a raced replacement, and aborts without
+logging credential contents. Unsupported atomic no-replace publication fails
+closed.
 
 Verified auth JSON supplies a bounded set of exact sensitive leaf values. The
 gateway redacts those values from stdout/stderr and transcript logs and performs
@@ -120,15 +124,22 @@ Docker always follows removal with an absence `inspect`, including after
 successful `rm -f`. Subscription teardown retries failed stop/absence checks a
 fixed number of times in the post-run worker. A still-unproven runtime is moved
 to periodic reconciliation instead of occupying that worker indefinitely.
-The private v4 cleanup journal contains runtime/container and pinned-root
-ownership plus a redacted, closed finalization authority: request identity,
-agent terminal state, optional terminal result, pending status, and timer marks.
-Once a result exists, it also stores its canonical digest and monotonic
-`export_succeeded`/`callback_succeeded` proofs. It does not contain auth bytes.
+The private v5 cleanup journal contains runtime/container and pinned-root
+ownership plus an explicit recovery phase and a redacted, closed finalization
+authority: request identity, agent terminal state, optional terminal result,
+pending status, and timer marks. A terminal agent result is fsynced into that
+authority before it becomes the live in-memory terminal state. Once a result
+exists, the journal also stores its canonical digest and monotonic
+`export_succeeded`/`callback_succeeded` proofs. A required evolution export binds
+the normalized backend URL, timeout, fail-open policy, and their canonical
+identity digest. It does not contain auth bytes.
 Evolution export uses the stable session source-event identity, and callbacks
 carry a result-derived `Idempotency-Key` and digest header. A failed or unknown
 response leaves that phase pending; a successful phase is fsynced before the
-next cleanup decision and is skipped on retry. Startup reloads the authority,
+next cleanup decision and is skipped on retry. Recovery requires the persisted
+phase and matching authority. Legacy/malformed records without an explicit
+phase retain all data, and missing, disabled, or drifted evolution export config
+keeps a required export pending instead of converting it to a no-op. Startup reloads the authority,
 re-verifies staged auth only when transcript rebuilding is still needed, proves
 every owned container absent, and resumes pending publication. Completion
 storage, session/transcript, credential, log roots, and the journal are removed

@@ -165,10 +165,13 @@ Evolution context 的临时源位于 agent 不可挂载的 Core 临时目录，�
 
 Codex subscription 的 `HOME`、`PATH` 和 `CODEX_HOME` 都由 Core 固定，agent、runtime
 和 action env 不能覆盖；Codex 使用镜像内固定绝对路径启动，不能被 workspace `PATH`
-shadow。Gateway 仅在 runtime prepare 完成后，才从绝对 filesystem anchor 逐组件固定并
-复核宿主机 `~/.codex/auth.json` 与私有 credential root，再把通过 no-follow、owner、
-regular、link-count-one、size/digest/identity 校验的 auth staging 到 session tree 外的
-专用 bind mount。
+shadow。Gateway 在创建 runtime 前，从绝对 filesystem anchor 逐组件固定并复核宿主机
+`~/.codex/auth.json`，先把 bytes 写入同 filesystem、容器不可见的随机 `0700` sibling
+staging root。在这里完成 no-follow、owner、mode、regular、link-count-one、size、digest、
+UTF-8 JSON、redactor 和全路径 identity 校验后，才用 Linux
+`renameat2(RENAME_NOREPLACE)` 把完整 `0600` inode 原子发布为私有 credential root 的最终
+`auth.json`。发布后再次绑定 destination/inode；任一校验、竞态或平台原语失败都会在
+runtime create/mount/start 前 fail closed，且不会删除竞态 replacement。
 
 Subscription post-run 先结束所有仍可访问 credential 的进程，并按 `docker create` 返回的
 container ID 执行 remove + absence inspect。只有 absence proof 成功、最终 fd-relative
@@ -182,11 +185,16 @@ output 或 artifact。scan 在任何写入前完成 per-file、aggregate byte、
 执行 deadline 耗尽后，transcript byte recovery/build 使用独立有界 finalization budget，保留
 timeout/cancel 前已经捕获的输出和原终态。结果发布前还会递归执行一次内存脱敏。失败时
 post-run 先做固定次数的 stop/absence retry，仍失败则释放 stage worker，由运行期周期
-reconciliation 继续。private v4 cleanup journal 除 runtime/container/session/log/credential
-identities 外，还保存闭集、已脱敏的 request/agent terminal/optional result/pending status/timer
-finalization authority，以及 canonical result digest 和单调的 export/callback success proof，
-不保存 auth bytes。Evolution export 由稳定 source event identity 去重，callback 带稳定 result
-digest/idempotency key；响应失败或未知保持 pending，成功 phase 必须先持久化。重启从私有
+reconciliation 继续。private v5 cleanup journal 除 runtime/container/session/log/credential
+identities 外，还保存显式 recovery phase、闭集且已脱敏的
+request/agent terminal/optional result/pending status/timer finalization authority，以及 canonical
+result digest 和单调的 export/callback success proof；agent terminal state 必须先 fsync 该
+authority 再落入 live memory，不保存 auth bytes。Required evolution export 还绑定 normalized
+backend URL、timeout、fail-open policy 及其 canonical identity digest。Evolution export 由稳定
+source event identity 去重，callback 带稳定 result digest/idempotency key；响应失败或未知保持
+pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当前 evolution config/client
+缺失、禁用、destination/config identity 漂移时，必须保留 transcript、event/callback authority
+并 fail closed，不能把 required export 解释为成功 no-op。重启从私有
 credential root 重新验证并构造 redactor（仅在仍需重建 transcript 时），证明容器 absent 后
 只重试 pending phase。两项 required proof 都持久成功后才删除 completion storage、session、
 credential、log roots 和 journal；无法证明时 authority 持续保留。

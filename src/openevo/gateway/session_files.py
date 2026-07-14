@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import errno
+import ctypes
 import hashlib
 import json
 import os
 import secrets
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import mkdtemp
 from typing import Final, TypeAlias
 
 
@@ -40,6 +43,7 @@ _LEAF_PIN_FLAGS: Final[int] = (
     | os.O_CLOEXEC
     | os.O_NOFOLLOW
 )
+_RENAME_NOREPLACE: Final[int] = 1
 
 
 class SessionFileSecurityError(RuntimeError):
@@ -579,17 +583,21 @@ def stage_codex_subscription_auth(
     session_identity: SessionRootIdentity,
     target_home_parts: tuple[str, ...],
 ) -> CredentialRedactor:
-    """Copy a verified private auth file into a private session directory."""
+    """Validate auth in an unmounted private root, then atomically publish it."""
 
     source_parent_fd = -1
     source_name = source.name
     source_fd = -1
     target_parent_fd = -1
-    target_fd = -1
-    target_identity: tuple[int, int] | None = None
+    staged_fd = -1
+    staged_file_identity: tuple[int, int] | None = None
     redactor: CredentialRedactor | None = None
     source_pin: _AbsoluteDirectoryPin | None = None
     target_pin: _AbsoluteDirectoryPin | None = None
+    staging_pin: _AbsoluteDirectoryPin | None = None
+    staging_dir: Path | None = None
+    staging_root_identity: SessionRootIdentity | None = None
+    published = False
     try:
         if not source.is_absolute() or source.name in {"", ".", ".."}:
             raise SessionFileSecurityError(
@@ -619,17 +627,26 @@ def stage_codex_subscription_auth(
                 "Codex subscription auth changed while it was opened"
             )
 
-        target_pin = _pin_absolute_directory(session_dir)
-        target_pin.verify(label="credential root")
-        _require_session_identity(os.fstat(target_pin.descriptor), session_identity)
-        _fchmod_stable(target_pin.descriptor, 0o700, label="session root")
-        target_parent_fd = _open_private_directories(
-            target_pin.descriptor,
-            target_home_parts,
-            expected_owner=session_identity[2],
+        staging_dir = Path(
+            mkdtemp(
+                prefix=".openevo-credential-staging-",
+                dir=session_dir.parent,
+            )
+        )
+        staging_root_identity = capture_session_root_identity(staging_dir)
+        staging_pin = _pin_absolute_directory(staging_dir)
+        staging_pin.verify(label="credential staging root")
+        _require_session_identity(
+            os.fstat(staging_pin.descriptor),
+            staging_root_identity,
+        )
+        _fchmod_stable(
+            staging_pin.descriptor,
+            0o700,
+            label="credential staging root",
         )
 
-        target_fd = os.open(
+        staged_fd = os.open(
             "auth.json",
             os.O_RDWR
             | os.O_CREAT
@@ -637,22 +654,22 @@ def stage_codex_subscription_auth(
             | os.O_CLOEXEC
             | os.O_NOFOLLOW,
             0o600,
-            dir_fd=target_parent_fd,
+            dir_fd=staging_pin.descriptor,
         )
-        os.fchmod(target_fd, 0o600)
-        target_opened = os.fstat(target_fd)
+        os.fchmod(staged_fd, 0o600)
+        staged_opened = os.fstat(staged_fd)
         _require_private_staged_auth(
-            target_opened,
-            expected_owner=session_identity[2],
+            staged_opened,
+            expected_owner=staging_root_identity[2],
         )
-        target_identity = _object_identity(target_opened)
+        staged_file_identity = _object_identity(staged_opened)
 
-        _copy_exact(source_fd, target_fd, source_opened.st_size)
-        os.fsync(target_fd)
+        _copy_exact(source_fd, staged_fd, source_opened.st_size)
+        os.fsync(staged_fd)
 
         source_digest = _digest_fd(source_fd, source_opened.st_size)
-        target_digest = _digest_fd(target_fd, source_opened.st_size)
-        if source_digest != target_digest:
+        staged_digest = _digest_fd(staged_fd, source_opened.st_size)
+        if source_digest != staged_digest:
             raise SessionFileSecurityError(
                 "staged Codex auth digest does not match the verified source"
             )
@@ -669,34 +686,31 @@ def stage_codex_subscription_auth(
             label="Codex subscription auth",
         )
 
-        target_after = os.fstat(target_fd)
-        if target_after.st_nlink != 1:
-            raise SessionFileSecurityError(
-                "staged Codex auth path changed while it was written"
-            )
+        staged_after = os.fstat(staged_fd)
         _require_private_staged_auth(
-            target_after,
-            expected_owner=session_identity[2],
+            staged_after,
+            expected_owner=staging_root_identity[2],
             expected_size=source_opened.st_size,
         )
-        if _object_identity(target_opened) != _object_identity(target_after):
+        if _object_identity(staged_opened) != _object_identity(staged_after):
             raise SessionFileSecurityError("staged Codex auth changed while it was written")
         _require_path_identity(
-            target_parent_fd,
+            staging_pin.descriptor,
             "auth.json",
-            target_after,
+            staged_after,
             label="staged Codex auth",
         )
         redactor = CredentialRedactor.from_auth_json(
-            _read_fd_exact(target_fd, source_opened.st_size)
+            _read_fd_exact(staged_fd, source_opened.st_size)
         )
+
         source_final = os.fstat(source_fd)
-        target_final = os.fstat(target_fd)
+        staged_final = os.fstat(staged_fd)
         if _auth_identity(source_after) != _auth_identity(source_final):
             raise SessionFileSecurityError(
                 "Codex subscription auth changed during final verification"
             )
-        if _auth_identity(target_after) != _auth_identity(target_final):
+        if _auth_identity(staged_after) != _auth_identity(staged_final):
             raise SessionFileSecurityError(
                 "staged Codex auth changed during final verification"
             )
@@ -707,38 +721,124 @@ def stage_codex_subscription_auth(
             label="Codex subscription auth",
         )
         _require_path_identity(
+            staging_pin.descriptor,
+            "auth.json",
+            staged_final,
+            label="staged Codex auth",
+        )
+        source_pin.verify(label="Codex subscription auth source")
+        staging_pin.verify(label="credential staging root")
+
+        target_pin = _pin_absolute_directory(session_dir)
+        target_pin.verify(label="credential root")
+        _require_session_identity(os.fstat(target_pin.descriptor), session_identity)
+        _fchmod_stable(target_pin.descriptor, 0o700, label="credential root")
+        target_parent_fd = _open_private_directories(
+            target_pin.descriptor,
+            target_home_parts,
+            expected_owner=session_identity[2],
+        )
+        target_pin.verify(label="credential root")
+        staging_pin.verify(label="credential staging root")
+        _rename_noreplace(
+            "auth.json",
+            "auth.json",
+            source_dir_fd=staging_pin.descriptor,
+            destination_dir_fd=target_parent_fd,
+        )
+        published = True
+        os.fsync(target_parent_fd)
+        os.fsync(staging_pin.descriptor)
+
+        try:
+            target_named = os.stat(
+                "auth.json",
+                dir_fd=target_parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise SessionFileSecurityError(
+                "staged Codex auth path changed during publication"
+            ) from exc
+        if _object_identity(target_named) != _object_identity(staged_final):
+            raise SessionFileSecurityError(
+                "staged Codex auth path changed during publication"
+            )
+        target_final = os.fstat(staged_fd)
+        _require_private_staged_auth(
+            target_final,
+            expected_owner=session_identity[2],
+            expected_size=source_opened.st_size,
+        )
+        if _auth_identity(staged_final)[:-1] != _auth_identity(target_final)[:-1]:
+            raise SessionFileSecurityError(
+                "staged Codex auth changed during publication"
+            )
+        _require_path_identity(
             target_parent_fd,
             "auth.json",
             target_final,
             label="staged Codex auth",
         )
-        source_pin.verify(label="Codex subscription auth source")
         target_pin.verify(label="credential root")
+        staging_pin.verify(label="credential staging root")
         return redactor
     except FileNotFoundError as exc:
-        _scrub_staged_auth(target_fd, target_identity)
-        _unlink_if_same_identity(target_parent_fd, "auth.json", target_identity)
+        _scrub_staged_auth(staged_fd, staged_file_identity)
+        _unlink_if_same_identity(
+            target_parent_fd if published else (
+                staging_pin.descriptor if staging_pin is not None else -1
+            ),
+            "auth.json",
+            staged_file_identity,
+        )
         raise SessionFileSecurityError(
             "Codex subscription auth was not found at ~/.codex/auth.json; "
             "sign in with Codex on the remote host before retrying"
         ) from exc
     except SessionFileSecurityError:
-        _scrub_staged_auth(target_fd, target_identity)
-        _unlink_if_same_identity(target_parent_fd, "auth.json", target_identity)
+        _scrub_staged_auth(staged_fd, staged_file_identity)
+        _unlink_if_same_identity(
+            target_parent_fd if published else (
+                staging_pin.descriptor if staging_pin is not None else -1
+            ),
+            "auth.json",
+            staged_file_identity,
+        )
         raise
     except (OSError, ValueError) as exc:
-        _scrub_staged_auth(target_fd, target_identity)
-        _unlink_if_same_identity(target_parent_fd, "auth.json", target_identity)
+        _scrub_staged_auth(staged_fd, staged_file_identity)
+        _unlink_if_same_identity(
+            target_parent_fd if published else (
+                staging_pin.descriptor if staging_pin is not None else -1
+            ),
+            "auth.json",
+            staged_file_identity,
+        )
         raise SessionFileSecurityError(
             "Codex subscription auth could not be staged safely; ensure "
             "~/.codex/auth.json is a private, user-owned regular file"
         ) from exc
     finally:
-        for descriptor in (target_fd, target_parent_fd, source_fd, source_parent_fd):
+        for descriptor in (staged_fd, target_parent_fd, source_fd, source_parent_fd):
             if descriptor >= 0:
                 os.close(descriptor)
         if target_pin is not None:
             target_pin.close()
+        if staging_pin is not None:
+            cleanup_failed = False
+            try:
+                _remove_pinned_private_staging(
+                    staging_pin,
+                    staging_root_identity,
+                )
+            except (OSError, SessionFileSecurityError):
+                cleanup_failed = True
+            staging_pin.close()
+            if cleanup_failed and sys.exc_info()[0] is None:
+                raise SessionFileSecurityError(
+                    "credential staging root could not be removed safely"
+                )
         if source_pin is not None:
             source_pin.close()
 
@@ -789,6 +889,44 @@ def load_staged_codex_subscription_redactor(
         if descriptor >= 0:
             os.close(descriptor)
         root_pin.close()
+
+
+def _remove_pinned_private_staging(
+    staging_pin: _AbsoluteDirectoryPin,
+    staging_identity: SessionRootIdentity | None,
+) -> None:
+    if staging_identity is None or not staging_pin.parts or len(staging_pin.descriptors) < 2:
+        raise SessionFileSecurityError("credential staging authority is incomplete")
+    for descriptor, expected in zip(staging_pin.descriptors, staging_pin.identities):
+        if _full_object_identity(os.fstat(descriptor)) != expected:
+            raise SessionFileSecurityError("credential staging descriptor changed")
+    root_state = os.fstat(staging_pin.descriptor)
+    _require_session_identity(root_state, staging_identity)
+    root_fd = _open_readable_directory(
+        staging_pin.descriptor,
+        label="credential staging root",
+    )
+    try:
+        _remove_directory_contents(
+            root_fd,
+            expected_owner=staging_identity[2],
+            depth=0,
+            max_depth=1,
+            budget=[2],
+        )
+    finally:
+        os.close(root_fd)
+    parent_fd = staging_pin.descriptors[-2]
+    root_name = staging_pin.parts[-1]
+    _require_named_identity(
+        parent_fd,
+        root_name,
+        _object_identity(root_state),
+        label="credential staging root",
+        expected_owner=staging_identity[2],
+    )
+    os.rmdir(root_name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
 
 
 def remove_session_tree(
@@ -1025,6 +1163,39 @@ def _open_private_directories(
     except Exception:
         os.close(current_fd)
         raise
+
+
+def _rename_noreplace(
+    source: str,
+    destination: str,
+    *,
+    source_dir_fd: int,
+    destination_dir_fd: int,
+) -> None:
+    if sys.platform != "linux":
+        raise OSError(errno.ENOSYS, "safe credential publication requires renameat2")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "safe credential publication requires renameat2")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_dir_fd,
+        os.fsencode(source),
+        destination_dir_fd,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
 
 
 def _copy_exact(source_fd: int, target_fd: int, expected_size: int) -> None:

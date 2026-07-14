@@ -247,15 +247,15 @@ def test_auth_staging_detects_target_replacement_without_leaking_secret(
     source = _private_auth(tmp_path, secret)
     root, identity = _session_root(tmp_path)
     target = root / "home" / ".codex" / "auth.json"
-    original_fsync = session_files.os.fsync
+    original_publish = session_files._rename_noreplace
 
-    def replace_target(descriptor: int) -> None:
-        original_fsync(descriptor)
+    def publish_then_replace(*args, **kwargs) -> None:
+        original_publish(*args, **kwargs)
         target.unlink()
         target.write_text("replacement", encoding="utf-8")
         target.chmod(0o600)
 
-    monkeypatch.setattr(session_files.os, "fsync", replace_target)
+    monkeypatch.setattr(session_files, "_rename_noreplace", publish_then_replace)
 
     with pytest.raises(SessionFileSecurityError, match="path changed"):
         _stage(source, root, identity)
@@ -292,7 +292,11 @@ def test_auth_staging_final_path_recheck_detects_new_hardlink(
         nonlocal raced
         is_selected = (
             race_target == "source" and label == "Codex subscription auth"
-        ) or (race_target == "target" and label == "staged Codex auth")
+        ) or (
+            race_target == "target"
+            and label == "staged Codex auth"
+            and target.exists()
+        )
         if is_selected and not raced:
             raced = True
             os.link(
@@ -333,6 +337,54 @@ def test_auth_staging_rejects_same_size_target_content_mismatch(
 
     with pytest.raises(SessionFileSecurityError, match="digest"):
         _stage(source, root, identity)
+
+
+def test_invalid_auth_is_never_visible_at_final_credential_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_auth(tmp_path, '{"access_token":"invalid-canary"}\n')
+    root, identity = _session_root(tmp_path)
+    target = root / "home" / ".codex" / "auth.json"
+    visibility_during_validation: list[bool] = []
+
+    def reject_auth(cls, auth_bytes: bytes):
+        del cls, auth_bytes
+        visibility_during_validation.append(target.exists())
+        raise SessionFileSecurityError("invalid credential probe")
+
+    monkeypatch.setattr(
+        session_files.CredentialRedactor,
+        "from_auth_json",
+        classmethod(reject_auth),
+    )
+
+    with pytest.raises(SessionFileSecurityError, match="invalid credential probe"):
+        _stage(source, root, identity)
+
+    assert visibility_during_validation == [False]
+    assert not target.exists()
+
+
+def test_auth_publication_fails_closed_without_atomic_noreplace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_auth(tmp_path, '{"access_token":"validated-canary"}\n')
+    root, identity = _session_root(tmp_path)
+    target = root / "home" / ".codex" / "auth.json"
+
+    def unavailable(*args, **kwargs) -> None:
+        del args, kwargs
+        raise OSError("renameat2 unavailable")
+
+    monkeypatch.setattr(session_files, "_rename_noreplace", unavailable)
+
+    with pytest.raises(SessionFileSecurityError, match="could not be staged safely"):
+        _stage(source, root, identity)
+
+    assert not target.exists()
+    assert list(tmp_path.glob(".openevo-credential-staging-*")) == []
 
 
 def test_credential_redactor_redacts_auth_json_and_nested_sensitive_leaves() -> None:

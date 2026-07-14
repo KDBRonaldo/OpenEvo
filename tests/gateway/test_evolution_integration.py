@@ -72,7 +72,9 @@ class FakeEvolutionClient:
         export_error: Exception | None = None,
         export_delay: float = 0.0,
         calls: list[str] | None = None,
+        base_url: str = "http://127.0.0.1:8200",
     ) -> None:
+        self.base_url = base_url.rstrip("/")
         self.context = context or {
             "context_id": "ctx_1",
             "memory": {"rendered_text": "Remember parser precedence."},
@@ -401,6 +403,60 @@ async def test_gateway_rejects_non_exact_subscription_contract_before_staging(
     assert managed.final_result is not None
     assert error in (managed.final_result.error or "")
     stage_auth.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_invalid_subscription_auth_fails_before_runtime_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    source = home / ".codex" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_text("not-json", encoding="utf-8")
+    source.chmod(0o600)
+    monkeypatch.setenv("HOME", str(home))
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    (session_dir / "artifacts").mkdir()
+    request = SessionDispatchRequest(
+        session_id="invalid-auth-before-runtime",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "gateway-test"
+    manager.default_runtime = None
+    manager._cleanup_retries = {}
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    manager._docker_ownership_root = tmp_path / "docker-ownership"
+    create = Mock(side_effect=AssertionError("runtime must not be created"))
+    monkeypatch.setattr("openevo.gateway.node.create_runtime", create)
+
+    await manager._handle_init(managed)
+
+    create.assert_not_called()
+    assert managed.runtime is None
+    assert managed.pending_status == SessionStatus.ERROR
+    assert managed.credential_dir is not None
+    assert not (managed.credential_dir / "auth.json").exists()
 
 
 @pytest.mark.parametrize("env_name", ["HOME", "PATH", "CODEX_HOME"])
@@ -1129,6 +1185,108 @@ async def test_subscription_finalization_journal_recovers_terminal_result_after_
 
 
 @pytest.mark.asyncio
+async def test_terminal_agent_result_is_durable_before_postprocess_and_recovers_after_crash(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "cleanup-journal"
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    log_authority_dir = tmp_path / "core-logs"
+    for root in (session_dir, credential_dir, log_authority_dir):
+        root.mkdir(mode=0o700)
+    (session_dir / "artifacts").mkdir()
+    auth = credential_dir / "auth.json"
+    auth.write_text('{"access_token":"access-canary"}', encoding="utf-8")
+    auth.chmod(0o600)
+
+    class TerminalRuntime(FakeRuntime):
+        @property
+        def runtime_id(self) -> str:
+            return "openevo-terminal-crash"
+
+        @property
+        def container_id(self) -> str:
+            return "sha256:terminal-crash"
+
+        async def exec(self, command, **kwargs):
+            del command, kwargs
+            return ExecResult(
+                return_code=0,
+                stdout=(
+                    '{"type":"item.completed","item":{"type":"agent_message",'
+                    '"text":"durable scientific answer"}}\n'
+                ),
+                stderr="",
+            )
+
+    request = SessionDispatchRequest(
+        session_id="terminal-crash",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        callback_url="http://rollout.test/callback",
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+        log_authority_dir=log_authority_dir,
+        log_authority_identity=capture_session_root_identity(log_authority_dir),
+        credential_dir=credential_dir,
+        credential_root_identity=capture_session_root_identity(credential_dir),
+        credential_redactor=session_files.CredentialRedactor.from_auth_json(
+            auth.read_bytes()
+        ),
+        runtime=TerminalRuntime(),
+    )
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._remaining_budget = lambda _managed: 30.0
+
+    result = await first._run_exec_inputs(
+        managed.runtime,
+        [ExecInput(command="codex")],
+        {},
+        managed,
+    )
+
+    journal_path = next(journal_dir.glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert result.status == "completed"
+    assert journal["phase"] == "terminal_finalization"
+    assert journal["subscription_finalization"]["agent_result"]["status"] == "completed"
+
+    delivered: list[SessionResult] = []
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted.session_registry = SessionRegistry()
+    restarted.storage = SessionStore()
+    restarted.builders = default_builder_registry()
+    restarted._stop_recovered_container = AsyncMock(return_value=True)
+
+    async def capture_result(callback_url, recovered):
+        del callback_url
+        delivered.append(recovered)
+        return False
+
+    restarted._push_result = capture_result
+    restarted._load_cleanup_retries()
+    await restarted._reconcile_cleanup_retries()
+
+    assert len(delivered) == 1
+    assert "durable scientific answer" in delivered[0].model_dump_json()
+    assert journal_path.exists()
+    assert session_dir.exists()
+    assert log_authority_dir.exists()
+
+
+@pytest.mark.asyncio
 async def test_subscription_finalization_rebuilds_transcript_after_restart(
     tmp_path: Path,
 ) -> None:
@@ -1355,6 +1513,173 @@ async def test_terminal_delivery_restart_skips_export_after_durable_success(
     assert calls.count("export") == 1
     assert not journal_path.exists()
     assert restarted.storage.deleted == [managed.session_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recovered_evolution", "recovered_client"),
+    [
+        (None, None),
+        (EvolutionConfig(enabled=False), None),
+        (
+            EvolutionConfig(enabled=True, backend_url="http://127.0.0.1:8300"),
+            FakeEvolutionClient(base_url="http://127.0.0.1:8300"),
+        ),
+    ],
+)
+async def test_required_export_config_drift_remains_pending_after_restart(
+    tmp_path: Path,
+    recovered_evolution: EvolutionConfig | None,
+    recovered_client: FakeEvolutionClient | None,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    calls: list[str] = []
+    original_config = EvolutionConfig(
+        enabled=True,
+        backend_url="http://127.0.0.1:8200",
+        event_export={"enabled": True, "fail_open": True},
+    )
+    original_client = FakeEvolutionClient(
+        export_error=RuntimeError("backend unavailable"),
+        calls=calls,
+        base_url=original_config.backend_url,
+    )
+    managed = _managed_postrun_session(session_dir, _session_result())
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    first = _postrun_manager(
+        calls=calls,
+        evolution=original_config,
+        evolution_client=original_client,
+    )
+    first._cleanup_journal_dir = journal_dir
+
+    assert await first._deliver_terminal_result(managed, managed.final_result) is False
+    journal_path = next(journal_dir.glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["terminal_delivery"]["export_required"] is True
+    assert journal["terminal_delivery"]["export_authority"]["backend_url"] == (
+        original_config.backend_url
+    )
+
+    recovered_calls: list[str] = []
+    restarted = _postrun_manager(
+        calls=recovered_calls,
+        evolution=recovered_evolution,
+        evolution_client=recovered_client,
+    )
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+    await restarted._reconcile_cleanup_retries()
+
+    assert journal_path.exists()
+    assert session_dir.exists()
+    assert "delete_session" not in recovered_calls
+    assert "remove_session_dir" not in recovered_calls
+    if recovered_client is not None:
+        assert recovered_client.exported_events == []
+
+
+def test_current_cleanup_journal_requires_explicit_recovery_phase(tmp_path: Path) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(session_dir, _session_result())
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed)
+
+    journal_path = next(journal_dir.glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["phase"] == "runtime_active"
+    journal.pop("phase")
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    journal_path.chmod(0o600)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="cleanup ownership journal is invalid"):
+        restarted._load_cleanup_retries()
+
+    assert journal_path.exists()
+    assert session_dir.exists()
+
+
+def test_terminal_finalization_phase_requires_durable_authority(tmp_path: Path) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(session_dir, _session_result())
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed)
+
+    journal_path = next(journal_dir.glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["phase"] = "terminal_finalization"
+    journal["subscription_finalization"] = None
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    journal_path.chmod(0o600)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="cleanup ownership journal is invalid"):
+        restarted._load_cleanup_retries()
+
+    assert journal_path.exists()
+    assert session_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_legacy_journal_without_phase_stops_runtime_but_preserves_roots(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    log_dir = tmp_path / "logs"
+    for root in (session_dir, log_dir):
+        root.mkdir(mode=0o700)
+    managed = _managed_postrun_session(session_dir, _session_result())
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.log_authority_dir = log_dir
+    managed.log_authority_identity = capture_session_root_identity(log_dir)
+
+    class LegacyRuntime:
+        runtime_id = "legacy-runtime"
+        container_id = "sha256:legacy-runtime"
+
+    managed.runtime = LegacyRuntime()
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed)
+
+    journal_path = next(journal_dir.glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["version"] = 4
+    journal.pop("phase")
+    journal["terminal_delivery"] = None
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    journal_path.chmod(0o600)
+
+    calls: list[str] = []
+    restarted = _postrun_manager(calls=calls)
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._stop_recovered_container = AsyncMock(return_value=True)
+    restarted._load_cleanup_retries()
+    await restarted._reconcile_cleanup_retries()
+    restarted._cleanup_retries = {}
+    restarted._load_cleanup_retries()
+    await restarted._reconcile_cleanup_retries()
+
+    assert journal_path.exists()
+    assert json.loads(journal_path.read_text(encoding="utf-8"))["version"] == 4
+    assert session_dir.exists()
+    assert log_dir.exists()
+    assert "remove_session_dir" not in calls
+    assert restarted._stop_recovered_container.await_count == 2
 
 
 @pytest.mark.asyncio

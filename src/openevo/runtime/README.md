@@ -143,11 +143,24 @@ destroyed only when a final inspect proves that exact ID absent. Gateway does
 not remove either bind root until that proof succeeds; cleanup ownership remains
 in the private authority root and durable retry journal otherwise. Subscription
 post-run uses bounded immediate retries and then periodic reconciliation. Its
-private v4 journal also carries redacted finalization state and a canonical
-result digest with monotonic export/callback success proofs. Evolution export is
-idempotent by stable source event identity; callback retries carry a stable
-result-derived idempotency key. A restarted Gateway skips a durably successful
-phase, retries an unknown/failed phase, and removes storage and owned roots only
-after both required phases are fsynced successful.
+private v5 journal also carries an explicit recovery phase, redacted
+finalization state, and a canonical result digest with monotonic export/callback
+success proofs. The terminal agent result is journaled before its in-memory
+terminal transition. Required export authority includes the normalized backend
+URL, timeout, fail-open policy, and canonical identity digest; recovery requires
+the current config/client to match it exactly. Evolution export is idempotent by
+stable source event identity; callback retries carry a stable result-derived
+idempotency key. A restarted Gateway skips a durably successful phase, retries
+an unknown/failed phase, and removes storage and owned roots only after both
+required phases are fsynced successful. Missing phase/finalization authority or
+export config drift retains the journal and all transcript/session roots.
+
+Subscription auth bytes are validated before `DockerRuntime` is created. Core
+uses an unmounted sibling `0700` staging root, verifies the complete source and
+staged file identities, digest, bounded JSON, and redactor, then publishes the
+`0600` inode into the credential root with Linux atomic no-replace rename. Only
+the verified final path can subsequently enter Docker's credential bind; a
+publication race, symlink, owner/mode/link mismatch, or unavailable rename
+primitive fails before container creation.
 Workspace and artifact files are not redaction write targets; files larger than
 the Core capture scan limit retain their exact bytes.

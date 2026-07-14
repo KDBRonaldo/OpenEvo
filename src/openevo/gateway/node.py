@@ -91,6 +91,14 @@ _SUBSCRIPTION_STOP_ATTEMPTS = 3
 _SUBSCRIPTION_STOP_RETRY_DELAY_SECONDS = 0.1
 _CLEANUP_RETRY_INTERVAL_SECONDS = 1.0
 _CLEANUP_JOURNAL_MAX_BYTES = 16 * 1024 * 1024
+_RECOVERY_PHASE_RUNTIME_ACTIVE = "runtime_active"
+_RECOVERY_PHASE_TERMINAL_FINALIZATION = "terminal_finalization"
+_RECOVERY_PHASE_TERMINAL_DELIVERY = "terminal_delivery"
+_RECOVERY_PHASES = {
+    _RECOVERY_PHASE_RUNTIME_ACTIVE,
+    _RECOVERY_PHASE_TERMINAL_FINALIZATION,
+    _RECOVERY_PHASE_TERMINAL_DELIVERY,
+}
 
 
 class GatewayExecutionTimeout(TimeoutError):
@@ -111,6 +119,16 @@ class SubscriptionFinalizationState:
 
 
 @dataclass(frozen=True, slots=True)
+class EvolutionExportAuthority:
+    """Persisted destination and behavior identity for one required export."""
+
+    backend_url: str
+    timeout_seconds: float
+    fail_open: bool
+    identity_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class TerminalDeliveryState:
     """Monotonic proof for idempotent export and callback delivery."""
 
@@ -118,6 +136,7 @@ class TerminalDeliveryState:
     result_digest: str
     callback_url: str | None
     export_required: bool
+    export_authority: EvolutionExportAuthority | None
     export_succeeded: bool
     callback_required: bool
     callback_succeeded: bool
@@ -143,6 +162,7 @@ class CleanupRetryOwnership:
     eval_runtime_id: str | None
     eval_container_id: str | None
     runtime: BaseRuntime | None
+    phase: str | None
     eval_runtime: BaseRuntime | None = None
     managed: ManagedSession | None = None
     finalize_subscription: bool = False
@@ -787,6 +807,11 @@ class GatewayNodeManager:
                 self._persist_cleanup_ownership(
                     self._cleanup_ownership_for(managed)
                 )
+                managed.credential_redactor = self._stage_codex_subscription_auth(
+                    request,
+                    managed.credential_dir,
+                    managed.credential_root_identity,
+                )
             if managed.credential_dir is None:
                 runtime = create_runtime(
                     runtime_spec,
@@ -807,12 +832,7 @@ class GatewayNodeManager:
             self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
             # Run ordered prepare actions
             await self._run_runtime_prepare(runtime, runtime_spec, request, managed)
-            if managed.credential_dir is not None:
-                managed.credential_redactor = self._stage_codex_subscription_auth(
-                    request,
-                    managed.credential_dir,
-                    managed.credential_root_identity,
-                )
+            if managed.credential_redactor is not None:
                 self._redact_core_capture_authority(managed)
         except GatewayExecutionTimeout as exc:
             self._set_terminal_failure(
@@ -1096,7 +1116,6 @@ class GatewayNodeManager:
             steps = harness.run_steps(request.instruction)
             env = self._runtime_env(request, managed, include_agent_env=True)
             agent_result = await self._run_exec_inputs(runtime, steps, env, managed)
-            managed.agent_result = agent_result
 
             # Postprocess always runs so harnesses can collect artifacts from
             # failed or timed-out agent runs before post-run evaluation.
@@ -1107,18 +1126,24 @@ class GatewayNodeManager:
             # Don't set final_result — let _handle_postrun build a partial
             # trajectory from the completions captured so far.
             if managed.agent_result is None:
-                managed.agent_result = AgentRunResult(
-                    status="timeout",
-                    return_code=-1,
-                    error=str(exc),
+                self._record_terminal_agent_result(
+                    managed,
+                    AgentRunResult(
+                        status="timeout",
+                        return_code=-1,
+                        error=str(exc),
+                    ),
                 )
             else:
-                managed.agent_result = managed.agent_result.model_copy(
-                    update={
-                        "status": "timeout",
-                        "return_code": -1,
-                        "error": managed.agent_result.error or str(exc),
-                    }
+                self._record_terminal_agent_result(
+                    managed,
+                    managed.agent_result.model_copy(
+                        update={
+                            "status": "timeout",
+                            "return_code": -1,
+                            "error": managed.agent_result.error or str(exc),
+                        }
+                    ),
                 )
         except Exception as exc:
             if managed.cancel_requested:
@@ -1210,27 +1235,84 @@ class GatewayNodeManager:
             return {}
 
     async def _export_evolution_event(self, result: SessionResult) -> bool:
-        if (
-            self.evolution is None
-            or not self.evolution.enabled
-            or not self.evolution.event_export.enabled
-        ):
+        authority = self._current_export_authority()
+        if authority is None:
             return True
+        return await self._export_evolution_event_with_authority(result, authority)
+
+    @staticmethod
+    def _export_authority_digest(
+        *,
+        backend_url: str,
+        timeout_seconds: float,
+        fail_open: bool,
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "backend_url": backend_url,
+                "fail_open": fail_open,
+                "timeout_seconds": timeout_seconds,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _current_export_authority(self) -> EvolutionExportAuthority | None:
+        evolution = self.evolution
+        if (
+            evolution is None
+            or not evolution.enabled
+            or not evolution.event_export.enabled
+        ):
+            return None
+        backend_url = evolution.backend_url.rstrip("/")
+        timeout_seconds = float(evolution.event_export.timeout_seconds)
+        fail_open = evolution.event_export.fail_open
+        return EvolutionExportAuthority(
+            backend_url=backend_url,
+            timeout_seconds=timeout_seconds,
+            fail_open=fail_open,
+            identity_digest=self._export_authority_digest(
+                backend_url=backend_url,
+                timeout_seconds=timeout_seconds,
+                fail_open=fail_open,
+            ),
+        )
+
+    async def _export_evolution_event_with_authority(
+        self,
+        result: SessionResult,
+        authority: EvolutionExportAuthority,
+    ) -> bool:
+        current = self._current_export_authority()
+        if current != authority:
+            raise RuntimeError(
+                "required evolution event export configuration changed after terminalization"
+            )
         if self.evolution_client is None:
-            if not self.evolution.event_export.fail_open:
+            if not authority.fail_open:
                 raise RuntimeError("evolution event export client is unavailable")
             logger.warning(
                 "Evolution event export client is unavailable for session %s",
                 result.session_id,
             )
             return False
+        client_base_url = getattr(self.evolution_client, "base_url", None)
+        if not isinstance(client_base_url, str) or (
+            client_base_url.rstrip("/") != authority.backend_url
+        ):
+            raise RuntimeError(
+                "required evolution event export client destination changed after terminalization"
+            )
         try:
             await asyncio.wait_for(
                 self.evolution_client.export_event(build_evolution_session_event(result)),
-                timeout=self.evolution.event_export.timeout_seconds,
+                timeout=authority.timeout_seconds,
             )
         except Exception as exc:
-            if not self.evolution.event_export.fail_open:
+            if not authority.fail_open:
                 raise
             logger.warning(
                 "Evolution event export failed for session %s: %s",
@@ -1247,12 +1329,15 @@ class GatewayNodeManager:
         env: dict[str, str],
         managed: ManagedSession,
     ) -> AgentRunResult:
-        """Execute a list of ExecInput steps and return an AgentRunResult."""
+        """Execute steps and durably record the terminal agent result."""
         log_dir = self._ensure_log_authority(managed) / "logs" / "agent"
 
         for i, step in enumerate(steps):
             if managed.cancel_requested:
-                return AgentRunResult(status="failed", return_code=-1, error="cancelled")
+                return self._record_terminal_agent_result(
+                    managed,
+                    AgentRunResult(status="failed", return_code=-1, error="cancelled"),
+                )
             merged_env = {**env, **(step.env or {})}
             result = await runtime.exec(
                 step.command,
@@ -1268,25 +1353,74 @@ class GatewayNodeManager:
                 result.stderr,
             )
             if result.return_code == -1:
-                return AgentRunResult(
-                    status="timeout",
-                    return_code=-1,
-                    error=f"step {i} timed out",
-                    metadata=self._step_metadata(log_dir, i, managed),
+                return self._record_terminal_agent_result(
+                    managed,
+                    AgentRunResult(
+                        status="timeout",
+                        return_code=-1,
+                        error=f"step {i} timed out",
+                        metadata=self._step_metadata(log_dir, i, managed),
+                    ),
                 )
             if result.return_code != 0:
-                return AgentRunResult(
-                    status="failed",
-                    return_code=result.return_code,
-                    error=f"step {i} exited with code {result.return_code}",
-                    metadata=self._step_metadata(log_dir, i, managed),
+                return self._record_terminal_agent_result(
+                    managed,
+                    AgentRunResult(
+                        status="failed",
+                        return_code=result.return_code,
+                        error=f"step {i} exited with code {result.return_code}",
+                        metadata=self._step_metadata(log_dir, i, managed),
+                    ),
                 )
 
-        return AgentRunResult(
-            status="completed",
-            return_code=0,
-            metadata=self._step_metadata(log_dir, len(steps) - 1, managed),
+        return self._record_terminal_agent_result(
+            managed,
+            AgentRunResult(
+                status="completed",
+                return_code=0,
+                metadata=self._step_metadata(log_dir, len(steps) - 1, managed),
+            ),
         )
+
+    def _record_terminal_agent_result(
+        self,
+        managed: ManagedSession,
+        result: AgentRunResult,
+    ) -> AgentRunResult:
+        if _is_codex_subscription_agent(managed.request.agent):
+            self._persist_subscription_finalization_authority(
+                managed,
+                agent_result=result,
+            )
+        managed.agent_result = result
+        return result
+
+    def _persist_subscription_finalization_authority(
+        self,
+        managed: ManagedSession,
+        *,
+        agent_result: AgentRunResult | None = None,
+    ) -> None:
+        retries = getattr(self, "_cleanup_retries", None)
+        if retries is None:
+            retries = {}
+            self._cleanup_retries = retries
+        ownership = retries.get(managed.session_id)
+        if ownership is None:
+            ownership = self._cleanup_ownership_for(
+                managed,
+                eval_runtime=managed.eval_runtime,
+                finalize_subscription=True,
+            )
+            retries[managed.session_id] = ownership
+        ownership.managed = managed
+        ownership.phase = _RECOVERY_PHASE_TERMINAL_FINALIZATION
+        ownership.finalize_subscription = True
+        ownership.finalization_state = self._subscription_finalization_state(
+            managed,
+            agent_result=agent_result,
+        )
+        self._persist_cleanup_ownership(ownership)
 
     # ------------------------------------------------------------------
     # Evaluator runtime prewarm
@@ -2035,6 +2169,7 @@ class GatewayNodeManager:
         ):
             managed.pending_status = status
             managed.pending_error = error
+            self._persist_subscription_finalization_authority(managed)
             return
         if status == SessionStatus.TIMEOUT:
             managed.final_result = self._timeout_result(
@@ -2315,9 +2450,13 @@ class GatewayNodeManager:
         previous = retries.get(managed.session_id)
         if previous is not None:
             ownership.delivery_state = previous.delivery_state
+            if previous.delivery_state is not None:
+                ownership.phase = previous.phase
             if ownership.finalization_state is None:
                 ownership.finalization_state = previous.finalization_state
                 ownership.finalize_subscription = previous.finalize_subscription
+                if previous.finalization_state is not None:
+                    ownership.phase = previous.phase
         retries[managed.session_id] = ownership
         self._persist_cleanup_ownership(ownership)
 
@@ -2363,17 +2502,15 @@ class GatewayNodeManager:
         result_digest = self._terminal_result_digest(result)
         state = ownership.delivery_state
         if state is None:
-            export_required = bool(
-                self.evolution is not None
-                and self.evolution.enabled
-                and self.evolution.event_export.enabled
-            )
+            export_authority = self._current_export_authority()
+            export_required = export_authority is not None
             callback_required = managed.request.callback_url is not None
             state = TerminalDeliveryState(
                 result=result,
                 result_digest=result_digest,
                 callback_url=managed.request.callback_url,
                 export_required=export_required,
+                export_authority=export_authority,
                 export_succeeded=not export_required,
                 callback_required=callback_required,
                 callback_succeeded=not callback_required,
@@ -2381,6 +2518,7 @@ class GatewayNodeManager:
             ownership.delivery_state = state
         elif state.result_digest != result_digest or state.result != result:
             raise RuntimeError("terminal delivery result identity changed")
+        ownership.phase = _RECOVERY_PHASE_TERMINAL_DELIVERY
         self._persist_cleanup_ownership(ownership)
         return ownership
 
@@ -2405,8 +2543,18 @@ class GatewayNodeManager:
 
         export_failed_open = False
         if not state.export_succeeded:
+            authority = state.export_authority
+            if authority is None:
+                logger.warning(
+                    "Required terminal evolution export authority is missing for session %s",
+                    session_id,
+                )
+                return False
             try:
-                exported = await self._export_evolution_event(result)
+                exported = await self._export_evolution_event_with_authority(
+                    result,
+                    authority,
+                )
             except Exception:
                 logger.warning(
                     "Terminal evolution export remains pending for session %s",
@@ -2454,6 +2602,7 @@ class GatewayNodeManager:
             result_digest=state.result_digest,
             callback_url=state.callback_url,
             export_required=state.export_required,
+            export_authority=state.export_authority,
             export_succeeded=state.export_succeeded or export_succeeded,
             callback_required=state.callback_required,
             callback_succeeded=state.callback_succeeded or callback_succeeded,
@@ -2487,6 +2636,8 @@ class GatewayNodeManager:
     def _subscription_finalization_state(
         cls,
         managed: ManagedSession,
+        *,
+        agent_result: AgentRunResult | None = None,
     ) -> SubscriptionFinalizationState:
         redactor = managed.credential_redactor
 
@@ -2504,7 +2655,10 @@ class GatewayNodeManager:
             pending_error = redactor.redact(pending_error)
         return SubscriptionFinalizationState(
             request=redacted_model(managed.request, SessionDispatchRequest),
-            agent_result=redacted_model(managed.agent_result, AgentRunResult),
+            agent_result=redacted_model(
+                agent_result if agent_result is not None else managed.agent_result,
+                AgentRunResult,
+            ),
             final_result=redacted_model(managed.final_result, SessionResult),
             pending_status=managed.pending_status,
             pending_error=pending_error,
@@ -2540,6 +2694,11 @@ class GatewayNodeManager:
             ),
             eval_container_id=getattr(eval_runtime, "container_id", None),
             runtime=runtime,
+            phase=(
+                _RECOVERY_PHASE_TERMINAL_FINALIZATION
+                if finalize_subscription
+                else _RECOVERY_PHASE_RUNTIME_ACTIVE
+            ),
             eval_runtime=eval_runtime,
             managed=managed,
             finalize_subscription=finalize_subscription,
@@ -2559,8 +2718,9 @@ class GatewayNodeManager:
         state = ownership.finalization_state
         delivery = ownership.delivery_state
         payload = {
-            "version": 4,
+            "version": 5,
             "session_id": ownership.session_id,
+            "phase": ownership.phase,
             "runtime": {
                 "runtime_id": ownership.runtime_id,
                 "container_id": ownership.container_id,
@@ -2622,6 +2782,16 @@ class GatewayNodeManager:
                     "result_digest": delivery.result_digest,
                     "callback_url": delivery.callback_url,
                     "export_required": delivery.export_required,
+                    "export_authority": (
+                        None
+                        if delivery.export_authority is None
+                        else {
+                            "backend_url": delivery.export_authority.backend_url,
+                            "timeout_seconds": delivery.export_authority.timeout_seconds,
+                            "fail_open": delivery.export_authority.fail_open,
+                            "identity_digest": delivery.export_authority.identity_digest,
+                        }
+                    ),
                     "export_succeeded": delivery.export_succeeded,
                     "callback_required": delivery.callback_required,
                     "callback_succeeded": delivery.callback_succeeded,
@@ -2726,18 +2896,25 @@ class GatewayNodeManager:
             "session_root",
             "credential_root",
         }
-        if version in {2, 3, 4}:
+        if version in {2, 3, 4, 5}:
             expected_keys.add("log_root")
-        if version in {3, 4}:
+        if version in {3, 4, 5}:
             expected_keys.add("subscription_finalization")
-        if version == 4:
+        if version in {4, 5}:
             expected_keys.add("terminal_delivery")
+        if version == 5:
+            expected_keys.add("phase")
         if set(payload) != expected_keys:
             raise ValueError("cleanup ownership payload is not closed")
-        if version not in {1, 2, 3, 4} or not isinstance(
+        if version not in {1, 2, 3, 4, 5} or not isinstance(
             payload["session_id"], str
         ):
             raise ValueError("cleanup ownership identity is invalid")
+        phase = payload.get("phase")
+        if version == 5 and phase not in _RECOVERY_PHASES:
+            raise ValueError("cleanup recovery phase is invalid")
+        if version != 5:
+            phase = None
         session_id = payload["session_id"]
         expected_name = f"{hashlib.sha256(session_id.encode('utf-8')).hexdigest()}.json"
         if path.name != expected_name:
@@ -2871,6 +3048,8 @@ class GatewayNodeManager:
                 "callback_required",
                 "callback_succeeded",
             }
+            if version == 5:
+                delivery_keys.add("export_authority")
             if (
                 not isinstance(delivery_payload, dict)
                 or set(delivery_payload) != delivery_keys
@@ -2902,11 +3081,53 @@ class GatewayNodeManager:
                 raise ValueError("terminal delivery result digest is invalid")
             callback_url = delivery_payload["callback_url"]
             export_required = delivery_payload["export_required"]
+            export_authority = None
+            authority_payload = delivery_payload.get("export_authority")
+            if authority_payload is not None:
+                authority_keys = {
+                    "backend_url",
+                    "timeout_seconds",
+                    "fail_open",
+                    "identity_digest",
+                }
+                if (
+                    not isinstance(authority_payload, dict)
+                    or set(authority_payload) != authority_keys
+                    or not isinstance(authority_payload["backend_url"], str)
+                    or not authority_payload["backend_url"]
+                    or isinstance(authority_payload["timeout_seconds"], bool)
+                    or not isinstance(
+                        authority_payload["timeout_seconds"], (int, float)
+                    )
+                    or not math.isfinite(float(authority_payload["timeout_seconds"]))
+                    or float(authority_payload["timeout_seconds"]) <= 0
+                    or not isinstance(authority_payload["fail_open"], bool)
+                    or not isinstance(authority_payload["identity_digest"], str)
+                ):
+                    raise ValueError("terminal export authority is invalid")
+                backend_url = authority_payload["backend_url"]
+                timeout_seconds = float(authority_payload["timeout_seconds"])
+                fail_open = authority_payload["fail_open"]
+                identity_digest = GatewayNodeManager._export_authority_digest(
+                    backend_url=backend_url,
+                    timeout_seconds=timeout_seconds,
+                    fail_open=fail_open,
+                )
+                if identity_digest != authority_payload["identity_digest"]:
+                    raise ValueError("terminal export authority digest is invalid")
+                export_authority = EvolutionExportAuthority(
+                    backend_url=backend_url,
+                    timeout_seconds=timeout_seconds,
+                    fail_open=fail_open,
+                    identity_digest=identity_digest,
+                )
             export_succeeded = delivery_payload["export_succeeded"]
             callback_required = delivery_payload["callback_required"]
             callback_succeeded = delivery_payload["callback_succeeded"]
             if callback_required != (callback_url is not None):
                 raise ValueError("terminal delivery callback authority is invalid")
+            if version == 5 and export_required != (export_authority is not None):
+                raise ValueError("terminal delivery export authority is invalid")
             if (not export_required and not export_succeeded) or (
                 not callback_required and not callback_succeeded
             ):
@@ -2922,10 +3143,21 @@ class GatewayNodeManager:
                 result_digest=result_digest,
                 callback_url=callback_url,
                 export_required=export_required,
+                export_authority=export_authority,
                 export_succeeded=export_succeeded,
                 callback_required=callback_required,
                 callback_succeeded=callback_succeeded,
             )
+        if phase == _RECOVERY_PHASE_TERMINAL_FINALIZATION and (
+            finalization_state is None or delivery_state is not None
+        ):
+            raise ValueError("terminal finalization phase authority is invalid")
+        if phase == _RECOVERY_PHASE_TERMINAL_DELIVERY and delivery_state is None:
+            raise ValueError("terminal delivery phase authority is invalid")
+        if phase == _RECOVERY_PHASE_RUNTIME_ACTIVE and (
+            finalization_state is not None or delivery_state is not None
+        ):
+            raise ValueError("runtime-active phase authority is invalid")
         return CleanupRetryOwnership(
             session_id=session_id,
             session_dir=session_dir,
@@ -2939,6 +3171,7 @@ class GatewayNodeManager:
             eval_runtime_id=eval_runtime_id,
             eval_container_id=eval_container_id,
             runtime=None,
+            phase=phase,
             eval_runtime=None,
             finalize_subscription=finalization_state is not None,
             finalization_state=finalization_state,
@@ -3083,12 +3316,19 @@ class GatewayNodeManager:
                 or not all(outcome is True for outcome in recovered_outcomes)
             ):
                 return
+            if ownership.phase is None:
+                logger.error(
+                    "Retaining cleanup roots because recovery phase authority is missing "
+                    "for session %s",
+                    session_id,
+                )
+                return
             self._record_cleanup_ownership_runtimes_absent(ownership)
-            if ownership.delivery_state is not None:
+            if ownership.phase == _RECOVERY_PHASE_TERMINAL_DELIVERY:
                 delivered = await self._resume_terminal_delivery(ownership)
                 if not delivered:
                     return
-            elif ownership.finalization_state is not None:
+            elif ownership.phase == _RECOVERY_PHASE_TERMINAL_FINALIZATION:
                 managed = self._restore_subscription_finalization(ownership)
                 ownership.managed = managed
                 await self._finalize_subscription_after_runtime_absence(
@@ -3144,12 +3384,19 @@ class GatewayNodeManager:
         )
         if not all(outcome is True for outcome in outcomes):
             return
+        if ownership.phase is None:
+            logger.error(
+                "Retaining cleanup roots because recovery phase authority is missing "
+                "for session %s",
+                session_id,
+            )
+            return
         self._record_cleanup_ownership_runtimes_absent(ownership)
-        if ownership.delivery_state is not None:
+        if ownership.phase == _RECOVERY_PHASE_TERMINAL_DELIVERY:
             delivered = await self._resume_terminal_delivery(ownership)
             if not delivered:
                 return
-        elif ownership.finalize_subscription:
+        elif ownership.phase == _RECOVERY_PHASE_TERMINAL_FINALIZATION:
             await self._finalize_subscription_after_runtime_absence(
                 managed,
                 result=managed.final_result,
