@@ -266,6 +266,46 @@ provider slice and return a closed `ApiErrorV1` with HTTP 503. They never return
 fixture data or a synthetic ready/success state. A successful SSH check reports
 Core as `offline` with `core_not_started`; it does not claim a live tunnel.
 
+`core_bridge_adapters_v1.py` supplies the production adapters for later
+composition without changing that release-app state. `CoreBootstrapConfigV1`
+accepts only the exact remote wheel, framework lock, host-global service root,
+source commit, requested port, and replacement policy. Its path fields are
+private in representations. `DesktopCoreSshBridgeAdapterV1` accepts only the
+currently connected `DesktopRemoteLifecycle` transport for the requested
+profile, runs the real isolated Core bootstrap/attach flow under the bridge
+deadline, and binds the returned bearer to the profile plus the complete remote
+release, registry, generation, port, and status-proof identity with a one-way
+host identity. It rechecks object identity against the active lifecycle before
+publishing either the attachment or tunnel, so reconnecting even the same
+profile invalidates in-flight authority.
+
+The same adapter implements `CoreTunnelFactory`. It opens the authenticated
+`ssh -W` Core endpoint through that exact transport and requires
+`open_core_control_tunnel` to match `/version` and `/v1/status` to the bootstrap
+attachment before publishing a bridge handle. `new_http_transport` is the
+corresponding bridge `transport_factory`: every HTTP request gets a newly
+verified anonymous socketpair connection and rechecks SSH child authority after
+response traffic. The handle's `127.0.0.1:1` endpoint is only the private HTTP
+origin used by the strict client; no TCP listener is bound or reserved. Handle
+close delegates to the existing bounded, idempotent, observable bridge close
+state and retains the verified tunnel on timeout or callback failure for an
+exact retry.
+
+`AdoptedWorkspaceArchiveSourceV1` is constructed from a frozen set of exact
+`WorkspaceImportRefV1` plus private `WorkspaceImportOwnership` bindings that
+composition has already durably adopted. It rejects any changed or unbound
+reference before store access and calls only `WorkspaceImportStore.resolve`
+with the bound ownership. The yielded object must remain the store's unlinked,
+regular, read-only descriptor-backed stream; the adapter never accepts or
+returns a host path, URI, or archive bytes object.
+
+These adapters are injectable building blocks, not release composition. This
+change does not instantiate `DesktopCoreBridgeV1` in `release_app` or
+`release_provider`, does not add a fallback, and does not make unavailable
+provider routes report ready. Release startup remains fail closed until a later
+change injects the adapters, bridge persistence, and exact adopted-import
+bindings together.
+
 `core_bridge_v1.py` now provides the strict active-project bridge needed by the
 next provider slice. It injects a host-global `CoreHostService`, a tunnel
 factory, an opaque adopted-archive source, and a durable persistence adapter.

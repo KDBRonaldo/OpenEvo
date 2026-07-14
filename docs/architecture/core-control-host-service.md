@@ -194,3 +194,17 @@ storage, reconnect policy, provider handlers, and routing Core operations over
 that handle. This branch deliberately does not fabricate a release-provider
 handler or modify those integration files; release startup remains fail closed
 until that downstream wiring is complete.
+
+`desktop.sidecar.core_bridge_adapters_v1` now provides that downstream primitive
+adapter without performing app composition. It uses only the exact transport
+currently owned by `DesktopRemoteLifecycle`, converts the attachment into the
+bridge's secret-bearing host authority, and computes a domain-separated
+bearer-HMAC identity over the profile and complete release/registry/generation/
+status tuple. Its tunnel method requires the same transport object and exact
+remote port, calls `open_core_control_tunnel`, and publishes a bridge handle only
+after authenticated attachment matching succeeds. The paired HTTPX transport
+opens all traffic through `VerifiedCoreControlTunnel.open_verified_socket`; its
+synthetic loopback origin never creates a local TCP listener. Deadline,
+transport replacement, SSH, bootstrap, and identity failures are normalized to
+closed renderer-safe bridge errors without paths, commands, output, or bearer
+values. Release provider/app composition remains intentionally out of scope.
