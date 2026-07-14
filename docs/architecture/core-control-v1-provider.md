@@ -88,20 +88,32 @@ cannot admit a second owner while the original parent-anchored owner is alive.
 Recovery reuses the held owner-verified private root FDs, validates every project
 publication against its finalized upload and the exact published tree, and fails
 startup when a referenced archive or snapshot is missing, replaced, or corrupt.
+One publication identity, workspace snapshot ID, and content ID may have only
+one project owner; a second persisted owner is corruption regardless of row
+order.
 Unreferenced upload files, temporary
 publications, and snapshots left by a crash after publish rename but before the
 SQLite commit are removed relative to those held FDs without following
 symlinks; cleanup never traverses outside the managed roots.
 
-The main SQLite database, WAL, and SHM are opened no-follow relative to the
-held provider-root FD and retained for the store lifetime. Each must remain an
-owner-owned, link-count-one `0600` regular file at the same pathname and inode.
+The main SQLite database authority FD, WAL, and SHM are opened no-follow
+relative to the held provider-root FD and retained for the store lifetime.
+Python sqlite has no native attach-existing-FD API, so on Linux Core opens the
+main connection through `/proc/self/fd/<authority-fd>`, verifies SQLite's
+resolved `main` path, and rechecks the held root, pathname, and inode around
+connection setup. A transient attach race is retried once; missing `/proc`
+support, a repeated race, or any binding mismatch fails startup closed. The
+provider and root locks are part of this protocol; SQLite itself is not claimed
+to honor those advisory locks. Each database file must remain an owner-owned,
+link-count-one `0600` regular file at the same pathname and inode.
 Startup runs bounded `integrity_check(1)` and `foreign_key_check`, applies an
 exact page limit, and rejects database, WAL, startup-row, aggregate-blob,
 managed-entry, and managed-disk quota violations. Recovery reads tables in
-fixed-size rowid keyset pages: SQL byte lengths are budgeted before guarded
-blobs enter Python. Provider recovery and project listing do not use unbounded
-`fetchall()`.
+fixed-size rowid keyset pages: every persisted TEXT or BLOB value is included in
+the SQL aggregate and per-value length budgets before a guarded value enters
+Python. Metadata is a one-key closed set; signing-key key/value lengths are
+checked before the value is read, and unknown metadata fails startup. Provider
+recovery and project listing do not use unbounded `fetchall()`.
 
 Project and upload ETags hash the complete validated canonical resource model,
 including model-populated defaults, plus an internal monotonic resource version.
@@ -184,6 +196,16 @@ entry set, sizes, and bytes against the retained canonical archive before
 serving projects. No run consumes this snapshot until the later run-owner phase.
 Recovery additionally requires the finalized source upload to belong to the
 same project that references the publication.
+
+Upload creation retains the new file descriptor until the transaction outcome
+is known and removes that exact inode only after a proven rollback. Finalize
+retains an inode receipt for the published snapshot and applies the same rule to
+the publication transaction; unknown or committed outcomes preserve the tree
+for startup recovery. Project deletion removes its uploads and owned snapshot
+after the database commit using no-follow, inode-bound traversal. Aborted
+uploads no longer reserve managed archive bytes. Cleanup failure after a
+committed mutation is a post-commit store failure; the durable idempotency result
+remains authoritative.
 
 ## SSE Recovery
 

@@ -77,6 +77,13 @@ def verify_and_materialize_workspace(
         published = True
         os.fsync(workspace_root_fd)
     except Exception:
+        if published:
+            _remove_tree_at(
+                workspace_root_fd,
+                snapshot_name,
+                expected_identity=temporary_identity,
+            )
+            published = False
         raise
     finally:
         if temporary_fd is not None:
@@ -686,7 +693,12 @@ def _fsync_tree_fd(root_fd: int) -> None:
     os.fsync(root_fd)
 
 
-def _remove_tree_at(parent_fd: int, name: str) -> None:
+def _remove_tree_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_identity: os.stat_result | None = None,
+) -> None:
     try:
         entry_fd = os.open(
             name,
@@ -698,6 +710,12 @@ def _remove_tree_at(parent_fd: int, name: str) -> None:
     except OSError as exc:
         raise WorkspaceArchiveError("temporary workspace root is unsafe") from exc
     try:
+        current_identity = os.fstat(entry_fd)
+        if expected_identity is not None and not _same_identity(
+            current_identity, expected_identity
+        ):
+            raise WorkspaceArchiveError("temporary workspace root binding changed")
+        _require_entry_binding(parent_fd, name, current_identity)
         for child_name in os.listdir(entry_fd):
             metadata = os.stat(child_name, dir_fd=entry_fd, follow_symlinks=False)
             if stat.S_ISDIR(metadata.st_mode):
@@ -707,6 +725,7 @@ def _remove_tree_at(parent_fd: int, name: str) -> None:
     finally:
         os.close(entry_fd)
     os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
 
 
 __all__ = [

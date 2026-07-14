@@ -37,6 +37,9 @@ _MAX_WAL_BYTES = 64 * 1024 * 1024
 _MAX_MANAGED_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_STARTUP_ROWS = 50_000
 _MAX_STARTUP_BLOB_BYTES = 128 * 1024 * 1024
+_MAX_STARTUP_VALUE_BYTES = 16 * 1024 * 1024
+_MAX_METADATA_BYTES = 4096
+_MAX_SCHEMA_BYTES = 256 * 1024
 _RECOVERY_PAGE_SIZE = 256
 _MAX_PROJECTS = 10_000
 _MAX_UPLOADS = 20_000
@@ -91,6 +94,10 @@ class PostCommitStoreError(StoreCorruptionError):
 
 class CommitOutcomeUnknownError(PostCommitStoreError):
     """SQLite may have committed, so durable state must be reconciled before repair."""
+
+
+class _DatabaseAttachRaceError(StoreCorruptionError):
+    """The held database inode moved while SQLite resolved its descriptor path."""
 
 
 class ResourceNotFoundError(CoreControlStoreError):
@@ -286,6 +293,24 @@ class CoreControlStoreV1:
             self._bind_database_sidecars()
             self._verify_database_integrity()
             self._recover_and_validate()
+        except OSError as exc:
+            connection = getattr(self, "_connection", None)
+            if connection is not None:
+                connection.close()
+            self._close_lifecycle_storage()
+            self._closed = True
+            raise CoreControlStoreError(
+                "Core Control provider startup filesystem is unavailable"
+            ) from exc
+        except sqlite3.Error as exc:
+            connection = getattr(self, "_connection", None)
+            if connection is not None:
+                connection.close()
+            self._close_lifecycle_storage()
+            self._closed = True
+            raise CoreControlStoreError(
+                "Core Control provider startup database is unavailable"
+            ) from exc
         except Exception:
             connection = getattr(self, "_connection", None)
             if connection is not None:
@@ -460,6 +485,7 @@ class CoreControlStoreV1:
             "deleteCoreProjectV1", project_id, None, {"if-match": if_match}
         )
         upload_files: list[str] = []
+        snapshot_name: str | None = None
         with self._mutex, self._transaction():
             replay = self._idempotency_replay(
                 "deleteCoreProjectV1", project_id, idempotency_key, envelope, None
@@ -468,6 +494,8 @@ class CoreControlStoreV1:
                 return replay
             _, current = self._project_row(project_id)
             self._require_etag(current.etag, if_match, "project")
+            if current.workspace_publication is not None:
+                snapshot_name = current.workspace_publication.workspace_snapshot.id
             upload_cursor = self._connection.execute(
                 "SELECT file_name FROM workspace_uploads WHERE project_id = ? "
                 "ORDER BY upload_id LIMIT ?",
@@ -481,14 +509,21 @@ class CoreControlStoreV1:
             self._store_idempotency(
                 "deleteCoreProjectV1", project_id, idempotency_key, envelope, result
             )
-        with self._mutex:
-            for path in upload_files:
-                self._verify_lifecycle_storage()
-                try:
-                    os.unlink(path, dir_fd=self._upload_root_fd)
-                except FileNotFoundError:
-                    pass
-                self._verify_lifecycle_storage()
+        try:
+            with self._mutex:
+                for path in upload_files:
+                    self._verify_lifecycle_storage()
+                    _remove_entry_at(self._upload_root_fd, path)
+                    self._verify_lifecycle_storage()
+                if snapshot_name is not None:
+                    _remove_entry_at(self._workspace_root_fd, snapshot_name)
+                    self._verify_lifecycle_storage()
+                os.fsync(self._upload_root_fd)
+                os.fsync(self._workspace_root_fd)
+        except Exception as exc:
+            raise PostCommitStoreError(
+                "committed project deletion could not reconcile managed state"
+            ) from exc
         return result
 
     def create_upload(
@@ -505,105 +540,133 @@ class CoreControlStoreV1:
             request,
             {"if-match": if_match},
         )
-        with self._mutex, self._transaction():
-            replay = self._idempotency_replay(
-                "createCoreWorkspaceUploadV1",
-                project_id,
-                idempotency_key,
-                envelope,
-                m.WorkspaceUploadSessionV1,
-            )
-            if replay is not None:
-                return replay
-            upload_count = int(
-                self._connection.execute("SELECT COUNT(*) FROM workspace_uploads").fetchone()[0]
-            )
-            reserved_bytes = int(
-                self._connection.execute(
-                    "SELECT COALESCE(SUM(CAST(json_extract(CAST(document_json AS TEXT), "
-                    "'$.archive.byte_size') AS INTEGER)), 0) FROM workspace_uploads"
-                ).fetchone()[0]
-            )
-            if upload_count >= _MAX_UPLOADS:
-                raise IdempotencyCapacityError("workspace upload capacity is exhausted")
-            if reserved_bytes + request.archive.byte_size > _MAX_MANAGED_WORKSPACE_BYTES:
-                raise ResourceConflictError(
-                    "provider_storage_quota_exceeded",
-                    "The managed workspace storage quota would be exceeded.",
-                )
-            _, project = self._project_row(project_id)
-            self._require_etag(project.etag, if_match, "project")
-            if request.project_snapshot != project.current_project_snapshot:
-                raise ResourceConflictError(
-                    "project_snapshot_changed",
-                    "The upload project snapshot is not the current project snapshot.",
-                )
-            if not isinstance(project.workspace, m.ImportedWorkspaceSpecV1):
-                raise ResourceConflictError(
-                    "workspace_upload_not_required",
-                    "Scratch projects do not accept workspace archive uploads.",
-                )
-            if request.archive != project.workspace.archive:
-                raise ResourceConflictError(
-                    "workspace_archive_declaration_changed",
-                    "The upload archive differs from the project workspace declaration.",
-                )
-            if request.base_workspace_snapshot != project.current_workspace_snapshot:
-                raise ResourceConflictError(
-                    "workspace_base_snapshot_changed",
-                    "The upload base workspace snapshot is no longer current.",
-                )
-            now = self._timestamp()
-            upload_id = _new_id("upload")
-            file_name = f"{upload_id}.part"
-            fd = os.open(
-                file_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=self._upload_root_fd,
-            )
+        with self._mutex:
+            transaction = self._transaction()
+            file_fd: int | None = None
+            file_name: str | None = None
+            file_identity: os.stat_result | None = None
             try:
-                os.fsync(fd)
+                with transaction:
+                    replay = self._idempotency_replay(
+                        "createCoreWorkspaceUploadV1",
+                        project_id,
+                        idempotency_key,
+                        envelope,
+                        m.WorkspaceUploadSessionV1,
+                    )
+                    if replay is not None:
+                        return replay
+                    upload_count = int(
+                        self._connection.execute(
+                            "SELECT COUNT(*) FROM workspace_uploads"
+                        ).fetchone()[0]
+                    )
+                    reserved_bytes = int(
+                        self._connection.execute(
+                            "SELECT COALESCE(SUM(CAST(json_extract("
+                            "CAST(document_json AS TEXT), '$.archive.byte_size') AS INTEGER)), "
+                            "0) FROM workspace_uploads WHERE json_extract("
+                            "CAST(document_json AS TEXT), '$.status') IN ('open', 'finalized')"
+                        ).fetchone()[0]
+                    )
+                    if upload_count >= _MAX_UPLOADS:
+                        raise IdempotencyCapacityError("workspace upload capacity is exhausted")
+                    if reserved_bytes + request.archive.byte_size > _MAX_MANAGED_WORKSPACE_BYTES:
+                        raise ResourceConflictError(
+                            "provider_storage_quota_exceeded",
+                            "The managed workspace storage quota would be exceeded.",
+                        )
+                    _, project = self._project_row(project_id)
+                    self._require_etag(project.etag, if_match, "project")
+                    if request.project_snapshot != project.current_project_snapshot:
+                        raise ResourceConflictError(
+                            "project_snapshot_changed",
+                            "The upload project snapshot is not the current project snapshot.",
+                        )
+                    if not isinstance(project.workspace, m.ImportedWorkspaceSpecV1):
+                        raise ResourceConflictError(
+                            "workspace_upload_not_required",
+                            "Scratch projects do not accept workspace archive uploads.",
+                        )
+                    if request.archive != project.workspace.archive:
+                        raise ResourceConflictError(
+                            "workspace_archive_declaration_changed",
+                            "The upload archive differs from the project workspace declaration.",
+                        )
+                    if request.base_workspace_snapshot != project.current_workspace_snapshot:
+                        raise ResourceConflictError(
+                            "workspace_base_snapshot_changed",
+                            "The upload base workspace snapshot is no longer current.",
+                        )
+                    now = self._timestamp()
+                    upload_id = _new_id("upload")
+                    file_name = f"{upload_id}.part"
+                    file_fd = os.open(
+                        file_name,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=self._upload_root_fd,
+                    )
+                    file_identity = os.fstat(file_fd)
+                    _require_private_regular_metadata(file_identity)
+                    _require_entry_binding(self._upload_root_fd, file_name, file_identity)
+                    os.fsync(file_fd)
+                    os.fsync(self._upload_root_fd)
+                    session_data = {
+                        "id": upload_id,
+                        "project_id": project_id,
+                        "status": m.WorkspaceUploadStatus.OPEN,
+                        "accepted_offset": 0,
+                        "project_snapshot": request.project_snapshot,
+                        "project_etag": project.etag,
+                        "archive": request.archive,
+                        "base_workspace_snapshot": request.base_workspace_snapshot,
+                        "publication": None,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    session = _model_with_etag(m.WorkspaceUploadSessionV1, session_data, version=1)
+                    self._connection.execute(
+                        "INSERT INTO workspace_uploads(upload_id, project_id, identity_hmac, "
+                        "document_json, resource_version, file_name, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+                        (
+                            upload_id,
+                            project_id,
+                            self._resource_identity_hmac("upload", upload_id),
+                            _model_bytes(session),
+                            file_name,
+                            now,
+                            now,
+                        ),
+                    )
+                    result = StoredResult(201, session, session.etag)
+                    self._store_idempotency(
+                        "createCoreWorkspaceUploadV1",
+                        project_id,
+                        idempotency_key,
+                        envelope,
+                        result,
+                    )
+                    return result
+            except BaseException:
+                if (
+                    transaction.outcome == "rolled_back"
+                    and file_fd is not None
+                    and file_name is not None
+                    and file_identity is not None
+                ):
+                    _remove_bound_entry_at(
+                        self._upload_root_fd,
+                        file_name,
+                        file_fd,
+                        file_identity,
+                    )
+                    os.fsync(self._upload_root_fd)
+                raise
             finally:
-                os.close(fd)
-            os.fsync(self._upload_root_fd)
-            session_data = {
-                "id": upload_id,
-                "project_id": project_id,
-                "status": m.WorkspaceUploadStatus.OPEN,
-                "accepted_offset": 0,
-                "project_snapshot": request.project_snapshot,
-                "project_etag": project.etag,
-                "archive": request.archive,
-                "base_workspace_snapshot": request.base_workspace_snapshot,
-                "publication": None,
-                "created_at": now,
-                "updated_at": now,
-            }
-            session = _model_with_etag(m.WorkspaceUploadSessionV1, session_data, version=1)
-            self._connection.execute(
-                "INSERT INTO workspace_uploads(upload_id, project_id, identity_hmac, "
-                "document_json, resource_version, file_name, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
-                (
-                    upload_id,
-                    project_id,
-                    self._resource_identity_hmac("upload", upload_id),
-                    _model_bytes(session),
-                    file_name,
-                    now,
-                    now,
-                ),
-            )
-            result = StoredResult(201, session, session.etag)
-            self._store_idempotency(
-                "createCoreWorkspaceUploadV1",
-                project_id,
-                idempotency_key,
-                envelope,
-                result,
-            )
-            return result
+                if file_fd is not None:
+                    os.close(file_fd)
 
     def get_upload(self, project_id: str, upload_id: str) -> m.WorkspaceUploadSessionV1:
         with self._mutex:
@@ -791,6 +854,8 @@ class CoreControlStoreV1:
                 {"archive_sha256": upload.archive.content_sha256},
                 now,
             )
+            snapshot_fd: int | None = None
+            snapshot_identity: os.stat_result | None = None
             try:
                 self._verify_lifecycle_storage()
                 verify_and_materialize_workspace(
@@ -801,100 +866,135 @@ class CoreControlStoreV1:
                     workspace_root_fd=self._workspace_root_fd,
                     snapshot_name=workspace_snapshot.id,
                 )
+                snapshot_fd = os.open(
+                    workspace_snapshot.id,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=self._workspace_root_fd,
+                )
+                snapshot_identity = os.fstat(snapshot_fd)
+                _require_private_directory_metadata(snapshot_identity)
+                _require_entry_binding(
+                    self._workspace_root_fd,
+                    workspace_snapshot.id,
+                    snapshot_identity,
+                )
                 self._verify_lifecycle_storage()
             except WorkspaceArchiveError as exc:
                 raise ResourceConflictError(
                     "workspace_archive_invalid", "The workspace archive is not canonical."
                 ) from exc
+            except OSError as exc:
+                raise StoreCorruptionError(
+                    "published workspace snapshot could not be bound"
+                ) from exc
 
-            with self._transaction():
-                upload_row, upload = self._upload_row(project_id, upload_id)
-                project_row, project = self._project_row(project_id)
-                self._validate_finalize_preconditions(
-                    upload,
-                    project,
-                    request,
-                    if_match=if_match,
-                    if_project_match=if_project_match,
-                )
-                content_ref = m.ContentRefV1(
-                    content_id=_core_owned_id(
+            transaction = self._transaction()
+            try:
+                with transaction:
+                    upload_row, upload = self._upload_row(project_id, upload_id)
+                    project_row, project = self._project_row(project_id)
+                    self._validate_finalize_preconditions(
+                        upload,
+                        project,
+                        request,
+                        if_match=if_match,
+                        if_project_match=if_project_match,
+                    )
+                    content_ref = m.ContentRefV1(
+                        content_id=_core_owned_id(
+                            self._signing_key,
+                            "workspace-content",
+                            {
+                                "sha256": upload.archive.content_sha256,
+                                "byte_size": upload.archive.byte_size,
+                                "published_at": now,
+                            },
+                        ),
+                        sha256=upload.archive.content_sha256,
+                        byte_size=upload.archive.byte_size,
+                    )
+                    publication = m.WorkspacePublicationV1(
+                        archive=upload.archive,
+                        content_ref=content_ref,
+                        workspace_snapshot=workspace_snapshot,
+                        published_at=now,
+                    )
+                    project_version = int(project_row["resource_version"]) + 1
+                    project_data = project.model_dump(
+                        mode="python", exclude={"etag", "current_project_snapshot"}
+                    )
+                    project_data.update(
+                        current_workspace_snapshot=workspace_snapshot,
+                        workspace_publication=publication,
+                        updated_at=now,
+                    )
+                    project_snapshot = _snapshot(
                         self._signing_key,
-                        "workspace-content",
-                        {
-                            "sha256": upload.archive.content_sha256,
-                            "byte_size": upload.archive.byte_size,
-                            "published_at": now,
-                        },
-                    ),
-                    sha256=upload.archive.content_sha256,
-                    byte_size=upload.archive.byte_size,
-                )
-                publication = m.WorkspacePublicationV1(
-                    archive=upload.archive,
-                    content_ref=content_ref,
-                    workspace_snapshot=workspace_snapshot,
-                    published_at=now,
-                )
-                project_version = int(project_row["resource_version"]) + 1
-                project_data = project.model_dump(
-                    mode="python", exclude={"etag", "current_project_snapshot"}
-                )
-                project_data.update(
-                    current_workspace_snapshot=workspace_snapshot,
-                    workspace_publication=publication,
-                    updated_at=now,
-                )
-                project_snapshot = _snapshot(
-                    self._signing_key,
-                    m.SnapshotKind.PROJECT,
-                    _project_snapshot_payload(project_data),
-                    now,
-                )
-                project_data["current_project_snapshot"] = project_snapshot
-                updated_project = _model_with_etag(
-                    m.ProjectV1,
-                    project_data,
-                    version=project_version,
-                )
-                upload_version = int(upload_row["resource_version"]) + 1
-                upload_data = upload.model_dump(mode="python", exclude={"etag"})
-                upload_data.update(
-                    status=m.WorkspaceUploadStatus.FINALIZED,
-                    publication=publication,
-                    updated_at=now,
-                )
-                updated_upload = _model_with_etag(
-                    m.WorkspaceUploadSessionV1,
-                    upload_data,
-                    version=upload_version,
-                )
-                self._connection.execute(
-                    "UPDATE projects SET document_json = ?, resource_version = ?, "
-                    "updated_at = ? WHERE project_id = ?",
-                    (_model_bytes(updated_project), project_version, now, project_id),
-                )
-                self._connection.execute(
-                    "UPDATE workspace_uploads SET document_json = ?, resource_version = ?, "
-                    "updated_at = ? WHERE upload_id = ?",
-                    (_model_bytes(updated_upload), upload_version, now, upload_id),
-                )
-                response = m.WorkspaceUploadFinalizeResponseV1(
-                    project_id=project_id,
-                    upload=updated_upload,
-                    publication=publication,
-                    project=updated_project,
-                )
-                self._append_project_event(updated_project, now=now)
-                result = StoredResult(201, response, updated_upload.etag)
-                self._store_idempotency(
-                    "finalizeCoreWorkspaceUploadV1",
-                    scope,
-                    idempotency_key,
-                    envelope,
-                    result,
-                )
-                return result
+                        m.SnapshotKind.PROJECT,
+                        _project_snapshot_payload(project_data),
+                        now,
+                    )
+                    project_data["current_project_snapshot"] = project_snapshot
+                    updated_project = _model_with_etag(
+                        m.ProjectV1,
+                        project_data,
+                        version=project_version,
+                    )
+                    upload_version = int(upload_row["resource_version"]) + 1
+                    upload_data = upload.model_dump(mode="python", exclude={"etag"})
+                    upload_data.update(
+                        status=m.WorkspaceUploadStatus.FINALIZED,
+                        publication=publication,
+                        updated_at=now,
+                    )
+                    updated_upload = _model_with_etag(
+                        m.WorkspaceUploadSessionV1,
+                        upload_data,
+                        version=upload_version,
+                    )
+                    self._connection.execute(
+                        "UPDATE projects SET document_json = ?, resource_version = ?, "
+                        "updated_at = ? WHERE project_id = ?",
+                        (_model_bytes(updated_project), project_version, now, project_id),
+                    )
+                    self._connection.execute(
+                        "UPDATE workspace_uploads SET document_json = ?, resource_version = ?, "
+                        "updated_at = ? WHERE upload_id = ?",
+                        (_model_bytes(updated_upload), upload_version, now, upload_id),
+                    )
+                    response = m.WorkspaceUploadFinalizeResponseV1(
+                        project_id=project_id,
+                        upload=updated_upload,
+                        publication=publication,
+                        project=updated_project,
+                    )
+                    self._append_project_event(updated_project, now=now)
+                    result = StoredResult(201, response, updated_upload.etag)
+                    self._store_idempotency(
+                        "finalizeCoreWorkspaceUploadV1",
+                        scope,
+                        idempotency_key,
+                        envelope,
+                        result,
+                    )
+                    return result
+            except BaseException:
+                if (
+                    transaction.outcome == "rolled_back"
+                    and snapshot_fd is not None
+                    and snapshot_identity is not None
+                ):
+                    _remove_bound_entry_at(
+                        self._workspace_root_fd,
+                        workspace_snapshot.id,
+                        snapshot_fd,
+                        snapshot_identity,
+                    )
+                    os.fsync(self._workspace_root_fd)
+                raise
+            finally:
+                if snapshot_fd is not None:
+                    os.close(snapshot_fd)
 
     def abort_upload(
         self,
@@ -1517,14 +1617,15 @@ class CoreControlStoreV1:
             "idempotency_records",
             "failed_idempotency_records",
             "events",
+            "metadata",
         ],
         *,
         columns: tuple[str, ...],
-        blob_columns: tuple[str, ...],
+        bounded_columns: tuple[str, ...],
         max_rows: int,
     ):
         totals = ["COUNT(*)"] + [
-            f"COALESCE(SUM(length(CAST({column} AS BLOB))), 0)" for column in blob_columns
+            f"COALESCE(SUM(length(CAST({column} AS BLOB))), 0)" for column in bounded_columns
         ]
         aggregate = self._connection.execute(f"SELECT {', '.join(totals)} FROM {table}").fetchone()
         assert aggregate is not None
@@ -1539,10 +1640,10 @@ class CoreControlStoreV1:
             or self._startup_scan_bytes > _MAX_STARTUP_BLOB_BYTES
         ):
             raise StoreCorruptionError("Core Control aggregate startup quota is exceeded")
-        for column in blob_columns:
+        for column in bounded_columns:
             oversized = self._connection.execute(
                 f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL AND "
-                f"length(CAST({column} AS BLOB)) > 16777216 LIMIT 1"
+                f"length(CAST({column} AS BLOB)) > {_MAX_STARTUP_VALUE_BYTES} LIMIT 1"
             ).fetchone()
             if oversized is not None:
                 raise StoreCorruptionError(f"Core Control {table} recovery quota is exceeded")
@@ -1550,9 +1651,10 @@ class CoreControlStoreV1:
         last_rowid = 0
         guarded_columns = []
         for column in columns:
-            if column in blob_columns:
+            if column in bounded_columns:
                 guarded_columns.append(
-                    f"CASE WHEN length(CAST({column} AS BLOB)) <= 16777216 "
+                    f"CASE WHEN length(CAST({column} AS BLOB)) "
+                    f"<= {_MAX_STARTUP_VALUE_BYTES} "
                     f"THEN {column} END AS {column}"
                 )
             else:
@@ -1584,6 +1686,20 @@ class CoreControlStoreV1:
             self._verify_database_integrity()
             self._startup_scan_rows = 0
             self._startup_scan_bytes = 0
+            metadata_rows = list(
+                self._recovery_rows(
+                    "metadata",
+                    columns=("key", "value"),
+                    bounded_columns=("key", "value"),
+                    max_rows=1,
+                )
+            )
+            if (
+                len(metadata_rows) != 1
+                or metadata_rows[0]["key"] != "signing_key"
+                or bytes(metadata_rows[0]["value"]) != self._signing_key
+            ):
+                raise StoreCorruptionError("Core Control metadata is invalid")
             _verify_managed_disk_quota(
                 self._upload_root_fd,
                 max_entries=_MAX_UPLOADS + 256,
@@ -1596,6 +1712,7 @@ class CoreControlStoreV1:
             )
             project_publications: dict[str, m.WorkspacePublicationV1] = {}
             publication_projects: dict[str, str] = {}
+            publication_owners: dict[tuple[str, str], str] = {}
             for row in self._recovery_rows(
                 "projects",
                 columns=(
@@ -1606,7 +1723,13 @@ class CoreControlStoreV1:
                     "created_at",
                     "updated_at",
                 ),
-                blob_columns=("document_json",),
+                bounded_columns=(
+                    "project_id",
+                    "identity_hmac",
+                    "document_json",
+                    "created_at",
+                    "updated_at",
+                ),
                 max_rows=_MAX_PROJECTS,
             ):
                 project = _validate_bytes(m.ProjectV1, row["document_json"])
@@ -1636,6 +1759,17 @@ class CoreControlStoreV1:
                     )
                     if existing != publication:
                         raise StoreCorruptionError("workspace snapshot publication is ambiguous")
+                    ownership_keys = (
+                        ("publication", hashlib.sha256(_model_bytes(publication)).hexdigest()),
+                        ("snapshot", publication.workspace_snapshot.id),
+                        ("content", publication.content_ref.content_id),
+                    )
+                    for ownership_key in ownership_keys:
+                        owner = publication_owners.setdefault(ownership_key, project.id)
+                        if owner != project.id:
+                            raise StoreCorruptionError(
+                                "workspace publication has more than one project owner"
+                            )
                     publication_projects[publication.workspace_snapshot.id] = project.id
             referenced_files: set[str] = set()
             snapshot_sources: dict[str, tuple[m.WorkspacePublicationV1, str, str]] = {}
@@ -1651,7 +1785,15 @@ class CoreControlStoreV1:
                     "created_at",
                     "updated_at",
                 ),
-                blob_columns=("document_json",),
+                bounded_columns=(
+                    "upload_id",
+                    "project_id",
+                    "identity_hmac",
+                    "document_json",
+                    "file_name",
+                    "created_at",
+                    "updated_at",
+                ),
                 max_rows=_MAX_UPLOADS,
             ):
                 upload = _validate_bytes(m.WorkspaceUploadSessionV1, row["document_json"])
@@ -1697,7 +1839,7 @@ class CoreControlStoreV1:
                     existing = snapshot_sources.setdefault(
                         snapshot_id, (publication, file_name, upload.project_id)
                     )
-                    if existing[0] != publication:
+                    if existing[0] != publication or existing[2] != upload.project_id:
                         raise StoreCorruptionError("workspace snapshot source is ambiguous")
             for snapshot_id, publication in project_publications.items():
                 source = snapshot_sources.get(snapshot_id)
@@ -1712,7 +1854,7 @@ class CoreControlStoreV1:
             for row in self._recovery_rows(
                 "events",
                 columns=("sequence", "event_id", "frame_json", "created_at_epoch"),
-                blob_columns=("frame_json",),
+                bounded_columns=("event_id", "frame_json"),
                 max_rows=self._event_replay_limit,
             ):
                 frame = _validate_bytes(m.SseFrameV1, row["frame_json"])
@@ -1745,10 +1887,16 @@ class CoreControlStoreV1:
                     "created_at_epoch",
                     "expires_at_epoch",
                 ),
-                blob_columns=(
+                bounded_columns=(
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
                     "request_json",
                     "semantic_headers_json",
+                    "response_type",
                     "response_json",
+                    "etag",
                 ),
                 max_rows=_IDEMPOTENCY_LIMIT,
             ):
@@ -1767,7 +1915,13 @@ class CoreControlStoreV1:
                     "created_at_epoch",
                     "expires_at_epoch",
                 ),
-                blob_columns=("error_json",),
+                bounded_columns=(
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "error_json",
+                ),
                 max_rows=_IDEMPOTENCY_LIMIT,
             ):
                 success_scope = _success_scope_for_failed_idempotency(row)
@@ -2146,28 +2300,49 @@ class CoreControlStoreV1:
         for name in ("_workspace_root_fd", "_upload_root_fd"):
             descriptor = getattr(self, name, None)
             if descriptor is not None:
-                os.close(descriptor)
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
                 delattr(self, name)
         lock_fd = getattr(self, "_lock_fd", None)
         if lock_fd is not None:
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
             finally:
-                os.close(lock_fd)
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
                 del self._lock_fd
         root_fd = getattr(self, "_root_fd", None)
         if root_fd is not None:
             try:
-                fcntl.flock(root_fd, fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(root_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
             finally:
-                os.close(root_fd)
+                try:
+                    os.close(root_fd)
+                except OSError:
+                    pass
                 del self._root_fd
         parent_fd = getattr(self, "_parent_fd", None)
         if parent_fd is not None:
             try:
-                fcntl.flock(parent_fd, fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(parent_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
             finally:
-                os.close(parent_fd)
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
                 del self._parent_fd
 
     def _prepare_root(self) -> None:
@@ -2191,14 +2366,31 @@ class CoreControlStoreV1:
                 raise CoreControlStoreError("Core Control managed root is not privately owned")
 
     def _load_or_create_signing_key(self) -> bytes:
-        row = self._connection.execute(
-            "SELECT value FROM metadata WHERE key = 'signing_key'"
+        aggregate = self._connection.execute(
+            "SELECT COUNT(*), "
+            "COALESCE(SUM(length(CAST(key AS BLOB))), 0), "
+            "COALESCE(SUM(length(CAST(value AS BLOB))), 0) FROM metadata"
         ).fetchone()
-        if row is not None:
-            value = bytes(row["value"])
-            if len(value) != 32:
-                raise StoreCorruptionError("provider signing key is invalid")
-            return value
+        if aggregate is None:
+            raise StoreCorruptionError("Core Control metadata is unavailable")
+        row_count = int(aggregate[0])
+        total_bytes = int(aggregate[1]) + int(aggregate[2])
+        if row_count > 1 or total_bytes > _MAX_METADATA_BYTES:
+            raise StoreCorruptionError("Core Control metadata quota is exceeded")
+        if row_count:
+            row = self._connection.execute(
+                "SELECT CASE WHEN length(CAST(key AS BLOB)) <= 64 THEN key END AS key, "
+                "CASE WHEN length(CAST(value AS BLOB)) <= 32 THEN value END AS value "
+                "FROM metadata LIMIT 2"
+            ).fetchone()
+            if (
+                row is None
+                or row["key"] != "signing_key"
+                or row["value"] is None
+                or len(bytes(row["value"])) != 32
+            ):
+                raise StoreCorruptionError("Core Control metadata is invalid")
+            return bytes(row["value"])
         value = secrets.token_bytes(32)
         self._connection.execute(
             "INSERT INTO metadata(key, value) VALUES ('signing_key', ?)", (value,)
@@ -2306,31 +2498,74 @@ class CoreControlStoreV1:
         ).hexdigest()
 
     def _open_database_connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.root / "provider.sqlite3",
-            isolation_level=None,
-            check_same_thread=False,
-            timeout=30,
-        )
+        authority_fd = self._database_fds.get("provider.sqlite3")
+        if authority_fd is None:
+            raise StoreCorruptionError("Core Control database authority is unavailable")
+        descriptor_path = f"/proc/self/fd/{authority_fd}"
         try:
-            connection.row_factory = sqlite3.Row
-            schema_row = connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
-            if (
-                schema_row is not None
-                and _schema_fingerprint(connection) != _expected_schema_fingerprint()
-            ):
-                raise StoreCorruptionError(
-                    "Core Control schema fingerprint is incompatible; provider state is fresh-only"
+            descriptor_identity = os.stat(descriptor_path, follow_symlinks=True)
+        except OSError as exc:
+            raise CoreControlStoreError(
+                "Core Control cannot attach SQLite to its held database authority"
+            ) from exc
+        _require_same_identity(
+            descriptor_identity,
+            self._database_identities["provider.sqlite3"],
+            "database descriptor",
+        )
+
+        last_error: Exception | None = None
+        for _attempt in range(2):
+            self._verify_database_authority()
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = sqlite3.connect(
+                    f"file:{descriptor_path}?mode=rw",
+                    uri=True,
+                    isolation_level=None,
+                    check_same_thread=False,
+                    timeout=30,
                 )
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = FULL")
-            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
-            connection.execute(f"PRAGMA max_page_count = {_MAX_DATABASE_BYTES // page_size}")
-        except Exception:
-            connection.close()
-            raise
-        return connection
+                connection.row_factory = sqlite3.Row
+                database_rows = connection.execute("PRAGMA database_list").fetchmany(2)
+                if len(database_rows) != 1 or database_rows[0][1] != "main":
+                    raise _DatabaseAttachRaceError(
+                        "Core Control SQLite connection identity is invalid"
+                    )
+                resolved_database = Path(database_rows[0][2])
+                if resolved_database != self.root / "provider.sqlite3":
+                    raise _DatabaseAttachRaceError(
+                        "Core Control SQLite connection path changed during attach"
+                    )
+                self._verify_database_authority()
+                schema_row = connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
+                if (
+                    schema_row is not None
+                    and _schema_fingerprint(connection) != _expected_schema_fingerprint()
+                ):
+                    raise StoreCorruptionError(
+                        "Core Control schema fingerprint is incompatible; "
+                        "provider state is fresh-only"
+                    )
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = FULL")
+                page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+                connection.execute(f"PRAGMA max_page_count = {_MAX_DATABASE_BYTES // page_size}")
+                self._verify_database_authority()
+                return connection
+            except (_DatabaseAttachRaceError, sqlite3.Error) as exc:
+                last_error = exc
+                if connection is not None:
+                    connection.close()
+                self._verify_database_authority()
+            except Exception:
+                if connection is not None:
+                    connection.close()
+                raise
+        raise StoreCorruptionError(
+            "Core Control SQLite connection could not bind its database authority"
+        ) from last_error
 
     def _require_etag(self, current: str, supplied: str, resource_type: str) -> None:
         if not hmac.compare_digest(current, supplied):
@@ -2365,8 +2600,15 @@ class _Transaction:
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         if exc_type is not None:
-            self.connection.execute("ROLLBACK")
-            self.outcome = "rolled_back"
+            try:
+                self.connection.execute("ROLLBACK")
+            except sqlite3.Error as rollback_exc:
+                self.outcome = "unknown"
+                raise CommitOutcomeUnknownError(
+                    "Core Control transaction rollback outcome is unknown"
+                ) from rollback_exc
+            else:
+                self.outcome = "rolled_back"
             return False
         try:
             self.verify_storage()
@@ -2402,8 +2644,26 @@ def _new_id(prefix: str) -> str:
 
 
 def _schema_fingerprint(connection: sqlite3.Connection) -> bytes:
+    aggregate = connection.execute(
+        "SELECT COUNT(*), "
+        "COALESCE(SUM(length(CAST(type AS BLOB))), 0), "
+        "COALESCE(SUM(length(CAST(name AS BLOB))), 0), "
+        "COALESCE(SUM(length(CAST(tbl_name AS BLOB))), 0), "
+        "COALESCE(SUM(length(CAST(sql AS BLOB))), 0) FROM sqlite_schema"
+    ).fetchone()
+    if aggregate is None:
+        raise StoreCorruptionError("Core Control schema fingerprint is unavailable")
+    row_count = int(aggregate[0])
+    byte_count = sum(int(aggregate[index]) for index in range(1, 5))
+    if row_count > 64 or byte_count > _MAX_SCHEMA_BYTES:
+        raise StoreCorruptionError("Core Control schema fingerprint is oversized")
     rows = connection.execute(
-        "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name"
+        "SELECT "
+        "CASE WHEN length(CAST(type AS BLOB)) <= 32 THEN type END, "
+        "CASE WHEN length(CAST(name AS BLOB)) <= 256 THEN name END, "
+        "CASE WHEN length(CAST(tbl_name AS BLOB)) <= 256 THEN tbl_name END, "
+        f"CASE WHEN length(CAST(sql AS BLOB)) <= {_MAX_SCHEMA_BYTES} THEN sql END "
+        "FROM sqlite_schema ORDER BY type, name"
     )
     schema: list[list[object]] = []
     while True:
@@ -2411,8 +2671,10 @@ def _schema_fingerprint(connection: sqlite3.Connection) -> bytes:
         if not page:
             break
         schema.extend([[row[0], row[1], row[2], row[3]] for row in page])
-        if len(schema) > 64:
+        if len(schema) > 64 or any(value is None for row in schema for value in row[:3]):
             raise StoreCorruptionError("Core Control schema fingerprint is oversized")
+    if len(schema) != row_count:
+        raise StoreCorruptionError("Core Control schema fingerprint changed during read")
     return _canonical_bytes(schema)
 
 
@@ -3154,7 +3416,24 @@ def _require_same_identity(
         raise StoreCorruptionError(f"Core Control {label} identity changed")
 
 
-def _remove_entry_at(parent_fd: int, name: str) -> None:
+def _remove_bound_entry_at(
+    parent_fd: int,
+    name: str,
+    entry_fd: int,
+    expected_identity: os.stat_result,
+) -> None:
+    current = os.fstat(entry_fd)
+    _require_same_identity(current, expected_identity, "managed cleanup entry")
+    _require_entry_binding(parent_fd, name, expected_identity)
+    _remove_entry_at(parent_fd, name, expected_identity=expected_identity)
+
+
+def _remove_entry_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_identity: os.stat_result | None = None,
+) -> None:
     try:
         metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -3163,7 +3442,34 @@ def _remove_entry_at(parent_fd: int, name: str) -> None:
         raise StoreCorruptionError("Core Control managed orphan is unreadable") from exc
     if metadata.st_uid != os.geteuid():
         raise StoreCorruptionError("Core Control managed orphan has the wrong owner")
+    if expected_identity is not None and not _same_identity(metadata, expected_identity):
+        raise StoreCorruptionError("Core Control managed cleanup entry identity changed")
     if not stat.S_ISDIR(metadata.st_mode):
+        if stat.S_ISLNK(metadata.st_mode):
+            _require_entry_binding(parent_fd, name, metadata)
+        elif stat.S_ISREG(metadata.st_mode):
+            try:
+                entry_fd = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                raise StoreCorruptionError("Core Control managed orphan file is unsafe") from exc
+            try:
+                current = os.fstat(entry_fd)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_uid != os.geteuid()
+                    or current.st_nlink != 1
+                ):
+                    raise StoreCorruptionError("Core Control managed orphan file is unsafe")
+                _require_same_identity(current, metadata, "managed orphan file")
+                _require_entry_binding(parent_fd, name, metadata)
+            finally:
+                os.close(entry_fd)
+        else:
+            raise StoreCorruptionError("Core Control managed orphan type is invalid")
         try:
             os.unlink(name, dir_fd=parent_fd)
         except OSError as exc:

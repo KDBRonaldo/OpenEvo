@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -580,6 +581,165 @@ def test_workspace_finalize_rejects_digest_and_stale_project_cas(tmp_path: Path)
         assert patch.status_code == 200
         assert stale.status_code == 412
         assert stale.json()["code"] == "project_etag_precondition_failed"
+
+
+def test_create_upload_discards_exact_file_when_transaction_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _workspace_archive()
+    with TestClient(_app(tmp_path)) as client:
+        project, etag = _create_project(client, _project_create(archive=archive))
+        store = client.app.state.core_control_provider.store
+        original = store._store_idempotency
+
+        def fail_create(operation_id, *args, **kwargs):
+            if operation_id == "createCoreWorkspaceUploadV1":
+                raise CoreControlStoreError("injected create rollback")
+            return original(operation_id, *args, **kwargs)
+
+        monkeypatch.setattr(store, "_store_idempotency", fail_create)
+        response = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "create-upload-rollback",
+                "If-Match": etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        assert response.status_code == 500
+        assert list((tmp_path / "core-control-v1" / "workspace-uploads").iterdir()) == []
+
+
+def test_finalize_discards_exact_snapshot_when_transaction_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _workspace_archive()
+    with TestClient(_app(tmp_path)) as client:
+        project, project_etag = _create_project(client, _project_create(archive=archive))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "begin-finalize-rollback",
+                "If-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-finalize-rollback",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+        store = client.app.state.core_control_provider.store
+        original = store._store_idempotency
+
+        def fail_finalize(operation_id, *args, **kwargs):
+            if operation_id == "finalizeCoreWorkspaceUploadV1":
+                raise CoreControlStoreError("injected finalize rollback")
+            return original(operation_id, *args, **kwargs)
+
+        monkeypatch.setattr(store, "_store_idempotency", fail_finalize)
+        response = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/finalize",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "finalize-rollback",
+                "If-Match": chunk.headers["etag"],
+                "If-Project-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "content_sha256": hashlib.sha256(archive).hexdigest(),
+            },
+        )
+        assert response.status_code == 500
+        assert list((tmp_path / "core-control-v1" / "workspace-snapshots").iterdir()) == []
+
+
+def test_project_delete_discards_owned_upload_and_workspace_snapshot(tmp_path: Path) -> None:
+    finalized = _finalize_workspace(tmp_path, _workspace_archive(), key_suffix="delete-owned")
+    project = finalized["project"]
+    with TestClient(_app(tmp_path)) as client:
+        deleted = client.delete(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "delete-owned-publication",
+                "If-Match": project["etag"],
+            },
+        )
+        assert deleted.status_code == 204, deleted.text
+        assert list((tmp_path / "core-control-v1" / "workspace-uploads").iterdir()) == []
+        assert list((tmp_path / "core-control-v1" / "workspace-snapshots").iterdir()) == []
+
+
+def test_aborted_upload_releases_reserved_managed_byte_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _workspace_archive()
+    monkeypatch.setattr(store_module, "_MAX_MANAGED_WORKSPACE_BYTES", len(archive))
+    with TestClient(_app(tmp_path)) as client:
+        first, first_etag = _create_project(
+            client, _project_create(archive=archive), idempotency_key="quota-project-first"
+        )
+        first_upload = client.post(
+            f"/v1/projects/{first['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "quota-upload-first",
+                "If-Match": first_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": first["current_project_snapshot"],
+                "archive": first["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        aborted = client.post(
+            f"/v1/projects/{first['id']}/workspace-uploads/{first_upload.json()['id']}/abort",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "quota-abort-first",
+                "If-Match": first_upload.headers["etag"],
+            },
+            json={"schema_version": "1", "reason": "release capacity"},
+        )
+        assert aborted.status_code == 200
+
+        second, second_etag = _create_project(
+            client, _project_create(archive=archive), idempotency_key="quota-project-second"
+        )
+        second_upload = client.post(
+            f"/v1/projects/{second['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "quota-upload-second",
+                "If-Match": second_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": second["current_project_snapshot"],
+                "archive": second["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        assert second_upload.status_code == 201, second_upload.text
 
 
 def test_workspace_chunk_handles_short_writes_before_advancing_offset(
@@ -1831,6 +1991,57 @@ def test_startup_binds_workspace_publication_to_an_upload_from_the_same_project(
         CoreControlStoreV1(tmp_path)
 
 
+def test_startup_rejects_shared_workspace_publication_regardless_of_project_order(
+    tmp_path: Path,
+) -> None:
+    archive = _workspace_archive()
+    payload = _project_create(archive=archive)
+    with TestClient(_app(tmp_path)) as client:
+        first_project, _ = _create_project(
+            client,
+            payload,
+            idempotency_key="create-publication-first-owner",
+        )
+    finalized = _finalize_workspace(tmp_path, archive, key_suffix="shared-owner")
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        signing_key = bytes(
+            connection.execute("SELECT value FROM metadata WHERE key = 'signing_key'").fetchone()[
+                0
+            ]
+        )
+        row = connection.execute(
+            "SELECT * FROM projects WHERE project_id = ?", (first_project["id"],)
+        ).fetchone()
+        assert row is not None
+        project = store_module._validate_bytes(store_module.m.ProjectV1, row["document_json"])
+        data = project.model_dump(mode="python", exclude={"etag", "current_project_snapshot"})
+        data.update(
+            current_workspace_snapshot=finalized["publication"]["workspace_snapshot"],
+            workspace_publication=finalized["publication"],
+        )
+        data["current_project_snapshot"] = store_module._snapshot(
+            signing_key,
+            store_module.m.SnapshotKind.PROJECT,
+            store_module._project_snapshot_payload(data),
+            project.current_project_snapshot.created_at,
+        )
+        damaged = store_module._model_with_etag(
+            store_module.m.ProjectV1,
+            data,
+            version=int(row["resource_version"]),
+        )
+        connection.execute(
+            "UPDATE projects SET document_json = ? WHERE project_id = ?",
+            (store_module._model_bytes(damaged), first_project["id"]),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="workspace publication.*owner"):
+        CoreControlStoreV1(tmp_path)
+
+
 @pytest.mark.parametrize("damage", ["cursor", "canonical_frame"])
 def test_startup_authenticates_event_cursor_and_canonical_frame(
     tmp_path: Path, damage: str
@@ -1893,6 +2104,95 @@ def test_live_store_rejects_database_hardlink_alias(tmp_path: Path) -> None:
         store.close()
 
 
+def test_sqlite_connection_remains_bound_to_authority_inode_during_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = CoreControlStoreV1(tmp_path)
+    authoritative_key = store._signing_key
+    store.close()
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    replacement = database.with_name("replacement.sqlite3")
+    displaced = database.with_name("authoritative.sqlite3")
+    shutil.copy2(database, replacement)
+    replacement_key = b"r" * 32
+    with sqlite3.connect(replacement) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'signing_key'",
+            (replacement_key,),
+        )
+
+    real_connect = store_module.sqlite3.connect
+    swapped = False
+
+    def swapping_connect(target, *args, **kwargs):
+        nonlocal swapped
+        target_text = os.fspath(target)
+        is_provider = target_text != ":memory:" and (
+            target_text.endswith("provider.sqlite3") or "/proc/self/fd/" in target_text
+        )
+        if not swapped and is_provider:
+            swapped = True
+            database.rename(displaced)
+            replacement.rename(database)
+            try:
+                connection = real_connect(target, *args, **kwargs)
+            finally:
+                database.rename(replacement)
+                displaced.rename(database)
+            return connection
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", swapping_connect)
+    reopened = CoreControlStoreV1(tmp_path)
+    try:
+        assert swapped
+        assert reopened._signing_key == authoritative_key
+        assert reopened._signing_key != replacement_key
+    finally:
+        reopened.close()
+
+
+def test_startup_metadata_is_length_guarded_and_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = CoreControlStoreV1(tmp_path)
+    store.close()
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("INSERT INTO metadata VALUES ('unknown', zeroblob(32))")
+
+    statements: list[str] = []
+    real_connect = store_module.sqlite3.connect
+
+    def traced_connect(target, *args, **kwargs):
+        connection = real_connect(target, *args, **kwargs)
+        if os.fspath(target) != ":memory:":
+            connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", traced_connect)
+    with pytest.raises(StoreCorruptionError, match="metadata"):
+        CoreControlStoreV1(tmp_path)
+    normalized = [" ".join(statement.lower().split()) for statement in statements]
+    assert not any(
+        statement == "select value from metadata where key = 'signing_key'"
+        for statement in normalized
+    )
+    assert any("length(cast(value as blob))" in statement for statement in normalized)
+
+
+def test_startup_length_guards_text_columns_before_recovery_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TestClient(_app(tmp_path)) as client:
+        _create_project(client, _project_create())
+
+    monkeypatch.setattr(store_module, "_MAX_STARTUP_VALUE_BYTES", 48)
+    with pytest.raises(StoreCorruptionError, match="projects recovery quota"):
+        CoreControlStoreV1(tmp_path)
+
+
 def test_startup_rejects_database_symlink_and_foreign_key_corruption(
     tmp_path: Path,
 ) -> None:
@@ -1934,11 +2234,27 @@ def test_startup_rejects_database_symlink_and_foreign_key_corruption(
     database.rename(displaced)
     database.symlink_to(displaced.name)
     try:
-        with pytest.raises(OSError):
+        with pytest.raises(CoreControlStoreError) as captured:
             CoreControlStoreV1(tmp_path)
+        assert str(database) not in str(captured.value)
     finally:
         database.unlink()
         displaced.rename(database)
+
+
+def test_startup_wraps_filesystem_errors_without_path_disclosure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_path = "/srv/private/core-control-state"
+
+    def fail_quota(*args, **kwargs):
+        del args, kwargs
+        raise OSError(private_path)
+
+    monkeypatch.setattr(store_module, "_verify_managed_disk_quota", fail_quota)
+    with pytest.raises(CoreControlStoreError) as captured:
+        CoreControlStoreV1(tmp_path)
+    assert private_path not in str(captured.value)
 
 
 def test_sync_store_work_does_not_block_health_on_the_asgi_event_loop(

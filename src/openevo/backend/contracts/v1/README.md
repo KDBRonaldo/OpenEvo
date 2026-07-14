@@ -68,8 +68,12 @@ canonical request and semantic headers and validate each operation's
 request/response relationship during replay and startup. Project validation
 constructs its framework profile from the persisted execution mode, capture
 mode, and harness ID. SQLite/workspace recovery is descriptor-bound and
-quota-limited, and synchronous store work runs on a bounded executor rather
-than the ASGI event loop.
+quota-limited across every persisted TEXT/BLOB value. The Linux provider opens
+SQLite through its held `/proc/self/fd` authority path and verifies the resolved
+managed path around connection setup. Workspace publication ownership is unique
+per project, and rollback/delete cleanup is no-follow and inode-bound.
+Synchronous store work runs on a bounded executor rather than the ASGI event
+loop.
 
 See `docs/architecture/desktop-core-contract-v1.md` for the product boundary and
 `docs/architecture/core-control-v1-provider.md` for implemented ownership. The
