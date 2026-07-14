@@ -129,6 +129,8 @@ class FakeHealthChecker:
         self.failed: set[str] = set()
         self.checked: list[str] = []
         self.block_service: str | None = None
+        self.block_entered = threading.Event()
+        self.cancellations: list[threading.Event | None] = []
 
     def wait_ready(
         self,
@@ -139,7 +141,9 @@ class FakeHealthChecker:
         cancellation=None,
     ) -> HealthCheckResult:
         self.checked.append(spec.service_id)
+        self.cancellations.append(cancellation)
         if self.block_service == spec.service_id:
+            self.block_entered.set()
             while time.monotonic() < deadline:
                 if cancellation is not None and cancellation.is_set():
                     return HealthCheckResult(ready=False, message="cancelled")
@@ -532,6 +536,42 @@ def test_log_snapshot_is_bounded_redacted_and_maps_to_frozen_contract(
         supervisor.close()
 
 
+def test_streaming_log_redaction_hides_fragmented_credentials_and_flushes_carry(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        _ensure_subscription(supervisor)
+        internal_identity = backend.spawned[0].internal_identity
+        assert internal_identity is not None
+        credential = internal_identity.credential
+        fragments = (credential[:11], credential[11:37], credential[37:])
+
+        backend.emit("gateway", f"Authorization: Bearer {fragments[0]}".encode())
+        for fragment in fragments[1:]:
+            backend.emit("gateway", fragment.encode())
+        backend.emit("rollout", f"Bearer {credential[:23]}".encode())
+        backend.crash("gateway", 19)
+        backend.crash("rollout", 20)
+
+        rendered = "\n".join(
+            entry.message
+            for service_id in ("gateway", "rollout")
+            for entry in supervisor.logs(service_id, limit=100)
+        )
+        ledger = (tmp_path / "core-services" / "ledger.json").read_text()
+        assert "<redacted>" in rendered
+        assert credential not in rendered
+        assert credential not in ledger
+        assert all(fragment not in rendered for fragment in fragments)
+        assert all(fragment not in ledger for fragment in fragments)
+        assert credential[:23] not in rendered
+        assert credential[:23] not in ledger
+    finally:
+        supervisor.close()
+
+
 def test_log_budget_is_global_across_all_services(
     tmp_path: Path,
     framework_lock: Path,
@@ -801,7 +841,14 @@ def test_cancel_interrupts_readiness_and_reaps_started_services(
         stop_timeout=0.05,
     )
     outcomes: list[object] = []
-    thread = threading.Thread(target=lambda: outcomes.append(_ensure_subscription(supervisor)))
+
+    def ensure() -> None:
+        try:
+            outcomes.append(_ensure_subscription(supervisor))
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    thread = threading.Thread(target=ensure)
     thread.start()
     deadline = time.monotonic() + 1
     while "rollout" not in health.checked:
@@ -815,6 +862,55 @@ def test_cancel_interrupts_readiness_and_reaps_started_services(
     assert time.monotonic() - started < 0.6
     assert not thread.is_alive()
     assert backend.terminated == ["rollout", "evolution-backend"]
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], SupervisorStateError)
+    assert str(outcomes[0]) == "service operation was cancelled"
+
+
+def test_cancel_interrupts_reused_generation_readiness_and_preserves_error(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    health = FakeHealthChecker()
+    supervisor, backend, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        health=health,
+        startup_timeout=0.4,
+        stop_timeout=0.02,
+    )
+    _ensure_subscription(supervisor)
+    original_generation = supervisor._ledger.generation_digest
+    health.block_service = "evolution-backend"
+    errors: list[BaseException] = []
+
+    def ensure_again() -> None:
+        try:
+            _ensure_subscription(supervisor)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=ensure_again)
+    thread.start()
+    assert health.block_entered.wait(timeout=1)
+    started = time.monotonic()
+    supervisor.cancel(total_timeout=0.2)
+    thread.join(timeout=1)
+
+    assert time.monotonic() - started < 0.25
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], SupervisorStateError)
+    assert str(errors[0]) == "service operation was cancelled"
+    assert health.cancellations[-1] is not None
+    assert health.cancellations[-1].is_set()
+    assert supervisor._ledger.generation_digest == original_generation
+    assert set(backend.terminated[-4:]) == {
+        "evolution-backend",
+        "rollout",
+        "gateway",
+        "evolution-worker",
+    }
 
 
 def test_symlinked_ledger_is_rejected_without_reading_target(

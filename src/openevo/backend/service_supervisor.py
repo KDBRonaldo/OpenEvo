@@ -682,6 +682,42 @@ class _TrackedProcess:
     identity: ProcessIdentity
 
 
+class _CredentialStreamRedactor:
+    """Redact one credential across arbitrary chunks with bounded carry."""
+
+    def __init__(self, credential: str) -> None:
+        self._credential = credential.encode("utf-8")
+        self._carry = b""
+
+    def feed(self, payload: bytes) -> bytes:
+        pending = self._carry + payload
+        self._carry = b""
+        output = bytearray()
+        while pending:
+            match = pending.find(self._credential)
+            if match >= 0:
+                output.extend(pending[:match])
+                output.extend(b"<redacted>")
+                pending = pending[match + len(self._credential) :]
+                continue
+            carry_size = min(len(pending), len(self._credential) - 1)
+            while carry_size > 0 and not self._credential.startswith(pending[-carry_size:]):
+                carry_size -= 1
+            if carry_size:
+                output.extend(pending[:-carry_size])
+                self._carry = pending[-carry_size:]
+            else:
+                output.extend(pending)
+            break
+        return bytes(output)
+
+    def flush(self) -> bytes:
+        if not self._carry:
+            return b""
+        self._carry = b""
+        return b"<redacted>"
+
+
 class RealSubprocessBackend:
     """Controlled process-group launcher with Linux PID birth identity."""
 
@@ -745,15 +781,16 @@ class RealSubprocessBackend:
         tracked = _TrackedProcess(process=process, identity=identity)
         with self._lock:
             self._tracked[identity.birth_token] = tracked
-        threading.Thread(
+        output_thread = threading.Thread(
             target=self._read_output,
             args=(tracked, on_output),
             name=f"openevo-log-{spec.service_id}",
             daemon=True,
-        ).start()
+        )
+        output_thread.start()
         threading.Thread(
             target=self._monitor,
-            args=(tracked, on_exit),
+            args=(tracked, output_thread, on_exit),
             name=f"openevo-monitor-{spec.service_id}",
             daemon=True,
         ).start()
@@ -849,9 +886,12 @@ class RealSubprocessBackend:
     @staticmethod
     def _monitor(
         tracked: _TrackedProcess,
+        output_thread: threading.Thread,
         on_exit: Callable[[ProcessIdentity, int], None],
     ) -> None:
-        on_exit(tracked.identity, tracked.process.wait())
+        returncode = tracked.process.wait()
+        output_thread.join()
+        on_exit(tracked.identity, returncode)
 
 
 class DefaultHealthChecker:
@@ -1196,6 +1236,9 @@ class CoreServiceSupervisor:
             self._max_log_bytes = max_log_bytes
             self._handles: dict[str, ProcessIdentity] = {}
             self._specs: dict[str, ServiceProcessSpec] = {}
+            self._output_redactors: dict[
+                tuple[str, str, ProcessIdentity], _CredentialStreamRedactor
+            ] = {}
             self._restart_results: dict[tuple[str, str], SupervisorServiceSummary] = {}
             self._active_plan_key: str | None = None
             self._active_credential: str | None = None
@@ -1275,8 +1318,10 @@ class CoreServiceSupervisor:
                     self._ledger.generation_digest,
                     tuple(self._specs.values()),
                     deadline,
+                    cancellation,
                 )
             ):
+                self._raise_if_cancelled(cancellation)
                 return self._group_snapshot()
             if not self._stop_all(deadline):
                 self._ledger.group_status_message = (
@@ -1289,6 +1334,10 @@ class CoreServiceSupervisor:
                 for service_id in ("evolution-backend", "rollout", "gateway"):
                     self._raise_if_cancelled(cancellation)
                     listeners[service_id] = self._port_probe.reserve("127.0.0.1")
+            except SupervisorStateError:
+                for listener in listeners.values():
+                    listener.close()
+                raise
             except Exception as exc:
                 for listener in listeners.values():
                     listener.close()
@@ -1390,6 +1439,7 @@ class CoreServiceSupervisor:
                         deadline,
                         cancellation,
                     )
+                    self._raise_if_cancelled(cancellation)
                     if not health.ready or not self._process_backend.is_alive(identity):
                         code = (
                             "service_readiness_timeout"
@@ -1778,6 +1828,7 @@ class CoreServiceSupervisor:
         generation_digest: str,
         specs: Sequence[ServiceProcessSpec],
         deadline: float,
+        cancellation: threading.Event,
     ) -> bool:
         if (
             self._ledger.execution_mode is not execution_mode
@@ -1803,7 +1854,9 @@ class CoreServiceSupervisor:
                 identity,
                 self._process_backend,
                 deadline,
+                cancellation,
             )
+            self._raise_if_cancelled(cancellation)
             if not health.ready or not self._process_backend.is_alive(identity):
                 self._fail_record(
                     spec.service_id,
@@ -1880,7 +1933,10 @@ class CoreServiceSupervisor:
         preserve_failure: bool = False,
     ) -> None:
         record = self._record(service_id)
-        identity = self._handles.pop(service_id, None)
+        identity = self._handles.get(service_id)
+        if identity is not None and self._ledger.generation_digest is not None:
+            self._flush_output(service_id, self._ledger.generation_digest, identity)
+        self._handles.pop(service_id, None)
         prior_error = (record.error_code, record.status_message)
         if identity is not None and self._process_backend.is_alive(identity):
             try:
@@ -1929,11 +1985,38 @@ class CoreServiceSupervisor:
                 or self._handles.get(service_id) != identity
             ):
                 return
-            decoded = payload[:65_536].decode("utf-8", errors="replace")
-            lines = decoded.splitlines() or [decoded]
-            for line in lines:
-                self._append_log(service_id, "info", line)
+            credential = self._active_credential
+            if credential is None:
+                return
+            key = (service_id, generation_digest, identity)
+            redactor = self._output_redactors.get(key)
+            if redactor is None:
+                redactor = _CredentialStreamRedactor(credential)
+                self._output_redactors[key] = redactor
+            redacted = redactor.feed(payload[:65_536])
+            self._append_output_payload(service_id, redacted)
             self._persist()
+
+    def _append_output_payload(self, service_id: str, payload: bytes) -> None:
+        if not payload:
+            return
+        decoded = payload.decode("utf-8", errors="replace")
+        lines = decoded.splitlines() or [decoded]
+        for line in lines:
+            self._append_log(service_id, "info", line)
+
+    def _flush_output(
+        self,
+        service_id: str,
+        generation_digest: str,
+        identity: ProcessIdentity,
+    ) -> None:
+        redactor = self._output_redactors.pop(
+            (service_id, generation_digest, identity),
+            None,
+        )
+        if redactor is not None:
+            self._append_output_payload(service_id, redactor.flush())
 
     def _record_exit(
         self,
@@ -1952,6 +2035,7 @@ class CoreServiceSupervisor:
             record = self._record_or_none(service_id)
             if record is None or not self._record_matches_identity(record, identity):
                 return
+            self._flush_output(service_id, generation_digest, identity)
             record.status = ServiceStatus.FAILED
             record.error_code = "service_process_exited"
             record.status_message = f"Managed process exited with status {returncode}."

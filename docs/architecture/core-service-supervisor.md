@@ -69,7 +69,12 @@ Durable output filtering treats JSON as a closed diagnostic object. Known
 credential, authorization, cookie, API key, token, password, private-key, and
 AWS-secret fields are redacted; values under unknown structured fields are not
 persisted. Header, environment, JSON, URL, and key-value forms receive the same
-filter before bounded storage.
+filter before bounded storage. The active generation credential additionally
+uses a per-process streaming redactor. It carries at most `len(credential) - 1`
+bytes across arbitrary stdout/stderr chunks, emits only a redaction marker
+for a complete credential, and redacts a residual credential prefix when the
+process exits or is stopped. A credential split across two or more chunks
+therefore cannot be reconstructed from ledger or log entries.
 
 The real subprocess backend starts a dedicated session/process group and binds
 the leader PID to `/proc` start ticks, uid, exact cmdline digest, SID, PGID, and
@@ -157,10 +162,13 @@ generation. Child exits are monitored and persisted as failures. `close` and
 `cancel` share one total deadline, send `SIGTERM`, escalate owned children to
 `SIGKILL`, and do not signal unverified recovery groups. Ensure/restart publish a cancellation
 token before invoking probes or readiness; `cancel` sets it without waiting for
-the lifecycle mutex, and command/HTTP probes poll it with a short bound before
-the sole owner performs rollback. If an injected backend still proves a child
-live after escalation, close fails and retains host-global ownership; it does
-not admit a replacement supervisor beside an unkillable child.
+the lifecycle mutex. Initial startup and existing-generation health checks receive
+that same token, and cancellation remains the typed `service operation was
+cancelled` error instead of being wrapped as listener or health failure. Command
+and HTTP probes poll it with a short bound before the sole owner performs rollback.
+If an injected backend still proves a child live after escalation, close fails
+and retains host-global ownership; it does not admit a replacement supervisor
+beside an unkillable child.
 
 ## Service Availability Versus Run Readiness
 
@@ -176,6 +184,24 @@ dispatch. Evolution outputs apply only to a later session after the revision
 contract commits. Provider injection, tunnel-only transport, durable operation
 records, and the run-owner admission path remain explicit downstream
 dependencies; this branch does not fabricate run success while they are absent.
+
+Internal bearer authentication is not run admission. In a release-owned service
+generation, `POST /rollout/task/submit` and both forms of gateway `POST /sessions`
+must also pass an injected `GenerationBoundRunAdmissionVerifier`. The verifier's
+closed check contains only operation, generation/registry/framework-lock digests,
+task/session identity, and the SHA-256 digest of the canonical validated payload.
+It does not receive the credential, raw instruction, runtime, environment, or an
+open request object. Request fields such as `run_ready` or `admission` have no
+authority and are excluded by validation before the canonical digest is built.
+
+There is no production verifier in this slice. Release-owned submissions
+therefore return HTTP 503 with typed code
+`run_admission_authority_unavailable` before manager dispatch or session
+registration. A later provider/run owner may inject the async verifier only after
+it can validate that exact generation-bound payload against its authoritative
+admission pin. Verifier failures remain closed typed errors; they never fall back
+to the service snapshot's `run_ready` field, legacy context, or caller-provided
+instruction/runtime data.
 
 ## Self-Deployed Boundary
 

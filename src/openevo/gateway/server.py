@@ -45,11 +45,14 @@ from openevo.rollout.models import SessionDispatchRequest, SessionDispatchRespon
 from openevo.trajectory.registry import default_builder_registry, default_evaluator_registry
 from openevo.evolution.client import EvolutionClient
 from openevo.internal_auth import (
+    GenerationBoundRunAdmissionVerifier,
     InternalServiceIdentity,
+    RunAdmissionOperation,
     health_identity_payload,
     inherited_listen_fd,
     install_internal_auth,
     read_internal_service_identity,
+    require_generation_bound_run_admission,
 )
 
 logging.basicConfig(
@@ -78,6 +81,7 @@ _state: GatewayState | None = None
 _configured_topology_path: str | None = None
 _configured_node_id: str | None = None
 _internal_identity: InternalServiceIdentity | None = None
+_run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None
 
 
 def configure_server(
@@ -85,11 +89,14 @@ def configure_server(
     *,
     node_id: str | None = None,
     internal_identity: InternalServiceIdentity | None = None,
+    run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None,
 ) -> None:
-    global _configured_topology_path, _configured_node_id, _internal_identity, _state
+    global _configured_topology_path, _configured_node_id
+    global _internal_identity, _run_admission_verifier, _state
     _configured_topology_path = topology_path
     _configured_node_id = node_id
     _internal_identity = internal_identity
+    _run_admission_verifier = run_admission_verifier
     _state = None
 
 
@@ -578,13 +585,21 @@ async def stream_events(request: Request):
 
 @app.post("/sessions", response_model=SessionCreateResponse | SessionDispatchResponse)
 async def create_session(request: Request):
-    state = get_state()
     try:
         body = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if "agent" in body and "session_id" in body:
         dispatch_request = SessionDispatchRequest.model_validate(body)
+        await require_generation_bound_run_admission(
+            identity=_internal_identity,
+            verifier=_run_admission_verifier,
+            operation=RunAdmissionOperation.GATEWAY_SESSION_DISPATCH,
+            payload=dispatch_request.model_dump(mode="json"),
+            task_id=dispatch_request.task_id,
+            session_id=dispatch_request.session_id,
+        )
+        state = get_state()
         try:
             await state.node_manager.dispatch(dispatch_request)
         except ValueError as exc:
@@ -603,6 +618,16 @@ async def create_session(request: Request):
         session_id = clean_session_id(create_request.session_id) or generate_session_id()
     except InvalidSessionIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    effective_request = create_request.model_copy(update={"session_id": session_id})
+    await require_generation_bound_run_admission(
+        identity=_internal_identity,
+        verifier=_run_admission_verifier,
+        operation=RunAdmissionOperation.GATEWAY_SESSION_CREATE,
+        payload=effective_request.model_dump(mode="json"),
+        task_id=create_request.task_id,
+        session_id=session_id,
+    )
+    state = get_state()
 
     info = state.session_registry.register(
         session_id,

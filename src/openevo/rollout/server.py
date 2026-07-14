@@ -25,12 +25,15 @@ from openevo.rollout.models import (
 )
 from openevo.rollout.pipeline import Pipeline
 from openevo.internal_auth import (
+    GenerationBoundRunAdmissionVerifier,
     INTERNAL_SERVICE_HEADER,
     InternalServiceIdentity,
+    RunAdmissionOperation,
     health_identity_payload,
     inherited_listen_fd,
     install_internal_auth,
     read_internal_service_identity,
+    require_generation_bound_run_admission,
 )
 
 logging.basicConfig(
@@ -56,16 +59,19 @@ class RolloutState:
 _state: RolloutState | None = None
 _configured_topology_path: str | None = None
 _internal_identity: InternalServiceIdentity | None = None
+_run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None
 
 
 def configure_server(
     topology_path: str = "topology.yaml",
     *,
     internal_identity: InternalServiceIdentity | None = None,
+    run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None,
 ) -> None:
-    global _configured_topology_path, _internal_identity, _state
+    global _configured_topology_path, _internal_identity, _run_admission_verifier, _state
     _configured_topology_path = topology_path
     _internal_identity = internal_identity
+    _run_admission_verifier = run_admission_verifier
     _state = None
 
 
@@ -149,6 +155,14 @@ async def submit_task_async(request: TaskRequest):
 
     Poll ``GET /rollout/task/{task_id}`` until status becomes terminal.
     """
+    await require_generation_bound_run_admission(
+        identity=_internal_identity,
+        verifier=_run_admission_verifier,
+        operation=RunAdmissionOperation.ROLLOUT_TASK_SUBMIT,
+        payload=request.model_dump(mode="json"),
+        task_id=request.task_id,
+        session_id=None,
+    )
     state = get_state()
     try:
         task_id = await state.manager.submit_task(request)

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 import hashlib
 import hmac
 import json
 import os
 import re
 import stat
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -30,6 +31,59 @@ _SERVICE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 
 class InternalAuthError(RuntimeError):
     """The inherited internal-service identity is missing or malformed."""
+
+
+class RunAdmissionOperation(StrEnum):
+    ROLLOUT_TASK_SUBMIT = "rollout_task_submit"
+    GATEWAY_SESSION_CREATE = "gateway_session_create"
+    GATEWAY_SESSION_DISPATCH = "gateway_session_dispatch"
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationBoundRunAdmissionCheck:
+    """Closed identity passed to the future Core run-owner verifier."""
+
+    operation: RunAdmissionOperation
+    generation_digest: str
+    registry_digest: str
+    framework_lock_digest: str
+    payload_sha256: str
+    task_id: str | None
+    session_id: str | None
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.generation_digest, "generation_digest"),
+            (self.registry_digest, "registry_digest"),
+            (self.framework_lock_digest, "framework_lock_digest"),
+            (self.payload_sha256, "payload_sha256"),
+        ):
+            if _DIGEST_RE.fullmatch(value) is None:
+                raise ValueError(f"run admission {label} is invalid")
+        for value, label in ((self.task_id, "task_id"), (self.session_id, "session_id")):
+            if value is not None and (not value or len(value.encode("utf-8")) > 256):
+                raise ValueError(f"run admission {label} is invalid")
+
+
+class GenerationBoundRunAdmissionVerifier(Protocol):
+    """Trusted run-owner interface; successful return authorizes one exact payload."""
+
+    async def verify(self, check: GenerationBoundRunAdmissionCheck) -> None: ...
+
+
+class RunAdmissionError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status_code: int,
+        retryable: bool,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+        self.retryable = retryable
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +245,20 @@ def install_internal_auth(
 
     is_protected = protected_path or (lambda _path: True)
 
+    @app.exception_handler(RunAdmissionError)
+    async def run_admission_error_handler(_request: Request, exc: RunAdmissionError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": {
+                    "code": exc.code,
+                    "message": str(exc),
+                    "retryable": exc.retryable,
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.middleware("http")
     async def authenticate_internal_request(request: Request, call_next):
         identity = identity_getter()
@@ -202,6 +270,63 @@ def install_internal_auth(
                     headers={"Cache-Control": "no-store"},
                 )
         return await call_next(request)
+
+
+async def require_generation_bound_run_admission(
+    *,
+    identity: InternalServiceIdentity | None,
+    verifier: GenerationBoundRunAdmissionVerifier | None,
+    operation: RunAdmissionOperation,
+    payload: Mapping[str, object],
+    task_id: str | None,
+    session_id: str | None,
+) -> None:
+    """Authorize an exact release-owned payload without trusting request proof fields."""
+
+    if identity is None:
+        return
+    if verifier is None:
+        raise RunAdmissionError(
+            "run_admission_authority_unavailable",
+            "Core run admission authority is unavailable for this service generation.",
+            status_code=503,
+            retryable=True,
+        )
+    try:
+        canonical_payload = json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        check = GenerationBoundRunAdmissionCheck(
+            operation=operation,
+            generation_digest=identity.generation_digest,
+            registry_digest=identity.registry_digest,
+            framework_lock_digest=identity.framework_lock_digest,
+            payload_sha256=hashlib.sha256(canonical_payload).hexdigest(),
+            task_id=task_id,
+            session_id=session_id,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RunAdmissionError(
+            "run_admission_request_invalid",
+            "The release run request cannot be bound to a closed admission identity.",
+            status_code=400,
+            retryable=False,
+        ) from exc
+    try:
+        await verifier.verify(check)
+    except RunAdmissionError:
+        raise
+    except Exception as exc:
+        raise RunAdmissionError(
+            "run_admission_verification_failed",
+            "Core run admission authority could not verify this request.",
+            status_code=503,
+            retryable=True,
+        ) from exc
 
 
 def inherited_listen_fd() -> int | None:
@@ -257,11 +382,16 @@ __all__ = [
     "INTERNAL_LISTEN_FD_ENV",
     "INTERNAL_OWNERSHIP_ENV",
     "INTERNAL_SERVICE_HEADER",
+    "GenerationBoundRunAdmissionCheck",
+    "GenerationBoundRunAdmissionVerifier",
     "InternalAuthError",
     "InternalServiceIdentity",
+    "RunAdmissionError",
+    "RunAdmissionOperation",
     "health_identity_payload",
     "inherited_listen_fd",
     "install_internal_auth",
     "read_internal_service_identity",
+    "require_generation_bound_run_admission",
     "verified_private_file_sha256",
 ]
