@@ -151,7 +151,6 @@ GET    /desktop/v1/artifacts/{artifact_id}/diff
 
 GET    /desktop/v1/services
 POST   /desktop/v1/services/{service_id}/restart
-POST   /desktop/v1/services/{service_id}/stop
 GET    /desktop/v1/services/{service_id}/logs
 POST   /desktop/v1/diagnostics
 GET    /desktop/v1/diagnostics/{diagnostic_id}
@@ -160,14 +159,18 @@ POST   /desktop/v1/maintenance/cache-cleanup
 GET    /desktop/v1/events
 ```
 
-Bootstrap, workspace sync, connection, repair, diagnostics, and other long
-actions return HTTP 202 with `LocalOperationV1`; the UI observes them through
-operation snapshots and events. HTTP requests do not remain open for the life
-of those operations.
+Only sidecar-owned connection, host-key, bootstrap, repair, activation, and
+workspace-sync actions return `LocalOperationV1`. Core-owned runs, service
+actions, diagnostics, and cleanup resources retain their Core v1 response
+shape after strict sidecar validation. The sidecar does not synthesize remote
+progress or replace authoritative Core state with a local operation.
 
 Local profile responses expose an authentication kind and an opaque native
 credential slot status, never a credential reference or secret. Network proxy
 URLs must not contain user information; proxy credentials use native slots.
+An optional `hugging_face_token` slot supports gated self-deployed models. It is
+read from macOS Keychain only for the bounded remote model-preparation action
+and is never returned to React or stored in project/Core configuration.
 Profile creation defaults an omitted port to `22`, authentication kind to
 `ssh_agent`, and proxy configuration to an empty proxy. Execution settings
 default omitted capture fields to `capture_mode="transcript"` and
@@ -195,11 +198,75 @@ Backend and bootstrap reports are normalized into typed checks, progress, and
 user-safe logs. Raw commands, stdout/stderr blobs, PIDs, and remote paths are
 not renderer contracts.
 
+Task input contains only the ordinary-user title and objective. A project
+source is either a new scratch workspace or a native-folder snapshot. For the
+latter, React invokes the Tauri native picker; the host creates the canonical
+archive in private storage, hands it to the sidecar, and returns only
+`WorkspaceImportRefV1 {import_id, content_sha256, byte_size, entry_count,
+extracted_byte_size}`.
+Neither the picker result nor the Local API contains a host path. Project
+creation and workspace sync resolve that opaque import inside the sidecar and
+then use the Core workspace-upload protocol.
+
+`POST /desktop/v1/projects/{project_id}/validate` has no renderer-authored
+body. `POST /desktop/v1/runs` accepts only `{project_id}`. Both require the
+saved local project ETag through `If-Match` and an idempotency key. For every
+attempt the sidecar reads the saved project, requires that project's active
+SSH tunnel, fetches the current Core project snapshots, verified capabilities,
+revision head, and model readiness, calls Core validation, and only then
+constructs the Core run-admission request. React never creates or caches an
+authoritative snapshot, registry digest, or required revision reference.
+
+Capability responses wrap the complete framework-owned
+`EvolutionCapabilitiesV1`; they preserve `supported`, `unsupported`, and
+`unavailable`, the evaluated profile, accepted methods, selection resolvers,
+identity digests, canonical config JSON, defaults, and all support axes. The
+sidecar has no reduced method table. Project responses expose typed remote
+model preparation and active-revision state rather than asking React to infer
+them.
+
+Local SSE carries Desktop state changes and resource invalidations. Every
+resource invalidation includes the authoritative ETag or content digest and
+an explicit `desktop` or `core` authority, and causes the renderer to reload
+the corresponding snapshot. Core project changes are first mapped into the
+sidecar-owned composite project and therefore invalidate its Local project
+ETag. Timeline, log,
+artifact, run, service, and diagnostic payloads are never reconstructed from
+partial events by the sidecar.
+
 `DesktopStateV1.core.state` is the renderer's authoritative remote connection
 phase: `disconnected`, `connecting`, `host_key_review`, `checking`,
 `bootstrapping`, `core_starting`, `online`, `degraded`, `reconnecting`, or
 `offline`. Native process startup phases remain Tauri-local and are mapped into
 the same renderer state machine; the renderer does not infer remote progress.
+
+### Sidecar Mapping
+
+The adapter between the two v1 contracts is deterministic and fail closed:
+
+| Local intent | Core authority used by the sidecar |
+| --- | --- |
+| Project name, task, execution, and `evolution.targets` | Core project create/patch; unknown method config is preserved byte-for-byte after canonical validation. |
+| `codex_subscription_transcript` | Codex harness, transcript capture, no token metrics, and the user-selected Codex model. |
+| `self-deployed` with `hf_model` | Self-deployed harness profile and the same bounded Hugging Face model reference; readiness comes from Core model preparation. |
+| Scratch source | Core creates its signed empty workspace snapshot. |
+| Native-folder `import_id` | Sidecar resolves the private canonical archive and completes the Core upload session; React never handles archive bytes. |
+| Validate current project | Sidecar fetches current Core project refs and verified capabilities, then submits Core project validation. |
+| Run current project | Sidecar fetches the active head and any reachable successor, selects the exact Core-required revision, validates, and submits Core run creation. |
+| Core SSE change | Sidecar validates the complete Core event, updates its remote snapshot cache, and emits only an ETag/digest-bound Local invalidation. |
+
+Missing tunnel, contract mismatch, stale Local ETag, unavailable registry,
+invalid project config, incomplete workspace upload, unprepared model, or a
+non-reachable revision produces a typed blocking error. None of these cases may
+fall back to an SSH run command, cached capability table, or renderer-generated
+reference.
+
+Required-revision selection is fixed: if Core reports a reachable queued or
+preparing successor for the active head, the new task requires that successor
+and remains queued until Core activates it. Otherwise it requires the current
+active head. Desktop never skips a pending valid successor to start against
+stale context, and it never treats failed or cancelled materialization as an
+admissible revision.
 
 ## Core Control API v1
 

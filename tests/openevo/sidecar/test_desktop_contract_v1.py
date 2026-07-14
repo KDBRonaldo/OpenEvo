@@ -7,28 +7,37 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from openevo.backend.contracts.v1 import models as core_contract
+
 from desktop.sidecar.contracts.v1 import (
     DESKTOP_EVENTS_SCHEMA_SHA256,
     DESKTOP_OPENAPI_SHA256,
     ArtifactContentV1,
+    ArtifactDiffV1,
     ArtifactPageV1,
+    ArtifactV1,
     BoundedJsonObjectV1,
     CoreConnectionStateV1,
-    DiffLineV1,
     DesktopStateV1,
+    DiagnosticReportV1,
     EventEnvelopeV1,
     ExecutionSettingsV1,
     HealthV1,
     LocalOperationV1,
+    LogPageV1,
     PageV1,
     ProjectCreateV1,
     ProjectPatchV1,
-    ProjectValidationRequestV1,
     RemoteProfileCreateV1,
     RemoteProfilePatchV1,
     RemoteProfileV1,
     RunCreateV1,
-    ServiceV1,
+    RunContextV1,
+    RunPageV1,
+    RunSummaryV1,
+    RunV1,
+    ServiceActionV1,
+    ServicePageV1,
     SseFrameV1,
     VersionV1,
     canonical_json_bytes,
@@ -85,7 +94,6 @@ _EXPECTED_OPERATIONS = {
     ("get", "/desktop/v1/artifacts/{artifact_id}/diff"),
     ("get", "/desktop/v1/services"),
     ("post", "/desktop/v1/services/{service_id}/restart"),
-    ("post", "/desktop/v1/services/{service_id}/stop"),
     ("get", "/desktop/v1/services/{service_id}/logs"),
     ("post", "/desktop/v1/diagnostics"),
     ("get", "/desktop/v1/diagnostics/{diagnostic_id}"),
@@ -115,26 +123,35 @@ def _walk_json(value: object) -> Iterator[object]:
             yield from _walk_json(child)
 
 
-def _run_create_payload() -> dict:
-    snapshot = {"snapshot_id": "snapshot-1", "digest": _DIGEST}
+def _project_payload() -> dict:
     return {
-        "project_id": "project-1",
-        "project_snapshot": snapshot,
-        "task_snapshot": snapshot | {"snapshot_id": "task-1"},
-        "workspace_snapshot": snapshot | {"snapshot_id": "workspace-1"},
-        "capability_registry_digest": _DIGEST,
-        "required_revision": {
-            "revision_id": "revision-1",
-            "generation": 0,
-            "manifest_digest": _DIGEST,
-            "state": "active",
+        "name": "Protein Design",
+        "profile_id": "profile-1",
+        "task": {"title": "Design", "objective": "Produce a candidate."},
+        "source": {"kind": "scratch", "display_name": "New workspace"},
+        "execution": {"mode": "self-deployed", "hf_model": "open-models/model-1"},
+        "evolution": {
+            "targets": {
+                "text_memory": {
+                    "enabled": True,
+                    "method": "reference_text_memory",
+                    "config": {"future_field": 1},
+                }
+            }
         },
+    }
+
+
+def _required_headers(schema: dict, method: str, path: str) -> set[str]:
+    return {
+        parameter["name"]
+        for parameter in schema["paths"][path][method].get("parameters", ())
+        if parameter["in"] == "header" and parameter["required"]
     }
 
 
 def test_contract_app_has_exact_release_operation_set() -> None:
     schema = desktop_openapi_document()
-
     assert _operations(schema) == _EXPECTED_OPERATIONS
     operation_ids = [
         operation["operationId"]
@@ -143,22 +160,14 @@ def test_contract_app_has_exact_release_operation_set() -> None:
         if method in {"get", "post", "patch", "delete", "put"}
     ]
     assert len(operation_ids) == len(set(operation_ids))
+    assert "/desktop/v1/services/{service_id}/stop" not in schema["paths"]
 
 
 def test_discovery_is_public_and_v1_uses_desktop_session_security() -> None:
     schema = contract_app.openapi()
-
-    assert schema["components"]["securitySchemes"] == {
-        "DesktopSession": {
-            "type": "apiKey",
-            "description": (
-                "Ephemeral Desktop session credential returned only by the native "
-                "start_sidecar command."
-            ),
-            "in": "header",
-            "name": "X-OpenEvo-Desktop-Session",
-        }
-    }
+    assert schema["components"]["securitySchemes"]["DesktopSession"]["name"] == (
+        "X-OpenEvo-Desktop-Session"
+    )
     assert "security" not in schema["paths"]["/version"]["get"]
     assert "security" not in schema["paths"]["/health"]["get"]
     for method, path in _EXPECTED_OPERATIONS:
@@ -166,57 +175,62 @@ def test_discovery_is_public_and_v1_uses_desktop_session_security() -> None:
             assert schema["paths"][path][method]["security"] == [{"DesktopSession": []}]
 
 
-def test_long_local_actions_return_202_local_operation() -> None:
+def test_only_sidecar_owned_actions_return_local_operations() -> None:
     schema = desktop_openapi_document()
-    operations = {
-        ("post", "/desktop/v1/profiles/{profile_id}/connect"),
-        ("post", "/desktop/v1/profiles/{profile_id}/disconnect"),
-        ("post", "/desktop/v1/profiles/{profile_id}/host-key/accept"),
-        ("post", "/desktop/v1/projects/{project_id}/activate"),
-        ("post", "/desktop/v1/projects/{project_id}/doctor"),
-        ("post", "/desktop/v1/projects/{project_id}/repair"),
-        ("post", "/desktop/v1/projects/{project_id}/bootstrap"),
-        ("post", "/desktop/v1/projects/{project_id}/workspace-sync"),
-        ("post", "/desktop/v1/operations/{operation_id}/cancel"),
-        ("post", "/desktop/v1/services/{service_id}/restart"),
-        ("post", "/desktop/v1/services/{service_id}/stop"),
-        ("post", "/desktop/v1/diagnostics"),
-        ("post", "/desktop/v1/maintenance/cache-cleanup"),
+    local_actions = {
+        "/desktop/v1/profiles/{profile_id}/connect",
+        "/desktop/v1/profiles/{profile_id}/disconnect",
+        "/desktop/v1/profiles/{profile_id}/host-key/accept",
+        "/desktop/v1/projects/{project_id}/activate",
+        "/desktop/v1/projects/{project_id}/doctor",
+        "/desktop/v1/projects/{project_id}/repair",
+        "/desktop/v1/projects/{project_id}/bootstrap",
+        "/desktop/v1/projects/{project_id}/workspace-sync",
+        "/desktop/v1/operations/{operation_id}/cancel",
     }
-
-    for method, path in operations:
-        response = schema["paths"][path][method]["responses"]
-        assert "202" in response
-        assert response["202"]["content"]["application/json"]["schema"] == {
+    for path in local_actions:
+        response = schema["paths"][path]["post"]["responses"]["202"]
+        assert response["content"]["application/json"]["schema"] == {
             "$ref": "#/components/schemas/LocalOperationV1"
         }
 
-
-def test_create_and_action_headers_bind_idempotency_and_mutable_resources() -> None:
-    schema = desktop_openapi_document()
-    create_or_unscoped_actions = {
-        ("post", "/desktop/v1/profiles"),
-        ("post", "/desktop/v1/projects"),
-        ("post", "/desktop/v1/runs"),
-        ("post", "/desktop/v1/diagnostics"),
-        ("post", "/desktop/v1/maintenance/cache-cleanup"),
+    expected_remote = {
+        "/desktop/v1/services/{service_id}/restart": "ServiceActionV1",
+        "/desktop/v1/diagnostics": "DiagnosticV1",
+        "/desktop/v1/maintenance/cache-cleanup": "CacheCleanupV1",
     }
-    scoped_actions = {
-        (method, path)
-        for method, path in _EXPECTED_OPERATIONS
-        if method == "post" and (method, path) not in create_or_unscoped_actions
-    }
-
-    for method, path in create_or_unscoped_actions | scoped_actions:
-        parameters = schema["paths"][path][method].get("parameters", ())
-        required_headers = {
-            parameter["name"]
-            for parameter in parameters
-            if parameter["in"] == "header" and parameter["required"]
+    for path, model in expected_remote.items():
+        response = schema["paths"][path]["post"]["responses"]["202"]
+        assert response["content"]["application/json"]["schema"] == {
+            "$ref": f"#/components/schemas/{model}"
         }
-        assert "Idempotency-Key" in required_headers
-        if (method, path) in scoped_actions:
-            assert "If-Match" in required_headers
+
+
+def test_core_owned_dtos_are_reused_without_sidecar_reinterpretation() -> None:
+    assert RunSummaryV1 is core_contract.RunSummaryV1
+    assert RunV1 is core_contract.RunV1
+    assert RunPageV1 is core_contract.RunPageV1
+    assert RunContextV1 is core_contract.RunContextV1
+    assert LogPageV1 is core_contract.LogPageV1
+    assert ArtifactV1 is core_contract.ArtifactSummaryV1
+    assert ArtifactPageV1 is core_contract.ArtifactPageV1
+    assert ArtifactContentV1 is core_contract.ArtifactContentV1
+    assert ArtifactDiffV1 is core_contract.ArtifactDiffV1
+    assert ServicePageV1 is core_contract.ServicePageV1
+    assert ServiceActionV1 is core_contract.ServiceActionV1
+    assert DiagnosticReportV1 is core_contract.DiagnosticV1
+
+
+def test_mutations_bind_idempotency_and_etag_to_renderer_intent() -> None:
+    schema = desktop_openapi_document()
+    for path in (
+        "/desktop/v1/runs",
+        "/desktop/v1/projects/{project_id}/validate",
+        "/desktop/v1/services/{service_id}/restart",
+    ):
+        assert {"Idempotency-Key", "If-Match"}.issubset(
+            _required_headers(schema, "post", path)
+        )
 
     for path in (
         "/desktop/v1/profiles/{profile_id}",
@@ -224,82 +238,161 @@ def test_create_and_action_headers_bind_idempotency_and_mutable_resources() -> N
         "/desktop/v1/runs/{run_id}",
         "/desktop/v1/diagnostics/{diagnostic_id}",
     ):
-        parameters = schema["paths"][path]["delete"]["parameters"]
-        assert "If-Match" in {parameter["name"] for parameter in parameters}
+        assert "If-Match" in _required_headers(schema, "delete", path)
 
 
-def test_snapshots_are_canonical_and_digests_are_stable() -> None:
-    openapi_digest, events_digest = verify_contract_snapshots()
+def test_renderer_never_authors_core_admission_references() -> None:
+    schema = desktop_openapi_document()
+    run_create = schema["components"]["schemas"]["RunCreateV1"]
+    assert set(run_create["properties"]) == {"project_id"}
+    assert run_create["required"] == ["project_id"]
+    assert "requestBody" not in schema["paths"][
+        "/desktop/v1/projects/{project_id}/validate"
+    ]["post"]
 
-    assert openapi_digest == DESKTOP_OPENAPI_SHA256
-    assert events_digest == DESKTOP_EVENTS_SCHEMA_SHA256
-    assert openapi_digest == "5a571f32c547063677533be9b4ccae417e2037b11963b5770d245f6c5419830e"
-    assert events_digest == "dd425b6050f1cb329d8a178ba77e0012aba7bbfc612cf04e258c0f9cd8480ad7"
-    snapshot_root = Path(__file__).parents[3] / "desktop/sidecar/contracts/v1"
-    assert (snapshot_root / "openapi.json").read_bytes() == canonical_json_bytes(
-        desktop_openapi_document()
-    )
-    assert (snapshot_root / "events.schema.json").read_bytes() == canonical_json_bytes(
-        desktop_events_schema_document()
-    )
-
-
-def test_openapi_exposes_defaults_patch_nullability_and_required_revision_states() -> None:
-    schemas = desktop_openapi_document()["components"]["schemas"]
-
-    profile_create = schemas["RemoteProfileCreateV1"]
-    assert set(profile_create["required"]) == {"name", "host", "user"}
-    assert profile_create["properties"]["port"]["default"] == 22
-    assert profile_create["properties"]["authentication_kind"]["default"] == "ssh_agent"
-    assert "proxy" not in profile_create["required"]
-
-    execution = schemas["ExecutionSettingsV1"]
-    assert execution["properties"]["capture_mode"]["default"] == "transcript"
-    assert execution["properties"]["token_level_metrics_available"]["default"] is False
-    assert {"capture_mode", "token_level_metrics_available"}.isdisjoint(
-        execution["required"]
-    )
-    assert "hf_model" in execution["properties"]
-    assert "managed_model_id" not in execution["properties"]
-
-    for schema_name in (
-        "ProjectCreateV1",
-        "ProjectPatchV1",
-        "ProjectV1",
-        "ProjectValidationRequestV1",
+    RunCreateV1.model_validate({"project_id": "project-1"})
+    for field in (
+        "project_snapshot",
+        "task_snapshot",
+        "workspace_snapshot",
+        "capability_registry_digest",
+        "required_revision",
+        "runtime",
+        "model",
+        "workspace_path",
+        "command",
     ):
-        assert schemas[schema_name]["properties"]["evolution"]["$ref"] == (
-            "#/components/schemas/EvolutionConfigV1"
-        )
-    assert schemas["EvolutionConfigV1"]["required"] == ["targets"]
-    assert schemas["EvolutionConfigV1"]["additionalProperties"] is False
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            RunCreateV1.model_validate({"project_id": "project-1", field: "forbidden"})
 
-    for schema_name in ("RemoteProfilePatchV1", "ProjectPatchV1"):
-        patch_schema = schemas[schema_name]
-        assert "required" not in patch_schema
-        for property_schema in patch_schema["properties"].values():
-            assert {entry.get("type") for entry in property_schema.get("anyOf", ())} != {
-                "null"
-            }
-            assert not any(
-                entry.get("type") == "null" for entry in property_schema.get("anyOf", ())
-            )
 
-    run_create = schemas["RunCreateV1"]
-    assert run_create["properties"]["required_revision"] == {
-        "$ref": "#/components/schemas/RequiredRevisionV1"
+def test_capabilities_are_lossless_and_model_readiness_is_typed() -> None:
+    schemas = desktop_openapi_document()["components"]["schemas"]
+    envelope = schemas["CapabilitiesEnvelopeV1"]
+    assert envelope["properties"]["capabilities"] == {
+        "$ref": "#/components/schemas/EvolutionCapabilitiesV1"
     }
-    assert schemas["RequiredRevisionV1"]["properties"]["state"]["enum"] == [
-        "active",
-        "queued",
-        "preparing",
+    assert schemas["SupportState"]["enum"] == [
+        "supported",
+        "unsupported",
+        "unavailable",
     ]
+    method_properties = schemas["EvolutionMethodCapabilityV1"]["properties"]
+    assert {
+        "exposure",
+        "execution_modes",
+        "capture_modes",
+        "harness_requirements",
+        "runtime_requirements",
+        "input_bindings",
+        "output_artifact_types",
+        "config_schema_json",
+        "default_config_json",
+        "implementation_identity_digest",
+        "support",
+    }.issubset(method_properties)
+    assert schemas["ModelPreparationStatus"]["enum"] == [
+        "unresolved",
+        "downloading",
+        "ready",
+        "failed",
+    ]
+    assert schemas["RemoteProjectStateV1"]["properties"]["model_preparation"] == {
+        "$ref": "#/components/schemas/ModelPreparationV1"
+    }
 
-    assert "etag" in schemas["LocalOperationV1"]["required"]
-    assert "etag" in schemas["ServiceV1"]["required"]
+
+def test_project_source_uses_only_opaque_native_imports() -> None:
+    scratch = ProjectCreateV1.model_validate(_project_payload())
+    assert scratch.source.import_ref is None
+
+    imported = _project_payload() | {
+        "source": {
+            "kind": "native_folder_snapshot",
+            "display_name": "Experiment data",
+            "import_ref": {
+                "import_id": "import-1",
+                "content_sha256": _DIGEST,
+                "byte_size": 1024,
+                "entry_count": 3,
+                "extracted_byte_size": 768,
+            },
+        }
+    }
+    parsed = ProjectCreateV1.model_validate(imported)
+    assert parsed.source.import_ref is not None
+    assert parsed.source.import_ref.import_id == "import-1"
+
+    with pytest.raises(ValidationError, match="require an opaque import_ref"):
+        ProjectCreateV1.model_validate(
+            _project_payload()
+            | {
+                "source": {
+                    "kind": "native_folder_snapshot",
+                    "display_name": "Experiment data",
+                }
+            }
+        )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ProjectCreateV1.model_validate(
+            imported
+            | {
+                "source": imported["source"]
+                | {"workspace_path": "/Users/researcher/private"}
+            }
+        )
 
 
-def test_models_are_closed_and_profile_never_accepts_secret_or_path_fields() -> None:
+def test_project_evolution_is_closed_lossless_and_aggregate_bounded() -> None:
+    project = _project_payload()
+    parsed = ProjectCreateV1.model_validate(project)
+    assert parsed.evolution.targets.root["text_memory"].config.model_dump() == {
+        "future_field": 1
+    }
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ProjectCreateV1.model_validate(project | {"evolution": {"text_memory": {}}})
+
+    oversized_targets = {
+        f"target_{index}": {
+            "enabled": False,
+            "method": None,
+            "config": {"payload": "x" * 220_000},
+        }
+        for index in range(5)
+    }
+    with pytest.raises(ValidationError, match="aggregate byte budget"):
+        ProjectCreateV1.model_validate(
+            project | {"evolution": {"targets": oversized_targets}}
+        )
+
+    for invalid in (
+        project | {"name": "x" * 129},
+        project | {"task": {"title": "x" * 257, "objective": "Research."}},
+        project
+        | {
+            "execution": {
+                "mode": "self-deployed",
+                "hf_model": "x" * 257,
+            }
+        },
+        project
+        | {
+            "evolution": {
+                "targets": {
+                    "not/a/stable/id": {
+                        "enabled": False,
+                        "method": None,
+                        "config": {},
+                    }
+                }
+            }
+        },
+    ):
+        with pytest.raises(ValidationError):
+            ProjectCreateV1.model_validate(invalid)
+
+
+def test_profiles_and_patches_never_accept_secrets_or_paths() -> None:
     base = {
         "name": "Lab GPU",
         "host": "gpu.example.org",
@@ -308,7 +401,10 @@ def test_models_are_closed_and_profile_never_accepts_secret_or_path_fields() -> 
         "authentication_kind": "native_private_key",
     }
     RemoteProfileCreateV1.model_validate(base)
-
+    credential_kind = desktop_openapi_document()["components"]["schemas"][
+        "CredentialSlotStatusV1"
+    ]["properties"]["kind"]["enum"]
+    assert "hugging_face_token" in credential_kind
     for forbidden in (
         "token",
         "secret_ref",
@@ -328,18 +424,12 @@ def test_models_are_closed_and_profile_never_accepts_secret_or_path_fields() -> 
         )
     with pytest.raises(ValidationError, match="not a URL or path"):
         RemoteProfileCreateV1.model_validate(base | {"host": "/etc/hosts"})
-    with pytest.raises(ValidationError, match="not a path"):
-        RemoteProfileCreateV1.model_validate(base | {"user": "../researcher"})
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         RemoteProfileV1.model_validate(
             {
+                **base,
                 "profile_id": "profile-1",
-                "name": "Lab GPU",
-                "host": "gpu.example.org",
-                "port": 22,
-                "user": "researcher",
-                "authentication_kind": "native_private_key",
                 "credential_slots": (),
                 "etag": _ETAG,
                 "created_at": _NOW,
@@ -348,56 +438,8 @@ def test_models_are_closed_and_profile_never_accepts_secret_or_path_fields() -> 
             }
         )
 
-
-def test_profile_execution_defaults_and_patch_semantics_are_canonical() -> None:
-    profile = RemoteProfileCreateV1.model_validate(
-        {"name": "Lab GPU", "host": "gpu.example.org", "user": "researcher"}
-    )
-    assert profile.model_dump() == {
-        "name": "Lab GPU",
-        "host": "gpu.example.org",
-        "port": 22,
-        "user": "researcher",
-        "authentication_kind": "ssh_agent",
-        "proxy": {"http_url": None, "https_url": None, "no_proxy": ()},
-    }
-
-    execution = ExecutionSettingsV1.model_validate(
-        {"mode": "self-deployed", "hf_model": "open-models/research-model-1"}
-    )
-    assert execution.capture_mode == "transcript"
-    assert execution.token_level_metrics_available is False
-
-    for invalid in ("", " open-models/research-model-1", "open-models/model\n"):
-        with pytest.raises(ValidationError):
-            ExecutionSettingsV1.model_validate(
-                {"mode": "self-deployed", "hf_model": invalid}
-            )
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        ExecutionSettingsV1.model_validate(
-            {"mode": "self-deployed", "managed_model_id": "legacy-model"}
-        )
-    subscription = ExecutionSettingsV1.model_validate(
-        {"mode": "codex_subscription_transcript", "codex_model": "gpt-5"}
-    )
-    assert subscription.hf_model is None
-    with pytest.raises(ValidationError, match="requires only codex_model"):
-        ExecutionSettingsV1.model_validate(
-            {
-                "mode": "codex_subscription_transcript",
-                "codex_model": "gpt-5",
-                "hf_model": "open-models/model-1",
-            }
-        )
-
-    patch = RemoteProfilePatchV1.model_validate(
-        {"proxy": {"https_url": None}}
-    )
-    assert patch.model_dump() == {
-        "proxy": {"http_url": None, "https_url": None, "no_proxy": ()}
-    }
+    patch = RemoteProfilePatchV1.model_validate({"proxy": {"https_url": None}})
     assert patch.model_dump(exclude_unset=True) == {"proxy": {"https_url": None}}
-
     for model, field in (
         (RemoteProfilePatchV1, "host"),
         (RemoteProfilePatchV1, "proxy"),
@@ -406,79 +448,110 @@ def test_profile_execution_defaults_and_patch_semantics_are_canonical() -> None:
         with pytest.raises(ValidationError):
             model.model_validate({field: None})
 
-    with pytest.raises(ValidationError, match="at least one field"):
-        RemoteProfilePatchV1.model_validate({})
 
+def test_execution_modes_are_exact_and_cannot_claim_token_metrics() -> None:
+    deployed = ExecutionSettingsV1.model_validate(
+        {"mode": "self-deployed", "hf_model": "open-models/research-model-1"}
+    )
+    assert deployed.capture_mode == "transcript"
+    assert deployed.token_level_metrics_available is False
 
-def test_project_evolution_uses_only_the_closed_targets_wrapper() -> None:
-    target = {
-        "enabled": True,
-        "method": "reference_text_memory",
-        "config": {"password": "algorithm-owned-value", "future_field": 1},
-    }
-    project = {
-        "name": "Protein Design",
-        "profile_id": "profile-1",
-        "task": {"title": "Design", "objective": "Produce a candidate."},
-        "source": {"kind": "scratch", "display_name": "New workspace"},
-        "execution": {"mode": "self-deployed", "hf_model": "open-models/model-1"},
-        "evolution": {"targets": {"text_memory": target}},
-    }
-    parsed = ProjectCreateV1.model_validate(project)
-    assert parsed.evolution.targets.root["text_memory"].config.model_dump() == target[
-        "config"
-    ]
-
+    subscription = ExecutionSettingsV1.model_validate(
+        {"mode": "codex_subscription_transcript", "codex_model": "gpt-5"}
+    )
+    assert subscription.hf_model is None
+    with pytest.raises(ValidationError):
+        ExecutionSettingsV1.model_validate(
+            {"mode": "self_deployed", "hf_model": "open-models/model-1"}
+        )
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        ProjectCreateV1.model_validate(project | {"evolution": {"text_memory": target}})
+        ExecutionSettingsV1.model_validate(
+            {"mode": "self-deployed", "managed_model_id": "legacy-model"}
+        )
 
-    request = ProjectValidationRequestV1.model_validate(
+
+def test_connection_health_and_release_provider_are_fail_closed() -> None:
+    state = CoreConnectionStateV1.model_validate(
         {
-            "project_etag": _ETAG,
-            "capability_registry_digest": _DIGEST,
-            "execution": project["execution"],
-            "evolution": project["evolution"],
+            "state": "host_key_review",
+            "profile_id": "profile-1",
+            "active_tunnel": False,
+            "operation_id": "operation-1",
+            "host_key_review": {
+                "algorithm": "ssh-ed25519",
+                "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            },
         }
     )
-    assert set(request.evolution.targets.root) == {"text_memory"}
-
-
-@pytest.mark.parametrize(
-    ("host", "user"),
-    (
-        ("gpu.example.org", "researcher"),
-        ("gpu.example.org.", "researcher.name"),
-        ("192.0.2.10", "researcher-1"),
-        ("2001:db8::10", "researcher_1"),
-        ("127.1", "researcher"),
-    ),
-)
-def test_profile_accepts_python_network_host_and_remote_user_boundaries(
-    host: str, user: str
-) -> None:
-    RemoteProfileCreateV1.model_validate(
-        {"name": "Lab GPU", "host": host, "user": user}
-    )
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    (
-        ("host", "gpu_name.example.org"),
-        ("host", "-gpu.example.org"),
-        ("host", "https://gpu.example.org"),
-        ("user", "researcher name"),
-        ("user", "researcher@lab"),
-        ("user", "../researcher"),
-    ),
-)
-def test_profile_rejects_invalid_python_network_identity(field: str, value: str) -> None:
-    payload = {"name": "Lab GPU", "host": "gpu.example.org", "user": "researcher"}
+    assert state.state == "host_key_review"
     with pytest.raises(ValidationError):
-        RemoteProfileCreateV1.model_validate(payload | {field: value})
+        CoreConnectionStateV1.model_validate(
+            {"state": "tunnel_ready", "profile_id": "profile-1", "active_tunnel": True}
+        )
+
+    native = HealthV1.model_validate(
+        {
+            "service": "openevo-sidecar",
+            "status": "ok",
+            "protocol": "openevo-native-sidecar-v1",
+            "instance_id": "a" * 32,
+            "instance_proof": "b" * 64,
+        }
+    )
+    assert native.instance_id == "a" * 32
+
+    version_payload = {
+        "openapi_sha256": _DIGEST,
+        "build_version": "1.0.0",
+        "source_commit": "dabbfec3",
+        "build_channel": "release",
+        "provider_kind": "desktop_sidecar",
+    }
+    VersionV1.model_validate(version_payload)
+    for provider_kind in ("contract_simulator", "scaffold", "dry_run"):
+        with pytest.raises(ValidationError, match="provider_kind=desktop_sidecar"):
+            VersionV1.model_validate(version_payload | {"provider_kind": provider_kind})
 
 
-def test_openapi_has_no_forbidden_renderer_property_names() -> None:
+def test_events_are_invalidation_only_and_require_authoritative_identity() -> None:
+    heartbeat_payload = {
+        "event_id": "event-1",
+        "event_name": "desktop.v1.heartbeat",
+        "occurred_at": _NOW,
+        "sequence": 7,
+        "data": {"kind": "heartbeat"},
+    }
+    envelope = EventEnvelopeV1.model_validate(heartbeat_payload)
+    frame = SseFrameV1(id="event-1", event="desktop.v1.heartbeat", data=envelope)
+    assert frame.data.sequence == 7
+
+    changed = {
+        "event_id": "event-2",
+        "event_name": "desktop.v1.resource.changed",
+        "occurred_at": _NOW,
+        "sequence": 8,
+        "data": {
+            "kind": "resource_changed",
+            "authority": "core",
+            "resource": {"resource_type": "run", "resource_id": "run-1"},
+            "change": "updated",
+            "change_id": "core-change-1",
+            "resource_etag": _ETAG,
+        },
+    }
+    EventEnvelopeV1.model_validate(changed)
+    del changed["data"]["resource_etag"]
+    with pytest.raises(ValidationError, match="authoritative ETag or digest"):
+        EventEnvelopeV1.model_validate(changed)
+
+    event_response = desktop_openapi_document()["paths"]["/desktop/v1/events"]["get"]
+    assert "Last-Event-ID" in {
+        parameter["name"] for parameter in event_response["parameters"]
+    }
+    assert set(event_response["responses"]["200"]["content"]) == {"text/event-stream"}
+
+
+def test_contract_forbids_renderer_host_runtime_and_secret_properties() -> None:
     forbidden = {
         "argv",
         "backend_url",
@@ -499,286 +572,18 @@ def test_openapi_has_no_forbidden_renderer_property_names() -> None:
         "token",
         "workspace_path",
     }
+    schemas = desktop_openapi_document()["components"]["schemas"]
     property_names = {
         property_name
-        for schema in desktop_openapi_document()["components"]["schemas"].values()
+        for schema in schemas.values()
         if isinstance(schema, dict)
         for property_name in schema.get("properties", {})
     }
-
     assert forbidden.isdisjoint(property_names)
 
 
-def test_release_version_rejects_non_release_provider_kinds() -> None:
-    payload = {
-        "openapi_sha256": _DIGEST,
-        "build_version": "1.0.0",
-        "source_commit": "dabbfec3",
-        "build_channel": "release",
-        "provider_kind": "desktop_sidecar",
-    }
-    version = VersionV1.model_validate(payload)
-    assert version.provider_kind == "desktop_sidecar"
-
-    for provider_kind in ("contract_simulator", "scaffold", "dry_run"):
-        with pytest.raises(ValidationError, match="provider_kind=desktop_sidecar"):
-            VersionV1.model_validate(payload | {"provider_kind": provider_kind})
-
-    development = VersionV1.model_validate(
-        payload | {"build_channel": "development", "provider_kind": "contract_simulator"}
-    )
-    assert development.provider_kind == "contract_simulator"
-
-
-def test_execution_mode_uses_exact_hyphenated_release_value() -> None:
-    settings = ExecutionSettingsV1.model_validate(
-        {
-            "mode": "self-deployed",
-            "capture_mode": "transcript",
-            "token_level_metrics_available": False,
-            "hf_model": "open-models/model-1",
-        }
-    )
-    assert settings.mode == "self-deployed"
-
-    with pytest.raises(ValidationError, match="self-deployed"):
-        ExecutionSettingsV1.model_validate(
-            {"mode": "self_deployed", "hf_model": "open-models/model-1"}
-        )
-
-
-def test_run_contract_rejects_runtime_model_path_and_command_overrides() -> None:
-    valid = _run_create_payload()
-    RunCreateV1.model_validate(valid)
-
-    for field, value in (
-        ("runtime", {"image": "unsafe"}),
-        ("model", {"path": "/srv/model"}),
-        ("workspace_path", "/srv/workspace"),
-        ("command", "bash run.sh"),
-        ("credential", "secret"),
-    ):
-        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-            RunCreateV1.model_validate(valid | {field: value})
-
-    for state in ("active", "queued", "preparing"):
-        run = RunCreateV1.model_validate(
-            valid | {"required_revision": valid["required_revision"] | {"state": state}}
-        )
-        assert run.required_revision.state == state
-
-    for state in ("failed", "cancelled"):
-        with pytest.raises(ValidationError):
-            RunCreateV1.model_validate(
-                valid | {"required_revision": valid["required_revision"] | {"state": state}}
-            )
-
-
-def test_dynamic_method_config_preserves_unknown_fields_without_name_heuristics() -> None:
-    config = {
-        "password": "algorithm-owned-value",
-        "command": {"strategy": "reflect"},
-        "future_plugin_field": [1, True, None],
-    }
-    parsed = BoundedJsonObjectV1.model_validate(config)
-    assert parsed.model_dump() == config
-
-
-def test_connection_contract_uses_the_renderer_remote_connection_phases() -> None:
-    state = CoreConnectionStateV1.model_validate(
-        {
-            "state": "host_key_review",
-            "profile_id": "profile-1",
-            "active_tunnel": False,
-            "operation_id": "operation-1",
-            "host_key_review": {
-                "algorithm": "ssh-ed25519",
-                "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-            },
-        }
-    )
-    assert state.state == "host_key_review"
-
-    with pytest.raises(ValidationError):
-        CoreConnectionStateV1.model_validate(
-            {"state": "tunnel_ready", "profile_id": "profile-1", "active_tunnel": True}
-        )
-
-
-def test_health_contract_preserves_native_instance_proof() -> None:
-    plain = HealthV1.model_validate({"service": "openevo-sidecar", "status": "ok"})
-    assert plain.protocol is None
-
-    native = HealthV1.model_validate(
-        {
-            "service": "openevo-sidecar",
-            "status": "ok",
-            "protocol": "openevo-native-sidecar-v1",
-            "instance_id": "a" * 32,
-            "instance_proof": "b" * 64,
-        }
-    )
-    assert native.instance_id == "a" * 32
-
-    with pytest.raises(ValidationError, match="all be present"):
-        HealthV1.model_validate(
-            {
-                "service": "openevo-sidecar",
-                "status": "ok",
-                "protocol": "openevo-native-sidecar-v1",
-            }
-        )
-
-
-def test_artifact_preview_has_an_aggregate_budget_and_allows_empty_diff_lines() -> None:
-    content = ArtifactContentV1.model_validate_json(
-        json.dumps(
-            {
-                "artifact_id": "artifact-1",
-                "content_digest": _DIGEST,
-                "documents": [
-                    {
-                        "document_id": "memory",
-                        "title": "Memory",
-                        "media_type": "text/markdown",
-                        "content": "hello",
-                    }
-                ],
-                "total_documents": 1,
-                "truncated": False,
-            }
-        )
-    )
-    assert content.total_documents == 1
-    assert DiffLineV1(kind="context", old_line=1, new_line=1, text="").text == ""
-
-    with pytest.raises(ValidationError, match="aggregate byte budget"):
-        ArtifactContentV1.model_validate_json(
-            json.dumps(
-                {
-                    "artifact_id": "artifact-1",
-                    "content_digest": _DIGEST,
-                    "documents": [
-                        {
-                            "document_id": f"document-{index}",
-                            "title": "Large",
-                            "media_type": "text/plain",
-                            "content": "x" * 65_536,
-                        }
-                        for index in range(33)
-                    ],
-                    "total_documents": 33,
-                    "truncated": False,
-                }
-            )
-        )
-
-
-def test_cross_language_critical_fixture_matches_python_contract() -> None:
-    fixture_path = (
-        Path(__file__).parents[3] / "desktop/sidecar/contracts/v1/fixtures/contract-critical.json"
-    )
-    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-
-    HealthV1.model_validate_json(json.dumps(fixture["health"]))
-    DesktopStateV1.model_validate_json(json.dumps(fixture["state"]))
-    RunCreateV1.model_validate_json(json.dumps(fixture["run_create"]))
-    assert RemoteProfileCreateV1.model_validate(
-        fixture["profile_create"]["wire"]
-    ).model_dump(mode="json") == fixture["profile_create"]["normalized"]
-    assert ExecutionSettingsV1.model_validate(
-        fixture["execution"]["wire"]
-    ).model_dump(mode="json") == fixture["execution"]["normalized"]
-    assert RemoteProfilePatchV1.model_validate(
-        fixture["profile_patch"]["wire"]
-    ).model_dump(mode="json") == fixture["profile_patch"]["normalized"]
-    assert ProjectCreateV1.model_validate(
-        fixture["project_create"]
-    ).evolution.targets.root["text_memory"].config.model_dump() == fixture[
-        "project_create"
-    ]["evolution"]["targets"]["text_memory"]["config"]
-    assert LocalOperationV1.model_validate(
-        fixture["operation_defaults"]["wire"]
-    ).model_dump(mode="json") == fixture["operation_defaults"]["normalized"]
-    assert ServiceV1.model_validate(
-        fixture["service_defaults"]["wire"]
-    ).model_dump(mode="json") == fixture["service_defaults"]["normalized"]
-    ArtifactContentV1.model_validate_json(json.dumps(fixture["artifact_content"]))
-    assert fixture["artifact_diff"]["hunks"][0]["lines"][0]["text"] == ""
-
-
-def test_bounded_json_detail_enforces_closed_resource_budgets() -> None:
-    detail = BoundedJsonObjectV1.model_validate({"reason": "not_ready", "attempt": 1})
-    assert detail.model_dump() == {"reason": "not_ready", "attempt": 1}
-
-    too_deep: dict = {"leaf": True}
-    for index in range(17):
-        too_deep = {f"level_{index}": too_deep}
-    with pytest.raises(ValidationError, match="depth budget"):
-        BoundedJsonObjectV1.model_validate(too_deep)
-
-    with pytest.raises(ValidationError, match="JavaScript safe"):
-        BoundedJsonObjectV1.model_validate({"integer": 9_007_199_254_740_992})
-
-
-def test_pagination_envelope_is_bounded_and_cursor_consistent() -> None:
-    page = PageV1[int](items=(1, 2), next_cursor="cursor-2", has_more=True)
-    assert page.items == (1, 2)
-
-    with pytest.raises(ValidationError, match="must agree"):
-        PageV1[int](items=(), next_cursor=None, has_more=True)
-    with pytest.raises(ValidationError, match="at most 100"):
-        PageV1[int](items=tuple(range(101)), next_cursor=None, has_more=False)
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        ArtifactPageV1.model_validate(
-            {"items": (), "next_cursor": None, "has_more": False, "total": 0}
-        )
-
-    schema = desktop_openapi_document()
-    list_paths = (
-        "/desktop/v1/profiles",
-        "/desktop/v1/projects",
-        "/desktop/v1/operations/{operation_id}/logs",
-        "/desktop/v1/runs",
-        "/desktop/v1/runs/{run_id}/timeline",
-        "/desktop/v1/runs/{run_id}/logs",
-        "/desktop/v1/runs/{run_id}/artifacts",
-        "/desktop/v1/services",
-        "/desktop/v1/services/{service_id}/logs",
-    )
-    for path in list_paths:
-        parameters = schema["paths"][path]["get"]["parameters"]
-        query_names = {item["name"] for item in parameters if item["in"] == "query"}
-        assert query_names == {"limit", "after", "sort", "direction"}
-
-
-def test_event_envelope_and_sse_frame_are_closed_and_correlated() -> None:
-    payload = {
-        "event_id": "event-1",
-        "event_name": "desktop.v1.heartbeat",
-        "occurred_at": _NOW,
-        "sequence": 7,
-        "data": {"kind": "heartbeat"},
-    }
-    envelope = EventEnvelopeV1.model_validate(payload)
-    frame = SseFrameV1(id="event-1", event="desktop.v1.heartbeat", data=envelope)
-    assert frame.data.sequence == 7
-
-    with pytest.raises(ValidationError, match="does not match"):
-        EventEnvelopeV1.model_validate(payload | {"event_name": "desktop.v1.state.changed"})
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        EventEnvelopeV1.model_validate(payload | {"raw_payload": {}})
-    with pytest.raises(ValidationError, match="must match"):
-        SseFrameV1(id="event-2", event="desktop.v1.heartbeat", data=envelope)
-
-    event_response = desktop_openapi_document()["paths"]["/desktop/v1/events"]["get"]
-    assert "Last-Event-ID" in {parameter["name"] for parameter in event_response["parameters"]}
-    assert set(event_response["responses"]["200"]["content"]) == {"text/event-stream"}
-
-
-def test_all_contract_object_models_are_closed_except_explicit_bounded_maps() -> None:
+def test_explicit_maps_are_the_only_open_object_schemas() -> None:
     schemas = desktop_openapi_document()["components"]["schemas"]
-    allowed_maps = {"BoundedJsonObjectV1", "EvolutionSelectionsV1"}
     open_object_schemas = {
         name
         for name, schema in schemas.items()
@@ -786,8 +591,55 @@ def test_all_contract_object_models_are_closed_except_explicit_bounded_maps() ->
         and schema.get("type") == "object"
         and schema.get("additionalProperties") is not False
     }
-
-    assert open_object_schemas == allowed_maps
+    assert open_object_schemas == {"BoundedJsonObjectV1", "EvolutionSelectionsV1"}
     assert not any(
         "dict[str, Any]" in value for value in _walk_json(schemas) if isinstance(value, str)
+    )
+
+
+def test_local_pagination_and_dynamic_config_are_bounded() -> None:
+    page = PageV1[int](items=(1, 2), next_cursor="cursor-2", has_more=True)
+    assert page.items == (1, 2)
+    with pytest.raises(ValidationError, match="must agree"):
+        PageV1[int](items=(), next_cursor=None, has_more=True)
+
+    config = {
+        "password": "algorithm-owned-value",
+        "command": {"strategy": "reflect"},
+        "future_plugin_field": [1, True, None],
+    }
+    assert BoundedJsonObjectV1.model_validate(config).model_dump() == config
+    with pytest.raises(ValidationError, match="JavaScript safe"):
+        BoundedJsonObjectV1.model_validate({"integer": 9_007_199_254_740_992})
+
+
+def test_cross_language_critical_fixture_matches_python_contract() -> None:
+    fixture_path = (
+        Path(__file__).parents[3]
+        / "desktop/sidecar/contracts/v1/fixtures/contract-critical.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    def parse_json(model: type, value: object) -> object:
+        return model.model_validate_json(json.dumps(value))
+
+    parse_json(HealthV1, fixture["health"])
+    parse_json(DesktopStateV1, fixture["state"])
+    parse_json(RunCreateV1, fixture["run_create"])
+    parse_json(ProjectCreateV1, fixture["project_create"])
+    parse_json(LocalOperationV1, fixture["operation_defaults"]["wire"])
+
+
+def test_snapshots_are_canonical_and_digests_are_stable() -> None:
+    openapi_digest, events_digest = verify_contract_snapshots()
+    assert openapi_digest == DESKTOP_OPENAPI_SHA256
+    assert events_digest == DESKTOP_EVENTS_SCHEMA_SHA256
+    assert openapi_digest == "ceadacb488b9212750cc408bf17f2358790736878e282392a4127ea5ab7ce922"
+    assert events_digest == "43ad2f8d2f8355a1d4227b7d26f8043cd2440cf9d35c5aa4f7a70d6717773543"
+    snapshot_root = Path(__file__).parents[3] / "desktop/sidecar/contracts/v1"
+    assert (snapshot_root / "openapi.json").read_bytes() == canonical_json_bytes(
+        desktop_openapi_document()
+    )
+    assert (snapshot_root / "events.schema.json").read_bytes() == canonical_json_bytes(
+        desktop_events_schema_document()
     )

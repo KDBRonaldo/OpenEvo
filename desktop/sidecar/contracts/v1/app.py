@@ -12,6 +12,8 @@ from .models import (
     ArtifactDiffV1,
     ArtifactPageV1,
     ArtifactV1,
+    CacheCleanupRequestV1,
+    CacheCleanupV1,
     CapabilitiesEnvelopeV1,
     DesktopStateV1,
     DiagnosticReportV1,
@@ -19,13 +21,13 @@ from .models import (
     EventEnvelopeV1,
     HealthV1,
     HostKeyAcceptV1,
+    LocalLogPageV1,
     LocalOperationV1,
     LogPageV1,
     ProjectCreateV1,
     ProjectPageV1,
     ProjectPatchV1,
     ProjectV1,
-    ProjectValidationRequestV1,
     ProjectValidationV1,
     RemoteProfileCreateV1,
     RemoteProfilePageV1,
@@ -35,6 +37,7 @@ from .models import (
     RunContextV1,
     RunPageV1,
     RunV1,
+    ServiceActionV1,
     ServicePageV1,
     TimelinePageV1,
     VersionV1,
@@ -348,7 +351,6 @@ def create_contract_app() -> FastAPI:
     )
     def validate_project(
         project_id: ResourceId,
-        request: ProjectValidationRequestV1,
         idempotency_key: IdempotencyKey,
         if_match: IfMatch,
     ) -> ProjectValidationV1:
@@ -365,7 +367,7 @@ def create_contract_app() -> FastAPI:
     @router.get(
         "/operations/{operation_id}/logs",
         operation_id="listLocalOperationLogs",
-        response_model=LogPageV1,
+        response_model=LocalLogPageV1,
     )
     def list_operation_logs(
         operation_id: ResourceId,
@@ -373,7 +375,7 @@ def create_contract_app() -> FastAPI:
         after: Cursor = None,
         sort: Sort = "occurred_at",
         direction: Direction = "asc",
-    ) -> LogPageV1:
+    ) -> LocalLogPageV1:
         _contract_only()
 
     @router.post(
@@ -397,7 +399,11 @@ def create_contract_app() -> FastAPI:
         _contract_only()
 
     @router.post("/runs", operation_id="createRun", response_model=RunV1, status_code=202)
-    def create_run(request: RunCreateV1, idempotency_key: IdempotencyKey) -> RunV1:
+    def create_run(
+        request: RunCreateV1,
+        idempotency_key: IdempotencyKey,
+        if_match: IfMatch,
+    ) -> RunV1:
         _contract_only()
 
     @router.get("/runs/{run_id}", operation_id="getRun", response_model=RunV1)
@@ -511,23 +517,12 @@ def create_contract_app() -> FastAPI:
     @router.post(
         "/services/{service_id}/restart",
         operation_id="restartService",
-        response_model=LocalOperationV1,
+        response_model=ServiceActionV1,
         status_code=202,
     )
     def restart_service(
         service_id: ResourceId, idempotency_key: IdempotencyKey, if_match: IfMatch
-    ) -> LocalOperationV1:
-        _contract_only()
-
-    @router.post(
-        "/services/{service_id}/stop",
-        operation_id="stopService",
-        response_model=LocalOperationV1,
-        status_code=202,
-    )
-    def stop_service(
-        service_id: ResourceId, idempotency_key: IdempotencyKey, if_match: IfMatch
-    ) -> LocalOperationV1:
+    ) -> ServiceActionV1:
         _contract_only()
 
     @router.get(
@@ -547,12 +542,12 @@ def create_contract_app() -> FastAPI:
     @router.post(
         "/diagnostics",
         operation_id="createDiagnostic",
-        response_model=LocalOperationV1,
+        response_model=DiagnosticReportV1,
         status_code=202,
     )
     def create_diagnostic(
         request: DiagnosticRequestV1, idempotency_key: IdempotencyKey
-    ) -> LocalOperationV1:
+    ) -> DiagnosticReportV1:
         _contract_only()
 
     @router.get(
@@ -575,10 +570,12 @@ def create_contract_app() -> FastAPI:
     @router.post(
         "/maintenance/cache-cleanup",
         operation_id="cleanupCaches",
-        response_model=LocalOperationV1,
+        response_model=CacheCleanupV1,
         status_code=202,
     )
-    def cleanup_caches(idempotency_key: IdempotencyKey) -> LocalOperationV1:
+    def cleanup_caches(
+        request: CacheCleanupRequestV1, idempotency_key: IdempotencyKey
+    ) -> CacheCleanupV1:
         _contract_only()
 
     @router.get(

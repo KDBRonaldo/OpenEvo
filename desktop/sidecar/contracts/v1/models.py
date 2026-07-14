@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from ipaddress import ip_address
+import json
 from math import isfinite
 import re
 from typing import Annotated, Any, Generic, Literal, TypeVar
@@ -21,6 +22,34 @@ from pydantic import (
 )
 from typing_extensions import TypeAliasType
 
+from openevo.backend.contracts.v1 import models as _core_contract
+from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
+
+
+ApiErrorV1 = _core_contract.ApiErrorV1
+ArtifactContentV1 = _core_contract.ArtifactContentV1
+ArtifactDiffV1 = _core_contract.ArtifactDiffV1
+ArtifactPageV1 = _core_contract.ArtifactPageV1
+ArtifactV1 = _core_contract.ArtifactSummaryV1
+CacheCleanupRequestV1 = _core_contract.CacheCleanupRequestV1
+CacheCleanupV1 = _core_contract.CacheCleanupV1
+DiagnosticV1 = _core_contract.DiagnosticV1
+DiagnosticsRequestV1 = _core_contract.DiagnosticsRequestV1
+LogEntryV1 = _core_contract.LogEntryV1
+LogPageV1 = _core_contract.LogPageV1
+ModelPreparationV1 = _core_contract.ModelPreparationV1
+RevisionRefV1 = _core_contract.RevisionRefV1
+RunContextV1 = _core_contract.RunContextV1
+RunPageV1 = _core_contract.RunPageV1
+RunSummaryV1 = _core_contract.RunSummaryV1
+RunTimelinePageV1 = _core_contract.RunTimelinePageV1
+RunV1 = _core_contract.RunV1
+ServiceActionV1 = _core_contract.ServiceActionV1
+ServicePageV1 = _core_contract.ServicePageV1
+ServiceSummaryV1 = _core_contract.ServiceSummaryV1
+TimelineEntryV1 = _core_contract.TimelineEntryV1
+ValidationCheckV1 = _core_contract.ValidationCheckV1
+
 
 SCHEMA_VERSION = "1"
 MAX_PAGE_SIZE = 100
@@ -32,6 +61,7 @@ MAX_JSON_TOTAL_BYTES = 1_048_576
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_ARTIFACT_PREVIEW_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACT_PREVIEW_DOCUMENTS = 128
+MAX_PROJECT_EVOLUTION_BYTES = 1_048_576
 
 JsonValueV1 = TypeAliasType(
     "JsonValueV1",
@@ -83,9 +113,9 @@ def _validate_remote_user(value: str) -> str:
     return value
 
 
-def _validate_hugging_face_model(value: str) -> str:
+def _validate_model_ref(value: str) -> str:
     if value != value.strip() or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
-        raise ValueError("hf_model must be trimmed text without control characters")
+        raise ValueError("model reference must be trimmed text without control characters")
     return value
 
 
@@ -98,6 +128,25 @@ ShortText = Annotated[
     str,
     StringConstraints(strict=True, min_length=1, max_length=512),
     AfterValidator(_validate_user_text),
+]
+ProjectDisplayName = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=1, max_length=128),
+    AfterValidator(_validate_user_text),
+]
+CoreShortText = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=1, max_length=256),
+    AfterValidator(_validate_user_text),
+]
+EvolutionId = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
+    ),
 ]
 LongText = Annotated[
     str,
@@ -138,11 +187,12 @@ RemoteUser = Annotated[
     StringConstraints(strict=True, min_length=1, max_length=128),
     AfterValidator(_validate_remote_user),
 ]
-HuggingFaceModel = Annotated[
+AgentModelRefText = Annotated[
     str,
-    StringConstraints(strict=True, min_length=1, max_length=512),
-    AfterValidator(_validate_hugging_face_model),
+    StringConstraints(strict=True, min_length=1, max_length=256),
+    AfterValidator(_validate_model_ref),
 ]
+HuggingFaceModel = AgentModelRefText
 
 
 class StrictModel(BaseModel):
@@ -253,40 +303,6 @@ class BoundedJsonObjectV1(RootModel[dict[str, JsonValueV1]]):
             if encoded_bytes > MAX_JSON_TOTAL_BYTES:
                 raise ValueError("JSON detail exceeds the byte budget")
         return self
-
-
-class ApiErrorV1(StrictModel):
-    schema_version: Literal["1"] = SCHEMA_VERSION
-    request_id: OpaqueId
-    code: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,127}$")]
-    http_status: int = Field(ge=400, le=599)
-    message: ShortText
-    severity: Literal["info", "warning", "blocking"]
-    category: Literal[
-        "contract",
-        "authentication",
-        "profile",
-        "connection",
-        "project",
-        "capability",
-        "operation",
-        "run",
-        "artifact",
-        "service",
-        "diagnostic",
-        "maintenance",
-    ]
-    retryable: bool
-    repair_action: Literal[
-        "none",
-        "openevo_can_retry",
-        "user_input_required",
-        "reconnect_required",
-        "upgrade_required",
-    ]
-    next_action: ShortText | None = None
-    details: BoundedJsonObjectV1 = Field(default_factory=lambda: BoundedJsonObjectV1({}))
-    logs_ref: OpaqueId | None = None
 
 
 BuildChannelV1 = Literal["release", "development", "test"]
@@ -454,6 +470,7 @@ CredentialSlotKindV1 = Literal[
     "ssh_private_key_passphrase",
     "http_proxy_password",
     "https_proxy_password",
+    "hugging_face_token",
 ]
 
 
@@ -565,12 +582,6 @@ class ResourceRefV1(StrictModel):
     resource_id: OpaqueId
 
 
-class ContentRefV1(StrictModel):
-    content_id: OpaqueId
-    sha256: Digest
-    byte_size: int = Field(ge=0, le=1_000_000_000_000)
-
-
 ExecutionModeV1 = Literal["codex_subscription_transcript", "self-deployed"]
 
 
@@ -578,7 +589,7 @@ class ExecutionSettingsV1(StrictModel):
     mode: ExecutionModeV1
     capture_mode: Literal["transcript"] = "transcript"
     token_level_metrics_available: Literal[False] = False
-    codex_model: ShortText | None = None
+    codex_model: AgentModelRefText | None = None
     hf_model: HuggingFaceModel | None = None
 
     @model_validator(mode="after")
@@ -592,28 +603,47 @@ class ExecutionSettingsV1(StrictModel):
 
 
 class ProjectTaskV1(StrictModel):
-    title: ShortText
+    title: CoreShortText
     objective: LongText
-    task_ref: ContentRefV1 | None = None
+
+
+class WorkspaceImportRefV1(StrictModel):
+    """Opaque native-to-sidecar handoff; it never contains a host path."""
+
+    import_id: OpaqueId
+    content_sha256: Digest
+    byte_size: int = Field(ge=1_024, le=_core_contract.MAX_WORKSPACE_UPLOAD_BYTES)
+    entry_count: int = Field(ge=0, le=_core_contract.MAX_WORKSPACE_ENTRIES)
+    extracted_byte_size: int = Field(
+        ge=0, le=_core_contract.MAX_WORKSPACE_UPLOAD_BYTES
+    )
+
+    @model_validator(mode="after")
+    def _empty_archive_is_empty(self) -> WorkspaceImportRefV1:
+        if self.byte_size % 512 != 0:
+            raise ValueError("workspace import size must align to a tar block")
+        if self.entry_count == 0 and self.extracted_byte_size != 0:
+            raise ValueError("an empty import cannot declare extracted bytes")
+        return self
 
 
 class ProjectSourceV1(StrictModel):
-    kind: Literal["scratch", "native_folder_snapshot", "git_snapshot", "remote_snapshot"]
-    display_name: ShortText
-    source_ref: ContentRefV1 | None = None
+    kind: Literal["scratch", "native_folder_snapshot"]
+    display_name: CoreShortText
+    import_ref: WorkspaceImportRefV1 | None = None
 
     @model_validator(mode="after")
     def _snapshot_required(self) -> ProjectSourceV1:
-        if self.kind == "scratch" and self.source_ref is not None:
-            raise ValueError("scratch sources must not include source_ref")
-        if self.kind != "scratch" and self.source_ref is None:
-            raise ValueError("non-scratch sources require a content-addressed source_ref")
+        if self.kind == "scratch" and self.import_ref is not None:
+            raise ValueError("scratch sources must not include import_ref")
+        if self.kind == "native_folder_snapshot" and self.import_ref is None:
+            raise ValueError("native folder sources require an opaque import_ref")
         return self
 
 
 class EvolutionTargetSelectionV1(StrictModel):
     enabled: bool
-    method: OpaqueId | None = None
+    method: EvolutionId | None = None
     config: BoundedJsonObjectV1 = Field(default_factory=lambda: BoundedJsonObjectV1({}))
 
     @model_validator(mode="after")
@@ -623,7 +653,7 @@ class EvolutionTargetSelectionV1(StrictModel):
         return self
 
 
-class EvolutionSelectionsV1(RootModel[dict[str, EvolutionTargetSelectionV1]]):
+class EvolutionSelectionsV1(RootModel[dict[EvolutionId, EvolutionTargetSelectionV1]]):
     model_config = ConfigDict(
         frozen=True,
         strict=True,
@@ -635,19 +665,28 @@ class EvolutionSelectionsV1(RootModel[dict[str, EvolutionTargetSelectionV1]]):
     def _validate_targets(self) -> EvolutionSelectionsV1:
         if len(self.root) > 128:
             raise ValueError("at most 128 evolution targets are allowed")
-        for target_id in self.root:
-            _validate_opaque_text(target_id)
-            if len(target_id) > 256:
-                raise ValueError("evolution target IDs must not exceed 256 characters")
         return self
 
 
 class EvolutionConfigV1(StrictModel):
     targets: EvolutionSelectionsV1
 
+    @model_validator(mode="after")
+    def _aggregate_budget(self) -> EvolutionConfigV1:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > MAX_PROJECT_EVOLUTION_BYTES:
+            raise ValueError("evolution config exceeds the aggregate byte budget")
+        return self
+
 
 class ProjectCreateV1(StrictModel):
-    name: ShortText
+    name: ProjectDisplayName
     profile_id: OpaqueId
     task: ProjectTaskV1
     source: ProjectSourceV1
@@ -656,7 +695,7 @@ class ProjectCreateV1(StrictModel):
 
 
 class ProjectPatchV1(PatchModel):
-    name: ShortText | None = None
+    name: ProjectDisplayName | None = None
     profile_id: OpaqueId | None = None
     task: ProjectTaskV1 | None = None
     source: ProjectSourceV1 | None = None
@@ -670,6 +709,34 @@ class ProjectPatchV1(PatchModel):
         return self
 
 
+class RemoteProjectStateV1(StrictModel):
+    core_project_id: OpaqueId
+    status: Literal["draft", "ready", "blocked", "archived"]
+    active_revision: RevisionRefV1 | None = None
+    registry_digest: Digest | None = None
+    model_preparation: ModelPreparationV1
+    observed_at: UtcTimestamp
+    etag: ETag
+
+    @model_validator(mode="after")
+    def _ready_state_is_complete(self) -> RemoteProjectStateV1:
+        if self.status == "ready" and (
+            self.active_revision is None
+            or self.registry_digest is None
+            or self.model_preparation.status
+            is not _core_contract.ModelPreparationStatus.READY
+        ):
+            raise ValueError(
+                "ready remote projects require a revision, registry, and prepared model"
+            )
+        if (
+            self.active_revision is not None
+            and self.active_revision.project_id != self.core_project_id
+        ):
+            raise ValueError("remote project revision belongs to another project")
+        return self
+
+
 class ProjectV1(StrictModel):
     schema_version: Literal["1"] = SCHEMA_VERSION
     project_id: OpaqueId
@@ -680,7 +747,7 @@ class ProjectV1(StrictModel):
     execution: ExecutionSettingsV1
     evolution: EvolutionConfigV1
     state: Literal["draft", "active", "archived", "blocked"]
-    current_revision_id: OpaqueId | None = None
+    remote: RemoteProjectStateV1 | None = None
     etag: ETag
     created_at: UtcTimestamp
     updated_at: UtcTimestamp
@@ -729,7 +796,7 @@ class DiagnosticFindingV1(StrictModel):
     next_action: ShortText | None = None
 
 
-class DiagnosticReportV1(StrictModel):
+class DesktopDiagnosticReportV1(StrictModel):
     schema_version: Literal["1"] = SCHEMA_VERSION
     diagnostic_id: OpaqueId
     status: Literal["healthy", "degraded", "blocked"]
@@ -741,7 +808,7 @@ class DiagnosticReportV1(StrictModel):
 
 class DiagnosticOperationResultV1(StrictModel):
     kind: Literal["diagnostic"] = "diagnostic"
-    report: DiagnosticReportV1
+    report: DesktopDiagnosticReportV1
 
 
 LocalOperationResultV1 = Annotated[
@@ -762,10 +829,6 @@ class LocalOperationV1(StrictModel):
         "project_repair",
         "bootstrap",
         "workspace_sync",
-        "service_restart",
-        "service_stop",
-        "diagnostics",
-        "cache_cleanup",
     ]
     state: Literal["queued", "running", "succeeded", "failed", "cancelling", "cancelled"]
     resource: ResourceRefV1
@@ -790,7 +853,7 @@ class LocalOperationV1(StrictModel):
         return self
 
 
-class LogEntryV1(StrictModel):
+class LocalLogEntryV1(StrictModel):
     log_id: OpaqueId
     occurred_at: UtcTimestamp
     level: Literal["debug", "info", "warning", "error"]
@@ -799,373 +862,34 @@ class LogEntryV1(StrictModel):
     code: ShortText | None = None
 
 
-class CapabilitySupportAxisV1(StrictModel):
-    supported: bool
-    reason_code: ShortText | None = None
-    summary: ShortText | None = None
-
-    @model_validator(mode="after")
-    def _unsupported_reason(self) -> CapabilitySupportAxisV1:
-        if self.supported and (self.reason_code is not None or self.summary is not None):
-            raise ValueError("supported axes must not include an unsupported reason")
-        if not self.supported and (self.reason_code is None or self.summary is None):
-            raise ValueError("unsupported axes require reason_code and summary")
-        return self
-
-
-class MethodSupportV1(StrictModel):
-    overall: Literal["supported", "unsupported"]
-    execution: CapabilitySupportAxisV1
-    capture: CapabilitySupportAxisV1
-    harness: CapabilitySupportAxisV1
-    runtime: CapabilitySupportAxisV1
-
-
-class ResolvedMethodCapabilityV1(StrictModel):
-    method_id: OpaqueId
-    identity_digest: Digest
-    support: MethodSupportV1
-
-
-class MethodCapabilityV1(StrictModel):
-    method_id: OpaqueId
-    display_name: ShortText
-    description: ShortText
-    maturity: Literal["experimental", "preview", "stable"]
-    identity_digest: Digest
-    config_schema: BoundedJsonObjectV1
-    default_config: BoundedJsonObjectV1
-    support: MethodSupportV1
-
-
-class SelectionResolverCapabilityV1(StrictModel):
-    selection_value: OpaqueId
-    display_name: ShortText
-    description: ShortText
-    resolved_methods: tuple[ResolvedMethodCapabilityV1, ...]
-
-
-class TargetCapabilityV1(StrictModel):
-    target_id: OpaqueId
-    display_name: ShortText
-    description: ShortText
-    artifact_type: Literal["text_memory", "skill_bundle", "agent_system", "parametric_memory"]
-    release_enabled: bool
-    configured_default_method_id: OpaqueId
-    effective_default_method_id: OpaqueId | None = None
-    methods: tuple[MethodCapabilityV1, ...]
-    accepted_methods: tuple[ResolvedMethodCapabilityV1, ...]
-    selection_resolvers: tuple[SelectionResolverCapabilityV1, ...] = ()
-
-
 class CapabilitiesEnvelopeV1(StrictModel):
     schema_version: Literal["1"] = SCHEMA_VERSION
     project_id: OpaqueId
-    execution_mode: ExecutionModeV1
+    project_etag: ETag
     source: Literal["verified_remote_core"] = "verified_remote_core"
     registry_verified: Literal[True] = True
-    registry_digest: Digest
-    core_version: ShortText
     fetched_at: UtcTimestamp
-    targets: tuple[TargetCapabilityV1, ...]
-
-
-class ProjectValidationRequestV1(StrictModel):
-    project_etag: ETag
-    capability_registry_digest: Digest
-    execution: ExecutionSettingsV1
-    evolution: EvolutionConfigV1
-
-
-class ValidationIssueV1(StrictModel):
-    issue_id: OpaqueId
-    severity: Literal["warning", "blocking"]
-    field: ShortText
-    code: ShortText
-    message: ShortText
-    next_action: ShortText | None = None
+    capabilities: EvolutionCapabilitiesV1
 
 
 class ProjectValidationV1(StrictModel):
     schema_version: Literal["1"] = SCHEMA_VERSION
     project_id: OpaqueId
     project_etag: ETag
-    capability_registry_digest: Digest
+    registry_digest: Digest
     valid: bool
-    issues: tuple[ValidationIssueV1, ...]
+    checks: tuple[ValidationCheckV1, ...]
     validated_at: UtcTimestamp
-
-    @model_validator(mode="after")
-    def _validity_matches_issues(self) -> ProjectValidationV1:
-        has_blocker = any(issue.severity == "blocking" for issue in self.issues)
-        if self.valid == has_blocker:
-            raise ValueError("valid must be false exactly when blocking issues exist")
-        return self
-
-
-class ImmutableSnapshotRefV1(StrictModel):
-    snapshot_id: OpaqueId
-    digest: Digest
-
-
-class RevisionRefV1(StrictModel):
-    revision_id: OpaqueId
-    generation: int = Field(ge=0)
-    manifest_digest: Digest
-    state: Literal["active", "queued", "preparing", "failed", "cancelled"]
-
-
-class RequiredRevisionV1(StrictModel):
-    revision_id: OpaqueId
-    generation: int = Field(ge=0)
-    manifest_digest: Digest
-    state: Literal["active", "queued", "preparing"]
 
 
 class RunCreateV1(StrictModel):
     project_id: OpaqueId
-    project_snapshot: ImmutableSnapshotRefV1
-    task_snapshot: ImmutableSnapshotRefV1
-    workspace_snapshot: ImmutableSnapshotRefV1
-    capability_registry_digest: Digest
-    required_revision: RequiredRevisionV1
 
 
-class RunQueuedReasonV1(StrictModel):
-    code: Literal[
-        "capacity_unavailable",
-        "required_revision_uncommitted",
-        "service_starting",
-        "project_activation_pending",
-    ]
-    summary: ShortText
-    retry_after_seconds: int | None = Field(default=None, ge=1, le=86_400)
-
-
-class RunAttemptV1(StrictModel):
-    attempt_id: OpaqueId
-    number: int = Field(ge=1)
-    state: Literal[
-        "queued", "preparing", "running", "cancelling", "succeeded", "failed", "cancelled"
-    ]
-    started_at: UtcTimestamp | None = None
-    finished_at: UtcTimestamp | None = None
-
-
-class RunV1(StrictModel):
-    schema_version: Literal["1"] = SCHEMA_VERSION
-    run_id: OpaqueId
-    project_id: OpaqueId
-    state: Literal[
-        "queued", "preparing", "running", "cancelling", "succeeded", "failed", "cancelled"
-    ]
-    queued_reason: RunQueuedReasonV1 | None = None
-    project_snapshot: ImmutableSnapshotRefV1
-    task_snapshot: ImmutableSnapshotRefV1
-    workspace_snapshot: ImmutableSnapshotRefV1
-    capability_registry_digest: Digest
-    pinned_revision: RevisionRefV1
-    successor_revision: RevisionRefV1 | None = None
-    latest_attempt: RunAttemptV1
-    created_at: UtcTimestamp
-    updated_at: UtcTimestamp
-    etag: ETag
-    error: ApiErrorV1 | None = None
-
-    @model_validator(mode="after")
-    def _run_state_shape(self) -> RunV1:
-        if (self.state == "queued") != (self.queued_reason is not None):
-            raise ValueError("queued runs require a queued_reason and other states forbid it")
-        if self.state == "failed" and self.error is None:
-            raise ValueError("failed runs require an error")
-        if self.state != "failed" and self.error is not None:
-            raise ValueError("only failed runs may include an error")
-        return self
-
-
-class TimelineEntryV1(StrictModel):
-    entry_id: OpaqueId
-    occurred_at: UtcTimestamp
-    stage: Literal[
-        "admission",
-        "workspace",
-        "agent",
-        "capture",
-        "dataset",
-        "evolution",
-        "materialization",
-        "revision",
-    ]
-    state: Literal["queued", "running", "succeeded", "failed", "cancelled", "blocked"]
-    title: ShortText
-    summary: ShortText
-    progress: OperationProgressV1 | None = None
-
-
-class ContextContributionV1(StrictModel):
-    target_id: OpaqueId
-    artifact_id: OpaqueId
-    artifact_type: Literal["text_memory", "skill_bundle", "agent_system", "parametric_memory"]
-    selected: bool
-    summary: ShortText
-
-
-class RunContextV1(StrictModel):
-    schema_version: Literal["1"] = SCHEMA_VERSION
-    run_id: OpaqueId
-    pinned_revision: RevisionRefV1
-    successor_revision: RevisionRefV1 | None = None
-    contributions: tuple[ContextContributionV1, ...]
-
-
-class ArtifactLineageV1(StrictModel):
-    source_dataset_ids: tuple[OpaqueId, ...] = ()
-    parent_artifact_ids: tuple[OpaqueId, ...] = ()
-    producing_job_id: OpaqueId | None = None
-
-
-class ArtifactCompatibilityV1(StrictModel):
-    execution_modes: tuple[ExecutionModeV1, ...]
-    harness_ids: tuple[OpaqueId, ...] = ()
-    base_model_ids: tuple[OpaqueId, ...] = ()
-
-
-class ArtifactScoreV1(StrictModel):
-    name: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,127}$")]
-    value: float
-
-    @field_validator("value")
-    @classmethod
-    def _finite_score(cls, value: float) -> float:
-        if not isfinite(value):
-            raise ValueError("artifact scores must be finite")
-        return value
-
-
-class ArtifactBaseV1(StrictModel):
-    schema_version: Literal["1"] = SCHEMA_VERSION
-    artifact_id: OpaqueId
-    project_id: OpaqueId
-    run_id: OpaqueId
-    target_id: OpaqueId
-    display_name: ShortText
-    summary: ShortText
-    content_digest: Digest
-    byte_size: int = Field(ge=0, le=1_000_000_000_000)
-    lineage: ArtifactLineageV1
-    compatibility: ArtifactCompatibilityV1
-    scores: tuple[ArtifactScoreV1, ...] = ()
-    selected: bool
-    promoted: bool
-    revision_ids: tuple[OpaqueId, ...] = ()
-    created_at: UtcTimestamp
-
-
-class TextMemoryArtifactV1(ArtifactBaseV1):
-    artifact_type: Literal["text_memory"] = "text_memory"
-    format: Literal["markdown", "plain_text"]
-
-
-class SkillBundleArtifactV1(ArtifactBaseV1):
-    artifact_type: Literal["skill_bundle"] = "skill_bundle"
-    skill_count: int = Field(ge=1, le=1_024)
-
-
-class AgentSystemArtifactV1(ArtifactBaseV1):
-    artifact_type: Literal["agent_system"] = "agent_system"
-    instruction_kind: Literal["agents", "claude", "gemini", "openhands_microagent", "generic"]
-
-
-class ParametricMemoryArtifactV1(ArtifactBaseV1):
-    artifact_type: Literal["parametric_memory"] = "parametric_memory"
-    release_enabled: Literal[False] = False
-    adapter_id: OpaqueId
-    base_model_id: OpaqueId
-    adapter_format: ShortText
-
-
-ArtifactV1 = Annotated[
-    TextMemoryArtifactV1
-    | SkillBundleArtifactV1
-    | AgentSystemArtifactV1
-    | ParametricMemoryArtifactV1,
-    Field(discriminator="artifact_type"),
-]
-
-
-class ArtifactDocumentV1(StrictModel):
-    document_id: OpaqueId
-    title: ShortText
-    media_type: Literal["text/markdown", "text/plain"]
-    content: LongText
-
-
-class ArtifactContentV1(StrictModel):
-    schema_version: Literal["1"] = SCHEMA_VERSION
-    artifact_id: OpaqueId
-    content_digest: Digest
-    documents: tuple[ArtifactDocumentV1, ...] = Field(
-        min_length=1, max_length=MAX_ARTIFACT_PREVIEW_DOCUMENTS
-    )
-    total_documents: int = Field(ge=1, le=1_000_000)
-    truncated: bool
-
-    @model_validator(mode="after")
-    def _bounded_preview(self) -> ArtifactContentV1:
-        if self.total_documents < len(self.documents):
-            raise ValueError("total_documents cannot be smaller than the returned preview")
-        if self.truncated != (self.total_documents > len(self.documents)):
-            raise ValueError("truncated must agree with total_documents")
-        aggregate_bytes = sum(len(document.content.encode("utf-8")) for document in self.documents)
-        if aggregate_bytes > MAX_ARTIFACT_PREVIEW_BYTES:
-            raise ValueError("artifact preview exceeds the aggregate byte budget")
-        return self
-
-
-class DiffLineV1(StrictModel):
-    kind: Literal["context", "added", "removed"]
-    old_line: int | None = Field(default=None, ge=1)
-    new_line: int | None = Field(default=None, ge=1)
-    text: DiffText
-
-
-class DiffHunkV1(StrictModel):
-    hunk_id: OpaqueId
-    heading: ShortText
-    lines: tuple[DiffLineV1, ...] = Field(max_length=10_000)
-
-
-class ArtifactDiffV1(StrictModel):
-    schema_version: Literal["1"] = SCHEMA_VERSION
-    artifact_id: OpaqueId
-    base_artifact_id: OpaqueId | None = None
-    hunks: tuple[DiffHunkV1, ...] = Field(max_length=1_024)
-    truncated: bool
-
-
-class ServiceV1(StrictModel):
-    schema_version: Literal["1"] = SCHEMA_VERSION
-    service_id: OpaqueId
-    display_name: ShortText
-    kind: Literal["core", "gateway", "model", "worker", "artifact_store"]
-    state: Literal["starting", "healthy", "degraded", "stopped", "failed", "unavailable"]
-    health_summary: ShortText
-    restart_supported: bool
-    observed_at: UtcTimestamp
-    etag: ETag
-
-
-class DiagnosticRequestV1(StrictModel):
-    scope: Literal["active_project", "connection", "core", "run", "services"]
-    resource_id: OpaqueId | None = None
-
-    @model_validator(mode="after")
-    def _resource_scope(self) -> DiagnosticRequestV1:
-        if self.scope in {"run", "services"} and self.resource_id is None:
-            raise ValueError("run and services diagnostics require resource_id")
-        if self.scope not in {"run", "services"} and self.resource_id is not None:
-            raise ValueError("resource_id is only valid for run or services diagnostics")
-        return self
+ServiceV1 = ServiceSummaryV1
+DiagnosticRequestV1 = DiagnosticsRequestV1
+DiagnosticReportV1 = DiagnosticV1
+TimelinePageV1 = RunTimelinePageV1
 
 
 class StateEventV1(StrictModel):
@@ -1174,34 +898,28 @@ class StateEventV1(StrictModel):
 
 
 class ResourceEventV1(StrictModel):
-    kind: Literal[
-        "profile_changed",
-        "project_changed",
-        "operation_changed",
-        "run_changed",
-        "artifact_available",
-        "service_changed",
-    ]
+    kind: Literal["resource_changed"] = "resource_changed"
+    authority: Literal["desktop", "core"]
     resource: ResourceRefV1
-    change: Literal["created", "updated", "deleted"]
+    change: Literal["created", "updated", "deleted", "appended"]
+    change_id: OpaqueId
+    resource_etag: ETag | None = None
+    content_sha256: Digest | None = None
 
-
-class TimelineEventV1(StrictModel):
-    kind: Literal["run_timeline"] = "run_timeline"
-    run_id: OpaqueId
-    entry: TimelineEntryV1
-
-
-class LogEventV1(StrictModel):
-    kind: Literal["log_appended"] = "log_appended"
-    resource: ResourceRefV1
-    entry: LogEntryV1
-
-
-class DiagnosticEventV1(StrictModel):
-    kind: Literal["diagnostic_ready"] = "diagnostic_ready"
-    diagnostic_id: OpaqueId
-    operation_id: OpaqueId
+    @model_validator(mode="after")
+    def _has_authoritative_identity(self) -> ResourceEventV1:
+        if self.resource_etag is None and self.content_sha256 is None:
+            raise ValueError("resource events require an authoritative ETag or digest")
+        desktop_resources = {"profile", "project", "operation", "maintenance"}
+        if self.authority == "desktop" and self.resource.resource_type not in desktop_resources:
+            raise ValueError("Desktop authority cannot identify a Core-owned resource")
+        if self.authority == "core" and self.resource.resource_type in {
+            "profile",
+            "project",
+            "maintenance",
+        }:
+            raise ValueError("Core changes must use a mapped Desktop project resource")
+        return self
 
 
 class HeartbeatEventV1(StrictModel):
@@ -1211,9 +929,6 @@ class HeartbeatEventV1(StrictModel):
 EventDataV1 = Annotated[
     StateEventV1
     | ResourceEventV1
-    | TimelineEventV1
-    | LogEventV1
-    | DiagnosticEventV1
     | HeartbeatEventV1,
     Field(discriminator="kind"),
 ]
@@ -1221,30 +936,14 @@ EventDataV1 = Annotated[
 
 EventNameV1 = Literal[
     "desktop.v1.state.changed",
-    "desktop.v1.profile.changed",
-    "desktop.v1.project.changed",
-    "desktop.v1.operation.changed",
-    "desktop.v1.run.changed",
-    "desktop.v1.run.timeline",
-    "desktop.v1.log.appended",
-    "desktop.v1.artifact.available",
-    "desktop.v1.service.changed",
-    "desktop.v1.diagnostic.ready",
+    "desktop.v1.resource.changed",
     "desktop.v1.heartbeat",
 ]
 
 
 _EVENT_NAMES_BY_KIND: dict[str, str] = {
     "state_changed": "desktop.v1.state.changed",
-    "profile_changed": "desktop.v1.profile.changed",
-    "project_changed": "desktop.v1.project.changed",
-    "operation_changed": "desktop.v1.operation.changed",
-    "run_changed": "desktop.v1.run.changed",
-    "run_timeline": "desktop.v1.run.timeline",
-    "log_appended": "desktop.v1.log.appended",
-    "artifact_available": "desktop.v1.artifact.available",
-    "service_changed": "desktop.v1.service.changed",
-    "diagnostic_ready": "desktop.v1.diagnostic.ready",
+    "resource_changed": "desktop.v1.resource.changed",
     "heartbeat": "desktop.v1.heartbeat",
 }
 
@@ -1254,7 +953,7 @@ class EventEnvelopeV1(StrictModel):
     event_id: OpaqueId
     event_name: EventNameV1
     occurred_at: UtcTimestamp
-    sequence: int = Field(ge=0)
+    sequence: int = Field(ge=0, le=MAX_SAFE_INTEGER)
     data: EventDataV1
 
     @model_validator(mode="after")
@@ -1295,11 +994,7 @@ class PageV1(StrictModel, Generic[PageItemT]):
 
 RemoteProfilePageV1 = PageV1[RemoteProfileV1]
 ProjectPageV1 = PageV1[ProjectV1]
-LogPageV1 = PageV1[LogEntryV1]
-RunPageV1 = PageV1[RunV1]
-TimelinePageV1 = PageV1[TimelineEntryV1]
-ArtifactPageV1 = PageV1[ArtifactV1]
-ServicePageV1 = PageV1[ServiceV1]
+LocalLogPageV1 = PageV1[LocalLogEntryV1]
 
 
 __all__ = tuple(sorted(name for name in globals() if name.endswith("V1"))) + (
