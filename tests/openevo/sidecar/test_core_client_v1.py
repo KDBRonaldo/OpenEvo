@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import queue
 import secrets
 import threading
 import time
@@ -300,7 +301,11 @@ def _chunk() -> v1.WorkspaceUploadChunkV1:
     )
 
 
-def _project(*, publication: v1.WorkspacePublicationV1 | None = None) -> v1.ProjectV1:
+def _project(
+    *,
+    publication: v1.WorkspacePublicationV1 | None = None,
+    registry_digest: str | None = None,
+) -> v1.ProjectV1:
     project_snapshot = _snapshot(
         "project-snapshot-2" if publication else "project-snapshot-1",
         v1.SnapshotKind.PROJECT,
@@ -329,6 +334,7 @@ def _project(*, publication: v1.WorkspacePublicationV1 | None = None) -> v1.Proj
         current_task_snapshot=_snapshot("task-snapshot-1", v1.SnapshotKind.TASK, "2"),
         current_workspace_snapshot=workspace_snapshot,
         workspace_publication=publication,
+        registry_digest=registry_digest,
         model_preparation=v1.ModelPreparationV1(
             model_ref="openai/gpt-oss-20b",
             status=v1.ModelPreparationStatus.UNRESOLVED,
@@ -789,6 +795,63 @@ def test_capabilities_pin_session_registry_and_execution_profile_authority() -> 
 
     assert changed_digest.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
     assert changed_profile.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+@pytest.mark.parametrize(
+    "project_first", [False, True], ids=["capabilities-first", "project-first"]
+)
+def test_capabilities_and_cached_project_bind_registry_digest_in_either_order(
+    project_first: bool,
+) -> None:
+    capabilities = _capabilities()
+    project = _project(registry_digest=capabilities.registry_digest)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = project if request.url.path.startswith("/v1/projects/") else capabilities
+        return httpx.Response(200, json=payload.model_dump(mode="json"))
+
+    client = _client(handler)
+    if project_first:
+        assert client.get_project() == project
+        assert client.capabilities(v1.ExecutionMode.SELF_DEPLOYED) == capabilities
+    else:
+        assert client.capabilities(v1.ExecutionMode.SELF_DEPLOYED) == capabilities
+        assert client.get_project() == project
+
+    assert client._project_state == project
+    assert client._capability_authority is not None
+    assert client._capability_authority.registry_digest == capabilities.registry_digest
+
+
+@pytest.mark.parametrize(
+    "project_first", [False, True], ids=["capabilities-first", "project-first"]
+)
+def test_capabilities_and_cached_project_reject_registry_mismatch_in_either_order(
+    project_first: bool,
+) -> None:
+    capabilities = _capabilities()
+    project = _project(registry_digest="5" * 64)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = project if request.url.path.startswith("/v1/projects/") else capabilities
+        return httpx.Response(200, json=payload.model_dump(mode="json"))
+
+    client = _client(handler)
+    if project_first:
+        assert client.get_project() == project
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.capabilities(v1.ExecutionMode.SELF_DEPLOYED)
+        assert client._project_state == project
+        assert client._capability_authority is None
+    else:
+        assert client.capabilities(v1.ExecutionMode.SELF_DEPLOYED) == capabilities
+        authority = client._capability_authority
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.get_project()
+        assert client._project_state is None
+        assert client._capability_authority == authority
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
 
 
 def test_validation_and_run_admission_require_exact_capability_authority() -> None:
@@ -1374,6 +1437,130 @@ def test_close_deadline_covers_blocking_response_close(monkeypatch) -> None:
         client.health()
 
 
+def test_close_generation_rejects_json_body_released_after_linearization() -> None:
+    class BlockingJsonStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.read_started = threading.Event()
+            self.release_body = threading.Event()
+            self.close_called = threading.Event()
+
+        def __iter__(self):
+            self.read_started.set()
+            self.release_body.wait(1)
+            yield json.dumps(_health_payload()).encode()
+
+        def close(self) -> None:
+            self.close_called.set()
+
+    body = BlockingJsonStream()
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=body,
+        )
+    )
+    results: list[v1.HealthResponseV1] = []
+    errors: list[CoreClientErrorV1] = []
+    close_errors: list[CoreClientErrorV1] = []
+
+    def read_health() -> None:
+        try:
+            results.append(client.health())
+        except CoreClientErrorV1 as exc:
+            errors.append(exc)
+
+    def close_client() -> None:
+        try:
+            client.close()
+        except CoreClientErrorV1 as exc:
+            close_errors.append(exc)
+
+    request_thread = threading.Thread(target=read_health)
+    close_thread = threading.Thread(target=close_client)
+    request_thread.start()
+    assert body.read_started.wait(1)
+    close_thread.start()
+    assert body.close_called.wait(1)
+    body.release_body.set()
+    request_thread.join(1)
+    close_thread.join(1)
+
+    assert not request_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert results == []
+    assert close_errors == []
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+
+
+def test_bounded_closer_start_failure_is_reported_by_close(monkeypatch) -> None:
+    class CloseTrackingTransport(httpx.BaseTransport):
+        def __init__(self) -> None:
+            self.close_called = False
+
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_health_payload(), request=request)
+
+        def close(self) -> None:
+            self.close_called = True
+
+    original_start = threading.Thread.start
+
+    def fail_closer_start(thread: threading.Thread) -> None:
+        if thread.name.startswith("openevo-core-resource-closer-"):
+            raise RuntimeError("injected start failure")
+        original_start(thread)
+
+    transport = CloseTrackingTransport()
+    client = CoreControlClientV1(_connection(), transport=transport)
+    monkeypatch.setattr(threading.Thread, "start", fail_closer_start)
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.close()
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    assert transport.close_called is False
+    assert client._close_tasks_pending == 0
+    assert client._resource_closer._workers == 0
+
+
+def test_bounded_closer_idle_submit_race_keeps_worker_for_accepted_action(
+    monkeypatch,
+) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    class CoordinatedQueue(queue.Queue):
+        def __init__(self) -> None:
+            super().__init__(maxsize=4)
+            self.idle_observed = threading.Event()
+            self.release_idle = threading.Event()
+
+        def get(self, block: bool = True, timeout: float | None = None):
+            if timeout is not None:
+                try:
+                    return super().get(block=False)
+                except queue.Empty:
+                    self.idle_observed.set()
+                    self.release_idle.wait(1)
+                    raise
+            return super().get(block=block, timeout=timeout)
+
+    monkeypatch.setattr(core_client_module, "CORE_CLOSE_WORKER_COUNT", 1)
+    closer = core_client_module._BoundedResourceCloser()
+    coordinated_queue = CoordinatedQueue()
+    closer._queue = coordinated_queue
+    first_done = threading.Event()
+    second_done = threading.Event()
+
+    assert closer.submit(first_done.set) is True
+    assert first_done.wait(1)
+    assert coordinated_queue.idle_observed.wait(1)
+    assert closer.submit(second_done.set) is True
+    coordinated_queue.release_idle.set()
+
+    assert second_done.wait(1)
+
+
 def test_late_response_close_is_handed_to_bounded_closer_without_state_lock(
     monkeypatch,
 ) -> None:
@@ -1493,6 +1680,63 @@ def test_sse_stream_validates_and_yields_final_wire_frame() -> None:
     assert isinstance(events[0], v1.SseFrameV1)
     assert events[0].event == "heartbeat.v1"
     assert events[0].data.root.event == "heartbeat.v1"
+
+
+def test_close_generation_rejects_late_sse_frame_without_replay_update() -> None:
+    first = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    second = {**first, "id": "event-2", "sequence": 2}
+
+    class BlockingSseStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.second_read_started = threading.Event()
+            self.release_second = threading.Event()
+
+        def __iter__(self):
+            yield _sse_bytes(first)
+            self.second_read_started.set()
+            self.release_second.wait(1)
+            yield _sse_bytes(second)
+
+    body = BlockingSseStream()
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=body,
+        )
+    )
+    late_frames: list[v1.SseFrameV1] = []
+    errors: list[CoreClientErrorV1] = []
+
+    with client.events() as stream:
+        iterator = iter(stream)
+        assert next(iterator).id == "event-1"
+
+        def read_late_frame() -> None:
+            try:
+                late_frames.append(next(iterator))
+            except CoreClientErrorV1 as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read_late_frame)
+        reader.start()
+        assert body.second_read_started.wait(1)
+        client.close()
+        body.release_second.set()
+        reader.join(1)
+
+    assert not reader.is_alive()
+    assert late_frames == []
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    assert "event-1" in client._sse_event_digests
+    assert "event-2" not in client._sse_event_digests
 
 
 def test_sse_event_id_is_bound_to_canonical_payload_across_reconnects() -> None:

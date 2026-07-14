@@ -170,12 +170,14 @@ class CoreSseStreamV1:
         private_values: tuple[str, ...],
         declared_length: int | None,
         close_started: Callable[[], bool],
+        session_guard: Callable[[], None],
     ) -> None:
         self._chunks = chunks
         self._validate_frame = validate_frame
         self._private_values = private_values
         self._declared_length = declared_length
         self._close_started = close_started
+        self._session_guard = session_guard
         self._started = False
 
     def __iter__(self) -> Iterator[v1.SseFrameV1]:
@@ -184,13 +186,18 @@ class CoreSseStreamV1:
         self._started = True
         boundary_error = False
         try:
+            self._session_guard()
             for frame in _iter_sse_frames(
                 self._chunks,
                 declared_length=self._declared_length,
             ):
+                self._session_guard()
                 validated_frame = _validate_sse_frame(frame, self._private_values)
+                self._session_guard()
                 self._validate_frame(validated_frame)
+                self._session_guard()
                 yield validated_frame
+                self._session_guard()
         except CoreClientErrorV1:
             raise
         except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError, ValidationError):
@@ -238,11 +245,11 @@ class _BoundedResourceCloser:
         self._worker_sequence = 0
 
     def submit(self, action: Callable[[], None]) -> bool:
-        try:
-            self._queue.put_nowait(action)
-        except queue.Full:
-            return False
         with self._lock:
+            try:
+                self._queue.put_nowait(action)
+            except queue.Full:
+                return False
             if self._workers < CORE_CLOSE_WORKER_COUNT:
                 self._worker_sequence += 1
                 self._workers += 1
@@ -255,7 +262,11 @@ class _BoundedResourceCloser:
                     worker.start()
                 except RuntimeError:
                     self._workers -= 1
-        return True
+                    if self._workers == 0:
+                        self._queue.get_nowait()
+                        self._queue.task_done()
+                        return False
+            return True
 
     def _worker(self) -> None:
         while True:
@@ -263,10 +274,15 @@ class _BoundedResourceCloser:
                 action = self._queue.get(timeout=1.0)
             except queue.Empty:
                 with self._lock:
-                    self._workers -= 1
-                return
+                    try:
+                        action = self._queue.get_nowait()
+                    except queue.Empty:
+                        self._workers -= 1
+                        return
             try:
                 action()
+            except BaseException:
+                pass
             finally:
                 self._queue.task_done()
 
@@ -288,6 +304,7 @@ class CoreControlClientV1:
         self._membership_lock = threading.RLock()
         self._closing = False
         self._closed = False
+        self._session_generation = 0
         self._close_tasks_pending = 0
         self._close_failed = False
         self._resource_closer = _BoundedResourceCloser()
@@ -339,6 +356,7 @@ class CoreControlClientV1:
                     self._state.wait(remaining)
                 return
             self._closing = True
+            self._session_generation += 1
             close_actions = tuple(response.close for response in self._active_responses) + (
                 self._http.close,
             )
@@ -361,7 +379,7 @@ class CoreControlClientV1:
         if close_failed:
             raise _local_exception(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503) from None
 
-    def _schedule_close(self, close_action: Callable[[], None]) -> None:
+    def _schedule_close(self, close_action: Callable[[], None]) -> bool:
         with self._state:
             self._close_tasks_pending += 1
 
@@ -383,6 +401,8 @@ class CoreControlClientV1:
                 self._close_failed = True
                 self._close_tasks_pending -= 1
                 self._state.notify_all()
+            return False
+        return True
 
     def version(self) -> v1.VersionResponseV1:
         return self._json("GET", "/version", v1.VersionResponseV1, authenticated=False)
@@ -452,9 +472,9 @@ class CoreControlClientV1:
             evaluated_profile=result.evaluated_profile,
         )
         with self._membership_lock:
-            if (
-                self._project_state is not None
-                and self._project_state.execution_mode is not execution_mode
+            if self._project_state is not None and (
+                self._project_state.execution_mode is not execution_mode
+                or self._project_state.registry_digest != result.registry_digest
             ):
                 _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
             if self._capability_authority is not None and self._capability_authority != authority:
@@ -1296,23 +1316,29 @@ class CoreControlClientV1:
                 400,
             )
             headers["Last-Event-ID"] = cursor
-        with self._lease():
+        with self._lease() as session_generation:
             transport_error = False
+            release_failed = False
             response: httpx.Response | None = None
             registered = False
             try:
                 request = self._http.build_request("GET", "/v1/events", headers=headers)
                 response = self._http.send(request, stream=True, follow_redirects=False)
-                self._register_response(response)
+                self._register_response(response, session_generation)
                 registered = True
+                self._ensure_session_generation(session_generation)
                 self._ensure_response_origin(response)
                 if 300 <= response.status_code < 400:
                     _read_bounded(response, MAX_CORE_ERROR_RESPONSE_BYTES)
+                    self._ensure_session_generation(session_generation)
                     _raise_local(CoreClientLocalErrorCodeV1.REDIRECT_REJECTED, 502)
                 if response.status_code != 200:
                     body = _read_bounded(response, MAX_CORE_ERROR_RESPONSE_BYTES)
+                    self._ensure_session_generation(session_generation)
                     _require_content_type(response, "application/json", error_response=True)
-                    self._raise_http_error(response.status_code, body)
+                    self._raise_http_error(
+                        response.status_code, body, session_generation=session_generation
+                    )
                 _require_content_type(response, "text/event-stream")
                 if response.headers.get("content-encoding", "identity").lower() not in {
                     "",
@@ -1324,12 +1350,16 @@ class CoreControlClientV1:
                     MAX_CORE_SSE_RESPONSE_BYTES,
                     invalid_code=CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR,
                 )
+                self._ensure_session_generation(session_generation)
                 yield CoreSseStreamV1(
                     response.iter_bytes(),
-                    validate_frame=self._validate_sse_frame,
+                    validate_frame=lambda frame: self._validate_sse_frame(
+                        frame, session_generation
+                    ),
                     private_values=self._private_values(),
                     declared_length=declared_length,
                     close_started=self._close_started,
+                    session_guard=lambda: self._ensure_session_generation(session_generation),
                 )
             except CoreClientErrorV1:
                 raise
@@ -1337,8 +1367,10 @@ class CoreControlClientV1:
                 transport_error = True
             finally:
                 if registered and response is not None:
-                    self._release_response(response)
+                    release_failed = not self._release_response(response)
             if transport_error:
+                self._raise_transport_error()
+            if release_failed:
                 self._raise_transport_error()
 
     def _mutation(
@@ -1407,8 +1439,9 @@ class CoreControlClientV1:
         request_headers = self._headers(authenticated=authenticated, accept="application/json")
         if headers:
             request_headers.update(headers)
-        with self._lease():
+        with self._lease() as session_generation:
             transport_error = False
+            release_failed = False
             response: httpx.Response | None = None
             registered = False
             try:
@@ -1420,8 +1453,9 @@ class CoreControlClientV1:
                     headers=request_headers,
                 )
                 response = self._http.send(request, stream=True, follow_redirects=False)
-                self._register_response(response)
+                self._register_response(response, session_generation)
                 registered = True
+                self._ensure_session_generation(session_generation)
                 self._ensure_response_origin(response)
                 limit = (
                     max_response_bytes
@@ -1429,6 +1463,7 @@ class CoreControlClientV1:
                     else MAX_CORE_ERROR_RESPONSE_BYTES
                 )
                 body = _read_bounded(response, limit)
+                self._ensure_session_generation(session_generation)
                 status_code = response.status_code
                 content_type = response.headers.get("content-type")
             except CoreClientErrorV1:
@@ -1437,43 +1472,49 @@ class CoreControlClientV1:
                 transport_error = True
             finally:
                 if registered and response is not None:
-                    self._release_response(response)
+                    release_failed = not self._release_response(response)
             if transport_error:
                 self._raise_transport_error()
-        if 300 <= status_code < 400:
-            _raise_local(CoreClientLocalErrorCodeV1.REDIRECT_REJECTED, 502)
-        if status_code != expected_status:
-            if content_type is None or (
-                content_type.split(";", 1)[0].strip().lower() != "application/json"
+            if release_failed:
+                self._raise_transport_error()
+            self._ensure_session_generation(session_generation)
+            if 300 <= status_code < 400:
+                _raise_local(CoreClientLocalErrorCodeV1.REDIRECT_REJECTED, 502)
+            if status_code != expected_status:
+                if content_type is None or (
+                    content_type.split(";", 1)[0].strip().lower() != "application/json"
+                ):
+                    _raise_local(CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502)
+                self._raise_http_error(status_code, body, session_generation=session_generation)
+            if expected_status == 204:
+                if body:
+                    _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+                self._ensure_session_generation(session_generation)
+                return None
+            if (
+                content_type is None
+                or content_type.split(";", 1)[0].strip().lower() != "application/json"
             ):
-                _raise_local(CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502)
-            self._raise_http_error(status_code, body)
-        if expected_status == 204:
-            if body:
                 _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
-            return None
-        if (
-            content_type is None
-            or content_type.split(";", 1)[0].strip().lower() != "application/json"
-        ):
-            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
-        decoded = _decode_json_checked(
-            body,
-            self._private_values(),
-            CoreClientLocalErrorCodeV1.INVALID_RESPONSE,
-        )
-        validation_failed = False
-        try:
-            adapter = TypeAdapter(response_model)
-            if not _json_matches_schema_types(decoded, adapter.json_schema(mode="validation")):
-                raise ValueError("response scalar does not match the contract schema")
-            return adapter.validate_json(body)
-        except (ValidationError, ValueError, TypeError, RecursionError):
-            validation_failed = True
-        if validation_failed:
-            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            decoded = _decode_json_checked(
+                body,
+                self._private_values(),
+                CoreClientLocalErrorCodeV1.INVALID_RESPONSE,
+            )
+            try:
+                adapter = TypeAdapter(response_model)
+                if not _json_matches_schema_types(decoded, adapter.json_schema(mode="validation")):
+                    raise ValueError("response scalar does not match the contract schema")
+                result = adapter.validate_json(body)
+            except (ValidationError, ValueError, TypeError, RecursionError):
+                self._ensure_session_generation(session_generation)
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            self._ensure_session_generation(session_generation)
+            return result
 
-    def _raise_http_error(self, status_code: int, body: bytes) -> None:
+    def _raise_http_error(
+        self, status_code: int, body: bytes, *, session_generation: int
+    ) -> NoReturn:
         decoded = _decode_json_checked(
             body,
             self._private_values(),
@@ -1486,12 +1527,14 @@ class CoreControlClientV1:
                 raise ValueError("error scalar does not match the contract schema")
             error = adapter.validate_json(body)
         except (ValidationError, ValueError, TypeError, RecursionError):
+            self._ensure_session_generation(session_generation)
             validation_failed = True
             error = None
         if validation_failed or error is None:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502)
         if error.http_status != status_code:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502)
+        self._ensure_session_generation(session_generation)
         raise CoreClientErrorV1(status_code, error) from None
 
     def _headers(self, *, authenticated: bool, accept: str) -> dict[str, str]:
@@ -1522,7 +1565,7 @@ class CoreControlClientV1:
         return headers
 
     @contextmanager
-    def _lease(self) -> Iterator[None]:
+    def _lease(self) -> Iterator[int]:
         owner = threading.get_ident()
         with self._state:
             if self._closing or self._closed:
@@ -1531,8 +1574,9 @@ class CoreControlClientV1:
                 _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
             self._leases += 1
             self._lease_owners[owner] = self._lease_owners.get(owner, 0) + 1
+            session_generation = self._session_generation
         try:
-            yield
+            yield session_generation
         finally:
             with self._state:
                 self._leases -= 1
@@ -1543,10 +1587,10 @@ class CoreControlClientV1:
                     del self._lease_owners[owner]
                 self._state.notify_all()
 
-    def _register_response(self, response: httpx.Response) -> None:
+    def _register_response(self, response: httpx.Response, session_generation: int) -> None:
         close_late_response = False
         with self._state:
-            if self._closing or self._closed:
+            if self._closing or self._closed or session_generation != self._session_generation:
                 close_late_response = True
             else:
                 self._active_responses.add(response)
@@ -1554,18 +1598,24 @@ class CoreControlClientV1:
             self._schedule_close(response.close)
             _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
 
-    def _release_response(self, response: httpx.Response) -> None:
+    def _release_response(self, response: httpx.Response) -> bool:
         owns_close = False
         with self._state:
             if response in self._active_responses:
                 self._active_responses.remove(response)
                 owns_close = True
         if owns_close:
-            self._schedule_close(response.close)
+            return self._schedule_close(response.close)
+        return True
 
     def _close_started(self) -> bool:
         with self._state:
             return self._closing or self._closed
+
+    def _ensure_session_generation(self, session_generation: int) -> None:
+        with self._state:
+            if self._closing or self._closed or session_generation != self._session_generation:
+                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
 
     def _raise_transport_error(self) -> None:
         if self._close_started():
@@ -1596,6 +1646,7 @@ class CoreControlClientV1:
                 self._operations,
                 self._diagnostics,
                 self._sse_event_digests,
+                self._capability_authority,
             )
             self._members = self._members.copy()
             self._log_refs = self._log_refs.copy()
@@ -1624,6 +1675,7 @@ class CoreControlClientV1:
                     self._operations,
                     self._diagnostics,
                     self._sse_event_digests,
+                    self._capability_authority,
                 ) = original
                 raise
 
@@ -1748,9 +1800,9 @@ class CoreControlClientV1:
         if expected_id is not None and project.id != expected_id:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         with self._membership_lock:
-            if (
-                self._capability_authority is not None
-                and project.execution_mode is not self._capability_authority.execution_mode
+            if self._capability_authority is not None and (
+                project.execution_mode is not self._capability_authority.execution_mode
+                or project.registry_digest != self._capability_authority.registry_digest
             ):
                 _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
             self._project_state = project
@@ -2022,7 +2074,7 @@ class CoreControlClientV1:
             return
         _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
 
-    def _validate_sse_frame(self, frame: v1.SseFrameV1) -> None:
+    def _validate_sse_frame(self, frame: v1.SseFrameV1, session_generation: int) -> None:
         canonical_event = json.dumps(
             frame.data.model_dump(mode="json"),
             ensure_ascii=False,
@@ -2031,16 +2083,19 @@ class CoreControlClientV1:
             separators=(",", ":"),
         ).encode("utf-8")
         event_digest = hashlib.sha256(canonical_event).hexdigest()
-        with self._membership_lock:
-            previous_digest = self._sse_event_digests.get(frame.id)
-            if previous_digest is not None:
-                if previous_digest != event_digest:
+        with self._state:
+            if self._closing or self._closed or session_generation != self._session_generation:
+                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+            with self._membership_lock:
+                previous_digest = self._sse_event_digests.get(frame.id)
+                if previous_digest is not None:
+                    if previous_digest != event_digest:
+                        _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
+                    return
+                if len(self._sse_event_digests) >= MAX_CORE_SSE_EVENT_BINDINGS:
                     _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
-                return
-            if len(self._sse_event_digests) >= MAX_CORE_SSE_EVENT_BINDINGS:
-                _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
-            self._validate_event_membership(frame.data)
-            self._sse_event_digests[frame.id] = event_digest
+                self._validate_event_membership(frame.data)
+                self._sse_event_digests[frame.id] = event_digest
 
     def _active_project(self, project_id: str | None) -> str:
         if project_id is None:

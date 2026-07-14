@@ -24,7 +24,10 @@ as valid encodings of tuple fields. The first valid capabilities response pins
 the client lifetime's exact release execution profile and registry digest.
 Later capability reads, project validation requests/responses, project
 snapshots, and run requests/responses must match that authority, in addition to
-the run snapshot and required-revision bindings. Malformed, oversized,
+the run snapshot and required-revision bindings. Capability and cached Core
+project registry digests are compared exactly regardless of which response
+arrives first; a missing project digest does not match a pinned capability
+digest. Malformed, oversized,
 redirected, cross-project, or connection failures become closed local errors
 without raw bodies, headers, URLs, paths, or credentials.
 
@@ -35,8 +38,18 @@ after sealing, is submitted outside the state lock to that client's
 fixed-worker, fixed-capacity daemon closer. An uninterruptible synchronous
 close therefore cannot exceed the caller's total wait bound. On timeout the client remains
 permanently closed while the bounded closer retains accepted old resources
-until their close calls return. A closed connection cannot send its bearer
+until their close calls return. Enqueue and worker retirement share one lock, so
+an idle worker rechecks the queue before exiting. If starting the first worker
+fails, submission is explicitly rejected and the client reports a typed failure;
+a later submission retries worker creation. A closed connection cannot send its bearer
 after Desktop switches to another project session or tunnel.
+
+The close seal increments a client session generation. A request rechecks that
+generation after response registration and bounded body reads and before a JSON
+result is returned. SSE rechecks it around frame parsing, state/replay-ledger
+application, and yield; frame application holds the same state lock as the close
+linearization point. Bodies and frames released after the seal therefore cannot
+be returned or mutate the retired session's authority caches.
 
 After JSON decoding, every nested string key and value is checked for the
 bearer, fixed Core tunnel URL/origin, and private Desktop session identity. The

@@ -234,7 +234,10 @@ profile selected by the requested release execution mode. The first valid
 response pins that complete profile and registry digest as the active-tunnel
 client authority. Later capability responses, Core project snapshots,
 validation requests/responses, and run requests/responses must match the pin;
-a different profile or digest requires a new project-session client. Run
+a different profile or digest requires a new project-session client. This
+binding is order independent: a cached Core project registry digest constrains
+the first capability response, and a pinned capability digest constrains every
+later project snapshot. `null` and a concrete digest are not equal. Run
 admission must also return the request's exact project, task, workspace, and
 required-revision references. Project responses expose
 typed remote model preparation and active-revision state rather than asking
@@ -254,7 +257,18 @@ Normal response completion, normal SSE context exit, active responses, and
 responses arriving after the seal all submit close ownership to a fixed-worker,
 fixed-capacity daemon closer owned by that client. `close()` waits only to its
 hard deadline; accepted late close work remains owned by that bounded closer
-and cannot consume a replacement session's workers.
+and cannot consume a replacement session's workers. Queue admission and idle
+worker retirement are serialized; an idle worker rechecks the queue before it
+decrements the live-worker count. A failed first `Thread.start()` rejects that
+submission, records a typed close failure, and leaves later submissions able to
+retry worker creation. It is never reported as accepted work without a worker.
+
+Sealing also advances a per-client session generation. JSON response handling
+rechecks that generation after response registration and body reads and before
+return. SSE handling rechecks it around parsing, authority/replay-ledger
+application, and yield; application and the close linearization point share the
+state lock. A body or frame released after sealing cannot be returned, applied,
+or recorded as replay authority for the retired session.
 
 Local SSE carries Desktop state changes and resource invalidations. Every
 resource invalidation includes the authoritative ETag or content digest and
