@@ -1,5 +1,7 @@
 import { CONTRACT_FIXTURE_V1 } from "../api/v1/fixtures";
+import { DesktopApiError } from "../api/v1/client";
 import {
+  apiErrorV1Schema,
   artifactContentV1Schema,
   artifactDiffV1Schema,
   artifactV1Schema,
@@ -83,6 +85,13 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private failProjectSave = false;
   private failProjectSaveWithUnknownError = false;
   private failRefresh = false;
+  private restoreCapabilitiesOnRefresh: ProjectCapabilitiesV1 | null = null;
+  private capabilityRefreshesBeforeRestore = 0;
+  private nextProjectSaveStatus: 412 | null = null;
+  private nextRunStartStatus: 409 | 410 | null = null;
+  private refreshAttempts = 0;
+  private projectSaveAttempts = 0;
+  private runAdmissionAttempts = 0;
   private diagnostic: DiagnosticReportV1 | null;
   private activeOperation: LocalOperationV1 | null = null;
   private readonly contents = new Map<string, ArtifactContentV1>();
@@ -114,12 +123,21 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   async refresh(): Promise<ProductRefreshResult> {
+    this.refreshAttempts += 1;
     if (this.failRefresh) {
       this.failRefresh = false;
       throw new Error("internal refresh details");
     }
     if (this.stream.status !== "fresh") {
       this.stream = { status: "fresh", epoch: this.stream.epoch + 1, lastEventId: null };
+    }
+    if (this.restoreCapabilitiesOnRefresh && this.capabilityRefreshesBeforeRestore > 0) {
+      this.capabilityRefreshesBeforeRestore -= 1;
+    } else if (this.restoreCapabilitiesOnRefresh) {
+      this.capabilities = this.restoreCapabilitiesOnRefresh;
+      this.restoreCapabilitiesOnRefresh = null;
+      const project = this.projects.find((item) => item.project_id === this.capabilities?.project_id);
+      this.validation = project && this.capabilities ? this.makeValidation(project, this.capabilities) : null;
     }
     return { status: "fresh", snapshot: this.snapshot() };
   }
@@ -310,8 +328,14 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   async updateProject(projectId: string, input: ProjectPatchV1, intent: ProductResourceMutationIntent): Promise<ProjectV1> {
+    this.projectSaveAttempts += 1;
     const current = this.requireProject(projectId);
     this.checkIntent(intent, `project:update:${projectId}`, current.etag);
+    if (this.nextProjectSaveStatus) {
+      const status = this.nextProjectSaveStatus;
+      this.nextProjectSaveStatus = null;
+      throw this.apiError(status, "etag_precondition_failed", "The project changed remotely.", "project");
+    }
     if (this.failProjectSave) {
       this.failProjectSave = false;
       throw new DesktopProductUserError("The project could not be saved. Try again.");
@@ -370,6 +394,16 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   async startRun(intent: ProductRunIntent): Promise<RunV1> {
+    this.runAdmissionAttempts += 1;
+    if (this.nextRunStartStatus) {
+      const status = this.nextRunStartStatus;
+      this.nextRunStartStatus = null;
+      if (status === 410) {
+        this.stream = { status: "cursor_reset", epoch: this.stream.epoch, resumeFromEventId: null };
+        throw this.apiError(status, "event_cursor_expired", "The event cursor expired.", "run");
+      }
+      throw this.apiError(status, "run_admission_conflict", "The required revision changed before admission.", "run");
+    }
     const projectId = intent.projectId;
     const project = this.requireProject(projectId);
     this.checkIntent(intent, `run:start:${projectId}`, project.etag);
@@ -915,6 +949,28 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     });
   }
 
+  private apiError(
+    httpStatus: 409 | 410 | 412,
+    code: string,
+    message: string,
+    category: "project" | "run",
+  ): DesktopApiError {
+    return new DesktopApiError(apiErrorV1Schema.parse({
+      schema_version: "1",
+      request_id: `request-fixture-${httpStatus}`,
+      code,
+      http_status: httpStatus,
+      message,
+      severity: "blocking",
+      category,
+      retryable: true,
+      repair_action: "openevo_can_retry",
+      next_action: httpStatus === 412 ? "Review the refreshed project and save again." : "Reload the current snapshot before retrying.",
+      details: {},
+      logs_ref: null,
+    }));
+  }
+
   private revision(generation: number, state: "active" | "queued" | "preparing" | "cancelled") {
     return {
       revision_id: `revision-fixture-${generation}`,
@@ -1008,6 +1064,207 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   failNextRefresh(): void {
     this.failRefresh = true;
+  }
+
+  setCapabilitiesUnavailableUntilRefresh(): void {
+    this.restoreCapabilitiesOnRefresh = this.capabilities;
+    this.capabilityRefreshesBeforeRestore = 1;
+    this.capabilities = null;
+    this.validation = null;
+    this.emit();
+  }
+
+  useEditableMethodSchema(): void {
+    const project = this.projects[0];
+    const capabilities = this.capabilities;
+    if (!project || !capabilities) return;
+    const defaultConfig = {
+      prompt: "Keep durable findings.",
+      iterations: 3,
+      temperature: 0.1,
+      strategy: "balanced",
+      include_failures: false,
+      advanced: { minimum_score: 0.5 },
+      tags: ["research"],
+    };
+    const configSchema = {
+      type: "object",
+      additionalProperties: false,
+      required: ["prompt", "iterations", "strategy", "include_failures", "advanced", "tags"],
+      properties: {
+        prompt: { type: "string", title: "Reflection prompt", minLength: 1, maxLength: 512 },
+        iterations: { type: "integer", title: "Iterations", minimum: 1, maximum: 20 },
+        temperature: { type: "number", title: "Temperature", minimum: 0, maximum: 2 },
+        strategy: { type: "string", title: "Strategy", enum: ["balanced", "strict"] },
+        include_failures: { type: "boolean", title: "Include failures" },
+        advanced: {
+          type: "object",
+          title: "Advanced",
+          additionalProperties: false,
+          required: ["minimum_score"],
+          properties: {
+            minimum_score: { type: "number", title: "Minimum score", minimum: 0, maximum: 1 },
+          },
+        },
+        tags: { type: "array", title: "Tags", items: { type: "string", maxLength: 64 }, maxItems: 8 },
+      },
+    };
+    this.capabilities = projectCapabilitiesV1Schema.parse({
+      ...capabilities,
+      targets: capabilities.targets.map((target) => target.target_id === "text_memory"
+        ? {
+            ...target,
+            methods: target.methods.map((method) => method.method_id === "reference_text_memory"
+              ? { ...method, config_schema: configSchema, default_config: defaultConfig }
+              : method),
+          }
+        : target),
+    });
+    const updated = projectV1Schema.parse({
+      ...project,
+      evolution: {
+        targets: {
+          ...project.evolution.targets,
+          text_memory: { enabled: true, method: "reference_text_memory", config: defaultConfig },
+        },
+      },
+    });
+    this.projects = [updated, ...this.projects.slice(1)];
+    this.validation = this.makeValidation(updated, this.capabilities);
+  }
+
+  useNullEffectiveDefault(): void {
+    const project = this.projects[0];
+    const capabilities = this.capabilities;
+    if (!project || !capabilities) return;
+    this.capabilities = projectCapabilitiesV1Schema.parse({
+      ...capabilities,
+      targets: capabilities.targets.map((target) => target.target_id === "text_memory"
+        ? { ...target, effective_default_method_id: null }
+        : target),
+    });
+    const updated = projectV1Schema.parse({
+      ...project,
+      evolution: {
+        targets: {
+          ...project.evolution.targets,
+          text_memory: { enabled: false, method: "reference_text_memory", config: {} },
+        },
+      },
+    });
+    this.projects = [updated, ...this.projects.slice(1)];
+    this.validation = this.makeValidation(updated, this.capabilities);
+  }
+
+  useRunStateReviewScenario(): void {
+    const project = this.projects[0];
+    if (!project) return;
+    const pinned = this.revision(2, "active");
+    const base = structuredClone(CONTRACT_FIXTURE_V1.run);
+    const makeRun = (
+      id: string,
+      state: RunV1["state"],
+      updatedAt: string,
+      options: { queued?: boolean; failed?: boolean } = {},
+    ) => runV1Schema.parse({
+      ...base,
+      run_id: id,
+      project_id: project.project_id,
+      state,
+      queued_reason: options.queued ? {
+        code: "service_starting",
+        summary: "The selected model is being prepared.",
+        retry_after_seconds: 5,
+      } : null,
+      pinned_revision: pinned,
+      successor_revision: null,
+      latest_attempt: {
+        ...base.latest_attempt,
+        attempt_id: `attempt-${id}`,
+        state,
+        started_at: state === "queued" ? null : updatedAt,
+        finished_at: isTerminal(state) ? updatedAt : null,
+      },
+      created_at: "2026-07-14T10:00:00Z",
+      updated_at: updatedAt,
+      error: options.failed ? this.apiError(409, "model_load_failed", "The model worker could not load the selected model.", "run").apiError : null,
+    });
+    this.runs = [
+      makeRun("run-succeeded", "succeeded", "2026-07-14T10:10:00Z"),
+      makeRun("run-queued-model", "queued", "2026-07-14T10:40:00Z", { queued: true }),
+      makeRun("run-cancelled", "cancelled", "2026-07-14T10:20:00Z"),
+      makeRun("run-failed-model", "failed", "2026-07-14T10:30:00Z", { failed: true }),
+    ];
+    this.timelines["run-queued-model"] = [this.timeline(1, "admission", "queued", "Model preparation", "The selected model is being prepared.")];
+    this.services = this.services.map((service) => service.kind === "model"
+      ? serviceV1Schema.parse({ ...service, state: "starting", health_summary: "Preparing the selected model." })
+      : service);
+  }
+
+  useAuthoritativeArtifactOrderingScenario(): void {
+    const project = this.projects[0];
+    if (!project) return;
+    const runId = "run-revision-4";
+    const base = structuredClone(CONTRACT_FIXTURE_V1.run);
+    const run = runV1Schema.parse({
+      ...base,
+      run_id: runId,
+      project_id: project.project_id,
+      state: "succeeded",
+      queued_reason: null,
+      pinned_revision: this.revision(2, "active"),
+      successor_revision: this.revision(4, "active"),
+      latest_attempt: { ...base.latest_attempt, attempt_id: "attempt-revision-4", state: "succeeded", finished_at: NOW },
+      error: null,
+    });
+    this.runs = [run, ...this.runs];
+    this.projects = [{ ...project, current_revision_id: "revision-fixture-4" }, ...this.projects.slice(1)];
+    this.createArtifacts(runId, 4);
+    const times: Record<string, string> = {
+      skill_bundle: "2026-07-14T12:03:00Z",
+      text_memory: "2026-07-14T12:02:00Z",
+      agent_system: "2026-07-14T12:01:00Z",
+    };
+    this.artifacts = this.artifacts.map((artifact) => artifact.revision_ids.includes("revision-fixture-4")
+      ? artifactV1Schema.parse({ ...artifact, created_at: times[artifact.target_id] ?? NOW })
+      : artifact);
+    const source = this.artifacts.find((artifact) => artifact.target_id === "text_memory" && artifact.revision_ids.includes("revision-fixture-4"));
+    if (source) {
+      this.artifacts = [artifactV1Schema.parse({
+        ...source,
+        artifact_id: "artifact-unselected-newer",
+        display_name: "Unselected newer artifact",
+        selected: false,
+        created_at: "2026-07-14T12:04:00Z",
+      }), ...this.artifacts];
+    }
+  }
+
+  makeRevisionEvidenceUnknown(): void {
+    const project = this.projects[0];
+    if (!project) return;
+    this.projects = [{ ...project, current_revision_id: "revision-unknown" }, ...this.projects.slice(1)];
+    this.emit();
+  }
+
+  failNextProjectSaveWithStatus(status: 412): void {
+    this.nextProjectSaveStatus = status;
+  }
+
+  failNextRunStartWithStatus(status: 409 | 410): void {
+    this.nextRunStartStatus = status;
+  }
+
+  refreshCount(): number {
+    return this.refreshAttempts;
+  }
+
+  projectUpdateAttempts(): number {
+    return this.projectSaveAttempts;
+  }
+
+  runStartAttempts(): number {
+    return this.runAdmissionAttempts;
   }
 
   addDraftProject(): ProjectV1 {

@@ -112,6 +112,8 @@ describe("DesktopProductApp", () => {
     await clickButton("Evolution");
     await flush();
     expect(screenText()).toContain("Preview is truncated");
+    await clickButton("Text memory");
+    await flush();
     expect(screenText()).toContain("Research memory");
     await clickButton("Skills");
     await flush();
@@ -228,6 +230,138 @@ describe("DesktopProductApp", () => {
     expect(button("Start session").disabled).toBe(false);
   });
 
+  it("retries unavailable capabilities for the same project and mode without losing the draft", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+    await act(async () => provider?.setCapabilitiesUnavailableUntilRefresh());
+    await flush();
+
+    await clickAria("Project settings");
+    setInput("Objective", "Keep this capability retry draft.");
+    expect(screenText()).toContain("Capabilities are unavailable for this project and mode.");
+    await clickButton("Retry capabilities");
+
+    expect(screenText()).toContain("Keep this capability retry draft.");
+    expect(screenText()).not.toContain("Capabilities are unavailable for this project and mode.");
+  });
+
+  it("edits every ordinary field in a closed remote method config schema", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useEditableMethodSchema();
+    root = await renderProduct(provider);
+    await clickAria("Project settings");
+
+    setInput("Reflection prompt", "Retain only verified findings.");
+    setInput("Iterations", "7");
+    setInput("Temperature", "0.25");
+    setSelect("Strategy", "strict");
+    setCheckbox("Include failures", true);
+    setInput("Minimum score", "0.8");
+    setInput("Tags", '["evidence","review"]');
+    await clickButton("Save");
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
+    expect(refreshed.snapshot.projects[0]?.evolution.targets.text_memory?.config).toEqual({
+      prompt: "Retain only verified findings.",
+      iterations: 7,
+      temperature: 0.25,
+      strategy: "strict",
+      include_failures: true,
+      advanced: { minimum_score: 0.8 },
+      tags: ["evidence", "review"],
+    });
+  });
+
+  it("does not enable a target when the remote effective default is null", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useNullEffectiveDefault();
+    root = await renderProduct(provider);
+    await clickAria("Project settings");
+
+    const toggle = document.querySelector<HTMLInputElement>('.target-toggle[data-target-id="text_memory"] input[role="switch"]');
+    expect(toggle?.checked).toBe(false);
+    expect(toggle?.disabled).toBe(true);
+    expect(screenText()).toContain("No supported default is available from the remote registry.");
+  });
+
+  it("renders typed queued, succeeded, failed, and cancelled run outcomes with recovery", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("Model preparation");
+    expect(screenText()).toContain("The selected model is being prepared.");
+    expect(screenText()).toContain("The model worker could not load the selected model.");
+    expect(screenText()).toContain("Complete");
+    expect(screenText()).toContain("Failed");
+    expect(screenText()).toContain("Cancelled");
+    expect(document.querySelectorAll('[role="columnheader"]')).toHaveLength(6);
+    expect(document.querySelectorAll('[role="cell"]').length).toBeGreaterThanOrEqual(24);
+
+    await clickButton("Cancel session");
+    expect(button("Retry session").disabled).toBe(false);
+    await clickButton("Retry session");
+    expect(screenText()).toContain("Preparing the remote workspace.");
+  });
+
+  it("uses selected revision membership and stable time/id ordering for artifacts", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useAuthoritativeArtifactOrderingScenario();
+    root = await renderProduct(provider);
+    await clickButton("Evolution");
+    await flush();
+
+    expect(screenText()).toContain("Revision 4");
+    expect(screenText()).not.toContain("Unselected newer artifact");
+    const artifactNames = Array.from(document.querySelectorAll(".artifact-list-item strong"), (item) => item.textContent);
+    expect(artifactNames).toEqual(["Skills", "Text memory", "Agent guidance"]);
+
+    provider.makeRevisionEvidenceUnknown();
+    await flush();
+    expect(screenText()).toContain("Revision unknown");
+    expect(button("Refetch revision").disabled).toBe(false);
+  });
+
+  it("reloads typed 409/410/412 failures without replaying stale mutations", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    setInput("Objective", "Draft retained across an etag refresh.");
+    provider.failNextProjectSaveWithStatus(412);
+    await clickButton("Save");
+    expect(screenText()).toContain("Draft retained across an etag refresh.");
+    expect(screenText()).toContain("The project changed remotely.");
+    expect(provider.projectUpdateAttempts()).toBe(1);
+    await clickButton("Save");
+    expect(provider.projectUpdateAttempts()).toBe(2);
+
+    provider.failNextRunStartWithStatus(409);
+    await clickButton("Start session");
+    expect(provider.runStartAttempts()).toBe(1);
+    expect(button("Re-admit session").disabled).toBe(false);
+    await clickButton("Re-admit session");
+    expect(provider.runStartAttempts()).toBe(2);
+    await clickButton("Cancel session");
+
+    provider.failNextRunStartWithStatus(410);
+    await clickButton("Start session");
+    expect(provider.runStartAttempts()).toBe(3);
+    expect(provider.refreshCount()).toBeGreaterThanOrEqual(4);
+    expect(screenText()).toContain("The event cursor expired.");
+  });
+
+  it("marks segmented controls as tabs with an explicit selected state", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+    await clickAria("Project settings");
+
+    const tablists = document.querySelectorAll('[role="tablist"]');
+    expect(tablists.length).toBeGreaterThanOrEqual(2);
+    expect(document.querySelector('[role="tab"][aria-selected="true"]')).not.toBeNull();
+  });
+
   it("requires explicit activation after a project switch", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.addDraftProject();
@@ -269,7 +403,7 @@ describe("DesktopProductApp", () => {
     });
   });
 
-  it("keeps drawers and drafts after save failures and restores focus on Escape", async () => {
+  it("keeps dirty drawer drafts until Escape, overlay, or close is confirmed", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     root = await renderProduct(provider);
     const opener = document.querySelector<HTMLButtonElement>('button[aria-label="Project settings"]');
@@ -285,7 +419,22 @@ describe("DesktopProductApp", () => {
     expect(screenText()).not.toContain("internal host path");
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
 
-    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    await pressEscape();
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(screenText()).toContain("Discard unsaved changes?");
+    await clickButton("Keep editing");
+
+    const backdrop = document.querySelector<HTMLElement>(".drawer-backdrop");
+    if (!backdrop) throw new Error("Drawer backdrop was not found.");
+    await act(async () => backdrop.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })));
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(screenText()).toContain("Discard unsaved changes?");
+    await clickButton("Keep editing");
+
+    await clickAria("Close settings");
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(screenText()).toContain("A retained draft objective.");
+    await clickButton("Discard changes");
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(document.activeElement).toBe(opener);
   });
@@ -373,8 +522,20 @@ function setSelect(label: string, value: string): void {
   });
 }
 
+function setCheckbox(label: string, checked: boolean): void {
+  const control = labelledControl<HTMLInputElement>(label, 'input[type="checkbox"]');
+  act(() => {
+    if (control.checked !== checked) control.click();
+  });
+}
+
+async function pressEscape(): Promise<void> {
+  await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+  await flush();
+}
+
 function labelledControl<T extends HTMLElement>(text: string, selector: string): T {
-  const label = Array.from(document.querySelectorAll("label")).find((item) => item.childNodes[0]?.textContent?.trim() === text);
+  const label = Array.from(document.querySelectorAll("label")).find((item) => item.textContent?.trim().startsWith(text));
   const control = label?.querySelector<T>(selector);
   if (!control) throw new Error(`Control ${text} was not found.`);
   return control;
