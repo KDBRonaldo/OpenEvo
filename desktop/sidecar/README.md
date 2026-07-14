@@ -40,13 +40,16 @@ close therefore cannot exceed the caller's total wait bound. On timeout the clie
 permanently closed while the bounded closer retains accepted old resources
 until their close calls return. Enqueue and worker retirement share one lock, so
 an idle worker rechecks the queue before exiting. If starting the first worker
-fails, submission is explicitly rejected and the client reports a typed failure;
-a later submission retries worker creation. A closed connection cannot send its bearer
-after Desktop switches to another project session or tunnel.
+fails, ownership remains with the submitting client, which runs that close action
+synchronously; a later submission can retry worker creation. A closed connection
+cannot send its bearer after Desktop switches to another project session or tunnel.
 
-The close seal increments a client session generation. A request rechecks that
-generation after response registration and bounded body reads and before a JSON
-result is returned. SSE rechecks it around frame parsing, state/replay-ledger
+The close seal increments a client session generation. Each public JSON call owns
+one generation token from admission through response-model validation, authority
+cache application, and its final return. After the bounded body is released, the
+token takes the close state lock before validation and retains it through the
+public method's cache commit and return linearization point. SSE rechecks the
+generation around frame parsing, state/replay-ledger
 application, and yield; frame application holds the same state lock as the close
 linearization point. Bodies and frames released after the seal therefore cannot
 be returned or mutate the retired session's authority caches.

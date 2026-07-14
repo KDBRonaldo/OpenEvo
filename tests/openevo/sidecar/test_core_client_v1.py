@@ -1493,7 +1493,67 @@ def test_close_generation_rejects_json_body_released_after_linearization() -> No
     assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
 
 
-def test_bounded_closer_start_failure_is_reported_by_close(monkeypatch) -> None:
+def test_close_generation_guard_covers_public_validation_cache_and_return(monkeypatch) -> None:
+    capabilities = _capabilities()
+    client = _client(
+        lambda _request: httpx.Response(200, json=capabilities.model_dump(mode="json"))
+    )
+    original_json = client._json
+    json_returned = threading.Event()
+    release_validation = threading.Event()
+    close_attempted = threading.Event()
+    close_returned = threading.Event()
+    results: list[v1.CapabilitiesResponseV1] = []
+    request_errors: list[CoreClientErrorV1] = []
+    close_errors: list[CoreClientErrorV1] = []
+    completion_order: list[str] = []
+
+    def pause_after_json(*args, **kwargs):
+        result = original_json(*args, **kwargs)
+        json_returned.set()
+        release_validation.wait(1)
+        return result
+
+    def read_capabilities() -> None:
+        try:
+            results.append(client.capabilities(v1.ExecutionMode.SELF_DEPLOYED))
+            completion_order.append("request")
+        except CoreClientErrorV1 as exc:
+            request_errors.append(exc)
+
+    def close_client() -> None:
+        close_attempted.set()
+        try:
+            client.close()
+            completion_order.append("close")
+        except CoreClientErrorV1 as exc:
+            close_errors.append(exc)
+        finally:
+            close_returned.set()
+
+    monkeypatch.setattr(client, "_json", pause_after_json)
+    request_thread = threading.Thread(target=read_capabilities)
+    close_thread = threading.Thread(target=close_client)
+    request_thread.start()
+    assert json_returned.wait(1)
+    close_thread.start()
+    assert close_attempted.wait(1)
+    assert not close_returned.wait(0.05)
+    release_validation.set()
+    request_thread.join(1)
+    close_thread.join(1)
+
+    assert not request_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert results == [capabilities]
+    assert request_errors == []
+    assert close_errors == []
+    assert completion_order == ["request", "close"]
+    assert client._capability_authority is not None
+    assert client._capability_authority.registry_digest == capabilities.registry_digest
+
+
+def test_bounded_closer_start_failure_runs_close_action_synchronously(monkeypatch) -> None:
     class CloseTrackingTransport(httpx.BaseTransport):
         def __init__(self) -> None:
             self.close_called = False
@@ -1515,13 +1575,12 @@ def test_bounded_closer_start_failure_is_reported_by_close(monkeypatch) -> None:
     client = CoreControlClientV1(_connection(), transport=transport)
     monkeypatch.setattr(threading.Thread, "start", fail_closer_start)
 
-    with pytest.raises(CoreClientErrorV1) as exc_info:
-        client.close()
+    client.close()
 
-    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
-    assert transport.close_called is False
+    assert transport.close_called is True
     assert client._close_tasks_pending == 0
     assert client._resource_closer._workers == 0
+    assert client._close_failed is False
 
 
 def test_bounded_closer_idle_submit_race_keeps_worker_for_accepted_action(

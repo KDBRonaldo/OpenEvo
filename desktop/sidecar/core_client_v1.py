@@ -9,13 +9,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from functools import wraps
 import hashlib
 import json
 import queue
 import re
 import threading
 import time
-from typing import Any, Literal, NoReturn, TypeVar
+from typing import Any, Literal, NoReturn, ParamSpec, TypeVar
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -47,6 +48,7 @@ _OPAQUE_ID = TypeAdapter(v1.OpaqueId)
 _CURSOR = TypeAdapter(v1.Cursor)
 
 ResponseT = TypeVar("ResponseT")
+MethodP = ParamSpec("MethodP")
 
 
 class CoreClientLocalErrorCodeV1(StrEnum):
@@ -233,6 +235,26 @@ class _CapabilityAuthority:
     evaluated_profile: EvolutionExecutionProfile
 
 
+@dataclass(slots=True)
+class _GenerationLeaseToken:
+    generation: int
+    result_guarded: bool = False
+
+
+def _generation_bound(method: Callable[MethodP, ResponseT]) -> Callable[MethodP, ResponseT]:
+    @wraps(method)
+    def wrapped(*args: MethodP.args, **kwargs: MethodP.kwargs) -> ResponseT:
+        client = args[0]
+        if not isinstance(client, CoreControlClientV1):
+            raise TypeError("generation-bound method requires CoreControlClientV1")
+        with client._generation_lease() as token:
+            result = method(*args, **kwargs)
+            client._guard_generation_result(token, token.generation)
+            return result
+
+    return wrapped
+
+
 class _BoundedResourceCloser:
     """Fixed-size daemon executor for close calls that may block indefinitely."""
 
@@ -245,11 +267,15 @@ class _BoundedResourceCloser:
         self._worker_sequence = 0
 
     def submit(self, action: Callable[[], None]) -> bool:
+        accepted, _caller_retains = self.submit_with_ownership(action)
+        return accepted
+
+    def submit_with_ownership(self, action: Callable[[], None]) -> tuple[bool, bool]:
         with self._lock:
             try:
                 self._queue.put_nowait(action)
             except queue.Full:
-                return False
+                return False, False
             if self._workers < CORE_CLOSE_WORKER_COUNT:
                 self._worker_sequence += 1
                 self._workers += 1
@@ -263,10 +289,12 @@ class _BoundedResourceCloser:
                 except RuntimeError:
                     self._workers -= 1
                     if self._workers == 0:
-                        self._queue.get_nowait()
+                        retained_action = self._queue.get_nowait()
                         self._queue.task_done()
-                        return False
-            return True
+                        if retained_action is not action:
+                            raise RuntimeError("close queue ownership invariant violated")
+                        return False, True
+            return True, False
 
     def _worker(self) -> None:
         while True:
@@ -300,11 +328,12 @@ class CoreControlClientV1:
         if not isinstance(connection, CoreTunnelConnectionV1):
             raise TypeError("connection must be CoreTunnelConnectionV1")
         self._connection = connection
-        self._state = threading.Condition(threading.Lock())
+        self._state = threading.Condition(threading.RLock())
         self._membership_lock = threading.RLock()
         self._closing = False
         self._closed = False
         self._session_generation = 0
+        self._generation_local = threading.local()
         self._close_tasks_pending = 0
         self._close_failed = False
         self._resource_closer = _BoundedResourceCloser()
@@ -396,7 +425,10 @@ class CoreControlClientV1:
                     self._close_tasks_pending -= 1
                     self._state.notify_all()
 
-        if not self._resource_closer.submit(tracked_close):
+        accepted, caller_retains = self._resource_closer.submit_with_ownership(tracked_close)
+        if caller_retains:
+            tracked_close()
+        elif not accepted:
             with self._state:
                 self._close_failed = True
                 self._close_tasks_pending -= 1
@@ -404,12 +436,15 @@ class CoreControlClientV1:
             return False
         return True
 
+    @_generation_bound
     def version(self) -> v1.VersionResponseV1:
         return self._json("GET", "/version", v1.VersionResponseV1, authenticated=False)
 
+    @_generation_bound
     def health(self) -> v1.HealthResponseV1:
         return self._json("GET", "/health", v1.HealthResponseV1, authenticated=False)
 
+    @_generation_bound
     def status(self) -> v1.CoreStatusV1:
         result = self._json("GET", "/v1/status", v1.CoreStatusV1)
         with self._registration_batch():
@@ -417,6 +452,7 @@ class CoreControlClientV1:
                 self._register_service(service)
         return result
 
+    @_generation_bound
     def environment_doctor(
         self,
         request: v1.EnvironmentDoctorRequestV1,
@@ -432,6 +468,7 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
         )
 
+    @_generation_bound
     def environment_repair(
         self,
         request: v1.EnvironmentRepairRequestV1,
@@ -454,6 +491,7 @@ class CoreControlClientV1:
         self._register_operation(result)
         return result
 
+    @_generation_bound
     def capabilities(self, execution_mode: v1.ExecutionMode) -> v1.CapabilitiesResponseV1:
         mode = _enum_query(execution_mode, v1.ExecutionMode)
         result = self._json(
@@ -482,6 +520,7 @@ class CoreControlClientV1:
             self._capability_authority = authority
         return result
 
+    @_generation_bound
     def list_projects(
         self,
         *,
@@ -503,6 +542,7 @@ class CoreControlClientV1:
                 self._register_project(project)
         return result
 
+    @_generation_bound
     def create_project(
         self,
         request: v1.ProjectCreateV1,
@@ -521,12 +561,14 @@ class CoreControlClientV1:
         self._register_project(result)
         return result
 
+    @_generation_bound
     def get_project(self, project_id: str | None = None) -> v1.ProjectV1:
         project_id = self._active_project(project_id)
         result = self._json("GET", f"/v1/projects/{_segment(project_id)}", v1.ProjectV1)
         self._register_project(result, expected_id=project_id)
         return result
 
+    @_generation_bound
     def patch_project(
         self,
         request: v1.ProjectPatchV1,
@@ -548,6 +590,7 @@ class CoreControlClientV1:
         self._register_project(result, expected_id=project_id)
         return result
 
+    @_generation_bound
     def delete_project(
         self,
         *,
@@ -563,6 +606,7 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
         )
 
+    @_generation_bound
     def list_revisions(
         self,
         *,
@@ -589,6 +633,7 @@ class CoreControlClientV1:
             self._ensure_active_project(revision.revision.project_id)
         return result
 
+    @_generation_bound
     def revision_head(self, project_id: str | None = None) -> v1.RevisionHeadV1:
         project_id = self._active_project(project_id)
         result = self._json(
@@ -599,6 +644,7 @@ class CoreControlClientV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
+    @_generation_bound
     def get_revision(self, revision_id: str, *, project_id: str) -> v1.RevisionV1:
         self._ensure_active_project(project_id)
         result = self._json("GET", f"/v1/revisions/{_segment(revision_id)}", v1.RevisionV1)
@@ -607,6 +653,7 @@ class CoreControlClientV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
+    @_generation_bound
     def create_workspace_upload(
         self,
         request: v1.WorkspaceUploadCreateV1,
@@ -643,6 +690,7 @@ class CoreControlClientV1:
         )
         return result
 
+    @_generation_bound
     def get_workspace_upload(
         self,
         upload_id: str,
@@ -659,6 +707,7 @@ class CoreControlClientV1:
         self._register_workspace_upload(result)
         return result
 
+    @_generation_bound
     def put_workspace_upload_chunk(
         self,
         upload_id: str,
@@ -700,6 +749,7 @@ class CoreControlClientV1:
         self._register_workspace_upload(result, expected_previous=upload)
         return result
 
+    @_generation_bound
     def finalize_workspace_upload(
         self,
         upload_id: str,
@@ -753,6 +803,7 @@ class CoreControlClientV1:
             self._register_project(result.project, expected_id=project_id)
         return result
 
+    @_generation_bound
     def abort_workspace_upload(
         self,
         upload_id: str,
@@ -787,6 +838,7 @@ class CoreControlClientV1:
         self._register_workspace_upload(result, expected_previous=upload)
         return result
 
+    @_generation_bound
     def validate_project(
         self,
         request: v1.ProjectValidationRequestV1,
@@ -811,6 +863,7 @@ class CoreControlClientV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
+    @_generation_bound
     def list_runs(
         self,
         *,
@@ -836,6 +889,7 @@ class CoreControlClientV1:
                 self._register_run(run)
         return result
 
+    @_generation_bound
     def create_run(
         self,
         request: v1.RunCreateV1,
@@ -869,12 +923,14 @@ class CoreControlClientV1:
         self._register_run(result)
         return result
 
+    @_generation_bound
     def get_run(self, run_id: str, *, project_id: str) -> v1.RunV1:
         self._ensure_active_project(project_id)
         result = self._json("GET", f"/v1/runs/{_segment(run_id)}", v1.RunV1)
         self._register_run(result, expected_id=run_id)
         return result
 
+    @_generation_bound
     def delete_run(
         self,
         run_id: str,
@@ -892,6 +948,7 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
         )
 
+    @_generation_bound
     def cancel_run(
         self,
         run_id: str,
@@ -916,6 +973,7 @@ class CoreControlClientV1:
         self._register_run(result, expected_id=run_id)
         return result
 
+    @_generation_bound
     def retry_run(
         self,
         run_id: str,
@@ -940,6 +998,7 @@ class CoreControlClientV1:
         self._register_run(result, expected_id=run_id)
         return result
 
+    @_generation_bound
     def run_timeline(
         self,
         run_id: str,
@@ -963,6 +1022,7 @@ class CoreControlClientV1:
                 _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
+    @_generation_bound
     def run_logs(
         self,
         run_id: str,
@@ -991,6 +1051,7 @@ class CoreControlClientV1:
                 _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
+    @_generation_bound
     def run_context(self, run_id: str, *, project_id: str) -> v1.RunContextV1:
         self._ensure_active_project(project_id)
         self._require_member(v1.ResourceChangeType.RUN, run_id)
@@ -1014,6 +1075,7 @@ class CoreControlClientV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
+    @_generation_bound
     def run_artifacts(
         self,
         run_id: str,
@@ -1046,12 +1108,14 @@ class CoreControlClientV1:
                 self._register_artifact(artifact)
         return result
 
+    @_generation_bound
     def get_artifact(self, artifact_id: str, *, project_id: str) -> v1.ArtifactSummaryV1:
         self._ensure_active_project(project_id)
         result = self._json("GET", f"/v1/artifacts/{_segment(artifact_id)}", v1.ArtifactSummaryV1)
         self._register_artifact(result, expected_id=artifact_id)
         return result
 
+    @_generation_bound
     def artifact_content(self, artifact_id: str, *, project_id: str) -> v1.ArtifactContentV1:
         self._ensure_active_project(project_id)
         self._require_member(v1.ResourceChangeType.ARTIFACT, artifact_id)
@@ -1069,6 +1133,7 @@ class CoreControlClientV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
+    @_generation_bound
     def artifact_diff(
         self,
         artifact_id: str,
@@ -1108,6 +1173,7 @@ class CoreControlClientV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
+    @_generation_bound
     def list_services(
         self,
         *,
@@ -1127,11 +1193,13 @@ class CoreControlClientV1:
                 self._register_service(service)
         return result
 
+    @_generation_bound
     def get_service(self, service_id: str) -> v1.ServiceSummaryV1:
         result = self._json("GET", f"/v1/services/{_segment(service_id)}", v1.ServiceSummaryV1)
         self._register_service(result, expected_id=service_id)
         return result
 
+    @_generation_bound
     def restart_service(
         self,
         service_id: str,
@@ -1158,6 +1226,7 @@ class CoreControlClientV1:
         self._register_operation(result)
         return result
 
+    @_generation_bound
     def service_logs(
         self,
         service_id: str,
@@ -1182,11 +1251,13 @@ class CoreControlClientV1:
                 self._require_member(v1.ResourceChangeType.RUN, entry.run_id)
         return result
 
+    @_generation_bound
     def get_operation(self, operation_id: str) -> v1.OperationV1:
         result = self._json("GET", f"/v1/operations/{_segment(operation_id)}", v1.OperationV1)
         self._register_operation(result, expected_id=operation_id)
         return result
 
+    @_generation_bound
     def cancel_operation(
         self,
         operation_id: str,
@@ -1209,6 +1280,7 @@ class CoreControlClientV1:
         self._register_operation(result, expected_id=operation_id)
         return result
 
+    @_generation_bound
     def logs_by_ref(
         self,
         logs_ref: str,
@@ -1238,6 +1310,7 @@ class CoreControlClientV1:
                 self._require_member(v1.ResourceChangeType.RUN, entry.run_id)
         return result
 
+    @_generation_bound
     def create_diagnostic(
         self,
         request: v1.DiagnosticsRequestV1,
@@ -1261,11 +1334,13 @@ class CoreControlClientV1:
         self._register_diagnostic(result)
         return result
 
+    @_generation_bound
     def get_diagnostic(self, diagnostic_id: str) -> v1.DiagnosticV1:
         result = self._json("GET", f"/v1/diagnostics/{_segment(diagnostic_id)}", v1.DiagnosticV1)
         self._register_diagnostic(result, expected_id=diagnostic_id)
         return result
 
+    @_generation_bound
     def delete_diagnostic(
         self,
         diagnostic_id: str,
@@ -1281,6 +1356,7 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
         )
 
+    @_generation_bound
     def cache_cleanup(
         self,
         request: v1.CacheCleanupRequestV1,
@@ -1439,7 +1515,7 @@ class CoreControlClientV1:
         request_headers = self._headers(authenticated=authenticated, accept="application/json")
         if headers:
             request_headers.update(headers)
-        with self._lease() as session_generation:
+        with self._json_generation_lease() as session_generation:
             transport_error = False
             release_failed = False
             response: httpx.Response | None = None
@@ -1477,7 +1553,7 @@ class CoreControlClientV1:
                 self._raise_transport_error()
             if release_failed:
                 self._raise_transport_error()
-            self._ensure_session_generation(session_generation)
+            self._guard_generation_result(self._current_generation_token(), session_generation)
             if 300 <= status_code < 400:
                 _raise_local(CoreClientLocalErrorCodeV1.REDIRECT_REJECTED, 502)
             if status_code != expected_status:
@@ -1586,6 +1662,55 @@ class CoreControlClientV1:
                 else:
                     del self._lease_owners[owner]
                 self._state.notify_all()
+
+    @contextmanager
+    def _generation_lease(self) -> Iterator[_GenerationLeaseToken]:
+        with self._lease() as session_generation:
+            token = _GenerationLeaseToken(session_generation)
+            stack = getattr(self._generation_local, "stack", None)
+            if stack is None:
+                stack = []
+                self._generation_local.stack = stack
+            stack.append(token)
+            try:
+                yield token
+            finally:
+                if token.result_guarded:
+                    self._state.release()
+                popped = stack.pop()
+                if popped is not token:
+                    raise RuntimeError("generation lease stack corrupted")
+
+    @contextmanager
+    def _json_generation_lease(self) -> Iterator[int]:
+        token = self._current_generation_token()
+        self._ensure_session_generation(token.generation)
+        yield token.generation
+
+    def _current_generation_token(self) -> _GenerationLeaseToken:
+        stack = getattr(self._generation_local, "stack", None)
+        if not stack:
+            raise RuntimeError("JSON request requires a public generation lease")
+        return stack[-1]
+
+    def _guard_generation_result(
+        self,
+        token: _GenerationLeaseToken,
+        session_generation: int,
+    ) -> None:
+        if token.generation != session_generation:
+            _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+        if token.result_guarded:
+            self._ensure_session_generation(session_generation)
+            return
+        self._state.acquire()
+        try:
+            if self._closing or self._closed or session_generation != self._session_generation:
+                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+            token.result_guarded = True
+        except BaseException:
+            self._state.release()
+            raise
 
     def _register_response(self, response: httpx.Response, session_generation: int) -> None:
         close_late_response = False
