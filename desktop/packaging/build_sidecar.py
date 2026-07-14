@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+import ctypes
 from email.parser import Parser
 import hashlib
 from io import BytesIO
@@ -39,8 +40,15 @@ CORE_RELEASE_TRANSACTION_READY = "transaction.ready"
 _CORE_RELEASE_TRANSACTION_PATTERN = re.compile(r"\.openevo-core-release-([0-9a-f]{32})")
 _CORE_RELEASE_STAGING_PATTERN = re.compile(r"\.member-([0-9a-f]{32})")
 _MAX_CORE_RELEASE_ROOT_MEMBERS = 4
-_MAX_CORE_RELEASE_TRANSACTION_MEMBERS = 4
+_MAX_CORE_RELEASE_TRANSACTION_MEMBERS = 6
 _MAX_CORE_RELEASE_MARKER_BYTES = 4096
+_DARWIN_ACL_TYPE_EXTENDED = 0x0000_0100
+_DARWIN_ACL_FIRST_ENTRY = 0
+_DARWIN_ACL_NEXT_ENTRY = -1
+_DARWIN_ACL_EXTENDED_ALLOW = 1
+_DARWIN_ACL_EXTENDED_DENY = 2
+_DARWIN_ACL_KNOWN_PERMISSIONS = sum(1 << bit for bit in (*range(1, 14), 20))
+_DARWIN_ACL_MUTATING_PERMISSIONS = sum(1 << bit for bit in (2, 4, 5, 6, 8, 10, 12, 13))
 FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
     {
         "openevo/evolution/terminal_bench_bridge.py",
@@ -863,6 +871,112 @@ def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _darwin_extended_acl_entries(file_fd: int) -> tuple[tuple[int, int], ...]:
+    if sys.platform != "darwin":
+        return ()
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    libc.acl_get_fd_np.restype = ctypes.c_void_p
+    libc.acl_get_entry.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+    libc.acl_get_entry.restype = ctypes.c_int
+    libc.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    libc.acl_get_tag_type.restype = ctypes.c_int
+    libc.acl_get_permset_mask_np.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
+    libc.acl_get_permset_mask_np.restype = ctypes.c_int
+    libc.acl_free.argtypes = [ctypes.c_void_p]
+    libc.acl_free.restype = ctypes.c_int
+    acl = libc.acl_get_fd_np(file_fd, _DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        error = ctypes.get_errno()
+        raise RuntimeError(f"macOS extended ACL cannot be read from held FD: errno {error}")
+    entries: list[tuple[int, int]] = []
+    try:
+        entry_id = _DARWIN_ACL_FIRST_ENTRY
+        while True:
+            entry = ctypes.c_void_p()
+            result = libc.acl_get_entry(acl, entry_id, ctypes.byref(entry))
+            if result == 0:
+                break
+            if result != 1 or not entry:
+                raise RuntimeError("macOS extended ACL contains an unreadable entry")
+            tag = ctypes.c_int()
+            permissions = ctypes.c_uint64()
+            if (
+                libc.acl_get_tag_type(entry, ctypes.byref(tag)) == -1
+                or libc.acl_get_permset_mask_np(entry, ctypes.byref(permissions)) == -1
+            ):
+                raise RuntimeError("macOS extended ACL entry cannot be decoded")
+            entries.append((tag.value, permissions.value))
+            entry_id = _DARWIN_ACL_NEXT_ENTRY
+    finally:
+        if libc.acl_free(acl) != 0:
+            raise RuntimeError("macOS extended ACL storage could not be released")
+    return tuple(entries)
+
+
+def _delete_darwin_extended_acl(file_fd: int) -> None:
+    if sys.platform != "darwin":
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.acl_delete_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    libc.acl_delete_fd_np.restype = ctypes.c_int
+    if libc.acl_delete_fd_np(file_fd, _DARWIN_ACL_TYPE_EXTENDED) != 0:
+        error = ctypes.get_errno()
+        raise RuntimeError(f"macOS extended ACL cannot be cleared from held FD: errno {error}")
+
+
+def _validate_darwin_acl_entries(
+    entries: tuple[tuple[int, int], ...],
+    *,
+    reject_mutating: bool,
+) -> None:
+    for tag, permissions in entries:
+        if tag not in {_DARWIN_ACL_EXTENDED_ALLOW, _DARWIN_ACL_EXTENDED_DENY}:
+            raise RuntimeError("macOS extended ACL contains an unknown tag")
+        if permissions & ~_DARWIN_ACL_KNOWN_PERMISSIONS:
+            raise RuntimeError("macOS extended ACL contains an unknown permission")
+        if (
+            reject_mutating
+            and tag == _DARWIN_ACL_EXTENDED_ALLOW
+            and permissions & _DARWIN_ACL_MUTATING_PERMISSIONS
+        ):
+            raise RuntimeError("macOS extended ACL permits mutation by an additional principal")
+
+
+def _clear_and_verify_fd_acl(file_fd: int, *, name: str) -> None:
+    if sys.platform != "darwin":
+        return
+    before = os.fstat(file_fd)
+    entries = _darwin_extended_acl_entries(file_fd)
+    _validate_darwin_acl_entries(entries, reject_mutating=False)
+    if entries:
+        _delete_darwin_extended_acl(file_fd)
+    if _darwin_extended_acl_entries(file_fd):
+        raise RuntimeError(f"Core release extended ACL remained after clearing: {name}")
+    after = os.fstat(file_fd)
+    if (
+        (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        or after.st_uid != before.st_uid
+        or after.st_mode != before.st_mode
+    ):
+        raise RuntimeError(f"Core release identity changed while clearing extended ACL: {name}")
+
+
+def _require_fd_acl_free(file_fd: int, *, name: str) -> None:
+    entries = _darwin_extended_acl_entries(file_fd)
+    _validate_darwin_acl_entries(entries, reject_mutating=True)
+    if entries:
+        raise RuntimeError(f"Core release extended ACL changed after initialization: {name}")
+
+
+def _require_fd_acl_no_mutating_allow(file_fd: int, *, name: str) -> None:
+    entries = _darwin_extended_acl_entries(file_fd)
+    try:
+        _validate_darwin_acl_entries(entries, reject_mutating=True)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Core release {name} extended ACL is unsafe") from exc
+
+
 def _prepare_core_wheel_output_dir(output_dir: Path) -> None:
     if output_dir.is_symlink():
         raise RuntimeError(f"Core wheel output must not be a symbolic link: {output_dir}")
@@ -887,6 +1001,7 @@ class _CoreReleaseOutput:
     __slots__ = (
         "path",
         "resolved_path",
+        "parent_fd",
         "directory_fd",
         "device",
         "inode",
@@ -907,12 +1022,14 @@ class _CoreReleaseOutput:
         *,
         path: Path,
         resolved_path: Path,
+        parent_fd: int,
         directory_fd: int,
         device: int,
         inode: int,
     ) -> None:
         self.path = path
         self.resolved_path = resolved_path
+        self.parent_fd = parent_fd
         self.directory_fd = directory_fd
         self.device = device
         self.inode = inode
@@ -933,6 +1050,16 @@ class _CoreReleaseOutput:
             current_path = self.path.resolve(strict=True)
             current = os.stat(self.path, follow_symlinks=False)
             pinned = os.fstat(self.directory_fd)
+            parent_current = os.stat(
+                self.resolved_path.name,
+                dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+            _require_fd_acl_no_mutating_allow(
+                self.parent_fd,
+                name="output parent",
+            )
+            _require_fd_acl_free(self.directory_fd, name="Core wheel output")
         except (OSError, RuntimeError) as exc:
             raise RuntimeError(
                 "Core wheel output path changed during the sidecar build"
@@ -942,6 +1069,7 @@ class _CoreReleaseOutput:
             current_path != self.resolved_path
             or (current.st_dev, current.st_ino) != expected_identity
             or (pinned.st_dev, pinned.st_ino) != expected_identity
+            or (parent_current.st_dev, parent_current.st_ino) != expected_identity
             or not stat.S_ISDIR(current.st_mode)
             or not stat.S_ISDIR(pinned.st_mode)
             or current.st_uid != os.geteuid()
@@ -1085,6 +1213,8 @@ def _open_core_release_source(path: Path, *, name: str) -> _CoreReleaseSource:
         descriptor = os.fstat(file_fd)
         if not stat.S_ISREG(descriptor.st_mode) or descriptor.st_nlink != 1:
             raise RuntimeError(f"Core release input is not a private regular file: {name}")
+        _clear_and_verify_fd_acl(file_fd, name=name)
+        descriptor = os.fstat(file_fd)
         byte_size, sha256 = _sha256_fd(file_fd)
         if byte_size != descriptor.st_size:
             raise RuntimeError(f"Core release input changed while hashing: {name}")
@@ -1169,6 +1299,7 @@ def _write_bound_member(
         dir_fd=directory_fd,
     )
     try:
+        _clear_and_verify_fd_acl(file_fd, name=name)
         view = memoryview(payload)
         while view:
             written = os.write(file_fd, view)
@@ -1179,13 +1310,7 @@ def _write_bound_member(
         descriptor = os.fstat(file_fd)
         return file_fd, (descriptor.st_dev, descriptor.st_ino)
     except BaseException:
-        try:
-            descriptor = os.fstat(file_fd)
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if (current.st_dev, current.st_ino) == (descriptor.st_dev, descriptor.st_ino):
-                os.unlink(name, dir_fd=directory_fd)
-        finally:
-            os.close(file_fd)
+        os.close(file_fd)
         raise
 
 
@@ -1230,6 +1355,15 @@ def _verify_member_path(
             identity=identity,
             link_counts=link_counts,
         )
+        _clear_and_verify_fd_acl(file_fd, name=path_name)
+        descriptor = os.fstat(file_fd)
+        _require_member_attributes(
+            descriptor,
+            name=path_name,
+            mode=0o644,
+            identity=identity,
+            link_counts=link_counts,
+        )
         byte_size, sha256 = _sha256_fd(file_fd)
         if (
             descriptor.st_size != source.byte_size
@@ -1252,6 +1386,9 @@ def _read_marker(directory_fd: int, name: str) -> tuple[bytes, tuple[int, int]]:
         dir_fd=directory_fd,
     )
     try:
+        descriptor = os.fstat(file_fd)
+        _require_member_attributes(descriptor, name=name, mode=0o600)
+        _clear_and_verify_fd_acl(file_fd, name=name)
         descriptor = os.fstat(file_fd)
         _require_member_attributes(descriptor, name=name, mode=0o600)
         if descriptor.st_size > _MAX_CORE_RELEASE_MARKER_BYTES:
@@ -1278,17 +1415,32 @@ def _open_core_release_output(output_dir: Path) -> Iterator[_CoreReleaseOutput]:
     if not hasattr(os, "O_NOFOLLOW"):
         raise RuntimeError("Core wheel output requires no-follow file support")
     flags |= os.O_NOFOLLOW
+    parent_fd = -1
     try:
+        parent_fd = os.open(resolved_path.parent, flags)
         directory_fd = os.open(output_dir, flags)
     except OSError as exc:
+        if parent_fd >= 0:
+            os.close(parent_fd)
         raise RuntimeError(f"Core wheel output cannot be opened safely: {output_dir}") from exc
     try:
+        _require_fd_acl_no_mutating_allow(parent_fd, name="output parent")
         descriptor = os.fstat(directory_fd)
         if not stat.S_ISDIR(descriptor.st_mode):
             raise RuntimeError(f"Core wheel output is not a directory: {output_dir}")
+        if (
+            descriptor.st_uid != os.geteuid()
+            or descriptor.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError(
+                "Core wheel output path, owner, or private permissions are invalid"
+            )
+        _clear_and_verify_fd_acl(directory_fd, name="Core wheel output")
+        descriptor = os.fstat(directory_fd)
         authority = _CoreReleaseOutput(
             path=output_dir,
             resolved_path=resolved_path,
+            parent_fd=parent_fd,
             directory_fd=directory_fd,
             device=descriptor.st_dev,
             inode=descriptor.st_ino,
@@ -1314,6 +1466,8 @@ def _open_core_release_output(output_dir: Path) -> Iterator[_CoreReleaseOutput]:
             authority.close()
     finally:
         os.close(directory_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def _verify_source(source: _CoreReleaseSource, *, require_path: bool) -> None:
@@ -1324,6 +1478,7 @@ def _verify_source(source: _CoreReleaseSource, *, require_path: bool) -> None:
         or descriptor.st_size != source.byte_size
     ):
         raise RuntimeError(f"Core release source identity changed: {source.name}")
+    _require_fd_acl_free(source.file_fd, name=source.name)
     byte_size, sha256 = _sha256_fd(source.file_fd)
     if byte_size != source.byte_size or sha256 != source.sha256:
         raise RuntimeError(f"Core release source content changed: {source.name}")
@@ -1412,20 +1567,87 @@ def _open_transaction_directory(
     ):
         os.close(transaction_fd)
         raise RuntimeError("Core release transaction directory identity changed")
+    try:
+        _clear_and_verify_fd_acl(transaction_fd, name="Core release transaction")
+    except BaseException:
+        os.close(transaction_fd)
+        raise
+    descriptor = os.fstat(transaction_fd)
+    current = os.stat(name, dir_fd=authority.directory_fd, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (descriptor.st_dev, descriptor.st_ino):
+        os.close(transaction_fd)
+        raise RuntimeError("Core release transaction directory changed while clearing ACL")
     return transaction_fd, descriptor
 
 
-def _remove_regular_path(
-    directory_fd: int,
-    name: str,
+def _rename_noreplace(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source_name)
+    encoded_destination = os.fsencode(destination_name)
+    if sys.platform == "linux":
+        libc.renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        libc.renameat2.restype = ctypes.c_int
+        result = libc.renameat2(
+            source_fd,
+            encoded_source,
+            destination_fd,
+            encoded_destination,
+            1,
+        )
+    elif sys.platform == "darwin":
+        libc.renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        libc.renameatx_np.restype = ctypes.c_int
+        result = libc.renameatx_np(
+            source_fd,
+            encoded_source,
+            destination_fd,
+            encoded_destination,
+            0x0000_0004,
+        )
+    else:
+        raise RuntimeError("Core release cleanup requires atomic no-replace rename support")
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), source_name, destination_name)
+
+
+def _after_core_release_cleanup_identity_verified(
+    source_fd: int,
+    source_name: str,
+) -> None:
+    del source_fd, source_name
+
+
+def _quarantine_regular_path(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
     *,
     identity: tuple[int, int],
     modes: frozenset[int],
 ) -> None:
     file_fd = os.open(
-        name,
+        source_name,
         os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        dir_fd=directory_fd,
+        dir_fd=source_fd,
     )
     try:
         descriptor = os.fstat(file_fd)
@@ -1435,30 +1657,68 @@ def _remove_regular_path(
             or stat.S_IMODE(descriptor.st_mode) not in modes
             or (descriptor.st_dev, descriptor.st_ino) != identity
         ):
-            raise RuntimeError(f"Core release cleanup identity changed: {name}")
-        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            raise RuntimeError(f"Core release cleanup identity changed: {source_name}")
+        _clear_and_verify_fd_acl(file_fd, name=source_name)
+        descriptor = os.fstat(file_fd)
+        if (descriptor.st_dev, descriptor.st_ino) != identity:
+            raise RuntimeError(f"Core release cleanup identity changed: {source_name}")
+        current = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != identity:
-            raise RuntimeError(f"Core release cleanup pathname changed: {name}")
-        os.unlink(name, dir_fd=directory_fd)
+            raise RuntimeError(f"Core release cleanup pathname changed: {source_name}")
+        _after_core_release_cleanup_identity_verified(source_fd, source_name)
+        _rename_noreplace(source_fd, source_name, destination_fd, destination_name)
+        quarantined = os.stat(destination_name, dir_fd=destination_fd, follow_symlinks=False)
+        if (quarantined.st_dev, quarantined.st_ino) != identity:
+            raise RuntimeError(
+                f"Core release cleanup replacement was preserved: {destination_name}"
+            )
+        held = os.fstat(file_fd)
+        if (held.st_dev, held.st_ino) != identity:
+            raise RuntimeError(f"Core release cleanup held identity changed: {source_name}")
     finally:
         os.close(file_fd)
 
 
-def _remove_transaction_directory(
+def _retire_transaction_directory(
     authority: _CoreReleaseOutput,
+    transaction_fd: int,
     name: str,
     *,
     identity: tuple[int, int],
-) -> None:
+) -> str:
+    held = os.fstat(transaction_fd)
+    _require_fd_acl_free(transaction_fd, name="Core release transaction")
     current = os.stat(name, dir_fd=authority.directory_fd, follow_symlinks=False)
     if (
         not stat.S_ISDIR(current.st_mode)
         or (current.st_dev, current.st_ino) != identity
+        or (held.st_dev, held.st_ino) != identity
         or current.st_uid != os.geteuid()
         or stat.S_IMODE(current.st_mode) != 0o700
     ):
         raise RuntimeError("Core release transaction directory changed before cleanup")
-    os.rmdir(name, dir_fd=authority.directory_fd)
+    _after_core_release_cleanup_identity_verified(authority.directory_fd, name)
+    for _ in range(8):
+        tombstone = f".openevo-core-release-tombstone-{secrets.token_hex(16)}"
+        try:
+            _rename_noreplace(authority.directory_fd, name, authority.parent_fd, tombstone)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise RuntimeError("Could not allocate a Core release cleanup tombstone")
+    moved = os.stat(tombstone, dir_fd=authority.parent_fd, follow_symlinks=False)
+    if (moved.st_dev, moved.st_ino) != identity:
+        raise RuntimeError("Core release transaction replacement was preserved as a tombstone")
+    try:
+        replacement = os.stat(name, dir_fd=authority.directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        replacement = None
+    if replacement is not None:
+        raise RuntimeError("Core release transaction replacement was preserved at its original name")
+    os.fsync(authority.parent_fd)
+    os.fsync(authority.directory_fd)
+    return tombstone
 
 
 def _decode_marker(payload: bytes) -> dict[str, object]:
@@ -1575,7 +1835,6 @@ def _replace_transaction_marker(
         raise RuntimeError("Core release marker identity changed before replacement")
     candidate_fd = -1
     candidate_identity: tuple[int, int] | None = None
-    replaced = False
     try:
         candidate_fd, candidate_identity = _write_bound_member(
             transaction_fd,
@@ -1605,7 +1864,6 @@ def _replace_transaction_marker(
             src_dir_fd=transaction_fd,
             dst_dir_fd=transaction_fd,
         )
-        replaced = True
         _after_core_release_marker_window(authority, payload, "marker-replaced")
         published_payload, published_identity = _read_marker(
             transaction_fd,
@@ -1628,16 +1886,6 @@ def _replace_transaction_marker(
         return candidate_identity
     finally:
         if candidate_fd >= 0:
-            if not replaced and candidate_identity is not None:
-                try:
-                    _remove_regular_path(
-                        transaction_fd,
-                        CORE_RELEASE_TRANSACTION_READY,
-                        identity=candidate_identity,
-                        modes=frozenset({0o600}),
-                    )
-                except BaseException:
-                    pass
             os.close(candidate_fd)
 
 
@@ -1796,7 +2044,7 @@ def _cleanup_core_release_transaction(
     marker_payload: bytes,
     marker_identity: tuple[int, int],
 ) -> None:
-    phase, identities, cleanup_index = _validate_marker_payload(
+    _, identities, cleanup_index = _validate_marker_payload(
         authority,
         marker_payload,
         transaction_identity=transaction_identity,
@@ -1830,6 +2078,7 @@ def _cleanup_core_release_transaction(
     for index, source in enumerate(cleanup_sources):
         expected_identity = identities.get(source.name)
         staging_name = authority.member_intents[source.name]
+        root_quarantine_name = staging_name.replace(".member-", ".root-", 1)
         candidates: list[tuple[int, str, bool]] = []
         for directory_fd, name, at_root in ordinary_locations:
             location = (directory_fd, name, at_root)
@@ -1841,7 +2090,9 @@ def _cleanup_core_release_transaction(
                 actual_identity = (descriptor.st_dev, descriptor.st_ino)
             if (
                 expected_identity is not None and actual_identity == expected_identity
-            ) or (at_root and name == source.name) or (not at_root and name == staging_name):
+            ) or (at_root and name == source.name) or (
+                not at_root and name in {staging_name, root_quarantine_name}
+            ):
                 candidates.append(location)
                 consumed_locations.add(location)
         locations: list[tuple[int, str, tuple[int, int], frozenset[int]]] = []
@@ -1864,6 +2115,7 @@ def _cleanup_core_release_transaction(
                         mode=0o600,
                         identity=observed_identity,
                     )
+                    _clear_and_verify_fd_acl(file_fd, name=name)
                     current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                     if (current.st_dev, current.st_ino) != observed_identity:
                         raise RuntimeError(f"Core release staging intent changed: {source.name}")
@@ -1895,7 +2147,7 @@ def _cleanup_core_release_transaction(
             locations.append(
                 (directory_fd, name, expected_identity, frozenset({0o600, 0o644}))
             )
-        if not locations and expected_identity is not None and index >= cleanup_index:
+        if not locations and expected_identity is not None:
             held_member = next(
                 (
                     member
@@ -1928,48 +2180,37 @@ def _cleanup_core_release_transaction(
                 current_identity=marker_identity,
             )
             cleanup_index = index + 1
+        root_quarantine_name = authority.member_intents[source.name].replace(
+            ".member-", ".root-", 1
+        )
         for directory_fd, name, location_identity, modes in locations:
-            _remove_regular_path(
-                directory_fd,
+            if directory_fd != authority.directory_fd:
+                continue
+            _quarantine_regular_path(
+                authority.directory_fd,
                 name,
+                transaction_fd,
+                root_quarantine_name,
                 identity=location_identity,
                 modes=modes,
             )
         os.fsync(transaction_fd)
         os.fsync(authority.directory_fd)
-        for member in authority.members:
-            if (member.device, member.inode) == identities.get(source.name):
-                if os.fstat(member.file_fd).st_nlink != 0:
-                    raise RuntimeError(f"Core release member {source.name} was not fully unlinked")
-                break
         _after_core_release_member_cleaned(authority, source)
-    if _bounded_listdir(
-        transaction_fd,
-        limit=_MAX_CORE_RELEASE_TRANSACTION_MEMBERS,
-        container="Core release transaction",
-    ) != (CORE_RELEASE_TRANSACTION_MARKER,):
-        raise RuntimeError("Core release recovery could not isolate its marker")
     if _bounded_listdir(
         authority.directory_fd,
         limit=_MAX_CORE_RELEASE_ROOT_MEMBERS,
         container="Core wheel output",
     ) != (transaction_name,):
         raise RuntimeError("Core release recovery preserved an identity-mismatched root member")
-    _remove_regular_path(
-        transaction_fd,
-        CORE_RELEASE_TRANSACTION_MARKER,
-        identity=marker_identity,
-        modes=frozenset({0o600}),
-    )
     if authority.transaction_fd == transaction_fd and authority.marker_identity == marker_identity:
-        if authority.marker_fd < 0 or os.fstat(authority.marker_fd).st_nlink != 0:
-            raise RuntimeError("Core release cleanup marker remained linked")
         os.close(authority.marker_fd)
         authority.marker_fd = -1
         authority.marker_identity = None
     os.fsync(transaction_fd)
-    _remove_transaction_directory(
+    _retire_transaction_directory(
         authority,
+        transaction_fd,
         transaction_name,
         identity=transaction_identity,
     )
@@ -2000,7 +2241,12 @@ def _recover_core_release_transaction(authority: _CoreReleaseOutput, name: str) 
             )
             if root_names not in {(), expected_pair}:
                 raise RuntimeError("Unmarked Core release transaction cannot be recovered")
-            _remove_transaction_directory(authority, name, identity=transaction_identity)
+            _retire_transaction_directory(
+                authority,
+                transaction_fd,
+                name,
+                identity=transaction_identity,
+            )
             os.fsync(authority.directory_fd)
             authority.initial_inventory = root_names
             return
@@ -2027,13 +2273,12 @@ def _recover_core_release_transaction(authority: _CoreReleaseOutput, name: str) 
                 CORE_RELEASE_TRANSACTION_MARKER,
             ):
                 raise
-            _remove_regular_path(
+            _retire_transaction_directory(
+                authority,
                 transaction_fd,
-                CORE_RELEASE_TRANSACTION_MARKER,
-                identity=marker_identity,
-                modes=frozenset({0o600}),
+                name,
+                identity=transaction_identity,
             )
-            _remove_transaction_directory(authority, name, identity=transaction_identity)
             os.fsync(authority.directory_fd)
             authority.initial_inventory = ()
             return
@@ -2168,6 +2413,7 @@ def _copy_core_release_member(
     )
     identity: tuple[int, int] | None = None
     try:
+        _clear_and_verify_fd_acl(destination_fd, name=staging_name)
         descriptor = os.fstat(destination_fd)
         identity = (descriptor.st_dev, descriptor.st_ino)
         _require_member_attributes(
@@ -2256,12 +2502,11 @@ def _publish_core_release_members(authority: _CoreReleaseOutput) -> None:
             identity=(member.device, member.inode),
         )
         try:
-            os.link(
+            _rename_noreplace(
+                authority.transaction_fd,
                 staging_name,
+                authority.directory_fd,
                 source.name,
-                src_dir_fd=authority.transaction_fd,
-                dst_dir_fd=authority.directory_fd,
-                follow_symlinks=False,
             )
         except FileExistsError as exc:
             raise RuntimeError(f"Refusing to replace Core release member: {source.name}") from exc
@@ -2269,16 +2514,7 @@ def _publish_core_release_members(authority: _CoreReleaseOutput) -> None:
             authority.directory_fd,
             source,
             identity=staged_identity,
-            link_counts=frozenset({2}),
         )
-        current = os.stat(
-            staging_name,
-            dir_fd=authority.transaction_fd,
-            follow_symlinks=False,
-        )
-        if (current.st_dev, current.st_ino) != staged_identity:
-            raise RuntimeError(f"Core release staged member changed: {source.name}")
-        os.unlink(staging_name, dir_fd=authority.transaction_fd)
         if os.fstat(member.file_fd).st_nlink != 1:
             raise RuntimeError(f"Core release member link count changed: {source.name}")
         os.fsync(authority.transaction_fd)
@@ -2305,6 +2541,7 @@ def _verify_live_transaction(authority: _CoreReleaseOutput) -> None:
     ) != (CORE_RELEASE_TRANSACTION_MARKER,):
         raise RuntimeError("Core release transaction inventory changed before commit")
     transaction = os.fstat(authority.transaction_fd)
+    _require_fd_acl_free(authority.transaction_fd, name="Core release transaction")
     expected_marker = _marker_bytes(
         authority,
         phase="ready",
@@ -2328,6 +2565,7 @@ def _verify_live_transaction(authority: _CoreReleaseOutput) -> None:
             mode=0o644,
             identity=(member.device, member.inode),
         )
+        _require_fd_acl_free(member.file_fd, name=source.name)
         byte_size, sha256 = _sha256_fd(member.file_fd)
         if byte_size != source.byte_size or sha256 != source.sha256:
             raise RuntimeError(f"Held Core release member changed: {source.name}")
@@ -2353,19 +2591,15 @@ def _commit_core_release_inputs(authority: _CoreReleaseOutput) -> None:
         os.fstat(authority.transaction_fd).st_dev,
         os.fstat(authority.transaction_fd).st_ino,
     )
-    _remove_regular_path(
-        authority.transaction_fd,
-        CORE_RELEASE_TRANSACTION_MARKER,
-        identity=authority.marker_identity,
-        modes=frozenset({0o600}),
-    )
-    if os.fstat(authority.marker_fd).st_nlink != 0:
-        raise RuntimeError("Core release marker remained linked after commit")
-    _remove_transaction_directory(
+    _retire_transaction_directory(
         authority,
+        authority.transaction_fd,
         authority.transaction_name,
         identity=transaction_identity,
     )
+    os.close(authority.marker_fd)
+    authority.marker_fd = -1
+    authority.marker_identity = None
     authority.transaction_name = None
     os.fsync(authority.directory_fd)
     _verify_preexisting_pair(authority)

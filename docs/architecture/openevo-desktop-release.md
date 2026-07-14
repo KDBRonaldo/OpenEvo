@@ -49,21 +49,28 @@ The repository currently provides:
   group/world writable and is empty or contains one recognized recoverable
   transaction/exact pair. Newly created output directories use `0700`. The
   builder pins that directory by an open no-follow descriptor and revalidates
-  its inode, owner, and private permissions through final return, so another
-  local user cannot replace the committed files through the output directory.
+  its inode, owner, private permissions, and ACL-free state through final return.
+  On macOS every held output, transaction, marker, wheel, and lock FD has any
+  valid inherited extended ACL removed with `acl_delete_fd_np` and is then read
+  back through `acl_get_fd_np`; malformed entries, unknown tags/permissions,
+  failed removal, or a later ACL mutation fail closed. The held immediate parent
+  FD is also rechecked and rejects any mutating ALLOW entry, because that ACL
+  could otherwise replace the output root itself. Linux keeps the same
+  FD/inode/mode policy with an explicit no-op ACL layer.
   Core wheel construction fixes `SOURCE_DATE_EPOCH` to the trusted source commit
   time so a retry can reproduce and recognize a fully committed pair.
   It stages the pair under a private `0700` transaction directory. Before any
   member is created, its bounded canonical v2 marker durably records the output and
   transaction identities plus a random per-member staging intent, name, size,
   and SHA-256. Each new member inode is added monotonically to that marker before
-  its bytes are copied and fsynced. Publication uses no-replace hard links,
+  its bytes are copied and fsynced. Publication uses FD-relative atomic
+  no-replace renames,
   retains the source and destination descriptors, and commits only after the
   temporary build tree has cleaned up and an exact root inventory revalidates
   both regular, link-count-one, owner-only-written members against the source and
   lock contract. A crash after the ready marker but before both names are
   published leaves complete inode-bound recovery authority; the next build
-  removes only that exact transaction and retries. Preparing transactions at
+  quarantines only that exact transaction and retries. Preparing transactions at
   every member create/copy/fsync boundary are also automatically and idempotently
   recovered: a random intent authorizes only its private `0600` transaction path,
   while a persisted inode receipt authorizes only that exact inode. Empty or
@@ -73,9 +80,14 @@ The repository currently provides:
   transaction inventories are read through bounded FD-based iterative scans;
   each scan rejects on `limit + 1`, and changing consecutive snapshots fail
   closed without first materializing or sorting an unbounded directory. An empty
-  marker-less transaction directory beside an exact complete
-  pair is the bounded crash state after marker removal and is removed before that
-  pair is accepted;
+  marker-less transaction directory beside an exact complete pair is a bounded
+  bootstrap crash state. Cleanup never uses a final stat-then-unlink/rmdir step:
+  authorized root members move under deterministic transaction quarantine names,
+  then the held transaction inode moves with atomic no-replace rename to a random
+  sibling tombstone. A replacement observed in either rename window is retained
+  at its original name or in the tombstone and the build fails closed. Tombstones
+  are conservative audit evidence outside the exact output pair, not a claim of
+  immediate deletion;
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;
@@ -386,11 +398,13 @@ instance channel remain native-host owned, and no sidecar launch path receives
 `--host` or `--port`.
 Linux executes the verified anonymous file through `/proc/self/fd`. macOS keeps
 the same digest-verified inode linked inside an owner-only `0700` launch
-directory only long enough for `exec`, passes its open descriptor to the
-FD-aware sidecar bootloader, and unlinks the private pathname immediately after
-the child is created. This avoids relying on macOS Mach-O execution through
-`/dev/fd` while preserving descriptor-bound archive reads and preventing a
-renderer-visible or reusable launch path.
+directory for the complete PyInstaller onefile parent/child process lifecycle,
+passes its open descriptor to the FD-aware sidecar bootloader, and unlinks the
+private pathname only after process-group cleanup is confirmed. This avoids
+relying on macOS Mach-O execution through `/dev/fd` while preserving
+descriptor-bound archive reads. The pathname is private native-host state and is
+never renderer-visible, but it intentionally remains available for PyInstaller's
+later child `execvp` until the owned process lifecycle has ended.
 Debug-only override and source-launcher code is absent under production cfg;
 the Desktop workflow compiles, lints, and tests both debug and release cfg.
 
@@ -709,11 +723,12 @@ code signing, notarization, closure of the same-UID pathname TOCTOU described
 above, first-run remote bootstrap, a real science task, or downloaded artifact
 identity, and do not make the DMG release-ready. The manual candidate workflow
 separately proves mounted/copied macOS application startup through the renderer
-readiness handshake. ACL permission-mask policy tests run cross-platform and a macOS
-cfg test exercises `acl_get_fd_np` on a fresh ACL-free anchored file. No test
-currently creates a real writable extended-ACL fixture on macOS, so rejection
-of an installed mutating ACE remains a macOS-runner fixture gap rather than
-claimed release evidence.
+readiness handshake, but not first-run remote bootstrap, a real science task,
+or downloaded artifact identity, and does not make the DMG release-ready. ACL
+contract tests cover inherited/mutating entries, unknown
+tags/permissions, post-initialization mutation, and cleanup replacement windows.
+The macOS runner also creates a real writable inherited extended-ACL fixture and
+executes the FD-based clear/readback path before building the packaged sidecar.
 
 Before that outer lifecycle harness, the workflow installs the exact remote Core
 wheel in a clean Python environment and runs

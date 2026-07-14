@@ -747,6 +747,103 @@ def test_core_release_output_is_created_private_and_stays_pinned(tmp_path: Path)
     assert list(output.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ((1, 1 << 6),),
+        ((1, (1 << 2) | (1 << 4)),),
+        ((2, (1 << 2) | (1 << 6)),),
+    ],
+)
+def test_macos_fd_acl_is_cleared_and_reverified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entries: tuple[tuple[int, int], ...],
+) -> None:
+    builder = _load_builder()
+    path = tmp_path / "acl-member"
+    path.write_bytes(b"member")
+    snapshots = iter((entries, ()))
+    deleted: list[int] = []
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder, "_darwin_extended_acl_entries", lambda _: next(snapshots))
+    monkeypatch.setattr(builder, "_delete_darwin_extended_acl", deleted.append)
+    file_fd = os.open(path, os.O_RDONLY)
+    try:
+        builder._clear_and_verify_fd_acl(file_fd, name=path.name)
+    finally:
+        os.close(file_fd)
+
+    assert len(deleted) == 1
+
+
+@pytest.mark.parametrize("entries", [((99, 0),), ((1, 1 << 63),)])
+def test_macos_fd_acl_rejects_unknown_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entries: tuple[tuple[int, int], ...],
+) -> None:
+    builder = _load_builder()
+    path = tmp_path / "acl-member"
+    path.write_bytes(b"member")
+    deleted: list[int] = []
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder, "_darwin_extended_acl_entries", lambda _: entries)
+    monkeypatch.setattr(builder, "_delete_darwin_extended_acl", deleted.append)
+    file_fd = os.open(path, os.O_RDONLY)
+    try:
+        with pytest.raises(RuntimeError, match="unknown"):
+            builder._clear_and_verify_fd_acl(file_fd, name=path.name)
+    finally:
+        os.close(file_fd)
+
+    assert deleted == []
+
+
+def test_macos_fd_acl_rejects_mutation_after_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    path = tmp_path / "acl-member"
+    path.write_bytes(b"member")
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        builder,
+        "_darwin_extended_acl_entries",
+        lambda _: ((builder._DARWIN_ACL_EXTENDED_ALLOW, 1 << 6),),
+    )
+    file_fd = os.open(path, os.O_RDONLY)
+    try:
+        with pytest.raises(RuntimeError, match="permits mutation"):
+            builder._require_fd_acl_free(file_fd, name=path.name)
+    finally:
+        os.close(file_fd)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires real macOS extended ACL APIs")
+def test_macos_real_fd_acl_runner_clears_inherited_mutating_entry(tmp_path: Path) -> None:
+    builder = _load_builder()
+    directory = tmp_path / "acl-directory"
+    directory.mkdir(mode=0o700)
+    subprocess.run(
+        [
+            "chmod",
+            "+a",
+            "everyone allow write,delete,delete_child,file_inherit,directory_inherit",
+            str(directory),
+        ],
+        check=True,
+    )
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert builder._darwin_extended_acl_entries(directory_fd)
+        builder._clear_and_verify_fd_acl(directory_fd, name=directory.name)
+        assert builder._darwin_extended_acl_entries(directory_fd) == ()
+    finally:
+        os.close(directory_fd)
+
+
 def test_bounded_directory_scan_stops_at_limit_plus_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1041,6 +1138,114 @@ def test_core_release_same_name_replacement_is_preserved_and_blocks_retry(
     assert len(list(output.glob(".openevo-core-release-*"))) == 1
 
 
+def test_cleanup_name_race_quarantines_replacement_without_deleting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    replacement = b"replacement created after cleanup verification"
+    injected = False
+
+    def replace_verified_name(directory_fd: int, name: str) -> None:
+        nonlocal injected
+        if injected or name != wheel.name:
+            return
+        injected = True
+        os.rename(
+            name,
+            "preserved-authorized-wheel",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        replacement_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o644,
+            dir_fd=directory_fd,
+        )
+        try:
+            os.write(replacement_fd, replacement)
+            os.fsync(replacement_fd)
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(
+        builder,
+        "_after_core_release_cleanup_identity_verified",
+        replace_verified_name,
+    )
+
+    with pytest.raises(RuntimeError, match="replacement.*preserved|rollback could not be verified"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+            raise OSError("trigger inode-bound rollback")
+
+    assert (output / "preserved-authorized-wheel").read_bytes() == wheel.read_bytes()
+    preserved_payloads = [
+        path.read_bytes()
+        for transaction in output.glob(".openevo-core-release-*")
+        for path in transaction.iterdir()
+        if path.is_file()
+    ]
+    assert replacement in preserved_payloads
+
+
+def test_transaction_name_race_preserves_replacement_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    injected = False
+
+    def replace_verified_transaction(directory_fd: int, name: str) -> None:
+        nonlocal injected
+        if injected or builder._CORE_RELEASE_TRANSACTION_PATTERN.fullmatch(name) is None:
+            return
+        injected = True
+        os.rename(
+            name,
+            ".preserved-authorized-transaction",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.mkdir(name, 0o700, dir_fd=directory_fd)
+
+    monkeypatch.setattr(
+        builder,
+        "_after_core_release_cleanup_identity_verified",
+        replace_verified_transaction,
+    )
+
+    with pytest.raises(RuntimeError, match="rollback could not be verified"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert (output / ".preserved-authorized-transaction").is_dir()
+    tombstones = list(tmp_path.glob(".openevo-core-release-tombstone-*"))
+    assert len(tombstones) == 1
+    assert tombstones[0].is_dir()
+    assert list(tombstones[0].iterdir()) == []
+
+
+def test_retired_transaction_tombstone_does_not_change_exact_pair_retry(tmp_path: Path) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    for _ in range(2):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+    tombstones = list(tmp_path.glob(".openevo-core-release-tombstone-*"))
+    assert len(tombstones) == 1
+    assert (tombstones[0] / builder.CORE_RELEASE_TRANSACTION_MARKER).is_file()
+
+
 def test_core_release_crash_between_names_is_reconciled_on_retry(tmp_path: Path) -> None:
     builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
     builder = _load_builder()
@@ -1130,7 +1335,7 @@ def test_core_release_recovery_resumes_after_second_cleanup_crash(
         assert (transactions[0] / staging_names[lock.name]).read_bytes() == lock.read_bytes()
     else:
         assert not (output / lock.name).exists()
-        assert not (transactions[0] / staging_names[lock.name]).exists()
+        assert (transactions[0] / staging_names[lock.name]).read_bytes() == lock.read_bytes()
 
     with builder._open_core_release_output(output) as authority:
         builder._export_core_release_inputs(authority, wheel, lock)

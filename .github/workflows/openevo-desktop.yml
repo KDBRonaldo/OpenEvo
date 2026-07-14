@@ -141,6 +141,12 @@ jobs:
             tests/openevo/sidecar/test_workspace_import_lifecycle.py \
             -q
 
+      - name: Exercise macOS Core release ACL and cleanup policy
+        run: |
+          uv run python -m pytest \
+            tests/ci/test_build_sidecar.py \
+            -q
+
       - name: Build frontend and FD-aware PyInstaller externalBin
         working-directory: desktop
         run: |
