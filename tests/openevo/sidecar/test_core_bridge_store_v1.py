@@ -44,6 +44,58 @@ ETAG_A = '"' + "a" * 64 + '"'
 ETAG_B = '"' + "b" * 64 + '"'
 
 
+def _prepare_unpublished_store_files(root: Path) -> tuple[Path, Path]:
+    root.mkdir(mode=0o700)
+    for name in (
+        store_module.OWNER_LOCK_FILENAME,
+        store_module.DATABASE_FILENAME,
+        store_module.IDENTITY_MARKER_FILENAME,
+    ):
+        path = root / name
+        path.touch(mode=0o600)
+        os.chmod(path, 0o600)
+    anchor = root.parent / (
+        store_module.ROOT_ANCHOR_PREFIX
+        + hashlib.sha256(os.fsencode(os.path.abspath(root))).hexdigest()
+        + ".identity"
+    )
+    anchor.touch(mode=0o600)
+    os.chmod(anchor, 0o600)
+    return root / store_module.DATABASE_FILENAME, anchor
+
+
+def _create_uncommitted_initial_schema_hot_journal(
+    root: Path,
+) -> tuple[Path, Path, Path]:
+    database, anchor = _prepare_unpublished_store_files(root)
+
+    script = """
+import os
+import sqlite3
+import sys
+
+from desktop.sidecar import core_bridge_store_v1 as store_module
+
+connection = sqlite3.connect(sys.argv[1], isolation_level=None)
+connection.execute("PRAGMA journal_mode = DELETE")
+connection.execute("PRAGMA synchronous = FULL")
+connection.execute("PRAGMA cache_size = 1")
+connection.execute("PRAGMA cache_spill = ON")
+connection.execute("BEGIN EXCLUSIVE")
+for statement in store_module._SCHEMA:
+    connection.execute(statement)
+os._exit(0)
+"""
+    subprocess.run([sys.executable, "-c", script, os.fspath(database)], check=True)
+
+    journal = root / store_module.JOURNAL_FILENAME
+    assert database.stat().st_size > 0
+    assert journal.stat().st_size > 0
+    assert (root / store_module.IDENTITY_MARKER_FILENAME).stat().st_size == 0
+    assert anchor.stat().st_size == 0
+    return database, journal, anchor
+
+
 def _snapshot(
     snapshot_id: str,
     kind: core_v1.SnapshotKind,
@@ -1192,6 +1244,120 @@ def test_nonempty_store_without_identity_marker_fails_closed(tmp_path: Path) -> 
     (root / store_module.IDENTITY_MARKER_FILENAME).unlink()
 
     with pytest.raises(CoreBridgeStoreStateRootError, match="identity marker"):
+        DesktopCoreBridgeStoreV1(root)
+
+
+def test_fresh_initial_schema_hot_journal_rolls_back_then_bootstraps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    database, journal, _anchor = _create_uncommitted_initial_schema_hot_journal(root)
+    original_initialize = DesktopCoreBridgeStoreV1._initialize_schema
+    recovered_state: tuple[bool, int, bool, int, int] | None = None
+
+    def inspect_recovered_state(
+        self: DesktopCoreBridgeStoreV1,
+        *,
+        fresh_database: bool,
+    ) -> None:
+        nonlocal recovered_state
+        recovered_state = (
+            fresh_database,
+            os.fstat(self._database_fd).st_size,
+            journal.exists(),
+            self._connection.execute("PRAGMA page_count").fetchone()[0],
+            self._connection.execute("SELECT count(*) FROM sqlite_schema").fetchone()[0],
+        )
+        original_initialize(self, fresh_database=fresh_database)
+
+    monkeypatch.setattr(
+        DesktopCoreBridgeStoreV1,
+        "_initialize_schema",
+        inspect_recovered_state,
+    )
+
+    store = DesktopCoreBridgeStoreV1(root)
+    assert recovered_state == (True, 0, False, 0, 0)
+    assert database.stat().st_size > 0
+    store.close()
+
+    reopened = DesktopCoreBridgeStoreV1(root)
+    with sqlite3.connect(reopened.database_path) as connection:
+        assert connection.execute(
+            "SELECT marker_generation, binding_state FROM store_identity"
+        ).fetchone() == (0, "bound")
+    reopened.close()
+
+
+def test_initial_schema_hot_journal_rollback_failure_is_not_claimed(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    database, journal, _anchor = _create_uncommitted_initial_schema_hot_journal(root)
+    journal.write_bytes(journal.read_bytes()[:100])
+    os.chmod(journal, 0o600)
+    database_size = database.stat().st_size
+
+    with pytest.raises(CoreBridgeStoreDataCorruptionError, match="safely opened"):
+        DesktopCoreBridgeStoreV1(root)
+
+    assert database.stat().st_size == database_size
+    assert (root / store_module.IDENTITY_MARKER_FILENAME).stat().st_size == 0
+
+
+def test_recovered_empty_hot_journal_with_foreign_marker_is_not_fresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_store = DesktopCoreBridgeStoreV1(source_root)
+    source_store.close()
+    foreign_marker = (source_root / store_module.IDENTITY_MARKER_FILENAME).read_bytes()
+
+    root = tmp_path / "state"
+    database, journal, _anchor = _create_uncommitted_initial_schema_hot_journal(root)
+    marker = root / store_module.IDENTITY_MARKER_FILENAME
+    marker.write_bytes(foreign_marker)
+    os.chmod(marker, 0o600)
+    original_initialize = DesktopCoreBridgeStoreV1._initialize_schema
+    fresh_after_recovery: bool | None = None
+
+    def observe_fresh_eligibility(
+        self: DesktopCoreBridgeStoreV1,
+        *,
+        fresh_database: bool,
+    ) -> None:
+        nonlocal fresh_after_recovery
+        fresh_after_recovery = fresh_database
+        original_initialize(self, fresh_database=fresh_database)
+
+    monkeypatch.setattr(
+        DesktopCoreBridgeStoreV1,
+        "_initialize_schema",
+        observe_fresh_eligibility,
+    )
+
+    with pytest.raises(CoreBridgeStoreSchemaError, match="not eligible for fresh creation"):
+        DesktopCoreBridgeStoreV1(root)
+
+    assert fresh_after_recovery is False
+    assert database.stat().st_size == 0
+    assert not journal.exists()
+    assert marker.read_bytes() == foreign_marker
+
+
+def test_physically_nonempty_empty_schema_is_not_fresh(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    database, _anchor = _prepare_unpublished_store_files(root)
+    with sqlite3.connect(database) as connection:
+        connection.execute("VACUUM")
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table'"
+        ).fetchall() == []
+    os.chmod(database, 0o600)
+    assert database.stat().st_size > 0
+
+    with pytest.raises(CoreBridgeStoreSchemaError, match="not eligible for fresh creation"):
         DesktopCoreBridgeStoreV1(root)
 
 

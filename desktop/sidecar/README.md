@@ -387,11 +387,18 @@ post-fork child fails closed without deadlocking or unlocking its parent owner.
 The store uses SQLite's rollback journal with `synchronous=FULL`, forbids WAL/SHM,
 caps the database at 1 GiB and journal at 2 GiB, and validates an exact private
 schema fingerprint and metadata row in every transaction. Private persistence
-schema v3 is independent of the public Core/Desktop API version. A genuinely
-empty database may create v3 by atomically committing its schema and exact
-generation-zero `pending` identity before publishing either marker. Restart may
-finish only that recognized empty pending bootstrap; a nonempty unversioned, v1,
-v2, markerless bound, or otherwise unrecognized partial store fails closed.
+schema v3 is independent of the public Core/Desktop API version. Fresh
+eligibility is decided only after SQLite has recovered any hot rollback journal
+through the pinned connection. The held database FD must then have zero bytes,
+and that same connection must report zero pages, `user_version=0`, and no
+`sqlite_schema` rows; both markers must still be unpublished. This permits a
+crashed, uncommitted first schema transaction to roll back to the genuine empty
+generation-zero state without trusting its nonempty pre-open size. A physically
+nonempty empty-schema file, marker mismatch, failed rollback, nonempty
+unversioned, v1, v2, markerless bound, or otherwise unrecognized partial store
+fails closed. An eligible database may create v3 by atomically committing its
+schema and exact generation-zero `pending` identity before publishing either
+marker. Restart may finish only that recognized empty pending bootstrap.
 There is no inference-based migration. Startup performs SQLite and foreign-key
 integrity checks before decoding authority. Recovery is bounded to 120,000 rows
 and 512 MiB of indexed/document bytes; each closed document is at most 4 MiB.

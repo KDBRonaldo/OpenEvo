@@ -162,6 +162,16 @@ Unknown entries in a fresh dedicated state root, unrecognized schemas, nonempty
 pending authority, or mismatched marker identity fail closed instead of being
 claimed as a new store.
 
+The pre-connect database size is not fresh authority because opening SQLite may
+first roll back a hot journal left by an uncommitted initial schema transaction.
+Fresh eligibility is recomputed after that recovery through the inode-pinned
+connection: the held FD must be zero bytes, while the connection reports zero
+pages, `user_version=0`, and an empty `sqlite_schema`, with both durable markers
+still unpublished. A rollback that restores those exact conditions may start
+the generation-zero protocol. Failed or nonempty recovery, a physically
+nonempty database with an apparently empty schema, and any published or foreign
+marker remain ineligible and fail closed.
+
 ## Session Ownership
 
 One `DesktopCoreBridgeV1` owns at most one candidate or active generation. A

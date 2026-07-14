@@ -983,8 +983,8 @@ class DesktopCoreBridgeStoreV1:
             self._ensure_empty_private_file(DATABASE_FILENAME)
             database_stat = self._verify_private_file(DATABASE_FILENAME)
             marker_stat = self._optional_private_file(IDENTITY_MARKER_FILENAME)
-            fresh_database = database_stat.st_size == 0
-            if fresh_database and marker_stat is None:
+            database_was_empty = database_stat.st_size == 0
+            if database_was_empty and marker_stat is None:
                 self._ensure_empty_private_file(IDENTITY_MARKER_FILENAME)
                 marker_stat = self._verify_private_file(IDENTITY_MARKER_FILENAME)
             if marker_stat is None:
@@ -992,14 +992,14 @@ class DesktopCoreBridgeStoreV1:
                     "nonempty or legacy bridge store has no durable identity marker"
                 )
             anchor_stat = self._optional_anchor_file()
-            if fresh_database and anchor_stat is None:
+            if database_was_empty and anchor_stat is None:
                 self._ensure_empty_anchor_file()
                 anchor_stat = self._verify_anchor_file()
             if anchor_stat is None:
                 raise CoreBridgeStoreStateRootError(
                     "nonempty or legacy bridge store has no durable root identity anchor"
                 )
-            if fresh_database and anchor_stat.st_size not in (0, MARKER_FILE_BYTES):
+            if database_was_empty and anchor_stat.st_size not in (0, MARKER_FILE_BYTES):
                 raise CoreBridgeStoreStateRootError(
                     "fresh bridge root identity anchor is invalid"
                 )
@@ -1012,6 +1012,7 @@ class DesktopCoreBridgeStoreV1:
             self._open_database_file()
             self._verify_storage_files()
             self._connection = self._open_database_connection()
+            fresh_database = self._is_fresh_database_after_recovery()
             self._initialize_schema(fresh_database=fresh_database)
             self._recover_and_validate()
             self._verify_storage_files()
@@ -1440,6 +1441,35 @@ class DesktopCoreBridgeStoreV1:
             if "connection" in locals():
                 connection.close()
             raise
+
+    def _is_fresh_database_after_recovery(self) -> bool:
+        connection = self._connection
+        try:
+            page_count = cast(int, connection.execute("PRAGMA page_count").fetchone()[0])
+            user_version = cast(int, connection.execute("PRAGMA user_version").fetchone()[0])
+            schema_rows = cast(
+                int,
+                connection.execute("SELECT count(*) FROM sqlite_schema").fetchone()[0],
+            )
+        except sqlite3.DatabaseError as exc:
+            raise CoreBridgeStoreDataCorruptionError(
+                "bridge SQLite recovery state could not be read"
+            ) from exc
+        self._verify_storage_files()
+        database_stat = os.fstat(self._database_fd)
+        if self._file_identity(database_stat) != self._managed_identities[DATABASE_FILENAME]:
+            raise CoreBridgeStoreStateRootError(
+                "held bridge database identity changed after SQLite recovery"
+            )
+        database_empty = (
+            database_stat.st_size == 0
+            and page_count == 0
+            and user_version == 0
+            and schema_rows == 0
+        )
+        if not database_empty:
+            return False
+        return self._read_identity_marker() is None and self._read_root_anchor() is None
 
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
