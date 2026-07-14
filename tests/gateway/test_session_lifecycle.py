@@ -174,7 +174,11 @@ async def test_dispatch_runs_runtime_lifecycle_and_builds_stdout_trajectory(
         ]
         assert manager.storage.get_session_metadata(request.session_id) is None
         assert {path.name for path in tmp_path.iterdir()} == {".openevo-gateway-cleanup"}
-        assert list(manager._cleanup_journal_dir.glob("*.json")) == []
+        records = list(manager._cleanup_journal_dir.glob("*.json"))
+        assert len(records) == 1
+        retired = json.loads(records[0].read_text(encoding="utf-8"))
+        assert retired["version"] == 8
+        assert retired["kind"] == "retired"
         assert list(manager._cleanup_journal_dir.parent.glob(".*.root.json"))
     finally:
         await manager.close()
@@ -661,6 +665,164 @@ async def test_ready_cancel_failure_still_enqueues_postrun_cleanup(tmp_path: Pat
     assert await dispatcher.cancel(managed.session_id) is True
     assert managed.stage == SessionStage.POSTRUN
     assert await dispatcher._postrun_queue.get() == managed.session_id
+
+
+@pytest.mark.asyncio
+async def test_ready_wait_cancel_does_not_release_unowned_slot(tmp_path: Path) -> None:
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    dispatcher._started = True
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="ready-wait-cancel",
+            task_id="task",
+            instruction="work",
+            remaining_timeout_seconds=10,
+            runtime=RuntimeSpec(image="runtime:latest"),
+            agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+        ),
+        timer=StageTimer(),
+        session_dir=tmp_path / "ready-wait-cancel",
+        artifacts_dir=tmp_path / "ready-wait-cancel" / "artifacts",
+        stage=SessionStage.READY,
+    )
+    dispatcher._sessions[managed.session_id] = managed
+
+    await dispatcher._ready_slots.acquire()
+    waiter = asyncio.create_task(dispatcher._acquire_ready_slot(managed))
+    await asyncio.sleep(0)
+
+    assert await dispatcher.cancel(managed.session_id) is True
+    assert await waiter is False
+    assert managed.ready_slot_owned is False
+    dispatcher._ready_slots.release()
+
+    await asyncio.wait_for(dispatcher._ready_slots.acquire(), timeout=0.1)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(dispatcher._ready_slots.acquire(), timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_ready_acquired_slot_is_released_once_across_repeated_cancel(
+    tmp_path: Path,
+) -> None:
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    dispatcher._started = True
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="ready-owned-cancel",
+            task_id="task",
+            instruction="work",
+            remaining_timeout_seconds=10,
+            runtime=RuntimeSpec(image="runtime:latest"),
+            agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+        ),
+        timer=StageTimer(),
+        session_dir=tmp_path / "ready-owned-cancel",
+        artifacts_dir=tmp_path / "ready-owned-cancel" / "artifacts",
+        stage=SessionStage.READY,
+    )
+    dispatcher._sessions[managed.session_id] = managed
+
+    assert await dispatcher._acquire_ready_slot(managed) is True
+    assert managed.ready_slot_owned is True
+    assert await dispatcher.cancel(managed.session_id) is True
+    assert await dispatcher.cancel(managed.session_id) is True
+    assert managed.ready_slot_owned is False
+
+    await asyncio.wait_for(dispatcher._ready_slots.acquire(), timeout=0.1)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(dispatcher._ready_slots.acquire(), timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_ready_acquire_cancel_race_preserves_exact_capacity(tmp_path: Path) -> None:
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    dispatcher._started = True
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="ready-acquire-cancel-race",
+            task_id="task",
+            instruction="work",
+            remaining_timeout_seconds=10,
+            runtime=RuntimeSpec(image="runtime:latest"),
+            agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+        ),
+        timer=StageTimer(),
+        session_dir=tmp_path / "ready-acquire-cancel-race",
+        artifacts_dir=tmp_path / "ready-acquire-cancel-race" / "artifacts",
+        stage=SessionStage.READY,
+    )
+    dispatcher._sessions[managed.session_id] = managed
+
+    await dispatcher._ready_slots.acquire()
+    waiter = asyncio.create_task(dispatcher._acquire_ready_slot(managed))
+    await asyncio.sleep(0)
+    dispatcher._ready_slots.release()
+    cancel_task = asyncio.create_task(dispatcher.cancel(managed.session_id))
+
+    _, cancelled = await asyncio.gather(waiter, cancel_task)
+    assert cancelled is True
+    assert managed.ready_slot_owned is False
+    await asyncio.wait_for(dispatcher._ready_slots.acquire(), timeout=0.1)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(dispatcher._ready_slots.acquire(), timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_ready_wait_cancel_keeps_other_session_backpressure(tmp_path: Path) -> None:
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    dispatcher._started = True
+
+    def ready_session(session_id: str) -> ManagedSession:
+        return ManagedSession(
+            request=SessionDispatchRequest(
+                session_id=session_id,
+                task_id="task",
+                instruction="work",
+                remaining_timeout_seconds=10,
+                runtime=RuntimeSpec(image="runtime:latest"),
+                agent=AgentSpec(
+                    harness="shell",
+                    custom_shell=ExecInput(command="true"),
+                ),
+            ),
+            timer=StageTimer(),
+            session_dir=tmp_path / session_id,
+            artifacts_dir=tmp_path / session_id / "artifacts",
+            stage=SessionStage.READY,
+        )
+
+    owner = ready_session("ready-owner")
+    waiter_session = ready_session("ready-backpressure-waiter")
+    dispatcher._sessions[owner.session_id] = owner
+    dispatcher._sessions[waiter_session.session_id] = waiter_session
+
+    assert await dispatcher._acquire_ready_slot(owner) is True
+    waiter = asyncio.create_task(dispatcher._acquire_ready_slot(waiter_session))
+    await asyncio.sleep(0)
+    assert await dispatcher.cancel(waiter_session.session_id) is True
+    assert await waiter is False
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(dispatcher._ready_slots.acquire(), timeout=0.01)
+    assert dispatcher._release_ready_slot(owner) is True
+    await asyncio.wait_for(dispatcher._ready_slots.acquire(), timeout=0.1)
 
 
 class _DispatcherCancelBaseException(BaseException):

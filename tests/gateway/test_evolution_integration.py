@@ -1007,6 +1007,16 @@ def _managed_postrun_session(tmp_path, result: SessionResult) -> ManagedSession:
     )
 
 
+def _assert_only_retired_cleanup_record(journal_dir: Path) -> dict:
+    records = list(journal_dir.glob("*.json"))
+    assert len(records) == 1
+    payload = json.loads(records[0].read_text(encoding="utf-8"))
+    assert payload["version"] == 8
+    assert payload["kind"] == "retired"
+    assert payload["generation"]
+    return payload
+
+
 @pytest.mark.asyncio
 async def test_handle_postrun_exports_after_set_result_before_cleanup_and_callback(
     tmp_path,
@@ -1846,7 +1856,7 @@ async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation
         "logs",
     ]
     assert restarted._cleanup_retries == {}
-    assert list(journal_dir.glob("*.json")) == []
+    _assert_only_retired_cleanup_record(journal_dir)
 
 
 def test_cleanup_journal_root_replacement_retains_displaced_records(
@@ -2028,7 +2038,7 @@ async def test_restart_removes_journaled_credential_staging_crash_window(
 
     assert not credential_dir.exists()
     assert not session_dir.exists()
-    assert list(journal_dir.glob("*.json")) == []
+    _assert_only_retired_cleanup_record(journal_dir)
 
 
 @pytest.mark.asyncio
@@ -2079,7 +2089,7 @@ async def test_credential_cleanup_fault_remains_journaled_and_retries(
 
     await restarted._reconcile_cleanup_retries()
     assert not credential_dir.exists()
-    assert list(journal_dir.glob("*.json")) == []
+    _assert_only_retired_cleanup_record(journal_dir)
 
 
 @pytest.mark.asyncio
@@ -2120,7 +2130,8 @@ async def test_recovery_scrubs_journal_bound_auth_before_cleanup_budget_exhausti
 
     journal_path = next(journal_dir.glob("*.json"))
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert journal["version"] == 7
+    assert journal["version"] == 8
+    assert journal["kind"] == "active"
     assert journal["credential_root"]["auth_identity"] == list(auth_identity)
 
     real_remove = session_files.remove_credential_tree
@@ -2227,7 +2238,8 @@ async def test_recovery_scrubs_auth_published_after_prewrite_identity_journal(
         assert os.pread(held_auth, 1, 0) == b""
         assert not credential_dir.exists()
         assert not session_dir.exists()
-        assert not journal_path.exists()
+        retired = _assert_only_retired_cleanup_record(journal_dir)
+        assert retired["session_id"] == managed.session_id
     finally:
         os.close(held_auth)
 
@@ -2317,7 +2329,7 @@ async def test_subscription_finalization_journal_recovers_terminal_result_after_
     assert info.status == SessionStatus.COMPLETED
     assert info.result is None  # callback delivery releases only the in-memory payload
     assert recovered_calls.index("callback_push") < recovered_calls.index("remove_session_dir")
-    assert list(journal_dir.glob("*.json")) == []
+    _assert_only_retired_cleanup_record(journal_dir)
 
 
 @pytest.mark.asyncio
@@ -2530,7 +2542,7 @@ async def test_subscription_finalization_rebuilds_transcript_after_restart(
     await restarted._reconcile_cleanup_retries()
 
     assert len(delivered) == 1
-    assert list(journal_dir.glob("*.json")) == []
+    _assert_only_retired_cleanup_record(journal_dir)
 
 
 @pytest.mark.asyncio
@@ -2651,7 +2663,9 @@ async def test_terminal_delivery_restart_skips_export_after_durable_success(
 
     await restarted._reconcile_cleanup_retries()
     assert calls.count("export") == 1
-    assert not journal_path.exists()
+    retired = _assert_only_retired_cleanup_record(journal_dir)
+    assert retired["terminal_delivery"]["export_succeeded"] is True
+    assert retired["terminal_delivery"]["callback_succeeded"] is True
     assert restarted.storage.deleted == [managed.session_id]
 
 
@@ -2924,7 +2938,8 @@ def test_cleanup_journal_stale_writer_cannot_regress_terminal_delivery(
 
     journal_path = next(journal_dir.glob("*.json"))
     payload = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert payload["version"] == 7
+    assert payload["version"] == 8
+    assert payload["kind"] == "active"
     assert payload["revision"] == delivery.revision
     assert payload["phase"] == "terminal_delivery"
     assert payload["terminal_delivery"]["callback_succeeded"] is True
@@ -2950,6 +2965,117 @@ def test_cleanup_journal_stale_writer_cannot_regress_terminal_delivery(
     persisted = json.loads(journal_path.read_text(encoding="utf-8"))
     assert persisted["phase"] == "terminal_delivery"
     assert persisted["terminal_delivery"]["callback_succeeded"] is True
+
+
+def test_cleanup_journal_retirement_blocks_precreation_stale_writer(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    result = _session_result(session_id="journal-retirement-aba")
+    managed = _managed_postrun_session(session_dir, result)
+    managed.request.callback_url = "http://rollout.test/callback"
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+
+    authoritative = _postrun_manager(calls=[])
+    authoritative._cleanup_journal_dir = journal_dir
+    stale_writer = _postrun_manager(calls=[])
+    stale_writer._cleanup_journal_dir = journal_dir
+    stale_candidate = stale_writer._cleanup_ownership_for(managed)
+    stale_entered = threading.Event()
+    release_stale = threading.Event()
+    original_acquire = stale_writer._acquire_cleanup_journal_lock
+
+    def delay_stale_lock(authority):
+        stale_entered.set()
+        assert release_stale.wait(timeout=2)
+        return original_acquire(authority)
+
+    stale_writer._acquire_cleanup_journal_lock = delay_stale_lock
+    stale_failures: list[BaseException] = []
+
+    def persist_stale_precreation_writer() -> None:
+        try:
+            stale_writer._persist_cleanup_ownership(stale_candidate)
+        except BaseException as exc:
+            stale_failures.append(exc)
+
+    stale_thread = threading.Thread(target=persist_stale_precreation_writer)
+    stale_thread.start()
+    assert stale_entered.wait(timeout=2)
+    try:
+        authoritative._register_cleanup_retry(managed)
+        delivery = authoritative._prepare_terminal_delivery(managed, result)
+        delivery = authoritative._advance_terminal_delivery(
+            delivery,
+            callback_succeeded=True,
+        )
+        authoritative._retire_cleanup_ownership(delivery)
+    finally:
+        release_stale.set()
+        stale_thread.join(timeout=2)
+
+    assert not stale_thread.is_alive()
+    assert len(stale_failures) == 1
+    assert isinstance(stale_failures[0], RuntimeError)
+    assert "retired" in str(stale_failures[0])
+
+    journal_path = next(journal_dir.glob("*.json"))
+    tombstone = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert tombstone["version"] == 8
+    assert tombstone["kind"] == "retired"
+    assert tombstone["generation"] == delivery.generation
+    assert tombstone["revision"] == delivery.revision + 1
+    assert tombstone["terminal_delivery"] == {
+        "result_digest": delivery.delivery_state.result_digest,
+        "export_succeeded": True,
+        "callback_succeeded": True,
+    }
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+    assert restarted._cleanup_retries == {}
+
+
+def test_cleanup_journal_v7_recovery_retires_with_generation_and_rejects_legacy_writer(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="journal-v7-retirement"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed)
+    journal_path = next(journal_dir.glob("*.json"))
+    legacy_payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    legacy_payload["version"] = 7
+    legacy_payload.pop("kind")
+    legacy_payload.pop("generation")
+    journal_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+    journal_path.chmod(0o600)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+    legacy = restarted._cleanup_retries[managed.session_id]
+    assert legacy.generation is None
+
+    restarted._retire_cleanup_ownership(legacy)
+    tombstone = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert tombstone["version"] == 8
+    assert tombstone["kind"] == "retired"
+    assert tombstone["generation"]
+
+    with pytest.raises(RuntimeError, match="retired"):
+        restarted._persist_cleanup_ownership(legacy)
 
 
 def test_cleanup_journal_process_lock_is_bounded_and_released_after_holder_exit(
@@ -3166,7 +3292,7 @@ def test_current_cleanup_journal_requires_explicit_recovery_phase(tmp_path: Path
     assert session_dir.exists()
 
 
-def test_v5_cleanup_journal_remains_readable_after_v7_upgrade(tmp_path: Path) -> None:
+def test_v5_cleanup_journal_remains_readable_after_v8_upgrade(tmp_path: Path) -> None:
     journal_dir = tmp_path / "journal"
     session_dir = tmp_path / "session"
     session_dir.mkdir(mode=0o700)
@@ -3180,6 +3306,8 @@ def test_v5_cleanup_journal_remains_readable_after_v7_upgrade(tmp_path: Path) ->
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     journal["version"] = 5
     journal.pop("revision")
+    journal.pop("kind")
+    journal.pop("generation")
     journal_path.write_text(json.dumps(journal), encoding="utf-8")
     journal_path.chmod(0o600)
 
@@ -3301,6 +3429,8 @@ async def test_legacy_journal_without_phase_stops_runtime_but_preserves_roots(
     journal["version"] = 4
     journal.pop("revision")
     journal.pop("phase")
+    journal.pop("kind")
+    journal.pop("generation")
     journal["terminal_delivery"] = None
     journal_path.write_text(json.dumps(journal), encoding="utf-8")
     journal_path.chmod(0o600)
@@ -4356,7 +4486,7 @@ async def test_subscription_finalization_preserves_transcript_after_execution_bu
     manager.session_registry = SessionRegistry()
     manager.session_registry.register("session_1", task_id="task_1")
     manager._cleanup_retries = {}
-    manager._clear_cleanup_ownership = Mock()
+    manager._retire_cleanup_ownership = Mock()
     delivered: list[SessionResult] = []
 
     async def capture_result(

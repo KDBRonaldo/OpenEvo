@@ -91,7 +91,9 @@ class ManagedSession:
     execution_deadline: float | None = None
     finalization_deadline: float | None = None
     runtime_cleanup_blocked: bool = False
+    ready_slot_owned: bool = False
     cleanup_journal_revision: int = 0
+    cleanup_journal_generation: str | None = None
     stage: SessionStage = SessionStage.INIT
     inflight: bool = False
 
@@ -165,6 +167,7 @@ class SessionDispatcher:
         for managed in sessions:
             managed.cancel_requested = True
             managed.cancel_event.set()
+            self._release_ready_slot(managed)
             if managed.runtime is not None:
                 cancel_tasks.append((managed, managed.runtime.cancel()))
         if cancel_tasks:
@@ -215,10 +218,9 @@ class SessionDispatcher:
                 before_cancel(managed)
             managed.cancel_requested = True
             managed.cancel_event.set()
-            # If the session is parked in READY (holding a ready slot), release it
-            # and transition to POSTRUN so the postrun worker picks it up.
+            # READY includes both semaphore waiters and sessions that own a slot.
             if managed.stage == SessionStage.READY and not managed.inflight:
-                self._ready_slots.release()
+                self._release_ready_slot(managed)
                 managed.stage = SessionStage.POSTRUN
                 managed.inflight = False
                 should_enqueue_postrun = True
@@ -406,8 +408,8 @@ class SessionDispatcher:
             if managed is None:
                 return None
             if from_ready:
-                # READY slot was granted via semaphore; RUNNING consumes it.
-                pass
+                if managed.stage != SessionStage.READY or not managed.ready_slot_owned:
+                    return None
             managed.stage = stage
             managed.inflight = True
         self._notify_stage_change(managed)
@@ -435,7 +437,7 @@ class SessionDispatcher:
     async def _transition_to_postrun(self, managed: ManagedSession) -> None:
         # The RUN callback is done (or was skipped). The ready slot is released
         # back to the pool on exit of RUNNING.
-        self._ready_slots.release()
+        self._release_ready_slot(managed)
         await self._move_to_postrun(managed, release_ready=False)
 
     async def _move_to_postrun(
@@ -448,7 +450,7 @@ class SessionDispatcher:
             if managed.stage == SessionStage.POSTRUN:
                 return
             if release_ready and managed.stage == SessionStage.READY and not managed.inflight:
-                self._ready_slots.release()
+                self._release_ready_slot(managed)
             managed.stage = SessionStage.POSTRUN
             managed.inflight = False
             transitioned = True
@@ -462,27 +464,48 @@ class SessionDispatcher:
             return False
         acquire_task = asyncio.create_task(self._ready_slots.acquire())
         cancel_task = asyncio.create_task(managed.cancel_event.wait())
+        ownership_transferred = False
         try:
-            done, _ = await asyncio.wait(
+            await asyncio.wait(
                 {acquire_task, cancel_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            acquired = (
+                acquire_task.done()
+                and not acquire_task.cancelled()
+                and acquire_task.exception() is None
+            )
+            if not acquired:
+                return False
+            async with self._lock:
+                if (
+                    managed.session_id in self._sessions
+                    and managed.stage == SessionStage.READY
+                    and not managed.cancel_event.is_set()
+                    and not managed.has_terminal_outcome
+                ):
+                    managed.ready_slot_owned = True
+                    ownership_transferred = True
+                    return True
+            return False
         finally:
             cancel_task.cancel()
             if not acquire_task.done():
                 acquire_task.cancel()
-        # If we managed to acquire the semaphore despite cancellation, release it
-        # so it doesn't leak to a later session.
-        acquired = (
-            acquire_task in done
-            and not acquire_task.cancelled()
-            and acquire_task.exception() is None
-        )
-        if managed.cancel_event.is_set() or managed.has_terminal_outcome:
-            if acquired:
+            await asyncio.gather(acquire_task, cancel_task, return_exceptions=True)
+            if (
+                not ownership_transferred
+                and not acquire_task.cancelled()
+                and acquire_task.exception() is None
+            ):
                 self._ready_slots.release()
+
+    def _release_ready_slot(self, managed: ManagedSession) -> bool:
+        if not managed.ready_slot_owned:
             return False
-        return acquired
+        managed.ready_slot_owned = False
+        self._ready_slots.release()
+        return True
 
     def _notify_stage_change(self, managed: ManagedSession) -> None:
         callback = self.on_stage_change

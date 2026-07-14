@@ -164,7 +164,8 @@ Docker always follows removal with an absence `inspect`, including after
 successful `rm -f`. Subscription teardown retries failed stop/absence checks a
 fixed number of times in the post-run worker. A still-unproven runtime is moved
 to periodic reconciliation instead of occupying that worker indefinitely.
-The private v7 cleanup journal contains a monotonic revision, runtime/container, and pinned-root
+The private v8 cleanup journal gives each active session an opaque generation and
+monotonic revision. Its active record contains runtime/container and pinned-root
 ownership, the exact staged auth-file identity, an explicit recovery phase, and a redacted, closed finalization
 authority: request identity, agent terminal state, optional terminal result,
 pending status, and timer marks. A terminal agent result is fsynced into that
@@ -185,7 +186,7 @@ successful return; exceptional exits always close the lock FD. A concurrent root
 rename or replacement therefore cannot receive journal bytes; pathname binding
 failure retains the displaced authority and its pending recovery marker.
 While holding that lock, each writer rereads and validates the authoritative
-record, performs a revision compare-and-swap, rejects recovery-phase regressions,
+record, performs a generation/revision compare-and-swap, rejects recovery-phase regressions,
 and prevents durable terminal delivery proofs from being changed or discarded.
 Replace/fsync failures roll back the old authority and retain the pending marker,
 so restart cannot treat an uncertain transition as permission to delete storage
@@ -197,8 +198,13 @@ device/inode identity, and the journal-root identity. Restart therefore rejects 
 renamed/replaced root or symlinked ancestor while retaining displaced records.
 Recovery preflights row count, filename bytes, metadata bytes, per-record size,
 and aggregate record bytes for the complete directory before reading any record
-content. Successful cleanup removes the session record but retains the empty
-journal root and marker as the node's persistent identity authority.
+content. Successful cleanup compare-and-retires the exact active generation to a
+persistent v8 tombstone containing the next revision and terminal proof summary.
+The session ID cannot return to revision zero, so a writer that began before
+creation cannot recreate authority after cleanup. Startup validates tombstones
+but does not schedule them for reconciliation. Historical v1-v7 active records
+remain readable and are assigned a generation on their next write or retirement;
+malformed legacy records fail closed.
 Evolution export uses the stable session source-event identity, and callbacks
 carry a result-derived `Idempotency-Key` and digest header. A failed or unknown
 response leaves that phase pending; a successful phase is fsynced before the
@@ -208,8 +214,8 @@ phase retain all data, and missing, disabled, or drifted evolution export config
 keeps a required export pending instead of converting it to a no-op. Startup reloads the authority,
 re-verifies staged auth only when transcript rebuilding is still needed, proves
 every owned container absent, and resumes pending publication. Completion
-storage, session/transcript, credential, log roots, and the journal are removed
-only after every required export and callback phase is durably successful. Once
+storage, session/transcript, credential, and log roots are removed and the active
+journal is retired only after every required export and callback phase is durably successful. Once
 authorized, cleanup first uses a separate bounded, recursive, no-follow scan to
 locate the journal-bound auth inode by stable device/inode. Same-root and nested
 renames are therefore scrubbed without treating an `auth.json` replacement as
@@ -224,6 +230,10 @@ cancellation completes any required POSTRUN enqueue before preserving
 `CancelledError` or another `BaseException`. POSTRUN callback execution and
 session removal are one shielded owned cleanup operation, so callback base
 exceptions do not strand the session or terminate the stage worker.
+READY semaphore capacity is released only by a session with explicit slot
+ownership. Cancelling a READY waiter therefore cannot release another session's
+permit; acquire/cancel races either transfer ownership and release it once or
+return the just-acquired permit directly.
 
 ## What it captures
 

@@ -206,7 +206,8 @@ output 或 artifact。scan 在任何写入前完成 per-file、aggregate byte、
 执行 deadline 耗尽后，transcript byte recovery/build 使用独立有界 finalization budget，保留
 timeout/cancel 前已经捕获的输出和原终态。结果发布前还会递归执行一次内存脱敏。失败时
 post-run 先做固定次数的 stop/absence retry，仍失败则释放 stage worker，由运行期周期
-reconciliation 继续。private v7 cleanup journal 除单调 revision、runtime/container/session/log/credential
+reconciliation 继续。private v8 cleanup journal 为 active session 保存不可复用的 opaque generation、
+单调 revision、runtime/container/session/log/credential
 identities 和 exact staged auth identity 外，还保存显式 recovery phase、闭集且已脱敏的
 request/agent terminal/optional result/pending status/timer finalization authority，以及 canonical
 result digest 和单调的 export/callback success proof；agent terminal state 必须先 fsync 该
@@ -224,14 +225,18 @@ previous record、pending、candidate、final、rollback、unlink、replace 和 
 `0600`、link-count-one inode 上的有界跨进程 `flock` 串行化。成功返回前重新验证 lock
 owner/mode/link/device/inode 与 root binding，异常路径关闭 lock FD；过程中 root pathname 被
 rename/replacement 时，不得向 replacement 写入 journal bytes，并保留 displaced authority 与
-pending recovery marker 后 fail closed。writer 持锁后重新读取权威记录，并以 exact revision CAS、
+pending recovery marker 后 fail closed。writer 持锁后重新读取权威记录，并以 exact generation/revision CAS、
 phase 前进关系和 terminal delivery proof 单调性校验候选；stale writer 不得覆盖终态或丢失已提交
 proof。
 journal 的 private parent 另有 immutable root marker，绑定 normalized absolute path、从 `/`
 逐组件 no-follow 获得的 ancestor device/inode identity chain 和 journal root identity。重启遇到
 root rename/replacement 或 ancestor symlink 必须保留 displaced records 并 fail closed。Recovery
 必须先对完整目录执行 row、filename、metadata、单文件和 aggregate byte budget 预检，之后才能读取
-任意 journal record 内容。
+任意 journal record 内容。cleanup 成功后必须把 exact active generation compare-and-retire 为持久
+v8 tombstone，保存下一 revision 和 terminal proof 摘要，不能 unlink 后允许 session identity 回到
+revision zero；因此在首次创建前已经构造 candidate 的 stale writer 也不能在 cleanup 后重建 authority。
+Startup 验证 tombstone 但不把它加入 reconciliation。历史 v1-v7 active record 仍可读取，并在下一次
+write 或 retirement 时获得 generation；畸形 legacy record fail closed。
 Evolution export 由稳定
 source event identity 去重，callback 带稳定 result digest/idempotency key；响应失败或未知保持
 pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当前 evolution config/client
@@ -239,7 +244,7 @@ pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当�
 并 fail closed，不能把 required export 解释为成功 no-op。重启从私有
 credential root 重新验证并构造 redactor（仅在仍需重建 transcript 时），证明容器 absent 后
 只重试 pending phase。两项 required proof 都持久成功后才删除 completion storage、session、
-credential、log roots 和 journal；无法证明时 authority 持续保留。
+credential、log roots 并 retire active journal；无法证明时 authority 持续保留。
 获得 cleanup 授权后，Core 在枚举 credential root 的普通 inventory budget 之前，先按 journal
 稳定 device/inode identity 做一轮独立 node/depth budget 的递归 no-follow scan；即使 agent 把
 exact inode 移入 nested subdirectory，也会复核后截断并 fsync。scan 超限、竞态或完整遍历后找不到
@@ -251,6 +256,9 @@ Credential-capable dispatcher shutdown/cancel/stage、Docker create
 reconciliation、init、agent postprocess、export、cleanup 和 teardown 异常日志不使用原始
 `exc_info`/traceback；始终保留 exception type，只有存在 verified `CredentialRedactor` 时才附加
 脱敏后的 exception text。
+READY semaphore permit 使用显式 session ownership；仍在等待 slot 的 READY session cancel 不得
+release permit。acquire/cancel 同时完成时，要么 ownership 成功转移后只释放一次，要么直接归还刚获得
+但未转移的 permit，重复 cancel 和其他 session backpressure 都不能改变 semaphore capacity。
 
 ## 主要模块
 
