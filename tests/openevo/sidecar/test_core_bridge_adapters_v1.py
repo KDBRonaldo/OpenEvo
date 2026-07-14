@@ -21,6 +21,7 @@ from desktop.sidecar.core_bridge_adapters_v1 import (
     AdoptedWorkspaceImportV1,
     CoreBootstrapConfigV1,
     DesktopCoreSshBridgeAdapterV1,
+    SealedCoreBootstrapAssetV1,
     VerifiedCoreHttpTransportV1,
 )
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1
@@ -33,8 +34,16 @@ from desktop.sidecar.workspace_imports import (
     WorkspaceImportStore,
 )
 from openevo.deployment import core_control
+from openevo.deployment.core_assets import (
+    CoreBootstrapAssetSnapshotError,
+    snapshot_core_bootstrap_assets,
+)
 from openevo.deployment.preflight import RemoteCommandResult
-from openevo.deployment.ssh import SshTransportError, SshTransportErrorCode
+from openevo.deployment.ssh import (
+    SshTransportError,
+    SshTransportErrorCode,
+    StagedCoreBootstrapAssets,
+)
 
 
 PROFILE_ID = "profile-a"
@@ -48,12 +57,37 @@ ARCHIVE = bytes(1024)
 IMPORT_ID = "workspace-import-" + "6" * 48
 
 
-def _bootstrap_config() -> CoreBootstrapConfigV1:
+def _bootstrap_config(tmp_path: Path) -> CoreBootstrapConfigV1:
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    wheel.write_bytes(b"sealed-wheel")
+    wheel_digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    framework_lock = tmp_path / "framework-lock.json"
+    framework_lock.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "distribution": "openevo",
+                "distribution_version": "0.1.0",
+                "distribution_digest": wheel_digest,
+                "wheel_filename": wheel.name,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     return CoreBootstrapConfigV1(
         source_commit=SOURCE_COMMIT,
-        wheel_path="/srv/openevo/releases/openevo.whl",
-        framework_lock_path="/srv/openevo/releases/framework-lock.json",
-        service_root="/srv/openevo/core",
+        wheel=SealedCoreBootstrapAssetV1(
+            local_path=str(wheel),
+            sha256=wheel_digest,
+            byte_size=wheel.stat().st_size,
+        ),
+        framework_lock=SealedCoreBootstrapAssetV1(
+            local_path=str(framework_lock),
+            sha256=hashlib.sha256(framework_lock.read_bytes()).hexdigest(),
+            byte_size=framework_lock.stat().st_size,
+        ),
     )
 
 
@@ -114,7 +148,53 @@ class FakeCoreTransport:
         self.tunnel = FakeCoreTunnel(remote_port=43117)
         self.run_error: Exception | None = None
         self.tunnel_error: Exception | None = None
+        self.stage_error: Exception | None = None
+        self.stage_calls: list[dict[str, object]] = []
+        self.runtime_preflight_error: Exception | None = None
+        self.runtime_preflight_timeouts: list[float] = []
+        self.after_runtime_preflight: Callable[[], None] | None = None
+        self.after_stage: Callable[[], None] | None = None
         self.after_secret: Callable[[], None] | None = None
+
+    def require_core_supervisor_runtime(self, *, timeout_seconds: float) -> None:
+        self.runtime_preflight_timeouts.append(timeout_seconds)
+        if self.runtime_preflight_error is not None:
+            raise self.runtime_preflight_error
+        if self.after_runtime_preflight is not None:
+            self.after_runtime_preflight()
+
+    def stage_core_bootstrap_assets(self, **kwargs: object) -> StagedCoreBootstrapAssets:
+        try:
+            with snapshot_core_bootstrap_assets(
+                wheel_path=str(kwargs["wheel_path"]),
+                wheel_sha256=str(kwargs["wheel_sha256"]),
+                wheel_size=int(kwargs["wheel_size"]),
+                framework_lock_path=str(kwargs["framework_lock_path"]),
+                framework_lock_sha256=str(kwargs["framework_lock_sha256"]),
+                framework_lock_size=int(kwargs["framework_lock_size"]),
+            ):
+                pass
+        except CoreBootstrapAssetSnapshotError:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+        self.stage_calls.append(kwargs)
+        if self.stage_error is not None:
+            error = self.stage_error
+            self.stage_error = None
+            raise error
+        if self.after_stage is not None:
+            self.after_stage()
+        return StagedCoreBootstrapAssets(
+            service_root="/home/alice/.openevo/core",
+            wheel_path=(
+                f"/home/alice/.openevo/core/assets/{kwargs['bundle_id']}/"
+                "openevo-0.1.0-py3-none-any.whl"
+            ),
+            framework_lock_path=(
+                f"/home/alice/.openevo/core/assets/{kwargs['bundle_id']}/framework-lock.json"
+            ),
+            wheel_sha256=str(kwargs["wheel_sha256"]),
+            framework_lock_sha256=str(kwargs["framework_lock_sha256"]),
+        )
 
     def run(
         self,
@@ -157,11 +237,16 @@ class FakeLifecycle(DesktopRemoteLifecycle):
 
 
 def _adapter(
+    tmp_path: Path,
     transport: FakeCoreTransport | None = None,
 ) -> tuple[DesktopCoreSshBridgeAdapterV1, FakeLifecycle, FakeCoreTransport]:
     active = transport or FakeCoreTransport()
     lifecycle = FakeLifecycle(PROFILE_ID, active)
-    return DesktopCoreSshBridgeAdapterV1(lifecycle, _bootstrap_config()), lifecycle, active
+    return (
+        DesktopCoreSshBridgeAdapterV1(lifecycle, _bootstrap_config(tmp_path)),
+        lifecycle,
+        active,
+    )
 
 
 @pytest.fixture
@@ -173,8 +258,10 @@ def verified_tunnel_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_core_host_uses_real_bootstrap_secret_channel_and_exact_identity() -> None:
-    adapter, _lifecycle, transport = _adapter()
+def test_core_host_stages_sealed_assets_then_bootstraps_supported_host(
+    tmp_path: Path,
+) -> None:
+    adapter, _lifecycle, transport = _adapter(tmp_path)
 
     first = adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
     second = adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
@@ -185,17 +272,20 @@ def test_core_host_uses_real_bootstrap_secret_channel_and_exact_identity() -> No
     assert first.bearer_token == BEARER
     assert first.bearer_identity.startswith("core-host-v1-")
     assert first.bearer_identity != BEARER
+    assert len(transport.stage_calls) == 2
+    assert len(transport.runtime_preflight_timeouts) == 2
+    assert transport.stage_calls[0]["wheel_sha256"] == _bootstrap_config(tmp_path).wheel.sha256
     assert "python3 -I -c" in transport.commands[0]
     assert "consume-attachment" in transport.secret_commands[0]
     assert BEARER not in " ".join(transport.commands + transport.secret_commands)
     assert all(0 < timeout <= 5 for timeout in transport.timeouts)
     assert BEARER not in repr(first)
     assert BEARER not in repr(adapter)
-    assert "/srv/openevo" not in repr(_bootstrap_config())
+    assert str(tmp_path) not in repr(_bootstrap_config(tmp_path))
 
 
-def test_core_host_rejects_cross_profile_and_transport_replacement() -> None:
-    adapter, lifecycle, transport = _adapter()
+def test_core_host_rejects_cross_profile_and_transport_replacement(tmp_path: Path) -> None:
+    adapter, lifecycle, transport = _adapter(tmp_path)
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as cross_profile:
         adapter.ensure_core("profile-b", deadline=time.monotonic() + 5)
@@ -209,10 +299,129 @@ def test_core_host_rejects_cross_profile_and_transport_replacement() -> None:
     assert BEARER not in str(replaced.value)
 
 
-def test_core_host_maps_bootstrap_timeout_and_expired_deadline() -> None:
+def test_core_host_rejects_transport_replacement_after_runtime_and_asset_checks(
+    tmp_path: Path,
+) -> None:
+    runtime_adapter, runtime_lifecycle, runtime_transport = _adapter(tmp_path)
+    runtime_transport.after_runtime_preflight = lambda: setattr(
+        runtime_lifecycle,
+        "transport",
+        FakeCoreTransport(),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as runtime_changed:
+        runtime_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert runtime_changed.value.error.code == "core_ssh_transport_identity_changed"
+    assert runtime_transport.stage_calls == []
+
+    asset_adapter, asset_lifecycle, asset_transport = _adapter(tmp_path)
+    asset_transport.after_stage = lambda: setattr(
+        asset_lifecycle,
+        "transport",
+        FakeCoreTransport(),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as asset_changed:
+        asset_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert asset_changed.value.error.code == "core_ssh_transport_identity_changed"
+    assert len(asset_transport.stage_calls) == 1
+    assert asset_transport.commands == []
+
+
+def test_core_host_rejects_local_asset_tamper_before_upload(tmp_path: Path) -> None:
+    config = _bootstrap_config(tmp_path)
+    adapter = DesktopCoreSshBridgeAdapterV1(
+        FakeLifecycle(PROFILE_ID, transport := FakeCoreTransport()),
+        config,
+    )
+    Path(config.wheel.local_path).write_bytes(b"tampered")
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as tampered:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert tampered.value.error.code == "core_bootstrap_asset_invalid"
+    assert transport.stage_calls == []
+    assert str(tmp_path) not in str(tampered.value)
+
+
+def test_core_host_reports_unsupported_remote_pidfd_runtime_before_upload(
+    tmp_path: Path,
+) -> None:
+    adapter, _lifecycle, transport = _adapter(tmp_path)
+    transport.runtime_preflight_error = SshTransportError(
+        SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as unsupported:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert unsupported.value.error.code == "core_supervisor_runtime_unsupported"
+    assert unsupported.value.error.http_status == 409
+    assert unsupported.value.error.retryable is False
+    assert "pidfd_open" in unsupported.value.error.message
+    assert "pidfd_send_signal" in unsupported.value.error.message
+    assert transport.stage_calls == []
+    assert transport.commands == []
+    assert str(tmp_path) not in str(unsupported.value)
+
+
+def test_core_host_normalizes_runtime_and_upload_errors_without_private_values(
+    tmp_path: Path,
+) -> None:
+    private = f"{BEARER} {tmp_path} python3 -I -c private-command"
+    runtime_adapter, _runtime_lifecycle, runtime_transport = _adapter(tmp_path)
+    runtime_transport.runtime_preflight_error = RuntimeError(private)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as runtime_error:
+        runtime_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert runtime_error.value.error.code == "core_supervisor_runtime_preflight_failed"
+    assert private not in str(runtime_error.value)
+    assert BEARER not in str(runtime_error.value)
+    assert str(tmp_path) not in str(runtime_error.value)
+
+    upload_adapter, _upload_lifecycle, upload_transport = _adapter(tmp_path)
+    upload_transport.stage_error = RuntimeError(private)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as upload_error:
+        upload_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert upload_error.value.error.code == "core_bootstrap_asset_upload_failed"
+    assert private not in str(upload_error.value)
+    assert BEARER not in str(upload_error.value)
+    assert str(tmp_path) not in str(upload_error.value)
+
+
+def test_core_host_partial_upload_retry_is_exact_and_idempotent(tmp_path: Path) -> None:
+    adapter, _lifecycle, transport = _adapter(tmp_path)
+    transport.stage_error = SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as partial:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert partial.value.error.code == "core_bootstrap_asset_upload_failed"
+
+    attachment = adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert attachment.remote_port == 43117
+    assert len(transport.stage_calls) == 2
+    assert transport.stage_calls[0]["bundle_id"] == transport.stage_calls[1]["bundle_id"]
+
+
+def test_core_host_maps_bootstrap_timeout_and_expired_deadline(tmp_path: Path) -> None:
+    preflight_transport = FakeCoreTransport()
+    preflight_transport.runtime_preflight_error = SshTransportError(SshTransportErrorCode.TIMEOUT)
+    preflight_adapter, _preflight_lifecycle, _preflight_transport = _adapter(
+        tmp_path,
+        preflight_transport,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as preflight_timeout:
+        preflight_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert (
+        preflight_timeout.value.error.code == "core_supervisor_runtime_preflight_deadline_exceeded"
+    )
+    assert preflight_transport.stage_calls == []
+
     transport = FakeCoreTransport()
     transport.run_error = SshTransportError(SshTransportErrorCode.TIMEOUT)
-    adapter, _lifecycle, _transport = _adapter(transport)
+    adapter, _lifecycle, _transport = _adapter(tmp_path, transport)
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as timeout:
         adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
@@ -227,9 +436,10 @@ def test_core_host_maps_bootstrap_timeout_and_expired_deadline() -> None:
 
 def test_tunnel_uses_same_transport_exact_attachment_and_idempotent_close(
     verified_tunnel_auth: None,
+    tmp_path: Path,
 ) -> None:
     del verified_tunnel_auth
-    adapter, _lifecycle, transport = _adapter()
+    adapter, _lifecycle, transport = _adapter(tmp_path)
     attachment = adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
 
     handle = adapter.open_tunnel(
@@ -256,9 +466,10 @@ def test_tunnel_uses_same_transport_exact_attachment_and_idempotent_close(
 
 def test_tunnel_rejects_attachment_and_profile_transport_mismatch(
     verified_tunnel_auth: None,
+    tmp_path: Path,
 ) -> None:
     del verified_tunnel_auth
-    adapter, lifecycle, transport = _adapter()
+    adapter, lifecycle, transport = _adapter(tmp_path)
     attachment = adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as wrong_port:
@@ -284,9 +495,10 @@ def test_tunnel_rejects_attachment_and_profile_transport_mismatch(
 
 def test_tunnel_maps_ssh_timeout_without_leaking_attachment(
     verified_tunnel_auth: None,
+    tmp_path: Path,
 ) -> None:
     del verified_tunnel_auth
-    adapter, _lifecycle, transport = _adapter()
+    adapter, _lifecycle, transport = _adapter(tmp_path)
     attachment = adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
     transport.tunnel_error = SshTransportError(SshTransportErrorCode.TIMEOUT)
 
@@ -305,9 +517,10 @@ def test_tunnel_maps_ssh_timeout_without_leaking_attachment(
 
 def test_tunnel_close_timeout_is_observable_and_reuses_one_close(
     verified_tunnel_auth: None,
+    tmp_path: Path,
 ) -> None:
     del verified_tunnel_auth
-    adapter, _lifecycle, transport = _adapter()
+    adapter, _lifecycle, transport = _adapter(tmp_path)
     transport.tunnel = FakeCoreTunnel(remote_port=43117, block_close=True)
     attachment = adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
     handle = adapter.open_tunnel(
@@ -376,6 +589,273 @@ def test_http_transport_opens_verified_socket_without_local_tcp_listener() -> No
     assert b"GET /v1/status HTTP/1.1" in requests[0]
     assert f"authorization: Bearer {BEARER}".encode() in requests[0]
     assert endpoint.authority_checks >= 2
+
+
+def test_http_transport_delivers_small_chunked_sse_chunk_before_stream_end() -> None:
+    first_chunk_sent = threading.Event()
+    finish_stream = threading.Event()
+    workers: list[threading.Thread] = []
+
+    class SseEndpoint:
+        def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+            parent, child = socket.socketpair()
+            parent.settimeout(timeout_seconds)
+
+            def serve() -> None:
+                with child:
+                    received = bytearray()
+                    while b"\r\n\r\n" not in received:
+                        received.extend(child.recv(4096))
+                    child.sendall(
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: text/event-stream\r\n"
+                        b"Transfer-Encoding: chunked\r\n"
+                        b"Connection: close\r\n\r\n"
+                        b"d\r\n: heartbeat\n\n\r\n"
+                    )
+                    first_chunk_sent.set()
+                    assert finish_stream.wait(timeout=2)
+                    child.sendall(b"0\r\n\r\n")
+
+            worker = threading.Thread(target=serve)
+            workers.append(worker)
+            worker.start()
+            return parent
+
+        def verify_authority(self) -> None:
+            pass
+
+    transport = VerifiedCoreHttpTransportV1(SseEndpoint())  # type: ignore[arg-type]
+    client = httpx.Client(base_url="http://127.0.0.1:1", transport=transport)
+    response = client.send(client.build_request("GET", "/v1/events"), stream=True)
+    delivered: list[bytes] = []
+    delivery_finished = threading.Event()
+    chunks = response.iter_raw()
+
+    def read_first() -> None:
+        delivered.append(next(chunks))
+        delivery_finished.set()
+
+    reader = threading.Thread(target=read_first)
+    reader.start()
+    try:
+        assert first_chunk_sent.wait(timeout=1)
+        assert delivery_finished.wait(timeout=0.25)
+        assert delivered == [b": heartbeat\n\n"]
+    finally:
+        finish_stream.set()
+        reader.join(timeout=1)
+        for worker in workers:
+            worker.join(timeout=1)
+        chunks.close()
+        response.close()
+        client.close()
+
+
+def test_http_transport_frames_unknown_length_chunked_request_on_wire() -> None:
+    wire: list[bytes] = []
+
+    class RequestChunks(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"abc"
+            yield b"de"
+
+    class WireEndpoint:
+        def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+            parent, child = socket.socketpair()
+            parent.settimeout(timeout_seconds)
+
+            def serve() -> None:
+                with child:
+                    received = bytearray()
+                    while b"0\r\n\r\n" not in received:
+                        received.extend(child.recv(4096))
+                    wire.append(bytes(received))
+                    child.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    )
+
+            threading.Thread(target=serve).start()
+            return parent
+
+        def verify_authority(self) -> None:
+            pass
+
+    transport = VerifiedCoreHttpTransportV1(WireEndpoint())  # type: ignore[arg-type]
+    request = httpx.Request(
+        "POST",
+        "http://127.0.0.1:1/v1/upload",
+        headers={"Transfer-Encoding": "chunked"},
+        stream=RequestChunks(),
+    )
+    response = transport.handle_request(request)
+    try:
+        assert response.read() == b"{}"
+    finally:
+        response.close()
+        transport.close()
+    assert b"\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n" in wire[0]
+
+
+def test_http_transport_clamps_endpoint_io_timeout_to_sixty_seconds() -> None:
+    observed_timeouts: list[float] = []
+
+    class TimeoutEndpoint:
+        def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+            observed_timeouts.append(timeout_seconds)
+            if timeout_seconds > 60:
+                raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+            parent, child = socket.socketpair()
+
+            def serve() -> None:
+                with child:
+                    received = bytearray()
+                    while b"\r\n\r\n" not in received:
+                        received.extend(child.recv(4096))
+                    child.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    )
+
+            threading.Thread(target=serve).start()
+            return parent
+
+        def verify_authority(self) -> None:
+            pass
+
+    transport = VerifiedCoreHttpTransportV1(TimeoutEndpoint())  # type: ignore[arg-type]
+    with httpx.Client(
+        base_url="http://127.0.0.1:1",
+        transport=transport,
+        timeout=300.0,
+    ) as client:
+        assert client.get("/v1/status").json() == {}
+    assert observed_timeouts == [60.0]
+
+
+def test_http_transport_close_blocks_late_socket_adoption_and_bearer_send() -> None:
+    open_entered = threading.Event()
+    release_open = threading.Event()
+    close_started = threading.Event()
+    close_returned = threading.Event()
+    wire = bytearray()
+
+    class BlockingEndpoint:
+        def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+            del timeout_seconds
+            open_entered.set()
+            assert release_open.wait(timeout=2)
+            parent, child = socket.socketpair()
+
+            def observe() -> None:
+                with child:
+                    child.settimeout(0.25)
+                    try:
+                        wire.extend(child.recv(4096))
+                    except (TimeoutError, OSError):
+                        pass
+
+            threading.Thread(target=observe).start()
+            return parent
+
+        def verify_authority(self) -> None:
+            pass
+
+    transport = VerifiedCoreHttpTransportV1(BlockingEndpoint())  # type: ignore[arg-type]
+    request_failed = threading.Event()
+
+    def request() -> None:
+        try:
+            with httpx.Client(
+                base_url="http://127.0.0.1:1",
+                transport=transport,
+            ) as client:
+                client.get(
+                    "/v1/status",
+                    headers={"Authorization": f"Bearer {BEARER}"},
+                )
+        except httpx.HTTPError:
+            request_failed.set()
+
+    def close() -> None:
+        close_started.set()
+        transport.close()
+        close_returned.set()
+
+    requester = threading.Thread(target=request)
+    requester.start()
+    assert open_entered.wait(timeout=1)
+    closer = threading.Thread(target=close)
+    closer.start()
+    assert close_started.wait(timeout=1)
+    assert not close_returned.wait(timeout=0.1)
+    release_open.set()
+    requester.join(timeout=1)
+    closer.join(timeout=1)
+
+    assert request_failed.is_set()
+    assert close_returned.is_set()
+    assert bytes(wire) == b""
+
+
+def test_http_transport_close_cancels_and_waits_for_active_chunk_stream() -> None:
+    response_started = threading.Event()
+    peer_closed = threading.Event()
+    workers: list[threading.Thread] = []
+
+    class StreamingEndpoint:
+        def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+            parent, child = socket.socketpair()
+            parent.settimeout(timeout_seconds)
+
+            def serve() -> None:
+                with child:
+                    received = bytearray()
+                    while b"\r\n\r\n" not in received:
+                        received.extend(child.recv(4096))
+                    child.sendall(
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: text/event-stream\r\n"
+                        b"Transfer-Encoding: chunked\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
+                    response_started.set()
+                    assert child.recv(1) == b""
+                    peer_closed.set()
+
+            worker = threading.Thread(target=serve)
+            workers.append(worker)
+            worker.start()
+            return parent
+
+        def verify_authority(self) -> None:
+            pass
+
+    transport = VerifiedCoreHttpTransportV1(StreamingEndpoint())  # type: ignore[arg-type]
+    request = httpx.Request("GET", "http://127.0.0.1:1/v1/events")
+    response = transport.handle_request(request)
+    chunks = response.iter_raw()
+    read_failed = threading.Event()
+    delivered: list[bytes] = []
+
+    def read() -> None:
+        try:
+            delivered.append(next(chunks))
+        except httpx.ReadError:
+            read_failed.set()
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    assert response_started.wait(timeout=1)
+
+    transport.close()
+
+    reader.join(timeout=1)
+    for worker in workers:
+        worker.join(timeout=1)
+    assert peer_closed.is_set()
+    assert read_failed.is_set()
+    assert delivered == []
+    response.close()
 
 
 def _ownership(*, project_id: str = "project-a") -> WorkspaceImportOwnership:

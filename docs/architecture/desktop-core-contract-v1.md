@@ -43,13 +43,29 @@ The composition-independent production implementation lives in
 one in-memory attachment authority bound to the exact active
 `DesktopRemoteLifecycle` transport object and profile. Bootstrap delegates to
 the verified generation installer/service attachment in
-`openevo.deployment.core_control`; tunnel publication delegates to its
-authenticated Core tunnel verifier. The bridge HTTP transport opens a fresh
-anonymous socketpair plus `ssh -W` child for each connection and treats the
-loopback URL in `CoreTunnelHandleV1` only as client origin authority, never as a
-bound TCP listener. The adapter also exposes only exact, pre-adopted workspace
-import ownership to `WorkspaceImportStore.resolve`, whose unlinked read-only
-snapshot is the sole archive stream. No adapter accepts a host path.
+`openevo.deployment.core_control`, but only after a same-transport runtime
+preflight and sealed-asset stage. Composition provides exact local wheel and
+framework-lock identities; the transport derives the private remote root,
+re-hashes both files, verifies their lock binding, and atomically publishes the
+bundle before bootstrap. It never depends on a user-preplaced remote file.
+
+The runtime preflight requires Linux Python 3.11+, kernel process identity, and
+callable `os.pidfd_open` plus `signal.pidfd_send_signal`. Missing Python wrappers
+produce the typed `core_supervisor_runtime_unsupported` blocker before upload.
+The adapter does not select a lower-version system Python or claim general
+fresh-server readiness; a Core-owned syscall compatibility layer remains a
+separate implementation and review item.
+
+Tunnel publication delegates to the authenticated Core tunnel verifier. The
+bridge HTTP transport opens a fresh anonymous socketpair plus `ssh -W` child for
+each connection and treats the loopback URL in `CoreTunnelHandleV1` only as
+client origin authority, never as a bound TCP listener. It incrementally
+delivers small chunked/SSE frames, applies legal request chunk framing, caps
+individual endpoint I/O at 60 seconds, and closes through a generation/in-flight
+barrier that rejects late socket adoption. The adapter also exposes only exact,
+pre-adopted workspace import ownership to `WorkspaceImportStore.resolve`, whose
+unlinked read-only snapshot is the sole archive stream. No adapter exposes a
+host path.
 
 This module is not instantiated by the release provider in this change.
 Release app composition, local operation routing, bridge persistence, and

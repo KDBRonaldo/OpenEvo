@@ -75,6 +75,17 @@ Recovery scans `/proc/*/fd` for that exact inode, captures each holder's process
 identity, terminates it through pidfd, acquires the spawn lock as a barrier, and
 then removes the intent. Invalid or ambiguous ledgers fail closed.
 
+The current supervisor additionally requires the selected Python interpreter to
+provide callable `os.pidfd_open` and `signal.pidfd_send_signal`; kernel pidfd
+support alone is insufficient when a Python build omits those wrappers. The
+Desktop production adapter therefore runs a closed `python3 -I` preflight before
+upload, including a boot-ID check and a no-signal pidfd probe. A missing wrapper
+is reported as `core_supervisor_runtime_unsupported` before any bootstrap claim.
+Some uv-managed CPython 3.11/3.12 builds have this limitation, while an available
+system Python 3.10 remains below Core's Python requirement. Until a separate
+Core syscall compatibility layer is implemented and reviewed, such a host is an
+explicit release blocker rather than an automatically supported fresh server.
+
 The supervisor binds and listens on one IPv4 loopback socket before spawning
 Core. Release bootstrap requests port `0`, so the kernel chooses an available
 ephemeral port; that selected port is pinned in the service ledger and reused
@@ -126,6 +137,18 @@ platform path separator. The script receives no bearer and uses an allowlisted
 environment. All Core imports, attachment consumption, verification, lifecycle,
 and daemon launch after installation use the generation interpreter with no
 `PYTHONPATH` semantics.
+
+The composition-independent adapter adds a transport-owned asset stage before
+that plan. Composition supplies only sealed local wheel/framework-lock paths,
+sizes, and digests. `openevo.deployment.core_assets` copies those files into a
+private no-follow local snapshot, while `SshRemoteExecutorTransport` prepares
+the canonical owner-only `~/.openevo/core` subdirectories and performs the
+rsync on the same authenticated transport. A remote standard-library verifier
+requires an exact two-file inventory, owner/mode/link identity, both digests,
+and the closed lock-to-wheel binding. It publishes to a deterministic bundle
+directory with atomic no-replace rename and treats an already published exact
+bundle as an idempotent retry. Remote paths are outputs of this verifier, never
+Desktop configuration or user-preplaced `/srv` inputs.
 
 The attachment keeps the bearer out of `repr` and has no general serializer or
 renderer-facing response model. Its loopback host/port, release identity, and
@@ -207,4 +230,8 @@ opens all traffic through `VerifiedCoreControlTunnel.open_verified_socket`; its
 synthetic loopback origin never creates a local TCP listener. Deadline,
 transport replacement, SSH, bootstrap, and identity failures are normalized to
 closed renderer-safe bridge errors without paths, commands, output, or bearer
-values. Release provider/app composition remains intentionally out of scope.
+values. Its HTTP transport uses incrementally decoded response reads for open
+SSE streams, valid chunk encoding for unknown-length requests, a 60-second
+endpoint I/O ceiling, and a generation/in-flight close barrier that prevents
+late socket adoption or bearer transmission. Release provider/app composition
+remains intentionally out of scope.

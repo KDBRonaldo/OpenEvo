@@ -19,6 +19,19 @@ from typing import NoReturn, Protocol
 
 from pydantic import SecretStr
 
+from openevo.deployment.core_assets import (
+    CoreBootstrapAssetSnapshotError,
+    StagedCoreBootstrapAssets,
+    build_core_asset_finalize_command,
+    build_core_asset_prepare_command,
+    parse_core_asset_prepare,
+    parse_staged_core_assets,
+    snapshot_core_bootstrap_assets,
+)
+from openevo.deployment.core_runtime import (
+    build_core_supervisor_runtime_preflight_command,
+    parse_core_supervisor_runtime_preflight,
+)
 from openevo.deployment.host_keys import TrustedKnownHostsBinding
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import RemoteProfileConfig
@@ -44,6 +57,9 @@ class SshTransportErrorCode(str, Enum):
     CONNECTION_FAILED = "connection_failed"
     START_FAILED = "start_failed"
     RSYNC_FAILED = "rsync_failed"
+    CORE_ASSET_FAILED = "core_asset_failed"
+    CORE_RUNTIME_UNSUPPORTED = "core_runtime_unsupported"
+    CORE_RUNTIME_PREFLIGHT_FAILED = "core_runtime_preflight_failed"
     INVALID_REQUEST = "invalid_ssh_request"
     TIMEOUT = "ssh_timeout"
 
@@ -60,6 +76,13 @@ class SshTransportError(RuntimeError):
             SshTransportErrorCode.CONNECTION_FAILED: "SSH connection failed.",
             SshTransportErrorCode.START_FAILED: "SSH process could not be started.",
             SshTransportErrorCode.RSYNC_FAILED: "rsync failed over SSH.",
+            SshTransportErrorCode.CORE_ASSET_FAILED: ("Core bootstrap asset verification failed."),
+            SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED: (
+                "Remote Python lacks required Core service supervision primitives."
+            ),
+            SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED: (
+                "Remote Core service runtime preflight failed."
+            ),
             SshTransportErrorCode.INVALID_REQUEST: "SSH request is invalid.",
             SshTransportErrorCode.TIMEOUT: "SSH operation timed out.",
         }
@@ -688,11 +711,162 @@ class SshRemoteExecutorTransport:
             _log_transport_failure(SshTransportErrorCode.RSYNC_FAILED)
             raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
 
+    def stage_core_bootstrap_assets(
+        self,
+        *,
+        wheel_path: str,
+        wheel_sha256: str,
+        wheel_size: int,
+        framework_lock_path: str,
+        framework_lock_sha256: str,
+        framework_lock_size: int,
+        bundle_id: str,
+        timeout_seconds: float,
+    ) -> StagedCoreBootstrapAssets:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= 300
+        ):
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        try:
+            prepare_command = build_core_asset_prepare_command(bundle_id)
+        except (TypeError, ValueError):
+            _log_transport_failure(SshTransportErrorCode.INVALID_REQUEST)
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+        deadline = time.monotonic() + float(timeout_seconds)
+        try:
+            with snapshot_core_bootstrap_assets(
+                wheel_path=wheel_path,
+                wheel_sha256=wheel_sha256,
+                wheel_size=wheel_size,
+                framework_lock_path=framework_lock_path,
+                framework_lock_sha256=framework_lock_sha256,
+                framework_lock_size=framework_lock_size,
+            ) as snapshot:
+                prepare_payload = self._run_secret_with_remote_failure(
+                    prepare_command,
+                    timeout_seconds=_stage_remaining(deadline),
+                    remote_failure_code=SshTransportErrorCode.CORE_ASSET_FAILED,
+                )
+                service_root, incoming_root = parse_core_asset_prepare(
+                    prepare_payload,
+                    bundle_id=bundle_id,
+                )
+                self._upload_core_asset_snapshot(
+                    snapshot.root,
+                    incoming_root,
+                    deadline=deadline,
+                )
+                finalize_payload = self._run_secret_with_remote_failure(
+                    build_core_asset_finalize_command(
+                        service_root=service_root,
+                        bundle_id=bundle_id,
+                        wheel_filename=snapshot.wheel_filename,
+                        wheel_sha256=wheel_sha256,
+                        wheel_size=wheel_size,
+                        framework_lock_sha256=framework_lock_sha256,
+                        framework_lock_size=framework_lock_size,
+                    ),
+                    timeout_seconds=_stage_remaining(deadline),
+                    remote_failure_code=SshTransportErrorCode.CORE_ASSET_FAILED,
+                )
+                return parse_staged_core_assets(
+                    finalize_payload,
+                    service_root=service_root,
+                    bundle_id=bundle_id,
+                    wheel_filename=snapshot.wheel_filename,
+                    wheel_sha256=wheel_sha256,
+                    framework_lock_sha256=framework_lock_sha256,
+                )
+        except CoreBootstrapAssetSnapshotError:
+            _log_transport_failure(SshTransportErrorCode.INVALID_REQUEST)
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+        except SshTransportError:
+            raise
+        except (OSError, TypeError, ValueError):
+            _log_transport_failure(SshTransportErrorCode.CORE_ASSET_FAILED)
+            raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED) from None
+
+    def require_core_supervisor_runtime(self, *, timeout_seconds: float) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= 300
+        ):
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        payload = self._run_secret_with_remote_failure(
+            build_core_supervisor_runtime_preflight_command(),
+            timeout_seconds=float(timeout_seconds),
+            remote_failure_code=SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED,
+        )
+        try:
+            reason = parse_core_supervisor_runtime_preflight(payload)
+        except (TypeError, ValueError):
+            _log_transport_failure(SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED)
+            raise SshTransportError(SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED) from None
+        if reason != "ready":
+            _log_transport_failure(SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED)
+            raise SshTransportError(SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED)
+
+    def _upload_core_asset_snapshot(
+        self,
+        local_root: Path,
+        remote_root: str,
+        *,
+        deadline: float,
+    ) -> None:
+        failure_code: SshTransportErrorCode | None = None
+        completed: subprocess.CompletedProcess[str] | None = None
+        phase = "trust"
+        try:
+            with self._trusted_host.open_for_spawn(self._profile) as known_hosts_file:
+                phase = "process"
+                completed = self._runner(
+                    self._core_asset_rsync_argv(
+                        local_root,
+                        remote_root,
+                        known_hosts_file,
+                    ),
+                    _stage_remaining(deadline),
+                )
+                phase = "trust"
+        except subprocess.TimeoutExpired:
+            failure_code = SshTransportErrorCode.TIMEOUT
+        except SshTransportError:
+            raise
+        except Exception:
+            failure_code = (
+                SshTransportErrorCode.RSYNC_FAILED
+                if phase == "process"
+                else SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+            )
+        if failure_code is not None:
+            _log_transport_failure(failure_code)
+            raise SshTransportError(failure_code)
+        assert completed is not None
+        if completed.returncode != 0:
+            _log_transport_failure(SshTransportErrorCode.RSYNC_FAILED)
+            raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
+
     def run_secret(
         self,
         command: str,
         *,
         timeout_seconds: float = 30.0,
+    ) -> SecretStr:
+        return self._run_secret_with_remote_failure(
+            command,
+            timeout_seconds=timeout_seconds,
+            remote_failure_code=SshTransportErrorCode.CONNECTION_FAILED,
+        )
+
+    def _run_secret_with_remote_failure(
+        self,
+        command: str,
+        *,
+        timeout_seconds: float,
+        remote_failure_code: SshTransportErrorCode,
     ) -> SecretStr:
         try:
             remote_command = _remote_command(command, cwd=None, env=None)
@@ -727,14 +901,15 @@ class SshRemoteExecutorTransport:
             completed.stderr or "",
             completion_marker,
         )
-        if (
-            remote_return_code is None
-            or completed.returncode == 255
-            or int(completed.returncode) != remote_return_code
-            or remote_return_code != 0
-        ):
+        if remote_return_code is None or completed.returncode == 255:
             _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
             raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        if int(completed.returncode) != remote_return_code:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        if remote_return_code != 0:
+            _log_transport_failure(remote_failure_code)
+            raise SshTransportError(remote_failure_code)
         return SecretStr(completed.stdout or "")
 
     def open_tunnel(
@@ -959,6 +1134,27 @@ class SshRemoteExecutorTransport:
             (f"{_rsync_host(self._profile.host)}:{_with_trailing_slash(remote_path)}"),
         ]
 
+    def _core_asset_rsync_argv(
+        self,
+        local_root: Path,
+        remote_root: str,
+        known_hosts_file: Path,
+    ) -> list[str]:
+        _validate_remote_absolute_path(remote_root, "remote_root")
+        ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
+        return [
+            "rsync",
+            "--recursive",
+            "--delete",
+            "--chmod=F600,D700",
+            "--no-owner",
+            "--no-group",
+            "-e",
+            ssh_command,
+            _with_trailing_slash(str(local_root)),
+            f"{_rsync_host(self._profile.host)}:{_with_trailing_slash(remote_root)}",
+        ]
+
 
 def _run_subprocess(argv: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -1130,6 +1326,14 @@ def _log_transport_failure(
         code.value,
         secrets.token_hex(12),
     )
+
+
+def _stage_remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _log_transport_failure(SshTransportErrorCode.TIMEOUT)
+        raise SshTransportError(SshTransportErrorCode.TIMEOUT)
+    return remaining
 
 
 def _with_completion_marker(command: str, marker: str) -> str:
