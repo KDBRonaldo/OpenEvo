@@ -22,7 +22,10 @@ raw paths, and secret values are not accepted.
 Run output is loaded on demand through the frozen run-log route rather than
 stored in the global renderer snapshot. The provider applies the same bounded
 pagination rules and rejects cross-wired run, attempt, service, duplicate, or
-non-monotonic log identities. The Research view renders at most the latest 200
+non-monotonic log identities. Renderer request state is tagged with the exact
+run and current-attempt identity; a transition renders an empty loading state
+until its own request resolves, and superseded requests cannot publish into the
+new identity. The Research view renders at most the latest 200
 matching records and separates agent, evolution, and system streams; SSE
 snapshot epochs trigger an authoritative output refresh while a session runs.
 
@@ -34,10 +37,12 @@ can ship; the provider must continue to fail closed until they exist.
 
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation
-all succeed. A failed startup exposes one explicit retry action; every attempt
-calls the release factory again and obtains a fresh `start_sidecar` bootstrap
-context. Superseded or unmounted attempts cannot publish their provider, and a
-failed session token is never retained or replayed.
+all succeed. Native transitions are serialized through Tauri: initial startup,
+retry, StrictMode supersession, and renderer unmount first complete
+`stop_sidecar` before another `start_sidecar` can issue a credential. Failed or
+superseded attempts are stopped before the next transition, so they cannot
+leave an unowned sidecar or publish/reuse their session token. A bounded native
+cleanup failure remains visible as retryable startup failure.
 
 The Local API release digest is
 `3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36`.
@@ -97,7 +102,11 @@ before Escape, overlay, or close-button dismissal.
 First-time project creation and activation are two distinct authoritative
 mutations. After create succeeds, the renderer reloads the saved project and
 uses that fresh stream epoch and ETag for activation; it never chains activation
-with the pre-create renderer snapshot.
+with the pre-create renderer snapshot. If activation returns HTTP 409 or 412,
+the drawer retains the created project identity and creates a new activation
+intent against the refreshed ETag. Retry activates that project instead of
+issuing another create; an unknown activation result retains its original
+action ID for exact retry.
 
 Revision generation is shown only from the authoritative
 `ProjectV1.remote.active_revision`. Core-owned runs and artifacts are associated

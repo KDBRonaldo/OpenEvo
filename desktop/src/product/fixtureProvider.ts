@@ -99,6 +99,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private restoreCapabilitiesOnRefresh: ProjectCapabilitiesV1 | null = null;
   private capabilityRefreshesBeforeRestore = 0;
   private nextProjectSaveStatus: 412 | null = null;
+  private nextProjectActivationStatus: 409 | 412 | null = null;
   private nextRunStartStatus: 409 | 410 | null = null;
   private nextRunStartConflict: {
     code: string;
@@ -114,6 +115,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private readonly profileUpdateActions: string[] = [];
   private readonly projectCreateActions: string[] = [];
   private readonly projectUpdateActions: string[] = [];
+  private readonly projectActivationActions: string[] = [];
   private diagnostic: DiagnosticReportV1 | null;
   private activeOperation: LocalOperationV1 | null = null;
   private readonly contents = new Map<string, ArtifactContentV1>();
@@ -404,7 +406,19 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   async activateProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
     const project = this.requireProject(projectId);
+    this.projectActivationActions.push(intent.actionId);
     this.checkIntent(intent, `project:activate:${projectId}`, project.etag);
+    if (this.nextProjectActivationStatus) {
+      const status = this.nextProjectActivationStatus;
+      this.nextProjectActivationStatus = null;
+      if (status === 412) {
+        this.projects = this.projects.map((item) => item.project_id === projectId
+          ? projectV1Schema.parse({ ...item, etag: ETAG_B, updated_at: NOW })
+          : item);
+      }
+      this.emit();
+      throw this.apiError(status, "project_activation_conflict", "The project changed before activation.", "project");
+    }
     const coreProjectId = project.remote?.core_project_id ?? this.fixtureCoreProjectId(project.project_id);
     const activated = projectV1Schema.parse({
       ...project,
@@ -1415,6 +1429,14 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   failNextProjectSaveWithUnknownError(): void {
     this.failProjectSaveWithUnknownError = true;
+  }
+
+  failNextProjectActivation(status: 409 | 412): void {
+    this.nextProjectActivationStatus = status;
+  }
+
+  projectActivationActionIds(): readonly string[] {
+    return [...this.projectActivationActions];
   }
 
   failNextRefresh(): void {

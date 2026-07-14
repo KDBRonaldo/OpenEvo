@@ -11,7 +11,10 @@ import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
 import { DesktopProductApp } from "./product/DesktopProductApp";
 import type { DesktopProductProvider } from "./product/provider";
-import { createReleaseDesktopProductProvider } from "./product/releaseProvider";
+import {
+  createReleaseDesktopProductProvider,
+  stopReleaseDesktopProductProvider,
+} from "./product/releaseProvider";
 
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
@@ -148,35 +151,64 @@ type ReleaseDesktopStartupState =
 
 export function ReleaseDesktopProductShell({
   createProvider = createReleaseDesktopProductProvider,
+  stopProvider = stopReleaseDesktopProductProvider,
 }: {
   createProvider?: () => Promise<DesktopProductProvider>;
+  stopProvider?: () => Promise<void>;
 }) {
   const generation = useRef(0);
+  const lifecycle = useRef<Promise<void>>(Promise.resolve());
   const [startup, setStartup] = useState<ReleaseDesktopStartupState>({ status: "loading" });
+
+  const enqueueLifecycle = useCallback((operation: () => Promise<void>): Promise<void> => {
+    const next = lifecycle.current.catch(() => {}).then(operation);
+    lifecycle.current = next.catch(() => {});
+    return next;
+  }, []);
+
+  const cancelLifecycle = useCallback(() => {
+    // Do not queue cancellation behind an in-flight bootstrap. Tauri's stop
+    // command cancels and joins a native start that has not published yet.
+    const cancellation = stopProvider().catch(() => {});
+    lifecycle.current = Promise.all([lifecycle.current.catch(() => {}), cancellation]).then(() => {});
+  }, [stopProvider]);
 
   const start = useCallback(() => {
     const requestGeneration = generation.current + 1;
     generation.current = requestGeneration;
     setStartup({ status: "loading" });
-    void createProvider()
-      .then((provider) => {
-        if (generation.current === requestGeneration) {
-          setStartup({ status: "ready", provider });
+    void enqueueLifecycle(async () => {
+      try {
+        // Revoke the previous native session before requesting another
+        // credential from the Tauri host.
+        await stopProvider();
+        if (generation.current !== requestGeneration) return;
+        const provider = await createProvider();
+        if (generation.current !== requestGeneration) {
+          await stopProvider();
+          return;
         }
-      })
-      .catch(() => {
+        setStartup({ status: "ready", provider });
+      } catch {
+        try {
+          await stopProvider();
+        } catch {
+          // Native cleanup is bounded; startup remains explicitly retryable.
+        }
         if (generation.current === requestGeneration) {
           setStartup({ status: "failed" });
         }
-      });
-  }, [createProvider]);
+      }
+    });
+  }, [createProvider, enqueueLifecycle, stopProvider]);
 
   useEffect(() => {
     start();
     return () => {
       generation.current += 1;
+      cancelLifecycle();
     };
-  }, [start]);
+  }, [cancelLifecycle, start]);
 
   if (startup.status === "ready") {
     return <OpenEvoDesktopOnlyShell provider={startup.provider} />;

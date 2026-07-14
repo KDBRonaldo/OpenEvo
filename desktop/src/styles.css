@@ -1476,6 +1476,10 @@ pre.json {
   gap: 16px;
 }
 
+.system-grid > * {
+  min-width: 0;
+}
+
 .definition-list {
   margin: 16px 0;
 }
@@ -1495,9 +1499,12 @@ pre.json {
 }
 
 .definition-list dd {
+  min-width: 0;
   margin: 0;
+  overflow-wrap: anywhere;
   font-size: 11px;
   font-weight: 650;
+  text-align: right;
 }
 
 .check-list {
@@ -2133,6 +2140,10 @@ pre.json {
   }
 
   .research-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .system-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 

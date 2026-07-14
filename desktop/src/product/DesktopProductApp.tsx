@@ -72,6 +72,10 @@ type ActionAttemptResult = {
   readonly error: unknown | null;
   readonly refreshedSnapshot: DesktopProductSnapshot | null;
 };
+type PendingProjectActivation = {
+  readonly projectId: string;
+  readonly activationActionId: string;
+};
 type SaveAttemptResult = { readonly saved: boolean; readonly replaceActionId: boolean };
 type ProfileSaveIntent = {
   readonly canonicalPayload: string;
@@ -99,6 +103,7 @@ export function DesktopProductApp({
   const [actionState, setActionState] = useState<AsyncState>("idle");
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
+  const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
   const refreshOrder = useRef(new ProductRefreshOrder());
 
   const refresh = useCallback(async (): Promise<DesktopProductSnapshot | null> => {
@@ -355,7 +360,15 @@ export function DesktopProductApp({
           capability={snapshot.capability}
           capabilities={capabilities}
           busy={actionState === "working"}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => {
+            const pending = pendingProjectActivation.current;
+            if (pending) {
+              setSelectedProjectId(pending.projectId);
+              setCreatingProject(false);
+              pendingProjectActivation.current = null;
+            }
+            setSettingsOpen(false);
+          }}
           onRetryCapabilities={() => refresh()}
           onSave={async (input, actionId) => {
             const requestEpoch = snapshot.stream.epoch;
@@ -365,26 +378,41 @@ export function DesktopProductApp({
                 await provider.updateProject(project.project_id, input, resourceIntent(snapshot, project.etag, actionId));
               } else {
                 if (!profile) throw new DesktopProductUserError("Add a remote workspace before creating a project.");
-                const created = await provider.createProject({
-                  name: input.name ?? "Untitled research",
-                  profile_id: profile.profile_id,
-                  task: input.task ?? { title: "Research task", objective: "Describe the research objective." },
-                  source: input.source ?? { kind: "scratch", display_name: "New workspace" },
-                  execution: input.execution ?? selfDeployedExecution("Qwen/Qwen3-8B"),
-                  evolution: input.evolution ?? { targets: {} },
-                }, mutationIntent(snapshot, actionId));
+                let pending = pendingProjectActivation.current;
+                if (!pending) {
+                  const created = await provider.createProject({
+                    name: input.name ?? "Untitled research",
+                    profile_id: profile.profile_id,
+                    task: input.task ?? { title: "Research task", objective: "Describe the research objective." },
+                    source: input.source ?? { kind: "scratch", display_name: "New workspace" },
+                    execution: input.execution ?? selfDeployedExecution("Qwen/Qwen3-8B"),
+                    evolution: input.evolution ?? { targets: {} },
+                  }, mutationIntent(snapshot, actionId));
+                  pending = { projectId: created.project_id, activationActionId: `${actionId}-activate` };
+                  pendingProjectActivation.current = pending;
+                }
                 const afterCreate = await refresh();
-                const current = afterCreate?.projects.find((item) => item.project_id === created.project_id);
-                if (!afterCreate || !current || current.etag !== created.etag) {
-                  throw new DesktopProductUserError("The new project changed before activation. Review it and activate it again.");
+                const current = afterCreate?.projects.find((item) => item.project_id === pending.projectId);
+                if (!afterCreate || !current) {
+                  throw new DesktopProductUserError("The new project is not available for activation. Refresh and try again.");
                 }
                 await provider.activateProject(
                   current.project_id,
-                  resourceIntent(afterCreate, current.etag, `${actionId}-activate`),
+                  resourceIntent(afterCreate, current.etag, pending.activationActionId),
                 );
-                setSelectedProjectId(created.project_id);
+                pendingProjectActivation.current = null;
+                setSelectedProjectId(current.project_id);
               }
             });
+            if (!result.saved
+              && pendingProjectActivation.current
+              && result.error instanceof DesktopApiError
+              && [409, 412].includes(result.error.apiError.http_status)) {
+              pendingProjectActivation.current = {
+                ...pendingProjectActivation.current,
+                activationActionId: `${newActionId()}-activate`,
+              };
+            }
             if (result.saved) setSettingsOpen(false);
             return {
               saved: result.saved,
@@ -710,35 +738,45 @@ function SessionOutput({
   provider: DesktopProductProvider;
   streamEpoch: number;
 }) {
-  const [logs, setLogs] = useState<readonly LogEntryV1[]>([]);
+  const identity = `${run.id}:${run.current_attempt_id ?? "no-attempt"}`;
+  const [output, setOutput] = useState<{
+    readonly identity: string;
+    readonly logs: readonly LogEntryV1[];
+    readonly loading: boolean;
+    readonly error: string | null;
+  }>({ identity, logs: [], loading: true, error: null });
   const [filter, setFilter] = useState<SessionLogFilter>("all");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
+  const requestSequence = useRef(0);
 
   useEffect(() => {
-    setLogs([]);
     setFilter("all");
-  }, [run.id]);
+  }, [identity]);
 
   useEffect(() => {
-    let active = true;
-    setLoading(true);
-    setError(null);
+    const request = requestSequence.current + 1;
+    requestSequence.current = request;
+    setOutput({ identity, logs: [], loading: true, error: null });
     void provider.getRunLogs(run.id)
       .then((next) => {
-        if (active) setLogs(next);
+        if (requestSequence.current === request) {
+          setOutput({ identity, logs: next, loading: false, error: null });
+        }
       })
       .catch((reason) => {
-        if (active) setError(userMessage(reason));
-      })
-      .finally(() => {
-        if (active) setLoading(false);
+        if (requestSequence.current === request) {
+          setOutput({ identity, logs: [], loading: false, error: userMessage(reason) });
+        }
       });
     return () => {
-      active = false;
+      if (requestSequence.current === request) requestSequence.current += 1;
     };
-  }, [provider, retry, run.id, run.updated_at, streamEpoch]);
+  }, [identity, provider, retry, run.id, run.updated_at, streamEpoch]);
+
+  const currentOutput = output.identity === identity
+    ? output
+    : { identity, logs: [] as readonly LogEntryV1[], loading: true, error: null };
+  const { logs, loading, error } = currentOutput;
 
   const filtered = logs.filter((entry) => {
     if (filter === "all") return true;

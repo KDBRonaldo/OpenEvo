@@ -14,6 +14,7 @@ import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 
 export interface ReleaseNativeBridge {
   bootstrap(): Promise<unknown>;
+  stop(): Promise<unknown>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
   configureCredential(
     profileId: string,
@@ -44,6 +45,7 @@ export interface ReleaseProviderFactoryDependencies {
 
 const tauriNativeBridge: ReleaseNativeBridge = {
   bootstrap: () => invoke<DesktopBootstrapContextV1>("start_sidecar"),
+  stop: () => invoke("stop_sidecar"),
   selectProjectSource: (intent) => invoke("select_project_source", { kind: intent.kind, actionId: intent.actionId }),
   configureCredential: (profileId, slotKind, etag, actionId) => invoke("configure_credential", {
     profileId,
@@ -52,6 +54,10 @@ const tauriNativeBridge: ReleaseNativeBridge = {
     actionId,
   }),
 };
+
+export async function stopReleaseDesktopProductProvider(): Promise<void> {
+  await tauriNativeBridge.stop();
+}
 
 export async function createReleaseDesktopProductProvider(
   dependencies: ReleaseProviderFactoryDependencies = {},

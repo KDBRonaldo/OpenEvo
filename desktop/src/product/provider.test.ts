@@ -37,6 +37,7 @@ describe("Desktop product provider boundary", () => {
     const bootstrap = releaseBootstrap(digest, [...contract.requiredFeatureFlags]);
     const native = {
       bootstrap: vi.fn().mockResolvedValue(bootstrap),
+      stop: vi.fn().mockResolvedValue(undefined),
       selectProjectSource: vi.fn().mockResolvedValue({
         kind: "native_folder_snapshot",
         display_name: "Native source",
@@ -72,6 +73,7 @@ describe("Desktop product provider boundary", () => {
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
         selectProjectSource: vi.fn(),
         configureCredential: vi.fn(),
       },
@@ -90,6 +92,7 @@ describe("Desktop product provider boundary", () => {
           ...releaseBootstrap(digest, flags),
           negotiated_contract: { ...releaseBootstrap(digest, flags).negotiated_contract, provider_kind: "contract_simulator" },
         }),
+        stop: vi.fn().mockResolvedValue(undefined),
         selectProjectSource: vi.fn(),
         configureCredential: vi.fn(),
       },
@@ -101,6 +104,7 @@ describe("Desktop product provider boundary", () => {
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, incompleteFlags))),
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, incompleteFlags)),
+        stop: vi.fn().mockResolvedValue(undefined),
         selectProjectSource: vi.fn(),
         configureCredential: vi.fn(),
       },
@@ -116,6 +120,7 @@ describe("Desktop product provider boundary", () => {
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
         selectProjectSource: vi.fn().mockResolvedValue({
           kind: "native_folder_snapshot",
           display_name: "Native source",
@@ -140,6 +145,7 @@ describe("Desktop product provider boundary", () => {
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
         selectProjectSource: vi.fn().mockResolvedValue({
           kind: "scratch",
           display_name: "Cross-wired scratch source",
@@ -161,6 +167,7 @@ describe("Desktop product provider boundary", () => {
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
         selectProjectSource: vi.fn(),
         configureCredential: vi.fn().mockResolvedValue({
           ...CONTRACT_FIXTURE_V1.profile,

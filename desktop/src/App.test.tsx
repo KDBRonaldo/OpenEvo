@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act } from "react";
+import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
@@ -68,11 +68,19 @@ describe("ReleaseDesktopProductShell", () => {
 
   it("restarts native bootstrap after a failed release startup", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const lifecycle: string[] = [];
     const factory = vi.fn()
-      .mockRejectedValueOnce(new Error("secret bootstrap detail"))
-      .mockResolvedValueOnce(provider);
+      .mockImplementationOnce(async () => {
+        lifecycle.push("start-1");
+        throw new Error("secret bootstrap detail");
+      })
+      .mockImplementationOnce(async () => {
+        lifecycle.push("start-2");
+        return provider!;
+      });
+    const stop = vi.fn(async () => { lifecycle.push("stop"); });
 
-    root = await renderReleaseShell(factory);
+    root = await renderReleaseShell(factory, stop);
     expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
     expect(document.body.textContent).not.toContain("secret bootstrap detail");
     expect(factory).toHaveBeenCalledTimes(1);
@@ -86,6 +94,41 @@ describe("ReleaseDesktopProductShell", () => {
 
     expect(factory).toHaveBeenCalledTimes(2);
     expect(document.body.textContent).toContain("Research brief");
+    const firstStart = lifecycle.indexOf("start-1");
+    const secondStart = lifecycle.indexOf("start-2");
+    expect(lifecycle.slice(firstStart + 1, secondStart)).toContain("stop");
+  });
+
+  it("serializes StrictMode bootstrap through a fresh native lifecycle", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const lifecycle: string[] = [];
+    const factory = vi.fn(async () => {
+      lifecycle.push("start");
+      return provider!;
+    });
+    const stop = vi.fn(async () => { lifecycle.push("stop"); });
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root?.render(
+        <StrictMode>
+          <MemoryRouter>
+            <ReleaseDesktopProductShell createProvider={factory} stopProvider={stop} />
+          </MemoryRouter>
+        </StrictMode>,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(lifecycle.at(-1)).toBe("start");
+    expect(lifecycle.slice(0, -1)).toContain("stop");
+    expect(document.body.textContent).toContain("Research brief");
   });
 
   it("ignores a provider resolved by a superseded factory", async () => {
@@ -94,6 +137,7 @@ describe("ReleaseDesktopProductShell", () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const firstFactory = vi.fn(() => first.promise);
     const secondFactory = vi.fn(async () => provider!);
+    const stop = vi.fn(async () => {});
 
     const container = document.createElement("div");
     document.body.appendChild(container);
@@ -101,35 +145,41 @@ describe("ReleaseDesktopProductShell", () => {
     await act(async () => {
       root?.render(
         <MemoryRouter>
-          <ReleaseDesktopProductShell createProvider={firstFactory} />
+          <ReleaseDesktopProductShell createProvider={firstFactory} stopProvider={stop} />
         </MemoryRouter>,
       );
       await Promise.resolve();
     });
+    const stopsBeforeSupersession = stop.mock.calls.length;
     await act(async () => {
       root?.render(
         <MemoryRouter>
-          <ReleaseDesktopProductShell createProvider={secondFactory} />
+          <ReleaseDesktopProductShell createProvider={secondFactory} stopProvider={stop} />
         </MemoryRouter>,
       );
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(document.body.textContent).toContain("Research brief");
+    expect(stop.mock.calls.length).toBeGreaterThan(stopsBeforeSupersession);
+    expect(document.body.textContent).toContain("Starting OpenEvo Desktop");
 
     await act(async () => {
       first.resolve(staleProvider);
       await Promise.resolve();
       await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
     });
     expect(document.body.textContent).toContain("Research brief");
     expect(document.body.textContent).not.toContain("Create your first research project");
+    expect(stop).toHaveBeenCalled();
     staleProvider.dispose();
   });
 });
 
 async function renderReleaseShell(
   factory: () => Promise<FixtureDesktopProductProvider>,
+  stopProvider?: () => Promise<void>,
 ): Promise<Root> {
   const container = document.createElement("div");
   document.body.appendChild(container);
@@ -137,7 +187,7 @@ async function renderReleaseShell(
   await act(async () => {
     rendered.render(
       <MemoryRouter>
-        <ReleaseDesktopProductShell createProvider={factory} />
+        <ReleaseDesktopProductShell createProvider={factory} stopProvider={stopProvider} />
       </MemoryRouter>,
     );
     await Promise.resolve();

@@ -70,6 +70,33 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Research execution is using the selected workspace and evidence sources.");
   });
 
+  it("never publishes a superseded run-log request into the next run", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const initial = await provider.refresh();
+    if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const previousRun = initial.snapshot.runs[0];
+    if (!previousRun) throw new Error("Expected a completed fixture run.");
+    const staleLogs = (await provider.getRunLogs(previousRun.id)).map((entry, index) => ({
+      ...entry,
+      message: index === 0 ? "STALE PREVIOUS RUN OUTPUT" : entry.message,
+    }));
+    const staleRequest = deferred<typeof staleLogs>();
+    const loadLogs = vi.spyOn(provider, "getRunLogs");
+    loadLogs.mockImplementationOnce(() => staleRequest.promise);
+    root = await renderProduct(provider);
+
+    expect(screenText()).not.toContain("STALE PREVIOUS RUN OUTPUT");
+    await clickButton("Start session");
+    expect(screenText()).toContain("Session admitted with an immutable project snapshot.");
+
+    await act(async () => {
+      staleRequest.resolve(staleLogs);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screenText()).not.toContain("STALE PREVIOUS RUN OUTPUT");
+  });
+
   it("gates sessions offline and completes first-time workspace setup", async () => {
     vi.useFakeTimers();
     provider = createFixtureDesktopProductProvider({ stepDelayMs: 20 });
@@ -607,6 +634,37 @@ describe("DesktopProductApp", () => {
     expect(provider.projectCreateActionIds()[0]).toBe(provider.projectCreateActionIds()[1]);
   });
 
+  it.each([409, 412] as const)("retries activation after HTTP %s without creating another project", async (status) => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    root = await renderProduct(provider);
+
+    await clickAria("Create project");
+    setInput("Objective", `Activate the authoritative project after ${status}.`);
+    provider.failNextProjectActivation(status);
+    await clickButton("Save");
+
+    expect(provider.projectCreateActionIds()).toHaveLength(1);
+    expect(provider.projectActivationActionIds()).toHaveLength(1);
+    await clickButton("Save");
+
+    expect(provider.projectCreateActionIds()).toHaveLength(1);
+    expect(provider.projectActivationActionIds()).toHaveLength(2);
+    expect(provider.projectActivationActionIds()[0]).not.toBe(provider.projectActivationActionIds()[1]);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(screenText()).toContain(`Activate the authoritative project after ${status}.`);
+  });
+
+  it("uses a single-column bounded System layout at the 760px minimum window", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    root = await renderProduct(provider);
+    await clickButton("System");
+
+    const grid = document.querySelector(".system-grid");
+    expect(grid).not.toBeNull();
+    expect(grid?.children).toHaveLength(2);
+    expect(Array.from(grid?.children ?? []).every((child) => child.classList.contains("product-panel"))).toBe(true);
+  });
+
   it("adopts a profile created before its response was lost without replaying it as an update", async () => {
     provider = createFixtureDesktopProductProvider({ newUser: true });
     root = await renderProduct(provider);
@@ -820,4 +878,15 @@ function labelledControl<T extends HTMLElement>(text: string, selector: string):
 
 function screenText(): string {
   return document.body.textContent ?? "";
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
