@@ -73,15 +73,19 @@ the bearer, host paths in API resources, model credentials, commands, or open
 metadata.
 
 The private schema is exact-fingerprinted. Startup accepts only an empty
-database, the current schema, the exact preceding provider schema, or the older
-empty pre-identity schema.
+database, the current schema, either exact preceding provider schema, or the
+older empty pre-identity schema.
 Near-match DDL, extra tables/indexes/views/triggers, and partially altered
 schemas are rejected. The exact preceding bound provider schema is upgraded in
-one SQLite transaction by adding the empty revision ledger; existing projects,
-uploads, events, and idempotency records remain authoritative and are then
-checked by the normal bounded recovery pass. Such older projects stay draft
-until a later verified mutation can publish a revision; startup does not infer
-readiness or synthesize events. The older pre-identity schema can migrate only
+one SQLite transaction by adding the empty revision ledger. The immediately
+preceding ledger layout is upgraded transactionally with the private activation
+request binding; a retained activation response is then validated before it may
+backfill the ledger and idempotency-owned audit bindings. Existing projects,
+uploads, events, and idempotency
+records remain authoritative and are checked by the normal bounded recovery
+pass. Projects from the pre-ledger schema stay draft until a later verified
+mutation can publish a revision; startup does not infer readiness or synthesize
+events. The older pre-identity schema can migrate only
 when every business table and both managed roots are empty and no identity
 marker exists. Core does not infer or backfill missing idempotency request
 envelopes.
@@ -179,8 +183,16 @@ digest, generation, and predecessor. Recovery recomputes that identity, every
 snapshot identity and revision ETag, the complete predecessor chain, and the
 ProjectV1 active-head binding. Missing rows, gaps, cross-project predecessors,
 noncanonical active transitions, and project/head divergence fail startup
-closed. Revision documents count against the same irreversible startup row,
-per-value, and aggregate byte budgets as other provider state.
+closed. A successor activation timestamp is `max(wall_clock,
+predecessor.updated_at + 1 microsecond)`, so it remains strictly increasing
+under a fixed or regressing clock. New ledger rows also sign the canonical
+idempotency request digest that activated that exact revision. A private audit
+row binds the same revision and request to the exact successful idempotency
+identity. It survives project deletion but is removed by the idempotency row's
+retention cascade, preserving exact historical replay without unbounded audit
+growth. Revision documents and activation bindings count against the same
+irreversible startup row, per-value, and aggregate byte budgets as other
+provider state.
 
 Project and upload ETags hash the complete validated canonical resource model,
 including model-populated defaults, plus an internal monotonic resource version.
@@ -205,7 +217,9 @@ operation. Create, patch, upload-create, chunk, finalize, abort, and validation
 also revalidate request-to-response relations. Validation binds the requested
 registry and snapshots, chunks bind the requested final offset, and finalize
 binds both CAS headers and the requested archive digest. Replay and startup use
-the same validator. A canonical response from another resource is therefore
+the same validator. A ready project response must also match the exact immutable
+ledger payload and the activation request digest stored for that revision. A
+canonical response from another resource or a later generation is therefore
 corruption, not an authoritative success.
 
 Project creation signs Core-owned project and task snapshots. Scratch projects
@@ -304,8 +318,12 @@ Every stored frame is validated as `SseFrameV1`; wire `id` and `event` therefore
 match the typed envelope. Project mutations emit `project.updated.v1` with the
 authoritative project ETag. A revision publication additionally emits the
 frozen `revision.activated.v1` envelope with the immutable revision ETag and
-project parent identity. Frame sequence is monotonic and the opaque ID is
-authenticated by the store key. A retained `Last-Event-ID` resumes after that
+project parent identity. Replay pruning never retains an activation without its
+immediately preceding project update; if the configured window cannot hold the
+pair, it retains neither half. Deleting a project truncates the replay prefix
+through that project's final retained event before its revision ledger is
+removed, so no orphan activation remains. Frame sequence is monotonic and the
+opaque ID is authenticated by the store key. A retained `Last-Event-ID` resumes after that
 sequence. A valid cursor older than the window returns 410 so the sidecar
 reloads snapshots; malformed, tampered, or future cursors return 400.
 
@@ -313,8 +331,13 @@ The stream polls durable state, emits retained records in order, and persists a
 heartbeat after 15 seconds without another frame. Restarting Core preserves the
 same cursor key and replay order.
 Startup and replay require canonical frame bytes and authenticate each stored
-frame ID against its exact row sequence. A shape-valid but unsigned persisted
-cursor is store corruption.
+frame ID against its exact row sequence. Startup additionally requires a
+contiguous retained suffix and checks every ready project-update/activation
+pair against the exact immutable ledger revision, including adjacency,
+generation order, snapshots, registry digest, timestamps, resource identity,
+parent identity, and ETags. Missing, reordered, duplicated, or shape-valid but
+substituted rows fail closed. A shape-valid but unsigned persisted cursor is
+store corruption.
 
 Typed conflict metadata is code-specific. Snapshot and registry races are
 retryable after an authoritative reload; malformed archive or config requests

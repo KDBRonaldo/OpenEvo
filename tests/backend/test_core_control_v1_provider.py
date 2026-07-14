@@ -4,6 +4,7 @@ import base64
 import asyncio
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -687,6 +688,38 @@ def test_project_delete_discards_owned_upload_and_workspace_snapshot(tmp_path: P
         assert deleted.status_code == 204, deleted.text
         assert list((tmp_path / "core-control-v1" / "workspace-uploads").iterdir()) == []
         assert list((tmp_path / "core-control-v1" / "workspace-snapshots").iterdir()) == []
+
+
+def test_ready_project_delete_prunes_orphaned_revision_events_before_restart(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, project_etag = _create_project(client, _project_create())
+        other, _ = _create_project(
+            client,
+            _project_create(),
+            idempotency_key="create-project-after-deleted-ready-project",
+        )
+        deleted = client.delete(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "delete-ready-project-with-revision",
+                "If-Match": project_etag,
+            },
+        )
+        assert deleted.status_code == 204, deleted.text
+
+    with TestClient(_app(tmp_path, registry=registry)) as restarted:
+        assert restarted.get(f"/v1/projects/{project['id']}", headers=AUTH).status_code == 404
+        assert restarted.get(f"/v1/projects/{other['id']}", headers=AUTH).status_code == 200
+        frames = restarted.app.state.core_control_provider.store.replay_events(None)
+        assert [frame["event"] for frame in frames] == [
+            "project.updated.v1",
+            "revision.activated.v1",
+        ]
+        assert frames[0]["data"]["payload"]["id"] == other["id"]
 
 
 def test_aborted_upload_releases_reserved_managed_byte_capacity(
@@ -2449,6 +2482,232 @@ def test_project_patch_publishes_a_durable_direct_successor_revision(
         assert head.json()["active_revision"] == successor_ref
 
 
+def test_project_successor_timestamp_is_strictly_monotonic_across_clock_rollback(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    registry = verified_builtin_registry(tmp_path / "registry")
+    app = _app(state_root, registry=registry)
+    provider = app.state.core_control_provider
+    provider.store._clock = lambda: datetime(2030, 1, 1, tzinfo=timezone.utc)
+    with TestClient(app) as client:
+        project, project_etag = _create_project(client, _project_create())
+        predecessor = client.get(
+            f"/v1/revisions/{project['active_revision']['id']}", headers=AUTH
+        ).json()
+
+        fixed = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-fixed-clock",
+                "If-Match": project_etag,
+            },
+            json={"schema_version": "1", "name": "Fixed-clock successor"},
+        )
+        assert fixed.status_code == 200, fixed.text
+        fixed_successor = client.get(
+            f"/v1/revisions/{fixed.json()['active_revision']['id']}", headers=AUTH
+        ).json()
+        assert fixed_successor["updated_at"] > predecessor["updated_at"]
+
+        provider.store._clock = lambda: datetime(2020, 1, 1, tzinfo=timezone.utc)
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-clock-rollback",
+                "If-Match": fixed.headers["etag"],
+            },
+            json={"schema_version": "1", "name": "Rollback-clock successor"},
+        )
+        assert patched.status_code == 200, patched.text
+        successor = client.get(
+            f"/v1/revisions/{patched.json()['active_revision']['id']}", headers=AUTH
+        ).json()
+        assert successor["updated_at"] > fixed_successor["updated_at"]
+
+    with TestClient(_app(state_root, registry=registry)) as restarted:
+        recovered = restarted.get(f"/v1/revisions/{successor['revision']['id']}", headers=AUTH)
+        assert recovered.status_code == 200
+        assert recovered.json() == successor
+        replay = restarted.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-clock-rollback",
+                "If-Match": fixed.headers["etag"],
+            },
+            json={"schema_version": "1", "name": "Rollback-clock successor"},
+        )
+        assert replay.status_code == 200
+        assert replay.json() == patched.json()
+
+
+def test_historical_successor_patch_replays_after_a_future_generation(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    registry = verified_builtin_registry(tmp_path / "registry")
+    first_request = {"schema_version": "1", "name": "Historical successor"}
+    with TestClient(_app(state_root, registry=registry)) as client:
+        project, project_etag = _create_project(client, _project_create())
+        first = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-historical-successor",
+                "If-Match": project_etag,
+            },
+            json=first_request,
+        )
+        assert first.status_code == 200, first.text
+        future = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-future-successor",
+                "If-Match": first.headers["etag"],
+            },
+            json={"schema_version": "1", "description": "Future generation change."},
+        )
+        assert future.status_code == 200, future.text
+        assert future.json()["active_revision"]["generation"] == 2
+
+    with TestClient(_app(state_root, registry=registry)) as restarted:
+        replay = restarted.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-historical-successor",
+                "If-Match": project_etag,
+            },
+            json=first_request,
+        )
+        assert replay.status_code == 200
+        assert replay.json() == first.json()
+        assert replay.headers["etag"] == first.headers["etag"]
+
+
+def test_successor_patch_idempotency_rejects_a_future_revision_response(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, project_etag = _create_project(client, _project_create())
+        first = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-bound-history",
+                "If-Match": project_etag,
+            },
+            json={"schema_version": "1", "name": "Bound historical name"},
+        )
+        assert first.status_code == 200, first.text
+        future = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-bound-future",
+                "If-Match": first.headers["etag"],
+            },
+            json={"schema_version": "1", "description": "A later change."},
+        )
+        assert future.status_code == 200, future.text
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE idempotency_records SET response_json = ?, etag = ? "
+            "WHERE operation_id = ? AND idempotency_key = ?",
+            (
+                store_module._canonical_bytes(future.json()),
+                future.headers["etag"],
+                "patchCoreProjectV1",
+                "patch-project-bound-history",
+            ),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="revision.*request"):
+        CoreControlStoreV1(tmp_path)
+
+
+def test_deleted_project_patch_idempotency_retains_revision_request_binding(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, project_etag = _create_project(client, _project_create())
+        first = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-deleted-project-history",
+                "If-Match": project_etag,
+            },
+            json={"schema_version": "1", "name": "Deleted project history"},
+        )
+        assert first.status_code == 200, first.text
+        future = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-deleted-project-future",
+                "If-Match": first.headers["etag"],
+            },
+            json={"schema_version": "1", "description": "Future before deletion."},
+        )
+        assert future.status_code == 200, future.text
+        deleted = client.delete(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "delete-project-with-patch-history",
+                "If-Match": future.headers["etag"],
+            },
+        )
+        assert deleted.status_code == 204, deleted.text
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM project_revisions").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revision_activation_bindings"
+        ).fetchone()[0] == 3
+        connection.execute(
+            "UPDATE idempotency_records SET response_json = ?, etag = ? "
+            "WHERE operation_id = ? AND idempotency_key = ?",
+            (
+                store_module._canonical_bytes(future.json()),
+                future.headers["etag"],
+                "patchCoreProjectV1",
+                "patch-deleted-project-history",
+            ),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="revision.*request"):
+        CoreControlStoreV1(tmp_path)
+
+
+def test_startup_rejects_a_missing_live_revision_activation_binding(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, _ = _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM revision_activation_bindings WHERE revision_id = ?",
+            (project["active_revision"]["id"],),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="revision.*binding.*missing"):
+        CoreControlStoreV1(tmp_path)
+
+
 def test_project_revision_readiness_fails_closed_until_all_inputs_are_ready(
     tmp_path: Path,
 ) -> None:
@@ -2557,9 +2816,7 @@ def test_project_revision_reads_paginate_and_return_typed_not_found(
         empty = draft_client.get(f"/v1/projects/{draft['id']}/revisions", headers=AUTH)
         assert empty.status_code == 200
         assert empty.json()["items"] == []
-        missing_head = draft_client.get(
-            f"/v1/projects/{draft['id']}/revisions/head", headers=AUTH
-        )
+        missing_head = draft_client.get(f"/v1/projects/{draft['id']}/revisions/head", headers=AUTH)
         assert missing_head.status_code == 404
         assert missing_head.json()["code"] == "revision_head_not_found"
         missing_revision = draft_client.get("/v1/revisions/revision-missing", headers=AUTH)
@@ -2620,6 +2877,7 @@ def test_project_revision_schema_migrates_exact_previous_store_with_state(
 
     database = tmp_path / "core-control-v1" / "provider.sqlite3"
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE revision_activation_bindings")
         connection.execute("DROP TABLE project_revisions")
 
     with TestClient(_app(tmp_path)) as restarted:
@@ -2633,9 +2891,75 @@ def test_project_revision_schema_migrates_exact_previous_store_with_state(
         assert replay.status_code == 201
         assert replay.json() == project
     with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM project_revisions").fetchone()[0] == 0
+
+
+def test_project_revision_schema_migrates_v1_ledger_and_backfills_request_binding(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    patch_request = {"schema_version": "1", "name": "Migrated ledger successor"}
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, project_etag = _create_project(client, _project_create())
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-migrated-ledger",
+                "If-Match": project_etag,
+            },
+            json=patch_request,
+        )
+        assert patched.status_code == 200, patched.text
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        signing_key = bytes(
+            connection.execute("SELECT value FROM metadata WHERE key = 'signing_key'").fetchone()[
+                0
+            ]
+        )
+        revisions = connection.execute(
+            "SELECT revision_id, project_id, generation, document_json, resource_version, "
+            "created_at, updated_at FROM project_revisions"
+        ).fetchall()
+        connection.execute("DROP TABLE revision_activation_bindings")
+        connection.execute("DROP TABLE project_revisions")
+        connection.execute(store_module._PROJECT_REVISIONS_SCHEMA_V1)
+        for revision in revisions:
+            revision_id = revision[0]
+            identity_hmac = hmac.new(
+                signing_key,
+                f"resource.v1:revision:{revision_id}".encode("ascii"),
+                hashlib.sha256,
+            ).hexdigest()
+            connection.execute(
+                "INSERT INTO project_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (*revision[:3], identity_hmac, *revision[3:]),
+            )
+
+    with TestClient(_app(tmp_path, registry=registry)) as restarted:
+        replay = restarted.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-migrated-ledger",
+                "If-Match": project_etag,
+            },
+            json=patch_request,
+        )
+        assert replay.status_code == 200
+        assert replay.json() == patched.json()
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT activation_request_digest FROM project_revisions ORDER BY generation"
+        ).fetchall()
+        assert len(rows) == 2
+        assert all(row[0] is not None for row in rows)
         assert connection.execute(
-            "SELECT COUNT(*) FROM project_revisions"
-        ).fetchone()[0] == 0
+            "SELECT COUNT(*) FROM revision_activation_bindings"
+        ).fetchone()[0] == 2
 
 
 def test_project_revision_manifest_corruption_fails_closed_on_restart(
@@ -2709,6 +3033,83 @@ def test_revision_activation_event_is_durable_and_canonical(tmp_path: Path) -> N
     with TestClient(restarted):
         frames = restarted.state.core_control_provider.store.replay_events(None)
         assert frames[-1]["event"] == "revision.activated.v1"
+
+
+def test_revision_event_retention_preserves_complete_activation_pairs(tmp_path: Path) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    app = _app(tmp_path, registry=registry, event_replay_limit=3)
+    provider = app.state.core_control_provider
+    with TestClient(app) as client:
+        for index in range(2):
+            project, _ = _create_project(
+                client,
+                {**_project_create(), "name": f"Ready project {index}"},
+                idempotency_key=f"create-ready-event-project-{index}",
+            )
+        frames = provider.store.replay_events(None)
+        assert [frame["event"] for frame in frames] == [
+            "project.updated.v1",
+            "revision.activated.v1",
+        ]
+        assert frames[0]["data"]["payload"]["id"] == project["id"]
+        assert frames[1]["data"]["payload"]["revision"]["id"] == project["active_revision"]["id"]
+
+    with TestClient(_app(tmp_path, registry=registry, event_replay_limit=3)) as restarted:
+        recovered = restarted.app.state.core_control_provider.store.replay_events(None)
+        assert recovered == frames
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing_project_update", "wrong_project_update", "wrong_activation_revision"],
+)
+def test_startup_validates_revision_event_ledger_order_closure(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, project_etag = _create_project(client, _project_create())
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-event-closure",
+                "If-Match": project_etag,
+            },
+            json={"schema_version": "1", "name": "Event closure successor"},
+        )
+        assert patched.status_code == 200, patched.text
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
+        assert [json.loads(bytes(row["frame_json"]))["event"] for row in rows] == [
+            "project.updated.v1",
+            "revision.activated.v1",
+            "project.updated.v1",
+            "revision.activated.v1",
+        ]
+        if damage == "missing_project_update":
+            connection.execute("DELETE FROM events WHERE sequence = ?", (rows[2]["sequence"],))
+        else:
+            target = rows[2] if damage == "wrong_project_update" else rows[3]
+            source = rows[0] if damage == "wrong_project_update" else rows[1]
+            target_frame = json.loads(bytes(target["frame_json"]))
+            source_frame = json.loads(bytes(source["frame_json"]))
+            target_frame["data"]["payload"] = source_frame["data"]["payload"]
+            target_frame["data"]["change"] = source_frame["data"]["change"]
+            target_frame["data"]["change"]["change_id"] = json.loads(bytes(target["frame_json"]))[
+                "data"
+            ]["change"]["change_id"]
+            connection.execute(
+                "UPDATE events SET frame_json = ? WHERE sequence = ?",
+                (store_module._canonical_bytes(target_frame), target["sequence"]),
+            )
+
+    with pytest.raises(StoreCorruptionError, match="event"):
+        CoreControlStoreV1(tmp_path)
 
 
 def test_project_validation_uses_the_exact_persisted_execution_profile(
@@ -3222,8 +3623,7 @@ def test_pending_store_identity_crash_window_recovers(
     recovered.close()
     with sqlite3.connect(database) as connection:
         identity = connection.execute(
-            "SELECT binding_state, marker_dev, marker_ino "
-            "FROM store_identity WHERE singleton = 1"
+            "SELECT binding_state, marker_dev, marker_ino FROM store_identity WHERE singleton = 1"
         ).fetchone()
     assert identity is not None
     assert identity[0] == "bound"
@@ -3369,8 +3769,7 @@ def test_fresh_identity_bootstrap_recovers_across_marker_publication_crash(
             store_module._expected_schema_fingerprint()
         )
         assert connection.execute(
-            "SELECT binding_state, marker_dev, marker_ino "
-            "FROM store_identity WHERE singleton = 1"
+            "SELECT binding_state, marker_dev, marker_ino FROM store_identity WHERE singleton = 1"
         ).fetchone() == ("pending", None, None)
     assert marker.exists() is (failure_point == "after_publish")
 
@@ -3406,9 +3805,7 @@ def test_bound_identity_missing_marker_preserves_managed_state(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("damage", ["mode", "hardlink", "symlink"])
-def test_store_identity_marker_rejects_unsafe_metadata(
-    tmp_path: Path, damage: str
-) -> None:
+def test_store_identity_marker_rejects_unsafe_metadata(tmp_path: Path, damage: str) -> None:
     CoreControlStoreV1(tmp_path).close()
     root = tmp_path / "core-control-v1"
     marker = root / "provider.identity"

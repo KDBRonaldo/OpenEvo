@@ -4,7 +4,7 @@ import base64
 from collections.abc import Callable, Mapping
 import ctypes
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import errno
 import fcntl
 import hashlib
@@ -341,7 +341,7 @@ _STORE_IDENTITY_SCHEMA = """
         )
     ) STRICT
 """
-_PROJECT_REVISIONS_SCHEMA = """
+_PROJECT_REVISIONS_SCHEMA_V1 = """
     CREATE TABLE IF NOT EXISTS project_revisions (
         revision_id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
@@ -356,8 +356,50 @@ _PROJECT_REVISIONS_SCHEMA = """
         FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE CASCADE
     ) STRICT
 """
+_PROJECT_REVISIONS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS project_revisions (
+        revision_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        generation INTEGER NOT NULL
+            CHECK (generation >= 0 AND generation <= 9007199254740991),
+        identity_hmac TEXT NOT NULL,
+        activation_request_digest TEXT
+            CHECK (
+                activation_request_digest IS NULL
+                OR length(activation_request_digest) = 64
+            ),
+        document_json BLOB NOT NULL,
+        resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (project_id, generation),
+        FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+    ) STRICT
+"""
+_REVISION_ACTIVATION_BINDINGS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS revision_activation_bindings (
+        revision_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        resource_scope TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+        identity_hmac TEXT NOT NULL,
+        FOREIGN KEY (operation_id, resource_scope, idempotency_key)
+            REFERENCES idempotency_records(
+                operation_id,
+                resource_scope,
+                idempotency_key
+            ) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+    ) STRICT
+"""
 _PREVIOUS_SCHEMA = (_STORE_IDENTITY_SCHEMA, *_LEGACY_SCHEMA)
-_SCHEMA = (*_PREVIOUS_SCHEMA, _PROJECT_REVISIONS_SCHEMA)
+_REVISION_LEDGER_V1_SCHEMA = (*_PREVIOUS_SCHEMA, _PROJECT_REVISIONS_SCHEMA_V1)
+_SCHEMA = (
+    *_PREVIOUS_SCHEMA,
+    _PROJECT_REVISIONS_SCHEMA,
+    _REVISION_ACTIVATION_BINDINGS_SCHEMA,
+)
 
 
 class CoreControlStoreV1:
@@ -474,7 +516,13 @@ class CoreControlStoreV1:
                 ),
             )
             if revision is not None:
-                self._insert_revision(revision)
+                self._insert_revision(
+                    revision,
+                    operation_id="createCoreProjectV1",
+                    resource_scope="projects",
+                    idempotency_key=idempotency_key,
+                    activation_request_digest=envelope.digest,
+                )
             self._append_project_event(project, now=now)
             if revision is not None:
                 self._append_revision_activated_event(revision, now=now)
@@ -659,7 +707,7 @@ class CoreControlStoreV1:
                 return replay
             row, current = self._project_row(project_id)
             self._require_etag(current.etag, if_match, "project")
-            now = self._timestamp()
+            now = self._project_mutation_timestamp(current)
             updated = self._patched_project(
                 current,
                 request,
@@ -678,7 +726,13 @@ class CoreControlStoreV1:
                 (_model_bytes(updated), int(row["resource_version"]) + 1, now, project_id),
             )
             if revision is not None:
-                self._insert_revision(revision)
+                self._insert_revision(
+                    revision,
+                    operation_id="patchCoreProjectV1",
+                    resource_scope=project_id,
+                    idempotency_key=idempotency_key,
+                    activation_request_digest=envelope.digest,
+                )
             self._append_project_event(updated, now=now)
             if revision is not None:
                 self._append_revision_activated_event(revision, now=now)
@@ -766,6 +820,7 @@ class CoreControlStoreV1:
                                     "project workspace cleanup identity is ambiguous"
                                 )
 
+                    self._prune_project_event_history(project_id)
                     self._connection.execute(
                         "DELETE FROM projects WHERE project_id = ?", (project_id,)
                     )
@@ -1119,7 +1174,7 @@ class CoreControlStoreV1:
                 )
                 archive_name = upload_row["file_name"]
 
-            now = self._timestamp()
+            now = self._project_mutation_timestamp(project)
             workspace_snapshot = _workspace_publication_snapshot(
                 self._signing_key,
                 project_id=project_id,
@@ -1250,7 +1305,13 @@ class CoreControlStoreV1:
                         (_model_bytes(updated_upload), upload_version, now, upload_id),
                     )
                     if revision is not None:
-                        self._insert_revision(revision)
+                        self._insert_revision(
+                            revision,
+                            operation_id="finalizeCoreWorkspaceUploadV1",
+                            resource_scope=scope,
+                            idempotency_key=idempotency_key,
+                            activation_request_digest=envelope.digest,
+                        )
                     response = m.WorkspaceUploadFinalizeResponseV1(
                         project_id=project_id,
                         upload=updated_upload,
@@ -1816,6 +1877,14 @@ class CoreControlStoreV1:
             if project.status is m.ProjectStatus.READY:
                 raise StoreCorruptionError("unready project cannot publish a revision")
             return project, None
+        if project.active_revision is not None:
+            predecessor = self._revision_row(project.active_revision.id)
+            if predecessor.revision != project.active_revision:
+                raise StoreCorruptionError("project revision head binding is invalid")
+            if _parse_utc_timestamp(now) <= _parse_utc_timestamp(predecessor.updated_at):
+                raise StoreCorruptionError(
+                    "successor revision timestamp is not strictly increasing"
+                )
         revision = _new_active_revision(
             self._signing_key,
             project,
@@ -1833,7 +1902,17 @@ class CoreControlStoreV1:
             revision,
         )
 
-    def _insert_revision(self, revision: m.RevisionV1) -> None:
+    def _insert_revision(
+        self,
+        revision: m.RevisionV1,
+        *,
+        operation_id: str,
+        resource_scope: str,
+        idempotency_key: str,
+        activation_request_digest: str,
+    ) -> None:
+        if not _is_sha256(activation_request_digest):
+            raise StoreCorruptionError("revision activation request digest is invalid")
         revision_count = int(
             self._connection.execute("SELECT COUNT(*) FROM project_revisions").fetchone()[0]
         )
@@ -1842,16 +1921,42 @@ class CoreControlStoreV1:
         try:
             self._connection.execute(
                 "INSERT INTO project_revisions(revision_id, project_id, generation, "
-                "identity_hmac, document_json, resource_version, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                "identity_hmac, activation_request_digest, document_json, resource_version, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 (
                     revision.revision.id,
                     revision.revision.project_id,
                     revision.revision.generation,
-                    self._resource_identity_hmac("revision", revision.revision.id),
+                    self._revision_identity_hmac(
+                        revision.revision.id,
+                        activation_request_digest,
+                    ),
+                    activation_request_digest,
                     _model_bytes(revision),
                     revision.created_at,
                     revision.updated_at,
+                ),
+            )
+            binding_values = {
+                "idempotency_key": idempotency_key,
+                "operation_id": operation_id,
+                "project_id": revision.revision.project_id,
+                "request_digest": activation_request_digest,
+                "resource_scope": resource_scope,
+                "revision_id": revision.revision.id,
+            }
+            self._connection.execute(
+                "INSERT INTO revision_activation_bindings(revision_id, project_id, "
+                "operation_id, resource_scope, idempotency_key, request_digest, "
+                "identity_hmac) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    revision.revision.id,
+                    revision.revision.project_id,
+                    operation_id,
+                    resource_scope,
+                    idempotency_key,
+                    activation_request_digest,
+                    self._revision_activation_binding_hmac(binding_values),
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -1869,6 +1974,7 @@ class CoreControlStoreV1:
     def _validated_revision_row(self, row: sqlite3.Row) -> m.RevisionV1:
         revision = _validate_bytes(m.RevisionV1, row["document_json"])
         revision_data = revision.model_dump(mode="python", exclude={"etag"})
+        activation_request_digest = row["activation_request_digest"]
         if (
             revision.revision.id != row["revision_id"]
             or revision.revision.project_id != row["project_id"]
@@ -1877,13 +1983,19 @@ class CoreControlStoreV1:
             or revision.updated_at != row["updated_at"]
             or int(row["resource_version"]) != 1
             or revision.etag != _etag(revision_data, version=1)
+            or (
+                activation_request_digest is not None and not _is_sha256(activation_request_digest)
+            )
             or not hmac.compare_digest(
                 row["identity_hmac"],
-                self._resource_identity_hmac("revision", revision.revision.id),
+                self._revision_identity_hmac(
+                    revision.revision.id,
+                    activation_request_digest,
+                ),
             )
         ):
             raise StoreCorruptionError("project revision row identity is invalid")
-        predecessor = None
+        predecessor_revision = None
         if revision.revision.generation > 0:
             predecessor_row = self._connection.execute(
                 "SELECT * FROM project_revisions WHERE project_id = ? AND generation = ?",
@@ -1899,6 +2011,7 @@ class CoreControlStoreV1:
                 mode="python",
                 exclude={"etag"},
             )
+            predecessor_activation_digest = predecessor_row["activation_request_digest"]
             if (
                 predecessor_revision.revision.id != predecessor_row["revision_id"]
                 or predecessor_revision.revision.project_id != predecessor_row["project_id"]
@@ -1907,20 +2020,23 @@ class CoreControlStoreV1:
                 or predecessor_revision.updated_at != predecessor_row["updated_at"]
                 or int(predecessor_row["resource_version"]) != 1
                 or predecessor_revision.etag != _etag(predecessor_data, version=1)
+                or (
+                    predecessor_activation_digest is not None
+                    and not _is_sha256(predecessor_activation_digest)
+                )
                 or not hmac.compare_digest(
                     predecessor_row["identity_hmac"],
-                    self._resource_identity_hmac(
-                        "revision",
+                    self._revision_identity_hmac(
                         predecessor_revision.revision.id,
+                        predecessor_activation_digest,
                     ),
                 )
             ):
                 raise StoreCorruptionError("project revision predecessor is invalid")
-            predecessor = predecessor_revision.revision
         _validate_revision_identity(
             self._signing_key,
             revision,
-            predecessor=predecessor,
+            predecessor=predecessor_revision,
         )
         return revision
 
@@ -2003,11 +2119,145 @@ class CoreControlStoreV1:
             signing_key=self._signing_key,
             publication_owner_lookup=self._publication_owner_for_snapshot,
         )
+        self._validate_idempotency_revision_request(row, model)
         if response_model is not None and not isinstance(model, response_model):
             raise StoreCorruptionError("idempotency response type is invalid")
         if response_model is None and model is not None:
             raise StoreCorruptionError("no-content idempotency response is invalid")
         return StoredResult(int(row["status_code"]), model, row["etag"], replayed=True)
+
+    def _validate_idempotency_revision_request(
+        self,
+        row: sqlite3.Row,
+        model: BaseModel | None,
+    ) -> None:
+        project: m.ProjectV1 | None = None
+        if isinstance(model, m.ProjectV1):
+            project = model
+        elif isinstance(model, m.WorkspaceUploadFinalizeResponseV1):
+            project = model.project
+        if project is None or project.status is not m.ProjectStatus.READY:
+            return
+        active_revision = project.active_revision
+        if active_revision is None:
+            raise StoreCorruptionError("idempotency revision request binding is missing")
+        revision_row = self._connection.execute(
+            "SELECT * FROM project_revisions WHERE revision_id = ?",
+            (active_revision.id,),
+        ).fetchone()
+        binding_row = self._connection.execute(
+            "SELECT * FROM revision_activation_bindings WHERE revision_id = ?",
+            (active_revision.id,),
+        ).fetchone()
+        if binding_row is not None:
+            self._validate_revision_activation_binding_row(binding_row)
+            if (
+                binding_row["project_id"] != project.id
+                or binding_row["operation_id"] != row["operation_id"]
+                or binding_row["resource_scope"] != row["resource_scope"]
+                or binding_row["idempotency_key"] != row["idempotency_key"]
+                or not hmac.compare_digest(
+                    binding_row["request_digest"],
+                    row["request_digest"],
+                )
+            ):
+                raise StoreCorruptionError("idempotency revision request binding is invalid")
+        if revision_row is None:
+            if binding_row is not None:
+                return
+            raise StoreCorruptionError("idempotency revision request binding is missing")
+        revision = self._validated_revision_row(revision_row)
+        if (
+            revision.revision != active_revision
+            or revision.project_snapshot != project.current_project_snapshot
+            or revision.task_snapshot != project.current_task_snapshot
+            or revision.workspace_snapshot != project.current_workspace_snapshot
+            or revision.registry_digest != project.registry_digest
+            or revision.updated_at != project.updated_at
+        ):
+            raise StoreCorruptionError("idempotency revision response closure is invalid")
+        request_digest = row["request_digest"]
+        activation_request_digest = revision_row["activation_request_digest"]
+        legacy_activation_binding = activation_request_digest is None
+        if activation_request_digest is None:
+            self._connection.execute(
+                "UPDATE project_revisions SET activation_request_digest = ?, "
+                "identity_hmac = ? WHERE revision_id = ? "
+                "AND activation_request_digest IS NULL",
+                (
+                    request_digest,
+                    self._revision_identity_hmac(active_revision.id, request_digest),
+                    active_revision.id,
+                ),
+            )
+            activation_request_digest = request_digest
+        if binding_row is None:
+            if not legacy_activation_binding:
+                raise StoreCorruptionError(
+                    "idempotency revision request binding is missing"
+                )
+            binding_values = {
+                "idempotency_key": row["idempotency_key"],
+                "operation_id": row["operation_id"],
+                "project_id": project.id,
+                "request_digest": request_digest,
+                "resource_scope": row["resource_scope"],
+                "revision_id": active_revision.id,
+            }
+            self._connection.execute(
+                "INSERT INTO revision_activation_bindings(revision_id, project_id, "
+                "operation_id, resource_scope, idempotency_key, request_digest, "
+                "identity_hmac) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    active_revision.id,
+                    project.id,
+                    row["operation_id"],
+                    row["resource_scope"],
+                    row["idempotency_key"],
+                    request_digest,
+                    self._revision_activation_binding_hmac(binding_values),
+                ),
+            )
+        if not hmac.compare_digest(activation_request_digest, request_digest):
+            raise StoreCorruptionError("idempotency revision request binding is invalid")
+
+    def _validate_revision_activation_binding_row(
+        self,
+        row: sqlite3.Row,
+    ) -> None:
+        values = {
+            "idempotency_key": row["idempotency_key"],
+            "operation_id": row["operation_id"],
+            "project_id": row["project_id"],
+            "request_digest": row["request_digest"],
+            "resource_scope": row["resource_scope"],
+            "revision_id": row["revision_id"],
+        }
+        operation_id = row["operation_id"]
+        project_id = row["project_id"]
+        scope = row["resource_scope"]
+        valid_scope = (
+            operation_id == "createCoreProjectV1" and scope == "projects"
+        ) or (
+            operation_id == "patchCoreProjectV1" and scope == project_id
+        ) or (
+            operation_id == "finalizeCoreWorkspaceUploadV1"
+            and isinstance(scope, str)
+            and scope.startswith(f"{project_id}:upload-")
+        )
+        if (
+            not _is_managed_resource_id(row["revision_id"], "revision")
+            or not _is_managed_resource_id(project_id, "project")
+            or not valid_scope
+            or not isinstance(row["idempotency_key"], str)
+            or not 1 <= len(row["idempotency_key"]) <= 256
+            or not _is_sha256(row["request_digest"])
+            or not hmac.compare_digest(
+                row["identity_hmac"],
+                self._revision_activation_binding_hmac(values),
+            )
+        ):
+            raise StoreCorruptionError("revision activation binding row is invalid")
 
     def _store_idempotency(
         self,
@@ -2329,6 +2579,26 @@ class CoreControlStoreV1:
         )
         self._finish_event(sequence, frame)
 
+    def _prune_project_event_history(self, project_id: str) -> None:
+        cursor = self._connection.execute(
+            "SELECT sequence, frame_json FROM events ORDER BY sequence LIMIT ?",
+            (self._event_replay_limit + 1,),
+        )
+        rows = cursor.fetchmany(self._event_replay_limit + 1)
+        if len(rows) > self._event_replay_limit or cursor.fetchone() is not None:
+            raise StoreCorruptionError("project event cleanup quota is exceeded")
+        cutoff: int | None = None
+        for row in rows:
+            frame = _validate_bytes(m.SseFrameV1, row["frame_json"])
+            envelope = frame.data.root
+            if (frame.event == "project.updated.v1" and envelope.payload.id == project_id) or (
+                frame.event == "revision.activated.v1"
+                and envelope.payload.revision.project_id == project_id
+            ):
+                cutoff = int(row["sequence"])
+        if cutoff is not None:
+            self._connection.execute("DELETE FROM events WHERE sequence <= ?", (cutoff,))
+
     def _append_revision_activated_event(
         self,
         revision: m.RevisionV1,
@@ -2363,6 +2633,83 @@ class CoreControlStoreV1:
         )
         self._finish_event(sequence, frame)
 
+    def _validate_revision_event_closure(
+        self,
+        frames: list[m.SseFrameV1],
+        revisions_by_id: Mapping[str, m.RevisionV1],
+    ) -> None:
+        last_generation_by_project: dict[str, int] = {}
+        for index, frame in enumerate(frames):
+            envelope = frame.data.root
+            if frame.event == "project.updated.v1":
+                project = envelope.payload
+                if project.status is not m.ProjectStatus.READY:
+                    continue
+                if index + 1 >= len(frames):
+                    raise StoreCorruptionError(
+                        "ready project event has no revision activation event"
+                    )
+                activation = frames[index + 1]
+                if activation.event != "revision.activated.v1":
+                    raise StoreCorruptionError(
+                        "ready project event is not followed by revision activation"
+                    )
+                self._validate_revision_event_pair(
+                    frame,
+                    activation,
+                    revisions_by_id,
+                )
+                continue
+            if frame.event != "revision.activated.v1":
+                continue
+            if index == 0 or frames[index - 1].event != "project.updated.v1":
+                raise StoreCorruptionError("revision activation event has no project update event")
+            revision = envelope.payload
+            last_generation = last_generation_by_project.get(revision.revision.project_id)
+            if last_generation is not None and revision.revision.generation != last_generation + 1:
+                raise StoreCorruptionError(
+                    "revision activation event generations are not contiguous"
+                )
+            last_generation_by_project[revision.revision.project_id] = revision.revision.generation
+
+        for project_id, generation in last_generation_by_project.items():
+            ledger_generations = [
+                revision.revision.generation
+                for revision in revisions_by_id.values()
+                if revision.revision.project_id == project_id
+            ]
+            if not ledger_generations or generation != max(ledger_generations):
+                raise StoreCorruptionError(
+                    "revision activation event is not the retained ledger head"
+                )
+
+    def _validate_revision_event_pair(
+        self,
+        project_frame: m.SseFrameV1,
+        revision_frame: m.SseFrameV1,
+        revisions_by_id: Mapping[str, m.RevisionV1],
+    ) -> None:
+        project_event = project_frame.data.root
+        revision_event = revision_frame.data.root
+        project = project_event.payload
+        revision = revision_event.payload
+        ledger_revision = revisions_by_id.get(revision.revision.id)
+        if (
+            ledger_revision is None
+            or _model_bytes(revision) != _model_bytes(ledger_revision)
+            or project.id != revision.revision.project_id
+            or project.active_revision != revision.revision
+            or project.current_project_snapshot != revision.project_snapshot
+            or project.current_task_snapshot != revision.task_snapshot
+            or project.current_workspace_snapshot != revision.workspace_snapshot
+            or project.registry_digest != revision.registry_digest
+            or project.updated_at != revision.updated_at
+            or project_event.occurred_at != revision.updated_at
+            or revision_event.occurred_at != revision.updated_at
+            or revision_event.sequence != project_event.sequence + 1
+        ):
+            raise StoreCorruptionError("project and revision activation event closure is invalid")
+
     def _reserve_event_sequence(self) -> int:
         cursor = self._connection.execute(
             "INSERT INTO events(event_id, frame_json, created_at_epoch) VALUES (NULL, NULL, ?)",
@@ -2378,6 +2725,17 @@ class CoreControlStoreV1:
         cutoff = sequence - self._event_replay_limit
         if cutoff > 0:
             self._connection.execute("DELETE FROM events WHERE sequence <= ?", (cutoff,))
+        first_row = self._connection.execute(
+            "SELECT sequence, frame_json FROM events ORDER BY sequence LIMIT 1"
+        ).fetchone()
+        if first_row is None:
+            return
+        first_frame = _validate_bytes(m.SseFrameV1, first_row["frame_json"])
+        if first_frame.event == "revision.activated.v1":
+            self._connection.execute(
+                "DELETE FROM events WHERE sequence = ?",
+                (first_row["sequence"],),
+            )
 
     def _decode_event_cursor(self, value: str) -> int:
         parts = value.split(".")
@@ -2435,6 +2793,7 @@ class CoreControlStoreV1:
         table: Literal[
             "projects",
             "project_revisions",
+            "revision_activation_bindings",
             "workspace_uploads",
             "workspace_publication_owners",
             "idempotency_records",
@@ -2639,6 +2998,8 @@ class CoreControlStoreV1:
                             )
                     publication_projects[publication.workspace_snapshot.id] = project.id
             revisions_by_project: dict[str, list[m.RevisionV1]] = {}
+            revisions_by_id: dict[str, m.RevisionV1] = {}
+            revision_request_digests: dict[str, str | None] = {}
             for row in self._recovery_rows(
                 "project_revisions",
                 columns=(
@@ -2646,6 +3007,7 @@ class CoreControlStoreV1:
                     "project_id",
                     "generation",
                     "identity_hmac",
+                    "activation_request_digest",
                     "document_json",
                     "resource_version",
                     "created_at",
@@ -2655,6 +3017,7 @@ class CoreControlStoreV1:
                     "revision_id",
                     "project_id",
                     "identity_hmac",
+                    "activation_request_digest",
                     "document_json",
                     "created_at",
                     "updated_at",
@@ -2663,6 +3026,7 @@ class CoreControlStoreV1:
             ):
                 revision = _validate_bytes(m.RevisionV1, row["document_json"])
                 revision_data = revision.model_dump(mode="python", exclude={"etag"})
+                activation_request_digest = row["activation_request_digest"]
                 if (
                     revision.revision.id != row["revision_id"]
                     or revision.revision.project_id != row["project_id"]
@@ -2671,30 +3035,41 @@ class CoreControlStoreV1:
                     or revision.updated_at != row["updated_at"]
                     or int(row["resource_version"]) != 1
                     or revision.etag != _etag(revision_data, version=1)
+                    or (
+                        activation_request_digest is not None
+                        and not _is_sha256(activation_request_digest)
+                    )
                     or not hmac.compare_digest(
                         row["identity_hmac"],
-                        self._resource_identity_hmac("revision", revision.revision.id),
+                        self._revision_identity_hmac(
+                            revision.revision.id,
+                            activation_request_digest,
+                        ),
                     )
                 ):
                     raise StoreCorruptionError("project revision row identity is invalid")
                 if revision.revision.project_id not in projects_by_id:
                     raise StoreCorruptionError("project revision owner is missing")
                 revisions_by_project.setdefault(revision.revision.project_id, []).append(revision)
+                revisions_by_id[revision.revision.id] = revision
+                revision_request_digests[revision.revision.id] = activation_request_digest
             for project_id, project in projects_by_id.items():
                 revisions = sorted(
                     revisions_by_project.get(project_id, []),
                     key=lambda item: item.revision.generation,
                 )
-                predecessor: m.RevisionRefV1 | None = None
+                predecessor: m.RevisionV1 | None = None
                 for generation, revision in enumerate(revisions):
                     if revision.revision.generation != generation:
-                        raise StoreCorruptionError("project revision generations are not contiguous")
+                        raise StoreCorruptionError(
+                            "project revision generations are not contiguous"
+                        )
                     _validate_revision_identity(
                         self._signing_key,
                         revision,
                         predecessor=predecessor,
                     )
-                    predecessor = revision.revision
+                    predecessor = revision
                 if project.active_revision is None:
                     if revisions or project.status is m.ProjectStatus.READY:
                         raise StoreCorruptionError("project revision head is missing")
@@ -2711,6 +3086,38 @@ class CoreControlStoreV1:
                         or active.registry_digest != project.registry_digest
                     ):
                         raise StoreCorruptionError("ready project revision closure is invalid")
+            for row in self._recovery_rows(
+                "revision_activation_bindings",
+                columns=(
+                    "revision_id",
+                    "project_id",
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "identity_hmac",
+                ),
+                bounded_columns=(
+                    "revision_id",
+                    "project_id",
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "identity_hmac",
+                ),
+                max_rows=_MAX_REVISIONS,
+            ):
+                self._validate_revision_activation_binding_row(row)
+                revision = revisions_by_id.get(row["revision_id"])
+                if revision is not None and (
+                    revision.revision.project_id != row["project_id"]
+                    or row["request_digest"]
+                    != revision_request_digests[revision.revision.id]
+                ):
+                    raise StoreCorruptionError(
+                        "revision activation binding does not match the ledger"
+                    )
             referenced_files: set[str] = set()
             snapshot_sources: dict[str, tuple[m.WorkspacePublicationV1, str, str]] = {}
             for row in self._recovery_rows(
@@ -2814,6 +3221,8 @@ class CoreControlStoreV1:
                     raise StoreCorruptionError(
                         "workspace publication is not bound to an upload from the same project"
                     )
+            recovered_events: list[m.SseFrameV1] = []
+            previous_event_sequence: int | None = None
             for row in self._recovery_rows(
                 "events",
                 columns=("sequence", "event_id", "frame_json", "created_at_epoch"),
@@ -2833,6 +3242,14 @@ class CoreControlStoreV1:
                     raise StoreCorruptionError("event cursor authentication failed") from exc
                 if cursor_sequence != int(row["sequence"]):
                     raise StoreCorruptionError("event cursor sequence is invalid")
+                if (
+                    previous_event_sequence is not None
+                    and cursor_sequence != previous_event_sequence + 1
+                ):
+                    raise StoreCorruptionError("event replay sequence is not contiguous")
+                previous_event_sequence = cursor_sequence
+                recovered_events.append(frame)
+            self._validate_revision_event_closure(recovered_events, revisions_by_id)
             valid_successes: set[tuple[str, str, str]] = set()
             idempotency_publications: set[str] = set()
             for row in self._recovery_rows(
@@ -2876,6 +3293,7 @@ class CoreControlStoreV1:
                         else None
                     ),
                 )
+                self._validate_idempotency_revision_request(row, idempotency_model)
                 idempotency_publications.update(_publication_snapshot_ids(idempotency_model))
                 valid_successes.add(
                     (row["operation_id"], row["resource_scope"], row["idempotency_key"])
@@ -3487,6 +3905,7 @@ class CoreControlStoreV1:
         empty_fingerprint = _expected_schema_fingerprint(())
         legacy_fingerprint = _expected_schema_fingerprint(_LEGACY_SCHEMA)
         previous_fingerprint = _expected_schema_fingerprint(_PREVIOUS_SCHEMA)
+        revision_ledger_v1_fingerprint = _expected_schema_fingerprint(_REVISION_LEDGER_V1_SCHEMA)
         current_fingerprint = _expected_schema_fingerprint(_SCHEMA)
         if fingerprint == empty_fingerprint:
             if hasattr(self, "_marker_fd"):
@@ -3516,6 +3935,14 @@ class CoreControlStoreV1:
                 self._verify_bound_store_identity(row)
             with self._transaction():
                 self._connection.execute(_PROJECT_REVISIONS_SCHEMA)
+                self._connection.execute(_REVISION_ACTIVATION_BINDINGS_SCHEMA)
+        elif fingerprint == revision_ledger_v1_fingerprint:
+            row = self._read_store_identity_row()
+            self._require_store_identity_root(row)
+            self._store_id = row["store_id"]
+            if row["binding_state"] == "bound":
+                self._verify_bound_store_identity(row)
+            self._migrate_revision_ledger_v1_schema()
         elif fingerprint != current_fingerprint:
             raise StoreCorruptionError(
                 "Core Control schema fingerprint is incompatible with an allowed migration"
@@ -3551,13 +3978,35 @@ class CoreControlStoreV1:
         self._verify_bound_store_identity(row)
         self._expected_marker_bytes = self._store_identity_marker_bytes(row)
 
+    def _migrate_revision_ledger_v1_schema(self) -> None:
+        with self._transaction():
+            self._connection.execute(
+                "ALTER TABLE project_revisions RENAME TO project_revisions_v1"
+            )
+            self._connection.execute(_PROJECT_REVISIONS_SCHEMA)
+            self._connection.execute(
+                "INSERT INTO project_revisions(revision_id, project_id, generation, "
+                "identity_hmac, activation_request_digest, document_json, "
+                "resource_version, created_at, updated_at) "
+                "SELECT revision_id, project_id, generation, identity_hmac, NULL, "
+                "document_json, resource_version, created_at, updated_at "
+                "FROM project_revisions_v1"
+            )
+            self._connection.execute("DROP TABLE project_revisions_v1")
+            self._connection.execute(_REVISION_ACTIVATION_BINDINGS_SCHEMA)
+            self._verify_schema_fingerprint()
+
     def _create_pending_store_identity(self, *, include_base_schema: bool) -> None:
         store_id = secrets.token_hex(_STORE_ID_BYTES)
         with self._transaction():
             statements = (
                 _SCHEMA
                 if include_base_schema
-                else (_STORE_IDENTITY_SCHEMA, _PROJECT_REVISIONS_SCHEMA)
+                else (
+                    _STORE_IDENTITY_SCHEMA,
+                    _PROJECT_REVISIONS_SCHEMA,
+                    _REVISION_ACTIVATION_BINDINGS_SCHEMA,
+                )
             )
             for statement in statements:
                 self._connection.execute(statement)
@@ -3730,11 +4179,15 @@ class CoreControlStoreV1:
             "failed_idempotency_records",
             "events",
         ]
-        if self._connection.execute(
-            "SELECT 1 FROM sqlite_schema WHERE type = 'table' "
-            "AND name = 'project_revisions'"
-        ).fetchone() is not None:
-            tables.append("project_revisions")
+        for optional_table in (
+            "project_revisions",
+            "revision_activation_bindings",
+        ):
+            if self._connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+                (optional_table,),
+            ).fetchone() is not None:
+                tables.append(optional_table)
         for table in tables:
             row = self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
             if row is None or int(row[0]) != 0:
@@ -3935,6 +4388,37 @@ class CoreControlStoreV1:
             hashlib.sha256,
         ).hexdigest()
 
+    def _revision_identity_hmac(
+        self,
+        revision_id: str,
+        activation_request_digest: str | None,
+    ) -> str:
+        if activation_request_digest is None:
+            return self._resource_identity_hmac("revision", revision_id)
+        return hmac.new(
+            self._signing_key,
+            _canonical_bytes(
+                {
+                    "activation_request_digest": activation_request_digest,
+                    "domain": "revision-activation.v1",
+                    "revision_id": revision_id,
+                }
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _revision_activation_binding_hmac(self, values: Mapping[str, object]) -> str:
+        return hmac.new(
+            self._signing_key,
+            _canonical_bytes(
+                {
+                    "domain": "revision-activation-binding.v1",
+                    "values": values,
+                }
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+
     def _open_database_connection(self) -> sqlite3.Connection:
         authority_fd = self._database_fds.get("provider.sqlite3")
         if authority_fd is None:
@@ -3985,6 +4469,7 @@ class CoreControlStoreV1:
                     not in {
                         _expected_schema_fingerprint(_LEGACY_SCHEMA),
                         _expected_schema_fingerprint(_PREVIOUS_SCHEMA),
+                        _expected_schema_fingerprint(_REVISION_LEDGER_V1_SCHEMA),
                         _expected_schema_fingerprint(_SCHEMA),
                     }
                 ):
@@ -4029,6 +4514,15 @@ class CoreControlStoreV1:
             .isoformat(timespec="microseconds")
             .replace("+00:00", "Z")
         )
+
+    def _project_mutation_timestamp(self, project: m.ProjectV1) -> str:
+        proposed = self._timestamp()
+        if project.active_revision is None:
+            return proposed
+        predecessor = self._revision_row(project.active_revision.id)
+        if predecessor.revision != project.active_revision:
+            raise StoreCorruptionError("project revision head binding is invalid")
+        return _strictly_later_timestamp(proposed, predecessor.updated_at)
 
     def _transaction(self):
         return _Transaction(
@@ -4336,14 +4830,15 @@ def _validate_revision_identity(
     signing_key: bytes,
     revision: m.RevisionV1,
     *,
-    predecessor: m.RevisionRefV1 | None,
+    predecessor: m.RevisionV1 | None,
 ) -> None:
-    generation = 0 if predecessor is None else predecessor.generation + 1
+    predecessor_ref = None if predecessor is None else predecessor.revision
+    generation = 0 if predecessor_ref is None else predecessor_ref.generation + 1
     manifest_payload = {
         "schema_version": "1",
         "project_id": revision.revision.project_id,
         "generation": generation,
-        "predecessor_revision": predecessor,
+        "predecessor_revision": predecessor_ref,
         "project_snapshot": revision.project_snapshot,
         "task_snapshot": revision.task_snapshot,
         "workspace_snapshot": revision.workspace_snapshot,
@@ -4372,7 +4867,7 @@ def _validate_revision_identity(
     if (
         revision.revision != expected_ref
         or revision.status is not m.RevisionStatus.ACTIVE
-        or revision.predecessor_revision != predecessor
+        or revision.predecessor_revision != predecessor_ref
         or revision.task_snapshot is None
         or revision.created_at != revision.updated_at
         or revision.activated_at != revision.updated_at
@@ -4394,11 +4889,13 @@ def _validate_revision_identity(
         if revision.transition is not None:
             raise StoreCorruptionError("genesis revision transition is invalid")
         return
+    if _parse_utc_timestamp(revision.updated_at) <= _parse_utc_timestamp(predecessor.updated_at):
+        raise StoreCorruptionError("successor revision timestamp is not strictly increasing")
     transition = revision.transition
     if (
         transition is None
         or transition.state is not m.RevisionTransitionState.ACTIVE
-        or transition.predecessor_revision != predecessor
+        or transition.predecessor_revision != predecessor_ref
         or transition.successor_revision != revision.revision
         or transition.progress_completed != 1
         or transition.progress_total != 1
@@ -4407,6 +4904,27 @@ def _validate_revision_identity(
         or transition.error is not None
     ):
         raise StoreCorruptionError("successor revision transition is invalid")
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise StoreCorruptionError("persisted UTC timestamp is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise StoreCorruptionError("persisted UTC timestamp is invalid")
+    return parsed
+
+
+def _strictly_later_timestamp(proposed: str, predecessor: str) -> str:
+    proposed_at = _parse_utc_timestamp(proposed)
+    predecessor_at = _parse_utc_timestamp(predecessor)
+    if proposed_at <= predecessor_at:
+        try:
+            proposed_at = predecessor_at + timedelta(microseconds=1)
+        except OverflowError as exc:
+            raise StoreCorruptionError("successor revision timestamp cannot advance") from exc
+    return proposed_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _revision_head(

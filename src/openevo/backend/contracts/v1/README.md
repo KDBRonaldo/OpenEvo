@@ -63,11 +63,19 @@ closure and active transition state.
 type without a local copy or projection.
 
 The provider's private SQLite schema is exact-fingerprinted and is not part of
-the frozen HTTP schema. The exact preceding bound schema is upgraded
-transactionally by adding the revision ledger; near matches and older
-state-bearing schemas fail closed. Successful idempotency rows retain the
-canonical request and semantic headers and validate each operation's
-request/response relationship during replay and startup. Project validation
+the frozen HTTP schema. The exact preceding bound schemas are upgraded
+transactionally by adding the revision ledger or its private activation-request
+binding; near matches and older state-bearing schemas fail closed. New revision
+rows sign the canonical activation request digest and add a private binding to
+the owning idempotency row. That binding survives project deletion for the
+idempotency retention window and is cascade-cleaned when the response expires.
+Legacy revision rows retain their old identity until a still-retained
+activation response is validated and atomically backfills both bindings.
+Successful idempotency rows retain the
+canonical request and semantic headers, validate each operation's
+request/response relationship, and require a ready project response to name the
+exact ledger revision activated by that same request during replay and startup.
+Project validation
 constructs its framework profile from the persisted execution mode, capture
 mode, and harness ID. SQLite/workspace recovery is descriptor-bound and
 quota-limited across every persisted TEXT/BLOB value. The Linux provider opens
@@ -90,12 +98,17 @@ Verified Codex subscription projects with a ready workspace atomically publish
 generation-zero active `RevisionV1`; ready project PATCH and final workspace
 publication atomically publish one direct successor while retaining history.
 The private ledger authenticates canonical manifests, enforces contiguous
-predecessors and active ProjectV1 head closure during bounded startup recovery,
-and backs the frozen revision list/head/get routes with signed cursors and
-strong ETags. Missing registry, unresolved self-deployed model preparation, or
-an unpublished imported workspace remains draft and does not synthesize a
-revision. Project and revision activation events commit with the mutation and
-idempotency response.
+predecessors, requires every successor timestamp to be strictly later than its
+predecessor even when the wall clock stalls or moves backward, and validates
+active ProjectV1 head closure during bounded startup recovery. It backs the
+frozen revision list/head/get routes with signed cursors and strong ETags.
+Missing registry, unresolved self-deployed model preparation, or an unpublished
+imported workspace remains draft and does not synthesize a revision. Project
+and revision activation events commit with the mutation and idempotency
+response. Replay pruning retains complete project-update/revision-activation
+pairs; startup requires a contiguous retained event suffix and verifies each
+pair's order, generation, payload, timestamps, change identity, and exact
+revision-ledger binding.
 Synchronous store work runs on a bounded executor rather than the ASGI event
 loop.
 
