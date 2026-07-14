@@ -68,6 +68,18 @@ that is not world-writable; this covers the standard root:admin `0775`
 non-sticky world-writable component remain invalid. Set-user-ID execution is
 rejected by requiring the real and effective UID to match.
 
+On macOS, mode and owner checks are not the complete write policy. Native code
+reads the extended ACL from every held component FD and from the held sidecar
+source FD with `acl_get_fd_np`. A NULL ACL result, malformed entry, unknown tag,
+unknown ALLOW permission, or ALLOW entry containing write-data, append, delete,
+delete-child, write-attribute, write-extended-attribute, write-security, or
+change-owner permission fails closed. Read/execute-only ALLOW entries and DENY
+entries are accepted,
+so the standard deny ACLs and root:admin `0775` mode used by `/Applications`
+remain supported. This deliberately stronger policy rejects a mutating ALLOW
+entry even when its principal might otherwise be trusted. Linux keeps its mode,
+owner, and no-follow policy and does not apply this macOS ACL interpretation.
+
 Linux obtains the loaded executable vnode through `/proc/self/exe`; its owner
 must be root or the effective user, and the sidecar source owner must match it
 exactly. macOS has no equivalent interface that reopens the vnode already
@@ -139,46 +151,75 @@ arguments, inherited listener, and instance channel remain native-host owned.
 Debug-only override and source-launcher code is absent under production cfg;
 the Desktop workflow compiles, lints, and tests both debug and release cfg.
 
-The child starts in its own process group. Explicit stop, startup failure,
-restart cleanup, and Tauri `ExitRequested`/`Exit` handling signal the complete
-group with TERM, poll for a fixed interval, escalate to KILL, and poll for a
-second fixed interval. Stop and exit first advance a cancellation epoch so an
-in-progress startup cannot publish or spawn after cancellation. The native
-launch gate linearizes epoch capture, spawn plus emergency process-group
-publication, cancellation advance, and running-state publication. Before
-spawn, the manager publishes an exclusive state-owned `starting` slot holding
-the listener, private directory, and executable FD. `Command::spawn` fills that
-same slot with `Child` and process-group ownership before either lock is
-released. Readiness takes only short state locks for child inspection; credential
-I/O, network polling, and source validation do not leave process ownership in a
-local value. Running publication waits up to the bounded state-lock interval,
-so ordinary status contention cannot spuriously reject a ready child.
+The child calls `setsid`, so its PID is also the ID of a new session and process
+group. Before exec, it forks a minimal watchdog in that group. The native host
+installs the writer of a close-on-exec parent-liveness channel in state before
+calling `Command::spawn`; the watchdog retains only the reader. Writer EOF makes
+the watchdog signal the group with TERM, wait 250 ms, and escalate to KILL.
+The sidecar branch closes both liveness descriptors before exec, while inherited
+FD 3 and FD 4 retain their listener and executable meanings. Thus cancellation,
+normal host process exit, and a host crash after the watchdog exists cannot
+leave an execing or running sidecar group detached from host liveness.
 
-Every post-spawn failure therefore leaves the complete slot available to status,
-restart blocking, exit cleanup, and explicit stop retry until group cleanup is
-proved. Mutex poison is recovered as fail-closed retained state; lock timeout
-leaves the slot unchanged. An unexpected TERM, KILL, child-wait, or
-group-inspection failure, including `try_wait` failure during status or restart
-inspection, moves the manager to `cleanup_pending`. Resources are dropped only
-after the child is reaped and the full process group is confirmed absent. No
-failure path performs an unbounded `Child::wait`.
+Startup uses one atomic epoch-and-phase word with `Idle`, `Reserved`,
+`Spawning`, `Published`, and `Cancelled` states. The
+`Reserved -> Spawning` compare-exchange is the spawn linearization point. If
+cancellation advances first, that transition and `Command::spawn` cannot occur;
+if spawning wins first, later cancellation closes the liveness writer and the
+phase can no longer publish. There is no mutex launch gate. Before the spawn
+transition, the manager publishes an exclusive `starting` slot containing the
+listener, private directory, and executable FD, plus a state-owned handoff. The
+handoff outcome lock is independent of cancellation and is held while
+`Command::spawn` waits, so a returned `Child` is installed in the handoff before
+the startup thread can wait for the manager lock. Short or poisoned manager-lock
+contention therefore cannot drop an unpublished child. Once transferred,
+readiness takes only bounded, short manager locks; credential I/O, network
+polling, and executable validation do not hold them. Running publication also
+uses bounded lock acquisition, so ordinary status contention does not
+spuriously reject an already-ready process.
 
-The launch gate is held across `Command::spawn` to preserve that ordering.
-Rust's Unix spawn path can wait for its child exec/error channel, so launch-gate
-wait is not claimed to have a strict wall-clock bound. The `pre_exec` closure is
-restricted to `setpgid`, `dup2`, `fcntl`, `fstat`, fixed-size comparisons, and
-non-allocating fixed OS-error construction; no lock, heap allocation, logging,
-or other non-async-signal-safe application work runs after `fork` and before
-`exec`.
+Group signaling is generation-bound to the unreaped leader. Status, restart,
+and cleanup observe leader exit with `waitid(..., WNOWAIT)` and do not reap it.
+Immediately before every TERM or KILL, cleanup repeats that non-reaping child
+check; an inspection error authorizes no numeric-PGID signal. While the manager
+is `Anchored`, the retained child identity prevents PID/PGID reuse and authorizes
+TERM/KILL to the group. Linux enumerates `/proc` and macOS uses
+`proc_listpgrppids` to confirm that no live non-leader group member remains.
+Only after the leader has exited and the rest of the group is absent does cleanup
+switch irreversibly to `Finalizing` and call `Child::try_wait`. A final reap
+error retains ownership for retry, but every retry in `Finalizing` is reap-only:
+it can never signal the old numeric PGID. This avoids stale-PGID signaling even
+when a reap operation has consumed the leader before reporting failure.
 
-The exit hook sets the atomic shutdown flag before waiting for the launch gate.
-After acquiring that gate it advances cancellation and reads the atomically
-published process group, so it can issue TERM and KILL even while the manager
-mutex is busy. It then retries manager-owned cleanup with bounded lock access.
-The configured cleanup sequence after launch-gate acquisition is 250 ms
-emergency TERM grace, 3 seconds for state-lock access, and two 1-second cleanup
-polls: 5.25 seconds plus constant-time syscalls. This is not an end-to-end exit
-bound while another thread is inside `Command::spawn`, as described above.
+Every post-spawn failure therefore leaves the process either in the handoff or
+in the manager slot until bounded group cleanup succeeds. Pending and failed
+handoffs are resolved without a child; spawned handoffs can be cleaned directly
+if manager transfer cannot complete. Mutex poison is recovered as fail-closed
+retained state, cleanup failure changes the manager to `cleanup_pending`, and a
+lock timeout leaves ownership unchanged. Restart remains blocked, while explicit
+stop can retry. No failure path uses `mem::forget`, leaks a `Child`, performs an
+unbounded `Child::wait`, or drops a live manager-owned process as cleanup.
+
+Stop and exit advance cancellation with an atomic compare-exchange before any
+bounded mutex access; neither waits for `Command::spawn` or a launch mutex. They
+then try to close the parent-liveness writer and acquire handoff/manager state
+within configured lock budgets. Explicit stop may return
+`sidecar_state_timeout` while retained startup ownership is still contended;
+the watchdog still terminates an already-created child after writer closure,
+and a later stop retries reap and state cleanup. The exit hook also sets the
+shutdown flag first; actual process exit closes any writer that bounded cleanup
+could not acquire. TERM/KILL polling remains fixed at one second per phase for
+normal manager cleanup.
+
+No claim is made that the thread inside `Command::spawn` has an independent
+wall-clock bound before the watchdog has been forked. The pre-exec path is kept
+to async-signal-safe libc work: `setsid`, `fork`, `close`, `dup2`, `fcntl`,
+`fstat`, `sigaction`, `read`, `kill`, `nanosleep`, `_exit`, and fixed-size
+comparisons. It takes no application lock, allocates no heap memory, and emits
+no log. Once the watchdog exists, closing the liveness writer terminates a child
+blocked in a later pre-exec hook or exec/error-channel handoff without making
+stop or exit wait on that channel.
+
 Sidecar stdout and stderr are connected to the null device. There is no native
 raw-log buffer and no `app_logs` Tauri command, so renderer JavaScript cannot
 receive child output; sidecar status also omits command, path, argv, credential,
@@ -190,7 +231,11 @@ and the native command surface exposes no placeholder Keychain operation. These
 native-host changes and Linux/macOS externalBin combination smokes do not prove
 code signing, notarization, mounted/copied macOS application launch, first-run
 remote bootstrap, or downloaded artifact identity, and do not make the DMG
-release-ready.
+release-ready. ACL permission-mask policy tests run cross-platform and a macOS
+cfg test exercises `acl_get_fd_np` on a fresh ACL-free anchored file. No test
+currently creates a real writable extended-ACL fixture on macOS, so rejection
+of an installed mutating ACE remains a macOS-runner fixture gap rather than
+claimed release evidence.
 
 Before that outer lifecycle harness, the workflow installs the exact remote Core
 wheel in a clean Python environment and runs

@@ -807,6 +807,13 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "fn allocate_sidecar_listener()" in main
     assert "fn prepare_packaged_sidecar(" in main
     assert "libc::O_NOFOLLOW" in main
+    assert "acl_get_fd_np" in main
+    assert "struct SpawnHandoff" in main
+    assert "run_parent_liveness_watchdog" in main
+    assert "libc::WNOWAIT" in main
+    assert "GroupSignalAuthority::Finalizing" in main
+    assert "launch_gate" not in main
+    assert "emergency_process_group" not in main
     assert "fn terminate_process_group(" in main
     assert "openevo-desktop-sidecar" in main
     assert "check_sidecar_health" in main

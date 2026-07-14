@@ -8,8 +8,8 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -90,6 +90,149 @@ enum TrustedDirectoryPolicy {
     Strict,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     MacOsBundle,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_READ_DATA: u64 = 1 << 1;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_WRITE_DATA: u64 = 1 << 2;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_EXECUTE: u64 = 1 << 3;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_DELETE: u64 = 1 << 4;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_APPEND_DATA: u64 = 1 << 5;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_DELETE_CHILD: u64 = 1 << 6;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_READ_ATTRIBUTES: u64 = 1 << 7;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_WRITE_ATTRIBUTES: u64 = 1 << 8;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_READ_EXTATTRIBUTES: u64 = 1 << 9;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_WRITE_EXTATTRIBUTES: u64 = 1 << 10;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_READ_SECURITY: u64 = 1 << 11;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_WRITE_SECURITY: u64 = 1 << 12;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_CHANGE_OWNER: u64 = 1 << 13;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_PERMISSION_SYNCHRONIZE: u64 = 1 << 20;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_READ_ONLY_PERMISSIONS: u64 = ACL_PERMISSION_READ_DATA
+    | ACL_PERMISSION_EXECUTE
+    | ACL_PERMISSION_READ_ATTRIBUTES
+    | ACL_PERMISSION_READ_EXTATTRIBUTES
+    | ACL_PERMISSION_READ_SECURITY
+    | ACL_PERMISSION_SYNCHRONIZE;
+#[cfg(any(test, target_os = "macos"))]
+const ACL_MUTATING_PERMISSIONS: u64 = ACL_PERMISSION_WRITE_DATA
+    | ACL_PERMISSION_DELETE
+    | ACL_PERMISSION_APPEND_DATA
+    | ACL_PERMISSION_DELETE_CHILD
+    | ACL_PERMISSION_WRITE_ATTRIBUTES
+    | ACL_PERMISSION_WRITE_EXTATTRIBUTES
+    | ACL_PERMISSION_WRITE_SECURITY
+    | ACL_PERMISSION_CHANGE_OWNER;
+
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtendedAclTag {
+    Allow,
+    Deny,
+    Unknown,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExtendedAclEntry {
+    tag: ExtendedAclTag,
+    permissions: u64,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn validate_extended_acl_entries(entries: &[ExtendedAclEntry]) -> HostResult<()> {
+    if entries.iter().any(|entry| {
+        entry.tag == ExtendedAclTag::Unknown
+            || (entry.tag == ExtendedAclTag::Allow
+                && (entry.permissions & ACL_MUTATING_PERMISSIONS != 0
+                    || entry.permissions & !(ACL_READ_ONLY_PERMISSIONS | ACL_MUTATING_PERMISSIONS)
+                        != 0))
+    }) {
+        return Err(packaged_path_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_anchored_extended_acl(_file: &File) -> HostResult<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_anchored_extended_acl(file: &File) -> HostResult<()> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    type Acl = *mut c_void;
+    type AclEntry = *mut c_void;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = -1;
+    const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+    const ACL_EXTENDED_DENY: libc::c_int = 2;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> Acl;
+        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut AclEntry) -> libc::c_int;
+        fn acl_get_tag_type(entry: AclEntry, tag: *mut libc::c_int) -> libc::c_int;
+        fn acl_get_permset_mask_np(entry: AclEntry, mask: *mut u64) -> libc::c_int;
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+    }
+
+    struct AclGuard(Acl);
+
+    impl Drop for AclGuard {
+        fn drop(&mut self) {
+            unsafe {
+                acl_free(self.0);
+            }
+        }
+    }
+
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        return Err(packaged_path_error());
+    }
+    let _guard = AclGuard(acl);
+    let mut entries = Vec::new();
+    let mut entry_id = ACL_FIRST_ENTRY;
+    loop {
+        let mut entry: AclEntry = ptr::null_mut();
+        match unsafe { acl_get_entry(acl, entry_id, &mut entry) } {
+            0 => break,
+            1 => {}
+            _ => return Err(packaged_path_error()),
+        }
+        let mut raw_tag = 0;
+        let mut permissions = 0_u64;
+        if unsafe { acl_get_tag_type(entry, &mut raw_tag) } == -1
+            || unsafe { acl_get_permset_mask_np(entry, &mut permissions) } == -1
+        {
+            return Err(packaged_path_error());
+        }
+        let tag = match raw_tag {
+            ACL_EXTENDED_ALLOW => ExtendedAclTag::Allow,
+            ACL_EXTENDED_DENY => ExtendedAclTag::Deny,
+            _ => ExtendedAclTag::Unknown,
+        };
+        entries.push(ExtendedAclEntry { tag, permissions });
+        entry_id = ACL_NEXT_ENTRY;
+    }
+    validate_extended_acl_entries(&entries)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,11 +342,19 @@ struct PreparedCommand {
     command: Command,
     _listener_guard: TcpListener,
     _executable_guard: Option<File>,
+    _parent_liveness_reader: File,
+    parent_liveness_writer: Option<File>,
 }
 
 impl PreparedCommand {
     fn spawn(&mut self) -> std::io::Result<Child> {
         self.command.spawn()
+    }
+
+    fn take_parent_liveness_writer(&mut self) -> HostResult<File> {
+        self.parent_liveness_writer
+            .take()
+            .ok_or_else(sidecar_state_error)
     }
 }
 
@@ -289,14 +440,42 @@ enum ManagedLifecycle {
     CleanupPending,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupSignalAuthority {
+    Anchored,
+    Finalizing,
+}
+
 struct ManagedSidecar {
     status: SidecarStatus,
     lifecycle: ManagedLifecycle,
+    startup_epoch: u64,
+    spawn_pending: bool,
     child: Option<Child>,
     process_group: i32,
+    group_signal_authority: GroupSignalAuthority,
     _private_launch_dir: Option<PrivateLaunchDirectory>,
     verified_executable: Option<VerifiedExecutableFile>,
     _listener: TcpListener,
+}
+
+struct SpawnedHandoffProcess {
+    child: Child,
+    process_group: i32,
+    group_signal_authority: GroupSignalAuthority,
+}
+
+enum SpawnHandoffOutcome {
+    Pending,
+    Spawning,
+    Spawned(SpawnedHandoffProcess),
+    Failed,
+    Transferred,
+}
+
+struct SpawnHandoff {
+    startup_epoch: u64,
+    outcome: Mutex<SpawnHandoffOutcome>,
 }
 
 impl ManagedSidecar {
@@ -313,24 +492,54 @@ impl ManagedSidecar {
 
 struct DesktopHostState {
     sidecar: Mutex<Option<ManagedSidecar>>,
-    launch_gate: Mutex<()>,
+    spawn_handoff: Mutex<Option<Arc<SpawnHandoff>>>,
+    parent_liveness: Mutex<Option<File>>,
     startup_in_progress: AtomicBool,
     cancellation_epoch: AtomicU64,
+    launch_state: AtomicU64,
     shutdown_requested: AtomicBool,
-    emergency_process_group: AtomicI32,
 }
 
 impl Default for DesktopHostState {
     fn default() -> Self {
         Self {
             sidecar: Mutex::new(None),
-            launch_gate: Mutex::new(()),
+            spawn_handoff: Mutex::new(None),
+            parent_liveness: Mutex::new(None),
             startup_in_progress: AtomicBool::new(false),
             cancellation_epoch: AtomicU64::new(0),
+            launch_state: AtomicU64::new(encode_launch_state(0, LaunchPhase::Idle)),
             shutdown_requested: AtomicBool::new(false),
-            emergency_process_group: AtomicI32::new(0),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+enum LaunchPhase {
+    Idle = 0,
+    Reserved = 1,
+    Spawning = 2,
+    Published = 3,
+    Cancelled = 4,
+}
+
+const LAUNCH_PHASE_BITS: u32 = 3;
+const LAUNCH_PHASE_MASK: u64 = (1 << LAUNCH_PHASE_BITS) - 1;
+
+fn encode_launch_state(epoch: u64, phase: LaunchPhase) -> u64 {
+    (epoch << LAUNCH_PHASE_BITS) | phase as u64
+}
+
+fn decode_launch_state(value: u64) -> (u64, LaunchPhase) {
+    let phase = match value & LAUNCH_PHASE_MASK {
+        0 => LaunchPhase::Idle,
+        1 => LaunchPhase::Reserved,
+        2 => LaunchPhase::Spawning,
+        3 => LaunchPhase::Published,
+        _ => LaunchPhase::Cancelled,
+    };
+    (value >> LAUNCH_PHASE_BITS, phase)
 }
 
 struct StartupClaim<'a> {
@@ -339,21 +548,22 @@ struct StartupClaim<'a> {
 
 impl<'a> StartupClaim<'a> {
     fn acquire(state: &'a DesktopHostState) -> HostResult<(Self, u64)> {
-        let _launch_gate = state
-            .launch_gate
-            .lock()
-            .map_err(|_| sidecar_state_error())?;
         if state.shutdown_requested.load(Ordering::Acquire) {
             return Err(NativeHostError::new(
                 "sidecar_host_shutting_down",
                 "OpenEvo Desktop is shutting down its native sidecar host.",
             ));
         }
+        let (epoch, _) = decode_launch_state(state.launch_state.load(Ordering::Acquire));
         state
             .startup_in_progress
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| sidecar_start_in_progress_error())?;
-        let epoch = state.cancellation_epoch.load(Ordering::Acquire);
+        let (confirmed_epoch, _) = decode_launch_state(state.launch_state.load(Ordering::Acquire));
+        if confirmed_epoch != epoch || state.shutdown_requested.load(Ordering::Acquire) {
+            state.startup_in_progress.store(false, Ordering::Release);
+            return Err(sidecar_start_cancelled_error());
+        }
         Ok((
             Self {
                 in_progress: &state.startup_in_progress,
@@ -380,9 +590,14 @@ struct NativeHealthResponse {
 }
 
 trait ProcessControl {
-    fn try_wait(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>>;
+    fn leader_exited(&self, child: &Child) -> std::io::Result<bool>;
+    fn reap_leader(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>>;
     fn signal_group(&self, process_group: i32, signal: libc::c_int) -> std::io::Result<()>;
-    fn group_exists(&self, process_group: i32) -> std::io::Result<bool>;
+    fn group_has_members_except_leader(
+        &self,
+        process_group: i32,
+        leader: i32,
+    ) -> std::io::Result<bool>;
     fn sleep(&self, duration: Duration);
 }
 
@@ -390,7 +605,11 @@ trait ProcessControl {
 struct OsProcessControl;
 
 impl ProcessControl for OsProcessControl {
-    fn try_wait(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+    fn leader_exited(&self, child: &Child) -> std::io::Result<bool> {
+        leader_exited_without_reaping(child)
+    }
+
+    fn reap_leader(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
         child.try_wait()
     }
 
@@ -413,22 +632,116 @@ impl ProcessControl for OsProcessControl {
         }
     }
 
-    fn group_exists(&self, process_group: i32) -> std::io::Result<bool> {
-        let result = unsafe { libc::kill(-process_group, 0) };
-        if result == 0 {
-            return Ok(true);
-        }
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(false),
-            Some(libc::EPERM) => Ok(true),
-            _ => Err(error),
-        }
+    fn group_has_members_except_leader(
+        &self,
+        process_group: i32,
+        leader: i32,
+    ) -> std::io::Result<bool> {
+        group_has_members_except_leader(process_group, leader)
     }
 
     fn sleep(&self, duration: Duration) {
         thread::sleep(duration);
     }
+}
+
+fn leader_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(unsafe { info.assume_init().si_pid() } != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn group_has_members_except_leader(process_group: i32, leader: i32) -> std::io::Result<bool> {
+    for entry in fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == leader {
+            continue;
+        }
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(after_name) = stat.rsplit_once(')').map(|(_, suffix)| suffix) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid proc stat",
+            ));
+        };
+        let mut fields = after_name.split_whitespace();
+        let state = fields.next();
+        let _parent = fields.next();
+        let group = fields.next().and_then(|value| value.parse::<i32>().ok());
+        if group == Some(process_group) && state != Some("Z") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn group_has_members_except_leader(process_group: i32, leader: i32) -> std::io::Result<bool> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    let required = unsafe { libc::proc_listpgrppids(process_group, ptr::null_mut(), 0) };
+    if required < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if required == 0 {
+        return Ok(false);
+    }
+    let extra_entries = 16_usize;
+    let entry_size = std::mem::size_of::<libc::pid_t>();
+    let capacity = usize::try_from(required)
+        .unwrap_or(0)
+        .div_ceil(entry_size)
+        .saturating_add(extra_entries);
+    let mut pids = vec![0 as libc::pid_t; capacity];
+    let buffer_bytes = pids
+        .len()
+        .checked_mul(entry_size)
+        .and_then(|size| libc::c_int::try_from(size).ok())
+        .ok_or_else(|| std::io::Error::other("process group listing is too large"))?;
+    let used = unsafe {
+        libc::proc_listpgrppids(
+            process_group,
+            pids.as_mut_ptr().cast::<c_void>(),
+            buffer_bytes,
+        )
+    };
+    if used < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let count = usize::try_from(used).unwrap_or(0) / entry_size;
+    Ok(pids[..count].iter().any(|pid| *pid > 0 && *pid != leader))
 }
 
 fn allocate_sidecar_listener() -> HostResult<AllocatedSidecarListener> {
@@ -530,6 +843,7 @@ fn prepare_packaged_sidecar_with_hooks(
     if file_identity(&source).map_err(|_| packaged_sidecar_identity_error())? != initial_identity {
         return Err(packaged_sidecar_identity_error());
     }
+    validate_anchored_extended_acl(&source)?;
     let initial_digest = hash_file_at(&source, initial_identity.size)
         .map_err(|_| packaged_sidecar_identity_error())?;
 
@@ -692,6 +1006,7 @@ fn open_trusted_source_parent(path: &Path) -> HostResult<(File, CString)> {
 fn open_directory_chain_no_follow(path: &Path) -> HostResult<File> {
     let mut current = open_directory(Path::new("/")).map_err(|_| packaged_path_error())?;
     validate_trusted_directory(&file_identity(&current).map_err(|_| packaged_path_error())?)?;
+    validate_anchored_extended_acl(&current)?;
     for component in path.components() {
         match component {
             Component::RootDir => continue,
@@ -707,6 +1022,7 @@ fn open_directory_chain_no_follow(path: &Path) -> HostResult<File> {
                 validate_trusted_directory(
                     &file_identity(&next).map_err(|_| packaged_path_error())?,
                 )?;
+                validate_anchored_extended_acl(&next)?;
                 current = next;
             }
             _ => return Err(packaged_path_error()),
@@ -1118,10 +1434,59 @@ fn duplicate_fd_at_least(fd: RawFd, minimum: RawFd) -> std::io::Result<RawFd> {
     }
 }
 
+fn parent_liveness_pipe() -> std::io::Result<(File, File)> {
+    let mut pipe = [-1; 2];
+    if unsafe { create_parent_liveness_pipe(pipe.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let reader = unsafe { File::from_raw_fd(pipe[0]) };
+    let writer = unsafe { File::from_raw_fd(pipe[1]) };
+    set_close_on_exec(reader.as_raw_fd())?;
+    set_close_on_exec(writer.as_raw_fd())?;
+    let reader = unsafe { File::from_raw_fd(duplicate_fd_at_least(reader.as_raw_fd(), 10)?) };
+    let writer = unsafe { File::from_raw_fd(duplicate_fd_at_least(writer.as_raw_fd(), 10)?) };
+    Ok((reader, writer))
+}
+
+fn set_close_on_exec(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn create_parent_liveness_pipe(pipe: *mut libc::c_int) -> libc::c_int {
+    unsafe { libc::pipe2(pipe, libc::O_CLOEXEC) }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn create_parent_liveness_pipe(pipe: *mut libc::c_int) -> libc::c_int {
+    unsafe { libc::pipe(pipe) }
+}
+
+fn open_file_descriptor_limit() -> RawFd {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } == -1 {
+        return 65_536;
+    }
+    let limit = unsafe { limit.assume_init() }.rlim_cur;
+    limit.min(i32::MAX as libc::rlim_t) as RawFd
+}
+
 fn command_from_launch_spec(
     launch: &SidecarLaunchSpec,
     listener: &TcpListener,
 ) -> HostResult<PreparedCommand> {
+    let (parent_liveness_reader, parent_liveness_writer) =
+        parent_liveness_pipe().map_err(|_| {
+            NativeHostError::new(
+                "sidecar_spawn_failed",
+                "OpenEvo Desktop could not create its sidecar parent-liveness channel.",
+            )
+        })?;
     let listener_fd = duplicate_fd_at_least(listener.as_raw_fd(), 10).map_err(|_| {
         NativeHostError::new(
             "sidecar_spawn_failed",
@@ -1163,12 +1528,24 @@ fn command_from_launch_spec(
         command.current_dir(workdir);
     }
     let listener_fd = listener_guard.as_raw_fd();
+    let parent_liveness_reader_fd = parent_liveness_reader.as_raw_fd();
+    let parent_liveness_writer_fd = parent_liveness_writer.as_raw_fd();
+    let descriptor_limit = open_file_descriptor_limit();
     // Command::spawn may wait for this block; keep it allocation-free and async-signal-safe.
     unsafe {
         command.pre_exec(move || {
-            if libc::setpgid(0, 0) == -1 {
+            if libc::setsid() == -1 {
                 return Err(pre_exec_error());
             }
+            let watchdog = libc::fork();
+            if watchdog == -1 {
+                return Err(pre_exec_error());
+            }
+            if watchdog == 0 {
+                run_parent_liveness_watchdog(parent_liveness_reader_fd, descriptor_limit);
+            }
+            libc::close(parent_liveness_reader_fd);
+            libc::close(parent_liveness_writer_fd);
             if libc::dup2(listener_fd, INHERITED_LISTENER_FD) == -1 {
                 return Err(pre_exec_error());
             }
@@ -1194,7 +1571,81 @@ fn command_from_launch_spec(
         command,
         _listener_guard: listener_guard,
         _executable_guard: executable_guard,
+        _parent_liveness_reader: parent_liveness_reader,
+        parent_liveness_writer: Some(parent_liveness_writer),
     })
+}
+
+unsafe fn run_parent_liveness_watchdog(reader: RawFd, descriptor_limit: RawFd) -> ! {
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = libc::SIG_IGN;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+    }
+    for fd in 0..reader {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    unsafe {
+        close_watchdog_descriptors_after(reader, descriptor_limit);
+    }
+    let mut byte = 0_u8;
+    loop {
+        let result = unsafe { libc::read(reader, (&mut byte as *mut u8).cast(), 1) };
+        if result > 0 {
+            continue;
+        }
+        if result == -1 && unsafe { current_errno() } == libc::EINTR {
+            continue;
+        }
+        break;
+    }
+    unsafe {
+        libc::kill(0, libc::SIGTERM);
+    }
+    let grace = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: SIDECAR_EXIT_EMERGENCY_TERM_GRACE.as_nanos() as libc::c_long,
+    };
+    unsafe {
+        libc::nanosleep(&grace, std::ptr::null_mut());
+        libc::kill(0, libc::SIGKILL);
+        libc::_exit(127);
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn current_errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn current_errno() -> libc::c_int {
+    unsafe { *libc::__error() }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn close_watchdog_descriptors_after(reader: RawFd, descriptor_limit: RawFd) {
+    let first = reader.saturating_add(1) as libc::c_uint;
+    if unsafe { libc::syscall(libc::SYS_close_range, first, libc::c_uint::MAX, 0) } == 0 {
+        return;
+    }
+    for fd in reader.saturating_add(1)..descriptor_limit {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn close_watchdog_descriptors_after(reader: RawFd, descriptor_limit: RawFd) {
+    for fd in reader.saturating_add(1)..descriptor_limit {
+        unsafe {
+            libc::close(fd);
+        }
+    }
 }
 
 unsafe fn clear_close_on_exec(fd: RawFd) -> std::io::Result<()> {
@@ -1287,9 +1738,8 @@ fn wait_for_sidecar_ready(
     is_cancelled: impl Fn() -> bool,
 ) -> HostResult<()> {
     wait_for_sidecar_ready_with_inspection(port, credential, timeout, is_cancelled, || {
-        child
-            .try_wait()
-            .map(|status| status.is_some())
+        OsProcessControl
+            .leader_exited(child)
             .map_err(|_| sidecar_inspection_error())
     })
 }
@@ -1311,8 +1761,8 @@ fn wait_for_state_owned_sidecar_ready<C: ProcessControl>(
             let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
             let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
             let child = managed.child_mut()?;
-            match control.try_wait(child) {
-                Ok(status) => Ok(status.is_some()),
+            match control.leader_exited(child) {
+                Ok(exited) => Ok(exited),
                 Err(_) => {
                     managed.mark_cleanup_pending();
                     Err(sidecar_inspection_error())
@@ -1367,10 +1817,12 @@ fn terminate_process_group(
     term_timeout: Duration,
     kill_timeout: Duration,
 ) -> HostResult<Option<ExitStatus>> {
+    let mut authority = GroupSignalAuthority::Anchored;
     terminate_process_group_with(
         &OsProcessControl,
         child,
         process_group,
+        &mut authority,
         term_timeout,
         kill_timeout,
     )
@@ -1380,49 +1832,41 @@ fn terminate_process_group_with<C: ProcessControl>(
     control: &C,
     child: &mut Child,
     process_group: i32,
+    signal_authority: &mut GroupSignalAuthority,
     term_timeout: Duration,
     kill_timeout: Duration,
 ) -> HostResult<Option<ExitStatus>> {
     if process_group <= 0 {
         return Err(sidecar_stop_error());
     }
+    if *signal_authority == GroupSignalAuthority::Finalizing {
+        return control
+            .reap_leader(child)
+            .ok()
+            .flatten()
+            .map(Some)
+            .ok_or_else(sidecar_stop_error);
+    }
     let mut control_failed = false;
-    let mut exit_status = match control.try_wait(child) {
-        Ok(status) => status,
-        Err(_) => {
-            control_failed = true;
-            None
-        }
-    };
-    if control.signal_group(process_group, libc::SIGTERM).is_err() {
+    if signal_verified_process_group(control, child, process_group, libc::SIGTERM).is_err() {
         control_failed = true;
     }
-    let terminated = match wait_for_process_group_exit_with(
-        control,
-        child,
-        process_group,
-        &mut exit_status,
-        term_timeout,
-    ) {
-        Ok(exited) => exited,
-        Err(_) => {
-            control_failed = true;
-            false
-        }
-    };
+    let terminated =
+        match wait_for_process_group_exit_with(control, child, process_group, term_timeout) {
+            Ok(exited) => exited,
+            Err(_) => {
+                control_failed = true;
+                false
+            }
+        };
     if terminated && !control_failed {
-        return Ok(exit_status);
+        return finalize_process_group_leader(control, child, signal_authority);
     }
-    if control.signal_group(process_group, libc::SIGKILL).is_err() {
+    if signal_verified_process_group(control, child, process_group, libc::SIGKILL).is_err() {
         control_failed = true;
     }
-    let killed = match wait_for_process_group_exit_with(
-        control,
-        child,
-        process_group,
-        &mut exit_status,
-        kill_timeout,
-    ) {
+    let killed = match wait_for_process_group_exit_with(control, child, process_group, kill_timeout)
+    {
         Ok(exited) => exited,
         Err(_) => {
             control_failed = true;
@@ -1430,24 +1874,33 @@ fn terminate_process_group_with<C: ProcessControl>(
         }
     };
     if killed && !control_failed {
-        return Ok(exit_status);
+        return finalize_process_group_leader(control, child, signal_authority);
     }
     Err(sidecar_stop_error())
+}
+
+fn signal_verified_process_group<C: ProcessControl>(
+    control: &C,
+    child: &Child,
+    process_group: i32,
+    signal: libc::c_int,
+) -> std::io::Result<()> {
+    control.leader_exited(child)?;
+    control.signal_group(process_group, signal)
 }
 
 fn wait_for_process_group_exit_with<C: ProcessControl>(
     control: &C,
     child: &mut Child,
     process_group: i32,
-    exit_status: &mut Option<ExitStatus>,
     timeout: Duration,
 ) -> std::io::Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
-        if exit_status.is_none() {
-            *exit_status = control.try_wait(child)?;
-        }
-        if exit_status.is_some() && !control.group_exists(process_group)? {
+        let leader_exited = control.leader_exited(child)?;
+        let has_other_members =
+            control.group_has_members_except_leader(process_group, child.id() as i32)?;
+        if leader_exited && !has_other_members {
             return Ok(true);
         }
         if Instant::now() >= deadline {
@@ -1457,11 +1910,32 @@ fn wait_for_process_group_exit_with<C: ProcessControl>(
     }
 }
 
+fn finalize_process_group_leader<C: ProcessControl>(
+    control: &C,
+    child: &mut Child,
+    signal_authority: &mut GroupSignalAuthority,
+) -> HostResult<Option<ExitStatus>> {
+    *signal_authority = GroupSignalAuthority::Finalizing;
+    control
+        .reap_leader(child)
+        .ok()
+        .flatten()
+        .map(Some)
+        .ok_or_else(sidecar_stop_error)
+}
+
 #[cfg(test)]
 fn process_group_exists(process_group: i32) -> HostResult<bool> {
-    OsProcessControl
-        .group_exists(process_group)
-        .map_err(|_| sidecar_inspection_error())
+    let result = unsafe { libc::kill(-process_group, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(sidecar_inspection_error()),
+    }
 }
 
 fn sidecar_stop_error() -> NativeHostError {
@@ -1504,6 +1978,7 @@ fn decode_hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
+#[cfg(test)]
 fn cleanup_managed_sidecar(managed: &mut ManagedSidecar) -> HostResult<()> {
     cleanup_managed_sidecar_with(&OsProcessControl, managed)
 }
@@ -1527,12 +2002,17 @@ fn cleanup_managed_sidecar_with_bounds<C: ProcessControl>(
     kill_timeout: Duration,
 ) -> HostResult<()> {
     let Some(child) = managed.child.as_mut() else {
+        if managed.spawn_pending {
+            managed.mark_cleanup_pending();
+            return Err(sidecar_stop_error());
+        }
         return Ok(());
     };
     match terminate_process_group_with(
         control,
         child,
         managed.process_group,
+        &mut managed.group_signal_authority,
         term_timeout,
         kill_timeout,
     ) {
@@ -1544,19 +2024,23 @@ fn cleanup_managed_sidecar_with_bounds<C: ProcessControl>(
     }
 }
 
-fn remove_cleaned_sidecar(state: &DesktopHostState, sidecar: &mut Option<ManagedSidecar>) {
+fn remove_cleaned_sidecar(
+    state: &DesktopHostState,
+    sidecar: &mut Option<ManagedSidecar>,
+) -> HostResult<()> {
+    let handoff = {
+        let active = lock_spawn_handoff_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+        active.as_ref().cloned()
+    };
+    if let Some(handoff) = handoff {
+        clear_spawn_handoff(state, &handoff)?;
+    }
+    abort_parent_liveness(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
     if let Some(managed) = sidecar.take() {
-        state
-            .emergency_process_group
-            .compare_exchange(
-                managed.process_group,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok();
         drop(managed);
     }
+    reset_launch_state_to_idle(state);
+    Ok(())
 }
 
 fn cleanup_sidecar_on_exit(state: &DesktopHostState) {
@@ -1572,16 +2056,18 @@ fn cleanup_sidecar_on_exit_with<C: ProcessControl>(
     state: &DesktopHostState,
     control: &C,
     lock_timeout: Duration,
-    emergency_term_grace: Duration,
+    _emergency_term_grace: Duration,
 ) {
     state.shutdown_requested.store(true, Ordering::Release);
     advance_cancellation(state);
-    let process_group = state.emergency_process_group.load(Ordering::Acquire);
-    if process_group > 0 {
-        let _ = control.signal_group(process_group, libc::SIGTERM);
-        control.sleep(emergency_term_grace);
-        let _ = control.signal_group(process_group, libc::SIGKILL);
-    }
+    let _ = abort_parent_liveness(state, lock_timeout);
+    let _ = cleanup_spawn_handoff_with_bounds(
+        state,
+        control,
+        lock_timeout,
+        _emergency_term_grace,
+        _emergency_term_grace,
+    );
     let Ok(mut sidecar) = lock_sidecar_bounded(state, lock_timeout) else {
         return;
     };
@@ -1589,8 +2075,200 @@ fn cleanup_sidecar_on_exit_with<C: ProcessControl>(
         return;
     };
     if cleanup_managed_sidecar_with(control, managed).is_ok() {
-        remove_cleaned_sidecar(state, &mut sidecar);
+        let _ = remove_cleaned_sidecar(state, &mut sidecar);
     }
+}
+
+fn lock_parent_liveness_bounded(
+    state: &DesktopHostState,
+    timeout: Duration,
+) -> HostResult<MutexGuard<'_, Option<File>>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match state.parent_liveness.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let guard = poisoned.into_inner();
+                state.parent_liveness.clear_poison();
+                return Ok(guard);
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(SIDECAR_STOP_POLL_INTERVAL);
+            }
+            Err(TryLockError::WouldBlock) => return Err(sidecar_state_error()),
+        }
+    }
+}
+
+fn lock_spawn_handoff_bounded(
+    state: &DesktopHostState,
+    timeout: Duration,
+) -> HostResult<MutexGuard<'_, Option<Arc<SpawnHandoff>>>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match state.spawn_handoff.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let guard = poisoned.into_inner();
+                state.spawn_handoff.clear_poison();
+                return Ok(guard);
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(SIDECAR_STOP_POLL_INTERVAL);
+            }
+            Err(TryLockError::WouldBlock) => return Err(sidecar_state_error()),
+        }
+    }
+}
+
+fn lock_spawn_outcome_bounded(
+    handoff: &SpawnHandoff,
+    timeout: Duration,
+) -> HostResult<MutexGuard<'_, SpawnHandoffOutcome>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match handoff.outcome.try_lock() {
+            Ok(outcome) => return Ok(outcome),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let outcome = poisoned.into_inner();
+                handoff.outcome.clear_poison();
+                return Ok(outcome);
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(SIDECAR_STOP_POLL_INTERVAL);
+            }
+            Err(TryLockError::WouldBlock) => return Err(sidecar_state_error()),
+        }
+    }
+}
+
+fn active_spawn_handoff(
+    state: &DesktopHostState,
+    startup_epoch: u64,
+) -> HostResult<Arc<SpawnHandoff>> {
+    let handoff = lock_spawn_handoff_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    let handoff = handoff.as_ref().ok_or_else(sidecar_state_error)?;
+    if handoff.startup_epoch != startup_epoch {
+        return Err(sidecar_state_error());
+    }
+    Ok(Arc::clone(handoff))
+}
+
+fn clear_spawn_handoff(state: &DesktopHostState, expected: &Arc<SpawnHandoff>) -> HostResult<()> {
+    let mut handoff = lock_spawn_handoff_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    if handoff
+        .as_ref()
+        .is_some_and(|active| !Arc::ptr_eq(active, expected))
+    {
+        return Err(sidecar_state_error());
+    }
+    let outcome = lock_spawn_outcome_bounded(expected, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    if !matches!(
+        *outcome,
+        SpawnHandoffOutcome::Failed | SpawnHandoffOutcome::Transferred
+    ) {
+        return Err(sidecar_state_error());
+    }
+    drop(outcome);
+    if handoff.is_some() {
+        handoff.take();
+    }
+    Ok(())
+}
+
+fn resolve_unstarted_spawn(state: &DesktopHostState, startup_epoch: u64) {
+    let handoff = lock_spawn_handoff_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)
+        .ok()
+        .and_then(|active| active.as_ref().cloned())
+        .filter(|handoff| handoff.startup_epoch == startup_epoch);
+    let Some(handoff) = handoff else {
+        return;
+    };
+    {
+        let Ok(mut outcome) = lock_spawn_outcome_bounded(&handoff, SIDECAR_STATE_LOCK_TIMEOUT)
+        else {
+            return;
+        };
+        if matches!(*outcome, SpawnHandoffOutcome::Pending) {
+            *outcome = SpawnHandoffOutcome::Failed;
+        }
+    }
+    let mut sidecar = state
+        .sidecar
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.sidecar.clear_poison();
+    if let Some(managed) = sidecar
+        .as_mut()
+        .filter(|managed| managed.startup_epoch == startup_epoch)
+    {
+        managed.spawn_pending = false;
+    }
+    drop(sidecar);
+    let _ = clear_spawn_handoff(state, &handoff);
+}
+
+fn cleanup_spawn_handoff_with_bounds<C: ProcessControl>(
+    state: &DesktopHostState,
+    control: &C,
+    state_lock_timeout: Duration,
+    term_timeout: Duration,
+    kill_timeout: Duration,
+) -> HostResult<()> {
+    let handoff = {
+        let active = lock_spawn_handoff_bounded(state, state_lock_timeout)?;
+        active.as_ref().cloned()
+    };
+    let Some(handoff) = handoff else {
+        return Ok(());
+    };
+    let mut outcome = lock_spawn_outcome_bounded(&handoff, state_lock_timeout)?;
+    match &mut *outcome {
+        SpawnHandoffOutcome::Pending if startup_cancelled(state, handoff.startup_epoch) => {
+            *outcome = SpawnHandoffOutcome::Failed;
+        }
+        SpawnHandoffOutcome::Spawned(spawned) => {
+            terminate_process_group_with(
+                control,
+                &mut spawned.child,
+                spawned.process_group,
+                &mut spawned.group_signal_authority,
+                term_timeout,
+                kill_timeout,
+            )?;
+            *outcome = SpawnHandoffOutcome::Transferred;
+        }
+        SpawnHandoffOutcome::Failed | SpawnHandoffOutcome::Transferred => {}
+        SpawnHandoffOutcome::Pending | SpawnHandoffOutcome::Spawning => {
+            return Err(sidecar_stop_error());
+        }
+    }
+    drop(outcome);
+    let mut sidecar = lock_sidecar_bounded(state, state_lock_timeout)?;
+    if let Some(managed) = sidecar
+        .as_mut()
+        .filter(|managed| managed.startup_epoch == handoff.startup_epoch)
+    {
+        managed.spawn_pending = false;
+    }
+    drop(sidecar);
+    clear_spawn_handoff(state, &handoff)?;
+    Ok(())
+}
+
+fn install_parent_liveness(state: &DesktopHostState, writer: File) -> HostResult<()> {
+    let mut parent_liveness = lock_parent_liveness_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    if parent_liveness.is_some() {
+        return Err(sidecar_state_error());
+    }
+    *parent_liveness = Some(writer);
+    Ok(())
+}
+
+fn abort_parent_liveness(state: &DesktopHostState, timeout: Duration) -> HostResult<()> {
+    let mut parent_liveness = lock_parent_liveness_bounded(state, timeout)?;
+    drop(parent_liveness.take());
+    Ok(())
 }
 
 fn lock_sidecar_bounded(
@@ -1623,8 +2301,10 @@ fn lock_sidecar_bounded(
 }
 
 fn startup_cancelled(state: &DesktopHostState, initial_epoch: u64) -> bool {
+    let (epoch, phase) = decode_launch_state(state.launch_state.load(Ordering::Acquire));
     state.shutdown_requested.load(Ordering::Acquire)
-        || state.cancellation_epoch.load(Ordering::Acquire) != initial_epoch
+        || epoch != initial_epoch
+        || phase == LaunchPhase::Cancelled
 }
 
 fn sidecar_start_cancelled_error() -> NativeHostError {
@@ -1646,12 +2326,45 @@ fn advance_cancellation(state: &DesktopHostState) {
 }
 
 fn advance_cancellation_with(state: &DesktopHostState, after_advance: impl FnOnce()) {
-    let _launch_gate = state
-        .launch_gate
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.cancellation_epoch.fetch_add(1, Ordering::AcqRel);
+    let next_epoch = loop {
+        let current = state.launch_state.load(Ordering::Acquire);
+        let (epoch, _) = decode_launch_state(current);
+        let next_epoch = epoch.wrapping_add(1) & (u64::MAX >> LAUNCH_PHASE_BITS);
+        let cancelled = encode_launch_state(next_epoch, LaunchPhase::Cancelled);
+        if state
+            .launch_state
+            .compare_exchange(current, cancelled, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break next_epoch;
+        }
+    };
+    state
+        .cancellation_epoch
+        .store(next_epoch, Ordering::Release);
     after_advance();
+}
+
+fn reset_launch_state_to_idle(state: &DesktopHostState) {
+    loop {
+        let current = state.launch_state.load(Ordering::Acquire);
+        let (epoch, phase) = decode_launch_state(current);
+        if phase == LaunchPhase::Idle {
+            return;
+        }
+        if state
+            .launch_state
+            .compare_exchange(
+                current,
+                encode_launch_state(epoch, LaunchPhase::Idle),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return;
+        }
+    }
 }
 
 fn spawn_sidecar_gated(
@@ -1659,52 +2372,92 @@ fn spawn_sidecar_gated(
     startup_epoch: u64,
     spawn: impl FnOnce() -> std::io::Result<Child>,
 ) -> HostResult<()> {
-    spawn_sidecar_gated_with_timeout(state, startup_epoch, SIDECAR_STATE_LOCK_TIMEOUT, spawn)
-}
-
-fn spawn_sidecar_gated_with_timeout(
-    state: &DesktopHostState,
-    startup_epoch: u64,
-    state_lock_timeout: Duration,
-    spawn: impl FnOnce() -> std::io::Result<Child>,
-) -> HostResult<()> {
-    let _launch_gate = state
-        .launch_gate
-        .lock()
-        .map_err(|_| sidecar_state_error())?;
     if startup_cancelled(state, startup_epoch) {
+        resolve_unstarted_spawn(state, startup_epoch);
         return Err(sidecar_start_cancelled_error());
     }
-    let mut sidecar = lock_sidecar_bounded(state, state_lock_timeout)?;
-    let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
-    if managed.lifecycle != ManagedLifecycle::Starting || managed.child.is_some() {
+    let handoff = active_spawn_handoff(state, startup_epoch)?;
+    let mut outcome = lock_spawn_outcome_bounded(&handoff, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    if !matches!(*outcome, SpawnHandoffOutcome::Pending) {
         return Err(sidecar_state_error());
     }
-    let child = spawn().map_err(|_| {
-        NativeHostError::new(
-            "sidecar_spawn_failed",
-            "OpenEvo Desktop could not start its local sidecar.",
+    if state
+        .launch_state
+        .compare_exchange(
+            encode_launch_state(startup_epoch, LaunchPhase::Reserved),
+            encode_launch_state(startup_epoch, LaunchPhase::Spawning),
+            Ordering::AcqRel,
+            Ordering::Acquire,
         )
-    })?;
-    managed.child = Some(child);
-    let child_id = managed
-        .child
-        .as_ref()
-        .map(Child::id)
-        .ok_or_else(sidecar_state_error)?;
-    let process_group = match i32::try_from(child_id) {
-        Ok(process_group) => process_group,
-        Err(_) => {
-            managed.mark_cleanup_pending();
+        .is_err()
+    {
+        *outcome = SpawnHandoffOutcome::Failed;
+        drop(outcome);
+        resolve_unstarted_spawn(state, startup_epoch);
+        return Err(if startup_cancelled(state, startup_epoch) {
+            sidecar_start_cancelled_error()
+        } else {
+            sidecar_state_error()
+        });
+    }
+    *outcome = SpawnHandoffOutcome::Spawning;
+    *outcome = match spawn() {
+        Ok(child) => {
+            let process_group = child.id() as libc::pid_t;
+            SpawnHandoffOutcome::Spawned(SpawnedHandoffProcess {
+                child,
+                process_group,
+                group_signal_authority: GroupSignalAuthority::Anchored,
+            })
+        }
+        Err(_) => SpawnHandoffOutcome::Failed,
+    };
+    drop(outcome);
+
+    let (mut sidecar, sidecar_was_poisoned) = match state.sidecar.lock() {
+        Ok(sidecar) => (sidecar, false),
+        Err(poisoned) => (poisoned.into_inner(), true),
+    };
+    state.sidecar.clear_poison();
+    let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
+    if managed.startup_epoch != startup_epoch || managed.child.is_some() {
+        return Err(sidecar_state_error());
+    }
+    let mut outcome = lock_spawn_outcome_bounded(&handoff, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    managed.spawn_pending = false;
+    match std::mem::replace(&mut *outcome, SpawnHandoffOutcome::Transferred) {
+        SpawnHandoffOutcome::Spawned(spawned) => {
+            managed.status.pid = Some(spawned.child.id());
+            managed.process_group = spawned.process_group;
+            managed.group_signal_authority = spawned.group_signal_authority;
+            managed.child = Some(spawned.child);
+        }
+        SpawnHandoffOutcome::Failed => {
+            drop(outcome);
+            clear_spawn_handoff(state, &handoff)?;
+            return Err(NativeHostError::new(
+                "sidecar_spawn_failed",
+                "OpenEvo Desktop could not start its local sidecar.",
+            ));
+        }
+        other @ (SpawnHandoffOutcome::Pending
+        | SpawnHandoffOutcome::Spawning
+        | SpawnHandoffOutcome::Transferred) => {
+            *outcome = other;
             return Err(sidecar_state_error());
         }
-    };
-    managed.status.pid = Some(child_id);
-    managed.process_group = process_group;
-    state
-        .emergency_process_group
-        .store(process_group, Ordering::Release);
-    Ok(())
+    }
+    drop(outcome);
+    clear_spawn_handoff(state, &handoff)?;
+    if sidecar_was_poisoned {
+        managed.mark_cleanup_pending();
+        Err(sidecar_state_error())
+    } else if startup_cancelled(state, startup_epoch) {
+        managed.mark_cleanup_pending();
+        Err(sidecar_start_cancelled_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn publish_sidecar_gated(
@@ -1720,10 +2473,6 @@ fn publish_sidecar_gated_with(
     state_lock_timeout: Duration,
     before_state_lock: impl FnOnce(),
 ) -> HostResult<SidecarStatus> {
-    let _launch_gate = state
-        .launch_gate
-        .lock()
-        .map_err(|_| sidecar_state_error())?;
     if startup_cancelled(state, startup_epoch) {
         return Err(sidecar_start_cancelled_error());
     }
@@ -1733,6 +2482,21 @@ fn publish_sidecar_gated_with(
     if managed.lifecycle != ManagedLifecycle::Starting || managed.child.is_none() {
         return Err(sidecar_state_error());
     }
+    state
+        .launch_state
+        .compare_exchange(
+            encode_launch_state(startup_epoch, LaunchPhase::Spawning),
+            encode_launch_state(startup_epoch, LaunchPhase::Published),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| {
+            if startup_cancelled(state, startup_epoch) {
+                sidecar_start_cancelled_error()
+            } else {
+                sidecar_state_error()
+            }
+        })?;
     managed.lifecycle = ManagedLifecycle::Running;
     managed.status.state = "running".to_string();
     let port = managed.status.port.ok_or_else(sidecar_state_error)?;
@@ -1745,6 +2509,36 @@ fn reserve_starting_sidecar(state: &DesktopHostState, managed: ManagedSidecar) -
     if sidecar.is_some() {
         return Err(sidecar_start_in_progress_error());
     }
+    state
+        .launch_state
+        .compare_exchange(
+            encode_launch_state(managed.startup_epoch, LaunchPhase::Idle),
+            encode_launch_state(managed.startup_epoch, LaunchPhase::Reserved),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| {
+            if startup_cancelled(state, managed.startup_epoch) {
+                sidecar_start_cancelled_error()
+            } else {
+                sidecar_state_error()
+            }
+        })?;
+    let mut spawn_handoff = match lock_spawn_handoff_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            reset_launch_state_to_idle(state);
+            return Err(error);
+        }
+    };
+    if spawn_handoff.is_some() {
+        reset_launch_state_to_idle(state);
+        return Err(sidecar_state_error());
+    }
+    *spawn_handoff = Some(Arc::new(SpawnHandoff {
+        startup_epoch: managed.startup_epoch,
+        outcome: Mutex::new(SpawnHandoffOutcome::Pending),
+    }));
     *sidecar = Some(managed);
     Ok(())
 }
@@ -1772,6 +2566,16 @@ fn fail_state_owned_startup_with_bounds<C: ProcessControl>(
     term_timeout: Duration,
     kill_timeout: Duration,
 ) -> NativeHostError {
+    let _ = abort_parent_liveness(state, state_lock_timeout);
+    if let Err(error) = cleanup_spawn_handoff_with_bounds(
+        state,
+        control,
+        state_lock_timeout,
+        term_timeout,
+        kill_timeout,
+    ) {
+        return error;
+    }
     let mut sidecar = match lock_sidecar_bounded(state, state_lock_timeout) {
         Ok(sidecar) => sidecar,
         Err(error) => return error,
@@ -1783,10 +2587,10 @@ fn fail_state_owned_startup_with_bounds<C: ProcessControl>(
         return sidecar_state_error();
     }
     match cleanup_managed_sidecar_with_bounds(control, managed, term_timeout, kill_timeout) {
-        Ok(()) => {
-            remove_cleaned_sidecar(state, &mut sidecar);
-            startup_error
-        }
+        Ok(()) => match remove_cleaned_sidecar(state, &mut sidecar) {
+            Ok(()) => startup_error,
+            Err(error) => error,
+        },
         Err(error) => error,
     }
 }
@@ -1816,10 +2620,6 @@ fn wait_for_startup_to_finish<C: ProcessControl>(
 ) -> HostResult<()> {
     if !state.startup_in_progress.load(Ordering::Acquire) {
         return Ok(());
-    }
-    let process_group = state.emergency_process_group.load(Ordering::Acquire);
-    if process_group > 0 {
-        let _ = control.signal_group(process_group, libc::SIGTERM);
     }
     let deadline = Instant::now() + timeout;
     while state.startup_in_progress.load(Ordering::Acquire) {
@@ -1852,19 +2652,19 @@ fn host_status_inner_with<C: ProcessControl>(
     if managed.child.is_none() {
         return Ok(managed.status.clone());
     }
-    match control.try_wait(managed.child_mut()?) {
-        Ok(Some(_)) => {
+    match control.leader_exited(managed.child_mut()?) {
+        Ok(true) => {
             managed.status.state = "exited".to_string();
             managed.status.url = None;
             if cleanup_managed_sidecar_with(control, managed).is_ok() {
                 let status = managed.status.clone();
-                remove_cleaned_sidecar(state, &mut sidecar);
+                remove_cleaned_sidecar(state, &mut sidecar)?;
                 Ok(status)
             } else {
                 Ok(managed.status.clone())
             }
         }
-        Ok(None) => Ok(managed.status.clone()),
+        Ok(false) => Ok(managed.status.clone()),
         Err(_) => {
             managed.mark_cleanup_pending();
             Err(sidecar_inspection_error())
@@ -1901,13 +2701,13 @@ fn start_sidecar_inner_with<C: ProcessControl>(
         if managed.lifecycle == ManagedLifecycle::Starting {
             return Err(sidecar_start_in_progress_error());
         }
-        match control.try_wait(managed.child_mut()?) {
-            Ok(None) => return Ok(managed.status.clone()),
-            Ok(Some(_)) => {
+        match control.leader_exited(managed.child_mut()?) {
+            Ok(false) => return Ok(managed.status.clone()),
+            Ok(true) => {
                 if cleanup_managed_sidecar_with(control, managed).is_err() {
                     return Err(sidecar_stop_error());
                 }
-                remove_cleaned_sidecar(state, &mut sidecar);
+                remove_cleaned_sidecar(state, &mut sidecar)?;
             }
             Err(_) => {
                 managed.mark_cleanup_pending();
@@ -1925,6 +2725,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     }
     let credential = NativeInstanceCredential::generate()?;
     let mut prepared = command_from_launch_spec(&launch, &allocated.listener)?;
+    let parent_liveness_writer = prepared.take_parent_liveness_writer()?;
     let status = SidecarStatus {
         state: "starting".to_string(),
         port: Some(port),
@@ -1934,13 +2735,20 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     let managed = ManagedSidecar {
         status,
         lifecycle: ManagedLifecycle::Starting,
+        startup_epoch,
+        spawn_pending: true,
         child: None,
         process_group: 0,
+        group_signal_authority: GroupSignalAuthority::Anchored,
         _private_launch_dir: launch.private_launch_dir.take(),
         verified_executable: launch.verified_executable.take(),
         _listener: allocated.listener,
     };
     reserve_starting_sidecar(state, managed)?;
+    if let Err(error) = install_parent_liveness(state, parent_liveness_writer) {
+        resolve_unstarted_spawn(state, startup_epoch);
+        return Err(fail_state_owned_startup(state, control, error));
+    }
     if let Err(error) = spawn_sidecar_gated(state, startup_epoch, || prepared.spawn()) {
         return Err(fail_state_owned_startup(state, control, error));
     }
@@ -1967,14 +2775,31 @@ fn start_sidecar_inner_with<C: ProcessControl>(
 }
 
 fn stop_sidecar_inner(state: &DesktopHostState) -> HostResult<SidecarStatus> {
+    stop_sidecar_inner_with(state, &OsProcessControl, SIDECAR_STATE_LOCK_TIMEOUT)
+}
+
+fn stop_sidecar_inner_with<C: ProcessControl>(
+    state: &DesktopHostState,
+    control: &C,
+    lock_timeout: Duration,
+) -> HostResult<SidecarStatus> {
     advance_cancellation(state);
-    wait_for_startup_to_finish(state, &OsProcessControl, SIDECAR_STATE_LOCK_TIMEOUT)?;
-    let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    abort_parent_liveness(state, lock_timeout)?;
+    wait_for_startup_to_finish(state, control, lock_timeout)?;
+    cleanup_spawn_handoff_with_bounds(
+        state,
+        control,
+        lock_timeout,
+        SIDECAR_TERM_TIMEOUT,
+        SIDECAR_KILL_TIMEOUT,
+    )?;
+    let mut sidecar = lock_sidecar_bounded(state, lock_timeout)?;
     let Some(managed) = sidecar.as_mut() else {
+        reset_launch_state_to_idle(state);
         return Ok(stopped_sidecar_status());
     };
-    cleanup_managed_sidecar(managed)?;
-    remove_cleaned_sidecar(state, &mut sidecar);
+    cleanup_managed_sidecar_with(control, managed)?;
+    remove_cleaned_sidecar(state, &mut sidecar)?;
     Ok(stopped_sidecar_status())
 }
 
@@ -2048,10 +2873,11 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::net::UnixStream;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Stdio};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2378,6 +3204,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extended_acl_policy_rejects_every_mutating_allow_ace() {
+        assert!(validate_extended_acl_entries(&[
+            ExtendedAclEntry {
+                tag: ExtendedAclTag::Allow,
+                permissions: ACL_READ_ONLY_PERMISSIONS,
+            },
+            ExtendedAclEntry {
+                tag: ExtendedAclTag::Deny,
+                permissions: ACL_MUTATING_PERMISSIONS,
+            },
+        ])
+        .is_ok());
+
+        for permission in [
+            ACL_PERMISSION_WRITE_DATA,
+            ACL_PERMISSION_DELETE,
+            ACL_PERMISSION_APPEND_DATA,
+            ACL_PERMISSION_DELETE_CHILD,
+            ACL_PERMISSION_WRITE_ATTRIBUTES,
+            ACL_PERMISSION_WRITE_EXTATTRIBUTES,
+            ACL_PERMISSION_WRITE_SECURITY,
+            ACL_PERMISSION_CHANGE_OWNER,
+        ] {
+            let error = validate_extended_acl_entries(&[ExtendedAclEntry {
+                tag: ExtendedAclTag::Allow,
+                permissions: permission,
+            }])
+            .unwrap_err();
+            assert_eq!(error.code, "bundled_sidecar_path_untrusted");
+        }
+    }
+
+    #[test]
+    fn extended_acl_policy_fails_closed_on_unknown_tags_and_permissions() {
+        let unknown_tag = validate_extended_acl_entries(&[ExtendedAclEntry {
+            tag: ExtendedAclTag::Unknown,
+            permissions: 0,
+        }])
+        .unwrap_err();
+        let unknown_permission = validate_extended_acl_entries(&[ExtendedAclEntry {
+            tag: ExtendedAclTag::Allow,
+            permissions: 1 << 63,
+        }])
+        .unwrap_err();
+
+        assert_eq!(unknown_tag.code, "bundled_sidecar_path_untrusted");
+        assert_eq!(unknown_permission.code, "bundled_sidecar_path_untrusted");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_release_selects_standard_applications_directory_policy() {
@@ -2385,6 +3261,15 @@ mod tests {
             trusted_directory_policy(),
             TrustedDirectoryPolicy::MacOsBundle
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_anchored_acl_reader_accepts_a_fresh_acl_free_file() {
+        let fixture = SidecarFixture::executable(b"acl-free-sidecar");
+        let file = File::open(fixture.path()).unwrap();
+
+        validate_anchored_extended_acl(&file).unwrap();
     }
 
     #[test]
@@ -2720,10 +3605,12 @@ mod tests {
             assert_eq!(error.code, "sidecar_stop_failed_owned");
             assert_owned_resources(&managed, &private_root, listener_port);
             assert_eq!(managed.lifecycle, ManagedLifecycle::CleanupPending);
-            assert_eq!(
-                *control.signals.lock().unwrap(),
-                [libc::SIGTERM, libc::SIGKILL]
-            );
+            let signals = control.signals.lock().unwrap().clone();
+            if control.fail_wait {
+                assert!(signals.is_empty());
+            } else {
+                assert_eq!(signals, [libc::SIGTERM, libc::SIGKILL]);
+            }
             cleanup_managed_sidecar(&mut managed).unwrap();
             drop(managed);
             assert!(!private_root.exists());
@@ -2731,12 +3618,108 @@ mod tests {
     }
 
     #[test]
+    fn handoff_cleanup_failure_retains_child_and_blocks_restart_until_stop_retry() {
+        let state = DesktopHostState::default();
+        let (startup_claim, startup_epoch) = StartupClaim::acquire(&state).unwrap();
+        let allocated = allocate_sidecar_listener().unwrap();
+        reserve_starting_sidecar(
+            &state,
+            ManagedSidecar {
+                status: SidecarStatus {
+                    state: "starting".to_string(),
+                    port: Some(allocated.port),
+                    pid: None,
+                    url: None,
+                },
+                lifecycle: ManagedLifecycle::Starting,
+                startup_epoch,
+                spawn_pending: true,
+                child: None,
+                process_group: 0,
+                group_signal_authority: GroupSignalAuthority::Anchored,
+                _private_launch_dir: None,
+                verified_executable: None,
+                _listener: allocated.listener,
+            },
+        )
+        .unwrap();
+        let handoff = active_spawn_handoff(&state, startup_epoch).unwrap();
+        let child = spawn_test_process_group("sleep 30");
+        let process_group = child.id() as i32;
+        state.launch_state.store(
+            encode_launch_state(startup_epoch, LaunchPhase::Spawning),
+            Ordering::Release,
+        );
+        *handoff.outcome.lock().unwrap() = SpawnHandoffOutcome::Spawned(SpawnedHandoffProcess {
+            child,
+            process_group,
+            group_signal_authority: GroupSignalAuthority::Anchored,
+        });
+        advance_cancellation(&state);
+        drop(startup_claim);
+
+        let error = cleanup_spawn_handoff_with_bounds(
+            &state,
+            &ScriptedProcessControl::term_failure(),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "sidecar_stop_failed_owned");
+        assert!(process_group_exists(process_group).unwrap());
+        {
+            let outcome = handoff.outcome.lock().unwrap();
+            let SpawnHandoffOutcome::Spawned(spawned) = &*outcome else {
+                panic!("cleanup failure dropped the spawned handoff");
+            };
+            assert_eq!(spawned.child.id(), process_group as u32);
+            assert_eq!(
+                spawned.group_signal_authority,
+                GroupSignalAuthority::Anchored
+            );
+        }
+        {
+            let sidecar = state.sidecar.lock().unwrap();
+            let managed = sidecar.as_ref().unwrap();
+            assert!(managed.spawn_pending);
+            assert!(managed.child.is_none());
+        }
+        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        assert_eq!(error.code, "sidecar_start_in_progress");
+
+        assert_eq!(stop_sidecar_inner(&state).unwrap().state, "stopped");
+        assert!(state.sidecar.lock().unwrap().is_none());
+        assert!(state.spawn_handoff.lock().unwrap().is_none());
+        assert!(!process_group_exists(process_group).unwrap());
+    }
+
+    #[test]
+    fn cleanup_retry_never_signals_after_a_possibly_consumed_leader() {
+        let (mut managed, private_root, listener_port) = managed_test_sidecar();
+        let control = ScriptedProcessControl::reap_then_fail();
+
+        cleanup_managed_sidecar_with_bounds(&control, &mut managed, Duration::ZERO, Duration::ZERO)
+            .unwrap_err();
+        let signals_after_first_attempt = control.signals.lock().unwrap().len();
+        cleanup_managed_sidecar_with_bounds(&control, &mut managed, Duration::ZERO, Duration::ZERO)
+            .unwrap_err();
+
+        assert_eq!(
+            control.signals.lock().unwrap().len(),
+            signals_after_first_attempt
+        );
+        assert!(!control.signalled_after_reap.load(Ordering::Acquire));
+        assert_owned_resources(&managed, &private_root, listener_port);
+        drop(managed);
+        assert!(!private_root.exists());
+    }
+
+    #[test]
     fn cleanup_pending_blocks_restart_and_explicit_stop_retries_cleanup() {
         let state = DesktopHostState::default();
         let (managed, private_root, listener_port) = managed_test_sidecar();
-        state
-            .emergency_process_group
-            .store(managed.process_group, Ordering::Release);
         *state.sidecar.lock().unwrap() = Some(managed);
         let control = ScriptedProcessControl::term_failure();
         {
@@ -2753,7 +3736,7 @@ mod tests {
 
         assert_eq!(stop_sidecar_inner(&state).unwrap().state, "stopped");
         assert!(state.sidecar.lock().unwrap().is_none());
-        assert_eq!(state.emergency_process_group.load(Ordering::Acquire), 0);
+        assert!(state.parent_liveness.lock().unwrap().is_none());
         assert!(!private_root.exists());
     }
 
@@ -2853,8 +3836,11 @@ mod tests {
                     url: None,
                 },
                 lifecycle: ManagedLifecycle::Starting,
+                startup_epoch,
+                spawn_pending: true,
                 child: None,
                 process_group: 0,
+                group_signal_authority: GroupSignalAuthority::Anchored,
                 _private_launch_dir: None,
                 verified_executable: None,
                 _listener: allocated.listener,
@@ -2881,6 +3867,61 @@ mod tests {
         }
         drop(startup_claim);
         stop_sidecar_inner(&state).unwrap();
+    }
+
+    #[test]
+    fn poisoned_manager_during_handoff_retains_child_for_stop_retry() {
+        let state = Arc::new(DesktopHostState::default());
+        let (startup_claim, startup_epoch) = StartupClaim::acquire(&state).unwrap();
+        let allocated = allocate_sidecar_listener().unwrap();
+        reserve_starting_sidecar(
+            &state,
+            ManagedSidecar {
+                status: SidecarStatus {
+                    state: "starting".to_string(),
+                    port: Some(allocated.port),
+                    pid: None,
+                    url: None,
+                },
+                lifecycle: ManagedLifecycle::Starting,
+                startup_epoch,
+                spawn_pending: true,
+                child: None,
+                process_group: 0,
+                group_signal_authority: GroupSignalAuthority::Anchored,
+                _private_launch_dir: None,
+                verified_executable: None,
+                _listener: allocated.listener,
+            },
+        )
+        .unwrap();
+        let poison_state = Arc::clone(&state);
+        assert!(thread::spawn(move || {
+            let _guard = poison_state.sidecar.lock().unwrap();
+            panic!("inject manager poison before spawn handoff");
+        })
+        .join()
+        .is_err());
+
+        let error = spawn_sidecar_gated(&state, startup_epoch, || {
+            Ok(spawn_test_process_group("sleep 30"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, "sidecar_state_unavailable");
+        {
+            let sidecar = state.sidecar.lock().unwrap();
+            let managed = sidecar.as_ref().unwrap();
+            assert_eq!(managed.lifecycle, ManagedLifecycle::CleanupPending);
+            assert!(!managed.spawn_pending);
+            assert!(managed.child.is_some());
+        }
+        assert!(state.spawn_handoff.lock().unwrap().is_none());
+        drop(startup_claim);
+        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        assert_eq!(error.code, "sidecar_stop_failed_owned");
+        assert_eq!(stop_sidecar_inner(&state).unwrap().state, "stopped");
+        assert!(state.sidecar.lock().unwrap().is_none());
     }
 
     #[test]
@@ -2931,6 +3972,10 @@ mod tests {
         managed.status.state = "starting".to_string();
         managed.status.url = None;
         *state.sidecar.lock().unwrap() = Some(managed);
+        state.launch_state.store(
+            encode_launch_state(startup_epoch, LaunchPhase::Spawning),
+            Ordering::Release,
+        );
         let guard = state.sidecar.lock().unwrap();
         let before_state_lock = Arc::new(Barrier::new(2));
         let publish_state = Arc::clone(&state);
@@ -3017,15 +4062,232 @@ mod tests {
     }
 
     #[test]
-    fn exit_kills_via_atomic_process_group_when_the_state_lock_is_busy() {
+    fn cancellation_advance_is_bounded_while_spawn_result_is_blocked() {
+        let state = Arc::new(DesktopHostState::default());
+        let (startup_claim, startup_epoch) = StartupClaim::acquire(&state).unwrap();
+        let allocated = allocate_sidecar_listener().unwrap();
+        reserve_starting_sidecar(
+            &state,
+            ManagedSidecar {
+                status: SidecarStatus {
+                    state: "starting".to_string(),
+                    port: Some(allocated.port),
+                    pid: None,
+                    url: None,
+                },
+                lifecycle: ManagedLifecycle::Starting,
+                startup_epoch,
+                spawn_pending: true,
+                child: None,
+                process_group: 0,
+                group_signal_authority: GroupSignalAuthority::Anchored,
+                _private_launch_dir: None,
+                verified_executable: None,
+                _listener: allocated.listener,
+            },
+        )
+        .unwrap();
+        let spawn_entered = Arc::new(Barrier::new(2));
+        let release_spawn = Arc::new(Barrier::new(2));
+        let spawn_state = Arc::clone(&state);
+        let entered = Arc::clone(&spawn_entered);
+        let release = Arc::clone(&release_spawn);
+        let spawning = thread::spawn(move || {
+            spawn_sidecar_gated(&spawn_state, startup_epoch, || {
+                entered.wait();
+                release.wait();
+                Ok(spawn_test_process_group("sleep 30"))
+            })
+        });
+        spawn_entered.wait();
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let cancellation_state = Arc::clone(&state);
+        let cancellation = thread::spawn(move || {
+            advance_cancellation(&cancellation_state);
+            cancelled_tx.send(()).unwrap();
+        });
+
+        let cancellation_was_bounded = cancelled_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+        release_spawn.wait();
+        cancellation.join().unwrap();
+        let _ = spawning.join().unwrap();
+
+        assert!(
+            cancellation_was_bounded,
+            "cancellation waited for the blocking spawn operation"
+        );
+        drop(startup_claim);
+        stop_sidecar_inner(&state).unwrap();
+    }
+
+    #[test]
+    fn blocked_exec_handoff_is_owned_and_stop_remains_bounded() {
+        let state = Arc::new(DesktopHostState::default());
+        let (reserved_tx, reserved_rx) = mpsc::channel();
+        let (begin_spawn_tx, begin_spawn_rx) = mpsc::channel();
+        let (mut entered_reader, entered_writer) = UnixStream::pair().unwrap();
+        let (_blocker_peer, blocker_child) = UnixStream::pair().unwrap();
+        entered_reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let startup_state = Arc::clone(&state);
+        let startup = thread::spawn(move || {
+            let (_startup_claim, startup_epoch) = StartupClaim::acquire(&startup_state).unwrap();
+            let allocated = allocate_sidecar_listener().unwrap();
+            let launch = SidecarLaunchSpec {
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".to_string(), "sleep 30".to_string()],
+                current_dir: None,
+                remove_env: &[],
+                private_launch_dir: None,
+                verified_executable: None,
+            };
+            let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
+            let parent_liveness = prepared.take_parent_liveness_writer().unwrap();
+            unsafe {
+                prepared.command.pre_exec(move || {
+                    let pid = libc::getpid().to_ne_bytes();
+                    if libc::write(entered_writer.as_raw_fd(), pid.as_ptr().cast(), pid.len())
+                        != pid.len() as isize
+                    {
+                        return Err(pre_exec_error());
+                    }
+                    let mut byte = 0_u8;
+                    loop {
+                        let result =
+                            libc::read(blocker_child.as_raw_fd(), (&mut byte as *mut u8).cast(), 1);
+                        if result == -1 && current_errno() == libc::EINTR {
+                            continue;
+                        }
+                        return Err(pre_exec_error());
+                    }
+                });
+            }
+            reserve_starting_sidecar(
+                &startup_state,
+                ManagedSidecar {
+                    status: SidecarStatus {
+                        state: "starting".to_string(),
+                        port: Some(allocated.port),
+                        pid: None,
+                        url: None,
+                    },
+                    lifecycle: ManagedLifecycle::Starting,
+                    startup_epoch,
+                    spawn_pending: true,
+                    child: None,
+                    process_group: 0,
+                    group_signal_authority: GroupSignalAuthority::Anchored,
+                    _private_launch_dir: None,
+                    verified_executable: None,
+                    _listener: allocated.listener,
+                },
+            )
+            .unwrap();
+            install_parent_liveness(&startup_state, parent_liveness).unwrap();
+            reserved_tx.send(()).unwrap();
+            begin_spawn_rx.recv().unwrap();
+
+            match spawn_sidecar_gated(&startup_state, startup_epoch, || prepared.spawn()) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(fail_state_owned_startup(
+                    &startup_state,
+                    &OsProcessControl,
+                    error,
+                )),
+            }
+        });
+        reserved_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let sidecar_guard = state.sidecar.lock().unwrap();
+        begin_spawn_tx.send(()).unwrap();
+        let mut pid_bytes = [0_u8; std::mem::size_of::<libc::pid_t>()];
+        entered_reader.read_exact(&mut pid_bytes).unwrap();
+        let child_pid = libc::pid_t::from_ne_bytes(pid_bytes);
+
+        let started = Instant::now();
+        let error = stop_sidecar_inner_with(&state, &OsProcessControl, Duration::from_millis(30))
+            .unwrap_err();
+        assert_eq!(error.code, "sidecar_state_timeout");
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let handoff = state
+                .spawn_handoff
+                .lock()
+                .unwrap()
+                .as_ref()
+                .cloned()
+                .unwrap();
+            let outcome = handoff.outcome.lock().unwrap();
+            if let SpawnHandoffOutcome::Spawned(spawned) = &*outcome {
+                if OsProcessControl.leader_exited(&spawned.child).unwrap() {
+                    break;
+                }
+            }
+            drop(outcome);
+            assert!(
+                Instant::now() < deadline,
+                "watchdog did not terminate the blocked pre-exec child"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let managed = sidecar_guard.as_ref().unwrap();
+        assert!(managed.spawn_pending);
+        assert!(managed.child.is_none());
+        drop(sidecar_guard);
+
+        let startup_error = startup.join().unwrap().unwrap_err();
+        assert_eq!(startup_error.code, "sidecar_start_cancelled");
+        assert_eq!(stop_sidecar_inner(&state).unwrap().state, "stopped");
+        assert!(state.sidecar.lock().unwrap().is_none());
+        assert!(state.spawn_handoff.lock().unwrap().is_none());
+        assert!(state.parent_liveness.lock().unwrap().is_none());
+        assert!(wait_for_pid_exit(child_pid, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn exit_is_bounded_and_parent_liveness_kills_while_state_lock_is_busy() {
         let state = DesktopHostState::default();
-        let (managed, private_root, _) = managed_test_sidecar();
-        let process_group = managed.process_group;
-        state
-            .emergency_process_group
-            .store(process_group, Ordering::Release);
+        let allocated = allocate_sidecar_listener().unwrap();
+        let launch = SidecarLaunchSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            current_dir: None,
+            remove_env: &[],
+            private_launch_dir: None,
+            verified_executable: None,
+        };
+        let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
+        let parent_liveness = prepared.take_parent_liveness_writer().unwrap();
+        let child = prepared.spawn().unwrap();
+        let process_group = child.id() as i32;
+        install_parent_liveness(&state, parent_liveness).unwrap();
+        let managed = ManagedSidecar {
+            status: SidecarStatus {
+                state: "running".to_string(),
+                port: Some(allocated.port),
+                pid: Some(child.id()),
+                url: None,
+            },
+            lifecycle: ManagedLifecycle::Running,
+            startup_epoch: 0,
+            spawn_pending: false,
+            child: Some(child),
+            process_group,
+            group_signal_authority: GroupSignalAuthority::Anchored,
+            _private_launch_dir: None,
+            verified_executable: None,
+            _listener: allocated.listener,
+        };
         *state.sidecar.lock().unwrap() = Some(managed);
-        let mut guard = state.sidecar.lock().unwrap();
+        state.launch_state.store(
+            encode_launch_state(0, LaunchPhase::Published),
+            Ordering::Release,
+        );
+        let guard = state.sidecar.lock().unwrap();
         let started = Instant::now();
 
         cleanup_sidecar_on_exit_with(
@@ -3041,15 +4303,9 @@ mod tests {
         assert!(guard.is_some());
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if guard
-                .as_mut()
+            if OsProcessControl
+                .leader_exited(guard.as_ref().unwrap().child.as_ref().unwrap())
                 .unwrap()
-                .child
-                .as_mut()
-                .unwrap()
-                .try_wait()
-                .unwrap()
-                .is_some()
             {
                 break;
             }
@@ -3059,11 +4315,10 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(!process_group_exists(process_group).unwrap());
         drop(guard);
         stop_sidecar_inner(&state).unwrap();
         assert!(state.sidecar.lock().unwrap().is_none());
-        assert!(!private_root.exists());
+        assert!(!process_group_exists(process_group).unwrap());
     }
 
     #[test]
@@ -3391,54 +4646,93 @@ mod tests {
 
     struct ScriptedProcessControl {
         fail_wait: bool,
+        fail_reap: bool,
         fail_term: bool,
         fail_kill: bool,
         group_states: Mutex<VecDeque<bool>>,
         signals: Mutex<Vec<i32>>,
+        leader_reaped: AtomicBool,
+        signalled_after_reap: AtomicBool,
     }
 
     impl ScriptedProcessControl {
         fn term_failure() -> Self {
             Self {
                 fail_wait: false,
+                fail_reap: false,
                 fail_term: true,
                 fail_kill: false,
                 group_states: Mutex::new(VecDeque::from([false, false])),
                 signals: Mutex::new(Vec::new()),
+                leader_reaped: AtomicBool::new(false),
+                signalled_after_reap: AtomicBool::new(false),
             }
         }
 
         fn kill_failure() -> Self {
             Self {
                 fail_wait: false,
+                fail_reap: false,
                 fail_term: false,
                 fail_kill: true,
                 group_states: Mutex::new(VecDeque::from([true, false])),
                 signals: Mutex::new(Vec::new()),
+                leader_reaped: AtomicBool::new(false),
+                signalled_after_reap: AtomicBool::new(false),
             }
         }
 
         fn wait_failure() -> Self {
             Self {
                 fail_wait: true,
+                fail_reap: false,
                 fail_term: false,
                 fail_kill: false,
                 group_states: Mutex::new(VecDeque::new()),
                 signals: Mutex::new(Vec::new()),
+                leader_reaped: AtomicBool::new(false),
+                signalled_after_reap: AtomicBool::new(false),
+            }
+        }
+
+        fn reap_then_fail() -> Self {
+            Self {
+                fail_wait: false,
+                fail_reap: true,
+                fail_term: false,
+                fail_kill: false,
+                group_states: Mutex::new(VecDeque::from([false])),
+                signals: Mutex::new(Vec::new()),
+                leader_reaped: AtomicBool::new(false),
+                signalled_after_reap: AtomicBool::new(false),
             }
         }
     }
 
     impl ProcessControl for ScriptedProcessControl {
-        fn try_wait(&self, _child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+        fn leader_exited(&self, _child: &Child) -> std::io::Result<bool> {
             if self.fail_wait {
                 Err(std::io::Error::other("injected wait failure"))
+            } else {
+                Ok(true)
+            }
+        }
+
+        fn reap_leader(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+            self.leader_reaped.store(true, Ordering::Release);
+            if self.fail_reap {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(std::io::Error::other("injected reap failure"))
             } else {
                 Ok(Some(ExitStatus::from_raw(0)))
             }
         }
 
         fn signal_group(&self, _process_group: i32, signal: libc::c_int) -> std::io::Result<()> {
+            if self.leader_reaped.load(Ordering::Acquire) {
+                self.signalled_after_reap.store(true, Ordering::Release);
+            }
             self.signals.lock().unwrap().push(signal);
             if (signal == libc::SIGTERM && self.fail_term)
                 || (signal == libc::SIGKILL && self.fail_kill)
@@ -3449,7 +4743,11 @@ mod tests {
             }
         }
 
-        fn group_exists(&self, _process_group: i32) -> std::io::Result<bool> {
+        fn group_has_members_except_leader(
+            &self,
+            _process_group: i32,
+            _leader: i32,
+        ) -> std::io::Result<bool> {
             Ok(self
                 .group_states
                 .lock()
@@ -3479,8 +4777,11 @@ mod tests {
                     url: Some(format!("http://127.0.0.1:{listener_port}/openevo")),
                 },
                 lifecycle: ManagedLifecycle::Running,
+                startup_epoch: 0,
+                spawn_pending: false,
                 child: Some(child),
                 process_group,
+                group_signal_authority: GroupSignalAuthority::Anchored,
                 _private_launch_dir: Some(private_launch_dir),
                 verified_executable: Some(verified_executable),
                 _listener: allocated.listener,
