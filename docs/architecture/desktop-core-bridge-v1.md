@@ -124,8 +124,10 @@ and cache delivery barrier.
 
 The published session and `CoreActivationV1` retain a non-secret Local binding:
 the Local project ID, profile ID, saved Local ETag, and SHA-256 of the canonical
-mapped `ProjectCreateV1` intent. Bridge capabilities, project validation, and
-run creation accept the complete saved Local `ProjectV1`, not a project ID.
+mapped `ProjectCreateV1` intent. The activation also carries its bridge
+generation and a process-local authority whose object identity can be produced
+only by that activation path. Bridge capabilities, project validation, and run
+creation accept the complete saved Local `ProjectV1`, not a project ID.
 They recompute and compare that binding after acquiring the active generation's
 external lease. Every following Core transport re-enters the same token gate,
 so cancellation between the comparison and transport fails with
@@ -137,10 +139,16 @@ errors raised before Core transport.
 The Local provider publishes activation state in a separate durable
 transaction, so the resulting `ProjectV1` has a new Local ETag and a
 `RemoteProjectStateV1`. It must then call `commit_local_activation()` with that
-exact object. The bridge verifies the Local ID, profile, mapped intent, active
-state, Core project ID, active revision, registry digest, model preparation,
-and Core ETag before advancing the session's Local ETag under the generation
-lease. This is a post-commit acknowledgement, not a general ETag bypass.
+exact object and the `CoreActivationV1` that authorized the durable transaction.
+The bridge verifies the activation generation and unforgeable authority before
+the Local ID, profile, mapped intent, active state, Core project ID, active
+revision, registry digest, model preparation, and Core ETag. Under the shared
+transition lock it performs one CAS from the activation's original Local ETag
+to the complete committed project. A retry is accepted only when the complete
+`ProjectV1` equals the first committed result. A late activation, altered
+source ETag or authority, second committed result, changed intent, or different
+Core projection fails closed. This is a post-commit acknowledgement, not a
+general ETag bypass.
 
 The inexpensive project/profile/Local-ETag comparison precedes canonical
 mapping. If an otherwise valid Local model cannot satisfy the narrower Core
@@ -177,7 +185,10 @@ boundary, the bridge consumes its actual result: success closes the handle once,
 while only an actual callback exception clears the future for a new callback
 attempt. Deadline expiry while computing the wait immediately after submission
 also retains that future; retry waits for the same callback instead of invoking
-it twice.
+it twice. Activation acknowledgement enters the same transition serialization:
+an acknowledgement already inside the lock commits before retirement, while a
+deactivate, close, or replacement activation that wins the lock invalidates the
+old generation before its acknowledgement can inspect or mutate active state.
 
 An active project config edit uses `deactivate_project()` rather than closing
 the bridge permanently. The transition rejects a different Local project and
