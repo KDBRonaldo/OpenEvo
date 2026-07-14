@@ -3,13 +3,14 @@ from __future__ import annotations
 import ipaddress
 import logging
 import re
+import secrets
 import shlex
 import socket
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
@@ -23,6 +24,10 @@ PortAllocator = Callable[[], int]
 TunnelStarter = Callable[[list[str]], "TunnelProcess"]
 
 logger = logging.getLogger(__name__)
+
+_TUNNEL_CLOSE_GRACE_SECONDS = 1.0
+_TUNNEL_KILL_GRACE_SECONDS = 1.0
+_TUNNEL_MONITOR_INTERVAL_SECONDS = 0.05
 
 
 class SshTransportErrorCode(str, Enum):
@@ -64,30 +69,120 @@ _REMOTE_PATH_RE = re.compile(r"^/[A-Za-z0-9._/@%+=,-]*$")
 _REMOTE_USER_RE = re.compile(r"^[A-Za-z0-9._%+-]+$")
 
 
-@dataclass(frozen=True)
-class SshTunnel:
-    local_port: int
-    remote_port: int
-    local_host: str
-    remote_host: str
-    process: TunnelProcess
-    _trust_lease: AbstractContextManager[Path] = field(repr=False, compare=False)
+class SshTunnel(AbstractContextManager["SshTunnel"]):
+    """A bounded, idempotently closable SSH forwarding process."""
+
+    def __init__(
+        self,
+        *,
+        local_port: int,
+        remote_port: int,
+        local_host: str,
+        remote_host: str,
+        process: TunnelProcess,
+        trust_lease: AbstractContextManager[Path],
+        trusted_host: TrustedKnownHostsBinding,
+    ) -> None:
+        self.local_port = local_port
+        self.remote_port = remote_port
+        self.local_host = local_host
+        self.remote_host = remote_host
+        self.process = process
+        self._trust_lease: AbstractContextManager[Path] | None = trust_lease
+        self._state_guard = threading.Lock()
+        self._close_guard = threading.Lock()
+        self._closed = threading.Event()
+        self._close_requested = False
+        self._unregister = trusted_host._register_tunnel(self.request_close)
+        self._monitor = threading.Thread(
+            target=self._monitor_exit,
+            name="openevo-ssh-tunnel-monitor",
+            daemon=True,
+        )
+        self._monitor.start()
 
     @property
     def base_url(self) -> str:
         return f"http://{self.local_host}:{self.local_port}"
 
-    def close(self) -> None:
-        try:
-            if self.process.poll() is None:
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
+
+    def __enter__(self) -> SshTunnel:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def request_close(self) -> None:
+        """Request termination without waiting; used before trust mutation."""
+
+        with self._state_guard:
+            if self._closed.is_set() or self._close_requested:
+                return
+            self._close_requested = True
+        if self.process.poll() is None:
+            try:
                 self.process.terminate()
-                try:
-                    self.process.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5.0)
-        finally:
-            self._trust_lease.__exit__(None, None, None)
+            except OSError:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+
+    def close(self) -> None:
+        with self._close_guard:
+            self._close_once()
+
+    def _close_once(self) -> None:
+        self.request_close()
+        if self._closed.is_set():
+            return
+        try:
+            self.process.wait(timeout=_TUNNEL_CLOSE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        except OSError:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            return
+        else:
+            self._finalize()
+            return
+        if self.process.poll() is None:
+            try:
+                self.process.kill()
+            except OSError:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+        try:
+            self.process.wait(timeout=_TUNNEL_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            return
+        except OSError:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            return
+        self._finalize()
+
+    def _monitor_exit(self) -> None:
+        while not self._closed.wait(_TUNNEL_MONITOR_INTERVAL_SECONDS):
+            try:
+                if self.process.poll() is not None:
+                    self._finalize()
+                    return
+            except OSError:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+                return
+
+    def _finalize(self) -> None:
+        with self._state_guard:
+            if self._closed.is_set():
+                return
+            unregister = self._unregister
+            self._unregister = None
+            trust_lease = self._trust_lease
+            self._trust_lease = None
+            self._closed.set()
+        if unregister is not None:
+            unregister()
+        if trust_lease is not None:
+            trust_lease.__exit__(None, None, None)
 
 
 class SshRemoteExecutorTransport:
@@ -124,26 +219,49 @@ class SshRemoteExecutorTransport:
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
         remote_command = _remote_command(command, cwd=cwd, env=env)
+        completion_marker = f"__OPENEVO_REMOTE_COMPLETION_{secrets.token_hex(16)}__="
+        marked_command = _with_completion_marker(remote_command, completion_marker)
         with self._trusted_host.open_for_spawn(self._profile) as known_hosts_file:
             try:
                 completed = self._runner(
-                    self._ssh_argv(remote_command, known_hosts_file), timeout_seconds
+                    self._ssh_argv(marked_command, known_hosts_file), timeout_seconds
                 )
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"SSH command timed out after {timeout_seconds}s") from exc
             except OSError as exc:
-                logger.warning("SSH process start failed: %r", exc)
+                _log_transport_failure(SshTransportErrorCode.START_FAILED)
                 raise SshTransportError(SshTransportErrorCode.START_FAILED) from exc
-            if completed.returncode == 255:
-                _raise_ssh_failure(completed.stderr or "")
-            stderr = _redact_trust_paths(
+            stderr, remote_return_code = _extract_remote_completion(
                 completed.stderr or "",
+                completion_marker,
+            )
+            if completed.returncode == 255 and remote_return_code is None:
+                _log_transport_failure(
+                    SshTransportErrorCode.CONNECTION_FAILED,
+                    return_code=completed.returncode,
+                )
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+            if (
+                remote_return_code is not None
+                and int(completed.returncode) != remote_return_code
+            ):
+                _log_transport_failure(
+                    SshTransportErrorCode.CONNECTION_FAILED,
+                    return_code=completed.returncode,
+                )
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+            stderr = _redact_trust_paths(
+                stderr,
                 known_hosts_file,
                 self._trusted_host.known_hosts_file,
             )
             return RemoteCommandResult(
                 command=command,
-                return_code=int(completed.returncode),
+                return_code=(
+                    remote_return_code
+                    if remote_return_code is not None
+                    else int(completed.returncode)
+                ),
                 stdout=completed.stdout or "",
                 stderr=stderr,
             )
@@ -166,14 +284,12 @@ class SshRemoteExecutorTransport:
                     self._rsync_argv(local, remote_path, known_hosts_file), 300.0
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
-                logger.warning("rsync SSH process failed to run: %r", exc)
+                _log_transport_failure(SshTransportErrorCode.RSYNC_FAILED)
                 raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED) from exc
             if completed.returncode != 0:
-                logger.warning(
-                    "rsync SSH failure (return code %s): stderr=%r stdout=%r",
-                    completed.returncode,
-                    completed.stderr or "",
-                    completed.stdout or "",
+                _log_transport_failure(
+                    SshTransportErrorCode.RSYNC_FAILED,
+                    return_code=completed.returncode,
                 )
                 raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
 
@@ -209,7 +325,7 @@ class SshRemoteExecutorTransport:
             )
         except OSError as exc:
             trust_lease.__exit__(type(exc), exc, exc.__traceback__)
-            logger.warning("SSH tunnel process start failed: %r", exc)
+            _log_transport_failure(SshTransportErrorCode.START_FAILED)
             raise SshTransportError(SshTransportErrorCode.START_FAILED) from exc
         except Exception:
             trust_lease.__exit__(None, None, None)
@@ -220,7 +336,8 @@ class SshRemoteExecutorTransport:
             local_host=local_host,
             remote_host=remote_host,
             process=process,
-            _trust_lease=trust_lease,
+            trust_lease=trust_lease,
+            trusted_host=self._trusted_host,
         )
         if wait_for_ready:
             try:
@@ -328,20 +445,37 @@ def _start_tunnel_subprocess(argv: list[str]) -> subprocess.Popen[str]:
     )
 
 
-def _raise_ssh_failure(stderr: str) -> None:
-    logger.warning("SSH transport failure: stderr=%r", stderr)
-    normalized = stderr.lower()
-    if any(
-        marker in normalized
-        for marker in (
-            "host key verification failed",
-            "remote host identification has changed",
-            "offending key in",
-            "known_hosts",
-        )
-    ):
-        raise SshTransportError(SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED)
-    raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+def _log_transport_failure(
+    code: SshTransportErrorCode,
+    *,
+    return_code: int | None = None,
+) -> None:
+    logger.warning(
+        "ssh_transport_failure code=%s return_code=%s diagnostic_id=%s",
+        code.value,
+        return_code,
+        secrets.token_hex(12),
+    )
+
+
+def _with_completion_marker(command: str, marker: str) -> str:
+    return (
+        f"(\n{command}\n)\n"
+        "__openevo_remote_status=$?\n"
+        f"printf '\\n%s%s\\n' {shlex.quote(marker)} "
+        '"$__openevo_remote_status" >&2\n'
+        'exit "$__openevo_remote_status"'
+    )
+
+
+def _extract_remote_completion(stderr: str, marker: str) -> tuple[str, int | None]:
+    match = re.search(rf"\n{re.escape(marker)}([0-9]{{1,3}})\n?\Z", stderr)
+    if match is None:
+        return stderr, None
+    return_code = int(match.group(1))
+    if return_code > 255:
+        return stderr, None
+    return stderr[: match.start()], return_code
 
 
 def _redact_trust_paths(stderr: str, *paths: Path) -> str:

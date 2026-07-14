@@ -9,11 +9,14 @@ import struct
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from openevo.deployment.host_keys import (
+    HostKeyStoreError,
+    HostKeyStoreErrorCode,
     ProviderKnownHostStore,
     TrustedKnownHostsBinding,
 )
@@ -465,23 +468,20 @@ def test_revoke_and_rotate_are_fingerprint_compare_and_swap(tmp_path: Path) -> N
     )
     pending = store.probe(profile)
     replacement = pending.candidates[0]
-    confirmed_pending = store.confirm_pending(
+    with pytest.raises(ValueError, match="expected fingerprint"):
+        store.rotate_from_pending(
+            pending,
+            profile=profile,
+            algorithm=replacement.algorithm,
+            fingerprint=replacement.fingerprint,
+            expected_old_fingerprint="SHA256:not-current",
+        )
+    rotated = store.rotate_from_pending(
         pending,
         profile=profile,
         algorithm=replacement.algorithm,
         fingerprint=replacement.fingerprint,
-    )
-
-    with pytest.raises(ValueError, match="expected fingerprint"):
-        store.rotate(
-            profile,
-            expected_old_fingerprint="SHA256:not-current",
-            confirmed_pending=confirmed_pending,
-        )
-    rotated = store.rotate(
-        profile,
         expected_old_fingerprint=old.fingerprint,
-        confirmed_pending=confirmed_pending,
     )
     assert rotated.fingerprint == replacement.fingerprint
 
@@ -491,11 +491,76 @@ def test_revoke_and_rotate_are_fingerprint_compare_and_swap(tmp_path: Path) -> N
     assert store.load(profile, expected_fingerprint=rotated.fingerprint) is None
 
 
+def test_rotate_rejects_cross_store_or_modified_pending_without_changing_trust(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    old = _confirmed_binding(tmp_path, profile)
+    replacement_output = _valid_output(profile, marker=b"replacement")
+    issuing_store = ProviderKnownHostStore(
+        old.known_hosts_file.parent,
+        runner=KeyscanRunner(replacement_output),
+    )
+    other_store = ProviderKnownHostStore(
+        old.known_hosts_file.parent,
+        runner=KeyscanRunner(replacement_output),
+    )
+    pending = issuing_store.probe(profile)
+    replacement = pending.candidates[0]
+    original = old.known_hosts_file.read_bytes()
+
+    with pytest.raises(ValueError, match="not issued by this store"):
+        other_store.rotate_from_pending(
+            pending,
+            profile=profile,
+            algorithm=replacement.algorithm,
+            fingerprint=replacement.fingerprint,
+            expected_old_fingerprint=old.fingerprint,
+        )
+    modified = replace(pending, candidates=(pending.candidates[1],))
+    with pytest.raises(ValueError, match="digest"):
+        issuing_store.rotate_from_pending(
+            modified,
+            profile=profile,
+            algorithm=pending.candidates[1].algorithm,
+            fingerprint=pending.candidates[1].fingerprint,
+            expected_old_fingerprint=old.fingerprint,
+        )
+
+    assert old.known_hosts_file.read_bytes() == original
+
+
+def test_rotate_reprobe_failure_preserves_old_trust(tmp_path: Path) -> None:
+    profile = _profile()
+    old = _confirmed_binding(tmp_path, profile)
+    original = old.known_hosts_file.read_bytes()
+    store = ProviderKnownHostStore(
+        old.known_hosts_file.parent,
+        runner=KeyscanRunner(
+            _valid_output(profile, marker=b"replacement"),
+            _valid_output(profile, marker=b"changed-again"),
+        ),
+    )
+    pending = store.probe(profile)
+    candidate = pending.candidates[0]
+
+    with pytest.raises(ValueError, match="changed before confirmation"):
+        store.rotate_from_pending(
+            pending,
+            profile=profile,
+            algorithm=candidate.algorithm,
+            fingerprint=candidate.fingerprint,
+            expected_old_fingerprint=old.fingerprint,
+        )
+
+    assert old.known_hosts_file.read_bytes() == original
+
+
 def test_concurrent_rotate_allows_only_one_first_writer(tmp_path: Path) -> None:
     profile = _profile()
     old = _confirmed_binding(tmp_path, profile)
     stores: list[ProviderKnownHostStore] = []
-    confirmed = []
+    pending_probes = []
     for marker in (b"first-writer-a", b"first-writer-b"):
         store = ProviderKnownHostStore(
             old.known_hosts_file.parent,
@@ -504,20 +569,16 @@ def test_concurrent_rotate_allows_only_one_first_writer(tmp_path: Path) -> None:
         pending = store.probe(profile)
         candidate = pending.candidates[0]
         stores.append(store)
-        confirmed.append(
-            store.confirm_pending(
-                pending,
-                profile=profile,
-                algorithm=candidate.algorithm,
-                fingerprint=candidate.fingerprint,
-            )
-        )
+        pending_probes.append((pending, candidate))
 
     def rotate(index: int) -> str:
-        return stores[index].rotate(
-            profile,
+        pending, candidate = pending_probes[index]
+        return stores[index].rotate_from_pending(
+            pending,
+            profile=profile,
+            algorithm=candidate.algorithm,
+            fingerprint=candidate.fingerprint,
             expected_old_fingerprint=old.fingerprint,
-            confirmed_pending=confirmed[index],
         ).fingerprint
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -560,6 +621,46 @@ def test_spawn_lease_holds_shared_lock_until_process_lifecycle_ends(
     finally:
         executor.shutdown(wait=True)
     assert not binding.known_hosts_file.exists()
+
+
+def test_exclusive_lock_timeout_is_typed_and_shared_across_store_instances(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    contender = ProviderKnownHostStore(
+        binding.known_hosts_file.parent,
+        runner=KeyscanRunner(""),
+        lock_timeout_seconds=0.05,
+    )
+
+    with binding.open_for_spawn(profile):
+        with pytest.raises(HostKeyStoreError) as exc_info:
+            contender.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+    assert exc_info.value.code is HostKeyStoreErrorCode.HOST_KEY_IN_USE
+    lock_path = binding.known_hosts_file.parent / ".openevo-host-key.lock"
+    assert lock_path.is_file()
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+def test_existing_instances_reject_replaced_lock_namespace(tmp_path: Path) -> None:
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    stores = [
+        ProviderKnownHostStore(binding.known_hosts_file.parent, runner=KeyscanRunner(""))
+        for _ in range(2)
+    ]
+    for store in stores:
+        assert store.load(profile, expected_fingerprint=binding.fingerprint) is not None
+
+    lock_path = binding.known_hosts_file.parent / ".openevo-host-key.lock"
+    lock_path.unlink()
+    lock_path.touch(mode=0o600)
+
+    for store in stores:
+        with pytest.raises(ValueError, match="lock"):
+            store.load(profile, expected_fingerprint=binding.fingerprint)
 
 
 def test_confirmation_fsyncs_file_and_store_directory(

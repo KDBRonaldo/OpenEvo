@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import shlex
 import shutil
 import subprocess
 import struct
+import time
 from pathlib import Path
 
 import pytest
@@ -73,9 +75,12 @@ class FakeTunnelProcess:
         self.terminated = False
         self.killed = False
         self.waited = False
+        self.return_code: int | None = None
 
     def poll(self) -> int | None:
-        return None
+        if self.return_code is not None:
+            return self.return_code
+        return 0 if self.terminated or self.killed else None
 
     def terminate(self) -> None:
         self.terminated = True
@@ -85,7 +90,12 @@ class FakeTunnelProcess:
 
     def wait(self, timeout: float | None = None) -> int:
         self.waited = True
+        if self.poll() is None:
+            raise subprocess.TimeoutExpired("ssh", timeout)
         return 0
+
+    def exit(self, return_code: int = 0) -> None:
+        self.return_code = return_code
 
 
 def _profile(**extra) -> RemoteProfileConfig:
@@ -202,6 +212,14 @@ def _expected_ssh_base(
     return argv
 
 
+def _assert_marked_command(wrapped: str, expected: str) -> str:
+    assert wrapped.startswith(f"(\n{expected}\n)\n__openevo_remote_status=$?\n")
+    match = re.search(r"(__OPENEVO_REMOTE_COMPLETION_[0-9a-f]{32}__=)", wrapped)
+    assert match is not None
+    assert wrapped.endswith('exit "$__openevo_remote_status"')
+    return match.group(1)
+
+
 def test_transport_fails_closed_without_trusted_host_binding() -> None:
     with pytest.raises(ValueError, match="trusted host-key binding"):
         SshRemoteExecutorTransport(_profile())
@@ -231,12 +249,12 @@ def test_run_forces_provider_known_hosts_options(tmp_path: Path) -> None:
     expected[expected.index(f"UserKnownHostsFile={binding.known_hosts_file}")] = (
         f"UserKnownHostsFile={known_hosts}"
     )
-    assert argv == [
+    assert argv[:-1] == [
         *expected,
         "--",
         "gpu.example.edu",
-        "true",
     ]
+    _assert_marked_command(argv[-1], "true")
 
 
 def test_run_revalidates_binding_before_spawning(tmp_path: Path) -> None:
@@ -271,7 +289,7 @@ def test_ipv6_rsync_and_tunnel_keep_exact_trust_binding(tmp_path: Path) -> None:
     )
 
     transport.upload_dir(str(local), "/remote/workspace")
-    transport.open_tunnel(
+    tunnel = transport.open_tunnel(
         remote_port=8765,
         local_port=49155,
         wait_for_ready=False,
@@ -286,6 +304,7 @@ def test_ipv6_rsync_and_tunnel_keep_exact_trust_binding(tmp_path: Path) -> None:
     assert "StrictHostKeyChecking=yes" in starter.calls[0]
     assert any(value.startswith("UserKnownHostsFile=") for value in starter.calls[0])
     assert f"UserKnownHostsFile={binding.known_hosts_file}" not in starter.calls[0]
+    tunnel.close()
 
 
 def test_ssh_transport_satisfies_executor_protocol(tmp_path: Path) -> None:
@@ -304,13 +323,13 @@ def test_run_invokes_ssh_with_batch_mode_and_maps_result(tmp_path: Path) -> None
         stdout="out",
         stderr="err",
     )
-    assert runner.calls[0][0][-5:] == [
+    assert runner.calls[0][0][-5:-1] == [
         "-l",
         "alice",
         "--",
         "gpu.example.edu",
-        "true",
     ]
+    _assert_marked_command(runner.calls[0][0][-1], "true")
     assert runner.calls[0][1] == 12.5
 
 
@@ -323,6 +342,32 @@ def test_run_maps_remote_nonzero_exit_without_throwing(tmp_path: Path) -> None:
     assert result.return_code == 7
     assert result.stdout == "out"
     assert result.stderr == "err"
+
+
+def test_run_preserves_verified_remote_exit_255(tmp_path: Path) -> None:
+    class Remote255Runner(RecordingRunner):
+        def __call__(
+            self, argv: list[str], timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append((argv, timeout_seconds))
+            marker = _assert_marked_command(argv[-1], "exit 255")
+            return subprocess.CompletedProcess(
+                argv,
+                255,
+                stdout="remote stdout",
+                stderr=f"remote stderr\n{marker}255\n",
+            )
+
+    transport = _transport(tmp_path, runner=Remote255Runner())
+
+    result = transport.run("exit 255")
+
+    assert result == RemoteCommandResult(
+        command="exit 255",
+        return_code=255,
+        stdout="remote stdout",
+        stderr="remote stderr",
+    )
 
 
 def test_private_key_auth_adds_identity_file_as_argv(tmp_path: Path) -> None:
@@ -359,7 +404,8 @@ def test_private_key_auth_adds_identity_file_as_argv(tmp_path: Path) -> None:
     assert "IdentitiesOnly=yes" in argv
     assert "IdentityAgent=none" in argv
     assert "BatchMode=yes" in argv
-    assert argv[-5:] == ["-l", "alice", "--", "gpu.example.edu", "true"]
+    assert argv[-5:-1] == ["-l", "alice", "--", "gpu.example.edu"]
+    _assert_marked_command(argv[-1], "true")
 
 
 @pytest.mark.skipif(shutil.which("ssh") is None, reason="OpenSSH is unavailable")
@@ -479,7 +525,7 @@ def test_spawn_lease_survives_trust_root_rename_and_replacement(tmp_path: Path) 
         binding.validate_for(profile)
 
 
-def test_ssh_host_key_error_does_not_leak_known_hosts_path(
+def test_unverified_ssh_255_is_connection_failure_and_logs_no_process_output(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -505,9 +551,13 @@ def test_ssh_host_key_error_does_not_leak_known_hosts_path(
     with pytest.raises(SshTransportError) as exc_info:
         transport.run("true")
 
-    assert exc_info.value.code is SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+    assert exc_info.value.code is SshTransportErrorCode.CONNECTION_FAILED
     assert canary not in str(exc_info.value)
-    assert canary in caplog.text
+    assert canary not in caplog.text
+    assert "REMOTE HOST" not in caplog.text
+    assert "code=connection_failed" in caplog.text
+    assert "return_code=255" in caplog.text
+    assert re.search(r"diagnostic_id=[0-9a-f]{24}", caplog.text)
 
 
 def test_rsync_error_does_not_leak_known_hosts_path(
@@ -539,7 +589,9 @@ def test_rsync_error_does_not_leak_known_hosts_path(
 
     assert exc_info.value.code is SshTransportErrorCode.RSYNC_FAILED
     assert canary not in str(exc_info.value)
-    assert canary in caplog.text
+    assert canary not in caplog.text
+    assert "failed to open" not in caplog.text
+    assert "code=rsync_failed" in caplog.text
 
 
 def test_run_quotes_remote_env_values_and_cwd(tmp_path: Path) -> None:
@@ -556,11 +608,12 @@ def test_run_quotes_remote_env_values_and_cwd(tmp_path: Path) -> None:
     )
 
     remote_command = runner.calls[0][0][-1]
-    assert remote_command == (
+    _assert_marked_command(
+        remote_command,
         "cd /home/alice/project-dir && "
         "export HTTPS_PROXY=http://127.0.0.1:7890 "
         "PIP_INDEX_URL='https://mirror.example/simple path' "
-        "&& python script.py"
+        "&& python script.py",
     )
 
 
@@ -578,10 +631,15 @@ def test_run_exports_env_before_multiline_remote_script(tmp_path: Path) -> None:
     )
 
     remote_command = runner.calls[0][0][-1]
-    assert remote_command.startswith(
-        "export HTTPS_PROXY=http://proxy-user:proxy-secret@127.0.0.1:7890 && python3 - <<'PY'"
+    expected = (
+        "export HTTPS_PROXY=http://proxy-user:proxy-secret@127.0.0.1:7890 && "
+        "python3 - <<'PY'\n"
+        "import os\n"
+        "print(os.environ['HTTPS_PROXY'])\n"
+        "PY\n"
+        'nohup env PATH="$HOME/.local/bin:$PATH" python3 server.py &'
     )
-    assert "\nnohup env PATH=" in remote_command
+    _assert_marked_command(remote_command, expected)
     assert "env HTTPS_PROXY=" not in remote_command
 
 
@@ -674,7 +732,10 @@ def test_upload_dir_creates_remote_parent_and_runs_rsync(tmp_path: Path) -> None
 
     transport.upload_dir(str(local), "/home/alice/.openevo/workspaces/task")
 
-    assert runner.calls[0][0][-1] == "mkdir -p /home/alice/.openevo/workspaces/task"
+    _assert_marked_command(
+        runner.calls[0][0][-1],
+        "mkdir -p /home/alice/.openevo/workspaces/task",
+    )
     actual_shell = shlex.split(runner.calls[1][0][4])
     lease_option = next(
         value for value in actual_shell if value.startswith("UserKnownHostsFile=")
@@ -742,6 +803,71 @@ def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process(
     assert starter.processes[0].waited is True
     assert starter.processes[0].killed is False
     assert not lease_path.exists()
+
+    tunnel.close()
+    assert tunnel.closed is True
+
+
+def test_tunnel_context_manager_and_exit_monitor_release_trust_lease(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    binding = _trusted_binding(tmp_path, profile)
+    starter = RecordingTunnelStarter()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=binding,
+        runner=RecordingRunner(),
+        tunnel_starter=starter,
+        port_allocator=lambda: 49155,
+    )
+
+    with transport.open_tunnel(remote_port=8765, wait_for_ready=False) as tunnel:
+        lease_option = next(
+            value
+            for value in starter.calls[0]
+            if value.startswith("UserKnownHostsFile=")
+        )
+        lease_path = Path(lease_option.removeprefix("UserKnownHostsFile="))
+        assert lease_path.exists()
+
+    assert tunnel.closed is True
+    assert not lease_path.exists()
+
+    monitored = transport.open_tunnel(remote_port=8765, wait_for_ready=False)
+    monitored_process = starter.processes[1]
+    monitored_process.exit()
+    deadline = time.monotonic() + 1.0
+    while not monitored.closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitored.closed is True
+
+
+def test_trust_mutation_requests_matching_tunnel_close_before_replace(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    binding = _trusted_binding(tmp_path, profile)
+    starter = RecordingTunnelStarter()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=binding,
+        runner=RecordingRunner(),
+        tunnel_starter=starter,
+        port_allocator=lambda: 49155,
+    )
+    tunnel = transport.open_tunnel(remote_port=8765, wait_for_ready=False)
+    store = ProviderKnownHostStore(
+        binding.known_hosts_file.parent,
+        runner=lambda argv, timeout: subprocess.CompletedProcess(argv, 1),
+        lock_timeout_seconds=0.5,
+    )
+
+    store.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+    assert starter.processes[0].terminated is True
+    assert tunnel.closed is True
+    assert not binding.known_hosts_file.exists()
 
 
 def test_upload_dir_rejects_missing_local_path(tmp_path: Path) -> None:

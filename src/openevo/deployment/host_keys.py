@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import fcntl
 import hashlib
+import hmac
 import ipaddress
 import json
 import math
@@ -14,9 +16,11 @@ import stat
 import struct
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
@@ -53,6 +57,29 @@ _METADATA_FIELDS = {
 _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9._%-]+$")
 _MAX_KEYSCAN_OUTPUT_BYTES = 64 * 1024
 _MAX_TRUST_FILE_BYTES = 32 * 1024
+_MAX_LOCK_TIMEOUT_SECONDS = 5.0
+_LOCK_RETRY_SECONDS = 0.01
+_LOCK_NAME = ".openevo-host-key.lock"
+
+_TUNNEL_REGISTRY_GUARD = threading.Lock()
+_TUNNEL_CLOSERS: dict[tuple[int, int, str, str], set[Callable[[], None]]] = {}
+
+
+class HostKeyStoreErrorCode(str, Enum):
+    HOST_KEY_IN_USE = "host_key_in_use"
+
+
+class HostKeyStoreError(RuntimeError):
+    """A typed failure safe to surface without trust-store path details."""
+
+    def __init__(self, code: HostKeyStoreErrorCode) -> None:
+        self.code = code
+        messages = {
+            HostKeyStoreErrorCode.HOST_KEY_IN_USE: (
+                "SSH host-key trust is in use. Close the active tunnel and retry."
+            ),
+        }
+        super().__init__(messages[code])
 
 
 @dataclass(frozen=True)
@@ -66,22 +93,14 @@ class HostKeyCandidate:
 
 @dataclass(frozen=True)
 class PendingHostKeyProbe:
-    """An immutable host-key observation awaiting an exact user confirmation."""
+    """A store-issued host-key observation awaiting exact user confirmation."""
 
     profile_id: str
     host: str
     port: int
     candidates: tuple[HostKeyCandidate, ...]
-
-
-@dataclass(frozen=True)
-class ConfirmedPendingHostKey:
-    """A user-selected pending key whose complete observation was re-probed."""
-
-    profile_id: str
-    host: str
-    port: int
-    candidate: HostKeyCandidate
+    _store_token: object = field(repr=False, compare=False)
+    _digest: str = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -126,6 +145,13 @@ class TrustedKnownHostsBinding:
 
         return _KnownHostsSpawnLease(self, profile)
 
+    def _register_tunnel(self, closer: Callable[[], None]) -> Callable[[], None]:
+        return _register_tunnel_closer(
+            self._anchor.registry_key,
+            self.profile_id,
+            closer,
+        )
+
 
 class ProviderKnownHostStore:
     """Probe, confirm, and persist Desktop-owned SSH host-key trust.
@@ -141,6 +167,7 @@ class ProviderKnownHostStore:
         *,
         secure_ancestor: Path | str | None = None,
         runner: KeyscanRunner | None = None,
+        lock_timeout_seconds: float = 1.0,
     ) -> None:
         self._root = Path(root).expanduser()
         if not self._root.is_absolute():
@@ -158,8 +185,14 @@ class ProviderKnownHostStore:
             raise ValueError(
                 "provider known-host store root must be a direct child of its secure ancestor"
             )
-        self._anchor = _StoreAnchor(self._root, ancestor)
+        self._anchor = _StoreAnchor(
+            self._root,
+            ancestor,
+            exclusive_timeout_seconds=_validate_lock_timeout(lock_timeout_seconds),
+        )
         self._runner = runner or _run_keyscan
+        self._pending_token = object()
+        self._pending_digest_key = secrets.token_bytes(32)
 
     def probe(
         self,
@@ -193,12 +226,7 @@ class ProviderKnownHostStore:
         if len(output.encode("utf-8")) > _MAX_KEYSCAN_OUTPUT_BYTES:
             raise ValueError("ssh-keyscan output exceeds the allowed size")
         candidates = _parse_keyscan_output(output, profile.host, profile.port)
-        return PendingHostKeyProbe(
-            profile_id=profile.id,
-            host=profile.host,
-            port=profile.port,
-            candidates=candidates,
-        )
+        return self._issue_pending(profile, candidates)
 
     def confirm(
         self,
@@ -211,16 +239,16 @@ class ProviderKnownHostStore:
     ) -> TrustedKnownHostsBinding:
         """Persist one exact pending key after an unchanged second probe."""
 
-        confirmed = self.confirm_pending(
+        selected = self._confirm_pending(
             pending,
             profile=profile,
             algorithm=algorithm,
             fingerprint=fingerprint,
             timeout_seconds=timeout_seconds,
         )
-        return self._persist(profile, confirmed.candidate)
+        return self._persist(profile, selected)
 
-    def confirm_pending(
+    def _confirm_pending(
         self,
         pending: PendingHostKeyProbe,
         *,
@@ -228,16 +256,10 @@ class ProviderKnownHostStore:
         algorithm: HostKeyAlgorithm,
         fingerprint: str,
         timeout_seconds: float = 10.0,
-    ) -> ConfirmedPendingHostKey:
-        """Re-probe and seal one exact user-confirmed pending candidate."""
+    ) -> HostKeyCandidate:
+        """Validate a store-issued observation and repeat it before mutation."""
 
-        _validate_profile_identity(profile)
-        if (profile.id, profile.host, profile.port) != (
-            pending.profile_id,
-            pending.host,
-            pending.port,
-        ):
-            raise ValueError("remote profile does not match pending probe")
+        self._validate_pending(pending, profile)
         selected = next(
             (
                 candidate
@@ -249,14 +271,59 @@ class ProviderKnownHostStore:
         if selected is None:
             raise ValueError("host-key confirmation does not match a pending candidate")
         current = self.probe(profile, timeout_seconds=timeout_seconds)
-        if current != pending:
+        if (
+            current.profile_id,
+            current.host,
+            current.port,
+            current.candidates,
+        ) != (
+            pending.profile_id,
+            pending.host,
+            pending.port,
+            pending.candidates,
+        ):
             raise ValueError("SSH host keys changed before confirmation")
-        return ConfirmedPendingHostKey(
+        self._validate_pending(current, profile)
+        return selected
+
+    def _issue_pending(
+        self,
+        profile: RemoteProfileConfig,
+        candidates: tuple[HostKeyCandidate, ...],
+    ) -> PendingHostKeyProbe:
+        payload = _canonical_pending_payload(profile.id, profile.host, profile.port, candidates)
+        return PendingHostKeyProbe(
             profile_id=profile.id,
             host=profile.host,
             port=profile.port,
-            candidate=selected,
+            candidates=candidates,
+            _store_token=self._pending_token,
+            _digest=hmac.new(self._pending_digest_key, payload, hashlib.sha256).hexdigest(),
         )
+
+    def _validate_pending(
+        self,
+        pending: PendingHostKeyProbe,
+        profile: RemoteProfileConfig,
+    ) -> None:
+        _validate_profile_identity(profile)
+        if pending._store_token is not self._pending_token:
+            raise ValueError("pending host-key probe was not issued by this store")
+        if (profile.id, profile.host, profile.port) != (
+            pending.profile_id,
+            pending.host,
+            pending.port,
+        ):
+            raise ValueError("remote profile does not match pending probe")
+        payload = _canonical_pending_payload(
+            pending.profile_id,
+            pending.host,
+            pending.port,
+            pending.candidates,
+        )
+        expected = hmac.new(self._pending_digest_key, payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(pending._digest, expected):
+            raise ValueError("pending host-key probe digest does not match its observation")
 
     def load(
         self,
@@ -288,6 +355,7 @@ class ProviderKnownHostStore:
         """Atomically remove exact trust after callers close tunnels/transports."""
 
         _validate_profile_identity(profile)
+        _request_tunnel_closure(self._anchor.registry_key, profile.id)
         path = self._root / _binding_filename(profile.id)
         with self._anchor.locked_root(create=False, exclusive=True) as root_fd:
             if root_fd is None:
@@ -301,24 +369,28 @@ class ProviderKnownHostStore:
             os.unlink(path.name, dir_fd=root_fd)
             os.fsync(root_fd)
 
-    def rotate(
+    def rotate_from_pending(
         self,
-        profile: RemoteProfileConfig,
+        pending: PendingHostKeyProbe,
         *,
+        profile: RemoteProfileConfig,
+        algorithm: HostKeyAlgorithm,
+        fingerprint: str,
         expected_old_fingerprint: str,
-        confirmed_pending: ConfirmedPendingHostKey,
+        timeout_seconds: float = 10.0,
     ) -> TrustedKnownHostsBinding:
-        """Atomically replace exact old trust with an independently confirmed key."""
+        """Re-probe and atomically CAS exact old trust to one pending candidate."""
 
-        _validate_profile_identity(profile)
-        if (profile.id, profile.host, profile.port) != (
-            confirmed_pending.profile_id,
-            confirmed_pending.host,
-            confirmed_pending.port,
-        ):
-            raise ValueError("remote profile does not match confirmed pending host key")
+        selected = self._confirm_pending(
+            pending,
+            profile=profile,
+            algorithm=algorithm,
+            fingerprint=fingerprint,
+            timeout_seconds=timeout_seconds,
+        )
+        _request_tunnel_closure(self._anchor.registry_key, profile.id)
         path = self._root / _binding_filename(profile.id)
-        expected = _render_binding_content(profile, confirmed_pending.candidate)
+        expected = _render_binding_content(profile, selected)
         with self._anchor.locked_root(create=False, exclusive=True) as root_fd:
             if root_fd is None:
                 raise ValueError("trusted host key is missing")
@@ -400,36 +472,52 @@ class ProviderKnownHostStore:
 class _StoreAnchor:
     """Held secure ancestor/root descriptors plus the cross-process lock namespace."""
 
-    def __init__(self, root: Path, secure_ancestor: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        secure_ancestor: Path,
+        *,
+        exclusive_timeout_seconds: float,
+    ) -> None:
         self.root = root
         self.secure_ancestor = secure_ancestor
         self._ancestor_fd = _open_secure_ancestor(secure_ancestor)
         self._root_fd: int | None = None
         self._lock_anchor_fd: int | None = None
         self._guard = threading.Lock()
-        token = hashlib.sha256(root.name.encode("utf-8")).hexdigest()[:24]
-        self._lock_name = f".openevo-known-hosts-{token}.lock"
+        self._exclusive_timeout_seconds = exclusive_timeout_seconds
+        ancestor_stat = os.fstat(self._ancestor_fd)
+        self.registry_key = (ancestor_stat.st_dev, ancestor_stat.st_ino, root.name)
 
     @contextmanager
     def locked_root(self, *, create: bool, exclusive: bool):
-        lock_fd = self._open_lock()
+        root_fd = self._get_root_fd(create=create)
+        if root_fd is None:
+            yield None
+            return
+        lock_fd = self._open_lock(root_fd)
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            _acquire_store_lock(
+                lock_fd,
+                exclusive=exclusive,
+                timeout_seconds=self._exclusive_timeout_seconds,
+            )
             self._validate_ancestor_binding()
-            root_fd = self._get_root_fd(create=create)
+            self._validate_root_binding()
+            self._validate_lock_binding(root_fd, lock_fd)
             yield root_fd
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
-    def _open_lock(self) -> int:
+    def _open_lock(self, root_fd: int) -> int:
         with self._guard:
             try:
                 fd = os.open(
-                    self._lock_name,
+                    _LOCK_NAME,
                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
                     0o600,
-                    dir_fd=self._ancestor_fd,
+                    dir_fd=root_fd,
                 )
             except OSError as exc:
                 raise ValueError(
@@ -447,10 +535,21 @@ class _StoreAnchor:
                     anchored.st_ino,
                 ):
                     raise ValueError("provider known-host store lock binding changed")
-            except Exception:
+            except Exception as exc:
                 os.close(fd)
-                raise
+                raise ValueError("provider known-host store lock binding changed") from exc
             return fd
+
+    def _validate_lock_binding(self, root_fd: int, lock_fd: int) -> None:
+        try:
+            current = os.stat(_LOCK_NAME, dir_fd=root_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError("provider known-host store lock binding changed") from exc
+        opened = os.fstat(lock_fd)
+        _validate_file_stat(current, require_single_link=True)
+        _validate_file_stat(opened, require_single_link=True)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("provider known-host store lock binding changed")
 
     def _get_root_fd(self, *, create: bool) -> int | None:
         with self._guard:
@@ -620,6 +719,39 @@ class _KnownHostsSpawnLease(AbstractContextManager[Path]):
                 self._locked = None
 
 
+def _register_tunnel_closer(
+    store_key: tuple[int, int, str],
+    profile_id: str,
+    closer: Callable[[], None],
+) -> Callable[[], None]:
+    key = (*store_key, profile_id)
+    with _TUNNEL_REGISTRY_GUARD:
+        _TUNNEL_CLOSERS.setdefault(key, set()).add(closer)
+
+    def unregister() -> None:
+        with _TUNNEL_REGISTRY_GUARD:
+            closers = _TUNNEL_CLOSERS.get(key)
+            if closers is None:
+                return
+            closers.discard(closer)
+            if not closers:
+                _TUNNEL_CLOSERS.pop(key, None)
+
+    return unregister
+
+
+def _request_tunnel_closure(store_key: tuple[int, int, str], profile_id: str) -> None:
+    key = (*store_key, profile_id)
+    with _TUNNEL_REGISTRY_GUARD:
+        closers = tuple(_TUNNEL_CLOSERS.get(key, ()))
+    for closer in closers:
+        try:
+            closer()
+        except Exception:
+            # The bounded exclusive lock remains the authoritative fail-closed gate.
+            continue
+
+
 def _run_keyscan(argv: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         argv,
@@ -665,6 +797,54 @@ def _parse_keyscan_output(
     if not observed:
         raise ValueError("ssh-keyscan returned no supported host keys")
     return tuple(observed[algorithm] for algorithm in _ALGORITHM_ORDER if algorithm in observed)
+
+
+def _canonical_pending_payload(
+    profile_id: str,
+    host: str,
+    port: int,
+    candidates: tuple[HostKeyCandidate, ...],
+) -> bytes:
+    if not candidates or len(candidates) > len(_ALGORITHM_ORDER):
+        raise ValueError("pending host-key probe has an invalid candidate count")
+    canonical_candidates: list[dict[str, str]] = []
+    algorithms: list[HostKeyAlgorithm] = []
+    for candidate in candidates:
+        fields = candidate.public_key.split(" ")
+        if len(fields) != 2 or any(not field for field in fields):
+            raise ValueError("pending host-key candidate public key is malformed")
+        public_key, fingerprint = _validate_public_key(*fields)
+        algorithm = _KEY_TYPE_TO_ALGORITHM.get(fields[0])
+        if (
+            algorithm is None
+            or candidate.algorithm != algorithm
+            or candidate.public_key != public_key
+            or candidate.fingerprint != fingerprint
+            or algorithm in algorithms
+        ):
+            raise ValueError("pending host-key candidate is not canonical")
+        algorithms.append(algorithm)
+        canonical_candidates.append(
+            {
+                "algorithm": algorithm,
+                "fingerprint": fingerprint,
+                "public_key": public_key,
+            }
+        )
+    expected_order = [algorithm for algorithm in _ALGORITHM_ORDER if algorithm in algorithms]
+    if algorithms != expected_order:
+        raise ValueError("pending host-key candidates are not canonically ordered")
+    return json.dumps(
+        {
+            "candidates": canonical_candidates,
+            "host": host,
+            "port": port,
+            "profile_id": profile_id,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _validate_public_key(key_type: str, encoded_key: str) -> tuple[str, str]:
@@ -1001,6 +1181,28 @@ def _validate_file_stat(result: os.stat_result, *, require_single_link: bool) ->
         raise ValueError("trusted known-host file must have exactly one link")
 
 
+def _acquire_store_lock(
+    lock_fd: int,
+    *,
+    exclusive: bool,
+    timeout_seconds: float,
+) -> None:
+    if not exclusive:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        return
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+        if time.monotonic() >= deadline:
+            raise HostKeyStoreError(HostKeyStoreErrorCode.HOST_KEY_IN_USE)
+        time.sleep(min(_LOCK_RETRY_SECONDS, max(0.0, deadline - time.monotonic())))
+
+
 def _validate_profile_identity(profile: RemoteProfileConfig) -> None:
     _validate_host(profile.host)
     if isinstance(profile.port, bool) or not 1 <= int(profile.port) <= 65535:
@@ -1062,6 +1264,17 @@ def _keyscan_timeout(timeout_seconds: float) -> int:
     return max(1, math.ceil(timeout_seconds))
 
 
+def _validate_lock_timeout(timeout_seconds: float) -> float:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+        or timeout_seconds > _MAX_LOCK_TIMEOUT_SECONDS
+    ):
+        raise ValueError("host-key lock timeout must be between 0 and 5 seconds")
+    return timeout_seconds
+
+
 def _write_all(fd: int, content: bytes) -> None:
     offset = 0
     while offset < len(content):
@@ -1081,9 +1294,10 @@ def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 __all__ = [
-    "ConfirmedPendingHostKey",
     "HostKeyAlgorithm",
     "HostKeyCandidate",
+    "HostKeyStoreError",
+    "HostKeyStoreErrorCode",
     "PendingHostKeyProbe",
     "ProviderKnownHostStore",
     "TrustedKnownHostsBinding",
