@@ -58,6 +58,7 @@ _TUNNEL_KILL_GRACE_SECONDS = 1.0
 _TUNNEL_MONITOR_INTERVAL_SECONDS = 0.05
 _MAX_SUBPROCESS_CAPTURE_BYTES = 4 * 1024 * 1024
 _SUBPROCESS_CAPTURE_CHUNK_BYTES = 64 * 1024
+_SUBPROCESS_BIRTH_RECOVERY_SECONDS = 1.0
 _SUBPROCESS_TERMINATE_GRACE_SECONDS = 1.0
 _SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS = 0.1
 _SUBPROCESS_STATUS_INTERVAL_SECONDS = 0.05
@@ -192,11 +193,17 @@ class _OwnedSubprocessProcess(Protocol):
     def wait(self, timeout: float | None = None) -> int: ...
 
 
+@dataclass(slots=True)
+class _TunnelChild:
+    process: TunnelProcess | _OwnedSubprocessProcess | None
+    authority: _OwnedSubprocessAuthority | None = None
+
+
 class _CoreTunnelEndpoint:
     def __init__(
         self,
         *,
-        connection_starter: CoreConnectionStarter,
+        connection_starter: CoreConnectionStarter | None,
         connection_argv: list[str],
         trust_lease: AbstractContextManager[Path],
         trusted_host: TrustedKnownHostsBinding,
@@ -206,8 +213,8 @@ class _CoreTunnelEndpoint:
         self._trust_lease: AbstractContextManager[Path] | None = trust_lease
         self._guard = threading.RLock()
         self._close_guard = threading.Lock()
-        self._children: dict[int, TunnelProcess] = {}
-        self._pending_child: TunnelProcess | None = None
+        self._children: dict[int, _TunnelChild] = {}
+        self._pending_child: _TunnelChild | None = None
         self._next_generation = 0
         self._close_requested = False
         self._finalized = threading.Event()
@@ -243,7 +250,7 @@ class _CoreTunnelEndpoint:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         local_stream: socket.socket | None = None
         child_stream: socket.socket | None = None
-        process: TunnelProcess | None = None
+        child: _TunnelChild | None = None
         failure: BaseException | None = None
         with self._guard:
             if self._close_requested or self._finalized.is_set():
@@ -257,14 +264,26 @@ class _CoreTunnelEndpoint:
                 local_identity = _require_parent_owned_stream(local_stream)
                 child_identity = _require_parent_owned_stream(child_stream)
                 local_stream.settimeout(timeout_seconds)
-                process = self._connection_starter(
-                    list(self._connection_argv),
-                    child_stream.fileno(),
-                )
-                self._pending_child = process
+                if self._connection_starter is None:
+                    authority = _OwnedSubprocessAuthority(trust_ownership=None)
+                    child = _TunnelChild(process=None, authority=authority)
+                    self._pending_child = child
+                    authority.acquire()
+                    authority.spawn_tunnel(
+                        list(self._connection_argv),
+                        stream_fd=child_stream.fileno(),
+                    )
+                    child.process = authority.process
+                else:
+                    process = self._connection_starter(
+                        list(self._connection_argv),
+                        child_stream.fileno(),
+                    )
+                    child = _TunnelChild(process=process)
+                    self._pending_child = child
                 generation = self._next_generation
                 self._next_generation += 1
-                self._children[generation] = process
+                self._children[generation] = child
                 _require_parent_owned_stream(
                     local_stream,
                     expected_identity=local_identity,
@@ -274,7 +293,7 @@ class _CoreTunnelEndpoint:
                     expected_identity=child_identity,
                 )
                 child_stream.close()
-                if not _tunnel_process_is_running(process):
+                if child.process is None or not _tunnel_process_is_running(child.process):
                     raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
                 _require_parent_owned_stream(
                     local_stream,
@@ -284,7 +303,7 @@ class _CoreTunnelEndpoint:
                 return local_stream
             except BaseException as exc:
                 failure = exc
-                self._poison_locked(pending_child=process)
+                self._poison_locked(pending_child=child)
         if failure is None:
             raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
         self._finish_failed_operation(
@@ -292,7 +311,7 @@ class _CoreTunnelEndpoint:
             streams=(local_stream, child_stream),
         )
 
-    def _poison_locked(self, *, pending_child: TunnelProcess | None = None) -> None:
+    def _poison_locked(self, *, pending_child: _TunnelChild | None = None) -> None:
         if pending_child is not None:
             self._pending_child = pending_child
         self._close_requested = True
@@ -334,12 +353,12 @@ class _CoreTunnelEndpoint:
                 children = list(self._children.values())
                 pending_child = self._pending_child
                 if pending_child is not None and not any(
-                    process is pending_child for process in children
+                    child is pending_child for child in children
                 ):
                     children.append(pending_child)
             all_exited = True
-            for process in children:
-                exited, failure = _terminate_tunnel_process(process)
+            for child in children:
+                exited, failure = _terminate_tunnel_child(child)
                 all_exited = all_exited and exited
                 if failure is not None:
                     failures.append(failure)
@@ -354,7 +373,10 @@ class _CoreTunnelEndpoint:
         if self._close_requested or self._finalized.is_set():
             raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
         completed: list[int] = []
-        for generation, process in self._children.items():
+        for generation, child in self._children.items():
+            process = child.process
+            if process is None:
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
             try:
                 return_code = process.poll()
             except BaseException:
@@ -363,6 +385,13 @@ class _CoreTunnelEndpoint:
                 continue
             if return_code != 0:
                 raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+            if child.authority is not None:
+                try:
+                    child.authority.cleanup()
+                except BaseException:
+                    raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
+                if not child.authority.released:
+                    raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
             completed.append(generation)
         for generation in completed:
             self._children.pop(generation, None)
@@ -462,9 +491,10 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
         remote_port: int,
         local_host: str,
         remote_host: str,
-        process: TunnelProcess,
-        trust_lease: AbstractContextManager[Path],
+        process: TunnelProcess | _OwnedSubprocessProcess,
+        trust_lease: AbstractContextManager[Path] | None,
         trusted_host: TrustedKnownHostsBinding,
+        process_authority: _OwnedSubprocessAuthority | None = None,
         on_finalize: Callable[[], None] | None = None,
     ) -> None:
         self.local_port = local_port
@@ -472,6 +502,7 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
         self.local_host = local_host
         self.remote_host = remote_host
         self.process = process
+        self._process_authority = process_authority
         self._trust_lease: AbstractContextManager[Path] | None = trust_lease
         self._state_guard = threading.Lock()
         self._close_guard = threading.Lock()
@@ -527,7 +558,10 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
             probe_failure = exc
         if running:
             try:
-                self.process.terminate()
+                if self._process_authority is None:
+                    self.process.terminate()
+                else:
+                    self._process_authority.request_group_termination()
             except BaseException as exc:
                 self._retain_orphan()
                 _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
@@ -556,7 +590,9 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
             return
         with self._state_guard:
             self._close_requested = True
-        exited, failure = _terminate_tunnel_process(self.process)
+        exited, failure = _terminate_tunnel_child(
+            _TunnelChild(self.process, self._process_authority)
+        )
         if exited:
             self._finalize()
         else:
@@ -568,7 +604,7 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
         while not self._closed.wait(_TUNNEL_MONITOR_INTERVAL_SECONDS):
             try:
                 if self.process.poll() is not None:
-                    self._finalize()
+                    self.close()
                     return
             except Exception:
                 _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
@@ -651,6 +687,7 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
             )
             if finalized:
                 self._orphaned = False
+                self._process_authority = None
                 self._closed.set()
         if finalized:
             _forget_orphaned_tunnel(self)
@@ -694,11 +731,9 @@ class SshRemoteExecutorTransport:
         self._trusted_host = trusted_host
         self._runner = runner or _run_subprocess
         self._uses_default_runner = runner is None
-        self._tunnel_starter = tunnel_starter or _start_tunnel_subprocess
+        self._tunnel_starter = tunnel_starter
         self._port_allocator = port_allocator or _allocate_local_port
-        self._core_connection_starter = (
-            core_connection_starter or _start_core_connection_subprocess
-        )
+        self._core_connection_starter = core_connection_starter
         self._core_asset_authority_lock = threading.Lock()
         self._core_asset_authorities: dict[str, StagedCoreBootstrapAssets] = {}
         self._core_asset_transfer_ownerships: set[_CoreAssetTransferAdmission] = set()
@@ -1364,21 +1399,40 @@ class SshRemoteExecutorTransport:
                     SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
                 ) from None
             raise
+        process_authority: _OwnedSubprocessAuthority | None = None
+        trust_ownership: _KnownHostsLeaseOwnership | None = None
         try:
-            process = self._tunnel_starter(
-                [
-                    *self._ssh_base_argv(known_hosts_file),
-                    "-o",
-                    "ExitOnForwardFailure=yes",
-                    "-N",
-                    "-L",
-                    forward_spec,
-                    "--",
-                    self._profile.host,
-                ]
-            )
+            argv = [
+                *self._ssh_base_argv(known_hosts_file),
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-N",
+                "-L",
+                forward_spec,
+                "--",
+                self._profile.host,
+            ]
+            if self._tunnel_starter is None:
+                trust_ownership = _KnownHostsLeaseOwnership(trust_lease)
+                process_authority = _OwnedSubprocessAuthority(trust_ownership=trust_ownership)
+                process_authority.acquire()
+                process_authority.spawn_tunnel(argv)
+                process = process_authority.process
+                if process is None:
+                    raise RuntimeError("SSH tunnel child birth was not observed")
+            else:
+                process = self._tunnel_starter(argv)
         except BaseException as exc:
-            _release_trust_lease(trust_lease)
+            if trust_ownership is None:
+                _release_trust_lease(trust_lease)
+            else:
+                if process_authority is not None and not process_authority.released:
+                    try:
+                        process_authority.cleanup()
+                    except BaseException:
+                        process_authority.retain()
+                        _log_transport_failure(SshTransportErrorCode.START_FAILED)
+                trust_ownership.release_if_caller_owned()
             if isinstance(exc, Exception):
                 _log_transport_failure(SshTransportErrorCode.START_FAILED)
                 raise SshTransportError(SshTransportErrorCode.START_FAILED) from None
@@ -1391,8 +1445,9 @@ class SshRemoteExecutorTransport:
                 local_host=local_host,
                 remote_host=remote_host,
                 process=process,
-                trust_lease=trust_lease,
+                trust_lease=trust_lease if process_authority is None else None,
                 trusted_host=self._trusted_host,
+                process_authority=process_authority,
             )
         except Exception:
             tunnel_failed = True
@@ -1642,6 +1697,7 @@ class _NonReapingPopen(subprocess.Popen):
 
 
 _OWNED_SUBPROCESS_POPEN = _NonReapingPopen
+_TUNNEL_SUBPROCESS_POPEN = _NonReapingPopen
 
 
 class _RecoveredSubprocess:
@@ -1708,6 +1764,27 @@ class _OwnedSubprocessAuthority:
         self._retained = False
         self._cleanup_guard = threading.Lock()
 
+    def acquire(self) -> None:
+        if self._slot_held or self._birth_record is not None:
+            raise RuntimeError("subprocess authority is already acquired")
+        _retry_orphaned_subprocess_cleanup()
+        try:
+            self._reserve_slot()
+        except BaseException:
+            self._group_cleanup_confirmed = True
+            try:
+                self.release()
+            except BaseException:
+                self.retain()
+            raise
+        try:
+            if self._trust_ownership is not None:
+                self._trust_ownership.transfer_to(self)
+        except BaseException:
+            self._group_cleanup_confirmed = True
+            self.release()
+            raise
+
     @classmethod
     def spawn(
         cls,
@@ -1724,40 +1801,40 @@ class _OwnedSubprocessAuthority:
         active_ownership = trust_ownership or caller_ownership
         authority = cls(trust_ownership=active_ownership)
         try:
-            _retry_orphaned_subprocess_cleanup()
-            try:
-                authority._reserve_slot()
-            except BaseException:
-                authority._group_cleanup_confirmed = True
-                try:
-                    authority.release()
-                except BaseException:
-                    authority.retain()
-                raise
-            try:
-                if active_ownership is not None:
-                    active_ownership.transfer_to(authority)
-            except BaseException:
-                authority._group_cleanup_confirmed = True
-                authority.release()
-                raise
-            try:
-                authority._spawn(argv)
-            except BaseException:
-                try:
-                    if authority.process is None:
-                        authority._recover_spawned_process(
-                            deadline=(time.monotonic() + _SUBPROCESS_TERMINATE_GRACE_SECONDS)
-                        )
-                    authority.cleanup()
-                except BaseException:
-                    authority.retain()
-                    _log_transport_failure(SshTransportErrorCode.START_FAILED)
-                raise
+            authority.acquire()
+            authority._spawn(argv)
             return authority
+        except BaseException:
+            try:
+                authority.cleanup()
+            except BaseException:
+                authority.retain()
+                _log_transport_failure(SshTransportErrorCode.START_FAILED)
+            raise
         finally:
             if caller_ownership is not None:
                 caller_ownership.release_if_caller_owned()
+
+    def spawn_tunnel(
+        self,
+        argv: list[str],
+        *,
+        stream_fd: int | None = None,
+    ) -> None:
+        try:
+            self._spawn_tunnel(argv, stream_fd=stream_fd)
+            self.initialize_observer()
+        except BaseException:
+            try:
+                if self.process is None:
+                    self._recover_spawned_process(
+                        deadline=time.monotonic() + _SUBPROCESS_BIRTH_RECOVERY_SECONDS
+                    )
+                self.cleanup()
+            except BaseException:
+                self.retain()
+                _log_transport_failure(SshTransportErrorCode.START_FAILED)
+            raise
 
     def _reserve_slot(self) -> None:
         with _ORPHANED_SUBPROCESS_GUARD:
@@ -1783,6 +1860,27 @@ class _OwnedSubprocessAuthority:
             text=False,
             start_new_session=True,
             pass_fds=(birth_record_fd,),
+        )
+        self.process_group_id = process.pid
+        self.process = process
+        self._spawn_outcome_unknown = False
+
+    def _spawn_tunnel(self, argv: list[str], *, stream_fd: int | None) -> None:
+        birth_record = self._birth_record
+        if birth_record is None:
+            raise RuntimeError("subprocess birth authority is unavailable")
+        birth_record_fd = birth_record.fileno()
+        pass_fds = (birth_record_fd,) if stream_fd is None else (birth_record_fd, stream_fd)
+        self._spawn_outcome_unknown = True
+        process = _TUNNEL_SUBPROCESS_POPEN(
+            _subprocess_birth_argv(argv, birth_record_fd),
+            stdin=subprocess.DEVNULL if stream_fd is None else stream_fd,
+            stdout=subprocess.DEVNULL if stream_fd is None else stream_fd,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            text=False,
+            start_new_session=True,
+            pass_fds=pass_fds,
         )
         self.process_group_id = process.pid
         self.process = process
@@ -1818,12 +1916,19 @@ class _OwnedSubprocessAuthority:
 
     def cleanup(self) -> None:
         with self._cleanup_guard:
+            if self.process is None and not self._spawn_outcome_unknown:
+                self._group_cleanup_confirmed = True
+                self.close_observer()
+                if not self.release():
+                    self.retain()
+                return
             if self.process is None and not self._recover_spawned_process(
-                deadline=time.monotonic() + _SUBPROCESS_TERMINATE_GRACE_SECONDS
+                deadline=time.monotonic() + _SUBPROCESS_BIRTH_RECOVERY_SECONDS
             ):
                 self.retain()
                 raise RuntimeError("subprocess birth outcome could not be confirmed")
             if self._group_cleanup_confirmed and self._is_reaped():
+                self.close_observer()
                 if not self.release():
                     self.retain()
                 return
@@ -1846,6 +1951,7 @@ class _OwnedSubprocessAuthority:
             except BaseException as exc:
                 failure = exc
             if self._group_cleanup_confirmed and self._is_reaped():
+                self.close_observer()
                 self.release()
             else:
                 self.retain()
@@ -1857,6 +1963,23 @@ class _OwnedSubprocessAuthority:
         self.exit_observer = None
         if observer is not None:
             observer.close()
+
+    @property
+    def released(self) -> bool:
+        with _ORPHANED_SUBPROCESS_GUARD:
+            return not self._slot_held
+
+    def request_group_termination(self) -> None:
+        process = self.process
+        process_group_id = self.process_group_id
+        if process is None or process_group_id is None:
+            self.retain()
+            raise RuntimeError("subprocess cleanup authority is incomplete")
+        _signal_owned_process_group(
+            process,
+            process_group_id=process_group_id,
+            signal_number=signal.SIGTERM,
+        )
 
     def retain(self) -> None:
         with _ORPHANED_SUBPROCESS_GUARD:
@@ -2429,31 +2552,6 @@ def _terminate_and_reap_subprocess(
     process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
 
 
-def _start_tunnel_subprocess(argv: list[str]) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-
-
-def _start_core_connection_subprocess(
-    argv: list[str],
-    stream_fd: int,
-) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        argv,
-        stdin=stream_fd,
-        stdout=stream_fd,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        pass_fds=(stream_fd,),
-        text=False,
-    )
-
-
 def _require_parent_owned_stream(
     stream: socket.socket,
     *,
@@ -2522,6 +2620,23 @@ def _terminate_tunnel_process(
             if failure is None:
                 failure = exc
     return exited, failure
+
+
+def _terminate_tunnel_child(
+    child: _TunnelChild,
+) -> tuple[bool, BaseException | None]:
+    authority = child.authority
+    if authority is None:
+        process = child.process
+        if process is None:
+            return False, RuntimeError("SSH tunnel child ownership is incomplete")
+        return _terminate_tunnel_process(process)
+    failure: BaseException | None = None
+    try:
+        authority.cleanup()
+    except BaseException as exc:
+        failure = exc
+    return authority.released, failure
 
 
 def _wait_for_tunnel_process_exit(

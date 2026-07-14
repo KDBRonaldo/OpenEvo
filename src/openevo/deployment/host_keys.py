@@ -63,6 +63,9 @@ _LOCK_NAME = ".openevo-host-key.lock"
 
 _TUNNEL_REGISTRY_GUARD = threading.Lock()
 _TUNNEL_CLOSERS: dict[tuple[int, int, str, str], set[Callable[[], None]]] = {}
+_MAX_KNOWN_HOST_SPAWN_LEASES = 64
+_SPAWN_LEASE_REGISTRY_GUARD = threading.Lock()
+_SPAWN_LEASES: dict[int, "_KnownHostsSpawnLease"] = {}
 
 
 class HostKeyStoreErrorCode(str, Enum):
@@ -697,14 +700,20 @@ class _KnownHostsSpawnLease(AbstractContextManager[Path]):
         self._profile = profile
         self._locked = None
         self._directory_fd: int | None = None
+        self._directory_identity: tuple[int, int] | None = None
         self._directory_name: str | None = None
+        self._slot_held = False
+        self._cleanup_requested = False
+        self._cleanup_guard = threading.Lock()
+        self._released = False
 
     def __enter__(self) -> Path:
-        self._binding.validate_for(self._profile)
-        anchor = self._binding._anchor
-        self._locked = anchor.locked_root(create=False, exclusive=False)
-        root_fd = self._locked.__enter__()
         try:
+            self._reserve_cleanup_slot()
+            self._binding.validate_for(self._profile)
+            anchor = self._binding._anchor
+            self._locked = anchor.locked_root(create=False, exclusive=False)
+            root_fd = self._locked.__enter__()
             if root_fd is None:
                 raise ValueError("trusted known-host file is missing")
             content = _read_secure_file(root_fd, self._binding.known_hosts_file.name)
@@ -720,59 +729,204 @@ class _KnownHostsSpawnLease(AbstractContextManager[Path]):
                 raise ValueError("trusted known-host file content does not match binding")
             self._directory_name = f".openevo-ssh-lease-{secrets.token_hex(16)}"
             os.mkdir(self._directory_name, 0o700, dir_fd=anchor._ancestor_fd)
+            os.fsync(anchor._ancestor_fd)
             self._directory_fd = os.open(
                 self._directory_name,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                 dir_fd=anchor._ancestor_fd,
             )
-            _validate_root_stat(os.fstat(self._directory_fd))
+            opened_directory = os.fstat(self._directory_fd)
+            _validate_root_stat(opened_directory)
+            self._directory_identity = (
+                opened_directory.st_dev,
+                opened_directory.st_ino,
+            )
+            current_directory = os.stat(
+                self._directory_name,
+                dir_fd=anchor._ancestor_fd,
+                follow_symlinks=False,
+            )
+            _validate_root_stat(current_directory)
+            if self._directory_identity != (
+                current_directory.st_dev,
+                current_directory.st_ino,
+            ):
+                raise ValueError("known-host spawn lease directory changed during pin")
             _write_new_secure_file(self._directory_fd, "known_hosts", content)
             os.fsync(self._directory_fd)
+            current_directory = os.stat(
+                self._directory_name,
+                dir_fd=anchor._ancestor_fd,
+                follow_symlinks=False,
+            )
+            _validate_root_stat(current_directory)
+            if self._directory_identity != (
+                current_directory.st_dev,
+                current_directory.st_ino,
+            ):
+                raise ValueError("known-host spawn lease directory binding changed")
             return anchor.secure_ancestor / self._directory_name / "known_hosts"
         except BaseException:
+            self._cleanup_requested = True
             try:
-                self.__exit__(None, None, None)
+                self._cleanup()
             except BaseException:
                 pass
             raise
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        anchor = self._binding._anchor
-        remove_directory_name = False
-        try:
-            if self._directory_fd is not None:
-                try:
-                    if self._directory_name is not None:
-                        current = os.stat(
-                            self._directory_name,
-                            dir_fd=anchor._ancestor_fd,
-                            follow_symlinks=False,
-                        )
-                        opened = os.fstat(self._directory_fd)
-                        _validate_root_stat(current)
-                        _validate_root_stat(opened)
-                        remove_directory_name = (current.st_dev, current.st_ino) == (
-                            opened.st_dev,
-                            opened.st_ino,
-                        )
-                    try:
-                        os.unlink("known_hosts", dir_fd=self._directory_fd)
-                        os.fsync(self._directory_fd)
-                    except FileNotFoundError:
-                        pass
-                finally:
-                    os.close(self._directory_fd)
-                    self._directory_fd = None
-            if self._directory_name is not None and remove_directory_name:
-                try:
-                    os.rmdir(self._directory_name, dir_fd=anchor._ancestor_fd)
-                except FileNotFoundError:
-                    pass
-        finally:
+        del exc_type, exc, traceback
+        self._cleanup_requested = True
+        self._cleanup()
+
+    def _reserve_cleanup_slot(self) -> None:
+        if self._slot_held:
+            return
+        if self._released or self._locked is not None or self._directory_name is not None:
+            raise ValueError("known-host spawn lease cannot be reused")
+        _retry_retained_spawn_lease_cleanup()
+        with _SPAWN_LEASE_REGISTRY_GUARD:
+            if len(_SPAWN_LEASES) >= _MAX_KNOWN_HOST_SPAWN_LEASES:
+                raise ValueError("known-host spawn lease cleanup capacity is exhausted")
+            _SPAWN_LEASES[id(self)] = self
+            self._slot_held = True
+
+    def _cleanup(self) -> None:
+        with self._cleanup_guard:
+            if self._released:
+                return
+            try:
+                self._remove_private_directory()
+                locked = self._locked
+                if locked is not None:
+                    locked.__exit__(None, None, None)
+                    self._locked = None
+            except BaseException:
+                self._retain_for_retry()
+                raise
             self._directory_name = None
-            if self._locked is not None:
-                self._locked.__exit__(exc_type, exc, traceback)
-                self._locked = None
+            self._released = True
+            with _SPAWN_LEASE_REGISTRY_GUARD:
+                if self._slot_held:
+                    _SPAWN_LEASES.pop(id(self), None)
+                    self._slot_held = False
+
+    def _remove_private_directory(self) -> None:
+        anchor = self._binding._anchor
+        directory_name = self._directory_name
+        directory_fd = self._directory_fd
+        if directory_name is None:
+            if directory_fd is not None or self._directory_identity is not None:
+                raise ValueError("known-host spawn lease directory identity is incomplete")
+            return
+        if directory_fd is None:
+            try:
+                before = os.stat(
+                    directory_name,
+                    dir_fd=anchor._ancestor_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                self._directory_name = None
+                self._directory_identity = None
+                return
+            _validate_root_stat(before)
+            directory_fd = os.open(
+                directory_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=anchor._ancestor_fd,
+            )
+            self._directory_fd = directory_fd
+            opened = os.fstat(directory_fd)
+            _validate_root_stat(opened)
+            self._directory_identity = (opened.st_dev, opened.st_ino)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ValueError("known-host spawn lease directory changed during pin")
+
+        opened = os.fstat(directory_fd)
+        try:
+            current = os.stat(
+                directory_name,
+                dir_fd=anchor._ancestor_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            _validate_root_stat(opened)
+            if self._directory_identity != (opened.st_dev, opened.st_ino):
+                raise ValueError("known-host spawn lease directory FD identity changed")
+            os.fsync(anchor._ancestor_fd)
+            self._close_directory_fd()
+            self._directory_name = None
+            return
+        _validate_root_stat(current)
+        _validate_root_stat(opened)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("known-host spawn lease directory binding changed")
+        try:
+            os.unlink("known_hosts", dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.fsync(directory_fd)
+        final = os.stat(
+            directory_name,
+            dir_fd=anchor._ancestor_fd,
+            follow_symlinks=False,
+        )
+        _validate_root_stat(final)
+        if (opened.st_dev, opened.st_ino) != (final.st_dev, final.st_ino):
+            raise ValueError("known-host spawn lease directory binding changed")
+        os.rmdir(directory_name, dir_fd=anchor._ancestor_fd)
+        os.fsync(anchor._ancestor_fd)
+        try:
+            os.stat(
+                directory_name,
+                dir_fd=anchor._ancestor_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("known-host spawn lease directory removal was not durable")
+        self._close_directory_fd()
+        self._directory_name = None
+
+    def _close_directory_fd(self) -> None:
+        directory_fd = self._directory_fd
+        identity = self._directory_identity
+        if directory_fd is None:
+            self._directory_identity = None
+            return
+        try:
+            os.close(directory_fd)
+        except BaseException:
+            try:
+                opened = os.fstat(directory_fd)
+            except OSError as probe_error:
+                if probe_error.errno != errno.EBADF:
+                    raise
+            else:
+                if identity == (opened.st_dev, opened.st_ino):
+                    raise
+        self._directory_fd = None
+        self._directory_identity = None
+
+    def _retain_for_retry(self) -> None:
+        with _SPAWN_LEASE_REGISTRY_GUARD:
+            if not self._slot_held:
+                if len(_SPAWN_LEASES) >= _MAX_KNOWN_HOST_SPAWN_LEASES:
+                    raise ValueError("known-host spawn lease cleanup capacity is exhausted")
+                self._slot_held = True
+            _SPAWN_LEASES[id(self)] = self
+
+
+def _retry_retained_spawn_lease_cleanup() -> None:
+    with _SPAWN_LEASE_REGISTRY_GUARD:
+        retained = tuple(lease for lease in _SPAWN_LEASES.values() if lease._cleanup_requested)
+    for lease in retained:
+        try:
+            lease._cleanup()
+        except BaseException:
+            continue
 
 
 def _register_tunnel_closer(

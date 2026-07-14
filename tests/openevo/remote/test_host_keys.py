@@ -866,6 +866,160 @@ def test_spawn_lease_enter_cancellation_closes_fd_and_removes_private_copy(
         pass
 
 
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_spawn_lease_directory_publish_cancellation_is_recovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+) -> None:
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    original_open = os.open
+    injected = False
+
+    def cancel_before_directory_pin(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal injected
+        if (
+            not injected
+            and isinstance(path, str)
+            and path.startswith(".openevo-ssh-lease-")
+            and flags & os.O_DIRECTORY
+        ):
+            injected = True
+            raise interruption()
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", cancel_before_directory_pin)
+
+    with pytest.raises(interruption):
+        binding.open_for_spawn(profile).__enter__()
+
+    assert injected is True
+    assert not list(tmp_path.rglob(".openevo-ssh-lease-*"))
+    with binding._anchor.locked_root(create=False, exclusive=True):
+        pass
+
+
+@pytest.mark.parametrize("cleanup_failure", ["fstat", "unlink", "rmdir"])
+def test_spawn_lease_cleanup_failure_retains_exact_identity_and_shared_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: str,
+) -> None:
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    lease = binding.open_for_spawn(profile)
+    lease_path = lease.__enter__()
+    directory_fd = lease._directory_fd
+    directory_name = lease._directory_name
+    assert directory_fd is not None
+    assert directory_name is not None
+    original_fstat = os.fstat
+    original_unlink = os.unlink
+    original_rmdir = os.rmdir
+    injected = False
+
+    def flaky_fstat(fd: int) -> os.stat_result:
+        nonlocal injected
+        if cleanup_failure == "fstat" and fd == directory_fd and not injected:
+            injected = True
+            raise OSError("injected lease fstat failure")
+        return original_fstat(fd)
+
+    def flaky_unlink(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal injected
+        if (
+            cleanup_failure == "unlink"
+            and path == "known_hosts"
+            and dir_fd == directory_fd
+            and not injected
+        ):
+            injected = True
+            raise OSError("injected lease unlink failure")
+        original_unlink(path, dir_fd=dir_fd)
+
+    def flaky_rmdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal injected
+        if cleanup_failure == "rmdir" and path == directory_name and not injected:
+            injected = True
+            raise OSError("injected lease rmdir failure")
+        original_rmdir(path, dir_fd=dir_fd)
+
+    contender = ProviderKnownHostStore(
+        binding.known_hosts_file.parent,
+        runner=KeyscanRunner(""),
+        lock_timeout_seconds=0.05,
+    )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "fstat", flaky_fstat)
+        scoped.setattr(os, "unlink", flaky_unlink)
+        scoped.setattr(os, "rmdir", flaky_rmdir)
+        with pytest.raises(OSError, match="injected lease"):
+            lease.__exit__(None, None, None)
+
+    assert injected is True
+    assert lease_path.parent.exists()
+    with pytest.raises(HostKeyStoreError) as error:
+        contender.revoke(profile, expected_fingerprint=binding.fingerprint)
+    assert error.value.code is HostKeyStoreErrorCode.HOST_KEY_IN_USE
+
+    host_keys_module._retry_retained_spawn_lease_cleanup()
+
+    assert not lease_path.parent.exists()
+    contender.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+
+def test_spawn_lease_retained_cleanup_capacity_fails_closed_before_new_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    monkeypatch.setattr(
+        host_keys_module,
+        "_MAX_KNOWN_HOST_SPAWN_LEASES",
+        1,
+        raising=False,
+    )
+    original_unlink = os.unlink
+
+    def fail_unlink(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path == "known_hosts":
+            raise OSError("persistent lease unlink failure")
+        original_unlink(path, dir_fd=dir_fd)
+
+    first = binding.open_for_spawn(profile)
+    first.__enter__()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "unlink", fail_unlink)
+        with pytest.raises(OSError, match="persistent lease unlink failure"):
+            first.__exit__(None, None, None)
+        with pytest.raises((HostKeyStoreError, ValueError)):
+            binding.open_for_spawn(profile).__enter__()
+
+    assert len(list(tmp_path.rglob(".openevo-ssh-lease-*"))) == 1
+    host_keys_module._retry_retained_spawn_lease_cleanup()
+    assert not list(tmp_path.rglob(".openevo-ssh-lease-*"))
+
+
 def test_exclusive_lock_timeout_is_typed_and_shared_across_store_instances(
     tmp_path: Path,
 ) -> None:

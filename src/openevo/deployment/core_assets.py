@@ -823,6 +823,54 @@ def clear_private_attempt(parent, attempt_name, require_transfer_lease=False):
     os.fsync(parent)
     return True
 
+def reconcile_incoming_attempt(parent, attempt_name, stale_before_ns):
+    fd = os.open(attempt_name, flags, dir_fd=parent)
+    try:
+        opened = os.fstat(fd)
+        current = os.stat(attempt_name, dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != uid
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+            raise SystemExit(76)
+        names = bounded_names(fd, max_staging_entries)
+        if ".openevo-transfer.lock" not in names:
+            if names:
+                raise SystemExit(76)
+            current = os.stat(attempt_name, dir_fd=parent, follow_symlinks=False)
+            if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                raise SystemExit(76)
+            os.rmdir(attempt_name, dir_fd=parent)
+            os.fsync(parent)
+            try:
+                os.stat(attempt_name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise SystemExit(76)
+            return
+        lease_fd = os.open(
+            ".openevo-transfer.lock",
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=fd,
+        )
+        try:
+            lease = os.fstat(lease_fd)
+            current_lease = os.stat(
+                ".openevo-transfer.lock", dir_fd=fd, follow_symlinks=False
+            )
+            if (not stat.S_ISREG(lease.st_mode) or lease.st_uid != uid
+                    or lease.st_nlink != 1 or stat.S_IMODE(lease.st_mode) != 0o600
+                    or (lease.st_dev, lease.st_ino)
+                        != (current_lease.st_dev, current_lease.st_ino)):
+                raise SystemExit(76)
+        finally:
+            os.close(lease_fd)
+        if opened.st_mtime_ns > stale_before_ns:
+            return
+    finally:
+        os.close(fd)
+    clear_private_attempt(parent, attempt_name, require_transfer_lease=True)
+
 def reconcile_staging(fd):
     names = bounded_names(fd, max_staging_entries)
     for name in names:
@@ -837,10 +885,7 @@ def reconcile_staging(fd):
         if not closed_attempt_name(name, "incoming-"):
             continue
         try:
-            current = os.stat(name, dir_fd=fd, follow_symlinks=False)
-            if current.st_mtime_ns > stale_before_ns:
-                continue
-            clear_private_attempt(fd, name, require_transfer_lease=True)
+            reconcile_incoming_attempt(fd, name, stale_before_ns)
         except FileNotFoundError:
             pass
     remaining = bounded_names(fd, max_staging_entries)
@@ -894,6 +939,15 @@ try:
                     incoming_fd = os.open(incoming, flags, dir_fd=staging_fd)
                     try:
                         require_dir(incoming_fd, 0o700)
+                        current_incoming = os.stat(
+                            incoming, dir_fd=staging_fd, follow_symlinks=False
+                        )
+                        opened_incoming = os.fstat(incoming_fd)
+                        if (current_incoming.st_dev, current_incoming.st_ino) != (
+                            opened_incoming.st_dev,
+                            opened_incoming.st_ino,
+                        ):
+                            raise SystemExit(78)
                         lease_fd = os.open(
                             ".openevo-transfer.lock",
                             os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -902,12 +956,35 @@ try:
                         )
                         try:
                             lease = os.fstat(lease_fd)
+                            current_lease = os.stat(
+                                ".openevo-transfer.lock",
+                                dir_fd=incoming_fd,
+                                follow_symlinks=False,
+                            )
                             if (not stat.S_ISREG(lease.st_mode) or lease.st_uid != uid
                                     or lease.st_nlink != 1
-                                    or stat.S_IMODE(lease.st_mode) != 0o600):
+                                    or stat.S_IMODE(lease.st_mode) != 0o600
+                                    or (lease.st_dev, lease.st_ino) != (
+                                        current_lease.st_dev,
+                                        current_lease.st_ino,
+                                    )):
                                 raise SystemExit(78)
                             os.fsync(lease_fd)
                             os.fsync(incoming_fd)
+                            current_lease = os.stat(
+                                ".openevo-transfer.lock",
+                                dir_fd=incoming_fd,
+                                follow_symlinks=False,
+                            )
+                            current_incoming = os.stat(
+                                incoming, dir_fd=staging_fd, follow_symlinks=False
+                            )
+                            if ((lease.st_dev, lease.st_ino) != (
+                                    current_lease.st_dev, current_lease.st_ino)
+                                    or (opened_incoming.st_dev, opened_incoming.st_ino) != (
+                                        current_incoming.st_dev, current_incoming.st_ino
+                                    )):
+                                raise SystemExit(78)
                         finally:
                             os.close(lease_fd)
                     finally:

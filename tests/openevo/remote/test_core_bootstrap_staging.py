@@ -839,6 +839,103 @@ def test_remote_asset_prepare_recovers_sixteen_proven_stale_incoming_authorities
     assert recovered not in incoming
 
 
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_remote_asset_prepare_recovers_marker_publication_interruptions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    interruption: type[BaseException],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    original_open = os.open
+    injections = 0
+
+    def interrupt_marker_publish(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal injections
+        if (
+            path == ".openevo-transfer.lock"
+            and flags & os.O_CREAT
+            and flags & os.O_EXCL
+            and injections < 16
+        ):
+            injections += 1
+            raise interruption()
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "open", interrupt_marker_publish)
+        for _index in range(16):
+            with pytest.raises(interruption):
+                _execute_remote_script(
+                    core_assets._REMOTE_PREPARE_SCRIPT,
+                    [BUNDLE_ID],
+                    home=home,
+                    monkeypatch=monkeypatch,
+                )
+            staging = home / ".openevo" / "core" / "asset-staging"
+            assert len(list(staging.iterdir())) <= 1
+
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    recovered = Path(json.loads(capsys.readouterr().out)["incoming_root"])
+    staging = home / ".openevo" / "core" / "asset-staging"
+    assert injections == 16
+    assert list(staging.iterdir()) == [recovered]
+    assert (recovered / ".openevo-transfer.lock").is_file()
+
+
+def test_remote_asset_prepare_rejects_nonempty_markerless_incoming_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    _execute_remote_script(
+        core_assets._REMOTE_DISCARD_SCRIPT,
+        [prepared["service_root"], BUNDLE_ID, prepared["transfer_id"]],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    capsys.readouterr()
+
+    staging = home / ".openevo" / "core" / "asset-staging"
+    malicious = staging / f"incoming-{BUNDLE_ID}-{'d' * 32}"
+    malicious.mkdir(mode=0o700)
+    payload = malicious / "unowned-payload"
+    payload.write_bytes(b"must not be treated as an interrupted prepare")
+    payload.chmod(0o600)
+
+    with pytest.raises(SystemExit):
+        _execute_remote_script(
+            core_assets._REMOTE_PREPARE_SCRIPT,
+            [BUNDLE_ID],
+            home=home,
+            monkeypatch=monkeypatch,
+        )
+
+    assert malicious.is_dir()
+    assert payload.read_bytes() == b"must not be treated as an interrupted prepare"
+
+
 def test_stale_prepare_and_discard_preserve_cross_process_active_transfer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

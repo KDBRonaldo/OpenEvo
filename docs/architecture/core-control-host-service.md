@@ -23,7 +23,10 @@ the bounded ownership registry, and given the entered known-host lease. The
 child first publishes its PID, PGID, and SID to that authority's anonymous birth
 record FD and then execs the requested command. Losing the `Popen` return to a
 `BaseException` therefore leaves the same pre-published owner able to recover
-the child without a Python return-to-constructor handoff. Observer construction,
+the child within an independent bounded birth-recovery window without a Python
+return-to-constructor handoff. This contract covers command/rsync children,
+general forwarding tunnels, and per-connection Core tunnels; every production
+child receives a new session/process group. Observer construction,
 capture, and cleanup failures cannot split the child, registry capacity, or
 lease. Unconfirmed cleanup retains that complete owner for later
 command/tunnel/close recovery. All waits remain bounded.
@@ -181,6 +184,11 @@ uses a unique random incoming authority. Before prepare, the local transport
 publishes one of 16 ownership tokens. The same token owns pending receipt,
 active upload, and inactive cleanup/reconciliation state until confirmed
 publication or discard, and new prepare work is rejected at capacity.
+Remote prepare no-follow pins the incoming directory and establishes a fsynced,
+inode-revalidated `0600` transfer marker before returning its receipt. A
+recognized empty `0700` incoming inode left before marker creation is recovered
+immediately; any markerless nonempty or otherwise noncanonical shape fails
+closed, so repeated interruption cannot strand all 16 remote slots.
 Finalize copies verified bytes into an owner-only private
 candidate whose inode and pathname were never exposed to rsync. Members are
 created as `0400` and populated only through publisher-held writer FDs that are
@@ -255,11 +263,12 @@ quarantine ownership under its state lock before either anonymous socket is
 closed. Each socket close and the bounded child cleanup then run independently,
 so `EBADF` cannot replace the original typed failure or skip process ownership
 cleanup. Concurrent opens observe the poison and cannot create another child.
-Confirmed child exit completes endpoint closure; otherwise quarantine retains
-the endpoint until a later bounded retry can prove exit. The starter's returned
-child enters a single endpoint-owned pending slot before generation advancement
-or registered-child map insertion. A cancellation or insertion failure retains
-that exact child under the poisoned endpoint. Close deduplicates pending and
+Confirmed whole-process-group exit and leader reap complete endpoint closure;
+otherwise quarantine retains the endpoint until a later bounded retry can prove
+exit. The production authority enters a single endpoint-owned pending slot before
+`Popen`, generation advancement, or registered-child map insertion. A
+cancellation or insertion failure retains that exact authority under the
+poisoned endpoint. Close deduplicates pending and
 registered references by identity and cannot release trust or finalize until
 bounded terminate/wait/kill proves every owned child exited.
 

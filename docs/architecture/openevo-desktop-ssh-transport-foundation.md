@@ -108,9 +108,14 @@ lease file is `0600`, is independent of the mutable trust-store root, and is
 created while the shared store lock is held. Synchronous command/rsync leases
 remain present until complete process-group cleanup and leader reap; tunnel
 leases remain present until the tunnel closes. Lease construction and
-synchronous runner exit handle every `BaseException`: partial lease directories
-and FDs are cleaned before propagation, or the exact lease is retained under
-bounded subprocess ownership for retry. The caller retains lease cleanup
+synchronous runner exit handle every `BaseException`. Before directory creation,
+the lease reserves one of 64 process-local recovery slots. Its random directory
+name, pinned directory FD/inode, and held shared store lock remain in that slot
+until no-follow pathname revalidation, file unlink, directory and parent fsync,
+`rmdir`, and FD close all complete. A partial publication or transient
+`fstat`/unlink/`rmdir` failure is retried synchronously by later lease creation;
+capacity exhaustion rejects a new lease before filesystem publication. The
+caller retains lease cleanup
 responsibility through runner entry and transfers it only after the process
 authority exists. Secret prepare/finalize/discard and runtime-preflight commands
 use the same handoff as ordinary commands and rsync. Replacing or renaming the
@@ -179,12 +184,15 @@ closed by that owner; otherwise mutation fails with `host_key_in_use` after the
 bounded lock timeout. Synchronous commands intentionally keep their shared lease
 until completion. Revoking the store record is not a general remote-session
 termination mechanism. Registration and exit-monitor startup are one constructor
-transaction. A failure after process creation performs bounded
-terminate/wait/kill cleanup, but unregisters the closer and releases the trust
-lease only after `wait` or `poll` proves that the child exited. If cleanup cannot
-confirm exit, a process-local quarantine registry retains the tunnel ownership,
-registration, and lease while a daemon monitor retries. Matching trust mutation
-also retries quarantined cleanup when constructor registration succeeded; later
+transaction. Before either the general forward or a Core connection child can
+call `Popen`, it owns a bounded registry slot, birth-record FD, and independent
+session/process group. A failure after process creation performs bounded
+whole-group TERM/observe/KILL cleanup, but unregisters the closer and releases
+the trust lease only after the group is dead or zombie and the leader is reaped.
+If cleanup cannot confirm exit, the same process authority and tunnel quarantine
+retain the registration and lease while a daemon monitor retries. Matching
+trust mutation also retries quarantined cleanup when constructor registration
+succeeded; later
 tunnel creation retries every quarantined entry. Finalization is idempotent, so
 concurrent recovery paths cannot unregister or close the lease twice. Until one
 path proves exit, revoke and rotation remain blocked by the shared trust lease
@@ -203,7 +211,8 @@ pathname. For each HTTP connection the Desktop process creates an anonymous
 type, effective UID, empty local/peer names, and the initial identity of both
 held FDs. It revalidates both identities after child creation and the parent
 identity again before returning the HTTP endpoint. It retains the HTTP side and
-transfers only the peer FD through the exact `pass_fds` set to a dedicated
+transfers only the peer FD plus the private birth-record FD through the exact
+`pass_fds` set to a dedicated
 `ssh -W 127.0.0.1:<remote-port>` child as stdin/stdout. The child uses the same
 pinned known-host lease and explicit auth argv as command execution.
 
@@ -236,11 +245,12 @@ socket endpoints closed independently and bounded child cleanup attempted, so an
 `EBADF` or another close failure cannot hide the original typed failure or skip
 process cleanup. A concurrent open observes the poison before cleanup completes
 and cannot create another child generation. The endpoint finalizes immediately
-when every owned child exit is confirmed; otherwise quarantine retains it for
-later retry. A child returned by the connection starter is first held in the
-endpoint's single pending-child ownership slot before generation advancement or
-insertion into the registered-child map. Cancellation and registry insertion
-failure therefore poison the endpoint while retaining that exact child. Close
+when every owned process group is confirmed terminated and its leader reaped;
+otherwise quarantine retains it for later retry. A production child authority
+is inserted into the endpoint's single pending-child ownership slot before
+`Popen`; injected test starters are wrapped in that state immediately on return.
+Cancellation and registry insertion failure therefore poison the endpoint while
+retaining the exact child authority. Close
 deduplicates pending and registered references by object identity, and neither
 unregisters the closer nor releases the trust lease until bounded cleanup proves
 that every such child exited.
@@ -400,7 +410,9 @@ The trailing slash semantics intentionally upload the contents of the local
 folder into the prepared remote workspace path.
 
 Each Core bootstrap transfer receives an unpredictable 128-bit transfer ID and
-a unique owner-only `incoming-<bundle>-<transfer>` directory. Prepare, discard,
+a unique owner-only `incoming-<bundle>-<transfer>` directory. Before prepare
+returns, that inode is no-follow pinned and contains a fsynced, inode-revalidated
+`0600` transfer marker. Prepare, discard,
 and finalize validate that closed authority under the same publication lock;
 concurrent or exact retries never reuse an incoming pathname or inode. Staging
 admits at most 16 live incoming attempts and scans at most 32 staging entries.
@@ -433,7 +445,12 @@ Timeout remnants stay private and bounded. Prepare creates a validated `0600`
 through a closed Python wrapper that holds a shared flock on that inode across
 `exec`; rsync deletion rules protect the marker. Prepare, discard, and finalize
 must acquire a nonblocking exclusive flock before retiring an incoming
-directory. Prepare considers only directories older than 600 seconds, twice the
+directory. A recognized owner-only `0700` incoming directory with no marker is
+an interrupted pre-authority prepare and is removed immediately only when its
+pinned inode is empty; a nonempty, wrong-mode, symlink, foreign-owner, or
+malformed-marker shape fails closed without cleanup. It therefore cannot
+permanently consume the 16-attempt capacity. Prepare considers marked
+directories only after they are older than 600 seconds, twice the
 maximum staging operation lifetime, but age alone never authorizes deletion.
 Thus a continuously writing or orphaned cross-process rsync remains protected,
 while a later Desktop staging/startup can recover all 16 unlocked abandoned

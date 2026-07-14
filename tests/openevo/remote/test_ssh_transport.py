@@ -1005,6 +1005,170 @@ def test_open_tunnel_readiness_cancellation_closes_forward_and_trust_lease(
     assert all(tunnel.process is not process for tunnel in ssh_module._ORPHANED_TUNNELS.values())
 
 
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("tunnel_kind", ["forward", "core_connection"])
+def test_tunnel_popen_cancellation_owns_and_reaps_entire_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+    tunnel_kind: str,
+) -> None:
+    original_popen = subprocess.Popen
+    descendant_path = tmp_path / f"{tunnel_kind}-descendant.pid"
+    spawned: list[subprocess.Popen[bytes]] = []
+    observed_argv: list[list[str]] = []
+    observed_kwargs: list[dict[str, object]] = []
+    lease_paths: list[Path] = []
+    sleeper = (
+        "import os,signal,subprocess,sys,time;"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)']);"
+        "open(sys.argv[1],'w').write(str(child.pid));"
+        "time.sleep(60)"
+    )
+
+    def popen_then_cancel(
+        argv: list[str],
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        actual = list(argv)
+        observed_argv.append(actual)
+        observed_kwargs.append(dict(kwargs))
+        for value in actual:
+            if value.startswith("UserKnownHostsFile="):
+                lease_paths.append(Path(value.removeprefix("UserKnownHostsFile=")))
+        if len(actual) >= 5 and actual[3] == ssh_module._SUBPROCESS_BIRTH_LAUNCHER:
+            replacement = [
+                *actual[:5],
+                sys.executable,
+                "-c",
+                sleeper,
+                str(descendant_path),
+            ]
+        else:
+            replacement = [sys.executable, "-c", sleeper, str(descendant_path)]
+        process = original_popen(replacement, *args, **kwargs)
+        spawned.append(process)
+        deadline = time.monotonic() + 3
+        while not descendant_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert descendant_path.exists()
+        raise interruption()
+
+    def process_stopped(process_id: int) -> bool:
+        try:
+            status = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            return True
+        fields = status[status.rfind(")") + 2 :].split()
+        return bool(fields) and fields[0] in {"X", "Z"}
+
+    monkeypatch.setattr(ssh_module, "_TUNNEL_SUBPROCESS_POPEN", popen_then_cancel)
+    transport = _transport(tmp_path)
+    orphan_ids = set(ssh_module._ORPHANED_SUBPROCESSES)
+    tunnel = None
+    try:
+        with pytest.raises(interruption):
+            if tunnel_kind == "forward":
+                transport.open_tunnel(
+                    remote_port=8765,
+                    local_port=49157,
+                    wait_for_ready=False,
+                )
+            else:
+                tunnel = transport.open_core_tunnel(remote_port=8765)
+                tunnel.open_verified_socket(timeout_seconds=1.0)
+
+        assert len(spawned) == 1
+        leader_id = spawned[0].pid
+        descendant_id = int(descendant_path.read_text(encoding="ascii"))
+        assert observed_kwargs[0].get("start_new_session") is True
+        assert process_stopped(leader_id)
+        assert process_stopped(descendant_id)
+        assert len(lease_paths) == 1
+        assert not lease_paths[0].exists()
+        assert set(ssh_module._ORPHANED_SUBPROCESSES) == orphan_ids
+    finally:
+        if tunnel is not None:
+            try:
+                tunnel.close()
+            except BaseException:
+                pass
+        for process_id in [
+            *(process.pid for process in spawned),
+            *(
+                [int(descendant_path.read_text(encoding="ascii"))]
+                if descendant_path.exists()
+                else []
+            ),
+        ]:
+            try:
+                os.kill(process_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for process in spawned:
+            try:
+                process.wait(timeout=3)
+            except (ChildProcessError, subprocess.TimeoutExpired):
+                pass
+
+
+@pytest.mark.parametrize("tunnel_kind", ["forward", "core_connection"])
+def test_tunnel_authority_acquire_cancellation_releases_slot_and_trust_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tunnel_kind: str,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    original_acquire = ssh_module._OwnedSubprocessAuthority.acquire
+    lease_paths: list[Path] = []
+
+    def acquire_then_cancel(authority: ssh_module._OwnedSubprocessAuthority) -> None:
+        original_acquire(authority)
+        raise Cancelled
+
+    monkeypatch.setattr(
+        ssh_module._OwnedSubprocessAuthority,
+        "acquire",
+        acquire_then_cancel,
+    )
+    transport = _transport(tmp_path)
+    orphan_ids = set(ssh_module._ORPHANED_SUBPROCESSES)
+    original_base_argv = transport._ssh_base_argv
+
+    def record_lease(known_hosts_file: Path) -> list[str]:
+        lease_paths.append(known_hosts_file)
+        return original_base_argv(known_hosts_file)
+
+    monkeypatch.setattr(transport, "_ssh_base_argv", record_lease)
+    tunnel = None
+    try:
+        with pytest.raises(Cancelled):
+            if tunnel_kind == "forward":
+                transport.open_tunnel(
+                    remote_port=8765,
+                    local_port=49158,
+                    wait_for_ready=False,
+                )
+            else:
+                tunnel = transport.open_core_tunnel(remote_port=8765)
+                tunnel.open_verified_socket(timeout_seconds=1.0)
+
+        assert len(lease_paths) == 1
+        assert not lease_paths[0].exists()
+        assert set(ssh_module._ORPHANED_SUBPROCESSES) == orphan_ids
+    finally:
+        if tunnel is not None:
+            try:
+                tunnel.close()
+            except BaseException:
+                pass
+
+
 def test_core_tunnel_uses_parent_owned_socketpair_and_per_connection_ssh_child(
     tmp_path: Path,
 ) -> None:
@@ -1331,7 +1495,8 @@ def test_core_tunnel_pre_registration_cancellation_quarantines_pending_child(
     try:
         first.start()
         assert cleanup_started.wait(timeout=2)
-        assert tunnel._endpoint._pending_child is process
+        assert tunnel._endpoint._pending_child is not None
+        assert tunnel._endpoint._pending_child.process is process
         assert tunnel._endpoint._close_requested is True
         assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
 
@@ -1351,7 +1516,8 @@ def test_core_tunnel_pre_registration_cancellation_quarantines_pending_child(
         assert process.waited is True
         assert process.killed is True
         assert tunnel._endpoint._children == {}
-        assert tunnel._endpoint._pending_child is process
+        assert tunnel._endpoint._pending_child is not None
+        assert tunnel._endpoint._pending_child.process is process
         assert tunnel._endpoint._trust_lease is not None
         assert tunnel.closed is False
 
@@ -1805,41 +1971,62 @@ def test_core_tunnel_poisons_before_dual_close_failures_and_concurrent_open(
                     pass
 
 
-def test_core_connection_subprocess_passes_only_peer_fd_to_exact_ssh_child(
+def test_core_connection_authority_passes_birth_and_peer_fds_to_exact_ssh_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed: list[tuple[list[str], dict[str, object]]] = []
     process = FakeTunnelProcess()
+    process.pid = 424_242
+    process.returncode = None
 
     def popen(argv: list[str], **kwargs: object) -> FakeTunnelProcess:
         observed.append((argv, kwargs))
         return process
 
-    monkeypatch.setattr(ssh_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(ssh_module, "_TUNNEL_SUBPROCESS_POPEN", popen)
+    monkeypatch.setattr(
+        ssh_module._OwnedSubprocessAuthority,
+        "initialize_observer",
+        lambda _self: None,
+    )
     argv = ["ssh", "-F", "/dev/null", "-W", "127.0.0.1:8765", "--", "host"]
+    authority = ssh_module._OwnedSubprocessAuthority(trust_ownership=None)
+    authority.acquire()
 
-    result = ssh_module._start_core_connection_subprocess(argv, 42)
+    authority.spawn_tunnel(argv, stream_fd=42)
 
-    assert result is process
-    assert observed == [
-        (
-            argv,
-            {
-                "stdin": 42,
-                "stdout": 42,
-                "stderr": subprocess.DEVNULL,
-                "close_fds": True,
-                "pass_fds": (42,),
-                "text": False,
-            },
-        )
+    assert authority.process is process
+    assert len(observed) == 1
+    actual_argv, kwargs = observed[0]
+    birth_fd = int(actual_argv[4])
+    assert actual_argv == [
+        sys.executable,
+        "-I",
+        "-c",
+        ssh_module._SUBPROCESS_BIRTH_LAUNCHER,
+        str(birth_fd),
+        *argv,
     ]
+    assert kwargs == {
+        "stdin": 42,
+        "stdout": 42,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+        "pass_fds": (birth_fd, 42),
+        "text": False,
+        "start_new_session": True,
+    }
+    process.returncode = 0
+    authority.mark_group_cleanup_confirmed()
+    assert authority.release() is True
 
 
 def test_core_connection_subprocess_bridges_a_real_parent_owned_af_unix_stream() -> None:
     local_stream, child_stream = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    authority = ssh_module._OwnedSubprocessAuthority(trust_ownership=None)
+    authority.acquire()
     try:
-        child = ssh_module._start_core_connection_subprocess(
+        authority.spawn_tunnel(
             [
                 sys.executable,
                 "-c",
@@ -1848,16 +2035,21 @@ def test_core_connection_subprocess_bridges_a_real_parent_owned_af_unix_stream()
                     "sys.stdout.buffer.write(data.upper()); sys.stdout.buffer.flush()"
                 ),
             ],
-            child_stream.fileno(),
+            stream_fd=child_stream.fileno(),
         )
         child_stream.close()
         local_stream.sendall(b"core relay")
         local_stream.shutdown(socket.SHUT_WR)
         assert local_stream.recv(64) == b"CORE RELAY"
-        assert child.wait(timeout=5) == 0
+        authority.cleanup()
+        assert authority.process is not None
+        assert authority.process.returncode is not None
+        assert authority.released is True
     finally:
         local_stream.close()
         child_stream.close()
+        if not authority.released:
+            authority.cleanup()
 
 
 def test_core_tunnel_close_quarantines_unconfirmed_connection_child(
