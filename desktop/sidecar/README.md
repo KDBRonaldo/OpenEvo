@@ -114,11 +114,16 @@ a deterministic old/new request key. The mapping records canonical mapped
 intent and immutable project/task/workspace content snapshots separately from
 mutable Core authority: project ETag, active revision, project `updated_at`, and
 registry digest. A legitimate cross-session successor may change only that
-mutable authority. After capabilities, project/head agreement, and validation
-succeed, compare-and-swap commit increments the mapping generation and retains
-the previous version in adapter-owned history; an authority-only version may
-repeat the predecessor request digest. Core must sign the required new snapshots
-before Desktop accepts task, model/execution, evolution, or workspace changes.
+mutable authority. Every mapped, patch-recovery, and finalize-recovery read
+validates active revision authority monotonically before using the current ETag:
+the same generation must preserve the complete revision ref, while a changed ref
+must be the same-project direct successor. Generation rollback, identity rewrite,
+and unproven generation skips fail closed without committing a mapping. After
+capabilities, project/head agreement, and validation succeed, compare-and-swap
+commit increments the mapping generation and retains the previous version in
+adapter-owned history; an authority-only version may repeat the predecessor
+request digest. Core must sign the required new snapshots before Desktop accepts
+task, model/execution, evolution, or workspace changes.
 Imported workspace upload IDs are additionally bound to the exact Core project
 snapshot, so a workspace revision cannot reuse an earlier upload session. A
 superseded open upload is durably aborted before its binding is cleared. Its
@@ -135,8 +140,10 @@ replayed. An imported patch may then be finalized without invalidating its
 durable proof: recovery requires the persisted upload's predecessor snapshot
 and ETag plus the durable exact finalize response's project/workspace snapshots
 and publication before accepting current status/ETag or later successor
-authority. Finalize authority is CAS-persisted before mapping commit. Mapping CAS
-and matching applied-operation cleanup are atomic. After an O-to-A patch whose
+authority. The finalize project's active revision is also a durable lower bound;
+recovery accepts only that exact revision or its direct successor. Finalize
+authority is CAS-persisted before mapping commit. Mapping CAS and matching
+applied-operation cleanup are atomic. After an O-to-A patch whose
 mapping commit failed, a same-A retry commits the finalized A mapping; a later
 Local B edit first commits that proven A generation, then issues one distinct
 A-to-B patch from A's latest ETag without another project create.

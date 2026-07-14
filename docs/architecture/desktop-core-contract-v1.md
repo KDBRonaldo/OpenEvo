@@ -445,6 +445,14 @@ non-reachable revision produces a typed blocking error. None of these cases may
 fall back to an SSH run command, cached capability table, or renderer-generated
 reference.
 
+Persisted Desktop mapping, applied-patch, and workspace-finalize revision refs
+are monotonic authority. Before mapping reconciliation, same-intent activation,
+patch/finalize recovery, or an A-to-B patch can use current mutable authority,
+the sidecar requires Core's active revision to be either the exact persisted ref
+or its same-project, generation-adjacent successor. A lower generation, a
+same-generation ID or manifest rewrite, or an unproven generation skip returns a
+typed conflict before mapping commit or use of the reported ETag.
+
 Required-revision selection is fixed: if Core reports a reachable queued or
 preparing successor for the active head, the new task requires that successor
 and remains queued until Core activates it. Otherwise it requires the current
