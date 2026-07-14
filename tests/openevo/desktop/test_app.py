@@ -28,6 +28,7 @@ from desktop.server import (
 import desktop.server.launcher as desktop_launcher
 from desktop.server.launcher import DEFAULT_DESKTOP_CONFIG_ROOT, create_app
 import desktop.packaging.sidecar_entry as sidecar_entry
+from desktop.sidecar.workspace_identity import project_id_for_native_import
 
 
 class _BinaryStdin:
@@ -505,6 +506,89 @@ def test_create_app_launcher_accepts_config_root_override(tmp_path: Path) -> Non
     assert (
         config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY / "provider.sqlite3"
     ).is_file()
+
+
+def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    source_root = tmp_path / "research-data"
+    source_root.mkdir()
+    (source_root / "observations.csv").write_text("sample,value\na,7\n", encoding="utf-8")
+    session_token = "7c" * 32
+    session_headers = {desktop_launcher.NATIVE_SESSION_HEADER: session_token}
+    app = create_app(
+        static_root=_static_root(tmp_path),
+        desktop_config_root=config_root,
+        native_frame=desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token=session_token,
+        ),
+        source_commit="89baeb26",
+        build_channel="test",
+    )
+    request = {
+        "schema_version": "1",
+        "kind": "native_folder_snapshot",
+        "action_id": "native-source-action-0001",
+        "selected_path": str(source_root.resolve()),
+        "selected_device": source_root.stat().st_dev,
+        "selected_inode": source_root.stat().st_ino,
+    }
+
+    with TestClient(app) as client:
+        assert client.post("/openevo-native/workspace-imports", json=request).status_code == 403
+        imported = client.post(
+            "/openevo-native/workspace-imports",
+            headers=session_headers,
+            json=request,
+        )
+        replayed = client.post(
+            "/openevo-native/workspace-imports",
+            headers=session_headers,
+            json=request,
+        )
+
+        assert imported.status_code == replayed.status_code == 201
+        assert imported.json() == replayed.json()
+        source = imported.json()
+        assert source["kind"] == "native_folder_snapshot"
+        assert source["display_name"] == "research-data"
+        assert source["import_ref"]["import_id"].startswith("workspace-import-")
+        assert str(source_root) not in imported.text
+        assert "selected_path" not in imported.text
+        assert "/openevo-native/workspace-imports" not in client.get("/openapi.json").text
+
+        profile = client.post(
+            "/desktop/v1/profiles",
+            headers={**session_headers, "Idempotency-Key": "create-profile-action-0001"},
+            json={
+                "name": "Research server",
+                "host": "compute.example.org",
+                "port": 22,
+                "user": "researcher",
+            },
+        )
+        assert profile.status_code == 201
+        project = client.post(
+            "/desktop/v1/projects",
+            headers={**session_headers, "Idempotency-Key": "create-project-action-0001"},
+            json={
+                "name": "Native research project",
+                "profile_id": profile.json()["profile_id"],
+                "task": {"title": "Analyse", "objective": "Analyse the imported results."},
+                "source": source,
+                "execution": {
+                    "mode": "codex_subscription_transcript",
+                    "codex_model": "gpt-5",
+                },
+                "evolution": {"targets": {}},
+            },
+        )
+
+        assert project.status_code == 201
+        assert project.json()["project_id"] == project_id_for_native_import(
+            source["import_ref"]["import_id"]
+        )
 
 
 @pytest.mark.parametrize(

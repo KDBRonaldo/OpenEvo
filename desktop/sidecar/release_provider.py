@@ -18,6 +18,7 @@ from desktop.sidecar.contracts.v1.models import (
     HealthV1,
     ProjectCreateV1,
     ProjectPatchV1,
+    ProjectSourceV1,
     ProjectV1,
     RemoteProfileCreateV1,
     RemoteProfilePatchV1,
@@ -25,6 +26,8 @@ from desktop.sidecar.contracts.v1.models import (
     VersionV1,
 )
 from desktop.sidecar.provider_store import DesktopProviderStore
+from desktop.sidecar.workspace_identity import ownership_for_native_import
+from desktop.sidecar.workspace_imports import WorkspaceImportStore
 
 
 NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
@@ -51,6 +54,7 @@ class DesktopReleaseProvider:
     def __init__(
         self,
         store: DesktopProviderStore,
+        workspace_import_store: WorkspaceImportStore,
         *,
         build_version: str,
         source_commit: str,
@@ -64,6 +68,7 @@ class DesktopReleaseProvider:
         if type(readiness_key) is not bytes or len(readiness_key) != 32:
             raise ValueError("native readiness key must contain exactly 32 bytes")
         self._store = store
+        self._workspace_import_store = workspace_import_store
         self._instance_id = instance_id
         self._readiness_key = readiness_key
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -92,7 +97,14 @@ class DesktopReleaseProvider:
         }
 
     def close(self) -> None:
-        self._store.close()
+        try:
+            self._store.close()
+        finally:
+            self._workspace_import_store.close()
+
+    @property
+    def workspace_import_store(self) -> WorkspaceImportStore:
+        return self._workspace_import_store
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handler = self._handlers.get(operation_id)
@@ -185,8 +197,10 @@ class DesktopReleaseProvider:
         )
 
     def _create_project(self, arguments: Mapping[str, object]) -> Response:
+        request = cast(ProjectCreateV1, arguments["request"])
+        self._verify_project_source(request.source, project_id=None)
         project = self._store.create_project(
-            cast(ProjectCreateV1, arguments["request"]),
+            request,
             idempotency_key=cast(str, arguments["idempotency_key"]),
         )
         return self._resource_response(project, status_code=201)
@@ -196,9 +210,13 @@ class DesktopReleaseProvider:
         return self._resource_response(project)
 
     def _update_project(self, arguments: Mapping[str, object]) -> Response:
+        project_id = cast(str, arguments["project_id"])
+        request = cast(ProjectPatchV1, arguments["request"])
+        if request.source is not None:
+            self._verify_project_source(request.source, project_id=project_id)
         project = self._store.patch_project(
-            cast(str, arguments["project_id"]),
-            cast(ProjectPatchV1, arguments["request"]),
+            project_id,
+            request,
             if_match=cast(str, arguments["if_match"]),
         )
         return self._resource_response(project)
@@ -216,6 +234,19 @@ class DesktopReleaseProvider:
             raise ValueError("provider clock must return a timezone-aware datetime")
         return (
             now.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        )
+
+    def _verify_project_source(
+        self, source: ProjectSourceV1, *, project_id: str | None
+    ) -> None:
+        if source.kind != "native_folder_snapshot":
+            return
+        import_ref = source.import_ref
+        if import_ref is None:
+            raise ValueError("native folder source requires an import reference")
+        self._workspace_import_store.verify(
+            import_ref,
+            ownership=ownership_for_native_import(import_ref, project_id=project_id),
         )
 
     @staticmethod

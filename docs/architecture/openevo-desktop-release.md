@@ -284,6 +284,26 @@ remains uncompromised; an attacker that also reads/replaces that key can forge
 the store. Stronger same-UID isolation requires a platform credential boundary
 such as a separately entitled key service and is outside this store module.
 
+The release native-folder bridge does not send a path to React or to any public
+Local API operation. Rust records the selected directory's device and inode and
+sends those values with the path only over the authenticated private loopback
+route. The sidecar opens every absolute component with `O_NOFOLLOW`, rejects a
+final identity mismatch, scans the complete tree twice around archive creation,
+and checks every reopened entry against its first-scan identity. It accepts only
+NFC UTF-8 regular files and directories within the frozen entry, path, depth,
+file, extracted-byte, and archive-byte budgets. Symlinks and special files fail
+closed. The deterministic tar is an unlinked mode-`0600` temporary regular file
+before `WorkspaceImportStore.ingest` sees it.
+
+The private action deterministically selects the opaque import ID, so an exact
+retry with the same folder bytes converges and a changed body conflicts. A new
+project ID derives from that opaque import ID; existing-project replacement
+passes the saved project ID only on the private native boundary. Ownership is
+then reproducible from project ID and archive digest for verification and later
+Core upload. The private route is excluded from OpenAPI, uses the process-owned
+Desktop session token, bounds the JSON request before parsing, and returns only
+the frozen path-free `ProjectSourceV1` shape.
+
 The child calls `setsid`, so its PID is also the ID of a new session and process
 group. Before exec, it forks a minimal watchdog in that group. The native host
 installs the writer of a close-on-exec parent-liveness channel in state before

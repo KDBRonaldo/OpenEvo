@@ -1703,6 +1703,7 @@ class WorkspaceImportStore:
         source: int | BinaryIO,
         *,
         ownership: WorkspaceImportOwnership,
+        import_id: str | None = None,
     ) -> WorkspaceImportRefV1:
         """Validate and persist one already-open native archive handoff."""
 
@@ -1720,13 +1721,17 @@ class WorkspaceImportStore:
             raise WorkspaceArchiveValidationError(
                 "workspace import source identity changed while reading"
             )
-        import_id = f"{_IMPORT_ID_PREFIX}{secrets.token_hex(24)}"
+        if import_id is None:
+            import_id = f"{_IMPORT_ID_PREFIX}{secrets.token_hex(24)}"
+        else:
+            self._require_store_import_id(import_id)
         temporary_name = f"{_TEMP_PREFIX}{secrets.token_hex(24)}"
         temporary_identity: tuple[int, int] | None = None
         published = False
         with self._locked_root() as root_descriptor:
             retained, existing_ref = self._retained_usage(
                 root_descriptor,
+                requested_import_id=import_id,
                 requested_ownership=ownership,
                 requested_size=before.st_size,
                 requested_digest=source_digest,
@@ -1947,6 +1952,7 @@ class WorkspaceImportStore:
         self,
         root_descriptor: int,
         *,
+        requested_import_id: str | None = None,
         requested_ownership: WorkspaceImportOwnership | None = None,
         requested_size: int | None = None,
         requested_digest: str | None = None,
@@ -1982,6 +1988,14 @@ class WorkspaceImportStore:
             self._require_retained_capacity(import_count, archive_bytes)
             if requested_ownership is None:
                 continue
+            if name == requested_import_id and (
+                stored_ownership != requested_ownership
+                or stored_ref.byte_size != requested_size
+                or stored_ref.content_sha256 != requested_digest
+            ):
+                raise WorkspaceImportIntegrityError(
+                    "workspace import ID was reused for different content or ownership"
+                )
             if stored_ownership == requested_ownership:
                 if existing_ref is not None and existing_ref != stored_ref:
                     raise WorkspaceImportIntegrityError(
@@ -2559,6 +2573,27 @@ class WorkspaceImportStore:
                     expected_identity=snapshot_identity,
                     missing_ok=True,
                 )
+
+    def verify(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        *,
+        ownership: WorkspaceImportOwnership,
+    ) -> None:
+        """Verify one exact import and its owner without exposing archive bytes."""
+
+        self._require_external_import_ref(import_ref, operation="verify")
+        self._require_ownership(ownership, operation="verify")
+        with self._locked_root() as root_descriptor:
+            _stored_ref, _stored_ownership, archive_descriptor, _directory_identity = (
+                self._validate_import_contents(
+                    root_descriptor,
+                    import_ref.import_id,
+                    import_ref,
+                    expected_ownership=ownership,
+                )
+            )
+            os.close(archive_descriptor)
 
     @contextmanager
     def resolve(

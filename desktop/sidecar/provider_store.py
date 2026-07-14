@@ -44,6 +44,7 @@ from desktop.sidecar.contracts.v1.models import (
     RemoteProfileV1,
     ResourceRefV1,
 )
+from desktop.sidecar.workspace_identity import project_id_for_native_import
 
 
 SCHEMA_VERSION = 2
@@ -701,7 +702,12 @@ class ProviderMutation:
 
     def _create_project(self, request: ProjectCreateV1) -> ProjectV1:
         self._store._require_profile_row(self._connection, request.profile_id)
-        project_id = self._store._new_id()
+        project_id = (
+            project_id_for_native_import(request.source.import_ref.import_id)
+            if request.source.kind == "native_folder_snapshot"
+            and request.source.import_ref is not None
+            else self._store._new_id()
+        )
         timestamp = self._store._timestamp()
         self._connection.execute(
             """

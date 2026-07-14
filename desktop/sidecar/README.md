@@ -10,9 +10,11 @@ they are not implemented in every private sidecar service module.
 native-folder snapshot. Its ingest boundary accepts only an already-open,
 seekable regular-file descriptor or a binary stream backed by such a descriptor.
 It does not accept a host path, URI, archive bytes object, or renderer payload.
-The future Tauri native channel is responsible for opening the picker result
-without following a symlink and privately transferring the open descriptor to
-the sidecar.
+The Tauri host sends the canonical path plus its selected device/inode only to
+the authenticated private loopback route. `native_workspace.py` reopens every
+absolute component with no-follow semantics, requires the final directory to
+match that exact identity, creates the canonical archive in an unlinked private
+temporary file, and passes only that open regular-file stream to this store.
 
 Ingest validates uncompressed `openevo_deterministic_tar_v1` byte for byte while
 streaming it into an owner-only store. Validation covers the frozen POSIX ustar
@@ -53,8 +55,10 @@ remains confidential and unmodified and the owner-only state directory has
 retained its integrity.
 
 The store root and import directories are mode `0700`; archive and closed
-metadata files are mode `0600` and link-count one. A random opaque import ID is
-independent of the source name and content digest. Archive plus metadata publish
+metadata files are mode `0600` and link-count one. The store normally creates a
+random opaque import ID. The native route instead supplies an action-derived,
+opaque ID so exact retries converge without using a path or content as identity.
+Archive plus metadata publish
 as one fsynced directory through an atomic no-replace rename. Ingest records the
 temporary directory's device/inode identity immediately after creation. Every
 pre-publish rollback supplies that identity to quarantine cleanup; a missing or
@@ -115,10 +119,15 @@ restart and replacement guarantees above therefore require that the key has not
 leaked and that the private state directory has not been compromised. Stronger
 same-UID isolation requires a platform credential boundary outside this module.
 
-The native descriptor transport, picker lifecycle, Local HTTP/provider wiring,
-and Core upload consumer remain future integration work. The provider owns the
-mapping from frozen Local API project/operation context to the internal ownership
-value described above.
+The private route is excluded from OpenAPI and requires the exact process-owned
+Desktop session token. Its bounded request is the only path-bearing message;
+success returns the closed `ProjectSourceV1` and never echoes that path. Native
+import ownership is reproducible from project identity and archive digest. A new
+project created from a native import receives a deterministic project ID derived
+from the opaque import ID; an existing project supplies its own ID privately.
+The release provider verifies the exact import and ownership before persisting a
+native project source. Core upload consumption remains the next integration step.
+
 ## Release Local Provider
 
 The sidecar also owns the renderer-facing Desktop Local API and the process-owned
@@ -129,7 +138,8 @@ point instead of registering another route table.
 ### Current implementation
 
 `release_app.create_release_desktop_local_api_app()` creates the real Local API v1
-application. It owns one `DesktopProviderStore` for the process lifetime and
+application. It owns one `DesktopProviderStore` and one `WorkspaceImportStore`
+for the process lifetime and
 requires the native host to supply a Desktop session token, native instance ID,
 readiness key, source commit, and private state root.
 
@@ -144,6 +154,8 @@ This phase implements:
 - profile and project list/create/get/patch/delete through
   `DesktopProviderStore`, including durable idempotency, signed cursors, ETags,
   and restart recovery.
+- private identity-bound native folder import plus project-source verification;
+  this route is deliberately absent from the public Local API OpenAPI document.
 
 No SSH or Core operation is claimed by this slice. Connection actions,
 activation, validation, operations, runs, artifacts, services, diagnostics,

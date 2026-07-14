@@ -315,8 +315,11 @@ not renderer contracts.
 
 Task input contains only the ordinary-user title and objective. A project
 source is either a new scratch workspace or a native-folder snapshot. For the
-latter, React invokes the Tauri native picker; the host creates the canonical
-archive in private storage, hands it to the sidecar, and returns only
+latter, React invokes the Tauri native picker; the host opens the selected
+directory, records its device/inode, and sends the path and identity only over
+the authenticated private native-to-sidecar route. The sidecar reopens the
+identity-bound directory with no-follow semantics, creates the canonical archive
+as an unlinked private regular file, and returns only
 `WorkspaceImportRefV1 {import_id, content_sha256, byte_size, entry_count,
 extracted_byte_size}`.
 Neither the picker result nor the Local API contains a host path. Project

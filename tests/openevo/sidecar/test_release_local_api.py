@@ -77,6 +77,41 @@ def _create_profile(client: TestClient, *, name: str, key: str):
     )
 
 
+def test_project_create_rejects_an_unregistered_native_workspace_reference(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path / "state")
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Research server",
+            key="create-profile-native-0001",
+        ).json()
+        request = _project(profile["profile_id"])
+        request["source"] = {
+            "kind": "native_folder_snapshot",
+            "display_name": "research",
+            "import_ref": {
+                "import_id": f"workspace-import-{'1a' * 24}",
+                "content_sha256": "2b" * 32,
+                "byte_size": 1024,
+                "entry_count": 0,
+                "extracted_byte_size": 0,
+            },
+        }
+
+        response = client.post(
+            "/desktop/v1/projects",
+            headers={**SESSION_HEADERS, "Idempotency-Key": "create-project-native-0001"},
+            json=request,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["code"] == "workspace_import_invalid"
+        assert "workspace-import" not in response.text
+        assert str(tmp_path) not in response.text
+
+
 def test_release_discovery_health_and_desktop_session_auth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -143,7 +178,12 @@ def test_release_discovery_health_and_desktop_session_auth(
         assert malformed_challenge.status_code == 403
         assert missing_challenge.json()["code"] == "native_challenge_invalid"
         assert compared_values
-        assert all(expected == SESSION_TOKEN.encode("utf-8") for _, expected in compared_values)
+        session_comparisons = [
+            (candidate, expected)
+            for candidate, expected in compared_values
+            if expected == SESSION_TOKEN.encode("utf-8")
+        ]
+        assert len(session_comparisons) >= 3
         assert SESSION_TOKEN not in caplog.text
 
 
