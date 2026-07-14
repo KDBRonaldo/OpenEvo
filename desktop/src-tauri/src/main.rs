@@ -775,6 +775,8 @@ struct ManagedSidecar {
     spawn_pending: bool,
     child: Option<Child>,
     process_group: i32,
+    session_id: i32,
+    birth_identity: Option<String>,
     group_signal_authority: GroupSignalAuthority,
     process_cleanup_confirmed: bool,
     _private_launch_dir: Option<PrivateLaunchDirectory>,
@@ -785,6 +787,8 @@ struct ManagedSidecar {
 struct SpawnedHandoffProcess {
     child: Child,
     process_group: i32,
+    session_id: i32,
+    birth_identity: Option<String>,
     group_signal_authority: GroupSignalAuthority,
 }
 
@@ -1218,7 +1222,7 @@ fn linux_proc_stat_start_ticks(stat: &str) -> std::io::Result<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn sidecar_process_birth_identity(pid: i32) -> std::io::Result<(i32, String)> {
+fn sidecar_process_birth_identity(pid: i32) -> std::io::Result<(i32, i32, String)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let after_name = stat
         .rsplit_once(')')
@@ -1231,11 +1235,15 @@ fn sidecar_process_birth_identity(pid: i32) -> std::io::Result<(i32, String)> {
         .parse::<i32>()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc group"))?;
     let start_ticks = linux_proc_stat_start_ticks(&stat)?;
-    Ok((process_group, format!("linux:{start_ticks}")))
+    let session_id = unsafe { libc::getsid(pid) };
+    if session_id == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((process_group, session_id, format!("linux:{start_ticks}")))
 }
 
 #[cfg(target_os = "macos")]
-fn sidecar_process_birth_identity(pid: i32) -> std::io::Result<(i32, String)> {
+fn sidecar_process_birth_identity(pid: i32) -> std::io::Result<(i32, i32, String)> {
     use std::ffi::c_void;
 
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
@@ -1265,8 +1273,13 @@ fn sidecar_process_birth_identity(pid: i32) -> std::io::Result<(i32, String)> {
             "invalid process identity",
         ));
     }
+    let session_id = unsafe { libc::getsid(pid) };
+    if session_id == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok((
         info.pbi_pgid as i32,
+        session_id,
         format!("darwin:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
     ))
 }
@@ -3955,10 +3968,19 @@ fn spawn_sidecar_gated(
     *outcome = SpawnHandoffOutcome::Spawning;
     *outcome = match spawn() {
         Ok(child) => {
-            let process_group = child.id() as libc::pid_t;
+            let pid = child.id() as libc::pid_t;
+            let identity = sidecar_process_birth_identity(pid).ok().filter(
+                |(process_group, session_id, _)| *process_group == pid && *session_id == pid,
+            );
             SpawnHandoffOutcome::Spawned(SpawnedHandoffProcess {
                 child,
-                process_group,
+                process_group: identity
+                    .as_ref()
+                    .map_or(pid, |(process_group, _, _)| *process_group),
+                session_id: identity
+                    .as_ref()
+                    .map_or(pid, |(_, session_id, _)| *session_id),
+                birth_identity: identity.map(|(_, _, birth_identity)| birth_identity),
                 group_signal_authority: GroupSignalAuthority::Anchored,
             })
         }
@@ -3981,6 +4003,8 @@ fn spawn_sidecar_gated(
         SpawnHandoffOutcome::Spawned(spawned) => {
             managed.status.pid = Some(spawned.child.id());
             managed.process_group = spawned.process_group;
+            managed.session_id = spawned.session_id;
+            managed.birth_identity = spawned.birth_identity;
             managed.group_signal_authority = spawned.group_signal_authority;
             managed.child = Some(spawned.child);
         }
@@ -4001,7 +4025,26 @@ fn spawn_sidecar_gated(
     }
     drop(outcome);
     clear_spawn_handoff(state, &handoff)?;
-    if sidecar_was_poisoned {
+    let pid = managed.child.as_ref().ok_or_else(sidecar_state_error)?.id() as i32;
+    let identity_verified = managed.process_group == pid
+        && managed.session_id == pid
+        && managed.birth_identity.is_some();
+    if identity_verified {
+        eprintln!(
+            "{SIDECAR_PROCESS_MARKER} {} {pid} {} {} {}",
+            encode_hex(&managed.instance_id),
+            managed.process_group,
+            managed.session_id,
+            managed
+                .birth_identity
+                .as_deref()
+                .expect("verified sidecar identity has a birth identity"),
+        );
+    }
+    if !identity_verified {
+        managed.mark_cleanup_pending();
+        Err(sidecar_inspection_error())
+    } else if sidecar_was_poisoned {
         managed.mark_cleanup_pending();
         Err(sidecar_state_error())
     } else if startup_cancelled(state, startup_epoch) {
@@ -4440,6 +4483,8 @@ fn start_sidecar_inner_with<C: ProcessControl>(
         spawn_pending: true,
         child: None,
         process_group: 0,
+        session_id: 0,
+        birth_identity: None,
         group_signal_authority: GroupSignalAuthority::Anchored,
         process_cleanup_confirmed: false,
         _private_launch_dir: launch.private_launch_dir.take(),
@@ -4555,16 +4600,16 @@ fn renderer_ready_inner_with<C: ProcessControl>(
         return Err(sidecar_contract_incompatible_error());
     }
     let pid = child.id() as i32;
-    let (observed_process_group, birth_identity) =
+    let (observed_process_group, observed_session_id, birth_identity) =
         sidecar_process_birth_identity(pid).map_err(|_| sidecar_inspection_error())?;
-    if managed.process_group != pid || observed_process_group != managed.process_group {
+    if managed.process_group != pid
+        || managed.session_id != pid
+        || observed_process_group != managed.process_group
+        || observed_session_id != managed.session_id
+        || managed.birth_identity.as_deref() != Some(&birth_identity)
+    {
         return Err(sidecar_inspection_error());
     }
-    eprintln!(
-        "{SIDECAR_PROCESS_MARKER} {} {pid} {} {birth_identity}",
-        encode_hex(&managed.instance_id),
-        managed.process_group,
-    );
     eprintln!("{RENDERER_READY_MARKER} {openapi_sha256}");
     Ok(())
 }
@@ -6666,6 +6711,8 @@ mod tests {
             spawn_pending: false,
             child: Some(child),
             process_group,
+            session_id: process_group,
+            birth_identity: None,
             group_signal_authority: GroupSignalAuthority::Anchored,
             process_cleanup_confirmed: false,
             _private_launch_dir: None,
@@ -7003,6 +7050,8 @@ mod tests {
                 spawn_pending: true,
                 child: None,
                 process_group: 0,
+                session_id: 0,
+                birth_identity: None,
                 group_signal_authority: GroupSignalAuthority::Anchored,
                 process_cleanup_confirmed: false,
                 _private_launch_dir: None,
@@ -7021,6 +7070,8 @@ mod tests {
         *handoff.outcome.lock().unwrap() = SpawnHandoffOutcome::Spawned(SpawnedHandoffProcess {
             child,
             process_group,
+            session_id: process_group,
+            birth_identity: None,
             group_signal_authority: GroupSignalAuthority::Anchored,
         });
         advance_cancellation(&state);
@@ -7211,6 +7262,8 @@ mod tests {
                 spawn_pending: true,
                 child: None,
                 process_group: 0,
+                session_id: 0,
+                birth_identity: None,
                 group_signal_authority: GroupSignalAuthority::Anchored,
                 process_cleanup_confirmed: false,
                 _private_launch_dir: None,
@@ -7231,6 +7284,8 @@ mod tests {
             assert_eq!(managed.lifecycle, ManagedLifecycle::Starting);
             assert!(managed.child.is_some());
             assert!(managed.process_group > 0);
+            assert_eq!(managed.session_id, managed.process_group);
+            assert!(managed.birth_identity.is_some());
             assert_eq!(
                 managed.status.pid,
                 Some(managed.child.as_ref().unwrap().id())
@@ -7263,6 +7318,8 @@ mod tests {
                 spawn_pending: true,
                 child: None,
                 process_group: 0,
+                session_id: 0,
+                birth_identity: None,
                 group_signal_authority: GroupSignalAuthority::Anchored,
                 process_cleanup_confirmed: false,
                 _private_launch_dir: None,
@@ -7460,6 +7517,8 @@ mod tests {
                 spawn_pending: true,
                 child: None,
                 process_group: 0,
+                session_id: 0,
+                birth_identity: None,
                 group_signal_authority: GroupSignalAuthority::Anchored,
                 process_cleanup_confirmed: false,
                 _private_launch_dir: None,
@@ -7563,6 +7622,8 @@ mod tests {
                     spawn_pending: true,
                     child: None,
                     process_group: 0,
+                    session_id: 0,
+                    birth_identity: None,
                     group_signal_authority: GroupSignalAuthority::Anchored,
                     process_cleanup_confirmed: false,
                     _private_launch_dir: None,
@@ -7665,6 +7726,8 @@ mod tests {
             spawn_pending: false,
             child: Some(child),
             process_group,
+            session_id: process_group,
+            birth_identity: None,
             group_signal_authority: GroupSignalAuthority::Anchored,
             process_cleanup_confirmed: false,
             _private_launch_dir: None,
@@ -8018,7 +8081,7 @@ mod tests {
             .stderr(Stdio::null());
         unsafe {
             command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
+                if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -8369,6 +8432,8 @@ mod tests {
         let listener_port = allocated.port;
         let child = spawn_test_process_group("sleep 30");
         let process_group = child.id() as i32;
+        let (_, session_id, birth_identity) =
+            sidecar_process_birth_identity(process_group).unwrap();
         (
             ManagedSidecar {
                 status: LifecycleStatus {
@@ -8385,6 +8450,8 @@ mod tests {
                 spawn_pending: false,
                 child: Some(child),
                 process_group,
+                session_id,
+                birth_identity: Some(birth_identity),
                 group_signal_authority: GroupSignalAuthority::Anchored,
                 process_cleanup_confirmed: false,
                 _private_launch_dir: Some(private_launch_dir),

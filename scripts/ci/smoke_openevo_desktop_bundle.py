@@ -37,6 +37,7 @@ NATIVE_LOG_READ_SIZE = 16 * 1024
 NATIVE_GROUP_TERM_TIMEOUT_SECONDS = 5.0
 NATIVE_GROUP_KILL_TIMEOUT_SECONDS = 5.0
 SIDECAR_GROUP_EXIT_TIMEOUT_SECONDS = 5.0
+SIDECAR_GROUP_TERM_TIMEOUT_SECONDS = 0.5
 SIDECAR_GROUP_KILL_TIMEOUT_SECONDS = 5.0
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -391,7 +392,13 @@ class _NativeLogReader:
 
 
 class _SidecarProcessEvidence:
-    __slots__ = ("instance_id", "pid", "process_group", "birth_identity")
+    __slots__ = (
+        "instance_id",
+        "pid",
+        "process_group",
+        "session_id",
+        "birth_identity",
+    )
 
     def __init__(
         self,
@@ -399,11 +406,13 @@ class _SidecarProcessEvidence:
         instance_id: str,
         pid: int,
         process_group: int,
+        session_id: int,
         birth_identity: str,
     ) -> None:
         self.instance_id = instance_id
         self.pid = pid
         self.process_group = process_group
+        self.session_id = session_id
         self.birth_identity = birth_identity
 
 
@@ -416,12 +425,13 @@ def _parse_sidecar_process_marker(line: str) -> _SidecarProcessEvidence | None:
     if not line.startswith(f"{SIDECAR_PROCESS_PREFIX} "):
         return None
     parts = line.split(" ")
-    if len(parts) != 5 or any(not part for part in parts):
+    if len(parts) != 6 or any(not part for part in parts):
         raise SmokeFailure("OpenEvo Desktop reported invalid sidecar process evidence")
-    _, instance_id, pid_text, process_group_text, birth_identity = parts
+    _, instance_id, pid_text, process_group_text, session_id_text, birth_identity = parts
     try:
         pid = int(pid_text)
         process_group = int(process_group_text)
+        session_id = int(session_id_text)
     except ValueError as exc:
         raise SmokeFailure(
             "OpenEvo Desktop reported invalid sidecar process evidence"
@@ -433,6 +443,7 @@ def _parse_sidecar_process_marker(line: str) -> _SidecarProcessEvidence | None:
         not _SIDECAR_INSTANCE_ID.fullmatch(instance_id)
         or pid <= 1
         or process_group != pid
+        or session_id != pid
         or not birth_pattern.fullmatch(birth_identity)
     ):
         raise SmokeFailure("OpenEvo Desktop reported invalid sidecar process evidence")
@@ -440,6 +451,7 @@ def _parse_sidecar_process_marker(line: str) -> _SidecarProcessEvidence | None:
         instance_id=instance_id,
         pid=pid,
         process_group=process_group,
+        session_id=session_id,
         birth_identity=birth_identity,
     )
 
@@ -530,11 +542,13 @@ def _validate_sidecar_process_evidence(
 ) -> None:
     try:
         actual_process_group = os.getpgid(evidence.pid)
+        actual_session_id = os.getsid(evidence.pid)
     except OSError as exc:
         raise SmokeFailure("OpenEvo Desktop sidecar process identity could not be verified") from exc
     if (
         evidence.process_group == native_process_group
         or actual_process_group != evidence.process_group
+        or actual_session_id != evidence.session_id
         or _process_birth_identity(evidence.pid) != evidence.birth_identity
     ):
         raise SmokeFailure("OpenEvo Desktop sidecar process identity could not be verified")
@@ -557,6 +571,7 @@ def _verify_sidecar_process_group_exit(evidence: _SidecarProcessEvidence) -> Non
     leader_is_gone = False
     try:
         leader_group = os.getpgid(evidence.pid)
+        leader_session = os.getsid(evidence.pid)
     except ProcessLookupError:
         leader_is_gone = True
     except OSError as exc:
@@ -565,10 +580,19 @@ def _verify_sidecar_process_group_exit(evidence: _SidecarProcessEvidence) -> Non
         ) from exc
     if not leader_is_gone and (
         leader_group != evidence.process_group
+        or leader_session != evidence.session_id
         or _process_birth_identity(evidence.pid) != evidence.birth_identity
     ):
         raise SmokeFailure(
             "OpenEvo Desktop sidecar process group survived but its leader identity changed"
+        )
+    _signal_native_process_group(evidence.process_group, signal.SIGTERM)
+    if _wait_for_process_group_exit(
+        evidence.process_group, SIDECAR_GROUP_TERM_TIMEOUT_SECONDS
+    ):
+        raise SmokeFailure(
+            "OpenEvo Desktop sidecar process group survived the Rust watchdog "
+            "and required TERM cleanup"
         )
     _signal_native_process_group(evidence.process_group, signal.SIGKILL)
     cleaned = _wait_for_process_group_exit(
@@ -579,7 +603,8 @@ def _verify_sidecar_process_group_exit(evidence: _SidecarProcessEvidence) -> Non
             "OpenEvo Desktop sidecar process group survived active cleanup"
         )
     raise SmokeFailure(
-        "OpenEvo Desktop sidecar process group survived the Rust watchdog and required cleanup"
+        "OpenEvo Desktop sidecar process group survived the Rust watchdog and required "
+        "TERM/KILL cleanup"
     )
 
 
@@ -667,22 +692,27 @@ def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
         log_reader = _NativeLogReader(log_path)
         deadline = time.monotonic() + timeout_seconds
         sidecar_evidence: _SidecarProcessEvidence | None = None
+        renderer_ready = False
+
+        def capture_native_evidence() -> None:
+            nonlocal renderer_ready, sidecar_evidence
+            for line in log_reader.read_complete_lines():
+                evidence = _parse_sidecar_process_marker(line)
+                if evidence is not None:
+                    if sidecar_evidence is not None:
+                        raise SmokeFailure(
+                            "OpenEvo Desktop reported duplicate sidecar process evidence"
+                        )
+                    _validate_sidecar_process_evidence(
+                        evidence, native_process_group=process.pid
+                    )
+                    sidecar_evidence = evidence
+                if line == RENDERER_READY_MARKER:
+                    renderer_ready = True
+
         try:
             while time.monotonic() < deadline:
-                renderer_ready = False
-                for line in log_reader.read_complete_lines():
-                    evidence = _parse_sidecar_process_marker(line)
-                    if evidence is not None:
-                        if sidecar_evidence is not None:
-                            raise SmokeFailure(
-                                "OpenEvo Desktop reported duplicate sidecar process evidence"
-                            )
-                        _validate_sidecar_process_evidence(
-                            evidence, native_process_group=process.pid
-                        )
-                        sidecar_evidence = evidence
-                    if line == RENDERER_READY_MARKER:
-                        renderer_ready = True
+                capture_native_evidence()
                 if renderer_ready:
                     if sidecar_evidence is None:
                         raise SmokeFailure(
@@ -699,16 +729,23 @@ def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
                     return executable
                 exit_code = process.poll()
                 if exit_code is not None:
+                    capture_native_evidence()
                     raise SmokeFailure(
                         "OpenEvo Desktop exited before renderer readiness "
                         f"(code {exit_code}): {log_reader.tail_text()[-2048:]}"
                     )
                 time.sleep(0.1)
+            capture_native_evidence()
             raise SmokeFailure(
                 "OpenEvo Desktop did not report renderer readiness before timeout: "
                 f"{log_reader.tail_text()[-2048:]}"
             )
         finally:
+            capture_error: SmokeFailure | None = None
+            try:
+                capture_native_evidence()
+            except SmokeFailure as exc:
+                capture_error = exc
             native_cleanup_error: SmokeFailure | None = None
             try:
                 _terminate_native_process(process)
@@ -718,6 +755,8 @@ def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
                 _verify_sidecar_process_group_exit(sidecar_evidence)
             if native_cleanup_error is not None:
                 raise native_cleanup_error
+            if capture_error is not None:
+                raise capture_error
 
 
 def smoke_bundle(bundle_root: Path, *, timeout_seconds: float) -> Path:

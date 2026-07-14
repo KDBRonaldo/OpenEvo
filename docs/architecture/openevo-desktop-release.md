@@ -281,28 +281,37 @@ for both the superseded bootstrap and native stop to settle before invoking
 in-flight start, allowing the native cancellation epoch and bounded join path to
 reclaim a not-yet-published child. Therefore a release startup retry crosses a
 real native lifecycle boundary and cannot adopt the failed attempt's credential.
+Immediately after `Command::spawn` returns, the native host reads the sidecar
+leader's kernel birth identity (`/proc/<pid>/stat` start ticks on Linux or
+`PROC_PIDTBSDINFO` start time on macOS) and its kernel PGID and SID. It requires
+`PID == PGID == SID`, stores all four process identity dimensions in the
+manager-owned slot, and emits the internal sidecar-process marker immediately.
+The marker contains only the non-secret instance ID, PID, PGID, SID, and
+platform-tagged birth identity; it is native-smoke evidence, not an HTTP or
+renderer contract. This evidence publication is independent of renderer
+connection and readiness.
+
 Before exposing the product shell, the renderer invokes the internal
 `renderer_ready` command with the checked-in Local API digest. The native host
 rejects the report unless the same digest belongs to the currently running
 managed sidecar, its unreaped leader is still live, and its retained credential
 still proves both authenticated acceptance and unauthenticated rejection. The
-session probe runs without the manager lock; before emitting the marker, native
-code reacquires the lock and requires the same random instance, endpoint,
-lifecycle, contract, and a second non-reaping leader check. It then reads the
-leader's kernel birth identity (`/proc/<pid>/stat` start ticks on Linux or
-`PROC_PIDTBSDINFO` start time on macOS), verifies that `PID == PGID` from the
-`setsid` launch, and emits an internal sidecar-process marker followed by the
-fixed renderer-ready marker. The process marker contains only the non-secret
-instance ID, PID, PGID, platform-tagged birth identity; it is native-smoke
-evidence, not an HTTP or renderer contract.
+session probe runs without the manager lock; before emitting the fixed
+renderer-ready marker, native code reacquires the lock and requires the same
+random instance, endpoint, lifecycle, contract, and a second non-reaping leader
+check. It rereads PID, PGID, SID, and birth identity and requires an exact match
+with the spawn-time identity. `renderer_ready` does not re-emit sidecar process
+evidence.
 
-The Python smoke validates that marker against the live process before accepting
-renderer readiness. It then terminates the app's separate session, waits a
-bounded interval for the Rust parent-liveness watchdog to remove the exact
-sidecar group, and requires the group to disappear. A surviving group is killed
-within a second bounded interval and still makes the smoke red; timeout and
-error paths run the same cleanup, so a passing or failing smoke cannot leave its
-observed sidecar group behind.
+The Python smoke captures native output from process start and validates the
+sidecar marker's PID, PGID, SID, and birth identity against the live process
+before accepting renderer readiness. It drains complete evidence again at
+normal, timeout, error, and pre-readiness-exit boundaries before terminating the
+app's separate session. It then waits a bounded interval for the Rust
+parent-liveness watchdog to remove the exact sidecar group and requires the
+group to disappear. A surviving identity-bound group receives TERM and then
+bounded KILL escalation, and still makes the smoke red, so a passing or failing
+smoke cannot leave its observed sidecar group behind.
 
 Release policy does not read `OPENEVO_DESKTOP_SIDECAR_COMMAND`,
 `OPENEVO_DESKTOP_SIDECAR_PROGRAM`,

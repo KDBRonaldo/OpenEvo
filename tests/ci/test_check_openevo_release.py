@@ -135,7 +135,7 @@ def _write_fake_native_with_independent_sidecar(
         "else:\n"
         "    start_ticks = Path(f'/proc/{child.pid}/stat').read_text(encoding='utf-8').rsplit(')', 1)[1].split()[19]\n"
         "    birth = f'linux:{start_ticks}'\n"
-        "print(f'OPENEVO_DESKTOP_SIDECAR_PROCESS_V1 {\"a\" * 32} {child.pid} {os.getpgid(child.pid)} {birth}', flush=True)\n"
+        "print(f'OPENEVO_DESKTOP_SIDECAR_PROCESS_V1 {\"a\" * 32} {child.pid} {os.getpgid(child.pid)} {os.getsid(child.pid)} {birth}', flush=True)\n"
         f"print({renderer_marker!r}, flush=True)\n"
         + (
             "def stop(_signum, _frame):\n"
@@ -345,6 +345,26 @@ def test_bundle_smoke_cleans_independent_sidecar_on_readiness_failure(
     with pytest.raises(smoke.SmokeFailure):
         smoke.smoke_native_app(app, timeout_seconds=0.5)
     assert not _process_is_live(int(sidecar_pid_path.read_text(encoding="utf-8")))
+
+
+def test_bundle_smoke_reviewer_regression_kills_evidenced_setsid_sidecar_on_code7(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    sidecar_pid_path = tmp_path / "reviewer-code7-sidecar.pid"
+    _write_fake_native_with_independent_sidecar(
+        app,
+        renderer_marker="renderer-never-ready",
+        sidecar_pid_path=sidecar_pid_path,
+        clean_sidecar=True,
+        exit_after_markers=True,
+    )
+
+    with pytest.raises(smoke.SmokeFailure):
+        smoke.smoke_native_app(app, timeout_seconds=0.5)
+    sidecar_pid = int(sidecar_pid_path.read_text(encoding="utf-8"))
+    assert not _process_is_live(sidecar_pid)
 
 
 def test_bundle_smoke_uses_the_original_bundle_path_on_darwin(
@@ -573,7 +593,7 @@ def test_bundle_smoke_keeps_an_early_marker_beyond_the_log_tail(
         output.write(
             (
                 f"{smoke.SIDECAR_PROCESS_PREFIX} {'a' * 32} "
-                "515151 515151 linux:12345\n"
+                "515151 515151 515151 linux:12345\n"
             ).encode()
         )
         output.write((smoke.RENDERER_READY_MARKER + "\n").encode())
@@ -641,7 +661,7 @@ def test_bundle_smoke_always_cleans_the_native_process_group(
         "trap '' TERM\n"
         "sh -c 'trap \"\" TERM; while :; do sleep 1; done' &\n"
         f"echo $! > '{child_pid_path}'\n"
-        f"printf '%s\\n' '{smoke.SIDECAR_PROCESS_PREFIX} {'a' * 32} 515151 515151 linux:12345'\n"
+        f"printf '%s\\n' '{smoke.SIDECAR_PROCESS_PREFIX} {'a' * 32} 515151 515151 515151 linux:12345'\n"
         f"printf '%s\\n' '{marker}'\n"
         f"{final_command}\n",
         encoding="utf-8",
