@@ -27,19 +27,22 @@ Terminal Bench maintainer commands and package boundaries are documented in
 4. [OpenEvo Core Backend Release](core-backend-release.md)
    - Core install artifact, backend launcher, remote install identity, and
      release smoke evidence.
-5. [Evolution API And Method Integration](evolution-api-and-method-integration.md)
+5. [Core Control API v1 Provider](core-control-v1-provider.md)
+   - Frozen remote control contract ownership, durable projects/workspaces,
+     verified capabilities, service observation, SSE replay, and fail-closed gaps.
+6. [Evolution API And Method Integration](evolution-api-and-method-integration.md)
    - Core artifact contracts and how new evolution methods plug into the
      method registry.
-6. [Pluggable Evolution Framework Contract](evolution-framework.md)
+7. [Pluggable Evolution Framework Contract](evolution-framework.md)
    - A2 target/method registry, durable plan identity, verified worker dispatch,
      remote capability projection, handler contributions, and security contract.
-7. [Protected Evolution Behavior](protected-behavior.md)
+8. [Protected Evolution Behavior](protected-behavior.md)
    - A1 regression tests for validated methods and the proven stage boundaries
      preserved during productization.
-8. [OpenEvo Core Evolution Backend](evolution-backend.md)
+9. [OpenEvo Core Evolution Backend](evolution-backend.md)
    - Events, datasets, jobs, workers, artifact registry, context resolver, and
      storage layout.
-9. [Evolution Runtime Context](evolution-runtime-context.md)
+10. [Evolution Runtime Context](evolution-runtime-context.md)
    - How memory, skill bundles, agent-system text, and adapters are resolved and
      staged into runtime sessions.
 
