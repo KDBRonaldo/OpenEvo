@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import select
 import socket
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -45,6 +47,7 @@ class FakeController:
         self.current: dict[int, ProcessIdentity] = {}
         self.next_start = 100
         self.terminated: list[ProcessIdentity] = []
+        self.lock_holders: tuple[ProcessIdentity, ...] = ()
 
     def capture(self, pid: int) -> ProcessIdentity:
         identity = ProcessIdentity(pid=pid, boot_id=self.boot_id, start_time_ticks=self.next_start)
@@ -60,6 +63,9 @@ class FakeController:
         self.terminated.append(identity)
         if self.current.get(identity.pid) == identity:
             del self.current[identity.pid]
+
+    def find_lock_holders(self, _lock: object) -> tuple[ProcessIdentity, ...]:
+        return self.lock_holders
 
 
 class FakeChild:
@@ -115,6 +121,24 @@ def service_fakes(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeController, list
 
     def spawn(argv: list[str], **kwargs: object) -> FakeChild:
         child = FakeChild(argv, **kwargs)
+        identity = controller.capture(child.pid)
+        root_path = Path(argv[argv.index("--service-root") + 1])
+        with HostServiceRoot(root_path) as root:
+            pending = root.read_json("pending.json")
+            root.atomic_write_json(
+                "pending.json",
+                {
+                    "schema_version": 2,
+                    "phase": "spawn_claimed",
+                    "release_identity": pending["release_identity"],
+                    "pid": identity.pid,
+                    "boot_id": identity.boot_id,
+                    "start_time_ticks": identity.start_time_ticks,
+                    "port": pending["port"],
+                    "generation": pending["generation"],
+                },
+                replace=True,
+            )
         children.append(child)
         return child
 
@@ -173,6 +197,158 @@ def test_second_project_and_concurrent_bootstrap_attach_one_daemon(
     assert sorted(result.attached for result in results) == [False, True]
 
 
+def test_bootstrap_lock_serializes_verification_install_and_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root(tmp_path)
+    wheel = tmp_path / "openevo.whl"
+    framework_lock = tmp_path / "framework-lock.json"
+    wheel.write_bytes(b"wheel")
+    framework_lock.write_text("{}", encoding="ascii")
+    active = 0
+    max_active = 0
+    calls: list[tuple[str, str]] = []
+    thread_invocations: dict[int, int] = {}
+    guard = threading.Lock()
+
+    def run_private(
+        argv: list[str],
+        *,
+        deadline: float,
+        pass_fds: tuple[int, ...] = (),
+    ) -> int:
+        nonlocal active, max_active
+        del deadline
+        if "--bootstrap-lock-fd" in argv:
+            assert pass_fds == (int(argv[argv.index("--bootstrap-lock-fd") + 1]),)
+        else:
+            assert pass_fds == ()
+        attachment = next(
+            (item for item in argv if item.startswith("bootstrap-")),
+            "verification",
+        )
+        with guard:
+            active += 1
+            max_active = max(max_active, active)
+            calls.append((attachment, "start"))
+        time.sleep(0.02)
+        with guard:
+            calls.append((attachment, "end"))
+            active -= 1
+            thread_id = threading.get_ident()
+            invocation = thread_invocations.get(thread_id, 0) + 1
+            thread_invocations[thread_id] = invocation
+        return 1 if invocation == 1 else 0
+
+    monkeypatch.setattr(service, "require_host_global_service_root", lambda path: Path(path))
+    monkeypatch.setattr(service, "_run_private_command", run_private)
+    barrier = threading.Barrier(2)
+    failures: list[BaseException] = []
+
+    def bootstrap(suffix: str) -> None:
+        try:
+            barrier.wait()
+            service.bootstrap_core_service(
+                service_root=root,
+                wheel_path=wheel,
+                framework_lock=framework_lock,
+                source_commit=SOURCE_COMMIT,
+                attachment_name=f"bootstrap-{suffix * 32}.json",
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=bootstrap, args=(suffix,)) for suffix in ("1", "2")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert failures == []
+    assert max_active == 1
+    assert len(calls) == 16
+
+
+def test_real_process_bootstrap_lock_serializes_mutation_window(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    wheel = tmp_path / "openevo.whl"
+    framework_lock = tmp_path / "framework-lock.json"
+    events = tmp_path / "events.log"
+    wheel.write_bytes(b"wheel")
+    framework_lock.write_text("{}", encoding="ascii")
+    script = """
+import os
+from pathlib import Path
+import sys
+import time
+
+from openevo.backend import service
+
+root, wheel, framework_lock, events, suffix = sys.argv[1:]
+service.require_host_global_service_root = lambda path: Path(path)
+
+def run_private(argv, *, deadline, pass_fds=()):
+    del argv, deadline, pass_fds
+    with open(events, "a", encoding="ascii") as stream:
+        stream.write(f"{os.getpid()} start\\n")
+        stream.flush()
+    time.sleep(0.05)
+    with open(events, "a", encoding="ascii") as stream:
+        stream.write(f"{os.getpid()} end\\n")
+        stream.flush()
+    return 0
+
+service._run_private_command = run_private
+service.bootstrap_core_service(
+    service_root=root,
+    wheel_path=wheel,
+    framework_lock=framework_lock,
+    source_commit="1" * 40,
+    attachment_name=f"bootstrap-{suffix * 32}.json",
+)
+"""
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[2] / "src")}
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(root),
+                str(wheel),
+                str(framework_lock),
+                str(events),
+                suffix,
+            ],
+            env=env,
+        )
+        for suffix in ("1", "2")
+    ]
+    assert [process.wait(timeout=10) for process in processes] == [0, 0]
+    process_order = [line.split()[0] for line in events.read_text(encoding="ascii").splitlines()]
+    assert len(process_order) == 8
+    assert process_order in (
+        [str(processes[0].pid)] * 4 + [str(processes[1].pid)] * 4,
+        [str(processes[1].pid)] * 4 + [str(processes[0].pid)] * 4,
+    )
+
+
+def test_inherited_bootstrap_lock_must_be_bound_and_held(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    with HostServiceRoot(root) as pinned:
+        lock_fd = pinned.open_lock("bootstrap.lock")
+        try:
+            with pytest.raises(CoreServiceError) as exc_info:
+                service._require_inherited_lock(pinned, "bootstrap.lock", lock_fd)
+            assert exc_info.value.code is CoreServiceErrorCode.STATE_INVALID
+
+            service._flock_until(lock_fd, time.monotonic() + 1)
+            service._require_inherited_lock(pinned, "bootstrap.lock", lock_fd)
+        finally:
+            os.close(lock_fd)
+
+
 def test_port_conflict_is_typed_and_readiness_is_not_published(
     tmp_path: Path,
     service_fakes: tuple[FakeController, list[FakeChild]],
@@ -199,6 +375,38 @@ def test_port_conflict_is_typed_and_readiness_is_not_published(
     assert not (root / "ready.json").exists()
 
 
+def test_deterministic_fault_injection_runs_after_spawn_before_publication(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    injected: list[tuple[str, int]] = []
+
+    class InjectedCrash(RuntimeError):
+        pass
+
+    def crash(stage: str, pid: int) -> None:
+        injected.append((stage, pid))
+        raise InjectedCrash
+
+    with pytest.raises(InjectedCrash):
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            process_controller=controller,
+            _fault_injector=crash,
+        )
+
+    assert injected == [("after_spawn", children[0].pid)]
+    assert children[0].returncode == -15
+    assert not (root / "service.json").exists()
+    assert not (root / "pending.json").exists()
+
+
 def test_status_proof_requires_authenticated_verified_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -211,7 +419,7 @@ def test_status_proof_requires_authenticated_verified_identity(
     }
     status = {"registry_status": "verified", "registry_digest": RELEASE_A.registry_digest}
 
-    def fetch(_port: int, path: str, **_kwargs: object) -> object:
+    def fetch(_host: str, _port: int, path: str, **_kwargs: object) -> object:
         return version if path == "/version" else status
 
     monkeypatch.setattr(service, "_fetch_json", fetch)
@@ -219,6 +427,7 @@ def test_status_proof_requires_authenticated_verified_identity(
         port=8765,
         bearer="B" * 64,
         release=RELEASE_A,
+        generation="3" * 32,
         deadline=time.monotonic() + 1,
     )
     assert len(proof) == 64
@@ -230,6 +439,7 @@ def test_status_proof_requires_authenticated_verified_identity(
             port=8765,
             bearer="B" * 64,
             release=RELEASE_A,
+            generation="3" * 32,
             deadline=time.monotonic() + 1,
         )
     assert exc_info.value.code is CoreServiceErrorCode.STATUS_INVALID
@@ -279,12 +489,114 @@ def test_status_probe_rejects_redirect_and_duplicate_json(
     monkeypatch.setattr(service.http.client, "HTTPConnection", Connection)
     with pytest.raises(CoreServiceError) as exc_info:
         service._fetch_json(
+            "127.0.0.1",
             8765,
             "/v1/status",
             bearer="S" * 64,
             deadline=time.monotonic() + 1,
         )
     assert exc_info.value.code is CoreServiceErrorCode.STATUS_INVALID
+
+
+def test_endpoint_probe_authenticates_version_and_rejects_wrong_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = "3" * 32
+    requests: list[tuple[str, dict[str, str]]] = []
+    response_generation = ["0" * 32]
+
+    class Headers:
+        def get_content_type(self) -> str:
+            return "application/json"
+
+        def get(self, name: str, default: str | None = None) -> str | None:
+            values = {
+                "Content-Length": str(len(self.payload)),
+                "X-OpenEvo-Core-Generation": response_generation[0],
+                "X-OpenEvo-Core-Release-Identity": RELEASE_A.digest,
+            }
+            return values.get(name, default)
+
+    class Response:
+        status = 200
+
+        def __init__(self, path: str) -> None:
+            value = (
+                {
+                    "provider_kind": "openevo_core",
+                    "build_channel": "release",
+                    "source_commit": SOURCE_COMMIT,
+                    "openapi_sha256": "4" * 64,
+                    "build_version": "0.1.0",
+                }
+                if path == "/version"
+                else {
+                    "registry_status": "verified",
+                    "registry_digest": RELEASE_A.registry_digest,
+                }
+            )
+            self.payload = json.dumps(value).encode("ascii")
+            self.headers = Headers()
+            self.headers.payload = self.payload
+
+        def read(self, _limit: int) -> bytes:
+            return self.payload
+
+    class Connection:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            self.path = ""
+
+        def request(
+            self,
+            _method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
+            self.path = path
+            requests.append((path, headers))
+
+        def getresponse(self) -> Response:
+            return Response(self.path)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(service.http.client, "HTTPConnection", Connection)
+
+    with pytest.raises(CoreServiceError) as exc_info:
+        service.authenticate_core_service_endpoint(
+            host="127.0.0.1",
+            port=8765,
+            bearer="S" * 64,
+            release_identity=RELEASE_A.digest,
+            registry_digest=RELEASE_A.registry_digest,
+            source_commit=SOURCE_COMMIT,
+            generation=generation,
+            deadline=time.monotonic() + 1,
+        )
+
+    assert exc_info.value.code is CoreServiceErrorCode.STATUS_INVALID
+    assert requests == [("/version", {"Authorization": f"Bearer {'S' * 64}"})]
+
+    response_generation[0] = generation
+    requests.clear()
+    proof = service.authenticate_core_service_endpoint(
+        host="127.0.0.1",
+        port=8765,
+        bearer="S" * 64,
+        release_identity=RELEASE_A.digest,
+        registry_digest=RELEASE_A.registry_digest,
+        source_commit=SOURCE_COMMIT,
+        generation=generation,
+        deadline=time.monotonic() + 1,
+    )
+    assert len(proof) == 64
+    assert requests == [
+        ("/version", {"Authorization": f"Bearer {'S' * 64}"}),
+        ("/v1/status", {"Authorization": f"Bearer {'S' * 64}"}),
+    ]
 
 
 def test_identity_mismatch_requires_controlled_replacement(
@@ -349,7 +661,8 @@ def test_pending_process_is_recovered_before_restart(
         pinned.atomic_write_json(
             "pending.json",
             {
-                "schema_version": 1,
+                "schema_version": 2,
+                "phase": "spawn_claimed",
                 "release_identity": RELEASE_A.digest,
                 "pid": pending_identity.pid,
                 "boot_id": pending_identity.boot_id,
@@ -372,6 +685,155 @@ def test_pending_process_is_recovered_before_restart(
     assert controller.terminated == [pending_identity]
     assert len(children) == 1
     assert not (root / "pending.json").exists()
+
+
+def test_spawn_intent_process_probe_recovers_child_before_pid_claim(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    holder = ProcessIdentity(
+        pid=778,
+        boot_id=controller.boot_id,
+        start_time_ticks=56,
+    )
+    controller.current[holder.pid] = holder
+    controller.lock_holders = (holder,)
+    with HostServiceRoot(root) as pinned:
+        spawn_lock_fd = pinned.open_lock("spawn.lock")
+        metadata = os.fstat(spawn_lock_fd)
+        os.close(spawn_lock_fd)
+        pinned.atomic_write_json(
+            "pending.json",
+            {
+                "schema_version": 2,
+                "phase": "spawn_intent",
+                "release_identity": RELEASE_A.digest,
+                "port": 8765,
+                "generation": "8" * 32,
+                "spawn_lock_device": metadata.st_dev,
+                "spawn_lock_inode": metadata.st_ino,
+            },
+            replace=False,
+        )
+
+    attachment = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        port=0,
+        process_controller=controller,
+    )
+
+    assert attachment.attached is False
+    assert controller.terminated == [holder]
+    assert len(children) == 1
+    assert not (root / "pending.json").exists()
+
+
+def test_real_sigkill_after_spawn_converges_via_lock_inode_probe(tmp_path: Path) -> None:
+    if sys.platform != "linux":
+        pytest.skip("Linux /proc process probe is unavailable")
+    root = _root(tmp_path)
+    child_pid_path = tmp_path / "child.pid"
+    script = """
+import fcntl
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+from openevo.backend.runtime_identity import HostServiceRoot
+
+root_path = Path(sys.argv[1])
+child_pid_path = Path(sys.argv[2])
+with HostServiceRoot(root_path) as root:
+    lock_fd = root.open_lock("spawn.lock")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    metadata = os.fstat(lock_fd)
+    root.atomic_write_json(
+        "pending.json",
+        {
+            "schema_version": 2,
+            "phase": "spawn_intent",
+            "release_identity": "a" * 64,
+            "port": 8765,
+            "generation": "8" * 32,
+            "spawn_lock_device": metadata.st_dev,
+            "spawn_lock_inode": metadata.st_ino,
+        },
+        replace=False,
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        close_fds=True,
+        pass_fds=(lock_fd,),
+    )
+    child_pid_path.write_text(str(child.pid), encoding="ascii")
+    os.kill(os.getpid(), signal.SIGKILL)
+"""
+    supervisor = subprocess.Popen(
+        [sys.executable, "-c", script, str(root), str(child_pid_path)],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2] / "src")},
+    )
+    child_pid: int | None = None
+    try:
+        assert supervisor.wait(timeout=10) == -service.signal.SIGKILL
+        deadline = time.monotonic() + 5
+        while not child_pid_path.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        child_pid = int(child_pid_path.read_text(encoding="ascii"))
+        if hasattr(os, "pidfd_open") and hasattr(service.signal, "pidfd_send_signal"):
+            controller = service.LinuxProcessController()
+        else:
+
+            class ProbeController(service.LinuxProcessController):
+                def __init__(self) -> None:
+                    self.boot_id = Path(service._BOOT_ID_PATH).read_text(encoding="ascii").strip()
+
+                def terminate(
+                    self,
+                    identity: ProcessIdentity,
+                    *,
+                    deadline: float,
+                ) -> None:
+                    if not self.is_alive(identity):
+                        return
+                    os.kill(identity.pid, service.signal.SIGTERM)
+                    while self.is_alive(identity):
+                        assert time.monotonic() < deadline
+                        time.sleep(0.01)
+
+            controller = ProbeController()
+        child_identity = controller.capture(child_pid)
+        assert controller.is_alive(child_identity)
+        with HostServiceRoot(root) as pinned:
+            lifecycle_lock_fd = pinned.open_lock("lifecycle.lock")
+            try:
+                service._flock_until(lifecycle_lock_fd, time.monotonic() + 5)
+                service._recover_pending(
+                    pinned,
+                    controller=controller,
+                    deadline=time.monotonic() + 5,
+                )
+            finally:
+                os.close(lifecycle_lock_fd)
+        assert controller.is_alive(child_identity) is False
+        assert not (root / "pending.json").exists()
+    finally:
+        if supervisor.poll() is None:
+            supervisor.kill()
+            supervisor.wait(timeout=5)
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, service.signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_dead_process_restarts_without_signalling_reused_pid(
@@ -410,8 +872,34 @@ def test_dead_process_restarts_without_signalling_reused_pid(
         process_controller=controller,
     )
     assert restarted.generation != first.generation
+    assert restarted.bearer_token != first.bearer_token
     assert controller.terminated == []
     assert len(children) == 2
+
+
+def test_stop_terminates_exact_service_and_clears_publication(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+    )
+
+    service.stop_core_service(
+        service_root=root,
+        process_controller=controller,
+    )
+
+    assert len(controller.terminated) == 1
+    assert not (root / "service.json").exists()
+    assert not (root / "ready.json").exists()
 
 
 @pytest.mark.asyncio

@@ -464,12 +464,16 @@ deterministic bootstrap plan, writes a remote service topology under
 `<state_root>/services/topology.yaml`, then starts and checks the OpenEvo
 service daemons needed by Desktop Science runs:
 
-- OpenEvo Core backend on `127.0.0.1:8765`;
 - evolution backend on `127.0.0.1:8200`;
 - rollout on `127.0.0.1:8080`;
 - gateway on `127.0.0.1:8100`;
 - evolution worker bound to the same topology file;
 - vLLM on `127.0.0.1:8000` for `self-deployed`.
+
+The historical services plan no longer contains a per-run Core daemon. The
+host-global Core listener is selected and authenticated only by
+`openevo.deployment.core_control`; deleted fixed-port launcher arguments are not
+retained as a compatibility wrapper.
 
 The service commands use the remote user PATH plus `~/.local/bin` and export the
 same proxy/PIP/Hugging Face environment rendered from the remote profile for the

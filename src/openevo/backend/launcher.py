@@ -16,6 +16,7 @@ from openevo.backend.runtime_identity import (
     load_or_create_core_bearer_token,
     require_host_global_service_root,
 )
+from openevo.backend.service import claim_core_service_spawn
 from openevo.evolution.framework import (
     EvolutionExecutionProfile,
     load_verified_framework_registry,
@@ -33,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--source-commit", required=True)
     serve.add_argument("--socket-fd", type=int, required=True)
     serve.add_argument("--ready-fd", type=int, required=True)
+    serve.add_argument("--spawn-lock-fd", type=int, required=True)
     serve.add_argument("--expected-release-identity", required=True)
     serve.add_argument("--generation", required=True)
     run = subparsers.add_parser("run", help="Run an OpenEvo experiment snapshot.")
@@ -57,9 +59,28 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _serve_core_control(args: argparse.Namespace) -> int:
-    if args.socket_fd < 3 or args.ready_fd < 3 or args.socket_fd == args.ready_fd:
+    descriptors = {args.socket_fd, args.ready_fd, args.spawn_lock_fd}
+    if min(descriptors) < 3 or len(descriptors) != 3:
         raise RuntimeError("Core supervisor descriptors are invalid")
     require_host_global_service_root(args.service_root)
+    inherited_socket = socket.socket(fileno=args.socket_fd)
+    inherited_socket.set_inheritable(False)
+    host, port = inherited_socket.getsockname()[:2]
+    if (
+        inherited_socket.family != socket.AF_INET
+        or host != "127.0.0.1"
+        or not 0 < port <= 65535
+        or inherited_socket.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1
+    ):
+        inherited_socket.close()
+        raise RuntimeError("Core supervisor socket is not a listening IPv4 loopback socket")
+    claim_core_service_spawn(
+        service_root=args.service_root,
+        spawn_lock_fd=args.spawn_lock_fd,
+        release_identity=args.expected_release_identity,
+        port=port,
+        generation=args.generation,
+    )
     registry = load_verified_framework_registry(args.framework_lock)
     release = compute_release_identity(
         framework_lock=args.framework_lock,
@@ -78,17 +99,11 @@ def _serve_core_control(args: argparse.Namespace) -> int:
         build_channel="release",
         evolution_registry=registry,
     )
-    inherited_socket = socket.socket(fileno=args.socket_fd)
-    inherited_socket.set_inheritable(False)
-    host, port = inherited_socket.getsockname()[:2]
-    if (
-        inherited_socket.family != socket.AF_INET
-        or host != "127.0.0.1"
-        or not 0 < port <= 65535
-        or inherited_socket.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1
-    ):
-        inherited_socket.close()
-        raise RuntimeError("Core supervisor socket is not a listening IPv4 loopback socket")
+    _bind_host_service_identity(
+        app,
+        generation=args.generation,
+        release_identity=release.digest,
+    )
     try:
         return asyncio.run(
             _run_supervised_server(
@@ -105,6 +120,20 @@ def _serve_core_control(args: argparse.Namespace) -> int:
         )
     finally:
         inherited_socket.close()
+
+
+def _bind_host_service_identity(
+    app: object,
+    *,
+    generation: str,
+    release_identity: str,
+) -> None:
+    @app.middleware("http")
+    async def add_host_service_identity(request, call_next):
+        response = await call_next(request)
+        response.headers["X-OpenEvo-Core-Generation"] = generation
+        response.headers["X-OpenEvo-Core-Release-Identity"] = release_identity
+        return response
 
 
 async def _run_supervised_server(

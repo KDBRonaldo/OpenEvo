@@ -341,6 +341,62 @@ def test_run_invokes_ssh_with_batch_mode_and_maps_result(tmp_path: Path) -> None
     assert runner.calls[0][1] == 12.5
 
 
+def test_run_secret_never_builds_a_remote_command_result_or_exposes_repr(
+    tmp_path: Path,
+) -> None:
+    bearer = "SECRET_BEARER_CANARY"
+
+    class SecretRunner(RecordingRunner):
+        def __call__(
+            self, argv: list[str], timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append((argv, timeout_seconds))
+            marker = _assert_marked_command(argv[-1], "consume-secret")
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=bearer,
+                stderr=f"\n{marker}0\n",
+            )
+
+    transport = _transport(tmp_path, runner=SecretRunner())
+
+    result = transport.run_secret("consume-secret")
+
+    assert result.get_secret_value() == bearer
+    assert bearer not in repr(result)
+    assert not hasattr(result, "model_dump")
+
+
+def test_run_secret_failure_drops_payload_from_error_and_diagnostics(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bearer = "FAILED_SECRET_BEARER_CANARY"
+
+    class FailedSecretRunner(RecordingRunner):
+        def __call__(
+            self, argv: list[str], timeout_seconds: float
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append((argv, timeout_seconds))
+            marker = _assert_marked_command(argv[-1], "consume-secret")
+            return subprocess.CompletedProcess(
+                argv,
+                7,
+                stdout=bearer,
+                stderr=f"remote failure {bearer}\n{marker}7\n",
+            )
+
+    transport = _transport(tmp_path, runner=FailedSecretRunner())
+
+    with pytest.raises(SshTransportError) as exc_info:
+        transport.run_secret("consume-secret")
+
+    assert bearer not in str(exc_info.value)
+    assert bearer not in repr(exc_info.value)
+    assert bearer not in caplog.text
+
+
 def test_run_maps_remote_nonzero_exit_without_throwing(tmp_path: Path) -> None:
     runner = RecordingRunner(fail=True)
     transport = _transport(tmp_path, runner=runner)

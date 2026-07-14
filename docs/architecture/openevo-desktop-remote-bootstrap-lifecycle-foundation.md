@@ -16,9 +16,11 @@ transport layers. The goal is to let a local Desktop app prepare a remote GPU
 server for a Science run, return a structured readiness report, and expose data
 models that the UI can render while later service supervisors are built.
 
-Bootstrap itself prepares run state and dependencies. The Desktop service
-lifecycle endpoint starts the OpenEvo backend, gateway, rollout server,
-evolution worker, and optional vLLM server after bootstrap readiness. No current
+Bootstrap itself prepares run state and dependencies. The historical Desktop
+service lifecycle plan now excludes Core: host-global Core startup and attach
+are owned only by `openevo.deployment.core_control`. The remaining legacy plan
+can still start gateway, rollout, Evolution backend/worker, and optional vLLM
+services where older development flows require them. No current
 Desktop path starts a Docker Compose stack.
 
 ## Input Boundary
@@ -258,7 +260,7 @@ exact match is idempotent. A missing or changed identity stops the old managed P
 before starting a replacement; if the old PID cannot be stopped, startup fails
 instead of running two service generations.
 An unreadable framework lock also fails closed and never reuses the live daemon.
-This binds gateway, rollout, vLLM, Core backend, Evolution backend, and Evolution
+This binds gateway, rollout, vLLM, Evolution backend, and Evolution
 worker processes to the release wheel/lock and their startup command without
 adding a separate supervisor.
 

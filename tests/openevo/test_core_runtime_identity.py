@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import threading
 import stat
 from types import SimpleNamespace
 
@@ -17,6 +18,29 @@ from openevo.backend.runtime_identity import (
     load_or_create_core_bearer_token,
     require_host_global_service_root,
 )
+
+
+def test_concurrent_host_root_creation_converges(tmp_path: Path) -> None:
+    root_path = tmp_path / "core"
+    barrier = threading.Barrier(2)
+    failures: list[BaseException] = []
+
+    def create() -> None:
+        try:
+            barrier.wait()
+            with HostServiceRoot(root_path):
+                pass
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=create) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert failures == []
+    assert root_path.stat().st_mode & 0o777 == 0o700
 
 
 def test_host_service_root_rejects_symlink_and_insecure_mode(tmp_path: Path) -> None:

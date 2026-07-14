@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import hmac
 import re
+import secrets
 import shlex
 import time
 from typing import Literal, Protocol
@@ -10,6 +12,7 @@ from typing import Literal, Protocol
 from pydantic import SecretStr
 
 from openevo.backend.runtime_identity import RuntimeIdentityError, load_bounded_json
+from openevo.backend.service import authenticate_core_service_endpoint
 from openevo.deployment.executor import RemoteExecutorTransport
 from openevo.deployment.preflight import RemoteCommandResult
 
@@ -76,6 +79,7 @@ class RemoteCoreControlAttachment:
     capture_mode: Literal["transcript"]
     release_identity: str
     registry_digest: str
+    source_commit: str
     generation: str
     status_proof: str
     attached: bool
@@ -86,6 +90,25 @@ class RemoteCoreControlAttachment:
         return self._bearer.get_secret_value()
 
 
+class CoreTunnelHandle(Protocol):
+    local_host: str
+    local_port: int
+
+    @property
+    def base_url(self) -> str: ...
+
+    def close(self) -> None: ...
+
+
+class CoreBootstrapTransport(RemoteExecutorTransport, Protocol):
+    def run_secret(
+        self,
+        command: str,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> SecretStr: ...
+
+
 class CoreTunnelTransport(Protocol):
     def open_tunnel(
         self,
@@ -94,7 +117,32 @@ class CoreTunnelTransport(Protocol):
         remote_host: str = "127.0.0.1",
         wait_for_ready: bool = True,
         timeout_seconds: float = 10.0,
-    ) -> object: ...
+    ) -> CoreTunnelHandle: ...
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedCoreControlTunnel:
+    base_url: str
+    release_identity: str
+    registry_digest: str
+    source_commit: str
+    generation: str
+    status_proof: str
+    _tunnel: CoreTunnelHandle = field(repr=False, compare=False)
+    _bearer: SecretStr = field(repr=False, compare=False)
+
+    @property
+    def bearer_token(self) -> str:
+        return self._bearer.get_secret_value()
+
+    def close(self) -> None:
+        self._tunnel.close()
+
+    def __enter__(self) -> VerifiedCoreControlTunnel:
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
 
 
 def build_core_control_bootstrap_plan(
@@ -133,59 +181,18 @@ def build_core_control_bootstrap_plan(
 
 def execute_core_control_bootstrap(
     plan: CoreControlBootstrapPlan,
-    transport: RemoteExecutorTransport,
+    transport: CoreBootstrapTransport,
 ) -> RemoteCoreControlAttachment:
     deadline = time.monotonic() + plan.deadline_seconds
-    verification_command = (
-        "python3 -c "
-        + shlex.quote(
-            "from openevo.evolution.framework import "
-            "load_verified_framework_registry as load; "
-            "import sys; load(sys.argv[1])"
-        )
-        + " "
-        + shlex.quote(plan._framework_lock)
-    )
-    verification = _run_bootstrap_command(
-        transport,
-        verification_command,
-        deadline=deadline,
-        code=CoreControlBootstrapErrorCode.VERIFICATION_FAILED,
-        message="The installed Core release could not be verified.",
-    )
-    if not verification.ok:
-        install = _run_bootstrap_command(
-            transport,
-            "python3 -m pip install --user --no-deps --force-reinstall "
-            + shlex.quote(plan._wheel_path),
-            deadline=deadline,
-            code=CoreControlBootstrapErrorCode.INSTALL_FAILED,
-            message="The verified Core wheel could not be installed.",
-        )
-        if not install.ok:
-            raise CoreControlBootstrapError(
-                CoreControlBootstrapErrorCode.INSTALL_FAILED,
-                "The verified Core wheel could not be installed.",
-                retryable=True,
-            )
-        verification = _run_bootstrap_command(
-            transport,
-            verification_command,
-            deadline=deadline,
-            code=CoreControlBootstrapErrorCode.VERIFICATION_FAILED,
-            message="The installed Core release could not be verified.",
-        )
-        if not verification.ok:
-            raise CoreControlBootstrapError(
-                CoreControlBootstrapErrorCode.VERIFICATION_FAILED,
-                "The installed Core release did not match its framework lock.",
-                retryable=False,
-            )
+    attachment_name = f"bootstrap-{secrets.token_hex(16)}.json"
     service_command = (
-        "python3 -m openevo.backend.service ensure --bootstrap-json"
+        f"env PYTHONPATH={shlex.quote(plan._wheel_path)} "
+        "python3 -m openevo.backend.service bootstrap"
         f" --service-root {shlex.quote(plan._service_root)}"
+        f" --wheel-path {shlex.quote(plan._wheel_path)}"
         f" --framework-lock {shlex.quote(plan._framework_lock)}"
         f" --source-commit {plan.source_commit}"
+        f" --attachment-name {attachment_name}"
         f" --port {plan.port}"
         f" --deadline-seconds {max(1.0, plan.deadline_seconds)}"
         + (" --replace-mismatched" if plan.replace_mismatched else "")
@@ -203,7 +210,27 @@ def execute_core_control_bootstrap(
             "Core Control could not be attached or started.",
             retryable=True,
         )
-    return parse_core_control_attachment(service.stdout)
+    consume_command = (
+        "python3 -m openevo.backend.service consume-attachment"
+        f" --service-root {shlex.quote(plan._service_root)}"
+        f" --attachment-name {attachment_name}"
+    )
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise CoreControlBootstrapError(
+            CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED,
+            "Core bootstrap exceeded its total deadline.",
+            retryable=True,
+        )
+    try:
+        payload = transport.run_secret(consume_command, timeout_seconds=remaining)
+    except Exception:
+        raise CoreControlBootstrapError(
+            CoreControlBootstrapErrorCode.RESPONSE_INVALID,
+            "Core bootstrap attachment could not be read securely.",
+            retryable=True,
+        ) from None
+    return parse_core_control_attachment(payload)
 
 
 def _run_bootstrap_command(
@@ -227,15 +254,22 @@ def _run_bootstrap_command(
         raise CoreControlBootstrapError(code, message, retryable=True) from None
 
 
-def parse_core_control_attachment(payload: str) -> RemoteCoreControlAttachment:
-    if len(payload) > _MAX_BOOTSTRAP_JSON_BYTES:
+def parse_core_control_attachment(payload: SecretStr) -> RemoteCoreControlAttachment:
+    if not isinstance(payload, SecretStr):
+        raise CoreControlBootstrapError(
+            CoreControlBootstrapErrorCode.RESPONSE_INVALID,
+            "Core bootstrap returned an invalid attachment.",
+            retryable=False,
+        )
+    payload_value = payload.get_secret_value()
+    if len(payload_value) > _MAX_BOOTSTRAP_JSON_BYTES:
         raise CoreControlBootstrapError(
             CoreControlBootstrapErrorCode.RESPONSE_INVALID,
             "Core bootstrap returned an invalid attachment.",
             retryable=False,
         )
     try:
-        encoded = payload.encode("utf-8")
+        encoded = payload_value.encode("utf-8")
     except UnicodeError:
         raise CoreControlBootstrapError(
             CoreControlBootstrapErrorCode.RESPONSE_INVALID,
@@ -256,6 +290,7 @@ def parse_core_control_attachment(payload: str) -> RemoteCoreControlAttachment:
         "port",
         "release_identity",
         "registry_digest",
+        "source_commit",
         "generation",
         "status_proof",
         "attached",
@@ -284,6 +319,8 @@ def parse_core_control_attachment(payload: str) -> RemoteCoreControlAttachment:
         or _BEARER_PATTERN.fullmatch(bearer) is None
         or not _valid_digest(value.get("release_identity"))
         or not _valid_digest(value.get("registry_digest"))
+        or not isinstance(value.get("source_commit"), str)
+        or _SOURCE_COMMIT_PATTERN.fullmatch(value["source_commit"]) is None
         or not _valid_digest(value.get("status_proof"))
         or not isinstance(value.get("generation"), str)
         or re.fullmatch(r"[0-9a-f]{32}", value["generation"]) is None
@@ -300,6 +337,7 @@ def parse_core_control_attachment(payload: str) -> RemoteCoreControlAttachment:
         capture_mode="transcript",
         release_identity=value["release_identity"],
         registry_digest=value["registry_digest"],
+        source_commit=value["source_commit"],
         generation=value["generation"],
         status_proof=value["status_proof"],
         attached=attached,
@@ -312,7 +350,7 @@ def open_core_control_tunnel(
     transport: CoreTunnelTransport,
     *,
     timeout_seconds: float = 10.0,
-) -> object:
+) -> VerifiedCoreControlTunnel:
     if timeout_seconds <= 0 or timeout_seconds > 60:
         raise CoreControlBootstrapError(
             CoreControlBootstrapErrorCode.INVALID_PLAN,
@@ -320,7 +358,7 @@ def open_core_control_tunnel(
             retryable=False,
         )
     try:
-        return transport.open_tunnel(
+        tunnel = transport.open_tunnel(
             remote_port=attachment.remote_port,
             remote_host="127.0.0.1",
             wait_for_ready=True,
@@ -331,6 +369,54 @@ def open_core_control_tunnel(
             CoreControlBootstrapErrorCode.SERVICE_FAILED,
             "The Core Control tunnel could not be opened.",
             retryable=True,
+        ) from None
+    try:
+        expected_base_url = f"http://127.0.0.1:{tunnel.local_port}"
+        if (
+            tunnel.local_host != "127.0.0.1"
+            or not 1 <= tunnel.local_port <= 65535
+            or tunnel.base_url != expected_base_url
+        ):
+            raise CoreControlBootstrapError(
+                CoreControlBootstrapErrorCode.RESPONSE_INVALID,
+                "The Core Control tunnel endpoint is invalid.",
+                retryable=False,
+            )
+        proof = authenticate_core_service_endpoint(
+            host=tunnel.local_host,
+            port=tunnel.local_port,
+            bearer=attachment.bearer_token,
+            release_identity=attachment.release_identity,
+            registry_digest=attachment.registry_digest,
+            source_commit=attachment.source_commit,
+            generation=attachment.generation,
+            deadline=time.monotonic() + timeout_seconds,
+        )
+        if not hmac.compare_digest(proof, attachment.status_proof):
+            raise CoreControlBootstrapError(
+                CoreControlBootstrapErrorCode.RESPONSE_INVALID,
+                "The Core Control tunnel identity did not match its attachment.",
+                retryable=False,
+            )
+        return VerifiedCoreControlTunnel(
+            base_url=expected_base_url,
+            release_identity=attachment.release_identity,
+            registry_digest=attachment.registry_digest,
+            source_commit=attachment.source_commit,
+            generation=attachment.generation,
+            status_proof=proof,
+            _tunnel=tunnel,
+            _bearer=SecretStr(attachment.bearer_token),
+        )
+    except Exception:
+        try:
+            tunnel.close()
+        except Exception:
+            pass
+        raise CoreControlBootstrapError(
+            CoreControlBootstrapErrorCode.RESPONSE_INVALID,
+            "The Core Control tunnel failed authenticated identity verification.",
+            retryable=False,
         ) from None
 
 
@@ -348,10 +434,12 @@ def _is_remote_absolute_path(value: str) -> bool:
 
 
 __all__ = [
+    "CoreBootstrapTransport",
     "CoreControlBootstrapError",
     "CoreControlBootstrapErrorCode",
     "CoreControlBootstrapPlan",
     "RemoteCoreControlAttachment",
+    "VerifiedCoreControlTunnel",
     "build_core_control_bootstrap_plan",
     "execute_core_control_bootstrap",
     "open_core_control_tunnel",

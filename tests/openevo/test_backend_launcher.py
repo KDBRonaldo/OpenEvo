@@ -224,6 +224,8 @@ def test_backend_launcher_serve_requires_supervised_core_control(
                 "3",
                 "--ready-fd",
                 "4",
+                "--spawn-lock-fd",
+                "5",
                 "--expected-release-identity",
                 "2" * 64,
                 "--generation",
@@ -259,6 +261,17 @@ def test_supervised_launcher_builds_release_core_control_app(
     monkeypatch.setattr(launcher, "load_verified_framework_registry", lambda path: registry)
     monkeypatch.setattr(launcher, "compute_release_identity", lambda **kwargs: release)
 
+    def claim_spawn(**kwargs: object) -> None:
+        calls["claim"] = kwargs
+        os.close(int(kwargs["spawn_lock_fd"]))
+
+    monkeypatch.setattr(launcher, "claim_core_service_spawn", claim_spawn)
+    monkeypatch.setattr(
+        launcher,
+        "_bind_host_service_identity",
+        lambda *args, **kwargs: calls.setdefault("identity", (args, kwargs)),
+    )
+
     def create_app(**kwargs: object) -> object:
         calls["create"] = kwargs
         return app
@@ -284,6 +297,7 @@ def test_supervised_launcher_builds_release_core_control_app(
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     read_fd, write_fd = os.pipe()
+    spawn_lock_fd = os.open(tmp_path / "spawn.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
         result = launcher._serve_core_control(
             argparse.Namespace(
@@ -292,6 +306,7 @@ def test_supervised_launcher_builds_release_core_control_app(
                 source_commit=release.source_commit,
                 socket_fd=listener.detach(),
                 ready_fd=write_fd,
+                spawn_lock_fd=spawn_lock_fd,
                 expected_release_identity=release.digest,
                 generation="d" * 32,
             )

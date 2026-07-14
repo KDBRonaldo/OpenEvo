@@ -332,7 +332,10 @@ def _open_absolute_directory(path: Path, *, create: bool) -> int:
             except FileNotFoundError:
                 if not create:
                     raise
-                os.mkdir(component, mode=0o700, dir_fd=fd)
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
                 os.fsync(fd)
                 child = _open_at(fd, component, os.O_RDONLY | _directory_flag())
                 _require_directory(child, mode=0o700, label="Core service path")

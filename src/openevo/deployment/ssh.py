@@ -15,6 +15,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
+from pydantic import SecretStr
+
 from openevo.deployment.host_keys import TrustedKnownHostsBinding
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import RemoteProfileConfig
@@ -377,6 +379,55 @@ class SshRemoteExecutorTransport:
         if completed.returncode != 0:
             _log_transport_failure(SshTransportErrorCode.RSYNC_FAILED)
             raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
+
+    def run_secret(
+        self,
+        command: str,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> SecretStr:
+        try:
+            remote_command = _remote_command(command, cwd=None, env=None)
+        except Exception:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+        completion_marker = f"__OPENEVO_REMOTE_COMPLETION_{secrets.token_hex(16)}__="
+        marked_command = _with_completion_marker(remote_command, completion_marker)
+        completed: subprocess.CompletedProcess[str] | None = None
+        phase = "trust"
+        failure_code: SshTransportErrorCode | None = None
+        try:
+            with self._trusted_host.open_for_spawn(self._profile) as known_hosts_file:
+                phase = "process"
+                completed = self._runner(
+                    self._ssh_argv(marked_command, known_hosts_file),
+                    timeout_seconds,
+                )
+                phase = "trust"
+        except subprocess.TimeoutExpired:
+            failure_code = SshTransportErrorCode.TIMEOUT
+        except Exception:
+            failure_code = (
+                SshTransportErrorCode.START_FAILED
+                if phase == "process"
+                else SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+            )
+        if failure_code is not None:
+            _log_transport_failure(failure_code)
+            raise SshTransportError(failure_code)
+        assert completed is not None
+        _stderr, remote_return_code = _extract_remote_completion(
+            completed.stderr or "",
+            completion_marker,
+        )
+        if (
+            remote_return_code is None
+            or completed.returncode == 255
+            or int(completed.returncode) != remote_return_code
+            or remote_return_code != 0
+        ):
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        return SecretStr(completed.stdout or "")
 
     def open_tunnel(
         self,

@@ -17,7 +17,7 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from pydantic import SecretStr
 
@@ -43,6 +43,9 @@ _MAX_HTTP_BYTES = 64 * 1024
 _LEDGER_NAME = "service.json"
 _READY_NAME = "ready.json"
 _PENDING_NAME = "pending.json"
+_SPAWN_LOCK_NAME = "spawn.lock"
+_SERVICE_GENERATION_HEADER = "X-OpenEvo-Core-Generation"
+_RELEASE_IDENTITY_HEADER = "X-OpenEvo-Core-Release-Identity"
 
 
 class CoreServiceErrorCode(StrEnum):
@@ -53,6 +56,8 @@ class CoreServiceErrorCode(StrEnum):
     STATUS_INVALID = "core_service_status_invalid"
     DEADLINE_EXCEEDED = "core_service_deadline_exceeded"
     STATE_INVALID = "core_service_state_invalid"
+    INSTALL_FAILED = "core_service_install_failed"
+    VERIFICATION_FAILED = "core_service_verification_failed"
 
 
 class CoreServiceError(RuntimeError):
@@ -76,10 +81,17 @@ class ProcessIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class LockIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True, slots=True)
 class CoreServiceAttachment:
     port: int
     release_identity: str
     registry_digest: str
+    source_commit: str
     generation: str
     status_proof: str
     attached: bool
@@ -167,6 +179,55 @@ class LinuxProcessController:
             return False
         return current == identity and state not in {"X", "Z"}
 
+    def find_lock_holders(self, lock: LockIdentity) -> tuple[ProcessIdentity, ...]:
+        holders: dict[int, ProcessIdentity] = {}
+        try:
+            process_entries = os.scandir("/proc")
+        except OSError as exc:
+            raise CoreServiceError(
+                CoreServiceErrorCode.STATE_INVALID,
+                "Core service process inventory is unavailable.",
+                retryable=True,
+            ) from exc
+        with process_entries:
+            for process_entry in process_entries:
+                if not process_entry.name.isdecimal():
+                    continue
+                pid = int(process_entry.name)
+                if pid == os.getpid():
+                    continue
+                try:
+                    fd_entries = os.scandir(f"/proc/{pid}/fd")
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+                except OSError as exc:
+                    raise CoreServiceError(
+                        CoreServiceErrorCode.STATE_INVALID,
+                        "Core service process inventory cannot be inspected.",
+                        retryable=True,
+                    ) from exc
+                found = False
+                with fd_entries:
+                    for fd_entry in fd_entries:
+                        try:
+                            metadata = os.stat(fd_entry.path)
+                        except (FileNotFoundError, PermissionError, ProcessLookupError):
+                            continue
+                        if (metadata.st_dev, metadata.st_ino) == (
+                            lock.device,
+                            lock.inode,
+                        ):
+                            found = True
+                            break
+                if found:
+                    try:
+                        identity = self.capture(pid)
+                    except ProcessLookupError:
+                        continue
+                    if self.is_alive(identity):
+                        holders[pid] = identity
+        return tuple(holders[pid] for pid in sorted(holders))
+
     def terminate(self, identity: ProcessIdentity, *, deadline: float) -> None:
         try:
             pid_fd = os.pidfd_open(identity.pid, 0)
@@ -201,6 +262,8 @@ def ensure_core_service(
     deadline_seconds: float = 45.0,
     replace_mismatched: bool = False,
     process_controller: LinuxProcessController | None = None,
+    _fault_injector: Callable[[str, int], None] | None = None,
+    _bootstrap_lock_fd: int | None = None,
 ) -> CoreServiceAttachment:
     if not 0 <= port <= 65535 or deadline_seconds <= 0 or deadline_seconds > 300:
         raise CoreServiceError(
@@ -221,28 +284,37 @@ def ensure_core_service(
     with root:
         root.ensure_directory("state")
         controller = process_controller or LinuxProcessController()
-        registry = load_verified_framework_registry(framework_lock)
-        release = compute_release_identity(
-            framework_lock=framework_lock,
-            registry=registry,
-            source_commit=source_commit,
+        bootstrap_lock_fd = (
+            root.open_lock("bootstrap.lock") if _bootstrap_lock_fd is None else _bootstrap_lock_fd
         )
-        bearer = load_or_create_core_bearer_token(root)
-        lock_fd = root.open_lock("lifecycle.lock")
         try:
-            _flock_until(lock_fd, deadline)
-            return _ensure_locked(
-                root=root,
-                framework_lock=Path(framework_lock),
-                release=release,
-                bearer=bearer,
-                port=port,
-                deadline=deadline,
-                replace_mismatched=replace_mismatched,
-                controller=controller,
-            )
+            if _bootstrap_lock_fd is None:
+                _flock_until(bootstrap_lock_fd, deadline)
+            else:
+                _require_inherited_lock(root, "bootstrap.lock", bootstrap_lock_fd)
+            lifecycle_lock_fd = root.open_lock("lifecycle.lock")
+            try:
+                _flock_until(lifecycle_lock_fd, deadline)
+                registry = load_verified_framework_registry(framework_lock)
+                release = compute_release_identity(
+                    framework_lock=framework_lock,
+                    registry=registry,
+                    source_commit=source_commit,
+                )
+                return _ensure_locked(
+                    root=root,
+                    framework_lock=Path(framework_lock),
+                    release=release,
+                    port=port,
+                    deadline=deadline,
+                    replace_mismatched=replace_mismatched,
+                    controller=controller,
+                    fault_injector=_fault_injector,
+                )
+            finally:
+                os.close(lifecycle_lock_fd)
         finally:
-            os.close(lock_fd)
+            os.close(bootstrap_lock_fd)
 
 
 def inspect_core_service(
@@ -275,6 +347,7 @@ def inspect_core_service(
             port=_required_int(ledger, "port", minimum=1, maximum=65535),
             bearer=bearer,
             release=release,
+            generation=ledger["generation"],
             deadline=time.monotonic() + 5.0,
         )
         return _attachment_from_ledger(
@@ -291,6 +364,12 @@ def stop_core_service(
     deadline_seconds: float = 15.0,
     process_controller: LinuxProcessController | None = None,
 ) -> None:
+    if not 0 < deadline_seconds <= 300:
+        raise CoreServiceError(
+            CoreServiceErrorCode.START_FAILED,
+            "Core service stop settings are invalid.",
+            retryable=False,
+        )
     deadline = time.monotonic() + deadline_seconds
     try:
         require_host_global_service_root(service_root)
@@ -303,21 +382,156 @@ def stop_core_service(
         ) from exc
     with root:
         controller = process_controller or LinuxProcessController()
-        lock_fd = root.open_lock("lifecycle.lock")
+        bootstrap_lock_fd = root.open_lock("bootstrap.lock")
         try:
-            _flock_until(lock_fd, deadline)
-            ledger = root.read_optional_json(_LEDGER_NAME)
-            if ledger is not None:
-                identity = _process_from_ledger(_require_ledger(ledger))
-                if controller.is_alive(identity):
-                    controller.terminate(identity, deadline=deadline)
-            else:
-                _recover_pending(root, controller=controller, deadline=deadline)
-            root.unlink_regular(_LEDGER_NAME)
-            root.unlink_regular(_READY_NAME)
-            root.unlink_regular(_PENDING_NAME)
+            _flock_until(bootstrap_lock_fd, deadline)
+            lifecycle_lock_fd = root.open_lock("lifecycle.lock")
+            try:
+                _flock_until(lifecycle_lock_fd, deadline)
+                ledger = root.read_optional_json(_LEDGER_NAME)
+                if ledger is not None:
+                    identity = _process_from_ledger(_require_ledger(ledger))
+                    if controller.is_alive(identity):
+                        controller.terminate(identity, deadline=deadline)
+                else:
+                    _recover_pending(root, controller=controller, deadline=deadline)
+                root.unlink_regular(_LEDGER_NAME)
+                root.unlink_regular(_READY_NAME)
+                root.unlink_regular(_PENDING_NAME)
+            finally:
+                os.close(lifecycle_lock_fd)
         finally:
-            os.close(lock_fd)
+            os.close(bootstrap_lock_fd)
+
+
+def bootstrap_core_service(
+    *,
+    service_root: str | Path,
+    wheel_path: str | Path,
+    framework_lock: str | Path,
+    source_commit: str,
+    attachment_name: str,
+    port: int = 0,
+    deadline_seconds: float = 90.0,
+    replace_mismatched: bool = False,
+) -> None:
+    if (
+        not Path(wheel_path).is_absolute()
+        or not Path(framework_lock).is_absolute()
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+        or not 0 <= port <= 65535
+        or not 1 <= deadline_seconds <= 300
+    ):
+        raise CoreServiceError(
+            CoreServiceErrorCode.START_FAILED,
+            "Core bootstrap settings are invalid.",
+            retryable=False,
+        )
+    deadline = time.monotonic() + deadline_seconds
+    _validate_attachment_name(attachment_name)
+    try:
+        require_host_global_service_root(service_root)
+        root = HostServiceRoot(service_root)
+    except (OSError, RuntimeIdentityError) as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.INVALID_ROOT,
+            "Core service root failed private ownership validation.",
+            retryable=False,
+        ) from exc
+    verification_argv = [
+        sys.executable,
+        "-c",
+        (
+            "from openevo.evolution.framework import "
+            "load_verified_framework_registry as load; import sys; load(sys.argv[1])"
+        ),
+        str(framework_lock),
+    ]
+    with root:
+        bootstrap_lock_fd = root.open_lock("bootstrap.lock")
+        try:
+            _flock_until(bootstrap_lock_fd, deadline)
+            root.unlink_regular(attachment_name)
+            if _run_private_command(verification_argv, deadline=deadline) != 0:
+                install_argv = [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--user",
+                    "--no-deps",
+                    "--force-reinstall",
+                    str(wheel_path),
+                ]
+                if _run_private_command(install_argv, deadline=deadline) != 0:
+                    raise CoreServiceError(
+                        CoreServiceErrorCode.INSTALL_FAILED,
+                        "The verified Core wheel could not be installed.",
+                        retryable=True,
+                    )
+                if _run_private_command(verification_argv, deadline=deadline) != 0:
+                    raise CoreServiceError(
+                        CoreServiceErrorCode.VERIFICATION_FAILED,
+                        "The installed Core release did not match its framework lock.",
+                        retryable=False,
+                    )
+            ensure_argv = [
+                sys.executable,
+                "-m",
+                "openevo.backend.service",
+                "ensure",
+                "--service-root",
+                str(service_root),
+                "--framework-lock",
+                str(framework_lock),
+                "--source-commit",
+                source_commit,
+                "--port",
+                str(port),
+                "--deadline-seconds",
+                str(max(1.0, deadline - time.monotonic())),
+                "--attachment-name",
+                attachment_name,
+                "--bootstrap-lock-fd",
+                str(bootstrap_lock_fd),
+            ]
+            if replace_mismatched:
+                ensure_argv.append("--replace-mismatched")
+            if (
+                _run_private_command(
+                    ensure_argv,
+                    deadline=deadline,
+                    pass_fds=(bootstrap_lock_fd,),
+                )
+                != 0
+            ):
+                raise CoreServiceError(
+                    CoreServiceErrorCode.START_FAILED,
+                    "Core Control could not be attached or started.",
+                    retryable=True,
+                )
+        finally:
+            os.close(bootstrap_lock_fd)
+
+
+def consume_core_service_attachment(
+    *,
+    service_root: str | Path,
+    attachment_name: str,
+) -> bytes:
+    _validate_attachment_name(attachment_name)
+    try:
+        require_host_global_service_root(service_root)
+        with HostServiceRoot(service_root, create=False) as root:
+            payload = root.read_bytes(attachment_name, max_bytes=_MAX_READY_BYTES)
+            root.unlink_regular(attachment_name)
+            return payload
+    except (OSError, RuntimeIdentityError) as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATE_INVALID,
+            "Core bootstrap attachment is unavailable.",
+            retryable=False,
+        ) from exc
 
 
 def _ensure_locked(
@@ -325,12 +539,13 @@ def _ensure_locked(
     root: HostServiceRoot,
     framework_lock: Path,
     release: CoreReleaseIdentity,
-    bearer: str,
     port: int,
     deadline: float,
     replace_mismatched: bool,
     controller: LinuxProcessController,
+    fault_injector: Callable[[str, int], None] | None = None,
 ) -> CoreServiceAttachment:
+    bearer = load_or_create_core_bearer_token(root)
     existing_value = root.read_optional_json(_LEDGER_NAME)
     if existing_value is None:
         _recover_pending(root, controller=controller, deadline=deadline)
@@ -350,6 +565,7 @@ def _ensure_locked(
                 port=ledger["port"],
                 bearer=bearer,
                 release=release,
+                generation=ledger["generation"],
                 deadline=deadline,
             )
             _verify_ready_ledger(root, ledger, proof)
@@ -369,14 +585,17 @@ def _ensure_locked(
                 )
             if alive:
                 controller.terminate(process, deadline=deadline)
-            bearer = rotate_core_bearer_token(root)
         root.unlink_regular(_LEDGER_NAME)
         root.unlink_regular(_READY_NAME)
         root.unlink_regular(_PENDING_NAME)
 
     _require_time(deadline)
+    bearer = rotate_core_bearer_token(root)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     child: subprocess.Popen[bytes] | None = None
+    ready_read = -1
+    ready_write = -1
+    spawn_lock_fd = -1
     try:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
         try:
@@ -392,6 +611,22 @@ def _ensure_locked(
         ready_read, ready_write = os.pipe2(os.O_CLOEXEC)
         log_fd = _open_log(root)
         generation = os.urandom(16).hex()
+        spawn_lock_fd = root.open_lock(_SPAWN_LOCK_NAME)
+        _flock_until(spawn_lock_fd, deadline)
+        spawn_lock_metadata = os.fstat(spawn_lock_fd)
+        root.atomic_write_json(
+            _PENDING_NAME,
+            {
+                "schema_version": 2,
+                "phase": "spawn_intent",
+                "release_identity": release.digest,
+                "port": actual_port,
+                "generation": generation,
+                "spawn_lock_device": spawn_lock_metadata.st_dev,
+                "spawn_lock_inode": spawn_lock_metadata.st_ino,
+            },
+            replace=False,
+        )
         argv = [
             sys.executable,
             "-m",
@@ -407,6 +642,8 @@ def _ensure_locked(
             str(listener.fileno()),
             "--ready-fd",
             str(ready_write),
+            "--spawn-lock-fd",
+            str(spawn_lock_fd),
             "--expected-release-identity",
             release.digest,
             "--generation",
@@ -420,35 +657,21 @@ def _ensure_locked(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
-                pass_fds=(listener.fileno(), ready_write),
+                pass_fds=(listener.fileno(), ready_write, spawn_lock_fd),
             )
         finally:
             os.close(log_fd)
             os.close(ready_write)
-        process = controller.capture(child.pid)
-        if not controller.is_alive(process):
-            raise CoreServiceError(
-                CoreServiceErrorCode.START_FAILED,
-                "Core service exited during startup.",
-                retryable=True,
-            )
-        root.atomic_write_json(
-            _PENDING_NAME,
-            {
-                "schema_version": 1,
-                "release_identity": release.digest,
-                "pid": process.pid,
-                "boot_id": process.boot_id,
-                "start_time_ticks": process.start_time_ticks,
-                "port": actual_port,
-                "generation": generation,
-            },
-            replace=False,
-        )
+            ready_write = -1
+            os.close(spawn_lock_fd)
+            spawn_lock_fd = -1
+        if fault_injector is not None:
+            fault_injector("after_spawn", child.pid)
         try:
             ready = _wait_ready(ready_read, child, deadline=deadline)
         finally:
             os.close(ready_read)
+            ready_read = -1
         if ready != {
             "schema_version": 1,
             "generation": generation,
@@ -460,6 +683,13 @@ def _ensure_locked(
                 "Core service returned an invalid readiness proof.",
                 retryable=True,
             )
+        process = _claimed_process(
+            root,
+            expected_pid=child.pid,
+            release_identity=release.digest,
+            port=actual_port,
+            generation=generation,
+        )
         if not controller.is_alive(process):
             raise CoreServiceError(
                 CoreServiceErrorCode.START_FAILED,
@@ -470,6 +700,7 @@ def _ensure_locked(
             port=actual_port,
             bearer=bearer,
             release=release,
+            generation=generation,
             deadline=deadline,
         )
         ready_ledger = {
@@ -519,6 +750,9 @@ def _ensure_locked(
             pass
         raise
     finally:
+        for descriptor in (ready_read, ready_write, spawn_lock_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
         listener.close()
 
 
@@ -527,18 +761,79 @@ def _authenticated_status_proof(
     port: int,
     bearer: str,
     release: CoreReleaseIdentity,
+    generation: str,
+    deadline: float,
+    host: str = "127.0.0.1",
+) -> str:
+    return authenticate_core_service_endpoint(
+        host=host,
+        port=port,
+        bearer=bearer,
+        release_identity=release.digest,
+        registry_digest=release.registry_digest,
+        source_commit=release.source_commit,
+        generation=generation,
+        deadline=deadline,
+    )
+
+
+def authenticate_core_service_endpoint(
+    *,
+    host: str,
+    port: int,
+    bearer: str,
+    release_identity: str,
+    registry_digest: str,
+    source_commit: str,
+    generation: str,
     deadline: float,
 ) -> str:
-    version = _fetch_json(port, "/version", bearer=None, deadline=deadline)
-    status = _fetch_json(port, "/v1/status", bearer=bearer, deadline=deadline)
+    if (
+        host != "127.0.0.1"
+        or not 1 <= port <= 65535
+        or re.fullmatch(r"[A-Za-z0-9_-]{64}", bearer) is None
+        or re.fullmatch(r"[0-9a-f]{64}", release_identity) is None
+        or re.fullmatch(r"[0-9a-f]{64}", registry_digest) is None
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+        or re.fullmatch(r"[0-9a-f]{32}", generation) is None
+    ):
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATUS_INVALID,
+            "Core service endpoint identity is invalid.",
+            retryable=False,
+        )
+    expected_headers = {
+        _SERVICE_GENERATION_HEADER: generation,
+        _RELEASE_IDENTITY_HEADER: release_identity,
+    }
+    version = _fetch_json(
+        host,
+        port,
+        "/version",
+        bearer=bearer,
+        deadline=deadline,
+        expected_headers=expected_headers,
+    )
+    status = _fetch_json(
+        host,
+        port,
+        "/v1/status",
+        bearer=bearer,
+        deadline=deadline,
+        expected_headers=expected_headers,
+    )
     if (
         not isinstance(version, dict)
         or version.get("provider_kind") != "openevo_core"
         or version.get("build_channel") != "release"
-        or version.get("source_commit") != release.source_commit
+        or version.get("source_commit") != source_commit
+        or not isinstance(version.get("openapi_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", version["openapi_sha256"]) is None
+        or not isinstance(version.get("build_version"), str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", version["build_version"]) is None
         or not isinstance(status, dict)
         or status.get("registry_status") != "verified"
-        or status.get("registry_digest") != release.registry_digest
+        or status.get("registry_digest") != registry_digest
     ):
         raise CoreServiceError(
             CoreServiceErrorCode.STATUS_INVALID,
@@ -548,7 +843,8 @@ def _authenticated_status_proof(
     material = canonical_json_bytes(
         {
             "schema_version": 1,
-            "release_identity": release.digest,
+            "generation": generation,
+            "release_identity": release_identity,
             "openapi_sha256": version.get("openapi_sha256"),
             "build_version": version.get("build_version"),
             "source_commit": version.get("source_commit"),
@@ -562,11 +858,13 @@ def _authenticated_status_proof(
 
 
 def _fetch_json(
+    host: str,
     port: int,
     path: str,
     *,
     bearer: str | None,
     deadline: float,
+    expected_headers: dict[str, str] | None = None,
 ) -> Any:
     last_error: Exception | None = None
     while True:
@@ -579,7 +877,7 @@ def _fetch_json(
             ) from last_error
         headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
         connection = http.client.HTTPConnection(
-            "127.0.0.1",
+            host,
             port,
             timeout=min(1.0, remaining),
         )
@@ -590,6 +888,15 @@ def _fetch_json(
                 raise CoreServiceError(
                     CoreServiceErrorCode.STATUS_INVALID,
                     "Core service status endpoint rejected identity verification.",
+                    retryable=False,
+                )
+            if expected_headers is not None and any(
+                not hmac.compare_digest(response.headers.get(name, ""), expected)
+                for name, expected in expected_headers.items()
+            ):
+                raise CoreServiceError(
+                    CoreServiceErrorCode.STATUS_INVALID,
+                    "Core service endpoint generation did not match the attachment.",
                     retryable=False,
                 )
             content_type = response.headers.get_content_type()
@@ -718,23 +1025,62 @@ def _recover_pending(
     if value is None:
         root.unlink_regular(_READY_NAME)
         return
-    expected = {
+    pending = _require_pending(value)
+    if pending["phase"] == "spawn_intent":
+        lock_identity = LockIdentity(
+            device=pending["spawn_lock_device"],
+            inode=pending["spawn_lock_inode"],
+        )
+        for holder in controller.find_lock_holders(lock_identity):
+            controller.terminate(holder, deadline=deadline)
+        spawn_lock_fd = root.open_lock(_SPAWN_LOCK_NAME)
+        try:
+            metadata = os.fstat(spawn_lock_fd)
+            if (metadata.st_dev, metadata.st_ino) != (
+                lock_identity.device,
+                lock_identity.inode,
+            ):
+                raise CoreServiceError(
+                    CoreServiceErrorCode.STATE_INVALID,
+                    "Core service spawn lock identity changed.",
+                    retryable=False,
+                )
+            _flock_until(spawn_lock_fd, deadline)
+            current = root.read_optional_json(_PENDING_NAME, max_bytes=_MAX_READY_BYTES)
+            if current is not None:
+                pending = _require_pending(current)
+        finally:
+            os.close(spawn_lock_fd)
+    if pending["phase"] == "spawn_claimed":
+        identity = ProcessIdentity(
+            pid=pending["pid"],
+            boot_id=pending["boot_id"],
+            start_time_ticks=pending["start_time_ticks"],
+        )
+        if controller.is_alive(identity):
+            controller.terminate(identity, deadline=deadline)
+    root.unlink_regular(_PENDING_NAME)
+    root.unlink_regular(_READY_NAME)
+
+
+def _require_pending(value: Any) -> dict[str, Any]:
+    common = {
         "schema_version",
+        "phase",
         "release_identity",
-        "pid",
-        "boot_id",
-        "start_time_ticks",
         "port",
         "generation",
     }
+    intent_keys = common | {"spawn_lock_device", "spawn_lock_inode"}
+    claimed_keys = common | {"pid", "boot_id", "start_time_ticks"}
     if (
         not isinstance(value, dict)
-        or set(value) != expected
-        or value.get("schema_version") != 1
+        or value.get("schema_version") != 2
+        or (value.get("phase") == "spawn_intent" and set(value) != intent_keys)
+        or (value.get("phase") == "spawn_claimed" and set(value) != claimed_keys)
+        or value.get("phase") not in {"spawn_intent", "spawn_claimed"}
         or not isinstance(value.get("release_identity"), str)
         or re.fullmatch(r"[0-9a-f]{64}", value["release_identity"]) is None
-        or not isinstance(value.get("boot_id"), str)
-        or _BOOT_ID_PATTERN.fullmatch(value["boot_id"]) is None
         or not isinstance(value.get("generation"), str)
         or re.fullmatch(r"[0-9a-f]{32}", value["generation"]) is None
     ):
@@ -743,18 +1089,125 @@ def _recover_pending(
             "Core service pending state is invalid.",
             retryable=False,
         )
-    _required_int(value, "pid", minimum=1)
-    _required_int(value, "start_time_ticks", minimum=1)
     _required_int(value, "port", minimum=1, maximum=65535)
-    identity = ProcessIdentity(
-        pid=value["pid"],
-        boot_id=value["boot_id"],
-        start_time_ticks=value["start_time_ticks"],
+    if value["phase"] == "spawn_intent":
+        _required_int(value, "spawn_lock_device", minimum=1)
+        _required_int(value, "spawn_lock_inode", minimum=1)
+    else:
+        _required_int(value, "pid", minimum=1)
+        _required_int(value, "start_time_ticks", minimum=1)
+        if (
+            not isinstance(value.get("boot_id"), str)
+            or _BOOT_ID_PATTERN.fullmatch(value["boot_id"]) is None
+        ):
+            raise CoreServiceError(
+                CoreServiceErrorCode.STATE_INVALID,
+                "Core service pending state is invalid.",
+                retryable=False,
+            )
+    return value
+
+
+def _claimed_process(
+    root: HostServiceRoot,
+    *,
+    expected_pid: int,
+    release_identity: str,
+    port: int,
+    generation: str,
+) -> ProcessIdentity:
+    pending = _require_pending(root.read_json(_PENDING_NAME, max_bytes=_MAX_READY_BYTES))
+    if (
+        pending["phase"] != "spawn_claimed"
+        or pending["pid"] != expected_pid
+        or pending["release_identity"] != release_identity
+        or pending["port"] != port
+        or pending["generation"] != generation
+    ):
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATE_INVALID,
+            "Core service child claim does not match the spawn intent.",
+            retryable=False,
+        )
+    return ProcessIdentity(
+        pid=pending["pid"],
+        boot_id=pending["boot_id"],
+        start_time_ticks=pending["start_time_ticks"],
     )
-    if controller.is_alive(identity):
-        controller.terminate(identity, deadline=deadline)
-    root.unlink_regular(_PENDING_NAME)
-    root.unlink_regular(_READY_NAME)
+
+
+def claim_core_service_spawn(
+    *,
+    service_root: str | Path,
+    spawn_lock_fd: int,
+    release_identity: str,
+    port: int,
+    generation: str,
+) -> ProcessIdentity:
+    try:
+        require_host_global_service_root(service_root)
+        if spawn_lock_fd < 3:
+            raise RuntimeIdentityError("Core spawn lock descriptor is invalid")
+        with HostServiceRoot(service_root, create=False) as root:
+            lock_metadata = os.fstat(spawn_lock_fd)
+            pathname_metadata = os.stat(
+                _SPAWN_LOCK_NAME,
+                dir_fd=root.fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat_is_regular(lock_metadata.st_mode)
+                or lock_metadata.st_uid != os.geteuid()
+                or (lock_metadata.st_mode & 0o777) != 0o600
+                or (lock_metadata.st_dev, lock_metadata.st_ino)
+                != (pathname_metadata.st_dev, pathname_metadata.st_ino)
+            ):
+                raise RuntimeIdentityError("Core spawn lock identity is invalid")
+            probe_fd = root.open_lock(_SPAWN_LOCK_NAME)
+            try:
+                try:
+                    fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise RuntimeIdentityError("Core spawn lock is not held")
+            finally:
+                os.close(probe_fd)
+            pending = _require_pending(root.read_json(_PENDING_NAME, max_bytes=_MAX_READY_BYTES))
+            if (
+                pending["phase"] != "spawn_intent"
+                or pending["release_identity"] != release_identity
+                or pending["port"] != port
+                or pending["generation"] != generation
+                or pending["spawn_lock_device"] != lock_metadata.st_dev
+                or pending["spawn_lock_inode"] != lock_metadata.st_ino
+            ):
+                raise RuntimeIdentityError("Core spawn intent does not match the child")
+            identity = LinuxProcessController().capture(os.getpid())
+            root.atomic_write_json(
+                _PENDING_NAME,
+                {
+                    "schema_version": 2,
+                    "phase": "spawn_claimed",
+                    "release_identity": release_identity,
+                    "pid": identity.pid,
+                    "boot_id": identity.boot_id,
+                    "start_time_ticks": identity.start_time_ticks,
+                    "port": port,
+                    "generation": generation,
+                },
+                replace=True,
+            )
+            return identity
+    except (OSError, RuntimeIdentityError) as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATE_INVALID,
+            "Core service child could not claim its spawn intent.",
+            retryable=False,
+        ) from exc
+    finally:
+        if spawn_lock_fd >= 3:
+            os.close(spawn_lock_fd)
 
 
 def _read_ledger(root: HostServiceRoot) -> dict[str, Any]:
@@ -847,6 +1300,7 @@ def _attachment_from_ledger(
         port=ledger["port"],
         release_identity=ledger["release_identity"],
         registry_digest=ledger["registry_digest"],
+        source_commit=ledger["source_commit"],
         generation=ledger["generation"],
         status_proof=status_proof,
         attached=attached,
@@ -923,6 +1377,86 @@ def _require_time(deadline: float) -> None:
         )
 
 
+def _run_private_command(
+    argv: list[str],
+    *,
+    deadline: float,
+    pass_fds: tuple[int, ...] = (),
+) -> int:
+    _require_time(deadline)
+    child_environment = os.environ.copy()
+    child_environment.pop("PYTHONPATH", None)
+    try:
+        completed = subprocess.run(
+            argv,
+            env=child_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            close_fds=True,
+            pass_fds=pass_fds,
+            timeout=max(0.001, deadline - time.monotonic()),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.DEADLINE_EXCEEDED,
+            "Core bootstrap exceeded its total deadline.",
+            retryable=True,
+        ) from exc
+    except OSError as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.START_FAILED,
+            "Core bootstrap process could not be started.",
+            retryable=True,
+        ) from exc
+    return completed.returncode
+
+
+def _require_inherited_lock(root: HostServiceRoot, name: str, lock_fd: int) -> None:
+    if lock_fd < 3:
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATE_INVALID,
+            "Core host lock descriptor is invalid.",
+            retryable=False,
+        )
+    try:
+        lock_metadata = os.fstat(lock_fd)
+        pathname_metadata = os.stat(name, dir_fd=root.fd, follow_symlinks=False)
+        if (
+            not stat_is_regular(lock_metadata.st_mode)
+            or lock_metadata.st_uid != os.geteuid()
+            or (lock_metadata.st_mode & 0o777) != 0o600
+            or (lock_metadata.st_dev, lock_metadata.st_ino)
+            != (pathname_metadata.st_dev, pathname_metadata.st_ino)
+        ):
+            raise OSError("lock identity mismatch")
+        probe_fd = root.open_lock(name)
+        try:
+            try:
+                fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            raise OSError("lock is not held")
+        finally:
+            os.close(probe_fd)
+    except OSError as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATE_INVALID,
+            "Core inherited host lock is invalid.",
+            retryable=False,
+        ) from exc
+
+
+def _validate_attachment_name(value: str) -> None:
+    if not isinstance(value, str) or re.fullmatch(r"bootstrap-[0-9a-f]{32}\.json", value) is None:
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATE_INVALID,
+            "Core bootstrap attachment name is invalid.",
+            retryable=False,
+        )
+
+
 def _terminate_spawned_child(child: subprocess.Popen[bytes]) -> None:
     if child.poll() is not None:
         return
@@ -944,7 +1478,20 @@ def build_parser() -> argparse.ArgumentParser:
     ensure.add_argument("--port", type=int, default=0)
     ensure.add_argument("--deadline-seconds", type=float, default=45.0)
     ensure.add_argument("--replace-mismatched", action="store_true")
-    ensure.add_argument("--bootstrap-json", action="store_true")
+    ensure.add_argument("--attachment-name")
+    ensure.add_argument("--bootstrap-lock-fd", type=int)
+    bootstrap = subparsers.add_parser("bootstrap")
+    bootstrap.add_argument("--service-root", type=Path, default=default_core_service_root())
+    bootstrap.add_argument("--wheel-path", type=Path, required=True)
+    bootstrap.add_argument("--framework-lock", type=Path, required=True)
+    bootstrap.add_argument("--source-commit", required=True)
+    bootstrap.add_argument("--attachment-name", required=True)
+    bootstrap.add_argument("--port", type=int, default=0)
+    bootstrap.add_argument("--deadline-seconds", type=float, default=90.0)
+    bootstrap.add_argument("--replace-mismatched", action="store_true")
+    consume = subparsers.add_parser("consume-attachment")
+    consume.add_argument("--service-root", type=Path, default=default_core_service_root())
+    consume.add_argument("--attachment-name", required=True)
     inspect_parser = subparsers.add_parser("inspect")
     inspect_parser.add_argument("--service-root", type=Path, default=default_core_service_root())
     stop = subparsers.add_parser("stop")
@@ -960,6 +1507,7 @@ def _attachment_metadata(attachment: CoreServiceAttachment) -> dict[str, object]
         "port": attachment.port,
         "release_identity": attachment.release_identity,
         "registry_digest": attachment.registry_digest,
+        "source_commit": attachment.source_commit,
         "generation": attachment.generation,
         "status_proof": attachment.status_proof,
         "attached": attachment.attached,
@@ -985,13 +1533,43 @@ def main(argv: Sequence[str] | None = None) -> int:
                 port=args.port,
                 deadline_seconds=args.deadline_seconds,
                 replace_mismatched=args.replace_mismatched,
+                _bootstrap_lock_fd=args.bootstrap_lock_fd,
             )
-            payload = (
-                _bootstrap_payload(attachment)
-                if args.bootstrap_json
-                else _attachment_metadata(attachment)
+            if args.attachment_name is not None:
+                _validate_attachment_name(args.attachment_name)
+                with HostServiceRoot(args.service_root, create=False) as root:
+                    root.atomic_write_json(
+                        args.attachment_name,
+                        _bootstrap_payload(attachment),
+                        replace=False,
+                    )
+            print(
+                json.dumps(
+                    _attachment_metadata(attachment),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
             )
-            print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+            return 0
+        if args.command == "bootstrap":
+            bootstrap_core_service(
+                service_root=args.service_root,
+                wheel_path=args.wheel_path,
+                framework_lock=args.framework_lock,
+                source_commit=args.source_commit,
+                attachment_name=args.attachment_name,
+                port=args.port,
+                deadline_seconds=args.deadline_seconds,
+                replace_mismatched=args.replace_mismatched,
+            )
+            print('{"schema_version":1,"bootstrapped":true}')
+            return 0
+        if args.command == "consume-attachment":
+            payload = consume_core_service_attachment(
+                service_root=args.service_root,
+                attachment_name=args.attachment_name,
+            )
+            sys.stdout.buffer.write(payload)
             return 0
         if args.command == "inspect":
             attachment = inspect_core_service(service_root=args.service_root)
@@ -1040,10 +1618,15 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "authenticate_core_service_endpoint",
+    "bootstrap_core_service",
+    "claim_core_service_spawn",
+    "consume_core_service_attachment",
     "CoreServiceAttachment",
     "CoreServiceError",
     "CoreServiceErrorCode",
     "LinuxProcessController",
+    "LockIdentity",
     "ProcessIdentity",
     "ensure_core_service",
     "inspect_core_service",
