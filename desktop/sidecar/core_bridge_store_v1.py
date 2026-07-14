@@ -58,6 +58,7 @@ DEFAULT_MAX_MAPPING_HISTORY_ROWS = 100_000
 MAX_IDENTITY_BYTES = 512
 MARKER_SLOT_BYTES = 4096
 MARKER_FILE_BYTES = MARKER_SLOT_BYTES * 2
+_SQLITE_SYNCHRONOUS_FULL = 2
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _MANAGED_FILES = (DATABASE_FILENAME, OWNER_LOCK_FILENAME, IDENTITY_MARKER_FILENAME)
@@ -1011,6 +1012,7 @@ class DesktopCoreBridgeStoreV1:
             self._anchor_identity = self._file_identity(anchor_stat)
             self._open_database_file()
             self._verify_storage_files()
+            self._verify_sqlite_default_synchronous_full()
             self._connection = self._open_database_connection()
             fresh_database = self._is_fresh_database_after_recovery()
             self._initialize_schema(fresh_database=fresh_database)
@@ -1390,6 +1392,12 @@ class DesktopCoreBridgeStoreV1:
                 check_same_thread=False,
                 uri=True,
             )
+            if connection.execute("PRAGMA synchronous").fetchone() != (
+                _SQLITE_SYNCHRONOUS_FULL,
+            ):
+                raise CoreBridgeStoreStateRootError(
+                    "SQLite target connection default synchronous is not FULL"
+                )
             connection.row_factory = sqlite3.Row
             database_rows = connection.execute("PRAGMA database_list").fetchall()
             if len(database_rows) != 1:
@@ -1411,6 +1419,12 @@ class DesktopCoreBridgeStoreV1:
             if connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0] != "delete":
                 raise CoreBridgeStoreStateRootError("SQLite rollback journal mode is unavailable")
             connection.execute("PRAGMA synchronous = FULL")
+            if connection.execute("PRAGMA synchronous").fetchone()[0] != (
+                _SQLITE_SYNCHRONOUS_FULL
+            ):
+                raise CoreBridgeStoreStateRootError(
+                    "SQLite full synchronous mode could not be enforced"
+                )
             connection.execute("PRAGMA temp_store = MEMORY")
             connection.execute("PRAGMA trusted_schema = OFF")
             page_size = cast(int, connection.execute("PRAGMA page_size").fetchone()[0])
@@ -1441,6 +1455,24 @@ class DesktopCoreBridgeStoreV1:
             if "connection" in locals():
                 connection.close()
             raise
+
+    @staticmethod
+    def _verify_sqlite_default_synchronous_full() -> None:
+        probe: sqlite3.Connection | None = None
+        try:
+            probe = sqlite3.connect(":memory:", isolation_level=None)
+            synchronous = probe.execute("PRAGMA synchronous").fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise CoreBridgeStoreStateRootError(
+                "SQLite library default synchronous could not be verified"
+            ) from exc
+        finally:
+            if probe is not None:
+                probe.close()
+        if synchronous != (_SQLITE_SYNCHRONOUS_FULL,):
+            raise CoreBridgeStoreStateRootError(
+                "SQLite library default synchronous is not FULL"
+            )
 
     def _is_fresh_database_after_recovery(self) -> bool:
         connection = self._connection
@@ -1511,12 +1543,107 @@ class DesktopCoreBridgeStoreV1:
 
     @staticmethod
     def _identity_row(connection: sqlite3.Connection) -> dict[str, object]:
-        rows = connection.execute("SELECT * FROM store_identity").fetchall()
-        if len(rows) != 1:
+        probe = connection.execute(
+            """
+            SELECT count(*) AS row_count,
+                   coalesce(sum(
+                       (typeof(singleton) != 'integer') +
+                       (typeof(root_device) != 'integer') +
+                       (typeof(root_inode) != 'integer') +
+                       (typeof(database_device) != 'integer') +
+                       (typeof(database_inode) != 'integer') +
+                       (typeof(marker_device) != 'integer') +
+                       (typeof(marker_inode) != 'integer') +
+                       (typeof(anchor_device) != 'integer') +
+                       (typeof(anchor_inode) != 'integer') +
+                       (typeof(lock_device) != 'integer') +
+                       (typeof(lock_inode) != 'integer') +
+                       (typeof(marker_generation) != 'integer') +
+                       (typeof(previous_marker_generation) != 'integer')
+                   ), 0) AS integer_type_errors,
+                   coalesce(sum(typeof(store_id) != 'text'), 0)
+                       AS store_id_type_errors,
+                   coalesce(sum(length(CAST(store_id AS BLOB))), 0)
+                       AS store_id_bytes,
+                   coalesce(sum(typeof(authority_digest) != 'text'), 0)
+                       AS authority_digest_type_errors,
+                   coalesce(sum(length(CAST(authority_digest AS BLOB))), 0)
+                       AS authority_digest_bytes,
+                   coalesce(sum(typeof(previous_authority_digest) != 'text'), 0)
+                       AS previous_authority_digest_type_errors,
+                   coalesce(sum(length(CAST(previous_authority_digest AS BLOB))), 0)
+                       AS previous_authority_digest_bytes,
+                   coalesce(sum(typeof(binding_state) != 'text'), 0)
+                       AS binding_state_type_errors,
+                   coalesce(sum(length(CAST(binding_state AS BLOB))), 0)
+                       AS binding_state_bytes
+            FROM store_identity
+            """
+        ).fetchone()
+        if probe is None or probe["row_count"] != 1:
             raise CoreBridgeStoreStateRootError(
                 "bridge database store identity row is missing or duplicated"
             )
-        row = dict(rows[0])
+        if (
+            probe["integer_type_errors"] != 0
+            or probe["store_id_type_errors"] != 0
+            or probe["store_id_bytes"] != 64
+            or probe["authority_digest_type_errors"] != 0
+            or probe["authority_digest_bytes"] != 64
+            or probe["previous_authority_digest_type_errors"] != 0
+            or probe["previous_authority_digest_bytes"] != 64
+            or probe["binding_state_type_errors"] != 0
+            or not 1 <= probe["binding_state_bytes"] <= 7
+        ):
+            raise CoreBridgeStoreStateRootError("bridge database store identity is invalid")
+        selected = connection.execute(
+            """
+            SELECT CASE WHEN typeof(singleton) = 'integer' THEN singleton END
+                       AS singleton,
+                   CASE WHEN typeof(store_id) = 'text'
+                                  AND length(CAST(store_id AS BLOB)) = 64
+                        THEN store_id END AS store_id,
+                   CASE WHEN typeof(root_device) = 'integer' THEN root_device END
+                       AS root_device,
+                   CASE WHEN typeof(root_inode) = 'integer' THEN root_inode END
+                       AS root_inode,
+                   CASE WHEN typeof(database_device) = 'integer' THEN database_device END
+                       AS database_device,
+                   CASE WHEN typeof(database_inode) = 'integer' THEN database_inode END
+                       AS database_inode,
+                   CASE WHEN typeof(marker_device) = 'integer' THEN marker_device END
+                       AS marker_device,
+                   CASE WHEN typeof(marker_inode) = 'integer' THEN marker_inode END
+                       AS marker_inode,
+                   CASE WHEN typeof(anchor_device) = 'integer' THEN anchor_device END
+                       AS anchor_device,
+                   CASE WHEN typeof(anchor_inode) = 'integer' THEN anchor_inode END
+                       AS anchor_inode,
+                   CASE WHEN typeof(lock_device) = 'integer' THEN lock_device END
+                       AS lock_device,
+                   CASE WHEN typeof(lock_inode) = 'integer' THEN lock_inode END
+                       AS lock_inode,
+                   CASE WHEN typeof(marker_generation) = 'integer'
+                        THEN marker_generation END AS marker_generation,
+                   CASE WHEN typeof(authority_digest) = 'text'
+                                  AND length(CAST(authority_digest AS BLOB)) = 64
+                        THEN authority_digest END AS authority_digest,
+                   CASE WHEN typeof(previous_marker_generation) = 'integer'
+                        THEN previous_marker_generation END AS previous_marker_generation,
+                   CASE WHEN typeof(previous_authority_digest) = 'text'
+                                  AND length(CAST(previous_authority_digest AS BLOB)) = 64
+                        THEN previous_authority_digest END AS previous_authority_digest,
+                   CASE WHEN typeof(binding_state) = 'text'
+                                  AND length(CAST(binding_state AS BLOB)) BETWEEN 1 AND 7
+                        THEN binding_state END AS binding_state
+            FROM store_identity
+            """
+        ).fetchone()
+        if selected is None:
+            raise CoreBridgeStoreStateRootError(
+                "bridge database store identity row is missing or duplicated"
+            )
+        row = dict(selected)
         text_fields = (
             "store_id",
             "authority_digest",
@@ -1550,6 +1677,18 @@ class DesktopCoreBridgeStoreV1:
                 "bridge database store identity binding state is invalid"
             )
         return row
+
+    @staticmethod
+    def _require_empty_pending_authority(connection: sqlite3.Connection) -> None:
+        rows, byte_count = DesktopCoreBridgeStoreV1._recovery_usage(connection)
+        if rows > MAX_RECOVERY_ROWS or byte_count > MAX_RECOVERY_BYTES:
+            raise CoreBridgeStoreCapacityError(
+                "pending bridge authority exceeds its recovery capacity"
+            )
+        if rows != 0 or byte_count != 0:
+            raise CoreBridgeStoreStateRootError(
+                "pending bridge store identity does not describe a fresh empty store"
+            )
 
     @staticmethod
     def _marker_payload(identity: dict[str, object]) -> dict[str, object]:
@@ -1825,22 +1964,13 @@ class DesktopCoreBridgeStoreV1:
         identity = self._identity_row(connection)
         if identity["binding_state"] != "pending":
             return
+        self._require_empty_pending_authority(connection)
         empty_authority = self._authority_digest(connection)
-        authority_rows = sum(
-            cast(int, connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-            for table in (
-                "create_operations",
-                "patch_operations",
-                "mappings",
-                "mapping_history",
-            )
-        )
         if (
             identity["marker_generation"] != 0
             or identity["previous_marker_generation"] != 0
             or identity["authority_digest"] != empty_authority
             or identity["previous_authority_digest"] != empty_authority
-            or authority_rows != 0
         ):
             raise CoreBridgeStoreStateRootError(
                 "pending bridge store identity does not describe a fresh empty store"
@@ -1890,6 +2020,7 @@ class DesktopCoreBridgeStoreV1:
                 raise CoreBridgeStoreStateRootError(
                     "pending bridge store identity changed during binding"
                 )
+            self._require_empty_pending_authority(connection)
             if self._authority_digest(connection) != empty_authority:
                 raise CoreBridgeStoreStateRootError(
                     "pending bridge authority changed during binding"

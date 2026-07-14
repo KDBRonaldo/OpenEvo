@@ -96,6 +96,26 @@ os._exit(0)
     return database, journal, anchor
 
 
+def _leave_pending_store_binding(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt_binding(
+        _self: DesktopCoreBridgeStoreV1,
+        _connection: sqlite3.Connection,
+    ) -> None:
+        raise OSError("injected pending binding interruption")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            DesktopCoreBridgeStoreV1,
+            "_complete_pending_store_binding",
+            interrupt_binding,
+        )
+        with pytest.raises(OSError, match="pending binding interruption"):
+            DesktopCoreBridgeStoreV1(root)
+
+
 def _snapshot(
     snapshot_id: str,
     kind: core_v1.SnapshotKind,
@@ -1304,6 +1324,154 @@ def test_initial_schema_hot_journal_rollback_failure_is_not_claimed(tmp_path: Pa
     assert (root / store_module.IDENTITY_MARKER_FILENAME).stat().st_size == 0
 
 
+def test_non_full_sqlite_default_does_not_open_or_recover_target_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    database, journal, _anchor = _create_uncommitted_initial_schema_hot_journal(root)
+    database_before = database.read_bytes()
+    journal_before = journal.read_bytes()
+    original_connect = store_module.sqlite3.connect
+    opened: list[object] = []
+
+    def connect_with_non_full_default(
+        database_name: object,
+        *args: object,
+        **kwargs: object,
+    ) -> sqlite3.Connection:
+        opened.append(database_name)
+        connection = original_connect(database_name, *args, **kwargs)
+        if database_name == ":memory:":
+            connection.execute("PRAGMA synchronous = OFF")
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_non_full_default)
+
+    with pytest.raises(CoreBridgeStoreStateRootError, match="default synchronous is not FULL"):
+        DesktopCoreBridgeStoreV1(root)
+
+    assert opened == [":memory:"]
+    assert database.read_bytes() == database_before
+    assert journal.read_bytes() == journal_before
+
+
+def test_pending_binding_proves_empty_authority_before_each_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    _leave_pending_store_binding(root, monkeypatch)
+    original_usage = DesktopCoreBridgeStoreV1._recovery_usage
+    original_digest = DesktopCoreBridgeStoreV1._authority_digest
+    calls: list[str] = []
+
+    def record_usage(connection: sqlite3.Connection) -> tuple[int, int]:
+        calls.append("count-length")
+        return original_usage(connection)
+
+    def record_digest(connection: sqlite3.Connection) -> str:
+        calls.append("digest")
+        return original_digest(connection)
+
+    monkeypatch.setattr(
+        DesktopCoreBridgeStoreV1,
+        "_recovery_usage",
+        staticmethod(record_usage),
+    )
+    monkeypatch.setattr(
+        DesktopCoreBridgeStoreV1,
+        "_authority_digest",
+        staticmethod(record_digest),
+    )
+
+    store = DesktopCoreBridgeStoreV1(root)
+    store.close()
+
+    assert calls[:4] == ["count-length", "digest", "count-length", "digest"]
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "row_count", "history_limit"),
+    [
+        ("MAX_RECOVERY_ROWS", 1, 2, 1),
+        ("MAX_RECOVERY_BYTES", 1, 1, store_module.DEFAULT_MAX_MAPPING_HISTORY_ROWS),
+    ],
+    ids=["rows", "bytes"],
+)
+def test_pending_binding_capacity_fails_before_authority_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit: int,
+    row_count: int,
+    history_limit: int,
+) -> None:
+    root = tmp_path / "state"
+    _leave_pending_store_binding(root, monkeypatch)
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        connection.executemany(
+            """
+            INSERT INTO create_operations(
+                local_project_id, state, document_json, document_sha256
+            ) VALUES (?, 'pre_create', X'7B7D', ?)
+            """,
+            [(f"corrupt-{index}", "0" * 64) for index in range(row_count)],
+        )
+    monkeypatch.setattr(store_module, limit_name, limit)
+    monkeypatch.setattr(
+        DesktopCoreBridgeStoreV1,
+        "_authority_digest",
+        staticmethod(
+            lambda _connection: pytest.fail(
+                "over-capacity pending authority reached materializing digest query"
+            )
+        ),
+    )
+
+    with pytest.raises(CoreBridgeStoreCapacityError, match="pending bridge authority"):
+        DesktopCoreBridgeStoreV1(
+            root,
+            max_mapping_history_rows=history_limit,
+        )
+
+
+def test_pending_identity_oversize_is_not_materialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    _leave_pending_store_binding(root, monkeypatch)
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE store_identity SET store_id = ?",
+            ("x" * (store_module.MAX_IDENTITY_BYTES + 1),),
+        )
+    original_complete = DesktopCoreBridgeStoreV1._complete_pending_store_binding
+
+    def reject_oversized_python_text(
+        self: DesktopCoreBridgeStoreV1,
+        connection: sqlite3.Connection,
+    ) -> None:
+        def bounded_text(raw: bytes) -> str:
+            if len(raw) > store_module.MAX_IDENTITY_BYTES:
+                pytest.fail("oversized store identity entered Python")
+            return raw.decode("utf-8")
+
+        connection.text_factory = bounded_text
+        original_complete(self, connection)
+
+    monkeypatch.setattr(
+        DesktopCoreBridgeStoreV1,
+        "_complete_pending_store_binding",
+        reject_oversized_python_text,
+    )
+
+    with pytest.raises(CoreBridgeStoreStateRootError, match="store identity is invalid"):
+        DesktopCoreBridgeStoreV1(root)
+
+
 def test_recovered_empty_hot_journal_with_foreign_marker_is_not_fresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1536,6 +1704,8 @@ def test_database_connect_path_swap_fails_without_writing_replacement_inode(
 
     def swap_before_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
         nonlocal opened_database_identity, swapped
+        if args[0] == ":memory:":
+            return original_connect(*args, **kwargs)
         if not swapped:
             swapped = True
             database.rename(displaced)

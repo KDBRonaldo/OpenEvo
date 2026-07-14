@@ -119,7 +119,14 @@ inherited store and do not explicitly unlock the parent's lease.
 
 The database is opened no-follow relative to the held root and remains pinned by
 that FD. SQLite receives a `file:/dev/fd/<fd>?mode=rw` URI through the native
-macOS/Linux VFS. Before any SQLite configuration or schema write, the store
+macOS/Linux VFS. Before SQLite receives that target URI, the release runtime
+opens a separate new in-memory connection and requires the current SQLite
+library's default numeric `PRAGMA synchronous` value to be `FULL`. The target
+connection must report the same default immediately after connect and must
+retain `FULL` after explicit configuration. A non-`FULL` library default fails
+before SQLite opens or recovers the target database, so hot-journal rollback
+does not depend on a host's incidental SQLite build default. Before any SQLite
+configuration or schema write, the store
 requires the connection-reported database inode, held descriptor inode, and
 managed pathname inode to equal the original pin. A pathname replacement at the
 `sqlite3.connect` boundary therefore opens the pinned inode or fails, and the
@@ -152,7 +159,13 @@ committed first. The inner identity marker and parent anchor are then published
 and verified before the database identity becomes `bound`. Restart may complete
 that sequence only when the pending row names the exact database, lock, root,
 marker and anchor inodes, both authority digests equal the canonical empty
-store, generation is zero, and all authority tables are empty. Either marker
+store, generation is zero, and all authority tables are empty. Every
+`store_identity` read first retrieves only SQL types and byte lengths, then uses
+closed `CASE` guards before returning bounded values to Python. Before either
+pending authority digest, count/length-only aggregate queries must prove all
+four authority tables empty within the shared row and byte recovery limits; an
+over-capacity corrupt pending store fails without selecting authority rows.
+Either marker
 may be empty, contain that exact pending identity, or have a torn first-slot
 publication while its never-used inactive slot remains entirely zero. Only this
 exact pending state may rewrite an invalid primary slot; a valid different
