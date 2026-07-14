@@ -110,6 +110,22 @@ identities are rejected. Mutations require their contract-declared idempotency
 and ETag precondition headers. Public list methods expose only each route's
 closed query set and runs are always filtered to the active project.
 
+Core owns newly created project IDs, while an ordinary `CoreControlClientV1`
+is already bound to exactly one project. New-project setup therefore uses the
+narrow `CoreProjectBootstrapClientV1`: after the same release `/version`
+negotiation, it may submit one idempotent `ProjectCreateV1`, verifies that the
+returned draft exactly matches the requested project snapshot, and returns a
+new `CoreTunnelConnectionV1` bound to Core's generated ID. An exact replay of a
+delivered success is local. The first request and idempotency key are frozen
+before transport, so an unknown network outcome can only be retried exactly;
+a different request or key is rejected even when no response was delivered.
+Initial draft validation rejects an already published imported workspace and
+requires the documented scratch/imported workspace snapshot shape. Result
+validation, connection binding, replay-state commit, and delivery share the
+same generation barrier as `close()`; lock wait and transport share one deadline.
+The project-bound client rejects `create_project` before transport, preventing
+an orphan project followed by an active-project mismatch.
+
 Requests are exact Pydantic v1 DTOs. JSON responses and `ApiErrorV1` bodies are
 read with route-class byte limits before contract-model validation. A generic
 model-generated JSON Schema pass recursively rejects scalar coercion and

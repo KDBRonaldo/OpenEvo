@@ -34,10 +34,13 @@ from desktop.sidecar.config import (
     save_desktop_project_config,
 )
 from desktop.sidecar.core_client_v1 import (
+    CoreBootstrapTunnelConnectionV1,
     CoreClientErrorV1,
     CoreClientLocalErrorCodeV1,
     CoreClientLocalErrorV1,
     CoreControlClientV1,
+    CoreProjectBootstrapClientV1,
+    CoreProjectBootstrapResultV1,
     CoreSseStreamV1,
     CoreTunnelConnectionV1,
 )
@@ -66,10 +69,13 @@ __all__ = [
     "BackendClient",
     "BackendConnection",
     "DesktopBackendError",
+    "CoreBootstrapTunnelConnectionV1",
     "CoreClientErrorV1",
     "CoreClientLocalErrorCodeV1",
     "CoreClientLocalErrorV1",
     "CoreControlClientV1",
+    "CoreProjectBootstrapClientV1",
+    "CoreProjectBootstrapResultV1",
     "CoreSseStreamV1",
     "CoreTunnelConnectionV1",
     "DesktopProjectConfigDraft",
