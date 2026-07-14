@@ -45,6 +45,19 @@ _ARCHIVE_TOKEN_XATTR = "user.openevo.workspace-import-token"
 _IMPORT_ID_PREFIX = "workspace-import-"
 _TEMP_PREFIX = ".workspace-import-tmp-"
 _IMPORT_ID_RE = re.compile(r"^workspace-import-[0-9a-f]{48}$")
+_DEFAULT_RECONCILE_MAX_NODES = 300_000
+_DEFAULT_RECONCILE_MAX_BYTES = 64 * 1024 * 1024 * 1024
+_DEFAULT_MAX_RETAINED_IMPORTS = 10_000
+_DEFAULT_MAX_RETAINED_ARCHIVE_BYTES = 24 * 1024 * 1024 * 1024
+_IMPORT_ID_BYTES = len(os.fsencode(f"{_IMPORT_ID_PREFIX}{'0' * 48}"))
+_TEMP_NAME_BYTES = len(os.fsencode(f"{_TEMP_PREFIX}{'0' * 48}"))
+_CHILD_NAME_BYTES = len(os.fsencode(_ARCHIVE_NAME)) + len(os.fsencode(_METADATA_NAME))
+_RECONCILE_NODES_PER_RETAINED_IMPORT = 5
+_RECONCILE_FIXED_BYTES_PER_RETAINED_IMPORT = (
+    _IMPORT_ID_BYTES + (2 * _CHILD_NAME_BYTES) + _METADATA_MAX_BYTES
+)
+_RECONCILE_CRASH_TEMP_NODES = 3
+_RECONCILE_CRASH_TEMP_BYTES = _TEMP_NAME_BYTES + _CHILD_NAME_BYTES
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
 _ROOT_OPEN_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
@@ -74,6 +87,10 @@ class WorkspaceImportStoreConfigurationError(WorkspaceImportError):
 
 class _ReconcileBudgetExceeded(WorkspaceImportIntegrityError):
     pass
+
+
+class _DeterministicImportCorruption(WorkspaceImportIntegrityError):
+    """State proven invalid from successfully observed filesystem contents."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +135,24 @@ class _ScanBudget:
         if count < 0 or count > self.remaining_bytes:
             raise _ReconcileBudgetExceeded("workspace import reconciliation byte budget exceeded")
         self.remaining_bytes -= count
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedUsage:
+    import_count: int
+    archive_bytes: int
+
+
+def _required_reconcile_budget(import_count: int, archive_bytes: int) -> tuple[int, int]:
+    """Return the worst reconciliation cost for retained imports plus one crash temp."""
+
+    return (
+        _RECONCILE_CRASH_TEMP_NODES
+        + (import_count * _RECONCILE_NODES_PER_RETAINED_IMPORT),
+        _RECONCILE_CRASH_TEMP_BYTES
+        + (import_count * _RECONCILE_FIXED_BYTES_PER_RETAINED_IMPORT)
+        + (2 * archive_bytes),
+    )
 
 
 _THREAD_LOCKS: dict[str, threading.RLock] = {}
@@ -492,8 +527,10 @@ class WorkspaceImportStore:
         max_archive_bytes: int = MAX_WORKSPACE_UPLOAD_BYTES,
         max_entries: int = MAX_WORKSPACE_ENTRIES,
         max_extracted_bytes: int = MAX_WORKSPACE_UPLOAD_BYTES,
-        reconcile_max_nodes: int = 300_000,
-        reconcile_max_bytes: int = 64 * 1024 * 1024 * 1024,
+        max_retained_imports: int = _DEFAULT_MAX_RETAINED_IMPORTS,
+        max_retained_archive_bytes: int = _DEFAULT_MAX_RETAINED_ARCHIVE_BYTES,
+        reconcile_max_nodes: int = _DEFAULT_RECONCILE_MAX_NODES,
+        reconcile_max_bytes: int = _DEFAULT_RECONCILE_MAX_BYTES,
     ) -> None:
         if not 1024 <= max_archive_bytes <= MAX_WORKSPACE_UPLOAD_BYTES:
             raise ValueError("max_archive_bytes is outside the workspace contract")
@@ -503,10 +540,22 @@ class WorkspaceImportStore:
             raise ValueError("max_extracted_bytes is outside the workspace contract")
         if reconcile_max_nodes <= 0 or reconcile_max_bytes <= 0:
             raise ValueError("reconciliation budgets must be positive")
+        if max_retained_imports < 0 or max_retained_archive_bytes < 0:
+            raise ValueError("retained workspace import limits must be non-negative")
+        required_nodes, required_bytes = _required_reconcile_budget(
+            max_retained_imports,
+            max_retained_archive_bytes,
+        )
+        if required_nodes > reconcile_max_nodes or required_bytes > reconcile_max_bytes:
+            raise ValueError(
+                "retained workspace import limits exceed reconciliation budgets"
+            )
         self._root = os.path.abspath(os.fspath(root))
         self._max_archive_bytes = max_archive_bytes
         self._max_entries = max_entries
         self._max_extracted_bytes = max_extracted_bytes
+        self._max_retained_imports = max_retained_imports
+        self._max_retained_archive_bytes = max_retained_archive_bytes
         self._reconcile_max_nodes = reconcile_max_nodes
         self._reconcile_max_bytes = reconcile_max_bytes
         self._prepare_root()
@@ -547,13 +596,22 @@ class WorkspaceImportStore:
     @staticmethod
     def _require_private_file(value: os.stat_result, *, label: str) -> None:
         if not stat.S_ISREG(value.st_mode):
-            raise WorkspaceImportIntegrityError(f"{label} is not a regular file")
+            raise _DeterministicImportCorruption(f"{label} is not a regular file")
         if (
             value.st_uid != os.geteuid()
             or stat.S_IMODE(value.st_mode) != 0o600
             or value.st_nlink != 1
         ):
-            raise WorkspaceImportIntegrityError(f"{label} is not private mode 0600 link-count one")
+            raise _DeterministicImportCorruption(
+                f"{label} is not private mode 0600 link-count one"
+            )
+
+    @staticmethod
+    def _require_stored_private_directory(value: os.stat_result, *, label: str) -> None:
+        if not stat.S_ISDIR(value.st_mode):
+            raise _DeterministicImportCorruption(f"{label} is not a directory")
+        if value.st_uid != os.geteuid() or stat.S_IMODE(value.st_mode) != 0o700:
+            raise _DeterministicImportCorruption(f"{label} must be owner-only mode 0700")
 
     @contextmanager
     def _locked_root(self) -> Iterator[int]:
@@ -610,6 +668,11 @@ class WorkspaceImportStore:
         temporary_name = f"{_TEMP_PREFIX}{secrets.token_hex(24)}"
         published = False
         with self._locked_root() as root_descriptor:
+            retained = self._retained_usage(root_descriptor)
+            self._require_retained_capacity(
+                retained.import_count + 1,
+                retained.archive_bytes + before.st_size,
+            )
             os.mkdir(temporary_name, 0o700, dir_fd=root_descriptor)
             temporary_descriptor: int | None = None
             archive_descriptor: int | None = None
@@ -710,6 +773,46 @@ class WorkspaceImportStore:
                 if not published:
                     self._discard_flat_directory(root_descriptor, temporary_name, missing_ok=True)
 
+    def _require_retained_capacity(self, import_count: int, archive_bytes: int) -> None:
+        if import_count > self._max_retained_imports:
+            raise WorkspaceImportError("workspace retained import count budget exceeded")
+        if archive_bytes > self._max_retained_archive_bytes:
+            raise WorkspaceImportError("workspace retained archive byte budget exceeded")
+        required_nodes, required_bytes = _required_reconcile_budget(import_count, archive_bytes)
+        if required_nodes > self._reconcile_max_nodes or required_bytes > self._reconcile_max_bytes:
+            raise WorkspaceImportError("workspace retained reconciliation budget exceeded")
+
+    def _retained_usage(self, root_descriptor: int) -> _RetainedUsage:
+        budget = _ScanBudget(
+            remaining_nodes=self._reconcile_max_nodes,
+            remaining_bytes=self._reconcile_max_bytes,
+        )
+        import_count = 0
+        archive_bytes = 0
+        with os.scandir(root_descriptor) as entries:
+            names = []
+            for entry in entries:
+                budget.charge_node(entry.name)
+                names.append(entry.name)
+        for name in names:
+            if _IMPORT_ID_RE.fullmatch(name) is None:
+                raise WorkspaceImportIntegrityError(
+                    "workspace import store requires reconciliation before ingest"
+                )
+            stored_ref, archive_descriptor, _directory_identity = (
+                self._validate_import_contents(
+                    root_descriptor,
+                    name,
+                    None,
+                    budget=budget,
+                )
+            )
+            os.close(archive_descriptor)
+            import_count += 1
+            archive_bytes += stored_ref.byte_size
+            self._require_retained_capacity(import_count, archive_bytes)
+        return _RetainedUsage(import_count=import_count, archive_bytes=archive_bytes)
+
     @staticmethod
     def _verify_directory_binding(
         root_descriptor: int,
@@ -726,7 +829,7 @@ class WorkspaceImportStore:
     @staticmethod
     def _read_bounded_file(descriptor: int, size: int, *, label: str) -> bytes:
         if size < 0 or size > _METADATA_MAX_BYTES:
-            raise WorkspaceImportIntegrityError(f"{label} exceeds its byte limit")
+            raise _DeterministicImportCorruption(f"{label} exceeds its byte limit")
         chunks: list[bytes] = []
         remaining = size
         while remaining:
@@ -745,7 +848,9 @@ class WorkspaceImportStore:
         except FileNotFoundError as exc:
             raise WorkspaceImportNotFoundError("workspace import does not exist") from exc
         try:
-            self._require_private_directory(os.fstat(descriptor), label="workspace import directory")
+            self._require_stored_private_directory(
+                os.fstat(descriptor), label="workspace import directory"
+            )
             self._verify_directory_binding(
                 root_descriptor,
                 import_id,
@@ -831,9 +936,13 @@ class WorkspaceImportStore:
                     archive_token=archive_token,
                 )
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                raise WorkspaceImportIntegrityError("workspace import metadata is not closed JSON") from exc
+                raise _DeterministicImportCorruption(
+                    "workspace import metadata is not closed JSON"
+                ) from exc
             if raw != _canonical_metadata(metadata):
-                raise WorkspaceImportIntegrityError("workspace import metadata is not canonical JSON")
+                raise _DeterministicImportCorruption(
+                    "workspace import metadata is not canonical JSON"
+                )
             return metadata
         finally:
             os.close(descriptor)
@@ -855,7 +964,9 @@ class WorkspaceImportStore:
             before = os.fstat(descriptor)
             self._require_private_file(before, label="workspace import archive")
             if (before.st_dev, before.st_ino) != archive_identity:
-                raise WorkspaceImportIntegrityError("workspace import archive identity changed")
+                raise _DeterministicImportCorruption(
+                    "workspace import archive identity changed"
+                )
             try:
                 observed_token = os.getxattr(descriptor, _ARCHIVE_TOKEN_XATTR)
             except OSError as exc:
@@ -863,9 +974,11 @@ class WorkspaceImportStore:
                     "workspace import archive storage token is unavailable"
                 ) from exc
             if observed_token != bytes.fromhex(archive_token):
-                raise WorkspaceImportIntegrityError("workspace import archive storage token changed")
+                raise _DeterministicImportCorruption(
+                    "workspace import archive storage token changed"
+                )
             if before.st_size != import_ref.byte_size:
-                raise WorkspaceImportIntegrityError("workspace import archive size changed")
+                raise _DeterministicImportCorruption("workspace import archive size changed")
             digests: list[str] = []
             for _attempt in range(2):
                 digest = hashlib.sha256()
@@ -891,7 +1004,9 @@ class WorkspaceImportStore:
             if _identity(before) != _identity(after) or not _same_inode(after, current):
                 raise WorkspaceImportIntegrityError("workspace import archive changed while hashing")
             if any(digest != import_ref.content_sha256 for digest in digests):
-                raise WorkspaceImportIntegrityError("workspace import archive digest changed")
+                raise _DeterministicImportCorruption(
+                    "workspace import archive digest changed"
+                )
             return descriptor
         except BaseException:
             os.close(descriptor)
@@ -905,6 +1020,7 @@ class WorkspaceImportStore:
         *,
         budget: _ScanBudget | None = None,
     ) -> tuple[WorkspaceImportRefV1, int, tuple[int, int]]:
+        self._require_store_import_id(import_id)
         directory_descriptor = self._open_import_directory(root_descriptor, import_id)
         archive_descriptor: int | None = None
         try:
@@ -915,11 +1031,15 @@ class WorkspaceImportStore:
                         budget.charge_node(entry.name)
                     names.add(entry.name)
             if names != {_ARCHIVE_NAME, _METADATA_NAME}:
-                raise WorkspaceImportIntegrityError("workspace import directory shape is invalid")
+                raise _DeterministicImportCorruption(
+                    "workspace import directory shape is invalid"
+                )
             metadata = self._load_metadata(directory_descriptor, budget=budget)
             stored_ref = metadata.import_ref
             if stored_ref.import_id != import_id:
-                raise WorkspaceImportIntegrityError("workspace import metadata ID does not match")
+                raise _DeterministicImportCorruption(
+                    "workspace import metadata ID does not match"
+                )
             if expected_ref is not None and stored_ref != expected_ref:
                 raise WorkspaceImportIntegrityError("workspace import reference does not match storage")
             directory_status = os.fstat(directory_descriptor)
@@ -927,7 +1047,9 @@ class WorkspaceImportStore:
                 metadata.directory_device,
                 metadata.directory_inode,
             ):
-                raise WorkspaceImportIntegrityError("workspace import directory identity changed")
+                raise _DeterministicImportCorruption(
+                    "workspace import directory identity changed"
+                )
             archive_descriptor = self._open_verified_archive(
                 directory_descriptor,
                 stored_ref,
@@ -953,12 +1075,29 @@ class WorkspaceImportStore:
         finally:
             os.close(directory_descriptor)
 
+    @staticmethod
+    def _require_store_import_id(import_id: str) -> None:
+        if _IMPORT_ID_RE.fullmatch(import_id) is None:
+            raise WorkspaceImportIntegrityError(
+                "workspace import ID was not issued by this store"
+            )
+
+    @classmethod
+    def _require_external_import_ref(
+        cls,
+        import_ref: WorkspaceImportRefV1,
+        *,
+        operation: str,
+    ) -> None:
+        if not isinstance(import_ref, WorkspaceImportRefV1):
+            raise TypeError(f"{operation} requires WorkspaceImportRefV1")
+        cls._require_store_import_id(import_ref.import_id)
+
     @contextmanager
     def resolve(self, import_ref: WorkspaceImportRefV1) -> Iterator[BinaryIO]:
         """Yield a digest-verified read handle without exposing a host path."""
 
-        if not isinstance(import_ref, WorkspaceImportRefV1):
-            raise TypeError("resolve requires WorkspaceImportRefV1")
+        self._require_external_import_ref(import_ref, operation="resolve")
         archive_descriptor: int | None = None
         try:
             with self._locked_root() as root_descriptor:
@@ -983,8 +1122,7 @@ class WorkspaceImportStore:
     def release(self, import_ref: WorkspaceImportRefV1) -> None:
         """Delete the exact verified import referenced by ``import_ref``."""
 
-        if not isinstance(import_ref, WorkspaceImportRefV1):
-            raise TypeError("release requires WorkspaceImportRefV1")
+        self._require_external_import_ref(import_ref, operation="release")
         with self._locked_root() as root_descriptor:
             _stored_ref, archive_descriptor, directory_identity = (
                 self._validate_import_contents(
@@ -1092,9 +1230,15 @@ class WorkspaceImportStore:
                 for entry in entries:
                     budget.charge_node(entry.name)
                     value = entry.stat(follow_symlinks=False)
-                    observed_entries.append((entry.name, (value.st_dev, value.st_ino)))
-            for name, observed_identity in observed_entries:
-                if name.startswith(_TEMP_PREFIX) or _IMPORT_ID_RE.fullmatch(name) is None:
+                    observed_entries.append(
+                        (entry.name, (value.st_dev, value.st_ino), value.st_mode)
+                    )
+            for name, observed_identity, observed_mode in observed_entries:
+                if (
+                    name.startswith(_TEMP_PREFIX)
+                    or _IMPORT_ID_RE.fullmatch(name) is None
+                    or not stat.S_ISDIR(observed_mode)
+                ):
                     self._discard_root_entry(
                         root_descriptor,
                         name,
@@ -1118,7 +1262,7 @@ class WorkspaceImportStore:
                         )
                 except _ReconcileBudgetExceeded:
                     raise
-                except WorkspaceImportIntegrityError:
+                except _DeterministicImportCorruption:
                     self._discard_root_entry(
                         root_descriptor,
                         name,

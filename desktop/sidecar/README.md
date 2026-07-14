@@ -26,9 +26,20 @@ metadata files are mode `0600` and link-count one. A random opaque import ID is
 independent of the source name and content digest. Archive plus metadata publish
 as one fsynced directory through an atomic no-replace rename. Metadata binds the
 exact `WorkspaceImportRefV1`, private storage identity, and a random archive
-generation token. Startup reconciliation is node/byte bounded and removes
-temporary, malformed, tampered, and unknown flat entries without following
-symlinks.
+generation token. External references must use the exact store-issued
+`workspace-import-` plus 48 lowercase hexadecimal grammar before any filesystem
+operation.
+
+The store retains at most 10,000 imports and 24 GiB of archive bytes by default.
+Those aggregate limits are checked under the cross-process root lock before each
+ingest. Their reconciliation reservation covers root and child enumeration,
+maximum metadata bytes, two full archive hash passes, deterministic-corruption
+cleanup, and one interrupted publish temporary directory. Startup reconciliation
+therefore remains bounded without increasing its 300,000-node/64-GiB budgets.
+It removes only recognized temporary/unknown entries and deterministically proven
+structural or content corruption without following symlinks. Filesystem and xattr
+`OSError` failures are treated as infrastructure failures: reconciliation keeps
+the observed entry and fails closed for a later retry.
 
 The only ingest result is the existing closed contract model:
 

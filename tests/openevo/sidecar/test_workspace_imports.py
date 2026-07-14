@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
 from desktop.sidecar import workspace_imports as workspace_imports_module
 from desktop.sidecar.workspace_imports import (
     WorkspaceArchiveValidationError,
+    WorkspaceImportError,
     WorkspaceImportIntegrityError,
     WorkspaceImportNotFoundError,
     WorkspaceImportStore,
@@ -143,6 +145,24 @@ def _process_ingest(root: str, source: str, results: multiprocessing.Queue[objec
         with open(source, "rb", buffering=0) as stream:
             import_ref = store.ingest(stream)
         results.put(("ok", import_ref.import_id, import_ref.content_sha256))
+    except BaseException as exc:
+        results.put(("error", repr(exc)))
+
+
+def _process_capacity_ingest(
+    root: str,
+    source: str,
+    max_retained_imports: int,
+    results: multiprocessing.Queue[object],
+) -> None:
+    try:
+        store = WorkspaceImportStore(
+            root,
+            max_retained_imports=max_retained_imports,
+        )
+        with open(source, "rb", buffering=0) as stream:
+            import_ref = store.ingest(stream)
+        results.put(("ok", import_ref.import_id))
     except BaseException as exc:
         results.put(("error", repr(exc)))
 
@@ -490,6 +510,91 @@ def test_cross_process_lock_serializes_same_and_different_ingests(tmp_path: Path
     assert [result[2] for result in observed].count(hashlib.sha256(archives[0]).hexdigest()) == 2
 
 
+def test_retained_count_and_archive_byte_limits_are_exact_boundaries(tmp_path: Path) -> None:
+    archive = _simple_archive()
+    count_root = tmp_path / "count-imports"
+    count_store = WorkspaceImportStore(
+        count_root,
+        max_retained_imports=2,
+        max_retained_archive_bytes=3 * len(archive),
+    )
+
+    _ingest(count_store, tmp_path, archive)
+    _ingest(count_store, tmp_path, archive)
+    with pytest.raises(WorkspaceImportError, match="retained import count"):
+        _ingest(count_store, tmp_path, archive)
+    assert len(list(count_root.iterdir())) == 2
+    WorkspaceImportStore(count_root)
+
+    byte_root = tmp_path / "byte-imports"
+    byte_store = WorkspaceImportStore(
+        byte_root,
+        max_retained_imports=3,
+        max_retained_archive_bytes=2 * len(archive),
+    )
+    _ingest(byte_store, tmp_path, archive)
+    _ingest(byte_store, tmp_path, archive)
+    with pytest.raises(WorkspaceImportError, match="retained archive byte"):
+        _ingest(byte_store, tmp_path, archive)
+    assert len(list(byte_root.iterdir())) == 2
+
+
+def test_retained_limits_reserve_complete_reconciliation_cost(tmp_path: Path) -> None:
+    archive = _simple_archive()
+    required_nodes, required_bytes = workspace_imports_module._required_reconcile_budget(
+        1,
+        len(archive),
+    )
+    root = tmp_path / "imports"
+    options = {
+        "max_retained_imports": 1,
+        "max_retained_archive_bytes": len(archive),
+        "reconcile_max_nodes": required_nodes,
+        "reconcile_max_bytes": required_bytes,
+    }
+
+    store = WorkspaceImportStore(root, **options)
+    _ingest(store, tmp_path, archive)
+    WorkspaceImportStore(root, **options)
+
+    with pytest.raises(ValueError, match="exceed reconciliation budgets"):
+        WorkspaceImportStore(tmp_path / "node-short", **(options | {"reconcile_max_nodes": required_nodes - 1}))
+    with pytest.raises(ValueError, match="exceed reconciliation budgets"):
+        WorkspaceImportStore(tmp_path / "byte-short", **(options | {"reconcile_max_bytes": required_bytes - 1}))
+
+
+def test_cross_process_capacity_check_cannot_overcommit_retained_count(tmp_path: Path) -> None:
+    root = tmp_path / "imports"
+    WorkspaceImportStore(root, max_retained_imports=2)
+    archive = _simple_archive()
+    sources = [
+        _source(tmp_path, archive, name=f"capacity-source-{index}.tar")
+        for index in range(3)
+    ]
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_process_capacity_ingest,
+            args=(str(root), str(source), 2, results),
+        )
+        for source in sources
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    observed = [results.get(timeout=2) for _process in processes]
+
+    assert [result[0] for result in observed].count("ok") == 2
+    errors = [result[1] for result in observed if result[0] == "error"]
+    assert len(errors) == 1
+    assert "retained import count budget exceeded" in errors[0]
+    assert len(list(root.iterdir())) == 2
+
+
 @pytest.mark.parametrize("hook", ["_after_archive_fsync", "_after_metadata_fsync", "_before_import_publish"])
 def test_fault_before_publish_cleans_private_temp(
     tmp_path: Path,
@@ -633,6 +738,45 @@ def test_release_and_delete_require_exact_ref_and_remove_import(tmp_path: Path) 
             pass
 
 
+@pytest.mark.parametrize("operation", ["resolve", "release", "delete"])
+@pytest.mark.parametrize(
+    "import_id",
+    [
+        "../workspace-import-" + ("0" * 48),
+        "workspace-import-" + ("0" * 47),
+        "workspace-import-" + ("0" * 49),
+        "workspace-import-" + ("A" * 48),
+    ],
+)
+def test_external_refs_require_exact_store_id_before_filesystem_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    import_id: str,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    valid_ref = _ingest(store, tmp_path, _simple_archive())
+    external_ref = valid_ref.model_copy(update={"import_id": import_id})
+    filesystem_reached = False
+
+    def forbidden_root_lock() -> object:
+        nonlocal filesystem_reached
+        filesystem_reached = True
+        raise AssertionError("filesystem access occurred before import ID validation")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(store, "_locked_root", forbidden_root_lock)
+    with pytest.raises(WorkspaceImportIntegrityError, match="not issued by this store"):
+        if operation == "resolve":
+            with store.resolve(external_ref):
+                pass
+        else:
+            getattr(store, operation)(external_ref)
+    assert not filesystem_reached
+    assert _stored_directory(root, valid_ref).is_dir()
+
+
 def test_startup_reconcile_removes_temp_orphan_tamper_and_symlink_without_following(
     tmp_path: Path,
 ) -> None:
@@ -663,10 +807,65 @@ def test_reconcile_scan_budgets_fail_closed(tmp_path: Path) -> None:
     store = WorkspaceImportStore(root)
     _ingest(store, tmp_path, _simple_archive())
 
+    store._reconcile_max_nodes = 1
     with pytest.raises(WorkspaceImportIntegrityError, match="node budget"):
-        WorkspaceImportStore(root, reconcile_max_nodes=1)
+        store.reconcile()
+    store._reconcile_max_nodes = workspace_imports_module._DEFAULT_RECONCILE_MAX_NODES
+    store._reconcile_max_bytes = 128
     with pytest.raises(WorkspaceImportIntegrityError, match="byte budget"):
-        WorkspaceImportStore(root, reconcile_max_bytes=128)
+        store.reconcile()
+
+
+@pytest.mark.parametrize("fault", ["metadata_open", "metadata_read", "archive_xattr"])
+def test_reconcile_preserves_import_on_transient_filesystem_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    import_ref = _ingest(store, tmp_path, _simple_archive())
+    stored = _stored_directory(root, import_ref)
+
+    if fault == "metadata_open":
+        real_operation = workspace_imports_module.os.open
+
+        def fail_metadata_open(path: object, *args: object, **kwargs: object) -> int:
+            if path == workspace_imports_module._METADATA_NAME:
+                raise OSError(errno.EIO, "injected metadata open failure")
+            return real_operation(path, *args, **kwargs)
+
+        monkeypatch.setattr(workspace_imports_module.os, "open", fail_metadata_open)
+    elif fault == "metadata_read":
+        real_operation = workspace_imports_module.os.read
+
+        def fail_metadata_read(_descriptor: int, _count: int) -> bytes:
+            raise OSError(errno.EIO, "injected metadata read failure")
+
+        monkeypatch.setattr(workspace_imports_module.os, "read", fail_metadata_read)
+    else:
+        real_operation = workspace_imports_module.os.getxattr
+
+        def fail_archive_xattr(*_args: object, **_kwargs: object) -> bytes:
+            raise OSError(errno.EIO, "injected archive xattr failure")
+
+        monkeypatch.setattr(workspace_imports_module.os, "getxattr", fail_archive_xattr)
+
+    with pytest.raises((OSError, WorkspaceImportIntegrityError)):
+        WorkspaceImportStore(root)
+    assert stored.is_dir()
+    assert (stored / "archive.tar").is_file()
+    assert (stored / "metadata.json").is_file()
+
+    if fault == "metadata_open":
+        monkeypatch.setattr(workspace_imports_module.os, "open", real_operation)
+    elif fault == "metadata_read":
+        monkeypatch.setattr(workspace_imports_module.os, "read", real_operation)
+    else:
+        monkeypatch.setattr(workspace_imports_module.os, "getxattr", real_operation)
+    store.reconcile()
+    with store.resolve(import_ref) as stream:
+        assert stream.read() == _simple_archive()
 
 
 def test_root_and_stored_modes_fail_closed(tmp_path: Path) -> None:
@@ -712,7 +911,9 @@ def test_reconcile_does_not_delete_a_pathname_replacement(
         original.rename(preserved)
         original.mkdir(mode=0o700)
         replacement_marker.write_text("replacement", encoding="ascii")
-        raise WorkspaceImportIntegrityError("injected validation failure")
+        raise workspace_imports_module._DeterministicImportCorruption(
+            "injected validation failure"
+        )
 
     monkeypatch.setattr(store, "_validate_import_contents", replace_then_fail)
 
