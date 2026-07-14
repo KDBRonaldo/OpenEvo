@@ -171,9 +171,11 @@ filesystem anchor 逐组件固定并复核宿主机 `~/.codex/auth.json`，把 b
 size、digest、UTF-8 JSON、redactor 和全路径 identity 校验后，才用 Linux
 `renameat2(RENAME_NOREPLACE)` 把完整 `0600` inode 原子发布为私有 credential root 的最终
 `auth.json`。Gateway 把 root/auth exact identity 交给 runtime；DockerRuntime no-follow
-重开并复核两者、持有两个 FD 到 container absence，并把
-`/proc/<core-pid>/fd/<held-fd>` 形式的 root/auth 分离 source 交给 Docker bind mount，显式固定
-`restart=no`；初次 adoption 和任何 restart 都不能重新解析到替换 pathname。Docker 只先启动 trusted inert command，
+重开并复核两者、持有两个 FD 到 container absence。Docker daemon 不能可靠访问 client
+PID namespace 中的 `/proc/<core-pid>/fd`，因此 runtime 把 Core-owned、daemon-visible 的绝对
+credential-root pathname 作为单个 read-only bind source，并显式固定 `restart=no`。`docker create`
+后、start 前还会 inspect exact immutable container ID，要求该 mount 的 source、destination 和
+`RW=false` 精确匹配；create 前后及 start 前都重验 pathname 与 held FD binding。Docker 只先启动 trusted inert command，
 随后 Core 在任何 prepare/agent command 前，对 exact container ID 内已经 adopted 的 root/auth
 执行 stat，将 device/inode/mode/owner/link-count/size 与 held authority 精确比较，并在前后绑定
 container ID、PID、start time、running state 和 restart count，最后再次复核 host pathname 与
@@ -210,10 +212,14 @@ pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当�
 credential root 重新验证并构造 redactor（仅在仍需重建 transcript 时），证明容器 absent 后
 只重试 pending phase。两项 required proof 都持久成功后才删除 completion storage、session、
 credential、log roots 和 journal；无法证明时 authority 持续保留。
-获得 cleanup 授权后，Core 在枚举 credential root 之前先按 journal exact identity no-follow
-复核、截断、fsync 并 unlink `auth.json`；剩余递归清理仍受 node/depth budget 限制，预算耗尽会
-保留 root/journal 供重试，但不会继续保留 auth bytes。Credential-capable init、agent
-postprocess、export、reconciliation、cleanup 和 teardown 异常日志不使用原始
+获得 cleanup 授权后，Core 在枚举 credential root 的普通 inventory budget 之前，先按 journal
+稳定 device/inode identity 在 root 直接条目中定位原 auth inode；即使 agent 把它 rename 为其他
+名字，也会 no-follow 打开、复核、截断、fsync 并只 unlink 该 inode。被放回 `auth.json` 的
+replacement 不会被误当成 redaction authority；剩余递归清理仍受 node/depth budget 限制，预算
+耗尽会保留 replacement、root/journal 供重试，但不会继续保留原 auth bytes。缺少 exact auth
+identity 的 credential-bearing v5 terminal-finalization journal 在 startup fail closed，不能从当前
+pathname 重建 redactor。Credential-capable dispatcher shutdown/cancel/stage、Docker create
+reconciliation、init、agent postprocess、export、cleanup 和 teardown 异常日志不使用原始
 `exc_info`/traceback；始终保留 exception type，只有存在 verified `CredentialRedactor` 时才附加
 脱敏后的 exception text。
 

@@ -130,10 +130,13 @@ replacement are rejected. The gateway copies from a verified no-follow file
 descriptor into an exclusive `0600` target under a `0700` root and rechecks
 source/target size, SHA-256 digest, identity, link count, and change times. Both
 source and credential-root absolute pathname chains are pinned component by
-component and rechecked before and after publication. Docker receives separate
-root/auth bind sources through the Core process's held `/proc/<pid>/fd/<fd>`
-descriptors and uses `restart=no`; stable container process identity brackets the
-in-container adoption check, followed by a final host pathname binding check.
+component and rechecked before and after publication. Docker daemon PID
+namespaces do not reliably expose Core's `/proc/<pid>/fd/<fd>` paths, so Docker
+receives one Core-owned, daemon-visible absolute credential-root pathname as a
+read-only bind source and uses `restart=no`. Core verifies the create-time mount
+source/destination and `RW=false`, then rechecks pathname-to-FD binding before
+start. Stable container process identity brackets the in-container adoption check,
+followed by a final host pathname binding check.
 
 Core derives a bounded exact-value redactor from the verified auth JSON and its
 string leaves. Core stdout/stderr and transcript logs live in a node-private,

@@ -1441,6 +1441,13 @@ async def test_subscription_finalization_journal_recovers_terminal_result_after_
     managed.session_root_identity = capture_session_root_identity(session_dir)
     managed.credential_dir = credential_dir
     managed.credential_root_identity = capture_session_root_identity(credential_dir)
+    managed.credential_mount = ManagedCredentialMount(
+        root=credential_dir,
+        root_identity=managed.credential_root_identity,
+        auth_identity=session_files._auth_identity(
+            (credential_dir / "auth.json").stat(follow_symlinks=False)
+        ),
+    )
     managed.credential_redactor = session_files.CredentialRedactor.from_auth_json(
         b'{"access_token":"access-canary"}'
     )
@@ -1540,6 +1547,11 @@ async def test_terminal_agent_result_is_durable_before_postprocess_and_recovers_
         log_authority_identity=capture_session_root_identity(log_authority_dir),
         credential_dir=credential_dir,
         credential_root_identity=capture_session_root_identity(credential_dir),
+        credential_mount=ManagedCredentialMount(
+            root=credential_dir,
+            root_identity=capture_session_root_identity(credential_dir),
+            auth_identity=session_files._auth_identity(auth.stat(follow_symlinks=False)),
+        ),
         credential_redactor=session_files.CredentialRedactor.from_auth_json(auth.read_bytes()),
         runtime=TerminalRuntime(),
     )
@@ -1640,6 +1652,11 @@ async def test_subscription_finalization_rebuilds_transcript_after_restart(
         log_authority_identity=log_identity,
         credential_dir=credential_dir,
         credential_root_identity=capture_session_root_identity(credential_dir),
+        credential_mount=ManagedCredentialMount(
+            root=credential_dir,
+            root_identity=capture_session_root_identity(credential_dir),
+            auth_identity=session_files._auth_identity(auth.stat(follow_symlinks=False)),
+        ),
         credential_redactor=session_files.CredentialRedactor.from_auth_json(auth.read_bytes()),
         runtime=JournalRuntime(),
         agent_result=AgentRunResult(
@@ -2130,6 +2147,60 @@ def test_v5_cleanup_journal_remains_readable_after_v6_upgrade(tmp_path: Path) ->
     recovered = restarted._cleanup_retries[managed.session_id]
     assert recovered.phase == "runtime_active"
     assert recovered.credential_auth_identity is None
+
+
+def test_v5_credential_terminal_finalization_fails_closed_without_auth_authority(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    for root in (session_dir, credential_dir):
+        root.mkdir(mode=0o700)
+    auth = credential_dir / "auth.json"
+    auth.write_text('{"access_token":"historical-canary"}', encoding="utf-8")
+    auth.chmod(0o600)
+    auth_identity = session_files._auth_identity(auth.stat(follow_symlinks=False))
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="v5-credential-finalization"),
+    )
+    managed.request.agent = AgentSpec(
+        harness="codex",
+        settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.credential_dir = credential_dir
+    managed.credential_root_identity = capture_session_root_identity(credential_dir)
+    managed.credential_mount = ManagedCredentialMount(
+        root=credential_dir,
+        root_identity=managed.credential_root_identity,
+        auth_identity=auth_identity,
+    )
+    managed.credential_redactor = session_files.CredentialRedactor.from_auth_json(
+        auth.read_bytes()
+    )
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed, finalize_subscription=True)
+
+    journal_path = next(journal_dir.glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["version"] = 5
+    journal["credential_root"].pop("auth_identity")
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    journal_path.chmod(0o600)
+    auth.unlink()
+    auth.write_text('{"access_token":"replacement-canary"}', encoding="utf-8")
+    auth.chmod(0o600)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="cleanup ownership journal is invalid"):
+        restarted._load_cleanup_retries()
+
+    assert journal_path.exists()
+    assert auth.read_text(encoding="utf-8") == '{"access_token":"replacement-canary"}'
 
 
 def test_terminal_finalization_phase_requires_durable_authority(tmp_path: Path) -> None:

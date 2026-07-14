@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -30,6 +31,88 @@ def _real_docker_unavailable(reason: str) -> None:
     if os.environ.get("OPENEVO_REQUIRE_REAL_DOCKER") == "1":
         pytest.fail(reason)
     pytest.skip(reason)
+
+
+async def _probe_real_docker_credential_mount(tmp_path: Path) -> None:
+    shared_parent, daemon_parent = _real_docker_shared_parent(tmp_path)
+    session_dir = tmp_path / "credential-session"
+    session_dir.mkdir()
+    authority = _credential_mount(shared_parent / "credential-root")
+    runtime = DockerRuntime(
+        RuntimeSpec(image=_REAL_DOCKER_IMAGE, container_user="host"),
+        f"credential-{uuid.uuid4().hex[:16]}",
+        session_dir,
+        credential_mount=authority,
+        ownership_root=tmp_path / "credential-docker-authority",
+    )
+    runtime._credential_docker_source = daemon_parent / "credential-root"
+    try:
+        await runtime.start()
+        result = await runtime.exec(
+            f"test -r {MANAGED_CODEX_HOME}/auth.json "
+            f"&& ! mv {MANAGED_CODEX_HOME}/auth.json "
+            f"{MANAGED_CODEX_HOME}/renamed.json "
+            f"&& test -f {MANAGED_CODEX_HOME}/auth.json"
+        )
+        assert result.return_code == 0, result.stderr
+        assert (authority.root / "auth.json").is_file()
+        assert not (authority.root / "renamed.json").exists()
+    finally:
+        if runtime.container_id is not None and not runtime.absence_proven:
+            await runtime.stop()
+        shutil.rmtree(shared_parent, ignore_errors=True)
+
+
+def _real_docker_shared_parent(tmp_path: Path) -> tuple[Path, Path]:
+    direct_probe = tmp_path / "daemon-path-probe"
+    direct_probe.mkdir()
+    visible = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--mount",
+            f"type=bind,source={direct_probe},target=/probe,readonly",
+            _REAL_DOCKER_IMAGE,
+            "test",
+            "-d",
+            "/probe",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    direct_probe.rmdir()
+    if visible.returncode == 0:
+        parent = Path(tempfile.mkdtemp(prefix="openevo-credential-", dir=tmp_path))
+        return parent, parent
+
+    current_container = os.environ.get("HOSTNAME") or os.uname().nodename
+    inspected = subprocess.run(
+        ["docker", "container", "inspect", current_container],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if inspected.returncode == 0:
+        payload = json.loads(inspected.stdout)
+        mounts = payload[0].get("Mounts", []) if len(payload) == 1 else []
+        for mount in mounts:
+            destination = Path(str(mount.get("Destination", "")))
+            source = Path(str(mount.get("Source", "")))
+            if (
+                mount.get("Type") == "bind"
+                and mount.get("RW") is True
+                and destination.is_dir()
+                and os.access(destination, os.W_OK | os.X_OK)
+                and source.is_absolute()
+            ):
+                parent = Path(tempfile.mkdtemp(prefix="openevo-credential-", dir=destination))
+                return parent, source / parent.relative_to(destination)
+    _real_docker_unavailable(
+        "Docker daemon has no writable bind root shared with the test process"
+    )
+    raise AssertionError("unreachable")
 
 
 @pytest.fixture(autouse=True)
@@ -85,6 +168,19 @@ def _credential_stat_output(authority: ManagedCredentialMount) -> str:
         f"{root.st_nlink} {root.st_size}\n"
         f"{auth.st_dev} {auth.st_ino} {auth.st_mode:x} {auth.st_uid} "
         f"{auth.st_nlink} {auth.st_size}\n"
+    )
+
+
+def _credential_mount_inspect_output(authority: ManagedCredentialMount) -> str:
+    return json.dumps(
+        [
+            {
+                "Type": "bind",
+                "Source": str(authority.root),
+                "Destination": MANAGED_CODEX_HOME,
+                "RW": False,
+            }
+        ]
     )
 
 
@@ -428,6 +524,8 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
             _write_mock_cidfile(args, container_id)
             return 0, container_id + "\n", None
         if args[1:3] == ("container", "inspect"):
+            if any("json .Mounts" in str(value) for value in args):
+                return 0, _credential_mount_inspect_output(credential_mount), None
             if any("State.Pid" in str(value) for value in args):
                 return 0, f"{container_id}|1234|started-at|true|0\n", None
             return 0, container_id + "\n", None
@@ -440,14 +538,11 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     await runtime.start()
 
     create = next(call.args for call in run_command.await_args_list if call.args[1] == "create")
-    volumes = [create[index + 1] for index, value in enumerate(create) if value == "-v"]
-    credential_volumes = [volume for volume in volumes if MANAGED_CODEX_HOME in volume]
-    assert len(credential_volumes) == 2
-    assert credential_volumes[0].startswith(f"/proc/{os.getpid()}/fd/")
-    assert credential_volumes[0].endswith(f":{MANAGED_CODEX_HOME}")
-    assert credential_volumes[1].startswith(f"/proc/{os.getpid()}/fd/")
-    assert credential_volumes[1].endswith(f":{MANAGED_CODEX_HOME}/auth.json")
-    assert str(credential_dir) not in credential_volumes
+    mounts = [create[index + 1] for index, value in enumerate(create) if value == "--mount"]
+    credential_mounts = [mount for mount in mounts if MANAGED_CODEX_HOME in mount]
+    assert credential_mounts == [
+        f"type=bind,source={credential_dir},target={MANAGED_CODEX_HOME},readonly"
+    ]
     assert not credential_dir.is_relative_to(session_dir)
 
 
@@ -485,17 +580,21 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
             credential_dir.rename(displaced)
             replacement = _credential_mount(credential_dir)
             assert replacement.root_identity != authority.root_identity
-            credential_volumes = [
+            credential_mounts = [
                 args[index + 1]
                 for index, value in enumerate(args)
-                if value == "-v" and MANAGED_CODEX_HOME in args[index + 1]
+                if value == "--mount" and MANAGED_CODEX_HOME in args[index + 1]
             ]
-            assert len(credential_volumes) == 2
-            assert all(value.startswith(f"/proc/{os.getpid()}/fd/") for value in credential_volumes)
+            assert credential_mounts == [
+                f"type=bind,source={authority.root},target={MANAGED_CODEX_HOME},readonly"
+            ]
             _write_mock_cidfile(args, container_id)
             return 0, container_id, None
         if args[1:3] == ("container", "inspect"):
             if container_present:
+                if any("json .Mounts" in str(value) for value in args):
+                    assert replacement is not None
+                    return 0, _credential_mount_inspect_output(replacement), None
                 if any("State.Pid" in str(value) for value in args):
                     return 0, f"{container_id}|5678|started-at|true|0\n", None
                 return 0, container_id, None
@@ -508,7 +607,7 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
         return 0, None, None
 
     monkeypatch.setattr(runtime, "_run_local_command", AsyncMock(side_effect=run_command_impl))
-    with pytest.raises(RuntimeError, match="did not adopt"):
+    with pytest.raises(RuntimeError, match="did not preserve"):
         await runtime.start()
 
     assert runtime._credential_root_fd == -1
@@ -551,6 +650,8 @@ async def test_credential_mount_rejects_replacement_after_final_process_identity
         if args[1:3] == ("container", "inspect"):
             if not container_present:
                 return 1, None, f"Error: No such object: {container_id}"
+            if any("json .Mounts" in str(value) for value in args):
+                return 0, _credential_mount_inspect_output(authority), None
             if any("State.Pid" in str(value) for value in args):
                 process_inspects += 1
                 if process_inspects == 2:
@@ -573,6 +674,39 @@ async def test_credential_mount_rejects_replacement_after_final_process_identity
     assert process_inspects == 2
     assert any(call.args[1] == "rm" for call in run_command.await_args_list)
     assert runtime.absence_proven is True
+
+
+@pytest.mark.asyncio
+async def test_credential_create_reconciliation_log_omits_traceback_canary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "docker-create-reconciliation-canary"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "credential-create-log",
+        session_dir,
+        credential_mount=_credential_mount(tmp_path / "credentials"),
+    )
+
+    class CanaryFailure(RuntimeError):
+        pass
+
+    async def fail_reconciliation(*, explicit_failure: bool) -> None:
+        del explicit_failure
+        traceback_local = secret
+        raise CanaryFailure(traceback_local) from ValueError(secret)
+
+    monkeypatch.setattr(runtime, "_reconcile_create_ownership", fail_reconciliation)
+    with caplog.at_level("WARNING", logger="openevo.runtime.docker"):
+        await runtime._reconcile_create_after_interruption(explicit_failure=False)
+
+    assert secret not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "CanaryFailure" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1358,6 +1492,8 @@ async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
         _real_docker_unavailable(
             f"required local probe image is unavailable: {_REAL_DOCKER_IMAGE}"
         )
+
+    await _probe_real_docker_credential_mount(tmp_path)
 
     session_dir = tmp_path / "session"
     session_dir.mkdir()

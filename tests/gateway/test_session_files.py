@@ -673,6 +673,10 @@ def test_credential_cleanup_scrubs_bound_auth_before_node_budget_exhaustion(
     auth.chmod(0o600)
     auth_state = auth.stat(follow_symlinks=False)
     auth_identity = session_files._auth_identity(auth_state)
+    moved_auth = root / "renamed-secret.json"
+    auth.rename(moved_auth)
+    auth.write_text('{"access_token":"replacement-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
     for name in ("000-attacker", "001-attacker"):
         directory = root / name
         directory.mkdir()
@@ -681,7 +685,8 @@ def test_credential_cleanup_scrubs_bound_auth_before_node_budget_exhaustion(
     with pytest.raises(SessionFileSecurityError, match="node limit"):
         remove_credential_tree(root, identity, auth_identity, max_nodes=1)
 
-    assert not auth.exists()
+    assert not moved_auth.exists()
+    assert auth.read_text(encoding="utf-8") == '{"access_token":"replacement-canary"}\n'
     assert root.exists()
 
 

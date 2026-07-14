@@ -160,9 +160,12 @@ class DockerRuntime(BaseRuntime):
     ) -> None:
         super().__init__(spec, session_id, session_dir)
         credential_dir = credential_mount.root if credential_mount is not None else None
+        credential_docker_source = credential_dir
         if credential_dir is not None:
             if not credential_dir.is_absolute():
                 raise ValueError("credential_dir must be absolute")
+            if credential_docker_source is None or not credential_docker_source.is_absolute():
+                raise ValueError("credential docker source must be absolute")
             try:
                 credential_dir.relative_to(session_dir)
             except ValueError:
@@ -170,6 +173,7 @@ class DockerRuntime(BaseRuntime):
             else:
                 raise ValueError("credential_dir must be outside the session tree")
         self._credential_dir = credential_dir
+        self._credential_docker_source = credential_docker_source
         self._credential_mount = credential_mount
         self._credential_root_fd = -1
         self._credential_auth_fd = -1
@@ -317,21 +321,51 @@ class DockerRuntime(BaseRuntime):
                 os.close(descriptor)
                 setattr(self, name, -1)
 
-    def _credential_mount_sources(self) -> tuple[str, str]:
+    def _credential_mount_source(self) -> str:
         self._verify_credential_mount_pins()
-        process_root = f"/proc/{os.getpid()}/fd"
-        root_source = f"{process_root}/{self._credential_root_fd}"
-        auth_source = f"{process_root}/{self._credential_auth_fd}"
+        source = self._credential_docker_source
+        if source is None or "," in str(source):
+            raise RuntimeError("managed credential Docker source is invalid")
+        return str(source)
+
+    async def _verify_created_credential_mount(self) -> None:
         authority = self._credential_mount
-        assert authority is not None
-        root_state = os.stat(root_source)
-        auth_state = os.stat(auth_source)
+        if authority is None:
+            return
+        self._verify_credential_mount_pins()
+        rc, stdout, _ = await self._run_local_command(
+            "docker",
+            "container",
+            "inspect",
+            "--format",
+            "{{json .Mounts}}",
+            self._container_ref,
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
+        )
+        try:
+            mounts = json.loads(str(stdout or ""))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("managed credential mount inspect returned invalid JSON") from exc
+        matches = (
+            [
+                mount
+                for mount in mounts
+                if isinstance(mount, dict) and mount.get("Destination") == MANAGED_CODEX_HOME
+            ]
+            if isinstance(mounts, list)
+            else []
+        )
+        if rc != 0 or len(matches) != 1:
+            raise RuntimeError("managed credential mount inspect is invalid")
+        mount = matches[0]
         if (
-            root_state.st_dev,
-            root_state.st_ino,
-        ) != authority.root_identity[:2] or _full_file_identity(auth_state) != authority.auth_identity:
-            raise RuntimeError("managed credential descriptor mount source changed")
-        return root_source, auth_source
+            mount.get("Type") != "bind"
+            or mount.get("Source") != str(self._credential_docker_source)
+            or mount.get("RW") is not False
+        ):
+            raise RuntimeError("managed credential mount configuration changed")
+        self._verify_credential_mount_pins()
 
     async def start(self) -> None:
         if self._destroyed:
@@ -367,16 +401,14 @@ class DockerRuntime(BaseRuntime):
         create_args.extend(["-v", f"{self.session_dir}:{self.runtime_session_dir}"])
         if self._credential_mount is not None:
             try:
-                root_source, auth_source = self._credential_mount_sources()
+                root_source = self._credential_mount_source()
             except Exception:
                 self._mark_no_ownership()
                 raise
             create_args.extend(
                 [
-                    "-v",
-                    f"{root_source}:{MANAGED_CODEX_HOME}",
-                    "-v",
-                    f"{auth_source}:{MANAGED_CODEX_HOME}/auth.json",
+                    "--mount",
+                    f"type=bind,source={root_source},target={MANAGED_CODEX_HOME},readonly",
                 ]
             )
         # Additional volumes from kwargs (e.g., Docker socket for agents that need DinD)
@@ -414,6 +446,15 @@ class DockerRuntime(BaseRuntime):
                 "docker create succeeded but container ownership could not be verified; "
                 "cleanup/recovery state was retained"
             )
+        if self._credential_mount is not None:
+            try:
+                await self._verify_created_credential_mount()
+            except Exception as exc:
+                await self.stop()
+                raise RuntimeError(
+                    "docker did not preserve the verified credential mount configuration"
+                ) from exc
+            self._verify_credential_mount_pins()
         rc, _, stderr = await self._run_local_command(
             "docker",
             "start",
@@ -612,13 +653,21 @@ class DockerRuntime(BaseRuntime):
                 "private recovery state was retained",
                 self._container_name,
             )
-        except Exception:
-            logger.warning(
-                "docker create ownership reconciliation failed for %s; "
-                "private recovery state was retained",
-                self._container_name,
-                exc_info=True,
-            )
+        except Exception as exc:
+            if self._credential_mount is not None:
+                logger.warning(
+                    "docker create ownership reconciliation failed for %s; "
+                    "private recovery state was retained [%s]",
+                    self._container_name,
+                    type(exc).__name__,
+                )
+            else:
+                logger.warning(
+                    "docker create ownership reconciliation failed for %s; "
+                    "private recovery state was retained",
+                    self._container_name,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
 
     async def _reconcile_create_ownership(self, *, explicit_failure: bool) -> None:
         try:

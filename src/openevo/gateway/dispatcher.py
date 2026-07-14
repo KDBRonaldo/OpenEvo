@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Final
 
 from openevo.harness.models import AgentRunResult
 from openevo.gateway.session_files import CredentialRedactor
@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 StageCallback = Callable[["ManagedSession"], Awaitable[None]]
 StageTransitionCallback = Callable[["ManagedSession"], None]
 _STOP = object()
+_SUBSCRIPTION_AUTH_MODES: Final[frozenset[str]] = frozenset(
+    {"subscription", "chatgpt_subscription"}
+)
 
 
 class SessionStage(str, Enum):
@@ -97,6 +100,16 @@ class ManagedSession:
     def has_terminal_outcome(self) -> bool:
         return self.final_result is not None or self.pending_status is not None
 
+    @property
+    def credential_capable(self) -> bool:
+        auth_mode = self.request.agent.settings.get("auth_mode")
+        return (
+            self.credential_dir is not None
+            or self.credential_mount is not None
+            or self.credential_redactor is not None
+            or (isinstance(auth_mode, str) and auth_mode in _SUBSCRIPTION_AUTH_MODES)
+        )
+
 
 class SessionDispatcher:
     """Drive INIT -> READY -> RUNNING -> POSTRUN with isolated worker pools."""
@@ -145,19 +158,24 @@ class SessionDispatcher:
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
-        cancel_tasks = []
+        cancel_tasks: list[tuple[ManagedSession, Awaitable[None]]] = []
         for managed in sessions:
             managed.cancel_requested = True
             managed.cancel_event.set()
             if managed.runtime is not None:
-                cancel_tasks.append(managed.runtime.cancel())
+                cancel_tasks.append((managed, managed.runtime.cancel()))
         if cancel_tasks:
-            outcomes = await asyncio.gather(*cancel_tasks, return_exceptions=True)
-            for outcome in outcomes:
+            outcomes = await asyncio.gather(
+                *(operation for _, operation in cancel_tasks),
+                return_exceptions=True,
+            )
+            for (managed, _), outcome in zip(cancel_tasks, outcomes, strict=True):
                 if isinstance(outcome, BaseException):
-                    logger.warning(
+                    self._log_session_exception(
+                        managed,
                         "Runtime cancellation failed during dispatcher shutdown",
-                        exc_info=(type(outcome), outcome, outcome.__traceback__),
+                        outcome,
+                        level=logging.WARNING,
                     )
         for task in self._workers:
             task.cancel()
@@ -200,11 +218,12 @@ class SessionDispatcher:
         if managed.runtime is not None:
             try:
                 await managed.runtime.cancel()
-            except Exception:
-                logger.warning(
-                    "Runtime cancellation failed for session %s; continuing cleanup",
-                    session_id,
-                    exc_info=True,
+            except Exception as exc:
+                self._log_session_exception(
+                    managed,
+                    "Runtime cancellation failed; continuing cleanup",
+                    exc,
+                    level=logging.WARNING,
                 )
         if should_enqueue_postrun:
             self._notify_stage_change(managed)
@@ -287,9 +306,11 @@ class SessionDispatcher:
             await callback(managed)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception(
-                "Dispatcher stage %s failed for session %s", stage, managed.session_id
+        except Exception as exc:
+            self._log_session_exception(
+                managed,
+                f"Dispatcher stage {stage} failed",
+                exc,
             )
 
     async def _begin(
@@ -389,8 +410,39 @@ class SessionDispatcher:
             return
         try:
             callback(managed)
-        except Exception:
-            logger.exception(
-                "Dispatcher stage-change callback failed for session %s",
-                managed.session_id,
+        except Exception as exc:
+            self._log_session_exception(
+                managed,
+                "Dispatcher stage-change callback failed",
+                exc,
             )
+
+    @staticmethod
+    def _log_session_exception(
+        managed: ManagedSession,
+        message: str,
+        exc: BaseException,
+        *,
+        level: int = logging.ERROR,
+    ) -> None:
+        if managed.credential_capable:
+            rendered = type(exc).__name__
+            if managed.credential_redactor is not None:
+                detail = managed.credential_redactor.redact(str(exc))
+                if detail:
+                    rendered = f"{rendered}: {detail}"
+            logger.log(
+                level,
+                "%s for session %s [%s]",
+                message,
+                managed.session_id,
+                rendered,
+            )
+            return
+        logger.log(
+            level,
+            "%s for session %s",
+            message,
+            managed.session_id,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )

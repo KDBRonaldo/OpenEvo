@@ -77,9 +77,13 @@ chains are all verified there. Linux
 `renameat2(RENAME_NOREPLACE)` then publishes the complete `0600` inode as the
 credential root's final `auth.json`. DockerRuntime reopens and revalidates the
 resulting root and file identities and keeps both descriptors alive through
-mount adoption. The root and auth file are separate bind sources addressed as
-`/proc/<core-pid>/fd/<held-fd>`, so pathname replacement cannot change initial
-adoption or a later restart; the managed container also fixes `restart=no`.
+mount adoption. Docker daemons cannot reliably resolve descriptors in the
+client's PID namespace, so Docker receives one Core-owned, daemon-visible
+absolute credential-root pathname as a read-only bind source; the managed
+container also fixes `restart=no`. After create, Core inspects the exact
+container ID and requires the recorded source, destination, and `RW=false` to
+match before start. Held root/auth descriptors are rebound to their pathnames
+before create, after create, and immediately before start.
 Docker starts only the trusted inert container command, then,
 before any prepare or agent command, stats the adopted root/auth mount inside
 the exact container ID and compares device, inode, mode, owner, link count, and
@@ -97,10 +101,11 @@ write targets. The scanner preflights the complete per-file, aggregate-byte,
 node, and depth budgets before changing a Core capture; a limit breach fails
 finalization explicitly and leaves all original bytes unchanged. Result objects
 receive a separate recursive in-memory redaction before persistence or delivery.
-Credential-capable initialization, execution/postprocess, export, reconciliation,
-and teardown exception logs never include `exc_info` or a raw traceback. They
-retain the exception type and include exception text only after verified
-credential redaction.
+Credential-capable dispatcher shutdown/cancel/stage handling, Docker create
+reconciliation, initialization, execution/postprocess, export, cleanup, and
+teardown exception logs never include `exc_info` or a raw traceback. They retain
+the exception type and include exception text only after verified credential
+redaction.
 The Codex harness remains a necessary trusted consumer of the credential.
 OpenEvo cannot prevent that process from actively transforming or transmitting a
 secret; that behavior is outside this boundary.
@@ -164,9 +169,14 @@ re-verifies staged auth only when transcript rebuilding is still needed, proves
 every owned container absent, and resumes pending publication. Completion
 storage, session/transcript, credential, log roots, and the journal are removed
 only after every required export and callback phase is durably successful. Once
-authorized, cleanup verifies and scrubs the journal-bound `auth.json` inode before
-enumerating any attacker-inflatable credential-root tree. The remaining walk is
-still bounded; budget exhaustion retains the root and journal but not auth bytes. The
+authorized, cleanup locates the journal-bound auth inode by stable device/inode
+among direct credential-root entries before enumerating any attacker-inflatable
+inventory. A same-root rename is therefore scrubbed and unlinked without treating
+an `auth.json` replacement as that authority. The remaining walk is still bounded;
+budget exhaustion retains replacement entries, the root, and the journal, but not
+the original auth bytes. Credential-bearing v5 terminal-finalization journals lack
+this exact authority and fail closed rather than rebuilding a redactor from a
+replacement pathname. The
 live retry loop applies the same state machine between restarts.
 
 ## What it captures

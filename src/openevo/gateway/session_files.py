@@ -1011,32 +1011,45 @@ def _scrub_bound_credential_auth(
     credential_root_fd: int,
     expected: CredentialFileIdentity,
 ) -> None:
+    matching_names: list[str] = []
     descriptor = -1
     try:
-        try:
-            named = os.stat(
-                "auth.json",
-                dir_fd=credential_root_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
+        with os.scandir(credential_root_fd) as entries:
+            for entry in entries:
+                try:
+                    named = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if _object_identity(named) == expected[:2]:
+                    matching_names.append(entry.name)
+        if not matching_names:
             return
+        if len(matching_names) != 1:
+            raise SessionFileSecurityError(
+                "journal-bound credential auth has multiple root entries"
+            )
+        auth_name = matching_names[0]
+        named = os.stat(
+            auth_name,
+            dir_fd=credential_root_fd,
+            follow_symlinks=False,
+        )
         descriptor = os.open(
-            "auth.json",
+            auth_name,
             os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=credential_root_fd,
         )
         opened = os.fstat(descriptor)
-        _require_private_staged_auth(
-            opened,
-            expected_owner=expected[3],
-            expected_size=expected[5],
-        )
-        if _auth_identity(named) != expected or _auth_identity(opened) != expected:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != expected[3]
+            or _object_identity(named) != expected[:2]
+            or _object_identity(opened) != expected[:2]
+        ):
             raise SessionFileSecurityError("journal-bound credential auth identity changed")
         _require_path_identity(
             credential_root_fd,
-            "auth.json",
+            auth_name,
             opened,
             label="journal-bound credential auth",
         )
@@ -1047,17 +1060,19 @@ def _scrub_bound_credential_auth(
             raise SessionFileSecurityError("journal-bound credential auth scrub was not stable")
         _require_named_identity(
             credential_root_fd,
-            "auth.json",
+            auth_name,
             _object_identity(opened),
             label="journal-bound credential auth",
             expected_owner=expected[3],
         )
-        os.unlink("auth.json", dir_fd=credential_root_fd)
+        os.unlink(auth_name, dir_fd=credential_root_fd)
         os.fsync(credential_root_fd)
     except SessionFileSecurityError:
         raise
     except OSError as exc:
-        raise SessionFileSecurityError("journal-bound credential auth cleanup failed safely") from exc
+        raise SessionFileSecurityError(
+            "journal-bound credential auth cleanup failed safely"
+        ) from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)

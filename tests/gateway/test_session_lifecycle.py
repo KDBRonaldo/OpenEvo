@@ -9,6 +9,7 @@ import pytest
 from openevo.gateway.dispatcher import ManagedSession, SessionDispatcher, SessionStage
 from openevo.gateway.node import GatewayNodeManager
 from openevo.gateway.session import SessionRegistry
+from openevo.gateway.session_files import CredentialRedactor
 from openevo.gateway.storage import SessionStore
 from openevo.harness.models import AgentSpec
 from openevo.rollout.models import SessionDispatchRequest, SessionStatus
@@ -431,6 +432,75 @@ async def test_dispatcher_shutdown_isolates_cancel_failures(tmp_path: Path) -> N
     await dispatcher.stop()
 
     assert calls == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_credential_capable_dispatcher_boundaries_omit_traceback_canary(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "dispatcher-boundary-traceback-canary"
+
+    class CanaryFailure(RuntimeError):
+        pass
+
+    class FailingRuntime:
+        async def cancel(self) -> None:
+            traceback_local = secret
+            raise CanaryFailure(traceback_local) from ValueError(secret)
+
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="credential-dispatcher",
+            task_id="task",
+            instruction="work",
+            remaining_timeout_seconds=10,
+            runtime=RuntimeSpec(image="runtime:latest"),
+            agent=AgentSpec(
+                harness="codex",
+                settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+            ),
+        ),
+        timer=StageTimer(),
+        session_dir=tmp_path / "credential-dispatcher",
+        artifacts_dir=tmp_path / "credential-dispatcher" / "artifacts",
+        credential_redactor=CredentialRedactor.from_auth_json(
+            f'{{"access_token":"{secret}"}}'.encode()
+        ),
+        runtime=FailingRuntime(),  # type: ignore[arg-type]
+        stage=SessionStage.RUNNING,
+    )
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+
+    async def fail_stage(_: ManagedSession) -> None:
+        traceback_local = secret
+        raise CanaryFailure(traceback_local) from ValueError(secret)
+
+    def fail_stage_change(_: ManagedSession) -> None:
+        traceback_local = secret
+        raise CanaryFailure(traceback_local) from ValueError(secret)
+
+    with caplog.at_level("WARNING", logger="openevo.gateway.dispatcher"):
+        dispatcher._started = True
+        dispatcher._sessions[managed.session_id] = managed
+        await dispatcher.stop()
+
+        dispatcher._started = True
+        dispatcher._sessions[managed.session_id] = managed
+        managed.cancel_requested = False
+        await dispatcher.cancel(managed.session_id)
+
+        await dispatcher._safe_invoke(fail_stage, managed, SessionStage.RUNNING)
+        dispatcher.on_stage_change = fail_stage_change
+        dispatcher._notify_stage_change(managed)
+
+    assert secret not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert caplog.text.count("CanaryFailure") == 4
 
 
 @pytest.mark.asyncio

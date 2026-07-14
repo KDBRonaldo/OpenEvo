@@ -3387,6 +3387,12 @@ class GatewayNodeManager:
             finalization_state is not None or delivery_state is not None
         ):
             raise ValueError("runtime-active phase authority is invalid")
+        if (
+            version < 6
+            and credential_dir is not None
+            and phase == _RECOVERY_PHASE_TERMINAL_FINALIZATION
+        ):
+            raise ValueError("legacy credential finalization lacks exact auth identity authority")
         return CleanupRetryOwnership(
             session_id=session_id,
             session_dir=session_dir,
@@ -3480,7 +3486,11 @@ class GatewayNodeManager:
         state = ownership.finalization_state
         if state is None:
             raise RuntimeError("subscription finalization authority is missing")
-        if ownership.credential_dir is None or ownership.credential_root_identity is None:
+        if (
+            ownership.credential_dir is None
+            or ownership.credential_root_identity is None
+            or ownership.credential_auth_identity is None
+        ):
             raise RuntimeError("subscription credential authority is missing")
         redactor = load_staged_codex_subscription_redactor(
             ownership.credential_dir,

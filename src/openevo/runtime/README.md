@@ -164,16 +164,21 @@ credential root, verifies the complete source and staged file identities,
 digest, bounded JSON, and redactor, then publishes the `0600` inode with Linux
 atomic no-replace rename. `ManagedCredentialMount` binds the root and auth-file
 identities. DockerRuntime reopens both no-follow, revalidates them, and retains
-both descriptors through runtime absence. Docker binds the root and auth file
-separately from `/proc/<core-pid>/fd/<held-fd>` sources and fixes `restart=no`, so
-neither initial adoption nor a restart can resolve a replacement pathname. After Docker starts only the trusted
+both descriptors through runtime absence. Because a daemon cannot reliably see
+the client's PID namespace, Docker binds one daemon-visible absolute root
+pathname read-only and fixes `restart=no`. Core verifies the create-time mount
+record (`Source`, destination, and `RW=false`) and rechecks pathname-to-FD binding
+before create, after create, and before start. After Docker starts only the trusted
 inert command, Core stats the adopted directory and auth file inside the exact
 container ID and compares their full mount identities before any prepare or
 agent command. Stable container ID/PID/start/restart state brackets that check.
 A final host pathname-to-FD check follows the process/adoption check; a mismatch
-stops the container. After terminal delivery, Core verifies, scrubs, fsyncs, and
-unlinks the journal-bound auth inode before applying the bounded recursive budget
-to the remaining credential tree. A publication race, symlink, owner/mode/link mismatch, or unavailable
+stops the container. After terminal delivery, Core finds the journal-bound auth
+inode by stable device/inode even after a same-root rename, then verifies, scrubs,
+fsyncs, and unlinks only that inode before applying the bounded recursive budget
+to the remaining credential tree. A replacement at `auth.json` is not redaction
+authority, and credential-bearing v5 terminal finalization without an exact auth
+identity fails closed. A publication race, symlink, owner/mode/link mismatch, or unavailable
 rename primitive fails before agent execution.
 Workspace and artifact files are not redaction write targets; files larger than
 the Core capture scan limit retain their exact bytes.
