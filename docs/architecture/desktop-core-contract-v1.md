@@ -451,7 +451,10 @@ patch/finalize recovery, or an A-to-B patch can use current mutable authority,
 the sidecar requires Core's active revision to be either the exact persisted ref
 or its same-project, generation-adjacent successor. A lower generation, a
 same-generation ID or manifest rewrite, or an unproven generation skip returns a
-typed conflict before mapping commit or use of the reported ETag.
+typed conflict before recovery workspace mutation, mapping commit, or use of the
+reported ETag. An applied imported-draft outcome with no active revision retains
+its pre-patch base revision as effective authority. If the base is also empty,
+only `null` or a same-project generation-zero first revision is accepted.
 
 Required-revision selection is fixed: if Core reports a reachable queued or
 preparing successor for the active head, the new task requires that successor

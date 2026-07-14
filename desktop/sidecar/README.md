@@ -118,7 +118,10 @@ mutable authority. Every mapped, patch-recovery, and finalize-recovery read
 validates active revision authority monotonically before using the current ETag:
 the same generation must preserve the complete revision ref, while a changed ref
 must be the same-project direct successor. Generation rollback, identity rewrite,
-and unproven generation skips fail closed without committing a mapping. After
+and unproven generation skips fail closed without committing a mapping. An
+applied imported draft may have no outcome revision; recovery then retains its
+pre-patch base revision as the effective lower bound. If both are absent, only
+no revision or a same-project generation-zero revision is valid. After
 capabilities, project/head agreement, and validation succeed, compare-and-swap
 commit increments the mapping generation and retains the previous version in
 adapter-owned history; an authority-only version may repeat the predecessor
@@ -140,9 +143,11 @@ replayed. An imported patch may then be finalized without invalidating its
 durable proof: recovery requires the persisted upload's predecessor snapshot
 and ETag plus the durable exact finalize response's project/workspace snapshots
 and publication before accepting current status/ETag or later successor
-authority. The finalize project's active revision is also a durable lower bound;
-recovery accepts only that exact revision or its direct successor. Finalize
-authority is CAS-persisted before mapping commit. Mapping CAS and matching
+authority. The finalize project's active revision must descend from the applied
+patch's effective lower bound and is then durable authority for later reads.
+Recovery performs both checks before another workspace mutation, mapping commit,
+or current ETag adoption. Finalize authority is CAS-persisted before mapping
+commit. Mapping CAS and matching
 applied-operation cleanup are atomic. After an O-to-A patch whose
 mapping commit failed, a same-A retry commits the finalized A mapping; a later
 Local B edit first commits that proven A generation, then issues one distinct

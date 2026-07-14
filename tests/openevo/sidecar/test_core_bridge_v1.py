@@ -1666,6 +1666,253 @@ def _prepare_finalized_import_patch_crash(
     return edited, archive, persistence, fake_core, mapping_o
 
 
+REVISION_1 = core_v1.RevisionRefV1(
+    id="revision-1",
+    project_id=CORE_PROJECT_ID,
+    generation=1,
+    manifest_sha256="7" * 64,
+)
+
+
+def _replace_finalize_revision_authority(
+    persistence: FakePersistence,
+    revision: core_v1.RevisionRefV1,
+) -> None:
+    operation = persistence.operation
+    assert operation is not None
+    authority = operation.workspace_upload_finalize
+    assert authority is not None
+    finalized_project = core_v1.ProjectV1.model_validate(
+        authority.outcome.project.model_copy(
+            update={"active_revision": revision},
+        ).model_dump(),
+        strict=True,
+    )
+    outcome = core_v1.WorkspaceUploadFinalizeResponseV1.model_validate(
+        authority.outcome.model_copy(
+            update={"project": finalized_project},
+        ).model_dump(),
+        strict=True,
+    )
+    persistence.operation = replace(
+        operation,
+        workspace_upload_finalize=replace(
+            authority,
+            outcome=outcome,
+        ),
+    )
+
+
+def _workspace_mutation_count(fake_core: FakeCore) -> int:
+    return len(
+        [
+            request
+            for request in fake_core.calls
+            if request.method == "POST"
+            and (
+                request.url.path.endswith("/workspace-uploads")
+                or request.url.path.endswith("/finalize")
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "reported_revision",
+    [
+        REVISION,
+        core_v1.RevisionRefV1(
+            id="revision-1-rewritten",
+            project_id=CORE_PROJECT_ID,
+            generation=1,
+            manifest_sha256=REVISION_1.manifest_sha256,
+        ),
+        core_v1.RevisionRefV1(
+            id=REVISION_1.id,
+            project_id=CORE_PROJECT_ID,
+            generation=1,
+            manifest_sha256="9" * 64,
+        ),
+        core_v1.RevisionRefV1(
+            id="revision-3",
+            project_id=CORE_PROJECT_ID,
+            generation=3,
+            manifest_sha256="3" * 64,
+        ),
+    ],
+    ids=[
+        "generation-rollback",
+        "same-generation-id-rewrite",
+        "same-generation-manifest-rewrite",
+        "generation-jump",
+    ],
+)
+def test_applied_imported_draft_recovery_uses_base_revision_authority_before_mutation(
+    reported_revision: core_v1.RevisionRefV1,
+) -> None:
+    edited, archive, persistence, fake_core, mapping_o = _prepare_finalized_import_patch_crash(
+        finalize_revision=REVISION_1
+    )
+    _replace_finalize_revision_authority(persistence, reported_revision)
+    reported_etag = '"' + "9" * 64 + '"'
+    fake_core.active_revision = reported_revision
+    fake_core.project_etag = reported_etag
+    fake_core.project_updated_at = "2026-07-14T12:46:00Z"
+    fake_core.head = _head(active_revision=reported_revision, etag=reported_etag)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    history_count = len(persistence.mapping_history)
+    recovered, _, _, _ = _bridge(
+        edited,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            edited,
+            idempotency_key="applied-draft-revision-recovery-0003",
+        )
+
+    assert exc_info.value.error.code == "core_project_revision_authority_mismatch"
+    assert "durable applied patch outcome" in exc_info.value.error.message
+    assert persistence.mapping == mapping_o
+    assert persistence.mapping.project_etag != reported_etag
+    assert len(persistence.mapping_history) == history_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+
+
+@pytest.mark.parametrize(
+    ("base_revision", "finalize_revision", "reported_revision"),
+    [
+        (REVISION_1, REVISION, REVISION_1),
+        (
+            REVISION_1,
+            core_v1.RevisionRefV1(
+                id="revision-1-rewritten",
+                project_id=CORE_PROJECT_ID,
+                generation=1,
+                manifest_sha256=REVISION_1.manifest_sha256,
+            ),
+            core_v1.RevisionRefV1(
+                id="revision-2",
+                project_id=CORE_PROJECT_ID,
+                generation=2,
+                manifest_sha256="2" * 64,
+            ),
+        ),
+        (
+            REVISION_1,
+            core_v1.RevisionRefV1(
+                id=REVISION_1.id,
+                project_id=CORE_PROJECT_ID,
+                generation=1,
+                manifest_sha256="9" * 64,
+            ),
+            core_v1.RevisionRefV1(
+                id="revision-2",
+                project_id=CORE_PROJECT_ID,
+                generation=2,
+                manifest_sha256="2" * 64,
+            ),
+        ),
+        (
+            REVISION,
+            core_v1.RevisionRefV1(
+                id="revision-2",
+                project_id=CORE_PROJECT_ID,
+                generation=2,
+                manifest_sha256="2" * 64,
+            ),
+            REVISION_1,
+        ),
+    ],
+    ids=[
+        "generation-rollback",
+        "same-generation-id-rewrite",
+        "same-generation-manifest-rewrite",
+        "generation-jump",
+    ],
+)
+def test_workspace_finalize_recovery_uses_effective_patch_predecessor(
+    base_revision: core_v1.RevisionRefV1,
+    finalize_revision: core_v1.RevisionRefV1,
+    reported_revision: core_v1.RevisionRefV1,
+) -> None:
+    edited, archive, persistence, fake_core, mapping_o = _prepare_finalized_import_patch_crash(
+        finalize_revision=base_revision
+    )
+    _replace_finalize_revision_authority(persistence, finalize_revision)
+    reported_etag = '"' + "9" * 64 + '"'
+    fake_core.active_revision = reported_revision
+    fake_core.project_etag = reported_etag
+    fake_core.project_updated_at = "2026-07-14T12:46:00Z"
+    fake_core.head = _head(active_revision=reported_revision, etag=reported_etag)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    history_count = len(persistence.mapping_history)
+    recovered, _, _, _ = _bridge(
+        edited,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            edited,
+            idempotency_key="finalize-predecessor-recovery-0003",
+        )
+
+    assert exc_info.value.error.code == "core_project_revision_authority_mismatch"
+    assert "durable workspace finalize predecessor" in exc_info.value.error.message
+    assert persistence.mapping == mapping_o
+    assert persistence.mapping.project_etag != reported_etag
+    assert len(persistence.mapping_history) == history_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+
+
+def test_empty_revision_authority_accepts_none_and_same_project_genesis() -> None:
+    bridge_module._ensure_revision_authority_successor(
+        None,
+        None,
+        project_id=CORE_PROJECT_ID,
+        label="empty project revision",
+    )
+    bridge_module._ensure_revision_authority_successor(
+        None,
+        REVISION,
+        project_id=CORE_PROJECT_ID,
+        label="first project revision",
+    )
+
+
+@pytest.mark.parametrize(
+    "reported_revision",
+    [
+        REVISION_1,
+        core_v1.RevisionRefV1(
+            id="other-project-revision-0",
+            project_id="other-core-project",
+            generation=0,
+            manifest_sha256="8" * 64,
+        ),
+    ],
+    ids=["generation-jump", "wrong-project-genesis"],
+)
+def test_empty_revision_authority_rejects_non_genesis_or_foreign_identity(
+    reported_revision: core_v1.RevisionRefV1,
+) -> None:
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge_module._ensure_revision_authority_successor(
+            None,
+            reported_revision,
+            project_id=CORE_PROJECT_ID,
+            label="first project revision",
+        )
+
+    assert exc_info.value.error.code == "core_project_revision_authority_mismatch"
+
+
 @pytest.mark.parametrize(
     ("finalize_revision", "reported_revision"),
     [

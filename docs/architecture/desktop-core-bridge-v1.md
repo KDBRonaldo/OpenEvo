@@ -77,8 +77,14 @@ project snapshot, workspace snapshot, status, publication, ETag, readiness, and
 revision authority. In that case the durable finalize response must bind a
 predecessor project snapshot and ETag exactly matching the applied patch's
 mutable authority, plus the exact final project snapshot, workspace snapshot,
-and publication observed now. Later successor-only mutable authority must be
-ETag-visible and monotonic. Only after this proof may Desktop commit mapping A;
+and publication observed now. If the applied imported-draft outcome has no active
+revision, its pre-patch base revision remains the effective predecessor authority.
+If both are absent, the finalize/current authority may remain absent or first
+appear only as a same-project generation-zero revision. Later successor-only
+mutable authority must be ETag-visible and monotonic. Recovery rejects rollback,
+same-generation ID or manifest rewrites, and generation jumps before another
+workspace mutation, mapping commit, or current ETag adoption. Only after this
+proof may Desktop commit mapping A;
 a requested B then starts from A's current ETag and gets a separate mapping
 generation.
 

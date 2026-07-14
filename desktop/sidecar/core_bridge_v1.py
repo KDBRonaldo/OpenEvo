@@ -1670,6 +1670,7 @@ class DesktopCoreBridgeV1:
         _ensure_revision_authority_successor(
             mapping.active_revision,
             current.active_revision,
+            project_id=mapping.core_project_id,
             label="durable project mapping",
         )
         if mapping.request_sha256 == request_sha256:
@@ -2599,6 +2600,7 @@ def _ensure_patch_operation_authority(
         _ensure_revision_authority_successor(
             mapping.active_revision,
             patch.base_project.active_revision,
+            project_id=patch.core_project_id,
             label="durable project patch base",
         )
         base_matches = (
@@ -2638,8 +2640,9 @@ def _ensure_persisted_patch_outcome(
         operation.new_project_create,
     )
     _ensure_revision_authority_successor(
-        operation.outcome_mutable.active_revision,
+        _effective_applied_revision_authority(operation),
         current.active_revision,
+        project_id=operation.core_project_id,
         label="durable applied patch outcome",
     )
     current_mutable = _patch_mutable_authority(current)
@@ -2718,13 +2721,15 @@ def _ensure_workspace_finalize_proof(
     finalized_mutable = _patch_mutable_authority(finalized_project)
     current_mutable = _patch_mutable_authority(current)
     _ensure_revision_authority_successor(
-        operation.outcome_mutable.active_revision,
+        _effective_applied_revision_authority(operation),
         finalized_mutable.active_revision,
+        project_id=operation.core_project_id,
         label="durable workspace finalize predecessor",
     )
     _ensure_revision_authority_successor(
         finalized_mutable.active_revision,
         current_mutable.active_revision,
+        project_id=operation.core_project_id,
         label="durable workspace finalize",
     )
     if current_mutable != finalized_mutable and (
@@ -2752,6 +2757,17 @@ def _patch_immutable_authority(
         ),
         task_snapshot=project.current_task_snapshot,
         created_at=project.created_at,
+    )
+
+
+def _effective_applied_revision_authority(
+    operation: CoreProjectPatchOperationV1,
+) -> core_v1.RevisionRefV1 | None:
+    assert operation.outcome_mutable is not None
+    return (
+        operation.outcome_mutable.active_revision
+        if operation.outcome_mutable.active_revision is not None
+        else operation.base_project.active_revision
     )
 
 
@@ -2912,18 +2928,24 @@ def _ensure_revision_authority_successor(
     authority: core_v1.RevisionRefV1 | None,
     current: core_v1.RevisionRefV1 | None,
     *,
+    project_id: str,
     label: str,
 ) -> None:
-    if authority is None:
-        return
-    valid_same_revision = current == authority
+    valid_initial_revision = authority is None and (
+        current is None or (current.project_id == project_id and current.generation == 0)
+    )
+    valid_same_revision = (
+        authority is not None and authority.project_id == project_id and current == authority
+    )
     valid_direct_successor = (
-        current is not None
+        authority is not None
+        and authority.project_id == project_id
+        and current is not None
         and current.project_id == authority.project_id
         and current.generation == authority.generation + 1
         and current.id != authority.id
     )
-    if not valid_same_revision and not valid_direct_successor:
+    if not valid_initial_revision and not valid_same_revision and not valid_direct_successor:
         raise _bridge_error(
             "core_project_revision_authority_mismatch",
             f"Core active revision does not directly descend from the {label} authority.",
@@ -2994,6 +3016,7 @@ def _mapping_from_request(
         _ensure_revision_authority_successor(
             previous_mapping.active_revision,
             active_revision,
+            project_id=project.id,
             label="previous project mapping",
         )
     if previous_mapping is None:
