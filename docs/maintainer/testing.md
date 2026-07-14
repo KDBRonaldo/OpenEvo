@@ -136,12 +136,19 @@ does not satisfy either gate.
 
 The exact Core wheel/lock export keeps the output directory open for the whole
 sidecar build and verifies its pathname/inode binding before and after writes.
+Before creating the output, it holds and validates the immediate parent's owner,
+group/world write bits, and macOS ACL. A newly created child may clear a valid
+inherited ACL once; an ACL added to an existing output, transaction, marker, or
+member must be rejected without mutation.
 It stages under a private transaction directory, publishes without replacement,
 keeps every source/export descriptor open, and exits the output context last so
 a `TemporaryDirectory` cleanup failure rolls the pair back. Before success, the
 test gate requires an exact wheel/lock root inventory and rechecks each pathname,
 inode/device, regular-file type, link count, owner/mode, byte size, and SHA-256
 against the source and canonical lock.
+The generated and embedded lock must load through Core's authoritative
+`FrameworkDistributionLock` loader, bind the exact wheel filename/version/digest,
+and be the only non-wheel member below PyInstaller's `openevo/wheels` directory.
 The wheel build fixes `SOURCE_DATE_EPOCH` to the trusted candidate commit time;
 reproducibility tests must build twice from the same source and compare exact
 wheel and generated lock bytes so a post-commit retry can recognize the pair.
@@ -159,6 +166,10 @@ installed through `transaction.ready`, and directory-fsynced again before the
 authorized unlink. Restart may adopt that temporary marker only when both files
 are closed, canonical, identity-bound markers and they describe the exact next
 phase or cleanup index.
+Marker replacement tests also interrupt after the prior marker has moved to its
+inode-named retired entry and race the source pathname after identity validation.
+Both the checked inode and a same-name replacement must remain preserved; marker
+publication never uses an overwrite-capable rename.
 
 An unauthorized member must retain at least one canonical binding. An authorized
 member may be absent or may still have names after an interrupted unlink, but

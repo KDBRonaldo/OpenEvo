@@ -60,9 +60,13 @@ the remote server.
 9. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
    dependency checks.
 
-The exact Core wheel export directory must be owned by the build user and must
-not be group/world writable; a newly created directory is `0700`. After an
-interrupted build, rerun the same builder with the same wheel inputs so its
+The exact Core wheel export parent and directory must be owned by the build user
+and must not be group/world writable. On macOS the held parent must not grant
+mutation through an extended ACL. A newly created directory is `0700` and may
+have an inherited ACL normalized once; any later ACL addition fails closed.
+The packaged `openevo/wheels` inventory must be exactly the Core wheel plus its
+canonical `framework-lock.json`, both verified through Core's lock loader. After
+an interrupted build, rerun the same builder with the same wheel inputs so its
 durable transaction recovery can complete. Successful and failed cleanup may
 leave an inode-bound `.openevo-core-release-tombstone-*` beside the export
 directory; it is conservative audit evidence and is not part of the exact

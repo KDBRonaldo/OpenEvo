@@ -39,8 +39,9 @@ CORE_RELEASE_TRANSACTION_MARKER = "transaction.json"
 CORE_RELEASE_TRANSACTION_READY = "transaction.ready"
 _CORE_RELEASE_TRANSACTION_PATTERN = re.compile(r"\.openevo-core-release-([0-9a-f]{32})")
 _CORE_RELEASE_STAGING_PATTERN = re.compile(r"\.member-([0-9a-f]{32})")
+_CORE_RELEASE_RETIRED_MARKER_PATTERN = re.compile(r"\.marker-retired-([0-9a-f]+)-([0-9a-f]+)")
 _MAX_CORE_RELEASE_ROOT_MEMBERS = 4
-_MAX_CORE_RELEASE_TRANSACTION_MEMBERS = 6
+_MAX_CORE_RELEASE_TRANSACTION_MEMBERS = 16
 _MAX_CORE_RELEASE_MARKER_BYTES = 4096
 _DARWIN_ACL_TYPE_EXTENDED = 0x0000_0100
 _DARWIN_ACL_FIRST_ENTRY = 0
@@ -654,16 +655,18 @@ def _validate_core_wheel(wheel: Path, *, name: str, version: str) -> None:
 def _core_framework_lock_bytes(wheel: Path, *, version: str) -> bytes:
     try:
         wheel_payload = wheel.read_bytes()
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("Core wheel is unavailable for framework lock generation") from exc
+    try:
         lock = FrameworkDistributionLock(
             distribution_version=version,
             distribution_digest=_sha256_bytes(wheel_payload),
             wheel_filename=wheel.name,
         )
-    except (OSError, ValueError) as exc:
+    except ValueError as exc:
         raise RuntimeError("Core wheel cannot produce a valid framework lock identity") from exc
-    return (
-        json.dumps(lock.model_dump(mode="json"), separators=(",", ":"), sort_keys=True) + "\n"
-    ).encode("utf-8")
+    payload = lock.model_dump(mode="json")
+    return (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
 
 
 def _validated_framework_lock(payload: bytes) -> FrameworkDistributionLock:
@@ -822,9 +825,7 @@ def _raw_carchive_member_names(archive: object, executable: Path) -> tuple[str, 
             )
             if entry_length < toc_entry_length or position + entry_length > len(toc_payload):
                 raise RuntimeError("sidecar archive TOC entry bounds are invalid")
-            encoded_name = toc_payload[
-                position + toc_entry_length : position + entry_length
-            ]
+            encoded_name = toc_payload[position + toc_entry_length : position + entry_length]
             name = encoded_name.rstrip(b"\0").decode("utf-8", errors="strict")
             if typecode.decode("ascii", errors="strict") != "o":
                 names.append(name.replace("\\", "/"))
@@ -977,12 +978,13 @@ def _require_fd_acl_no_mutating_allow(file_fd: int, *, name: str) -> None:
         raise RuntimeError(f"Core release {name} extended ACL is unsafe") from exc
 
 
-def _prepare_core_wheel_output_dir(output_dir: Path) -> None:
-    if output_dir.is_symlink():
-        raise RuntimeError(f"Core wheel output must not be a symbolic link: {output_dir}")
-    if output_dir.exists() and not output_dir.is_dir():
-        raise RuntimeError(f"Core wheel output is not a directory: {output_dir}")
-    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+def _require_private_directory(descriptor: os.stat_result, *, name: str) -> None:
+    if (
+        not stat.S_ISDIR(descriptor.st_mode)
+        or descriptor.st_uid != os.geteuid()
+        or descriptor.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError(f"Core release {name} owner or private permissions are invalid")
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -1050,20 +1052,20 @@ class _CoreReleaseOutput:
             current_path = self.path.resolve(strict=True)
             current = os.stat(self.path, follow_symlinks=False)
             pinned = os.fstat(self.directory_fd)
+            parent = os.fstat(self.parent_fd)
             parent_current = os.stat(
                 self.resolved_path.name,
                 dir_fd=self.parent_fd,
                 follow_symlinks=False,
             )
+            _require_private_directory(parent, name="output parent")
             _require_fd_acl_no_mutating_allow(
                 self.parent_fd,
                 name="output parent",
             )
             _require_fd_acl_free(self.directory_fd, name="Core wheel output")
         except (OSError, RuntimeError) as exc:
-            raise RuntimeError(
-                "Core wheel output path changed during the sidecar build"
-            ) from exc
+            raise RuntimeError("Core wheel output path changed during the sidecar build") from exc
         expected_identity = (self.device, self.inode)
         if (
             current_path != self.resolved_path
@@ -1355,7 +1357,7 @@ def _verify_member_path(
             identity=identity,
             link_counts=link_counts,
         )
-        _clear_and_verify_fd_acl(file_fd, name=path_name)
+        _require_fd_acl_free(file_fd, name=path_name)
         descriptor = os.fstat(file_fd)
         _require_member_attributes(
             descriptor,
@@ -1388,7 +1390,7 @@ def _read_marker(directory_fd: int, name: str) -> tuple[bytes, tuple[int, int]]:
     try:
         descriptor = os.fstat(file_fd)
         _require_member_attributes(descriptor, name=name, mode=0o600)
-        _clear_and_verify_fd_acl(file_fd, name=name)
+        _require_fd_acl_free(file_fd, name=name)
         descriptor = os.fstat(file_fd)
         _require_member_attributes(descriptor, name=name, mode=0o600)
         if descriptor.st_size > _MAX_CORE_RELEASE_MARKER_BYTES:
@@ -1407,35 +1409,52 @@ def _read_marker(directory_fd: int, name: str) -> tuple[bytes, tuple[int, int]]:
 
 @contextmanager
 def _open_core_release_output(output_dir: Path) -> Iterator[_CoreReleaseOutput]:
+    output_dir = Path(os.path.abspath(output_dir))
     _reject_symlink_path(output_dir)
-    _prepare_core_wheel_output_dir(output_dir)
-    _reject_symlink_path(output_dir)
-    resolved_path = output_dir.resolve(strict=True)
+    if output_dir.name in {"", ".", ".."}:
+        raise RuntimeError("Core wheel output must name a child of a trusted parent")
+    resolved_parent = output_dir.parent.resolve(strict=True)
+    resolved_path = resolved_parent / output_dir.name
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if not hasattr(os, "O_NOFOLLOW"):
         raise RuntimeError("Core wheel output requires no-follow file support")
     flags |= os.O_NOFOLLOW
     parent_fd = -1
+    directory_fd = -1
+    created = False
     try:
-        parent_fd = os.open(resolved_path.parent, flags)
-        directory_fd = os.open(output_dir, flags)
-    except OSError as exc:
+        parent_fd = os.open(resolved_parent, flags)
+        parent_descriptor = os.fstat(parent_fd)
+        _require_private_directory(parent_descriptor, name="output parent")
+        _require_fd_acl_no_mutating_allow(parent_fd, name="output parent")
+        try:
+            os.mkdir(output_dir.name, 0o700, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
+        directory_fd = os.open(output_dir.name, flags, dir_fd=parent_fd)
+    except (OSError, RuntimeError) as exc:
+        if directory_fd >= 0:
+            os.close(directory_fd)
         if parent_fd >= 0:
             os.close(parent_fd)
-        raise RuntimeError(f"Core wheel output cannot be opened safely: {output_dir}") from exc
+        raise RuntimeError(
+            f"Core wheel output parent owner, or private permissions are invalid: {output_dir}"
+        ) from exc
     try:
-        _require_fd_acl_no_mutating_allow(parent_fd, name="output parent")
+        if output_dir.resolve(strict=True) != resolved_path:
+            raise RuntimeError("Core wheel output path changed while it was opened")
         descriptor = os.fstat(directory_fd)
-        if not stat.S_ISDIR(descriptor.st_mode):
-            raise RuntimeError(f"Core wheel output is not a directory: {output_dir}")
-        if (
-            descriptor.st_uid != os.geteuid()
-            or descriptor.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-        ):
+        try:
+            _require_private_directory(descriptor, name="output")
+        except RuntimeError as exc:
             raise RuntimeError(
                 "Core wheel output path, owner, or private permissions are invalid"
-            )
-        _clear_and_verify_fd_acl(directory_fd, name="Core wheel output")
+            ) from exc
+        if created:
+            _clear_and_verify_fd_acl(directory_fd, name="Core wheel output")
+        else:
+            _require_fd_acl_free(directory_fd, name="Core wheel output")
         descriptor = os.fstat(directory_fd)
         authority = _CoreReleaseOutput(
             path=output_dir,
@@ -1465,7 +1484,8 @@ def _open_core_release_output(output_dir: Path) -> Iterator[_CoreReleaseOutput]:
         finally:
             authority.close()
     finally:
-        os.close(directory_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
         if parent_fd >= 0:
             os.close(parent_fd)
 
@@ -1501,29 +1521,8 @@ def _validate_framework_lock_contract(
     os.lseek(framework_lock.file_fd, 0, os.SEEK_SET)
     payload = os.read(framework_lock.file_fd, framework_lock.byte_size + 1)
     os.lseek(framework_lock.file_fd, 0, os.SEEK_SET)
-    try:
-        parsed = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Core framework lock is invalid") from exc
-    if (
-        not isinstance(parsed, dict)
-        or set(parsed)
-        != {
-            "schema_version",
-            "distribution",
-            "distribution_version",
-            "distribution_digest",
-            "wheel_filename",
-        }
-        or parsed.get("schema_version") != "1"
-        or parsed.get("distribution") != "openevo"
-        or not isinstance(parsed.get("distribution_version"), str)
-        or not parsed["distribution_version"]
-        or parsed.get("distribution_digest") != wheel.sha256
-        or parsed.get("wheel_filename") != wheel.name
-        or payload
-        != (json.dumps(parsed, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-    ):
+    lock = _validated_framework_lock(payload)
+    if lock.distribution_digest != wheel.sha256 or lock.wheel_filename != wheel.name:
         raise RuntimeError("Core framework lock does not bind the exported wheel")
 
 
@@ -1551,6 +1550,8 @@ def _open_release_sources(
 def _open_transaction_directory(
     authority: _CoreReleaseOutput,
     name: str,
+    *,
+    initialize_acl: bool = False,
 ) -> tuple[int, os.stat_result]:
     transaction_fd = os.open(
         name,
@@ -1568,7 +1569,10 @@ def _open_transaction_directory(
         os.close(transaction_fd)
         raise RuntimeError("Core release transaction directory identity changed")
     try:
-        _clear_and_verify_fd_acl(transaction_fd, name="Core release transaction")
+        if initialize_acl:
+            _clear_and_verify_fd_acl(transaction_fd, name="Core release transaction")
+        else:
+            _require_fd_acl_free(transaction_fd, name="Core release transaction")
     except BaseException:
         os.close(transaction_fd)
         raise
@@ -1576,7 +1580,7 @@ def _open_transaction_directory(
     current = os.stat(name, dir_fd=authority.directory_fd, follow_symlinks=False)
     if (current.st_dev, current.st_ino) != (descriptor.st_dev, descriptor.st_ino):
         os.close(transaction_fd)
-        raise RuntimeError("Core release transaction directory changed while clearing ACL")
+        raise RuntimeError("Core release transaction directory changed during ACL verification")
     return transaction_fd, descriptor
 
 
@@ -1628,6 +1632,17 @@ def _rename_noreplace(
         raise OSError(error, os.strerror(error), source_name, destination_name)
 
 
+def _retired_marker_name(identity: tuple[int, int]) -> str:
+    return f".marker-retired-{identity[0]:x}-{identity[1]:x}"
+
+
+def _retired_marker_identity(name: str) -> tuple[int, int] | None:
+    match = _CORE_RELEASE_RETIRED_MARKER_PATTERN.fullmatch(name)
+    if match is None:
+        return None
+    return int(match.group(1), 16), int(match.group(2), 16)
+
+
 def _after_core_release_cleanup_identity_verified(
     source_fd: int,
     source_name: str,
@@ -1658,7 +1673,7 @@ def _quarantine_regular_path(
             or (descriptor.st_dev, descriptor.st_ino) != identity
         ):
             raise RuntimeError(f"Core release cleanup identity changed: {source_name}")
-        _clear_and_verify_fd_acl(file_fd, name=source_name)
+        _require_fd_acl_free(file_fd, name=source_name)
         descriptor = os.fstat(file_fd)
         if (descriptor.st_dev, descriptor.st_ino) != identity:
             raise RuntimeError(f"Core release cleanup identity changed: {source_name}")
@@ -1715,7 +1730,9 @@ def _retire_transaction_directory(
     except FileNotFoundError:
         replacement = None
     if replacement is not None:
-        raise RuntimeError("Core release transaction replacement was preserved at its original name")
+        raise RuntimeError(
+            "Core release transaction replacement was preserved at its original name"
+        )
     os.fsync(authority.parent_fd)
     os.fsync(authority.directory_fd)
     return tombstone
@@ -1844,49 +1861,97 @@ def _replace_transaction_marker(
         )
         os.fsync(transaction_fd)
         _after_core_release_marker_window(authority, payload, "candidate-durable")
-        current = os.stat(
-            CORE_RELEASE_TRANSACTION_MARKER,
-            dir_fd=transaction_fd,
-            follow_symlinks=False,
-        )
-        candidate = os.stat(
-            CORE_RELEASE_TRANSACTION_READY,
-            dir_fd=transaction_fd,
-            follow_symlinks=False,
-        )
-        if (current.st_dev, current.st_ino) != current_identity:
-            raise RuntimeError("Core release marker pathname changed before replacement")
-        if (candidate.st_dev, candidate.st_ino) != candidate_identity:
-            raise RuntimeError("Core release marker candidate pathname changed")
-        os.replace(
-            CORE_RELEASE_TRANSACTION_READY,
-            CORE_RELEASE_TRANSACTION_MARKER,
-            src_dir_fd=transaction_fd,
-            dst_dir_fd=transaction_fd,
-        )
-        _after_core_release_marker_window(authority, payload, "marker-replaced")
-        published_payload, published_identity = _read_marker(
+        published_identity = _promote_transaction_marker_candidate(
+            authority,
             transaction_fd,
-            CORE_RELEASE_TRANSACTION_MARKER,
+            payload,
+            current_identity=current_identity,
+            candidate_identity=candidate_identity,
         )
-        if published_payload != payload or published_identity != candidate_identity:
-            raise RuntimeError("Core release replacement marker changed")
-        os.fsync(transaction_fd)
-        _after_core_release_marker_window(authority, payload, "marker-durable")
         if (
             authority.transaction_fd == transaction_fd
             and authority.marker_identity == current_identity
         ):
-            if authority.marker_fd < 0 or os.fstat(authority.marker_fd).st_nlink != 0:
-                raise RuntimeError("Core release replaced marker retained a linked old inode")
+            if authority.marker_fd < 0:
+                raise RuntimeError("Core release marker authority was not held")
+            retired = os.stat(
+                _retired_marker_name(current_identity),
+                dir_fd=transaction_fd,
+                follow_symlinks=False,
+            )
+            if (retired.st_dev, retired.st_ino) != current_identity:
+                raise RuntimeError("Core release retired marker identity changed")
             os.close(authority.marker_fd)
             authority.marker_fd = candidate_fd
-            authority.marker_identity = candidate_identity
+            authority.marker_identity = published_identity
             candidate_fd = -1
-        return candidate_identity
+        return published_identity
     finally:
         if candidate_fd >= 0:
             os.close(candidate_fd)
+
+
+def _after_core_release_marker_identity_verified(
+    authority: _CoreReleaseOutput,
+    payload: bytes,
+    identity: tuple[int, int],
+) -> None:
+    del authority, payload, identity
+
+
+def _promote_transaction_marker_candidate(
+    authority: _CoreReleaseOutput,
+    transaction_fd: int,
+    payload: bytes,
+    *,
+    current_identity: tuple[int, int],
+    candidate_identity: tuple[int, int],
+) -> tuple[int, int]:
+    current = os.stat(
+        CORE_RELEASE_TRANSACTION_MARKER,
+        dir_fd=transaction_fd,
+        follow_symlinks=False,
+    )
+    candidate = os.stat(
+        CORE_RELEASE_TRANSACTION_READY,
+        dir_fd=transaction_fd,
+        follow_symlinks=False,
+    )
+    if (current.st_dev, current.st_ino) != current_identity:
+        raise RuntimeError("Core release marker pathname changed before quarantine")
+    if (candidate.st_dev, candidate.st_ino) != candidate_identity:
+        raise RuntimeError("Core release marker candidate pathname changed")
+    _after_core_release_marker_identity_verified(authority, payload, current_identity)
+    retired_name = _retired_marker_name(current_identity)
+    _rename_noreplace(
+        transaction_fd,
+        CORE_RELEASE_TRANSACTION_MARKER,
+        transaction_fd,
+        retired_name,
+    )
+    retired = os.stat(retired_name, dir_fd=transaction_fd, follow_symlinks=False)
+    if (retired.st_dev, retired.st_ino) != current_identity:
+        raise RuntimeError("Core release marker replacement was preserved in quarantine")
+    _after_core_release_marker_window(authority, payload, "marker-quarantined")
+    try:
+        _rename_noreplace(
+            transaction_fd,
+            CORE_RELEASE_TRANSACTION_READY,
+            transaction_fd,
+            CORE_RELEASE_TRANSACTION_MARKER,
+        )
+    except FileExistsError as exc:
+        raise RuntimeError("Core release marker replacement was preserved at publication") from exc
+    _after_core_release_marker_window(authority, payload, "marker-replaced")
+    published_payload, published_identity = _read_marker(
+        transaction_fd,
+        CORE_RELEASE_TRANSACTION_MARKER,
+    )
+    if published_payload != payload or published_identity != candidate_identity:
+        raise RuntimeError("Core release replacement marker changed")
+    os.fsync(transaction_fd)
+    _after_core_release_marker_window(authority, payload, "marker-durable")
+    return published_identity
 
 
 def _after_core_release_marker_window(
@@ -1922,31 +1987,16 @@ def _validate_marker_payload(
     raise RuntimeError("Core release transaction marker phase is invalid")
 
 
-def _recover_pending_marker_replacement(
+def _is_valid_marker_transition(
     authority: _CoreReleaseOutput,
-    transaction_fd: int,
+    current_payload: bytes,
+    candidate_payload: bytes,
+    *,
     transaction_identity: tuple[int, int],
-    transaction_names: tuple[str, ...],
-) -> tuple[bytes, tuple[int, int]]:
-    marker_payload, marker_identity = _read_marker(
-        transaction_fd,
-        CORE_RELEASE_TRANSACTION_MARKER,
-    )
-    try:
-        _adopt_marker_intents(authority, marker_payload)
-    except RuntimeError:
-        if CORE_RELEASE_TRANSACTION_READY in transaction_names:
-            raise
-        return marker_payload, marker_identity
-    if CORE_RELEASE_TRANSACTION_READY not in transaction_names:
-        return marker_payload, marker_identity
-    candidate_payload, candidate_identity = _read_marker(
-        transaction_fd,
-        CORE_RELEASE_TRANSACTION_READY,
-    )
+) -> bool:
     phase, identities, cleanup_index = _validate_marker_payload(
         authority,
-        marker_payload,
+        current_payload,
         transaction_identity=transaction_identity,
     )
     candidate_phase, candidate_identities, candidate_cleanup_index = _validate_marker_payload(
@@ -1954,53 +2004,43 @@ def _recover_pending_marker_replacement(
         candidate_payload,
         transaction_identity=transaction_identity,
     )
-    valid_transition = False
     if phase == "preparing" and candidate_phase == "preparing":
         current_items = tuple(identities.items())
         candidate_items = tuple(candidate_identities.items())
-        valid_transition = (
+        return (
             len(candidate_items) == len(current_items) + 1
             and candidate_items[: len(current_items)] == current_items
         )
-    elif phase == "preparing" and candidate_phase == "ready":
-        valid_transition = (
-            len(candidate_identities) == len(authority.sources)
-            and tuple(candidate_identities.items())[: len(identities)]
-            == tuple(identities.items())
+    if phase == "preparing" and candidate_phase == "ready":
+        return len(candidate_identities) == len(authority.sources) and tuple(
+            candidate_identities.items()
+        )[: len(identities)] == tuple(identities.items())
+    if phase == "preparing" and candidate_phase == "cleaning":
+        return candidate_identities == identities and candidate_cleanup_index == min(
+            1, len(authority.sources)
         )
-    elif phase == "preparing" and candidate_phase == "cleaning":
-        valid_transition = (
-            candidate_identities == identities
-            and candidate_cleanup_index == min(1, len(authority.sources))
+    if phase == "ready" and candidate_phase == "cleaning":
+        return candidate_identities == identities and candidate_cleanup_index == 1
+    if phase == "cleaning" and candidate_phase == "cleaning":
+        return candidate_identities == identities and candidate_cleanup_index == cleanup_index + 1
+    return False
+
+
+def _publish_recovered_marker_candidate(
+    authority: _CoreReleaseOutput,
+    transaction_fd: int,
+    candidate_payload: bytes,
+    candidate_identity: tuple[int, int],
+) -> tuple[bytes, tuple[int, int]]:
+    try:
+        _rename_noreplace(
+            transaction_fd,
+            CORE_RELEASE_TRANSACTION_READY,
+            transaction_fd,
+            CORE_RELEASE_TRANSACTION_MARKER,
         )
-    elif phase == "ready" and candidate_phase == "cleaning":
-        valid_transition = candidate_identities == identities and candidate_cleanup_index == 1
-    elif phase == "cleaning" and candidate_phase == "cleaning":
-        valid_transition = (
-            candidate_identities == identities and candidate_cleanup_index == cleanup_index + 1
-        )
-    if not valid_transition:
-        raise RuntimeError("Core release pending marker transition is invalid")
-    current = os.stat(
-        CORE_RELEASE_TRANSACTION_MARKER,
-        dir_fd=transaction_fd,
-        follow_symlinks=False,
-    )
-    candidate = os.stat(
-        CORE_RELEASE_TRANSACTION_READY,
-        dir_fd=transaction_fd,
-        follow_symlinks=False,
-    )
-    if (current.st_dev, current.st_ino) != marker_identity:
-        raise RuntimeError("Core release marker changed during pending recovery")
-    if (candidate.st_dev, candidate.st_ino) != candidate_identity:
-        raise RuntimeError("Core release marker candidate changed during pending recovery")
-    os.replace(
-        CORE_RELEASE_TRANSACTION_READY,
-        CORE_RELEASE_TRANSACTION_MARKER,
-        src_dir_fd=transaction_fd,
-        dst_dir_fd=transaction_fd,
-    )
+    except FileExistsError as exc:
+        raise RuntimeError("Core release recovery preserved a replacement marker") from exc
     os.fsync(transaction_fd)
     recovered_payload, recovered_identity = _read_marker(
         transaction_fd,
@@ -2009,6 +2049,108 @@ def _recover_pending_marker_replacement(
     if recovered_payload != candidate_payload or recovered_identity != candidate_identity:
         raise RuntimeError("Core release pending marker replacement changed")
     return recovered_payload, recovered_identity
+
+
+def _verify_retired_markers(
+    authority: _CoreReleaseOutput,
+    transaction_fd: int,
+    transaction_identity: tuple[int, int],
+    transaction_names: tuple[str, ...],
+) -> None:
+    for name in transaction_names:
+        expected_identity = _retired_marker_identity(name)
+        if expected_identity is None:
+            continue
+        payload, identity = _read_marker(transaction_fd, name)
+        if identity != expected_identity:
+            raise RuntimeError("Core release retired marker replacement was preserved")
+        _adopt_marker_intents(authority, payload)
+        _validate_marker_payload(
+            authority,
+            payload,
+            transaction_identity=transaction_identity,
+        )
+
+
+def _recover_pending_marker_replacement(
+    authority: _CoreReleaseOutput,
+    transaction_fd: int,
+    transaction_identity: tuple[int, int],
+    transaction_names: tuple[str, ...],
+) -> tuple[bytes, tuple[int, int]]:
+    _verify_retired_markers(
+        authority,
+        transaction_fd,
+        transaction_identity,
+        transaction_names,
+    )
+    has_marker = CORE_RELEASE_TRANSACTION_MARKER in transaction_names
+    has_candidate = CORE_RELEASE_TRANSACTION_READY in transaction_names
+    if not has_marker:
+        if not has_candidate:
+            raise RuntimeError("Core release transaction has no active marker")
+        candidate_payload, candidate_identity = _read_marker(
+            transaction_fd,
+            CORE_RELEASE_TRANSACTION_READY,
+        )
+        _adopt_marker_intents(authority, candidate_payload)
+        predecessors: list[tuple[bytes, tuple[int, int]]] = []
+        for name in transaction_names:
+            expected_identity = _retired_marker_identity(name)
+            if expected_identity is None:
+                continue
+            retired_payload, retired_identity = _read_marker(transaction_fd, name)
+            if retired_identity != expected_identity:
+                raise RuntimeError("Core release retired marker replacement was preserved")
+            if _is_valid_marker_transition(
+                authority,
+                retired_payload,
+                candidate_payload,
+                transaction_identity=transaction_identity,
+            ):
+                predecessors.append((retired_payload, retired_identity))
+        if len(predecessors) != 1:
+            raise RuntimeError("Core release pending marker has no unique inode-bound predecessor")
+        return _publish_recovered_marker_candidate(
+            authority,
+            transaction_fd,
+            candidate_payload,
+            candidate_identity,
+        )
+    marker_payload, marker_identity = _read_marker(
+        transaction_fd,
+        CORE_RELEASE_TRANSACTION_MARKER,
+    )
+    try:
+        _adopt_marker_intents(authority, marker_payload)
+    except RuntimeError:
+        if has_candidate:
+            raise
+        return marker_payload, marker_identity
+    if not has_candidate:
+        return marker_payload, marker_identity
+    candidate_payload, candidate_identity = _read_marker(
+        transaction_fd,
+        CORE_RELEASE_TRANSACTION_READY,
+    )
+    if not _is_valid_marker_transition(
+        authority,
+        marker_payload,
+        candidate_payload,
+        transaction_identity=transaction_identity,
+    ):
+        raise RuntimeError("Core release pending marker transition is invalid")
+    _promote_transaction_marker_candidate(
+        authority,
+        transaction_fd,
+        candidate_payload,
+        current_identity=marker_identity,
+        candidate_identity=candidate_identity,
+    )
+    return _read_marker(
+        transaction_fd,
+        CORE_RELEASE_TRANSACTION_MARKER,
+    )
 
 
 def _recover_preparing_transaction(
@@ -2068,7 +2210,7 @@ def _cleanup_core_release_transaction(
     ordinary_locations.extend(
         (transaction_fd, name, False)
         for name in transaction_names
-        if name != CORE_RELEASE_TRANSACTION_MARKER
+        if name != CORE_RELEASE_TRANSACTION_MARKER and _retired_marker_identity(name) is None
     )
     consumed_locations: set[tuple[int, str, bool]] = set()
     member_locations: dict[
@@ -2089,9 +2231,9 @@ def _cleanup_core_release_transaction(
                 descriptor = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 actual_identity = (descriptor.st_dev, descriptor.st_ino)
             if (
-                expected_identity is not None and actual_identity == expected_identity
-            ) or (at_root and name == source.name) or (
-                not at_root and name in {staging_name, root_quarantine_name}
+                (expected_identity is not None and actual_identity == expected_identity)
+                or (at_root and name == source.name)
+                or (not at_root and name in {staging_name, root_quarantine_name})
             ):
                 candidates.append(location)
                 consumed_locations.add(location)
@@ -2115,7 +2257,7 @@ def _cleanup_core_release_transaction(
                         mode=0o600,
                         identity=observed_identity,
                     )
-                    _clear_and_verify_fd_acl(file_fd, name=name)
+                    _require_fd_acl_free(file_fd, name=name)
                     current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                     if (current.st_dev, current.st_ino) != observed_identity:
                         raise RuntimeError(f"Core release staging intent changed: {source.name}")
@@ -2144,9 +2286,7 @@ def _cleanup_core_release_transaction(
                     identity=expected_identity,
                     link_counts=frozenset({expected_links}),
                 )
-            locations.append(
-                (directory_fd, name, expected_identity, frozenset({0o600, 0o644}))
-            )
+            locations.append((directory_fd, name, expected_identity, frozenset({0o600, 0o644})))
         if not locations and expected_identity is not None:
             held_member = next(
                 (
@@ -2269,9 +2409,7 @@ def _recover_core_release_transaction(authority: _CoreReleaseOutput, name: str) 
                 limit=_MAX_CORE_RELEASE_ROOT_MEMBERS,
                 container="Core wheel output",
             )
-            if root_names != (name,) or transaction_names != (
-                CORE_RELEASE_TRANSACTION_MARKER,
-            ):
+            if root_names != (name,) or transaction_names != (CORE_RELEASE_TRANSACTION_MARKER,):
                 raise
             _retire_transaction_directory(
                 authority,
@@ -2337,7 +2475,11 @@ def _create_core_release_transaction(authority: _CoreReleaseOutput) -> None:
             continue
     else:
         raise RuntimeError("Could not allocate a private Core release transaction")
-    transaction_fd, descriptor = _open_transaction_directory(authority, name)
+    transaction_fd, descriptor = _open_transaction_directory(
+        authority,
+        name,
+        initialize_acl=True,
+    )
     authority.transaction_name = name
     authority.transaction_fd = transaction_fd
     authority.member_intents = {
@@ -2429,9 +2571,10 @@ def _copy_core_release_member(
         _publish_preparing_member_identity(authority, source, identity)
         _after_core_release_stage_window(authority, source, "inode-bound")
         os.lseek(source.file_fd, 0, os.SEEK_SET)
-        with os.fdopen(os.dup(source.file_fd), "rb") as source_file, os.fdopen(
-            os.dup(destination_fd), "wb"
-        ) as destination_file:
+        with (
+            os.fdopen(os.dup(source.file_fd), "rb") as source_file,
+            os.fdopen(os.dup(destination_fd), "wb") as destination_file,
+        ):
             shutil.copyfileobj(source_file, destination_file)
             destination_file.flush()
         os.fsync(destination_fd)
@@ -2528,20 +2671,33 @@ def _verify_live_transaction(authority: _CoreReleaseOutput) -> None:
     expected_root = tuple(
         sorted((authority.transaction_name, *(source.name for source in authority.sources)))
     )
-    if _bounded_listdir(
-        authority.directory_fd,
-        limit=_MAX_CORE_RELEASE_ROOT_MEMBERS,
-        container="Core wheel output",
-    ) != expected_root:
+    if (
+        _bounded_listdir(
+            authority.directory_fd,
+            limit=_MAX_CORE_RELEASE_ROOT_MEMBERS,
+            container="Core wheel output",
+        )
+        != expected_root
+    ):
         raise RuntimeError("Core release output inventory changed before commit")
-    if _bounded_listdir(
+    transaction_names = _bounded_listdir(
         authority.transaction_fd,
         limit=_MAX_CORE_RELEASE_TRANSACTION_MEMBERS,
         container="Core release transaction",
-    ) != (CORE_RELEASE_TRANSACTION_MARKER,):
+    )
+    if CORE_RELEASE_TRANSACTION_MARKER not in transaction_names or any(
+        name != CORE_RELEASE_TRANSACTION_MARKER and _retired_marker_identity(name) is None
+        for name in transaction_names
+    ):
         raise RuntimeError("Core release transaction inventory changed before commit")
     transaction = os.fstat(authority.transaction_fd)
     _require_fd_acl_free(authority.transaction_fd, name="Core release transaction")
+    _verify_retired_markers(
+        authority,
+        authority.transaction_fd,
+        (transaction.st_dev, transaction.st_ino),
+        transaction_names,
+    )
     expected_marker = _marker_bytes(
         authority,
         phase="ready",
@@ -2976,11 +3132,11 @@ def _validate_embedded_core_framework_lock(
 ) -> str:
     expected_wheel = (CORE_WHEEL_ARCHIVE_ROOT / wheel.name).as_posix()
     expected_lock = (CORE_WHEEL_ARCHIVE_ROOT / CORE_FRAMEWORK_LOCK_BASENAME).as_posix()
-    archive_root = CORE_WHEEL_ARCHIVE_ROOT.as_posix()
+    archive_members = _archive_member_names(executable)
     embedded_release_inputs = sorted(
         name
-        for name in _archive_member_names(executable)
-        if name == archive_root or name.startswith(f"{archive_root}/")
+        for name in archive_members
+        if name.startswith(f"{CORE_WHEEL_ARCHIVE_ROOT.as_posix()}/")
     )
     expected_release_inputs = sorted((expected_wheel, expected_lock))
     if embedded_release_inputs != expected_release_inputs:
@@ -2997,7 +3153,6 @@ def _validate_embedded_core_framework_lock(
     if source_payload != expected_payload:
         raise RuntimeError("staged Core framework lock differs from the exact built wheel")
     _load_exact_framework_lock(framework_lock, wheel, version=version)
-
     embedded_payload = _archive_member_bytes(executable, expected_lock)
     if embedded_payload != source_payload:
         raise RuntimeError("sidecar embedded Core framework lock differs from the staged lock")

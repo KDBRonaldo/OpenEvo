@@ -34,29 +34,30 @@ The repository currently provides:
   and `src/` into an exclusive temporary directory, excluding wheel, egg-info,
   and cache content. It builds the exact Core wheel there with the locked
   `setuptools` and `wheel` using `python -m build --no-isolation`, verifies its
-  name/version metadata, and creates a canonical `framework-lock.json` through
-  Core's closed `FrameworkDistributionLock` model. The Core lock loader must
-  resolve that lock back to the exact wheel filename, version, and SHA-256 before
-  either file becomes a release input. PyInstaller receives that same verified
-  wheel/lock pair with `--add-data` at `openevo/wheels`; optional release-input
-  export preserves the same two bytes. Archive inspection requires the resource
-  root to be the closed set of exactly one wheel and one lock, rejects additional
-  and path-escaping members, rechecks both source digests, and reloads the
-  extracted pair through the Core lock loader. Raw CArchive TOC multiplicity is
-  verified before accepting PyInstaller's parsed inventory. `--core-wheel-output-dir`
-  exports the same pair
-  only to a current-user-owned path with no symbolic-link component that is not
-  group/world writable and is empty or contains one recognized recoverable
-  transaction/exact pair. Newly created output directories use `0700`. The
+  name/version metadata, then uses Core's authoritative
+  `FrameworkDistributionLock` model and loader to write and reload a canonical
+  `framework-lock.json` bound to that wheel's filename, version, and SHA-256.
+  PyInstaller receives both exact files with `--add-data` at `openevo/wheels`.
+  Archive inspection requires that directory to contain exactly one matching
+  wheel and one lock, verifies raw CArchive TOC multiplicity before accepting
+  PyInstaller's parsed inventory, verifies the wheel bytes, and reloads the
+  embedded pair through the same lock contract. `--core-wheel-output-dir`
+  exports the same pair only to a current-user-owned path with no symbolic-link
+  component that is not group/world writable and is empty or contains one
+  recognized recoverable transaction/exact pair. Before creating that output,
+  the builder opens its immediate parent no-follow and rejects a different owner,
+  group/world write bits, or a macOS ACL that grants mutation to another
+  principal. Newly created output directories use `0700`. The
   builder pins that directory by an open no-follow descriptor and revalidates
   its inode, owner, private permissions, and ACL-free state through final return.
-  On macOS every held output, transaction, marker, wheel, and lock FD has any
-  valid inherited extended ACL removed with `acl_delete_fd_np` and is then read
-  back through `acl_get_fd_np`; malformed entries, unknown tags/permissions,
-  failed removal, or a later ACL mutation fail closed. The held immediate parent
-  FD is also rechecked and rejects any mutating ALLOW entry, because that ACL
-  could otherwise replace the output root itself. Linux keeps the same
-  FD/inode/mode policy with an explicit no-op ACL layer.
+  On macOS only a newly created output, transaction, marker, wheel, or lock may
+  normalize a valid inherited extended ACL with `acl_delete_fd_np`, followed by
+  readback through `acl_get_fd_np`. Every later open requires the ACL to remain
+  empty; malformed entries, unknown tags/permissions, failed removal, or an ACL
+  added after initialization fail closed and are never silently cleared. The held
+  immediate parent FD is also rechecked and rejects any mutating ALLOW entry,
+  because that ACL could otherwise replace the output root itself. Linux keeps
+  the same FD/inode/mode policy with an explicit no-op ACL layer.
   Core wheel construction fixes `SOURCE_DATE_EPOCH` to the trusted source commit
   time so a retry can reproduce and recognize a fully committed pair.
   It stages the pair under a private `0700` transaction directory. Before any
@@ -76,8 +77,14 @@ The repository currently provides:
   while a persisted inode receipt authorizes only that exact inode. Empty or
   marker-only bootstrap transactions remain bounded recovery states. Any path
   outside the durable intents, unknown root entry, symlink/hardlink fault, or
-  identity-mismatched replacement is preserved and fails closed. Root and
-  transaction inventories are read through bounded FD-based iterative scans;
+  identity-mismatched replacement is preserved and fails closed. Marker updates
+  first move the exact previously held marker inode to an identity-named retired
+  entry with no-replace semantics, then publish the candidate marker with a
+  second no-replace rename. Recovery accepts a missing canonical marker only
+  when the durable candidate has one unique valid inode-bound retired
+  predecessor. A replacement introduced after an identity check is therefore
+  preserved or quarantined rather than deleted by a pathname-based replace. Root
+  and transaction inventories are read through bounded FD-based iterative scans;
   each scan rejects on `limit + 1`, and changing consecutive snapshots fail
   closed without first materializing or sorting an unbounded directory. An empty
   marker-less transaction directory beside an exact complete pair is a bounded
@@ -809,8 +816,9 @@ The replacement workflow must:
 
 1. run Python, frontend, sidecar, Rust, identity, and package-inventory tests;
 2. build and clean-install the exact Core artifact;
-3. create and validate its descriptor and SHA256; the sidecar build must embed
-   those exact Core bytes without a pre-staged wheel;
+3. create and validate its framework lock and SHA256 through the authoritative
+   Core lock model/loader; the sidecar build must embed exactly that wheel and
+   lock without a pre-staged artifact;
 4. build the sidecar, Vite assets, Tauri app bundle, and DMG on a supported
    macOS runner;
 5. mount the DMG, copy the app into a clean location, and launch that copied

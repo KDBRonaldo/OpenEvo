@@ -205,6 +205,10 @@ def test_core_framework_lock_is_canonical_and_bound_to_exact_wheel(tmp_path: Pat
         json.dumps(expected, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode("utf-8")
     assert (
+        builder._validated_framework_lock(framework_lock.read_bytes()).model_dump(mode="json")
+        == expected
+    )
+    assert (
         builder._load_exact_framework_lock(
             framework_lock,
             wheel,
@@ -461,9 +465,7 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
                 )
                 if destination == "openevo/wheels"
             }
-            embedded_wheel, wheel_destination = core_data[
-                "openevo-0.1.0-py3-none-any.whl"
-            ]
+            embedded_wheel, wheel_destination = core_data["openevo-0.1.0-py3-none-any.whl"]
             embedded_lock, lock_destination = core_data["framework-lock.json"]
             assert embedded_wheel.name == "openevo-0.1.0-py3-none-any.whl"
             assert embedded_wheel.is_file()
@@ -747,6 +749,119 @@ def test_core_release_output_is_created_private_and_stays_pinned(tmp_path: Path)
     assert list(output.iterdir()) == []
 
 
+@pytest.mark.parametrize("mode", [0o720, 0o702, 0o777])
+def test_core_release_output_rejects_unsafe_parent_before_creation(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    tmp_path.chmod(mode)
+
+    with pytest.raises(RuntimeError, match="parent owner, or private permissions"):
+        with builder._open_core_release_output(output):
+            pass
+
+    assert not output.exists()
+
+
+def test_core_release_output_rejects_unowned_parent_before_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(builder.os, "geteuid", lambda: actual_euid + 1)
+
+    with pytest.raises(RuntimeError, match="parent owner, or private permissions"):
+        with builder._open_core_release_output(output):
+            pass
+
+    assert not output.exists()
+
+
+def test_core_release_output_rejects_parent_mutating_acl_before_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    deleted: list[int] = []
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        builder,
+        "_darwin_extended_acl_entries",
+        lambda _: ((builder._DARWIN_ACL_EXTENDED_ALLOW, 1 << 6),),
+    )
+    monkeypatch.setattr(builder, "_delete_darwin_extended_acl", deleted.append)
+
+    with pytest.raises(RuntimeError, match="parent owner, or private permissions"):
+        with builder._open_core_release_output(output):
+            pass
+
+    assert not output.exists()
+    assert deleted == []
+
+
+def test_core_release_output_clears_inherited_acl_before_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    parent_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+    output_reads = 0
+    deleted: list[int] = []
+
+    def acl_entries(file_fd: int) -> tuple[tuple[int, int], ...]:
+        nonlocal output_reads
+        descriptor = os.fstat(file_fd)
+        if (descriptor.st_dev, descriptor.st_ino) == parent_identity:
+            return ()
+        output_reads += 1
+        if output_reads == 1:
+            return ((builder._DARWIN_ACL_EXTENDED_DENY, 1 << 6),)
+        return ()
+
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder, "_darwin_extended_acl_entries", acl_entries)
+    monkeypatch.setattr(builder, "_delete_darwin_extended_acl", deleted.append)
+
+    with builder._open_core_release_output(output):
+        assert stat.S_IMODE(output.stat().st_mode) == 0o700
+
+    assert len(deleted) == 1
+    assert output_reads >= 3
+
+
+def test_core_release_output_rejects_acl_added_after_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    output_identity = (output.stat().st_dev, output.stat().st_ino)
+    deleted: list[int] = []
+
+    def acl_entries(file_fd: int) -> tuple[tuple[int, int], ...]:
+        descriptor = os.fstat(file_fd)
+        if (descriptor.st_dev, descriptor.st_ino) == output_identity:
+            return ((builder._DARWIN_ACL_EXTENDED_ALLOW, 1 << 6),)
+        return ()
+
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder, "_darwin_extended_acl_entries", acl_entries)
+    monkeypatch.setattr(builder, "_delete_darwin_extended_acl", deleted.append)
+
+    with pytest.raises(RuntimeError, match="permits mutation"):
+        with builder._open_core_release_output(output):
+            pass
+
+    assert deleted == []
+
+
 @pytest.mark.parametrize(
     "entries",
     [
@@ -821,27 +936,71 @@ def test_macos_fd_acl_rejects_mutation_after_initialization(
         os.close(file_fd)
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="requires real macOS extended ACL APIs")
-def test_macos_real_fd_acl_runner_clears_inherited_mutating_entry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("kind", ["marker", "member"])
+def test_runtime_acl_injection_is_rejected_without_acl_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
     builder = _load_builder()
-    directory = tmp_path / "acl-directory"
-    directory.mkdir(mode=0o700)
+    path = tmp_path / kind
+    payload = b"member"
+    path.write_bytes(payload)
+    path.chmod(0o600 if kind == "marker" else 0o644)
+    deleted: list[int] = []
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        builder,
+        "_darwin_extended_acl_entries",
+        lambda _: ((builder._DARWIN_ACL_EXTENDED_ALLOW, 1 << 6),),
+    )
+    monkeypatch.setattr(builder, "_delete_darwin_extended_acl", deleted.append)
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(RuntimeError, match="permits mutation"):
+            if kind == "marker":
+                builder._read_marker(directory_fd, path.name)
+            else:
+                descriptor = path.stat()
+                source = builder._CoreReleaseSource(
+                    path=path,
+                    name=path.name,
+                    file_fd=-1,
+                    device=descriptor.st_dev,
+                    inode=descriptor.st_ino,
+                    byte_size=len(payload),
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                )
+                builder._verify_member_path(directory_fd, source)
+    finally:
+        os.close(directory_fd)
+
+    assert deleted == []
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires real macOS extended ACL APIs")
+def test_macos_real_output_creation_clears_inherited_acl(tmp_path: Path) -> None:
+    builder = _load_builder()
+    parent = tmp_path / "acl-parent"
+    parent.mkdir(mode=0o700)
     subprocess.run(
         [
             "chmod",
             "+a",
-            "everyone allow write,delete,delete_child,file_inherit,directory_inherit",
-            str(directory),
+            "everyone allow read,file_inherit,directory_inherit",
+            str(parent),
         ],
         check=True,
     )
-    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        assert builder._darwin_extended_acl_entries(directory_fd)
-        builder._clear_and_verify_fd_acl(directory_fd, name=directory.name)
-        assert builder._darwin_extended_acl_entries(directory_fd) == ()
+        assert builder._darwin_extended_acl_entries(parent_fd)
     finally:
-        os.close(directory_fd)
+        os.close(parent_fd)
+
+    output = parent / "output"
+    with builder._open_core_release_output(output) as authority:
+        assert builder._darwin_extended_acl_entries(authority.directory_fd) == ()
 
 
 def test_bounded_directory_scan_stops_at_limit_plus_one(
@@ -1040,9 +1199,10 @@ def test_core_release_commit_verifies_exact_member_contract(tmp_path: Path) -> N
         assert descriptor.st_uid == os.geteuid()
         assert descriptor.st_mode & 0o777 == 0o644
         assert exported.read_bytes() == source.read_bytes()
-        assert hashlib.sha256(exported.read_bytes()).digest() == hashlib.sha256(
-            source.read_bytes()
-        ).digest()
+        assert (
+            hashlib.sha256(exported.read_bytes()).digest()
+            == hashlib.sha256(source.read_bytes()).digest()
+        )
 
 
 @pytest.mark.parametrize("fault", ["unlink", "rename", "extra"])
@@ -1177,7 +1337,9 @@ def test_cleanup_name_race_quarantines_replacement_without_deleting_it(
         replace_verified_name,
     )
 
-    with pytest.raises(RuntimeError, match="replacement.*preserved|rollback could not be verified"):
+    with pytest.raises(
+        RuntimeError, match="replacement.*preserved|rollback could not be verified"
+    ):
         with builder._open_core_release_output(output) as authority:
             builder._export_core_release_inputs(authority, wheel, lock)
             raise OSError("trigger inode-bound rollback")
@@ -1229,6 +1391,65 @@ def test_transaction_name_race_preserves_replacement_tombstone(
     assert len(tombstones) == 1
     assert tombstones[0].is_dir()
     assert list(tombstones[0].iterdir()) == []
+
+
+def test_marker_name_race_preserves_checked_and_replacement_inodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    replacement = b"replacement marker after identity check"
+    original_payload: bytes | None = None
+    injected = False
+
+    def replace_verified_marker(authority, payload: bytes, identity: tuple[int, int]) -> None:
+        nonlocal injected, original_payload
+        del payload, identity
+        if injected:
+            return
+        injected = True
+        marker_name = builder.CORE_RELEASE_TRANSACTION_MARKER
+        marker_fd = os.open(marker_name, os.O_RDONLY, dir_fd=authority.transaction_fd)
+        try:
+            original_payload = os.read(marker_fd, builder._MAX_CORE_RELEASE_MARKER_BYTES)
+        finally:
+            os.close(marker_fd)
+        os.rename(
+            marker_name,
+            "preserved-checked-marker",
+            src_dir_fd=authority.transaction_fd,
+            dst_dir_fd=authority.transaction_fd,
+        )
+        replacement_fd = os.open(
+            marker_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=authority.transaction_fd,
+        )
+        try:
+            os.write(replacement_fd, replacement)
+            os.fsync(replacement_fd)
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(
+        builder,
+        "_after_core_release_marker_identity_verified",
+        replace_verified_marker,
+    )
+
+    with pytest.raises(RuntimeError, match="rollback could not be verified"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    transactions = list(output.glob(".openevo-core-release-*"))
+    assert len(transactions) == 1
+    assert (transactions[0] / "preserved-checked-marker").read_bytes() == original_payload
+    assert replacement in [
+        path.read_bytes() for path in transactions[0].iterdir() if path.is_file()
+    ]
 
 
 def test_retired_transaction_tombstone_does_not_change_exact_pair_retry(tmp_path: Path) -> None:
@@ -1548,7 +1769,7 @@ def test_preparing_member_crash_windows_recover_repeatedly(
 @pytest.mark.parametrize("bound_count", [1, 2])
 @pytest.mark.parametrize(
     "marker_window",
-    ["candidate-durable", "marker-replaced", "marker-durable"],
+    ["candidate-durable", "marker-quarantined", "marker-replaced", "marker-durable"],
 )
 def test_preparing_marker_crash_windows_recover_repeatedly(
     tmp_path: Path,
@@ -1704,7 +1925,9 @@ def test_temporary_directory_cleanup_failure_rolls_back_release_pair(
     monkeypatch.setattr(builder.subprocess, "run", fake_pyinstaller)
     monkeypatch.setattr(builder, "_validate_fd_bound_bootloader", lambda _: None)
     monkeypatch.setattr(builder, "_validate_embedded_core_wheel", lambda *_: None)
-    monkeypatch.setattr(builder, "_validate_embedded_core_framework_lock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        builder, "_validate_embedded_core_framework_lock", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(builder, "_validate_embedded_product_web", lambda *args: None)
 
     with pytest.raises(OSError, match="TemporaryDirectory cleanup failure"):
@@ -2028,15 +2251,18 @@ def test_raw_carchive_parser_rejects_duplicate_toc_members(tmp_path: Path) -> No
 
     def entry() -> bytes:
         encoded = name.encode("utf-8") + b"\0"
-        return struct.pack(
-            toc_entry_format,
-            toc_entry_length + len(encoded),
-            0,
-            0,
-            0,
-            0,
-            b"x",
-        ) + encoded
+        return (
+            struct.pack(
+                toc_entry_format,
+                toc_entry_length + len(encoded),
+                0,
+                0,
+                0,
+                0,
+                b"x",
+            )
+            + encoded
+        )
 
     toc = entry() + entry()
     cookie_format = "!8sIIII64s"
