@@ -293,6 +293,18 @@ session replacement cannot race a successful precheck into an old-tunnel
 request. Project-ID drift and Local-version drift return distinct typed 409
 errors before transport.
 
+Cheap project/profile/ETag checks run before canonical mapping. A Local model
+that cannot satisfy Core's narrower project or archive constraints returns the
+closed `invalid_local_project` 422; no public bridge method exposes a Pydantic
+validation exception. Each config-dependent capability, validation, and run
+call then refreshes Core project authority. The session's completed mapping
+fixes canonical project intent and project/task/workspace content snapshots.
+The last validated Core project may stay equal or advance through one direct
+revision successor with a changed ETag, newer timestamp, and matching registry;
+other mutable publication fields remain fixed. A validated successor becomes
+the next predecessor. External name/spec/task/workspace drift therefore fails
+before validation or run mutation even when paired with a plausible successor.
+
 Activation negotiates version and verified capabilities, performs an exact
 idempotent Core project create only when no durable mapping exists, publishes a
 native-folder workspace through the bounded chunk protocol, validates the

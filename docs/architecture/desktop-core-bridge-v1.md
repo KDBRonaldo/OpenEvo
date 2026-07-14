@@ -118,6 +118,27 @@ project ID fails with `active_project_mismatch`; profile, ETag, or mapped-intent
 drift fails with `active_local_project_version_mismatch`. Both are typed 409
 errors raised before Core transport.
 
+The inexpensive project/profile/Local-ETag comparison precedes canonical
+mapping. If an otherwise valid Local model cannot satisfy the narrower Core
+mapping contract, including archive declaration invariants, the mapper and all
+public bridge methods return a closed `invalid_local_project` 422 instead of a
+Pydantic exception.
+
+Every config-dependent capability, validation, and run call also rereads the
+Core project before using it. The active session retains the completed durable
+mapping: its canonical `ProjectCreateV1` and project/task/workspace content
+snapshots remain fixed. The refresh compares Core project intent through the
+same canonical project-identity helper used by activation and compares the
+complete immutable authority projection. The last validated session project is
+the mutable predecessor. It may remain byte-for-byte equal or advance by one
+revision generation with a new ETag and strictly newer `updated_at`; only the
+active revision, matching registry digest, ETag, and timestamp may differ.
+Status, model preparation, publication, and content snapshots cannot drift.
+The accepted successor becomes the next in-session predecessor, allowing a
+fully observed direct-successor chain. Config changes cannot be legitimized by
+an otherwise valid successor revision, and same-revision mutable changes fail
+closed before Core validation or run mutation.
+
 Activation, switch, and close are serialized. A switch first cancels and fully
 retires the previous candidate or active token; no new host/Core work starts
 until its clients, adapter work, archive contexts, and tunnel are closed. A

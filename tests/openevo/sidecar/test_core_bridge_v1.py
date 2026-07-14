@@ -1291,6 +1291,171 @@ def test_local_project_binding_drift_fails_before_core_transport(
     assert len(fake_core.calls) == calls_before
 
 
+def _core_project_intent_drift(fake_core: FakeCore, field: str) -> None:
+    request = fake_core.request
+    if field == "name":
+        request = request.model_copy(update={"name": "Externally rewritten project"})
+    elif field == "spec":
+        request = request.model_copy(
+            update={
+                "spec": request.spec.model_copy(
+                    update={"agent_model_ref": "external/model-rewrite"}
+                )
+            }
+        )
+    elif field == "task":
+        request = request.model_copy(
+            update={
+                "task": core_v1.TaskSpecV1(
+                    title="Externally rewritten task",
+                    objective="This task was not authorized by Desktop.",
+                )
+            }
+        )
+        fake_core.task_snapshot = _snapshot(
+            "task-snapshot-external", core_v1.SnapshotKind.TASK, "e"
+        )
+    elif field == "workspace":
+        request = request.model_copy(
+            update={
+                "workspace": core_v1.ScratchWorkspaceSpecV1(
+                    kind=core_v1.WorkspaceSourceKind.SCRATCH,
+                    display_name="Externally rewritten workspace",
+                )
+            }
+        )
+        fake_core.workspace_snapshot = _snapshot(
+            "workspace-snapshot-external", core_v1.SnapshotKind.WORKSPACE, "e"
+        )
+    else:
+        raise AssertionError(f"unsupported drift field: {field}")
+    fake_core.request = request
+    fake_core.project_snapshot = _snapshot(
+        "project-snapshot-external", core_v1.SnapshotKind.PROJECT, "e"
+    )
+    fake_core.project_etag = '"' + "e" * 64 + '"'
+    fake_core.project_updated_at = "2026-07-14T12:01:00Z"
+    successor = core_v1.RevisionRefV1(
+        id="revision-external-successor",
+        project_id=CORE_PROJECT_ID,
+        generation=1,
+        manifest_sha256="e" * 64,
+    )
+    fake_core.active_revision = successor
+    fake_core.head = _head(active_revision=successor, etag=fake_core.project_etag)
+
+
+@pytest.mark.parametrize("method", ["capabilities", "validate", "create_run"])
+@pytest.mark.parametrize("field", ["name", "spec", "task", "workspace"])
+def test_refreshed_core_project_intent_drift_fails_before_transport_mutation(
+    method: str,
+    field: str,
+) -> None:
+    local_project = _local_project()
+    bridge, _, fake_core, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-core-drift-0001")
+    _core_project_intent_drift(fake_core, field)
+    calls_before = len(fake_core.calls)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        if method == "capabilities":
+            bridge.capabilities(local_project)
+        elif method == "validate":
+            bridge.validate_project(
+                local_project,
+                idempotency_key=f"validate-core-{field}-drift-0001",
+            )
+        else:
+            bridge.create_run(
+                local_project,
+                idempotency_key=f"create-run-core-{field}-drift-0001",
+            )
+
+    assert exc_info.value.error.code == "core_project_identity_mismatch"
+    calls = fake_core.calls[calls_before:]
+    assert calls
+    assert all(request.method == "GET" for request in calls)
+    assert not fake_core.run_requests
+
+
+def _project_with_core_invalid_empty_import(
+    project: local_v1.ProjectV1,
+) -> local_v1.ProjectV1:
+    archive = b"\0" * 2048
+    source = local_v1.ProjectSourceV1(
+        kind="native_folder_snapshot",
+        display_name="Core-invalid empty archive",
+        import_ref=local_v1.WorkspaceImportRefV1(
+            import_id="adopted-import-core-invalid",
+            content_sha256=hashlib.sha256(archive).hexdigest(),
+            byte_size=len(archive),
+            entry_count=0,
+            extracted_byte_size=0,
+        ),
+    )
+    return project.model_copy(update={"source": source})
+
+
+@pytest.mark.parametrize("method", ["capabilities", "validate", "create_run"])
+def test_core_invalid_local_mapping_is_a_closed_bridge_error_before_transport(
+    method: str,
+) -> None:
+    local_project = _local_project(imported=True)
+    bridge, _, fake_core, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-invalid-map-a-0001")
+    invalid = _project_with_core_invalid_empty_import(local_project)
+    calls_before = len(fake_core.calls)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        if method == "capabilities":
+            bridge.capabilities(invalid)
+        elif method == "validate":
+            bridge.validate_project(
+                invalid,
+                idempotency_key="validate-invalid-local-map-0001",
+            )
+        else:
+            bridge.create_run(
+                invalid,
+                idempotency_key="create-run-invalid-local-map-0001",
+            )
+
+    assert exc_info.value.error.code == "invalid_local_project"
+    assert exc_info.value.error.http_status == 422
+    assert len(fake_core.calls) == calls_before
+
+
+def test_local_version_mismatch_precedes_invalid_core_mapping() -> None:
+    local_project = _local_project(imported=True)
+    bridge, _, fake_core, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-invalid-map-a-0001")
+    invalid = _project_with_core_invalid_empty_import(local_project).model_copy(
+        update={"etag": ETAG_B}
+    )
+    calls_before = len(fake_core.calls)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.capabilities(invalid)
+
+    assert exc_info.value.error.code == "active_local_project_version_mismatch"
+    assert len(fake_core.calls) == calls_before
+
+
+def test_same_revision_mutable_authority_drift_is_not_a_successor() -> None:
+    local_project = _local_project()
+    bridge, _, fake_core, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-authority-a-0001")
+    fake_core.project_etag = '"' + "d" * 64 + '"'
+    fake_core.project_updated_at = "2026-07-14T12:02:00Z"
+    calls_before = len(fake_core.calls)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.capabilities(local_project)
+
+    assert exc_info.value.error.code == "core_project_refresh_authority_mismatch"
+    assert all(request.method == "GET" for request in fake_core.calls[calls_before:])
+
+
 def test_authority_only_revision_successor_keeps_local_project_binding_valid() -> None:
     local_project = _local_project()
     bridge, _, fake_core, _ = _bridge(local_project)
@@ -1314,6 +1479,27 @@ def test_authority_only_revision_successor_keeps_local_project_binding_valid() -
 
     assert run.required_revision.revision == successor
     assert fake_core.run_requests[-1].project_snapshot == READY_PROJECT_SNAPSHOT
+
+    next_successor = core_v1.RevisionRefV1(
+        id="revision-2",
+        project_id=CORE_PROJECT_ID,
+        generation=2,
+        manifest_sha256="8" * 64,
+    )
+    next_etag = '"' + "8" * 64 + '"'
+    fake_core.active_revision = next_successor
+    fake_core.project_etag = next_etag
+    fake_core.project_updated_at = "2026-07-14T12:03:00Z"
+    fake_core.head = _head(active_revision=next_successor, etag=next_etag)
+
+    validation = bridge.validate_project(
+        local_project,
+        idempotency_key="validate-authority-successor-0002",
+    )
+
+    assert validation.valid is True
+    assert bridge._active is not None
+    assert bridge._active.project.active_revision == next_successor
 
 
 def test_project_binding_and_core_transport_share_one_generation_lease(

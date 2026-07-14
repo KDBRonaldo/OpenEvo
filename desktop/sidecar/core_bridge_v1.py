@@ -18,6 +18,7 @@ import time
 from typing import Any, BinaryIO, Literal, Protocol, TypeVar
 
 import httpx
+from pydantic import ValidationError
 
 from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.core_client_v1 import (
@@ -620,6 +621,7 @@ class DesktopCoreActiveSessionV1:
     profile_id: str
     local_project_etag: str
     local_project_intent_sha256: str
+    mapping: CoreProjectMappingV1
     attachment: CoreHostAttachmentV1
     tunnel: CoreTunnelHandleV1
     client: CoreControlClientV1
@@ -637,6 +639,17 @@ class DesktopCoreBridgeErrorV1(RuntimeError):
 def map_project_create_v1(project: local_v1.ProjectV1) -> core_v1.ProjectCreateV1:
     """Map saved Local project intent into the one frozen Core create contract."""
 
+    try:
+        return _map_project_create_v1(project)
+    except ValidationError:
+        raise _bridge_error(
+            "invalid_local_project",
+            "The saved project cannot be represented by the Core project contract.",
+            status=422,
+        ) from None
+
+
+def _map_project_create_v1(project: local_v1.ProjectV1) -> core_v1.ProjectCreateV1:
     execution = project.execution
     if execution.mode == "codex_subscription_transcript":
         execution_mode = core_v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
@@ -1047,6 +1060,7 @@ class DesktopCoreBridgeV1:
                 profile_id=project.profile_id,
                 local_project_etag=project.etag,
                 local_project_intent_sha256=request_sha256,
+                mapping=completed_mapping,
                 attachment=attachment,
                 tunnel=tunnel,
                 client=client,
@@ -1079,11 +1093,8 @@ class DesktopCoreBridgeV1:
             session: DesktopCoreActiveSessionV1,
             deadline: float,
         ) -> core_v1.CapabilitiesResponseV1:
-            return self._core_external(
-                session.token,
-                deadline,
-                lambda: session.client.capabilities(session.project.spec.execution_mode),
-            )
+            _project, capabilities = self._refresh_authority(session, deadline)
+            return capabilities
 
         return self._invoke_project(project, call)
 
@@ -2364,8 +2375,55 @@ class DesktopCoreBridgeV1:
             deadline,
             session.client.get_project,
         )
+        self._ensure_refreshed_project_authority(session, project)
         self._ensure_project_ready(project, capabilities)
+        session.project = project
+        session.capabilities = capabilities
         return project, capabilities
+
+    @staticmethod
+    def _ensure_refreshed_project_authority(
+        session: DesktopCoreActiveSessionV1,
+        project: core_v1.ProjectV1,
+    ) -> None:
+        previous = session.project
+        mapping = session.mapping
+        _ensure_project_identity(project, mapping.project_create)
+        if _patch_immutable_authority(project) != _patch_immutable_authority(previous):
+            raise _bridge_error(
+                "core_project_identity_mismatch",
+                "The refreshed Core project changed immutable project authority.",
+                status=409,
+            )
+        _ensure_mapping_content_snapshots(mapping, project)
+        _ensure_revision_authority_successor(
+            previous.active_revision,
+            project.active_revision,
+            project_id=mapping.core_project_id,
+            label="active project session",
+        )
+        previous_mutable = _patch_mutable_authority(previous)
+        current_mutable = _patch_mutable_authority(project)
+        if current_mutable == previous_mutable:
+            return
+        expected_successor = replace(
+            previous_mutable,
+            active_revision=current_mutable.active_revision,
+            registry_digest=current_mutable.registry_digest,
+            updated_at=current_mutable.updated_at,
+            etag=current_mutable.etag,
+        )
+        if (
+            project.active_revision == previous.active_revision
+            or current_mutable != expected_successor
+            or _utc_timestamp(project.updated_at) <= _utc_timestamp(previous.updated_at)
+            or project.etag == previous.etag
+        ):
+            raise _bridge_error(
+                "core_project_refresh_authority_mismatch",
+                "The refreshed Core project changed outside successor publication authority.",
+                status=409,
+            )
 
     def _validate_current(
         self,
@@ -2467,12 +2525,17 @@ class DesktopCoreBridgeV1:
                 "The requested resource does not belong to the active local project.",
                 status=409,
             )
-        intent_sha256 = _model_digest(map_project_create_v1(project))
         if (
             session.profile_id != project.profile_id
             or session.local_project_etag != project.etag
-            or session.local_project_intent_sha256 != intent_sha256
         ):
+            raise _bridge_error(
+                "active_local_project_version_mismatch",
+                "The saved local project changed after this Core session was activated.",
+                status=409,
+            )
+        intent_sha256 = _model_digest(map_project_create_v1(project))
+        if session.local_project_intent_sha256 != intent_sha256:
             raise _bridge_error(
                 "active_local_project_version_mismatch",
                 "The saved local project changed after this Core session was activated.",
