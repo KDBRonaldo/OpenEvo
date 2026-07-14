@@ -384,16 +384,24 @@ pre-commit completion error leaves the nonterminal reservation and its terminal
 capacity intact until the same finalizer transaction publishes failure. A
 commit-return error instead observes the persisted terminal first: committed
 success remains success and keeps its transport, even if concurrent CRUD fills
-the now-released budget. Every persisted terminal body and ETag is permanently
-frozen; late complete/fail calls return it unchanged and only close a transport
-still owned by their own stale result. The failed operation embeds the exact API
-error used by later replays, and exact replay never repeats remote work. Profile
-deletion atomically rejects any queued, running, or cancelling profile operation,
-including a disconnect reservation that deliberately leaves an already-
-disconnected profile state unchanged. Once that operation is terminal, its
-historical record no longer blocks deletion. Process restart resets persisted
-runtime connection state to disconnected and does not claim a surviving tunnel.
-It only reconciles nonterminal reservations, writing
+the now-released budget. Failure finalization uses the same exact reservation,
+request digest, profile, and operation identity for a read-only observation after
+any commit-return error. An observed terminal is authoritative; an observed
+`running` state is retried once and is never inferred to have committed. After a
+terminal failure is durable, transport cleanup runs only when the current durable
+profile remains disconnected and the process lifecycle still names that same
+profile as owner. Exact failed replay repeats that owner-checked cleanup, repairing
+a prior cleanup interruption without repeating SSH work or disconnecting a newer
+owner. Every persisted terminal body and ETag is permanently frozen; late
+complete/fail calls return it unchanged and only close a transport still owned by
+their own stale result. The failed operation embeds the exact API error used by
+later replays. Profile deletion atomically rejects any queued, running, or
+cancelling profile operation, including a disconnect reservation that deliberately
+leaves an already-disconnected profile state unchanged. Once that operation is
+terminal and its owned transport is closed, its historical record no longer
+blocks deletion. Process restart resets persisted runtime connection state to
+disconnected and does not claim a surviving tunnel. It only reconciles
+nonterminal reservations, writing
 their cancelled operation and idempotency response together. SSH success alone
 reports `core_not_started`, not an online Core.
 

@@ -2103,6 +2103,31 @@ class DesktopProviderStore:
                 error=error,
             )
 
+    def observe_profile_runtime_action(
+        self,
+        *,
+        reservation: ProfileRuntimeActionReservation,
+        route: str,
+        profile_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+    ) -> LocalOperationV1:
+        """Read an exact reserved action without changing nonterminal state."""
+
+        identity = self._profile_action_identity(
+            route=route,
+            profile_id=profile_id,
+            key=key,
+            body=body,
+            if_match=if_match,
+        )
+        with self._transaction(write=False) as connection:
+            operation, _ = self._require_reserved_profile_action(
+                connection, identity, reservation.operation.operation_id
+            )
+            return operation
+
     def _profile_action_identity(
         self,
         *,

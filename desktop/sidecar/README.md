@@ -46,7 +46,13 @@ request-ETag check. If completion reports an error before commit, the running
 reservation retains its terminal capacity until failure is durable. If commit
 succeeded before returning an error, the frozen success remains authoritative
 and its transport stays open even if concurrent CRUD consumed the released
-capacity. Failed operations retain their bounded `ApiErrorV1`, so exact replays
+capacity. Failure finalization resolves the same return ambiguity with a
+read-only observation bound to the exact idempotency envelope and reserved
+operation. It retries only a proven `running` state. A durable failed operation
+authorizes cleanup only while the profile remains durably disconnected and the
+process transport still has that profile as owner; exact failed replay repeats
+this check so interrupted cleanup converges without closing another owner's
+transport. Failed operations retain their bounded `ApiErrorV1`, so exact replays
 return the same error and do not repeat remote work. Once any operation is
 terminal, its body and ETag are immutable; a late complete/fail call only returns
 that terminal and may close the transport owned by its own stale result. Restart

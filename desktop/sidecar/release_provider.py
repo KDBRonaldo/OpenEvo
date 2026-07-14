@@ -37,6 +37,7 @@ from desktop.sidecar.provider_store import (
     DesktopProviderStore,
     ProfileRuntimeActionReservation,
     ProviderStoreError,
+    ResourceNotFoundError,
     ResourceInUseError,
 )
 from desktop.sidecar.remote_lifecycle import (
@@ -353,6 +354,9 @@ class DesktopReleaseProvider:
                 displace_existing=operation_kind != "profile_disconnect",
             )
             if reservation.replayed:
+                self._reconcile_failed_profile_transport(
+                    profile_id, reservation.operation
+                )
                 return self._operation_response(reservation.operation)
             owner_error: RemoteConnectionFailedError | None = None
             snapshot = self._remote_lifecycle.snapshot()
@@ -378,7 +382,7 @@ class DesktopReleaseProvider:
             outcome = action(profile)
         except RemoteLifecycleError as exc:
             error = self._remote_action_error(reservation, exc)
-            operation = self._store.fail_profile_runtime_action(
+            operation = self._finalize_profile_runtime_failure(
                 reservation=reservation,
                 route=route,
                 profile_id=profile_id,
@@ -389,6 +393,7 @@ class DesktopReleaseProvider:
             )
             with self._connection_state_lock:
                 if generation is not None and self._owns_connection_locked(generation, profile_id):
+                    self._reconcile_failed_profile_transport(profile_id, operation)
                     self._core_state = self._connection_failure_state(profile_id, exc)
             return self._operation_response(operation)
 
@@ -398,7 +403,7 @@ class DesktopReleaseProvider:
                     "A newer remote lifecycle operation superseded this result."
                 )
                 self._disconnect_owned_transport(profile_id)
-                operation = self._store.fail_profile_runtime_action(
+                operation = self._finalize_profile_runtime_failure(
                     reservation=reservation,
                     route=route,
                     profile_id=profile_id,
@@ -421,7 +426,7 @@ class DesktopReleaseProvider:
                 )
             except (ProviderStoreError, sqlite3.Error):
                 error = self._provider_action_error(reservation)
-                operation = self._store.fail_profile_runtime_action(
+                operation = self._finalize_profile_runtime_failure(
                     reservation=reservation,
                     route=route,
                     profile_id=profile_id,
@@ -437,7 +442,10 @@ class DesktopReleaseProvider:
                         outcome,
                     )
                     return self._operation_response(operation)
-                self._disconnect_owned_transport(profile_id)
+                if operation.state == "failed":
+                    self._reconcile_failed_profile_transport(profile_id, operation)
+                else:
+                    self._disconnect_owned_transport(profile_id)
                 self._core_state = self._local_provider_failure_state(profile_id)
                 return self._operation_response(operation)
             if operation.state != "succeeded":
@@ -484,6 +492,61 @@ class DesktopReleaseProvider:
 
     def _owns_connection_locked(self, generation: int, profile_id: str) -> bool:
         return generation == self._connection_generation and self._connection_owner == profile_id
+
+    def _finalize_profile_runtime_failure(
+        self,
+        *,
+        reservation: ProfileRuntimeActionReservation,
+        route: str,
+        profile_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+        error: ApiErrorV1,
+    ) -> LocalOperationV1:
+        for attempt in range(2):
+            try:
+                return self._store.fail_profile_runtime_action(
+                    reservation=reservation,
+                    route=route,
+                    profile_id=profile_id,
+                    key=key,
+                    body=body,
+                    if_match=if_match,
+                    error=error,
+                )
+            except (ProviderStoreError, sqlite3.Error):
+                observed = self._store.observe_profile_runtime_action(
+                    reservation=reservation,
+                    route=route,
+                    profile_id=profile_id,
+                    key=key,
+                    body=body,
+                    if_match=if_match,
+                )
+                if observed.state != "running":
+                    return observed
+                if attempt != 0:
+                    raise
+        raise AssertionError("profile failure finalization loop did not return")
+
+    def _reconcile_failed_profile_transport(
+        self,
+        profile_id: str,
+        operation: LocalOperationV1,
+    ) -> None:
+        if operation.state != "failed":
+            return
+        try:
+            profile = self._store.get_profile(profile_id)
+        except ResourceNotFoundError:
+            return
+        if profile.connection_state != "disconnected":
+            return
+        snapshot = self._remote_lifecycle.snapshot()
+        if snapshot.profile_id != profile_id or snapshot.state == "disconnected":
+            return
+        self._disconnect_owned_transport(profile_id)
 
     def _disconnect_owned_transport(self, profile_id: str) -> None:
         try:

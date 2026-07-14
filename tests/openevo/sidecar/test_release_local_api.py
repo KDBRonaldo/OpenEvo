@@ -737,6 +737,171 @@ def test_remote_connection_failure_is_typed_and_does_not_persist_details(
         assert restarted_lifecycle.connect_calls == 0
 
 
+@pytest.mark.parametrize("failure_timing", ["before_commit", "after_commit"])
+def test_failure_finalization_reconciles_commit_return_ambiguity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_timing: str
+) -> None:
+    lifecycle = FakeRemoteLifecycle()
+    lifecycle.connect_error = RemoteConnectionFailedError("injected SSH failure")
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client, name="Failure finalization", key="profile-failure-finalize-create"
+        ).json()
+        store = app.state.desktop_release_provider._store
+        original_fail = store.fail_profile_runtime_action
+        calls = 0
+
+        def fail_once(*args: object, **kwargs: object):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                if failure_timing == "after_commit":
+                    original_fail(*args, **kwargs)
+                raise sqlite3.OperationalError("injected failure finalization error")
+            return original_fail(*args, **kwargs)
+
+        monkeypatch.setattr(store, "fail_profile_runtime_action", fail_once)
+        headers = {
+            **SESSION_HEADERS,
+            "If-Match": profile["etag"],
+            "Idempotency-Key": "profile-failure-finalize-connect",
+        }
+
+        failed = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+        )
+        replay = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+        )
+
+        assert failed.status_code == replay.status_code == 503
+        assert failed.content == replay.content
+        assert failed.json()["code"] == "ssh_connection_failed"
+        assert calls == (2 if failure_timing == "before_commit" else 1)
+        assert lifecycle.connect_calls == 1
+        assert lifecycle.disconnect_calls == 1
+        assert lifecycle.current == RemoteLifecycleSnapshot(None, "disconnected")
+        terminal_profile = client.get(
+            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+        ).json()
+        assert terminal_profile["connection_state"] == "disconnected"
+        deleted = client.delete(
+            f"/desktop/v1/profiles/{profile['profile_id']}",
+            headers={**SESSION_HEADERS, "If-Match": terminal_profile["etag"]},
+        )
+        assert deleted.status_code == 204
+
+
+def test_uncommitted_failure_finalization_is_not_treated_as_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = FakeRemoteLifecycle()
+    lifecycle.connect_error = RemoteConnectionFailedError("injected SSH failure")
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client, name="Uncommitted failure", key="profile-uncommitted-failure-create"
+        ).json()
+        store = app.state.desktop_release_provider._store
+        calls = 0
+
+        def fail_before_commit(*args: object, **kwargs: object):
+            nonlocal calls
+            calls += 1
+            raise sqlite3.OperationalError("injected pre-commit failure")
+
+        monkeypatch.setattr(store, "fail_profile_runtime_action", fail_before_commit)
+        failed = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": profile["etag"],
+                "Idempotency-Key": "profile-uncommitted-failure-connect",
+            },
+        )
+
+        assert failed.status_code == 503
+        assert failed.json()["code"] == "local_provider_unavailable"
+        assert calls == 2
+        assert lifecycle.disconnect_calls == 0
+        assert store.get_profile(profile["profile_id"]).connection_state == "connecting"
+        operation = store._connection.execute(
+            "SELECT state FROM local_operations WHERE resource_id = ?",
+            (profile["profile_id"],),
+        ).fetchone()
+        assert operation is not None and operation[0] == "running"
+
+
+@pytest.mark.parametrize("transport_owner", ["same", "other", "disconnected"])
+def test_exact_failed_replay_repairs_only_its_owned_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport_owner: str,
+) -> None:
+    lifecycle = FakeRemoteLifecycle()
+    lifecycle.connect_error = RemoteConnectionFailedError("injected SSH failure")
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client, name="Replay cleanup", key="profile-replay-cleanup-create"
+        ).json()
+        original_disconnect = lifecycle.disconnect
+        cleanup_attempts = 0
+
+        def fail_cleanup(profile_id: str | None = None) -> None:
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            raise RemoteConnectionFailedError("injected cleanup failure")
+
+        monkeypatch.setattr(lifecycle, "disconnect", fail_cleanup)
+        headers = {
+            **SESSION_HEADERS,
+            "If-Match": profile["etag"],
+            "Idempotency-Key": "profile-replay-cleanup-connect",
+        }
+        failed = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+        )
+        assert failed.status_code == 503
+        assert failed.json()["code"] == "ssh_connection_failed"
+        assert cleanup_attempts == 1
+
+        if transport_owner == "same":
+            lifecycle.current = RemoteLifecycleSnapshot(profile["profile_id"], "connected")
+        elif transport_owner == "other":
+            lifecycle.current = RemoteLifecycleSnapshot("profile-other-owner", "connected")
+        else:
+            lifecycle.current = RemoteLifecycleSnapshot(None, "disconnected")
+        monkeypatch.setattr(lifecycle, "disconnect", original_disconnect)
+
+        replay = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+        )
+
+        assert replay.status_code == 503
+        assert replay.content == failed.content
+        assert lifecycle.connect_calls == 1
+        assert lifecycle.disconnect_calls == (1 if transport_owner == "same" else 0)
+        if transport_owner == "same":
+            assert lifecycle.current == RemoteLifecycleSnapshot(None, "disconnected")
+        elif transport_owner == "other":
+            assert lifecycle.current == RemoteLifecycleSnapshot(
+                "profile-other-owner", "connected"
+            )
+        else:
+            assert lifecycle.current == RemoteLifecycleSnapshot(None, "disconnected")
+
+        terminal_profile = client.get(
+            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+        ).json()
+        deleted = client.delete(
+            f"/desktop/v1/profiles/{profile['profile_id']}",
+            headers={**SESSION_HEADERS, "If-Match": terminal_profile["etag"]},
+        )
+        assert deleted.status_code == 204
+
+
 def test_reserved_action_keeps_terminal_byte_slots_during_ssh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
