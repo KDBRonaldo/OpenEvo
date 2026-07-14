@@ -21,6 +21,10 @@ from openevo.backend.service import (
     authenticate_core_service_endpoint,
 )
 from openevo.deployment.executor import RemoteExecutorTransport
+from openevo.deployment.core_runtime import (
+    CorePythonRuntimeAuthority,
+    build_verified_python_command,
+)
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.ssh import SshTransportError, SshTransportErrorCode
 
@@ -40,7 +44,12 @@ import venv
 
 install_root = Path(sys.argv[1])
 wheel_path = Path(sys.argv[2])
-service_argv = sys.argv[3:]
+base_executable = sys.argv[3]
+service_argv = sys.argv[4:]
+# FD-bound invocation deliberately reports /proc/self/fd/N. Restore the verified
+# canonical base path so venv copies and pyvenv.cfg bind the selected runtime.
+sys.executable = base_executable
+sys._base_executable = base_executable
 parent = install_root.parent
 service_root = parent.parent
 service_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -141,6 +150,11 @@ class CoreControlBootstrapPlan:
     _wheel_path: str = field(repr=False, compare=False, default="")
     _framework_lock: str = field(repr=False, compare=False, default="")
     _service_root: str = field(repr=False, compare=False, default="")
+    _runtime: CorePythonRuntimeAuthority | None = field(
+        repr=False,
+        compare=False,
+        default=None,
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -150,12 +164,22 @@ class CoreControlBootstrapPlan:
             or not _is_remote_absolute_path(self._wheel_path)
             or not _is_remote_absolute_path(self._framework_lock)
             or not _is_remote_absolute_path(self._service_root)
+            or not isinstance(self._runtime, CorePythonRuntimeAuthority)
         ):
             raise CoreControlBootstrapError(
                 CoreControlBootstrapErrorCode.INVALID_PLAN,
                 "Core bootstrap settings are invalid.",
                 retryable=False,
             )
+        assert self._runtime is not None
+        try:
+            self._runtime.__post_init__()
+        except ValueError:
+            raise CoreControlBootstrapError(
+                CoreControlBootstrapErrorCode.INVALID_PLAN,
+                "Core bootstrap settings are invalid.",
+                retryable=False,
+            ) from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +265,7 @@ class VerifiedCoreControlTunnel:
 
 def build_core_control_bootstrap_plan(
     *,
+    runtime: CorePythonRuntimeAuthority,
     wheel_path: str,
     framework_lock: str,
     service_root: str,
@@ -256,12 +281,21 @@ def build_core_control_bootstrap_plan(
         or _SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None
         or not 0 <= port <= 65535
         or not 1 <= deadline_seconds <= 300
+        or not isinstance(runtime, CorePythonRuntimeAuthority)
     ):
         raise CoreControlBootstrapError(
             CoreControlBootstrapErrorCode.INVALID_PLAN,
             "Core bootstrap settings are invalid.",
             retryable=False,
         )
+    try:
+        runtime.__post_init__()
+    except ValueError:
+        raise CoreControlBootstrapError(
+            CoreControlBootstrapErrorCode.INVALID_PLAN,
+            "Core bootstrap settings are invalid.",
+            retryable=False,
+        ) from None
     return CoreControlBootstrapPlan(
         source_commit=source_commit,
         port=port,
@@ -270,6 +304,7 @@ def build_core_control_bootstrap_plan(
         _wheel_path=wheel_path,
         _framework_lock=framework_lock,
         _service_root=service_root,
+        _runtime=runtime,
     )
 
 
@@ -278,6 +313,12 @@ def execute_core_control_bootstrap(
     transport: CoreBootstrapTransport,
 ) -> RemoteCoreControlAttachment:
     deadline = time.monotonic() + plan.deadline_seconds
+    if plan._runtime is None:
+        raise CoreControlBootstrapError(
+            CoreControlBootstrapErrorCode.INVALID_PLAN,
+            "Core bootstrap settings are invalid.",
+            retryable=False,
+        )
     attachment_name = f"bootstrap-{secrets.token_hex(16)}.json"
     install_generation = secrets.token_hex(16)
     install_root = f"{plan._service_root}/releases/{install_generation}"
@@ -293,10 +334,13 @@ def execute_core_control_bootstrap(
         f" --deadline-seconds {max(1.0, plan.deadline_seconds)}"
         + (" --replace-mismatched" if plan.replace_mismatched else "")
     )
-    service_command = (
-        f"python3 -I -c {shlex.quote(_GENERATION_BOOTSTRAP)} "
-        f"{shlex.quote(install_root)} {shlex.quote(plan._wheel_path)} "
-        f"{service_arguments}"
+    service_command = build_verified_python_command(
+        plan._runtime,
+        _GENERATION_BOOTSTRAP,
+        install_root,
+        plan._wheel_path,
+        plan._runtime.executable_path,
+        *shlex.split(service_arguments),
     )
     service = _run_bootstrap_command(
         transport,

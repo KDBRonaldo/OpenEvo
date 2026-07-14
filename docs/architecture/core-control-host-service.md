@@ -109,16 +109,16 @@ The `/proc/<pid>/fd` asset-consumption anchor and Linux atomic no-replace rename
 used below execute on that remote Core host. A macOS Desktop is only the local
 SSH/rsync caller; it does not replace or relax those remote Linux primitives.
 
-The current supervisor additionally requires the selected Python interpreter to
-provide callable `os.pidfd_open` and `signal.pidfd_send_signal`; kernel pidfd
-support alone is insufficient when a Python build omits those wrappers. The
-Desktop production adapter therefore runs a closed `python3 -I` preflight before
-upload, including a boot-ID check and a no-signal pidfd probe. A missing wrapper
-is reported as `core_supervisor_runtime_unsupported` before any bootstrap claim.
-Some uv-managed CPython 3.11/3.12 builds have this limitation, while an available
-system Python 3.10 remains below Core's Python requirement. Until a separate
-Core syscall compatibility layer is implemented and reviewed, such a host is an
-explicit release blocker rather than an automatically supported fresh server.
+The Desktop production adapter uses the system Python only as a fixed Ubuntu
+bootstrap selector, not as the Core runtime. It searches verified Python 3.13
+through 3.11 candidates and may use an existing verified `uv` to find or install
+Python 3.11. Selection probes the same direct pidfd syscall ABI as the service,
+so uv-managed Python builds without the convenience wrappers remain eligible.
+It returns a canonical executable authority that binds path, inode, metadata,
+digest, and version. Every later asset and generation command revalidates that
+authority and executes its held FD; it never resolves `python3` from PATH again.
+Missing Python, failed uv provisioning, and missing kernel syscalls remain
+distinct typed failures before any bootstrap claim.
 
 The supervisor binds and listens on one IPv4 loopback socket before spawning
 Core. Release bootstrap requests port `0`, so the kernel chooses an available

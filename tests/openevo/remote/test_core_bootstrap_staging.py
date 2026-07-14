@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+from dataclasses import asdict
 import hashlib
 import json
 import os
@@ -9,7 +10,6 @@ from pathlib import Path
 import pwd
 import re
 import shlex
-import signal
 import struct
 import subprocess
 import sys
@@ -67,7 +67,7 @@ class RemoteFailureRunner(RecordingRunner):
         )
 
 
-def _profile() -> RemoteProfileConfig:
+def _profile(*, https_proxy: str | None = None) -> RemoteProfileConfig:
     return RemoteProfileConfig.model_validate(
         {
             "version": 1,
@@ -75,6 +75,7 @@ def _profile() -> RemoteProfileConfig:
             "host": "gpu.example.edu",
             "port": 2222,
             "user": "alice",
+            "proxy": {"https_proxy": https_proxy},
         }
     )
 
@@ -82,8 +83,10 @@ def _profile() -> RemoteProfileConfig:
 def _transport(
     tmp_path: Path,
     runner: RecordingRunner,
+    *,
+    profile: RemoteProfileConfig | None = None,
 ) -> SshRemoteExecutorTransport:
-    profile = _profile()
+    profile = profile or _profile()
     key_type = "ssh-ed25519"
     encoded_type = key_type.encode("ascii")
     key = hashlib.sha256(b"staging-test-key").digest()
@@ -112,6 +115,45 @@ def _transport(
         fingerprint=candidate.fingerprint,
     )
     return SshRemoteExecutorTransport(profile, trusted_host=binding, runner=runner)
+
+
+def _runtime() -> core_runtime.CorePythonRuntimeAuthority:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "executable_path": "/home/alice/.local/share/uv/python/python3.11",
+        "executable_sha256": "d" * 64,
+        "device": 21,
+        "inode": 22,
+        "uid": 1000,
+        "mode": 0o755,
+        "byte_size": 4096,
+        "mtime_ns": 23,
+        "ctime_ns": 24,
+        "version": [3, 11, 12],
+    }
+    canonical = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    authority_id = hashlib.sha256(b"openevo-core-python-runtime-v1\0" + canonical).hexdigest()
+    return core_runtime.CorePythonRuntimeAuthority(
+        authority_id=authority_id,
+        executable_path=str(values["executable_path"]),
+        executable_sha256=str(values["executable_sha256"]),
+        device=21,
+        inode=22,
+        uid=1000,
+        mode=0o755,
+        byte_size=4096,
+        mtime_ns=23,
+        ctime_ns=24,
+        version=(3, 11, 12),
+    )
+
+
+def _runtime_payload(
+    authority: core_runtime.CorePythonRuntimeAuthority,
+) -> dict[str, object]:
+    value = asdict(authority)
+    value["version"] = list(authority.version)
+    return {"schema_version": 2, "reason": "ready", "authority": value}
 
 
 def _assets(tmp_path: Path) -> tuple[Path, str, Path, str]:
@@ -193,8 +235,9 @@ def _install_secret_responses(
         *,
         timeout_seconds: float,
         remote_failure_code: SshTransportErrorCode,
+        env: dict[str, str] | None = None,
     ) -> SecretStr:
-        del remote_failure_code
+        del remote_failure_code, env
         calls.append((command, timeout_seconds))
         return responses.pop(0)
 
@@ -210,6 +253,7 @@ def _stage(
 ) -> StagedCoreBootstrapAssets:
     wheel, wheel_digest, lock, lock_digest = assets
     return transport.stage_core_bootstrap_assets(
+        runtime=_runtime(),
         wheel_path=str(wheel),
         wheel_sha256=wheel_digest,
         wheel_size=wheel.stat().st_size,
@@ -1149,7 +1193,7 @@ def test_stage_core_assets_prepares_fresh_host_uploads_private_snapshot_and_fina
     assert staged.framework_lock_inode == 16
     consumer_command = f"consume {staged.wheel_path} {staged.framework_lock_path}"
     bound_command = transport._bind_core_asset_consumption(consumer_command)
-    assert bound_command.startswith("python3 -I -c ")
+    assert bound_command.startswith("/usr/bin/python3 -I -c ")
     assert shlex.quote(consumer_command) in bound_command
     assert bound_command != consumer_command
     assert len(secret_calls) == 2
@@ -1168,12 +1212,45 @@ def test_stage_core_assets_prepares_fresh_host_uploads_private_snapshot_and_fina
     assert str(tmp_path) not in repr(staged)
 
 
-def test_core_supervisor_runtime_preflight_rejects_missing_pidfd_wrappers(
+def test_core_asset_consumer_inherits_runtime_proxy_for_venv_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _assets(tmp_path)
+    runner = RecordingRunner()
+    transport = _transport(
+        tmp_path,
+        runner,
+        profile=_profile(https_proxy="http://127.0.0.1:7890"),
+    )
+    _install_secret_responses(
+        monkeypatch,
+        transport,
+        _stage_responses(assets[1], assets[3]),
+    )
+    staged = _stage(transport, assets)
+
+    result = transport.run(
+        f"consume {staged.wheel_path} {staged.framework_lock_path}",
+        timeout_seconds=20,
+    )
+
+    assert result.ok
+    remote_command = runner.calls[-1][0][-1]
+    assert "HTTPS_PROXY=http://127.0.0.1:7890" in remote_command
+    assert "https_proxy=http://127.0.0.1:7890" in remote_command
+
+
+def test_core_python_runtime_selection_maps_no_supported_python_and_inherits_proxy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = RecordingRunner()
-    transport = _transport(tmp_path, runner)
+    transport = _transport(
+        tmp_path,
+        runner,
+        profile=_profile(https_proxy="http://127.0.0.1:7890"),
+    )
     commands: list[tuple[str, float]] = []
 
     def unsupported(
@@ -1181,15 +1258,20 @@ def test_core_supervisor_runtime_preflight_rejects_missing_pidfd_wrappers(
         *,
         timeout_seconds: float,
         remote_failure_code: SshTransportErrorCode,
+        env: dict[str, str] | None = None,
     ) -> SecretStr:
         assert remote_failure_code is SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED
         commands.append((command, timeout_seconds))
+        assert env == {
+            "HTTPS_PROXY": "http://127.0.0.1:7890",
+            "https_proxy": "http://127.0.0.1:7890",
+        }
         return SecretStr(
             json.dumps(
                 {
-                    "schema_version": 1,
-                    "supported": False,
-                    "reason": "missing_python_pidfd_api",
+                    "schema_version": 2,
+                    "authority": None,
+                    "reason": "no_supported_python",
                 },
                 separators=(",", ":"),
                 sort_keys=True,
@@ -1199,13 +1281,13 @@ def test_core_supervisor_runtime_preflight_rejects_missing_pidfd_wrappers(
     monkeypatch.setattr(transport, "_run_secret_with_remote_failure", unsupported)
 
     with pytest.raises(SshTransportError) as error:
-        transport.require_core_supervisor_runtime(timeout_seconds=300)
+        transport.select_core_python_runtime(timeout_seconds=300)
 
-    assert error.value.code is SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED
+    assert error.value.code is SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE
     assert len(commands) == 1
     assert commands[0][1] == 300
-    assert "pidfd_open" in commands[0][0]
-    assert "pidfd_send_signal" in commands[0][0]
+    assert "uv" in commands[0][0]
+    assert 'python", "install", "3.11' in commands[0][0]
     assert str(tmp_path) not in str(error.value)
 
 
@@ -1228,28 +1310,135 @@ def test_secret_runner_maps_authenticated_remote_failure_without_output_leak(
     assert "private remote output" not in str(error.value)
 
 
-def test_core_supervisor_runtime_script_reports_missing_python_wrappers(
+def test_core_python_runtime_probe_accepts_direct_pidfd_syscalls_without_wrappers() -> None:
+    completed = subprocess.run(
+        core_runtime.build_core_supervisor_runtime_preflight_command(timeout_seconds=30),
+        shell=True,
+        executable="/bin/sh",
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=35,
+    )
+    assert completed.returncode == 0
+    selection = core_runtime.parse_core_supervisor_runtime_preflight(SecretStr(completed.stdout))
+    assert selection.reason == "ready"
+    assert selection.authority is not None
+    assert selection.authority.version >= (3, 11, 0)
+    assert 'getattr(os, "pidfd_open"' not in core_runtime._REMOTE_SELECTION_SCRIPT
+    assert 'getattr(signal, "pidfd_send_signal"' not in core_runtime._REMOTE_SELECTION_SCRIPT
+    assert "libc.syscall" in core_runtime._REMOTE_SELECTION_SCRIPT
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("python_provision_failed", SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED),
+        (
+            "kernel_syscall_unsupported",
+            SshTransportErrorCode.CORE_KERNEL_SYSCALL_UNSUPPORTED,
+        ),
+    ],
+)
+def test_core_python_runtime_selection_preserves_typed_failures(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    reason: str,
+    expected: SshTransportErrorCode,
 ) -> None:
-    with monkeypatch.context() as scoped:
-        scoped.setattr(sys, "platform", "linux")
-        scoped.setattr(sys, "version_info", (3, 12, 0))
-        scoped.delattr(os, "pidfd_open", raising=False)
-        scoped.delattr(signal, "pidfd_send_signal", raising=False)
-        exec(
-            compile(
-                core_runtime._REMOTE_PREFLIGHT_SCRIPT,
-                "<core-runtime-preflight>",
-                "exec",
-            ),
-            {"__name__": "__main__"},
+    transport = _transport(tmp_path, RecordingRunner())
+
+    def response(*_args: object, **_kwargs: object) -> SecretStr:
+        return SecretStr(
+            json.dumps(
+                {"schema_version": 2, "reason": reason, "authority": None},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         )
 
-    reason = core_runtime.parse_core_supervisor_runtime_preflight(
-        SecretStr(capsys.readouterr().out)
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", response)
+    with pytest.raises(SshTransportError) as error:
+        transport.select_core_python_runtime(timeout_seconds=30)
+    assert error.value.code is expected
+
+
+def test_core_python_runtime_response_rejects_malicious_paths_versions_and_identity() -> None:
+    authority = _runtime()
+    payload = _runtime_payload(authority)
+    invalid_payloads = []
+    for field, value in (
+        ("executable_path", "../../python3.11"),
+        ("authority_id", "f" * 64),
+        ("version", [3, 10, 12]),
+    ):
+        changed = json.loads(json.dumps(payload))
+        changed["authority"][field] = value
+        invalid_payloads.append(json.dumps(changed))
+    invalid_payloads.extend(
+        (
+            '{"authority":null,"authority":null,"reason":"no_supported_python",'
+            '"schema_version":2}',
+            "x" * 4097,
+        )
     )
-    assert reason == "missing_python_pidfd_api"
+    for invalid in invalid_payloads:
+        with pytest.raises(ValueError):
+            core_runtime.parse_core_supervisor_runtime_preflight(SecretStr(invalid))
+
+
+def test_verified_python_command_rejects_pathname_replacement(tmp_path: Path) -> None:
+    executable = tmp_path / "python3.11"
+    executable.write_bytes(b"first executable")
+    executable.chmod(0o755)
+    metadata = executable.stat()
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    values = {
+        "schema_version": 1,
+        "executable_path": str(executable),
+        "executable_sha256": digest,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "mode": 0o755,
+        "byte_size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "ctime_ns": metadata.st_ctime_ns,
+        "version": [3, 11, 12],
+    }
+    canonical = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    authority = core_runtime.CorePythonRuntimeAuthority(
+        authority_id=hashlib.sha256(b"openevo-core-python-runtime-v1\0" + canonical).hexdigest(),
+        executable_path=str(executable),
+        executable_sha256=digest,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        uid=metadata.st_uid,
+        mode=0o755,
+        byte_size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+        ctime_ns=metadata.st_ctime_ns,
+        version=(3, 11, 12),
+    )
+    command = core_runtime.build_verified_python_command(
+        authority,
+        "print('must-not-run')",
+    )
+    executable.unlink()
+    executable.write_bytes(b"replacement executable")
+    executable.chmod(0o755)
+
+    completed = subprocess.run(
+        command,
+        shell=True,
+        executable="/bin/sh",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "must-not-run" not in completed.stdout
 
 
 def test_core_supervisor_runtime_script_rejects_non_linux_remote_host(
@@ -1306,6 +1495,7 @@ def test_core_staging_closed_payloads_reject_boolean_numeric_aliases() -> None:
         )
     with pytest.raises(ValueError):
         core_assets.build_core_asset_finalize_command(
+            runtime=_runtime(),
             service_root=root,
             bundle_id=BUNDLE_ID,
             transfer_id=TRANSFER_ID,
@@ -1330,6 +1520,7 @@ def test_stage_core_assets_rejects_symlink_and_digest_tamper_before_remote_work(
 
     with pytest.raises(SshTransportError) as symlink_error:
         transport.stage_core_bootstrap_assets(
+            runtime=_runtime(),
             wheel_path=str(symlink),
             wheel_sha256=assets[1],
             wheel_size=assets[0].stat().st_size,
@@ -1364,6 +1555,7 @@ def test_stage_core_assets_rejects_symlinked_parent_before_remote_work(
 
     with pytest.raises(SshTransportError) as error:
         transport.stage_core_bootstrap_assets(
+            runtime=_runtime(),
             wheel_path=str(linked_root / WHEEL_NAME),
             wheel_sha256=assets[1],
             wheel_size=assets[0].stat().st_size,

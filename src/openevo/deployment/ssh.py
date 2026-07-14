@@ -39,6 +39,7 @@ from openevo.deployment.core_assets import (
     snapshot_core_bootstrap_assets,
 )
 from openevo.deployment.core_runtime import (
+    CorePythonRuntimeAuthority,
     build_core_supervisor_runtime_preflight_command,
     parse_core_supervisor_runtime_preflight,
 )
@@ -99,6 +100,7 @@ os.execvp(argv[0], argv)
 
 @dataclass(frozen=True, slots=True)
 class _CoreAssetTransferAuthority:
+    runtime: CorePythonRuntimeAuthority
     service_root: str
     bundle_id: str
     transfer_id: str
@@ -115,6 +117,7 @@ class _CoreAssetTransferAuthority:
 
     def with_finalize_started(self) -> _CoreAssetTransferAuthority:
         return _CoreAssetTransferAuthority(
+            runtime=self.runtime,
             service_root=self.service_root,
             bundle_id=self.bundle_id,
             transfer_id=self.transfer_id,
@@ -141,6 +144,9 @@ class SshTransportErrorCode(str, Enum):
     START_FAILED = "start_failed"
     RSYNC_FAILED = "rsync_failed"
     CORE_ASSET_FAILED = "core_asset_failed"
+    CORE_PYTHON_UNAVAILABLE = "core_python_unavailable"
+    CORE_PYTHON_PROVISION_FAILED = "core_python_provision_failed"
+    CORE_KERNEL_SYSCALL_UNSUPPORTED = "core_kernel_syscall_unsupported"
     CORE_RUNTIME_UNSUPPORTED = "core_runtime_unsupported"
     CORE_RUNTIME_PREFLIGHT_FAILED = "core_runtime_preflight_failed"
     INVALID_REQUEST = "invalid_ssh_request"
@@ -160,8 +166,17 @@ class SshTransportError(RuntimeError):
             SshTransportErrorCode.START_FAILED: "SSH process could not be started.",
             SshTransportErrorCode.RSYNC_FAILED: "rsync failed over SSH.",
             SshTransportErrorCode.CORE_ASSET_FAILED: ("Core bootstrap asset verification failed."),
+            SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE: (
+                "No supported remote Python runtime is available."
+            ),
+            SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED: (
+                "OpenEvo could not provision a supported remote Python runtime."
+            ),
+            SshTransportErrorCode.CORE_KERNEL_SYSCALL_UNSUPPORTED: (
+                "The remote Linux kernel lacks required Core supervision syscalls."
+            ),
             SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED: (
-                "Remote Python lacks required Core service supervision primitives."
+                "The remote host lacks required Core service supervision primitives."
             ),
             SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED: (
                 "Remote Core service runtime preflight failed."
@@ -750,7 +765,9 @@ class SshRemoteExecutorTransport:
         self._port_allocator = port_allocator or _allocate_local_port
         self._core_connection_starter = core_connection_starter
         self._core_asset_authority_lock = threading.Lock()
-        self._core_asset_authorities: dict[str, StagedCoreBootstrapAssets] = {}
+        self._core_asset_authorities: dict[
+            str, tuple[StagedCoreBootstrapAssets, CorePythonRuntimeAuthority]
+        ] = {}
         self._core_asset_transfer_ownerships: set[_CoreAssetTransferAdmission] = set()
 
     def _run_trusted_subprocess(
@@ -798,7 +815,10 @@ class SshRemoteExecutorTransport:
         invalid_request = False
         try:
             bound_command = self._bind_core_asset_consumption(command)
-            remote_command = _remote_command(bound_command, cwd=cwd, env=env)
+            effective_env = dict(env or {})
+            if bound_command != command:
+                effective_env = _core_runtime_proxy_env(self._profile) | effective_env
+            remote_command = _remote_command(bound_command, cwd=cwd, env=effective_env)
         except Exception:
             invalid_request = True
             remote_command = ""
@@ -900,6 +920,7 @@ class SshRemoteExecutorTransport:
     def stage_core_bootstrap_assets(
         self,
         *,
+        runtime: CorePythonRuntimeAuthority,
         wheel_path: str,
         wheel_sha256: str,
         wheel_size: int,
@@ -916,7 +937,10 @@ class SshRemoteExecutorTransport:
         ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         try:
-            prepare_command = build_core_asset_prepare_command(bundle_id)
+            if not isinstance(runtime, CorePythonRuntimeAuthority):
+                raise ValueError("Core Python runtime authority is invalid")
+            runtime.__post_init__()
+            prepare_command = build_core_asset_prepare_command(bundle_id, runtime)
         except (TypeError, ValueError):
             _log_transport_failure(SshTransportErrorCode.INVALID_REQUEST)
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
@@ -951,6 +975,7 @@ class SshRemoteExecutorTransport:
                 authority: _CoreAssetTransferAuthority | None = None
                 try:
                     authority = _CoreAssetTransferAuthority(
+                        runtime=runtime,
                         service_root=service_root,
                         bundle_id=bundle_id,
                         transfer_id=transfer_id,
@@ -969,6 +994,7 @@ class SshRemoteExecutorTransport:
                 except BaseException:
                     if authority is None:
                         authority = _CoreAssetTransferAuthority(
+                            runtime=runtime,
                             service_root=service_root,
                             bundle_id=bundle_id,
                             transfer_id=transfer_id,
@@ -1023,7 +1049,7 @@ class SshRemoteExecutorTransport:
             _log_transport_failure(SshTransportErrorCode.CORE_ASSET_FAILED)
             raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED) from None
 
-    def require_core_supervisor_runtime(self, *, timeout_seconds: float) -> None:
+    def select_core_python_runtime(self, *, timeout_seconds: float) -> CorePythonRuntimeAuthority:
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -1031,18 +1057,31 @@ class SshRemoteExecutorTransport:
         ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         payload = self._run_secret_with_remote_failure(
-            build_core_supervisor_runtime_preflight_command(),
+            build_core_supervisor_runtime_preflight_command(
+                timeout_seconds=float(timeout_seconds)
+            ),
             timeout_seconds=float(timeout_seconds),
             remote_failure_code=SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED,
+            env=_core_runtime_proxy_env(self._profile),
         )
         try:
-            reason = parse_core_supervisor_runtime_preflight(payload)
+            selection = parse_core_supervisor_runtime_preflight(payload)
         except (TypeError, ValueError):
             _log_transport_failure(SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED)
             raise SshTransportError(SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED) from None
-        if reason != "ready":
-            _log_transport_failure(SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED)
-            raise SshTransportError(SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED)
+        if selection.authority is not None:
+            return selection.authority
+        reason_codes = {
+            "no_supported_python": SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE,
+            "python_provision_failed": SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED,
+            "kernel_syscall_unsupported": (SshTransportErrorCode.CORE_KERNEL_SYSCALL_UNSUPPORTED),
+        }
+        code = reason_codes.get(
+            selection.reason,
+            SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED,
+        )
+        _log_transport_failure(code)
+        raise SshTransportError(code)
 
     def _remember_core_asset_transfer(
         self,
@@ -1170,7 +1209,7 @@ class SshRemoteExecutorTransport:
     ) -> None:
         final_root = str(Path(staged.wheel_path).parent)
         with self._core_asset_authority_lock:
-            self._core_asset_authorities[final_root] = staged
+            self._core_asset_authorities[final_root] = (staged, authority.runtime)
             admission = self._find_core_asset_admission_locked(authority.key)
             if admission is not None:
                 admission.active = False
@@ -1184,6 +1223,7 @@ class SshRemoteExecutorTransport:
     ) -> StagedCoreBootstrapAssets:
         finalize_payload = self._run_secret_with_remote_failure(
             build_core_asset_finalize_command(
+                runtime=authority.runtime,
                 service_root=authority.service_root,
                 bundle_id=authority.bundle_id,
                 transfer_id=authority.transfer_id,
@@ -1251,6 +1291,7 @@ class SshRemoteExecutorTransport:
             timeout_seconds = _stage_remaining(deadline)
             self._run_secret_with_remote_failure(
                 build_core_asset_discard_command(
+                    runtime=authority.runtime,
                     service_root=authority.service_root,
                     bundle_id=authority.bundle_id,
                     transfer_id=authority.transfer_id,
@@ -1329,10 +1370,11 @@ class SshRemoteExecutorTransport:
         *,
         timeout_seconds: float,
         remote_failure_code: SshTransportErrorCode,
+        env: dict[str, str] | None = None,
     ) -> SecretStr:
         try:
             bound_command = self._bind_core_asset_consumption(command)
-            remote_command = _remote_command(bound_command, cwd=None, env=None)
+            remote_command = _remote_command(bound_command, cwd=None, env=env)
         except Exception:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
         completion_marker = f"__OPENEVO_REMOTE_COMPLETION_{secrets.token_hex(16)}__="
@@ -1372,13 +1414,16 @@ class SshRemoteExecutorTransport:
     def _bind_core_asset_consumption(self, command: str) -> str:
         with self._core_asset_authority_lock:
             matches = [
-                assets for root, assets in self._core_asset_authorities.items() if root in command
+                authority
+                for root, authority in self._core_asset_authorities.items()
+                if root in command
             ]
         if not matches:
             return command
         if len(matches) != 1:
             raise ValueError("Core asset consumer command has ambiguous authority")
-        return build_core_asset_consumer_command(command, matches[0])
+        assets, runtime = matches[0]
+        return build_core_asset_consumer_command(command, assets, runtime)
 
     def open_tunnel(
         self,
@@ -2902,6 +2947,20 @@ def _remote_command(
         pieces.append(env_export)
     pieces.append(command)
     return " && ".join(pieces)
+
+
+def _core_runtime_proxy_env(profile: RemoteProfileConfig) -> dict[str, str]:
+    allowed = {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+    return {key: value for key, value in profile.proxy.to_env().items() if key in allowed}
 
 
 def _env_export(env: dict[str, str]) -> str:

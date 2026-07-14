@@ -49,12 +49,25 @@ framework-lock identities; the transport derives the private remote root,
 re-hashes both files, verifies their lock binding, and atomically publishes the
 bundle before bootstrap. It never depends on a user-preplaced remote file.
 
-The runtime preflight requires Linux Python 3.11+, kernel process identity, and
-callable `os.pidfd_open` plus `signal.pidfd_send_signal`. Missing Python wrappers
-produce the typed `core_supervisor_runtime_unsupported` blocker before upload.
-The adapter does not select a lower-version system Python or claim general
-fresh-server readiness; a Core-owned syscall compatibility layer remains a
-separate implementation and review item.
+The pre-Core SSH phase selects one Linux Python 3.11+ runtime authority before
+upload. Selection checks PATH Python 3.13 through 3.11 and then verified `uv`
+executables in PATH and standard user locations. If `uv python find 3.11` has no
+candidate, Desktop may run `uv python install 3.11` with the configured
+HTTP(S)/NO_PROXY environment. This contract does not download `uv` itself.
+
+Candidate stdout is not an authority. The selector canonicalizes and no-follow
+opens the absolute executable, checks regular-file ownership, mode, link count,
+size and version, hashes its bytes, and directly probes the Linux pidfd syscall
+ABI plus boot identity. Python-level `os.pidfd_open` and
+`signal.pidfd_send_signal` wrappers are not required because Core uses the same
+direct syscall fallback. The resulting private authority binds path, inode,
+metadata, digest, version, and a canonical opaque ID. Asset preparation and
+finalization, asset consumption, venv creation, wheel installation, and service
+bootstrap each reopen and revalidate that authority and execute the held FD;
+independent SSH processes never re-resolve PATH. Runtime errors separately name
+missing Python, uv provisioning/network failure, unsupported kernel syscalls,
+and invalid selection responses. This internal change does not alter frozen
+Desktop/Core OpenAPI or event contracts.
 
 Tunnel publication delegates to the authenticated Core tunnel verifier. The
 bridge HTTP transport opens a fresh anonymous socketpair plus `ssh -W` child for

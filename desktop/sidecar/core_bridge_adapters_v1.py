@@ -55,6 +55,7 @@ from openevo.deployment.core_assets import (
     StagedCoreBootstrapAssets,
 )
 from openevo.deployment.preflight import RemoteCommandResult
+from openevo.deployment.core_runtime import CorePythonRuntimeAuthority
 from openevo.deployment.ssh import SshTransportError, SshTransportErrorCode
 
 
@@ -80,11 +81,14 @@ class _CoreTunnelEndpoint(Protocol):
 
 
 class _CoreSshTransport(Protocol):
-    def require_core_supervisor_runtime(self, *, timeout_seconds: float) -> None: ...
+    def select_core_python_runtime(
+        self, *, timeout_seconds: float
+    ) -> CorePythonRuntimeAuthority: ...
 
     def stage_core_bootstrap_assets(
         self,
         *,
+        runtime: CorePythonRuntimeAuthority,
         wheel_path: str,
         wheel_sha256: str,
         wheel_size: int,
@@ -469,7 +473,7 @@ class DesktopCoreSshBridgeAdapterV1:
         )
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         try:
-            cast(_CoreSshTransport, transport).require_core_supervisor_runtime(
+            runtime = cast(_CoreSshTransport, transport).select_core_python_runtime(
                 timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS)
             )
         except SshTransportError as exc:
@@ -488,6 +492,7 @@ class DesktopCoreSshBridgeAdapterV1:
         bundle_id = _bootstrap_bundle_id(self._bootstrap)
         try:
             staged = cast(_CoreSshTransport, transport).stage_core_bootstrap_assets(
+                runtime=runtime,
                 wheel_path=self._bootstrap.wheel.local_path,
                 wheel_sha256=self._bootstrap.wheel.sha256,
                 wheel_size=self._bootstrap.wheel.byte_size,
@@ -512,6 +517,7 @@ class DesktopCoreSshBridgeAdapterV1:
         _verify_staged_assets(self._bootstrap, staged, bundle_id=bundle_id)
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         plan = build_core_control_bootstrap_plan(
+            runtime=runtime,
             wheel_path=staged.wheel_path,
             framework_lock=staged.framework_lock_path,
             service_root=staged.service_root,
@@ -705,7 +711,7 @@ class DesktopCoreSshBridgeAdapterV1:
             ("run", "run_secret")
             + (("open_core_tunnel",) if require_tunnel else ())
             + (("stage_core_bootstrap_assets",) if require_asset_stage else ())
-            + (("require_core_supervisor_runtime",) if require_runtime_preflight else ())
+            + (("select_core_python_runtime",) if require_runtime_preflight else ())
         )
         if any(not callable(getattr(transport, name, None)) for name in required):
             raise _adapter_error(
@@ -1028,19 +1034,43 @@ def _ssh_asset_error(exc: SshTransportError) -> DesktopCoreBridgeErrorV1:
 
 
 def _ssh_runtime_preflight_error(exc: SshTransportError) -> DesktopCoreBridgeErrorV1:
+    if exc.code is SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE:
+        return _adapter_error(
+            "core_python_runtime_unavailable",
+            "No executable Python 3.11 or newer is available on the remote server.",
+            status=409,
+            next_action=(
+                "Install uv in the standard user location or install Python 3.11 or newer, "
+                "then retry activation."
+            ),
+        )
+    if exc.code is SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED:
+        return _adapter_error(
+            "core_python_runtime_provision_failed",
+            "OpenEvo found uv but could not provision and verify remote Python 3.11.",
+            status=409,
+            retryable=True,
+            next_action=(
+                "Check the configured HTTP and HTTPS proxy or server network access, "
+                "then retry activation."
+            ),
+        )
+    if exc.code is SshTransportErrorCode.CORE_KERNEL_SYSCALL_UNSUPPORTED:
+        return _adapter_error(
+            "core_supervisor_kernel_unsupported",
+            "The remote Linux kernel does not provide the pidfd syscalls required by Core.",
+            status=409,
+            next_action="Use a Linux server whose kernel supports pidfd_open and pidfd_send_signal.",
+        )
     if exc.code is SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED:
         return _adapter_error(
             "core_supervisor_runtime_unsupported",
             (
-                "The remote Python does not satisfy Core's pidfd supervision "
-                "prerequisite, including os.pidfd_open and "
-                "signal.pidfd_send_signal."
+                "The remote host does not satisfy Core's Linux process identity "
+                "and supervision prerequisites."
             ),
             status=409,
-            next_action=(
-                "Use a remote Python with the required pidfd APIs or wait for "
-                "the separately reviewed Core compatibility layer."
-            ),
+            next_action="Use a supported Linux GPU server and retry activation.",
         )
     if exc.code is SshTransportErrorCode.TIMEOUT:
         return _adapter_error(

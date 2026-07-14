@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import hashlib
 import os
 import sys
 
@@ -19,6 +20,7 @@ from openevo.deployment.core_control import (
     parse_core_control_attachment,
 )
 from openevo.deployment.preflight import RemoteCommandResult
+from openevo.deployment.core_runtime import CorePythonRuntimeAuthority
 from openevo.deployment.ssh import SshTransportError, SshTransportErrorCode
 
 
@@ -39,6 +41,37 @@ def _attachment_json(**updates: object) -> str:
     }
     payload.update(updates)
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _runtime() -> CorePythonRuntimeAuthority:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "executable_path": "/home/user/.local/share/uv/python/python3.11",
+        "executable_sha256": "a" * 64,
+        "device": 1,
+        "inode": 2,
+        "uid": 1000,
+        "mode": 0o755,
+        "byte_size": 1024,
+        "mtime_ns": 3,
+        "ctime_ns": 4,
+        "version": [3, 11, 12],
+    }
+    canonical = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    authority_id = hashlib.sha256(b"openevo-core-python-runtime-v1\0" + canonical).hexdigest()
+    return CorePythonRuntimeAuthority(
+        authority_id=authority_id,
+        executable_path=str(values["executable_path"]),
+        executable_sha256=str(values["executable_sha256"]),
+        device=1,
+        inode=2,
+        uid=1000,
+        mode=0o755,
+        byte_size=1024,
+        mtime_ns=3,
+        ctime_ns=4,
+        version=(3, 11, 12),
+    )
 
 
 class FakeTunnel:
@@ -98,6 +131,7 @@ class FakeTransport:
 def test_core_bootstrap_uses_one_host_locked_command_and_secret_channel() -> None:
     compile(core_control._GENERATION_BOOTSTRAP, "<generation-bootstrap>", "exec")
     plan = build_core_control_bootstrap_plan(
+        runtime=_runtime(),
         wheel_path="/home/user/upload/openevo.whl",
         framework_lock="/home/user/upload/framework-lock.json",
         service_root="/home/user/.openevo/core",
@@ -144,6 +178,7 @@ def test_core_bootstrap_rejects_pathsep_and_non_closed_remote_paths() -> None:
     ):
         with pytest.raises(CoreControlBootstrapError) as exc_info:
             build_core_control_bootstrap_plan(
+                runtime=_runtime(),
                 wheel_path=path,
                 framework_lock="/home/user/upload/framework-lock.json",
                 service_root="/home/user/.openevo/core",
@@ -157,6 +192,7 @@ def test_core_bootstrap_preserves_ssh_timeout_as_retryable_deadline(
     secret_phase: bool,
 ) -> None:
     plan = build_core_control_bootstrap_plan(
+        runtime=_runtime(),
         wheel_path="/home/user/upload/openevo.whl",
         framework_lock="/home/user/upload/framework-lock.json",
         service_root="/home/user/.openevo/core",
@@ -183,6 +219,7 @@ def test_core_bootstrap_preserves_ssh_timeout_as_retryable_deadline(
 
 def test_bootstrap_does_not_expose_bearer_in_normal_command_result() -> None:
     plan = build_core_control_bootstrap_plan(
+        runtime=_runtime(),
         wheel_path="/home/user/upload/openevo.whl",
         framework_lock="/home/user/upload/framework-lock.json",
         service_root="/home/user/.openevo/core",
@@ -208,6 +245,7 @@ def test_core_bootstrap_parser_rejects_duplicate_oversized_and_bad_bearer() -> N
 
 def test_core_bootstrap_failure_does_not_expose_command_or_paths() -> None:
     plan = build_core_control_bootstrap_plan(
+        runtime=_runtime(),
         wheel_path="/secret/upload/openevo.whl",
         framework_lock="/secret/upload/framework-lock.json",
         service_root="/secret/home/.openevo/core",

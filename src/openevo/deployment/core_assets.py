@@ -7,12 +7,16 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import stat
 import tempfile
 from typing import Iterator
 
 from pydantic import SecretStr
+
+from openevo.deployment.core_runtime import (
+    CorePythonRuntimeAuthority,
+    build_verified_python_command,
+)
 
 
 MAX_CORE_WHEEL_BYTES = 512 * 1024 * 1024
@@ -167,9 +171,12 @@ def snapshot_core_bootstrap_assets(
         )
 
 
-def build_core_asset_prepare_command(bundle_id: str) -> str:
+def build_core_asset_prepare_command(
+    bundle_id: str,
+    runtime: CorePythonRuntimeAuthority,
+) -> str:
     _require_bundle_id(bundle_id)
-    return f"python3 -I -c {shlex.quote(_REMOTE_PREPARE_SCRIPT)} {shlex.quote(bundle_id)}"
+    return build_verified_python_command(runtime, _REMOTE_PREPARE_SCRIPT, bundle_id)
 
 
 def build_core_asset_rsync_path(
@@ -230,6 +237,7 @@ def parse_core_asset_prepare(
 
 def build_core_asset_finalize_command(
     *,
+    runtime: CorePythonRuntimeAuthority,
     service_root: str,
     bundle_id: str,
     transfer_id: str,
@@ -266,14 +274,12 @@ def build_core_asset_finalize_command(
         framework_lock_sha256,
         str(framework_lock_size),
     )
-    return " ".join(
-        ["python3", "-I", "-c", shlex.quote(_REMOTE_FINALIZE_SCRIPT)]
-        + [shlex.quote(value) for value in arguments]
-    )
+    return build_verified_python_command(runtime, _REMOTE_FINALIZE_SCRIPT, *arguments)
 
 
 def build_core_asset_discard_command(
     *,
+    runtime: CorePythonRuntimeAuthority,
     service_root: str,
     bundle_id: str,
     transfer_id: str,
@@ -282,16 +288,12 @@ def build_core_asset_discard_command(
     _require_bundle_id(bundle_id)
     if not isinstance(transfer_id, str) or _TRANSFER_ID.fullmatch(transfer_id) is None:
         raise ValueError("Core asset transfer identity is invalid")
-    return " ".join(
-        [
-            "python3",
-            "-I",
-            "-c",
-            shlex.quote(_REMOTE_DISCARD_SCRIPT),
-            shlex.quote(service_root),
-            shlex.quote(bundle_id),
-            shlex.quote(transfer_id),
-        ]
+    return build_verified_python_command(
+        runtime,
+        _REMOTE_DISCARD_SCRIPT,
+        service_root,
+        bundle_id,
+        transfer_id,
     )
 
 
@@ -370,6 +372,7 @@ def parse_staged_core_assets(
 def build_core_asset_consumer_command(
     command: str,
     assets: StagedCoreBootstrapAssets,
+    runtime: CorePythonRuntimeAuthority,
 ) -> str:
     if not isinstance(command, str) or not command or "\x00" in command:
         raise ValueError("Core asset consumer command is invalid")
@@ -392,10 +395,7 @@ def build_core_asset_consumer_command(
         str(assets.framework_lock_inode),
         command,
     )
-    return " ".join(
-        ["python3", "-I", "-c", shlex.quote(_REMOTE_CONSUME_SCRIPT)]
-        + [shlex.quote(value) for value in arguments]
-    )
+    return build_verified_python_command(runtime, _REMOTE_CONSUME_SCRIPT, *arguments)
 
 
 def _validate_asset_request(

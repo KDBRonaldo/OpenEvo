@@ -471,15 +471,26 @@ remote service or asset path is a configuration input.
 
 `DesktopCoreSshBridgeAdapterV1` accepts only the currently connected
 `DesktopRemoteLifecycle` transport for the requested profile. Before upload it
-runs a closed remote `python3 -I` supervisor preflight under the same total
-deadline. The selected interpreter must be Linux Python 3.11 or newer, expose
-callable `os.pidfd_open` and `signal.pidfd_send_signal`, provide the kernel boot
-identity, and pass a no-signal pidfd probe. Failure is the typed,
-non-retryable `core_supervisor_runtime_unsupported` blocker and occurs before
-asset staging or bootstrap. In particular, a uv-managed Python without those
-wrappers is not silently replaced with system Python, and this adapter does not
-claim automatic fresh-server success pending a separately reviewed Core syscall
-compatibility layer.
+runs a closed remote runtime selection under the same total deadline. It checks
+PATH Python 3.13 through 3.11, then an owner-safe `uv` from PATH or the standard
+user install locations. An existing `uv` may run `uv python install 3.11`; that
+download inherits the profile's `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
+settings. Desktop does not download `uv` itself in this contract.
+
+Every candidate is reduced to an absolute canonical path and checked as an
+owner/root-owned, non-writable, regular executable before an isolated version
+probe. Linux boot identity and the actual pidfd syscalls are probed directly, so
+uv standalone Python does not need `os.pidfd_open` or
+`signal.pidfd_send_signal` wrappers. Success returns a private content and inode
+authority. Every later asset, venv, install, and Core bootstrap command reopens
+that exact path without following symlinks, rechecks its metadata and SHA-256,
+and executes the held FD. A pathname replacement therefore fails closed across
+separate SSH processes instead of selecting another PATH interpreter.
+
+Runtime failures distinguish no supported Python, failed uv provisioning,
+unsupported kernel syscalls, and malformed/failed selection. The first two give
+actionable Python or network/proxy guidance; they no longer claim Python pidfd
+wrapper APIs are required.
 
 On a supported runtime, the same transport snapshots the sealed local files
 with component-wise no-follow checks, uploads them into an automatically derived

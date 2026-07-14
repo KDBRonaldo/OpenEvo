@@ -39,6 +39,7 @@ from openevo.deployment.core_assets import (
     snapshot_core_bootstrap_assets,
 )
 from openevo.deployment.preflight import RemoteCommandResult
+from openevo.deployment.core_runtime import CorePythonRuntimeAuthority
 from openevo.deployment.ssh import (
     SshTransportError,
     SshTransportErrorCode,
@@ -114,6 +115,37 @@ def _attachment_payload(*, bearer: str = BEARER, port: int = 43117) -> SecretStr
     )
 
 
+def _runtime() -> CorePythonRuntimeAuthority:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "executable_path": "/home/alice/.local/share/uv/python/python3.11",
+        "executable_sha256": "a" * 64,
+        "device": 1,
+        "inode": 10,
+        "uid": 1000,
+        "mode": 0o755,
+        "byte_size": 4096,
+        "mtime_ns": 11,
+        "ctime_ns": 12,
+        "version": [3, 11, 12],
+    }
+    canonical = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    authority_id = hashlib.sha256(b"openevo-core-python-runtime-v1\0" + canonical).hexdigest()
+    return CorePythonRuntimeAuthority(
+        authority_id=authority_id,
+        executable_path=str(values["executable_path"]),
+        executable_sha256=str(values["executable_sha256"]),
+        device=1,
+        inode=10,
+        uid=1000,
+        mode=0o755,
+        byte_size=4096,
+        mtime_ns=11,
+        ctime_ns=12,
+        version=(3, 11, 12),
+    )
+
+
 class FakeCoreTunnel:
     base_url = "http://openevo-core.local"
 
@@ -156,12 +188,13 @@ class FakeCoreTransport:
         self.after_stage: Callable[[], None] | None = None
         self.after_secret: Callable[[], None] | None = None
 
-    def require_core_supervisor_runtime(self, *, timeout_seconds: float) -> None:
+    def select_core_python_runtime(self, *, timeout_seconds: float) -> CorePythonRuntimeAuthority:
         self.runtime_preflight_timeouts.append(timeout_seconds)
         if self.runtime_preflight_error is not None:
             raise self.runtime_preflight_error
         if self.after_runtime_preflight is not None:
             self.after_runtime_preflight()
+        return _runtime()
 
     def stage_core_bootstrap_assets(self, **kwargs: object) -> StagedCoreBootstrapAssets:
         try:
@@ -283,7 +316,7 @@ def test_core_host_stages_sealed_assets_then_bootstraps_supported_host(
     assert len(transport.stage_calls) == 2
     assert len(transport.runtime_preflight_timeouts) == 2
     assert transport.stage_calls[0]["wheel_sha256"] == _bootstrap_config(tmp_path).wheel.sha256
-    assert "python3 -I -c" in transport.commands[0]
+    assert "/usr/bin/python3 -I -c" in transport.commands[0]
     assert "consume-attachment" in transport.secret_commands[0]
     assert BEARER not in " ".join(transport.commands + transport.secret_commands)
     assert all(0 < timeout <= 5 for timeout in transport.timeouts)
@@ -352,22 +385,48 @@ def test_core_host_rejects_local_asset_tamper_before_upload(tmp_path: Path) -> N
     assert str(tmp_path) not in str(tampered.value)
 
 
-def test_core_host_reports_unsupported_remote_pidfd_runtime_before_upload(
+@pytest.mark.parametrize(
+    ("transport_code", "desktop_code", "message_fragment", "retryable"),
+    [
+        (
+            SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE,
+            "core_python_runtime_unavailable",
+            "Python 3.11",
+            False,
+        ),
+        (
+            SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED,
+            "core_python_runtime_provision_failed",
+            "could not provision",
+            True,
+        ),
+        (
+            SshTransportErrorCode.CORE_KERNEL_SYSCALL_UNSUPPORTED,
+            "core_supervisor_kernel_unsupported",
+            "Linux kernel",
+            False,
+        ),
+    ],
+)
+def test_core_host_reports_typed_remote_runtime_failures_before_upload(
     tmp_path: Path,
+    transport_code: SshTransportErrorCode,
+    desktop_code: str,
+    message_fragment: str,
+    retryable: bool,
 ) -> None:
     adapter, _lifecycle, transport = _adapter(tmp_path)
-    transport.runtime_preflight_error = SshTransportError(
-        SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED
-    )
+    transport.runtime_preflight_error = SshTransportError(transport_code)
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as unsupported:
         adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
 
-    assert unsupported.value.error.code == "core_supervisor_runtime_unsupported"
+    assert unsupported.value.error.code == desktop_code
     assert unsupported.value.error.http_status == 409
-    assert unsupported.value.error.retryable is False
-    assert "pidfd_open" in unsupported.value.error.message
-    assert "pidfd_send_signal" in unsupported.value.error.message
+    assert unsupported.value.error.retryable is retryable
+    assert message_fragment in unsupported.value.error.message
+    assert "os.pidfd_open" not in unsupported.value.error.message
+    assert "signal.pidfd_send_signal" not in unsupported.value.error.message
     assert transport.stage_calls == []
     assert transport.commands == []
     assert str(tmp_path) not in str(unsupported.value)
