@@ -356,6 +356,35 @@ mapping commit failed, a same-A retry commits the finalized A mapping; a later
 Local B edit first commits that proven A generation, then issues one distinct
 A-to-B patch from A's latest ETag without another project create.
 
+`core_bridge_store_v1.py` is the production persistence implementation of that
+callback protocol. It owns a dedicated sidecar-private state directory rather
+than extending the public provider database. The directory must remain a real,
+owner-held mode-`0700` inode. Its database and owner-lock files are no-follow,
+link-count-one mode-`0600` regular files whose device/inode identities are pinned
+for the store lifetime. A nonblocking `flock` permits one process owner, a
+process-local reentrant lock serializes SQLite use, and an inherited post-fork
+instance fails closed without unlocking its parent owner.
+
+The store uses SQLite's rollback journal with `synchronous=FULL`, forbids WAL/SHM,
+caps the database at 1 GiB and journal at 2 GiB, and validates an exact v1 schema
+fingerprint and metadata row in every transaction. Startup performs SQLite and
+foreign-key integrity checks before decoding authority. Recovery is bounded to
+120,000 rows and 512 MiB of indexed/document bytes; each closed document is at
+most 4 MiB. SQL length probes and exact-length guarded reads run before a
+document BLOB enters Python. Mapping history is contiguous per project and
+bounded to 100,000 rows by default.
+
+Create, patch, mapping, abort, and finalize authority use explicit closed
+canonical JSON records with a per-row SHA-256 binding. Decode strictly rebuilds
+the Core DTOs and bridge dataclasses, reruns their invariants, and requires
+byte-identical reserialization. The store does not use pickle or accept generic
+environment, credential, secret, URI, command, or host-path fields. Create and
+patch transitions compare the complete previous canonical row. Mapping commit
+compares the complete create and prior mapping authority, appends the exact next
+history generation, and removes only the supplied matching `applied` patch in
+one transaction. Exact committed-state retries resolve a lost commit response;
+rollback retains the old mapping and pending patch.
+
 Host, tunnel, archive open/read/close, and persistence callbacks run through a
 fixed bounded executor. A deadline stops result delivery, while any callback
 still running remains owned by the cancelled generation. Successful close or
@@ -370,12 +399,14 @@ reachable nonterminal successor before the active head, and builds Core's
 maintenance, and event methods preserve the strict Core DTOs and project
 membership checks.
 
-This module is not yet wired into `DesktopReleaseProvider` or
-`DesktopProviderStore`. The store has no durable Core mapping/create/patch-operation
-schema, and the release app has no production host-service, tunnel-factory, or
-adopted-archive adapter. Consequently the provider routes above intentionally
-remain typed 503 and the release feature flags remain unchanged. Tests use
-fake adapters and `httpx.MockTransport`; those fakes are not a release provider.
+The bridge and `DesktopCoreBridgeStoreV1` are not yet wired into
+`DesktopReleaseProvider` or `DesktopProviderStore`. The release app still has no
+complete production composition of the host service, tunnel factory, adopted
+archive source, bridge, and dedicated bridge-state root. Consequently the
+provider routes above intentionally remain typed 503 and the release feature
+flags remain unchanged. Conformance tests inject the real durable store while
+the remaining adapters use `httpx.MockTransport`; that composition is not a
+release provider.
 
 ### Provider extension
 

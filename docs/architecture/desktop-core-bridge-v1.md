@@ -96,6 +96,38 @@ mapping; a durable adapter must retain the ordered audit history and reject lost
 updates. Every load recomputes the canonical request digest before Core
 transport.
 
+## Durable Store
+
+`desktop/sidecar/core_bridge_store_v1.py` implements
+`DesktopCoreBridgePersistence` in a dedicated private state root. It does not
+extend the public Local API resource schema. The root is a stable owner-held
+mode-`0700` directory; the SQLite database and process-owner lock are no-follow,
+link-count-one mode-`0600` files with pinned device/inode identities. A
+nonblocking cross-process `flock` and process-local reentrant transaction lock
+make one connection the only writer/reader owner. Forked children reject the
+inherited store and do not explicitly unlock the parent's lease.
+
+SQLite v1 uses DELETE journaling and `synchronous=FULL`; WAL and SHM are
+forbidden. The store enforces 1-GiB database and 2-GiB journal limits, exact
+schema rows plus a bound schema-fingerprint metadata row, SQLite integrity and
+foreign-key checks, and canonical authority-graph recovery. Recovery admits at
+most 120,000 rows and 512 MiB. Each document is capped at 4 MiB and is fetched
+only after SQL byte-length probes permit an exact-length guarded read. Mapping
+history is ordered and contiguous from generation one through the current row,
+with a default global cap of 100,000 versions.
+
+Persistence is explicit closed canonical JSON, never pickle. Every row stores a
+SHA-256 of its exact bytes. Decode validates exact object keys, strict Core DTOs,
+all bridge dataclass invariants, indexed scalar agreement, canonical request and
+outcome digests, and byte-identical reserialization. The serializer has no
+field for bearer secrets, credentials, environment, commands, URIs, or host
+paths. Full-row create/patch/mapping CAS rejects lost updates. Mapping history
+append, current mapping replacement, and exact matching applied-patch deletion
+share one transaction; rollback preserves the prior mapping and patch. An exact
+retry recognizes the fully committed state after an ambiguous commit without
+adding another history row, but fails if a later pending patch now owns the
+project transition.
+
 ## Session Ownership
 
 One `DesktopCoreBridgeV1` owns at most one candidate or active generation. A
@@ -198,10 +230,11 @@ remain the exact typed Core error; the bridge does not synthesize readiness.
 
 ## Release Wiring Status
 
-The bridge is tested with fake host/tunnel/archive/persistence adapters and a
-real strict client over `httpx.MockTransport`. `DesktopProviderStore` does not
-yet implement the persistence protocol, and `DesktopReleaseProvider` does not
-yet own production host/tunnel/archive adapters. No release feature flag is
-enabled by this module. Until those adapters and Local API operation wiring are
+The bridge is tested with `DesktopCoreBridgeStoreV1` across process restart,
+scratch/imported workspace activation, finalize recovery, and unknown abort
+replay. Host, tunnel, archive, and Core transport conformance still use fake
+adapters and `httpx.MockTransport`. `DesktopReleaseProvider` does not yet compose
+those production adapters or allocate the dedicated bridge-state root. No
+release feature flag is enabled by these modules. Until that Local API wiring is
 implemented and tested, the corresponding release provider routes continue to
 return typed HTTP 503.
