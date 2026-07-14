@@ -2,7 +2,7 @@
 
 Status: current execution backlog
 Canonical design: `docs/maintainer/productization/spec.md`
-Tracking issues: #131, #154
+Tracking issues: #131, #154, #163
 Base branch: `stable`
 
 ## How To Use This Plan
@@ -15,6 +15,28 @@ Implementation details are decided in the issue and PR that owns the affected
 module. When a decision changes a product boundary or release criterion, update
 the canonical spec. Otherwise update the relevant architecture doc, module
 README, test, or workflow instead of expanding this plan.
+
+## Exhibition Critical Path
+
+Issue #163 temporarily makes Desktop delivery the execution priority. The
+canonical release scope is unchanged, but work proceeds in this order:
+
+1. Freeze and conformance-test Desktop Local API v1 and Core Control API v1 as
+   defined in `docs/architecture/desktop-core-contract-v1.md`.
+2. Build the ordinary-scientist React workflow against a deterministic,
+   development-only contract simulator while the sidecar adapters are wired.
+3. Complete native session security, Keychain-backed credential slots, SSH
+   host verification, automatic bootstrap/doctor, and tunnel recovery.
+4. Exercise the copied app against real Core for a Codex subscription science
+   run, all three non-parametric artifact families, and next-session reuse.
+5. Build and rehearse the unsigned DMG on a clean macOS user and the exhibition
+   GPU server.
+
+Other backend workstreams pause unless they are required to satisfy the frozen
+Core Control API for that real Desktop flow. Contract simulators can unblock UI
+work but cannot satisfy release or exhibition evidence. No step may modify the
+protected evolution algorithms or replace the existing Polar-based execution,
+capture, dataset/job/worker, artifact, context, or runtime path.
 
 ## Working Rules
 

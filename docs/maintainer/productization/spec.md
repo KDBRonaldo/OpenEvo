@@ -445,6 +445,9 @@ release performance run can claim the cross-session contract.
 Desktop is a macOS application for scientists, not a developer dashboard or a
 passive wrapper around an unrelated web product.
 
+The normative renderer/sidecar/Core ownership, versioning, route, error, and
+simulator boundary is `docs/architecture/desktop-core-contract-v1.md`.
+
 The Tauri/Rust host owns native lifecycle, sidecar supervision, secure local
 state, Keychain integration, file pickers, and app-level recovery. React owns
 the user experience. The local sidecar forwards typed operations and manages
