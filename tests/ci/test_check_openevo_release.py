@@ -812,6 +812,15 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "run_parent_liveness_watchdog" in main
     assert "libc::WNOWAIT" in main
     assert "GroupSignalAuthority::Finalizing" in main
+    assert main.count("const DESKTOP_LOCAL_API_OPENAPI_SHA256") == 1
+    assert (
+        "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36"
+        in main
+    )
+    assert "fn macos_proc_listpgrppids_call(" in main
+    assert "fn sanitize_pyinstaller_launch_environment(" in main
+    assert 'command.env(PYINSTALLER_RESET_ENVIRONMENT, "1")' in main
+    assert "fn monitor_running_sidecar(" in main
     assert "launch_gate" not in main
     assert "emergency_process_group" not in main
     assert "fn terminate_process_group(" in main

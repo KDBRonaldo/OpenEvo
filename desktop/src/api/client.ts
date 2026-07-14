@@ -50,7 +50,19 @@ async function request<T>(
   if (resolved.sessionToken) {
     requestHeaders.set("X-OpenEvo-Desktop-Session", resolved.sessionToken);
   }
-  const response = await fetch(resolved.url, init);
+  let response: Response;
+  try {
+    response = await fetch(resolved.url, init);
+  } catch (error) {
+    if (
+      error instanceof TypeError &&
+      resolved.bootstrapPromise &&
+      sidecarStartPromise === resolved.bootstrapPromise
+    ) {
+      sidecarStartPromise = null;
+    }
+    throw error;
+  }
   if (!response.ok) {
     let detail: any;
     try {
@@ -76,14 +88,20 @@ async function request<T>(
 
 async function resolveRequest(
   path: string,
-): Promise<{ url: string; sessionToken?: string }> {
+): Promise<{
+  url: string;
+  sessionToken?: string;
+  bootstrapPromise?: Promise<DesktopBootstrapContextV1>;
+}> {
   if (!path.startsWith("/openevo-api/") || !isTauriRuntime()) {
     return { url: path };
   }
-  const context = await ensureTauriSidecar();
+  const bootstrapPromise = ensureTauriSidecar();
+  const context = await bootstrapPromise;
   return {
     url: `${new URL(context.endpoint).origin}${path}`,
     sessionToken: context.session_token,
+    bootstrapPromise,
   };
 }
 
@@ -94,13 +112,18 @@ function isTauriRuntime(): boolean {
   return Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 }
 
-async function ensureTauriSidecar(): Promise<DesktopBootstrapContextV1> {
+function ensureTauriSidecar(): Promise<DesktopBootstrapContextV1> {
   if (!sidecarStartPromise) {
-    sidecarStartPromise = invoke<DesktopBootstrapContextV1>("start_sidecar")
-      .catch((error) => {
-        sidecarStartPromise = null;
+    let trackedPromise: Promise<DesktopBootstrapContextV1>;
+    trackedPromise = invoke<DesktopBootstrapContextV1>("start_sidecar").catch(
+      (error) => {
+        if (sidecarStartPromise === trackedPromise) {
+          sidecarStartPromise = null;
+        }
         throw error;
-      });
+      },
+    );
+    sidecarStartPromise = trackedPromise;
   }
   return sidecarStartPromise;
 }

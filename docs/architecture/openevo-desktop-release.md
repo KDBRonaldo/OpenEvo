@@ -121,6 +121,15 @@ FD identity immediately before exec. Replacing any final pathname cannot alter
 the launched bytes. Typed failures contain a stable code and user-readable
 message without either host path.
 
+Every verified packaged launch also removes all inherited environment names with
+the PyInstaller-private `_PYI_` prefix and forces
+`PYINSTALLER_RESET_ENVIRONMENT=1`. This prevents an inherited extraction path,
+archive identity, parent level, splash endpoint, or future private bootloader
+field from selecting attacker-controlled state. Reset is a first-bootloader
+instruction: the bootloader consumes it while constructing the clean packaged
+environment, so ordinary subprocesses created by the running sidecar inherit the
+normal post-bootloader environment rather than another forced reset.
+
 The native host binds the loopback listener before spawn and transfers that
 already-bound socket on inherited FD 3, removing the release-and-rebind port
 window. Native code sends exactly one UTF-8 JSON frame of at most 512 bytes over
@@ -144,8 +153,9 @@ code reads the sidecar's actual `/version` response into a deny-unknown-fields
 model and requires Local API major 1, release provider `desktop_sidecar`, the
 frozen OpenAPI digest, and a unique subset of the closed feature-flag enum. The
 expected digest has one build-time source of truth,
-`DESKTOP_LOCAL_API_OPENAPI_SHA256`; the current value is an integration
-placeholder and the final Local contract update replaces that single constant.
+`DESKTOP_LOCAL_API_OPENAPI_SHA256`; it contains the final frozen Local API v1
+OpenAPI digest. Exact bootstrap and version tests consume that same native
+constant.
 Native readiness also requires `GET /openevo-api/desktop/shell` to return 404,
 so the old shell token route cannot remain in a release sidecar inventory.
 Contract, digest, provider, feature, or route mismatch triggers owned child-group
@@ -159,13 +169,20 @@ exactly `major`, `openapi_sha256`, `provider_kind`, and `feature_flags`.
 `host_status` and `stop_sidecar` return only `{state}`; they never expose a PID,
 port, URL, endpoint, command, or credential. Internal lifecycle snapshots retain
 the process data required for ownership but are not serializable renderer DTOs.
+The renderer caches this bootstrap context while requests can reach the endpoint.
+Only a network-level `fetch` rejection invalidates that exact cached promise; the
+next request invokes `start_sidecar` again for the current native endpoint and
+token. HTTP status failures, authentication failures, and response-contract
+parsing failures preserve the cache and cannot cause a blind restart loop.
 
 Release policy does not read `OPENEVO_DESKTOP_SIDECAR_COMMAND`,
 `OPENEVO_DESKTOP_SIDECAR_PROGRAM`,
 `OPENEVO_DESKTOP_SIDECAR_ARGS_JSON`,
 `OPENEVO_DESKTOP_SIDECAR_WORKDIR`, or
 `OPENEVO_DESKTOP_BACKEND_BASE_URL`, and removes those variables from the child
-environment before spawn. It has no `sh -c`, source-checkout Python, or
+environment before spawn. The `_PYI_*` removal and reset rule above is applied
+in addition to this fixed product override list. It has no `sh -c`,
+source-checkout Python, or
 direct-backend fallback. Debug builds retain a development launcher behind
 `cfg(debug_assertions)`: an optional program plus JSON string-array argv is
 passed directly to `Command` without shell parsing, and the local host and port
@@ -209,7 +226,10 @@ TERM/KILL to the group. Linux enumerates `/proc`; a visible PID's denied or
 malformed `stat` data fails closed, while only a real `NotFound` race is skipped.
 macOS treats both return values from `proc_listpgrppids` as PID counts. Only the
 buffer call receives byte capacity. A full buffer causes bounded growth and
-retry; impossible sizes, over-counts, or persistent truncation fail closed.
+retry. Native code clears `errno` immediately before every count and buffer call;
+a zero return is an empty result only when the captured `errno` remains zero.
+Zero with nonzero `errno`, impossible sizes, over-counts, or persistent
+truncation fail closed.
 Both platforms therefore retain ownership when the leader has exited but a
 descendant remains in the process group.
 Only after the leader has exited and the rest of the group is absent does cleanup
@@ -217,6 +237,17 @@ switch irreversibly to `Finalizing` and call `Child::try_wait`. A final reap
 error retains ownership for retry, but every retry in `Finalizing` is reap-only:
 it can never signal the old numeric PGID. This avoids stale-PGID signaling even
 when a reap operation has consumed the leader before reporting failure.
+
+Publication starts exactly one detached native monitor for the random instance
+identity stored in the manager slot. It uses `waitid(..., WNOWAIT)` to detect a
+post-readiness leader exit without surrendering the PID/PGID anchor. Under the
+same manager lock used by stop and restart, it terminates and waits for residual
+group members (including the parent-liveness watchdog), enters `Finalizing`,
+reaps the leader, closes the watchdog writer, and removes the matching slot.
+Cleanup failure retains the exact slot as `cleanup_pending` for monitor or
+explicit-stop retry. A monitor for an older random instance exits when it sees a
+replacement slot, so it cannot signal or reap a reused numeric PID/PGID; the
+shared manager lock also prevents stop and monitor from double-reaping.
 
 Every post-spawn failure therefore leaves the process either in the handoff or
 in the manager slot until bounded group cleanup succeeds. Pending and failed

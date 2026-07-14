@@ -72,6 +72,91 @@ describe("OpenEvo API client host routing", () => {
 
     expect(invoke).toHaveBeenCalledTimes(2);
   });
+
+  it("bootstraps a fresh endpoint after a network-level sidecar failure", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    const replacementToken = "t".repeat(32);
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(bootstrapContext(49152, SESSION_TOKEN))
+      .mockResolvedValueOnce(bootstrapContext(49153, replacementToken));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow(
+      "Failed to fetch",
+    );
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([
+      "http://127.0.0.1:49152/openevo-api/desktop/projects",
+      "http://127.0.0.1:49153/openevo-api/desktop/projects",
+    ]);
+    expect(
+      new Headers(fetchMock.mock.calls[1][1]?.headers).get(
+        "X-OpenEvo-Desktop-Session",
+      ),
+    ).toBe(replacementToken);
+  });
+
+  it("does not rebootstrap for auth, contract, or other HTTP errors", async () => {
+    window.__TAURI__ = {};
+    vi.mocked(invoke).mockResolvedValue(bootstrapContext(49152, SESSION_TOKEN));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ detail: "unauthorized" }, 401))
+      .mockResolvedValueOnce(jsonResponse({ code: "contract_mismatch" }, 409))
+      .mockResolvedValueOnce(jsonResponse({ detail: "unavailable" }, 503))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow(
+      "HTTP 401",
+    );
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow(
+      "HTTP 409",
+    );
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow(
+      "HTTP 503",
+    );
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not rebootstrap after a successful response fails contract parsing", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    vi.mocked(invoke).mockResolvedValue(bootstrapContext(49152, SESSION_TOKEN));
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response("{", {
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow();
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not rebootstrap after a non-network fetch cancellation", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    vi.mocked(invoke).mockResolvedValue(bootstrapContext(49152, SESSION_TOKEN));
+    vi.spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new DOMException("Aborted", "AbortError"))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toMatchObject(
+      { name: "AbortError" },
+    );
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
 });
 
 function bootstrapContext(port: number, sessionToken: string) {
@@ -81,15 +166,17 @@ function bootstrapContext(port: number, sessionToken: string) {
     session_token: sessionToken,
     negotiated_contract: {
       major: 1,
-      openapi_sha256: "a".repeat(64),
+      openapi_sha256:
+        "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36",
       provider_kind: "desktop_sidecar",
       feature_flags: ["remote_profiles"],
     },
   } as const;
 }
 
-function jsonResponse(payload: unknown): Response {
+function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
+    status,
     headers: { "Content-Type": "application/json" },
   });
 }

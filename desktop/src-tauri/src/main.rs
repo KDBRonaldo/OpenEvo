@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -28,9 +29,11 @@ const BUNDLED_SIDECAR_BINARY: &str = "openevo-desktop-sidecar";
 const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v1";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
-    "c9f2fa2cdcc2ff5cde40b9bbd007430ac0ccfdf6452844315d8e29d913f0b7a0";
+    "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_EXECUTABLE_FD_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_FD";
+const PYINSTALLER_PRIVATE_ENV_PREFIX: &[u8] = b"_PYI_";
+const PYINSTALLER_RESET_ENVIRONMENT: &str = "PYINSTALLER_RESET_ENVIRONMENT";
 const INHERITED_LISTENER_FD: libc::c_int = 3;
 const INHERITED_EXECUTABLE_FD: libc::c_int = 4;
 const INSTANCE_ID_BYTES: usize = 16;
@@ -44,6 +47,7 @@ const SIDECAR_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
 const SIDECAR_TERM_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const SIDECAR_MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const SIDECAR_EXIT_EMERGENCY_TERM_GRACE: Duration = Duration::from_millis(250);
 #[cfg(any(test, target_os = "macos"))]
@@ -548,6 +552,8 @@ struct ManagedSidecar {
     bootstrap: Option<SidecarBootstrapState>,
     lifecycle: ManagedLifecycle,
     startup_epoch: u64,
+    instance_id: [u8; INSTANCE_ID_BYTES],
+    monitor_started: bool,
     spawn_pending: bool,
     child: Option<Child>,
     process_group: i32,
@@ -605,7 +611,7 @@ impl ManagedSidecar {
     }
 }
 
-struct DesktopHostState {
+struct DesktopHostStateInner {
     sidecar: Mutex<Option<ManagedSidecar>>,
     spawn_handoff: Mutex<Option<Arc<SpawnHandoff>>>,
     parent_liveness: Mutex<Option<File>>,
@@ -615,9 +621,20 @@ struct DesktopHostState {
     shutdown_requested: AtomicBool,
 }
 
+#[derive(Clone)]
+struct DesktopHostState(Arc<DesktopHostStateInner>);
+
+impl Deref for DesktopHostState {
+    type Target = DesktopHostStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl Default for DesktopHostState {
     fn default() -> Self {
-        Self {
+        Self(Arc::new(DesktopHostStateInner {
             sidecar: Mutex::new(None),
             spawn_handoff: Mutex::new(None),
             parent_liveness: Mutex::new(None),
@@ -625,7 +642,7 @@ impl Default for DesktopHostState {
             cancellation_epoch: AtomicU64::new(0),
             launch_state: AtomicU64::new(encode_launch_state(0, LaunchPhase::Idle)),
             shutdown_requested: AtomicBool::new(false),
-        }
+        }))
     }
 }
 
@@ -895,6 +912,24 @@ where
     ))
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn macos_proc_listpgrppids_call(call: impl FnOnce() -> libc::c_int) -> std::io::Result<usize> {
+    unsafe {
+        set_current_errno(0);
+    }
+    let raw_count = call();
+    let error_number = unsafe { current_errno() };
+    if raw_count < 0 || (raw_count == 0 && error_number != 0) {
+        return Err(std::io::Error::from_raw_os_error(if error_number == 0 {
+            libc::EIO
+        } else {
+            error_number
+        }));
+    }
+    usize::try_from(raw_count)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid PID count"))
+}
+
 #[cfg(target_os = "macos")]
 fn group_has_members_except_leader(process_group: i32, leader: i32) -> std::io::Result<bool> {
     use std::ffi::c_void;
@@ -903,8 +938,9 @@ fn group_has_members_except_leader(process_group: i32, leader: i32) -> std::io::
     macos_group_has_members_except_leader_with(
         leader,
         || {
-            let count = unsafe { libc::proc_listpgrppids(process_group, ptr::null_mut(), 0) };
-            usize::try_from(count).map_err(|_| std::io::Error::last_os_error())
+            macos_proc_listpgrppids_call(|| unsafe {
+                libc::proc_listpgrppids(process_group, ptr::null_mut(), 0)
+            })
         },
         |pids| {
             let byte_capacity = pids
@@ -912,14 +948,13 @@ fn group_has_members_except_leader(process_group: i32, leader: i32) -> std::io::
                 .checked_mul(std::mem::size_of::<libc::pid_t>())
                 .and_then(|size| libc::c_int::try_from(size).ok())
                 .ok_or_else(|| std::io::Error::other("process group listing is too large"))?;
-            let count = unsafe {
+            macos_proc_listpgrppids_call(|| unsafe {
                 libc::proc_listpgrppids(
                     process_group,
                     pids.as_mut_ptr().cast::<c_void>(),
                     byte_capacity,
                 )
-            };
-            usize::try_from(count).map_err(|_| std::io::Error::last_os_error())
+            })
         },
     )
 }
@@ -1696,6 +1731,7 @@ fn command_from_launch_spec(
     }
     command.env_remove(NATIVE_EXECUTABLE_FD_ENV);
     if launch.verified_executable.is_some() {
+        sanitize_pyinstaller_launch_environment(&mut command);
         command.env(
             NATIVE_EXECUTABLE_FD_ENV,
             INHERITED_EXECUTABLE_FD.to_string(),
@@ -1753,6 +1789,15 @@ fn command_from_launch_spec(
     })
 }
 
+fn sanitize_pyinstaller_launch_environment(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.as_bytes().starts_with(PYINSTALLER_PRIVATE_ENV_PREFIX) {
+            command.env_remove(name);
+        }
+    }
+    command.env(PYINSTALLER_RESET_ENVIRONMENT, "1");
+}
+
 unsafe fn run_parent_liveness_watchdog(reader: RawFd, descriptor_limit: RawFd) -> ! {
     let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
     action.sa_sigaction = libc::SIG_IGN;
@@ -1798,9 +1843,23 @@ unsafe fn current_errno() -> libc::c_int {
     unsafe { *libc::__errno_location() }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+unsafe fn set_current_errno(value: libc::c_int) {
+    unsafe {
+        *libc::__errno_location() = value;
+    }
+}
+
 #[cfg(target_os = "macos")]
 unsafe fn current_errno() -> libc::c_int {
     unsafe { *libc::__error() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn set_current_errno(value: libc::c_int) {
+    unsafe {
+        *libc::__error() = value;
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2944,12 +3003,116 @@ fn host_status_inner_with<C: ProcessControl>(
     }
 }
 
+fn ensure_running_sidecar_monitor(
+    state: &DesktopHostState,
+    expected_context: &DesktopBootstrapContextV1,
+) -> HostResult<()> {
+    let instance_id = {
+        let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+        let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
+        if managed.lifecycle != ManagedLifecycle::Running || managed.child.is_none() {
+            return Err(sidecar_state_error());
+        }
+        let current_context = managed.bootstrap_context()?;
+        if current_context.endpoint != expected_context.endpoint
+            || current_context.session_token != expected_context.session_token
+        {
+            return Err(sidecar_state_error());
+        }
+        if managed.monitor_started {
+            return Ok(());
+        }
+        managed.monitor_started = true;
+        managed.instance_id
+    };
+    let monitor_state = state.clone();
+    if thread::Builder::new()
+        .name("openevo-sidecar-monitor".to_string())
+        .spawn(move || monitor_running_sidecar(monitor_state, instance_id))
+        .is_err()
+    {
+        let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+        if let Some(managed) = sidecar
+            .as_mut()
+            .filter(|managed| managed.instance_id == instance_id)
+        {
+            managed.monitor_started = false;
+            managed.mark_cleanup_pending();
+            abort_parent_liveness(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+            cleanup_managed_sidecar_with(&OsProcessControl, managed)?;
+            remove_cleaned_sidecar(state, &mut sidecar)?;
+        }
+        return Err(NativeHostError::new(
+            "sidecar_monitor_failed",
+            "OpenEvo Desktop could not monitor its local sidecar process.",
+        ));
+    }
+    Ok(())
+}
+
+fn monitor_running_sidecar(state: DesktopHostState, instance_id: [u8; INSTANCE_ID_BYTES]) {
+    loop {
+        let mut sidecar = match lock_sidecar_bounded(&state, SIDECAR_STATE_LOCK_TIMEOUT) {
+            Ok(sidecar) => sidecar,
+            Err(_) => {
+                thread::sleep(SIDECAR_MONITOR_POLL_INTERVAL);
+                continue;
+            }
+        };
+        let Some(managed) = sidecar.as_mut() else {
+            return;
+        };
+        if managed.instance_id != instance_id || !managed.monitor_started {
+            return;
+        }
+        let cleanup_required = match managed.lifecycle {
+            ManagedLifecycle::Starting => false,
+            ManagedLifecycle::CleanupPending => true,
+            ManagedLifecycle::Running => match managed
+                .child
+                .as_ref()
+                .ok_or_else(sidecar_state_error)
+                .and_then(|child| {
+                    OsProcessControl
+                        .leader_exited(child)
+                        .map_err(|_| sidecar_inspection_error())
+                }) {
+                Ok(false) => false,
+                Ok(true) => {
+                    managed.status.state = "exited".to_string();
+                    managed.status.url = None;
+                    true
+                }
+                Err(_) => {
+                    managed.mark_cleanup_pending();
+                    true
+                }
+            },
+        };
+        if cleanup_required && cleanup_managed_sidecar_with(&OsProcessControl, managed).is_ok() {
+            if remove_cleaned_sidecar(&state, &mut sidecar).is_ok() {
+                return;
+            }
+            if let Some(managed) = sidecar
+                .as_mut()
+                .filter(|managed| managed.instance_id == instance_id)
+            {
+                managed.mark_cleanup_pending();
+            }
+        }
+        drop(sidecar);
+        thread::sleep(SIDECAR_MONITOR_POLL_INTERVAL);
+    }
+}
+
 fn start_sidecar_inner(
     state: &DesktopHostState,
     policy: LaunchPolicy,
     bundled_path: Option<&Path>,
 ) -> HostResult<DesktopBootstrapContextV1> {
-    start_sidecar_inner_with(state, policy, bundled_path, &OsProcessControl)
+    let context = start_sidecar_inner_with(state, policy, bundled_path, &OsProcessControl)?;
+    ensure_running_sidecar_monitor(state, &context)?;
+    Ok(context)
 }
 
 fn start_sidecar_inner_with<C: ProcessControl>(
@@ -3009,6 +3172,8 @@ fn start_sidecar_inner_with<C: ProcessControl>(
         bootstrap: None,
         lifecycle: ManagedLifecycle::Starting,
         startup_epoch,
+        instance_id: credential.instance_id,
+        monitor_started: false,
         spawn_pending: true,
         child: None,
         process_group: 0,
@@ -3147,6 +3312,7 @@ mod tests {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     use std::collections::VecDeque;
+    use std::ffi::OsString;
     use std::fs::{self, hard_link, OpenOptions};
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3310,6 +3476,89 @@ mod tests {
     }
 
     #[test]
+    fn macos_proc_list_raw_result_clears_errno_and_rejects_zero_with_errno() {
+        unsafe {
+            set_current_errno(libc::EPERM);
+        }
+        let empty = macos_proc_listpgrppids_call(|| {
+            assert_eq!(unsafe { current_errno() }, 0);
+            0
+        })
+        .unwrap();
+        let error = macos_proc_listpgrppids_call(|| {
+            assert_eq!(unsafe { current_errno() }, 0);
+            unsafe {
+                set_current_errno(libc::EIO);
+            }
+            0
+        })
+        .unwrap_err();
+        let negative = macos_proc_listpgrppids_call(|| {
+            assert_eq!(unsafe { current_errno() }, 0);
+            -1
+        })
+        .unwrap_err();
+
+        assert_eq!(empty, 0);
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(negative.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn macos_proc_list_count_fill_and_growth_errors_all_fail_closed() {
+        let count_error = macos_group_has_members_except_leader_with(
+            4100,
+            || {
+                macos_proc_listpgrppids_call(|| {
+                    unsafe {
+                        set_current_errno(libc::EPERM);
+                    }
+                    0
+                })
+            },
+            |_| unreachable!("fill must not run after a count error"),
+        )
+        .unwrap_err();
+        let fill_error = macos_group_has_members_except_leader_with(
+            4100,
+            || Ok(1),
+            |_| {
+                macos_proc_listpgrppids_call(|| {
+                    unsafe {
+                        set_current_errno(libc::EACCES);
+                    }
+                    0
+                })
+            },
+        )
+        .unwrap_err();
+        let fill_calls = AtomicU64::new(0);
+        let growth_error = macos_group_has_members_except_leader_with(
+            4100,
+            || Ok(1),
+            |buffer| {
+                let call = fill_calls.fetch_add(1, Ordering::AcqRel);
+                macos_proc_listpgrppids_call(|| {
+                    if call == 0 {
+                        libc::c_int::try_from(buffer.len()).unwrap()
+                    } else {
+                        unsafe {
+                            set_current_errno(libc::EFAULT);
+                        }
+                        0
+                    }
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(count_error.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(fill_error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(growth_error.raw_os_error(), Some(libc::EFAULT));
+        assert_eq!(fill_calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
     fn linux_proc_inspection_fails_closed_on_permission_and_parse_errors() {
         let permission = inspect_linux_proc_stat(
             Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
@@ -3458,6 +3707,52 @@ mod tests {
         assert_eq!(fs::read_dir(&private_root).unwrap().count(), 0);
         drop(launch);
         assert!(!private_root.exists());
+    }
+
+    #[test]
+    fn verified_packaged_launch_rejects_poisoned_pyinstaller_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _environment = ScopedEnvironment::set(&[
+            (
+                "_PYI_APPLICATION_HOME_DIR",
+                "/tmp/attacker-controlled-extraction",
+            ),
+            ("_PYI_ARCHIVE_FILE", "/tmp/attacker-controlled-archive"),
+            ("_PYI_PARENT_PROCESS_LEVEL", "99"),
+            ("_PYI_SPLASH_IPC", "31337"),
+            ("_PYI_UNKNOWN_PRIVATE_STATE", "poisoned"),
+            (PYINSTALLER_RESET_ENVIRONMENT, "0"),
+        ]);
+        let fixture = SidecarFixture::from_existing(Path::new("/bin/sh"));
+        let (verified_executable, private_launch_dir) =
+            prepare_packaged_sidecar(fixture.path()).unwrap();
+        let allocated = allocate_sidecar_listener().unwrap();
+        let launch = SidecarLaunchSpec {
+            program: fd_execution_path(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "test -z \"${_PYI_APPLICATION_HOME_DIR+x}\" || exit 31; ",
+                    "test -z \"${_PYI_ARCHIVE_FILE+x}\" || exit 32; ",
+                    "test -z \"${_PYI_PARENT_PROCESS_LEVEL+x}\" || exit 33; ",
+                    "test -z \"${_PYI_SPLASH_IPC+x}\" || exit 34; ",
+                    "test -z \"${_PYI_UNKNOWN_PRIVATE_STATE+x}\" || exit 35; ",
+                    "test \"$PYINSTALLER_RESET_ENVIRONMENT\" = 1 || exit 36"
+                )
+                .to_string(),
+            ],
+            current_dir: None,
+            remove_env: &RELEASE_FORBIDDEN_SIDECAR_ENV,
+            private_launch_dir: Some(private_launch_dir),
+            verified_executable: Some(verified_executable),
+        };
+
+        let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
+        let mut child = prepared.spawn().unwrap();
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+
+        assert_eq!(status.code(), Some(0));
     }
 
     #[test]
@@ -4033,6 +4328,173 @@ mod tests {
         assert!(wait_for_pid_exit(descendant_pid, Duration::from_secs(1)));
     }
 
+    #[test]
+    fn ready_crash_monitor_removes_the_old_group_before_a_new_bootstrap() {
+        let fixture = SidecarFixture::directory();
+        let descendant_pid_path = fixture.path().join("monitored-descendant.pid");
+        let allocated = allocate_sidecar_listener().unwrap();
+        let old_port = allocated.port;
+        let launch = SidecarLaunchSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "sleep 30 & echo $! > '{}'; wait",
+                    descendant_pid_path.display()
+                ),
+            ],
+            current_dir: None,
+            remove_env: &[],
+            private_launch_dir: None,
+            verified_executable: None,
+        };
+        let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
+        let parent_liveness = prepared.take_parent_liveness_writer().unwrap();
+        let child = prepared.spawn().unwrap();
+        let process_group = child.id() as i32;
+        wait_for_file(&descendant_pid_path);
+        let descendant_pid = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let old_token = "11".repeat(SESSION_TOKEN_BYTES);
+        let state = DesktopHostState::default();
+        install_parent_liveness(&state, parent_liveness).unwrap();
+        *state.sidecar.lock().unwrap() = Some(ManagedSidecar {
+            status: LifecycleStatus {
+                state: "running".to_string(),
+                port: Some(old_port),
+                pid: Some(child.id()),
+                url: Some(format!("http://127.0.0.1:{old_port}/openevo")),
+            },
+            bootstrap: Some(SidecarBootstrapState {
+                session_credential: SessionCredential([0x11; SESSION_TOKEN_BYTES]),
+                negotiated_contract: test_bootstrap_state().negotiated_contract,
+            }),
+            lifecycle: ManagedLifecycle::Running,
+            startup_epoch: 0,
+            instance_id: [0x11; INSTANCE_ID_BYTES],
+            monitor_started: false,
+            spawn_pending: false,
+            child: Some(child),
+            process_group,
+            group_signal_authority: GroupSignalAuthority::Anchored,
+            _private_launch_dir: None,
+            verified_executable: None,
+            _listener: allocated.listener,
+        });
+        state.launch_state.store(
+            encode_launch_state(0, LaunchPhase::Published),
+            Ordering::Release,
+        );
+        let old_context = state
+            .sidecar
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .bootstrap_context()
+            .unwrap();
+        ensure_running_sidecar_monitor(&state, &old_context).unwrap();
+
+        assert_eq!(unsafe { libc::kill(process_group, libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if state.sidecar.lock().unwrap().is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ready-crash monitor did not release the old sidecar slot"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(!process_group_exists(process_group).unwrap());
+        assert!(wait_for_pid_exit(descendant_pid, Duration::from_secs(1)));
+        assert!(state.parent_liveness.lock().unwrap().is_none());
+        let (mut replacement, replacement_root, replacement_port) = managed_test_sidecar();
+        replacement.instance_id = [0x22; INSTANCE_ID_BYTES];
+        replacement.bootstrap = Some(SidecarBootstrapState {
+            session_credential: SessionCredential([0x22; SESSION_TOKEN_BYTES]),
+            negotiated_contract: test_bootstrap_state().negotiated_contract,
+        });
+        *state.sidecar.lock().unwrap() = Some(replacement);
+        state.launch_state.store(
+            encode_launch_state(0, LaunchPhase::Published),
+            Ordering::Release,
+        );
+
+        let replacement_context = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap();
+
+        assert_eq!(
+            replacement_context.endpoint,
+            format!("http://127.0.0.1:{replacement_port}")
+        );
+        assert_ne!(replacement_port, old_port);
+        assert_ne!(replacement_context.session_token, old_token);
+        stop_sidecar_inner(&state).unwrap();
+        assert!(!replacement_root.exists());
+    }
+
+    #[test]
+    fn stale_monitor_identity_cannot_touch_a_replacement_slot() {
+        let state = DesktopHostState::default();
+        let (mut replacement, private_root, listener_port) = managed_test_sidecar();
+        replacement.instance_id = [0x44; INSTANCE_ID_BYTES];
+        replacement.monitor_started = true;
+        let process_group = replacement.process_group;
+        *state.sidecar.lock().unwrap() = Some(replacement);
+        let stale_context = DesktopBootstrapContextV1 {
+            schema_version: "1",
+            endpoint: format!("http://127.0.0.1:{listener_port}"),
+            session_token: "33".repeat(SESSION_TOKEN_BYTES),
+            negotiated_contract: test_bootstrap_state().negotiated_contract,
+        };
+
+        let error = ensure_running_sidecar_monitor(&state, &stale_context).unwrap_err();
+        assert_eq!(error.code, "sidecar_state_unavailable");
+
+        monitor_running_sidecar(state.clone(), [0x33; INSTANCE_ID_BYTES]);
+
+        {
+            let sidecar = state.sidecar.lock().unwrap();
+            let replacement = sidecar.as_ref().unwrap();
+            assert_eq!(replacement.instance_id, [0x44; INSTANCE_ID_BYTES]);
+            assert_managed_resources(replacement, &private_root, listener_port);
+        }
+        assert!(process_group_exists(process_group).unwrap());
+        stop_sidecar_inner(&state).unwrap();
+    }
+
+    #[test]
+    fn ready_crash_monitor_and_explicit_stop_share_single_reap_ownership() {
+        let state = DesktopHostState::default();
+        let (mut managed, private_root, _) = managed_test_sidecar();
+        managed.instance_id = [0x55; INSTANCE_ID_BYTES];
+        let process_group = managed.process_group;
+        let context = managed.bootstrap_context().unwrap();
+        *state.sidecar.lock().unwrap() = Some(managed);
+        state.launch_state.store(
+            encode_launch_state(0, LaunchPhase::Published),
+            Ordering::Release,
+        );
+        ensure_running_sidecar_monitor(&state, &context).unwrap();
+        assert_eq!(unsafe { libc::kill(process_group, libc::SIGKILL) }, 0);
+        let stop_state = state.clone();
+
+        let stopped = thread::spawn(move || stop_sidecar_inner(&stop_state))
+            .join()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stopped.state, "stopped");
+        assert!(state.sidecar.lock().unwrap().is_none());
+        assert!(!process_group_exists(process_group).unwrap());
+        assert!(!private_root.exists());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_proc_listing_keeps_ownership_after_the_leader_exits() {
@@ -4212,6 +4674,8 @@ mod tests {
                 bootstrap: None,
                 lifecycle: ManagedLifecycle::Starting,
                 startup_epoch,
+                instance_id: [1; INSTANCE_ID_BYTES],
+                monitor_started: false,
                 spawn_pending: true,
                 child: None,
                 process_group: 0,
@@ -4417,6 +4881,8 @@ mod tests {
                 bootstrap: None,
                 lifecycle: ManagedLifecycle::Starting,
                 startup_epoch,
+                instance_id: [2; INSTANCE_ID_BYTES],
+                monitor_started: false,
                 spawn_pending: true,
                 child: None,
                 process_group: 0,
@@ -4466,6 +4932,8 @@ mod tests {
                 bootstrap: None,
                 lifecycle: ManagedLifecycle::Starting,
                 startup_epoch,
+                instance_id: [3; INSTANCE_ID_BYTES],
+                monitor_started: false,
                 spawn_pending: true,
                 child: None,
                 process_group: 0,
@@ -4660,6 +5128,8 @@ mod tests {
                 bootstrap: None,
                 lifecycle: ManagedLifecycle::Starting,
                 startup_epoch,
+                instance_id: [4; INSTANCE_ID_BYTES],
+                monitor_started: false,
                 spawn_pending: true,
                 child: None,
                 process_group: 0,
@@ -4760,6 +5230,8 @@ mod tests {
                     bootstrap: None,
                     lifecycle: ManagedLifecycle::Starting,
                     startup_epoch,
+                    instance_id: [5; INSTANCE_ID_BYTES],
+                    monitor_started: false,
                     spawn_pending: true,
                     child: None,
                     process_group: 0,
@@ -4859,6 +5331,8 @@ mod tests {
             bootstrap: None,
             lifecycle: ManagedLifecycle::Running,
             startup_epoch: 0,
+            instance_id: [6; INSTANCE_ID_BYTES],
+            monitor_started: false,
             spawn_pending: false,
             child: Some(child),
             process_group,
@@ -4944,6 +5418,18 @@ mod tests {
     #[test]
     #[ignore = "requires a freshly generated strict Local API PyInstaller externalBin"]
     fn packaged_external_bin_native_launch_smoke() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _environment = ScopedEnvironment::set(&[
+            (
+                "_PYI_APPLICATION_HOME_DIR",
+                "/tmp/attacker-controlled-extraction",
+            ),
+            ("_PYI_ARCHIVE_FILE", "/tmp/attacker-controlled-archive"),
+            ("_PYI_PARENT_PROCESS_LEVEL", "99"),
+            ("_PYI_SPLASH_IPC", "31337"),
+            ("_PYI_UNKNOWN_PRIVATE_STATE", "poisoned"),
+            (PYINSTALLER_RESET_ENVIRONMENT, "0"),
+        ]);
         let path = PathBuf::from(
             std::env::var_os("OPENEVO_PACKAGED_SIDECAR_PATH")
                 .expect("OPENEVO_PACKAGED_SIDECAR_PATH is required"),
@@ -5229,6 +5715,31 @@ mod tests {
         }
     }
 
+    struct ScopedEnvironment(Vec<(OsString, Option<OsString>)>);
+
+    impl ScopedEnvironment {
+        fn set(values: &[(&str, &str)]) -> Self {
+            let mut previous = Vec::with_capacity(values.len());
+            for (name, value) in values {
+                previous.push((OsString::from(name), std::env::var_os(name)));
+                std::env::set_var(name, value);
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for ScopedEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..).rev() {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+
     struct SidecarFixture {
         root: PathBuf,
         path: PathBuf,
@@ -5476,6 +5987,8 @@ mod tests {
                 bootstrap: Some(test_bootstrap_state()),
                 lifecycle: ManagedLifecycle::Running,
                 startup_epoch: 0,
+                instance_id: [7; INSTANCE_ID_BYTES],
+                monitor_started: false,
                 spawn_pending: false,
                 child: Some(child),
                 process_group,
