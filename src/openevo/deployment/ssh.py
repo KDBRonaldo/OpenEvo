@@ -1730,9 +1730,9 @@ class _RecoveredSubprocess:
         self.returncode: int | None = None
 
     def poll(self) -> int | None:
-        if self.returncode is not None:
-            return self.returncode
-        return self._waitpid(os.WNOHANG)
+        if self.returncode is None:
+            raise RuntimeError("owned subprocess liveness requires its non-reaping observer")
+        return self.returncode
 
     def wait(self, timeout: float | None = None) -> int:
         if self.returncode is not None:

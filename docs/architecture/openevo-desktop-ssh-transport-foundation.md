@@ -359,9 +359,10 @@ registry handoff and no portable waiter thread that can call `wait()` early.
 Process-group validation, `waitid`, Darwin `kqueue`, Linux
 `/proc/<pid>/stat` fallback setup, and capture all execute under that authority.
 Production tunnel readiness, exit monitoring, Core connection verification, and
-close use only this non-reaping observer. `_NonReapingPopen.poll()` rejects a
-live unreaped child, preventing an accidental `waitpid(WNOHANG)` from consuming
-the leader status before group cleanup.
+close use only this non-reaping observer. Both `_NonReapingPopen.poll()` and the
+birth-record-recovered wait handle reject a live unreaped child, preventing an
+accidental `waitpid(WNOHANG)` from consuming the leader status before group
+cleanup.
 If no non-reaping observer is available, closed capture pipes or the operation
 deadline initiate cleanup conservatively. Error and cancellation cleanup keeps
 the direct child unreaped while that PID fixes the group identity, sends

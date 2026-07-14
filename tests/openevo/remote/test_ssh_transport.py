@@ -3002,6 +3002,164 @@ def test_secret_popen_return_cancellation_publishes_one_recoverable_owner(
                 pass
 
 
+def test_recovered_poll_cannot_reap_short_leader_before_retryable_group_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    transport = _transport(tmp_path)
+    original_popen = ssh_module._OWNED_SUBPROCESS_POPEN
+    original_cleanup = ssh_module._terminate_and_reap_subprocess
+    original_confirm_disappeared = ssh_module._confirm_owned_process_group_disappeared
+    original_signal_group = ssh_module._signal_owned_process_group
+    orphan_ids = set(ssh_module._ORPHANED_SUBPROCESSES)
+    orphan_trust_ids = set(ssh_module._ORPHANED_TRUST_LEASES)
+    lease_paths: list[Path] = []
+    started: list[subprocess.Popen[bytes]] = []
+    child_path = tmp_path / "recovered-child.pid"
+    cleanup_blocked = True
+    defer_disappearance_once = True
+    signal_count = 0
+
+    leader_program = (
+        "import subprocess,sys;"
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)']);"
+        "open(sys.argv[1],'w',encoding='ascii').write(str(child.pid))"
+    )
+
+    def local_argv(_command: str, known_hosts_file: Path) -> list[str]:
+        lease_paths.append(known_hosts_file)
+        return [sys.executable, "-c", leader_program, str(child_path)]
+
+    def spawn_then_cancel(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = original_popen(*args, **kwargs)
+        started.append(process)
+        deadline = time.monotonic() + 3
+        while not child_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child_path.exists()
+        raise Cancelled
+
+    def controlled_cleanup(*args: object, **kwargs: object) -> None:
+        if cleanup_blocked:
+            raise OSError("initial cleanup deferred")
+        original_cleanup(*args, **kwargs)
+
+    def confirm_disappeared_once(*, process_group_id: int) -> None:
+        nonlocal defer_disappearance_once
+        if defer_disappearance_once:
+            defer_disappearance_once = False
+            raise OSError("disappearance proof deferred")
+        original_confirm_disappeared(process_group_id=process_group_id)
+
+    def record_signal_group(*args: object, **kwargs: object) -> None:
+        nonlocal signal_count
+        signal_count += 1
+        original_signal_group(*args, **kwargs)
+
+    monkeypatch.setattr(transport, "_ssh_argv", local_argv)
+    monkeypatch.setattr(ssh_module, "_MAX_OWNED_SUBPROCESSES", 1)
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", spawn_then_cancel)
+    monkeypatch.setattr(ssh_module, "_terminate_and_reap_subprocess", controlled_cleanup)
+
+    authority: ssh_module._OwnedSubprocessAuthority | None = None
+    child_id: int | None = None
+    try:
+        with pytest.raises(Cancelled):
+            transport.run_secret("private command")
+
+        new_authorities = tuple(
+            retained
+            for authority_id, retained in ssh_module._ORPHANED_SUBPROCESSES.items()
+            if authority_id not in orphan_ids
+        )
+        assert len(started) == 1
+        assert len(new_authorities) == 1
+        authority = new_authorities[0]
+        process = authority.process
+        assert isinstance(process, ssh_module._RecoveredSubprocess)
+        child_id = int(child_path.read_text(encoding="ascii"))
+
+        authority.initialize_observer()
+        deadline = time.monotonic() + 3
+        while not authority.leader_exited():
+            if time.monotonic() >= deadline:
+                pytest.fail("short-lived recovered leader did not exit")
+            time.sleep(0.01)
+
+        with pytest.raises(RuntimeError, match="non-reaping observer"):
+            process.poll()
+        assert process.returncode is None
+        os.kill(child_id, 0)
+        assert authority.released is False
+        assert len(lease_paths) == 1
+        assert lease_paths[0].exists()
+
+        cleanup_blocked = False
+        monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", original_popen)
+        monkeypatch.setattr(
+            ssh_module,
+            "_confirm_owned_process_group_disappeared",
+            confirm_disappeared_once,
+        )
+        monkeypatch.setattr(ssh_module, "_signal_owned_process_group", record_signal_group)
+
+        with pytest.raises(OSError, match="disappearance proof deferred"):
+            authority.cleanup()
+
+        assert process.returncode is not None
+        assert signal_count >= 2
+        signals_before_retry = signal_count
+        assert authority.released is False
+        assert lease_paths[0].exists()
+
+        authority.cleanup()
+        authority.cleanup()
+
+        _assert_processes_gone(child_id)
+        assert signal_count == signals_before_retry
+        assert authority.released is True
+        assert authority._slot_held is False
+        assert set(ssh_module._ORPHANED_SUBPROCESSES) == orphan_ids
+        assert set(ssh_module._ORPHANED_TRUST_LEASES) == orphan_trust_ids
+        assert not lease_paths[0].exists()
+    finally:
+        cleanup_blocked = False
+        monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", original_popen)
+        monkeypatch.setattr(ssh_module, "_terminate_and_reap_subprocess", original_cleanup)
+        monkeypatch.setattr(
+            ssh_module,
+            "_confirm_owned_process_group_disappeared",
+            original_confirm_disappeared,
+        )
+        monkeypatch.setattr(ssh_module, "_signal_owned_process_group", original_signal_group)
+        if authority is not None and not authority.released:
+            try:
+                authority.cleanup()
+            except BaseException:
+                pass
+        if child_id is not None:
+            try:
+                os.kill(child_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for process in started:
+            if process.returncode is not None:
+                continue
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=3)
+            except ChildProcessError:
+                pass
+
+
 def test_secret_runner_retains_lease_until_group_termination_is_observed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
