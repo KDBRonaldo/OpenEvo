@@ -1,20 +1,38 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { DesktopApiClientV1, FetchLike } from "../api/v1/client";
 import { createDesktopApiClient, DesktopContractError } from "../api/v1/client";
-import { projectSourceV1Schema, type DesktopBootstrapContextV1, type ProjectSourceV1 } from "../api/v1/schemas";
+import {
+  projectSourceV1Schema,
+  remoteProfileV1Schema,
+  type DesktopBootstrapContextV1,
+  type ProjectSourceV1,
+  type RemoteProfileV1,
+} from "../api/v1/schemas";
+import { createLocalApiDesktopProductProvider } from "./localApiProvider";
 import type { DesktopProductProvider, ProjectSourceSelectionIntent } from "./provider";
-import { DesktopProductProviderUnavailableError } from "./provider";
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 
 export interface ReleaseNativeBridge {
   bootstrap(): Promise<unknown>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
+  configureCredential(
+    profileId: string,
+    slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
+    etag: string,
+    actionId: string,
+  ): Promise<unknown>;
 }
 
 export interface ReleaseProviderAdapterContext {
   readonly client: DesktopApiClientV1;
   readonly native: {
     selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
+    configureCredential(
+      profileId: string,
+      slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
+      etag: string,
+      actionId: string,
+    ): Promise<RemoteProfileV1>;
   };
 }
 
@@ -27,6 +45,12 @@ export interface ReleaseProviderFactoryDependencies {
 const tauriNativeBridge: ReleaseNativeBridge = {
   bootstrap: () => invoke<DesktopBootstrapContextV1>("start_sidecar"),
   selectProjectSource: (intent) => invoke("select_project_source", { kind: intent.kind, actionId: intent.actionId }),
+  configureCredential: (profileId, slotKind, etag, actionId) => invoke("configure_credential", {
+    profileId,
+    slotKind,
+    etag,
+    actionId,
+  }),
 };
 
 export async function createReleaseDesktopProductProvider(
@@ -48,16 +72,18 @@ export async function createReleaseDesktopProductProvider(
   if (missingFeatures.length > 0) {
     throw new DesktopContractError("Desktop Local API is missing required release features");
   }
-  if (!dependencies.adapterFactory) {
-    throw new DesktopProductProviderUnavailableError();
-  }
-
-  const provider = await dependencies.adapterFactory({
+  const context: ReleaseProviderAdapterContext = {
     client,
     native: {
       selectProjectSource: async (intent) => projectSourceV1Schema.parse(await native.selectProjectSource(intent)),
+      configureCredential: async (profileId, slotKind, etag, actionId) => remoteProfileV1Schema.parse(
+        await native.configureCredential(profileId, slotKind, etag, actionId),
+      ),
     },
-  });
+  };
+  const provider = dependencies.adapterFactory
+    ? await dependencies.adapterFactory(context)
+    : createLocalApiDesktopProductProvider({ client, native: context.native, fetch: dependencies.fetch });
   if (provider.providerKind !== "desktop_sidecar") {
     throw new DesktopContractError("Release provider adapter reported a forbidden provider kind");
   }

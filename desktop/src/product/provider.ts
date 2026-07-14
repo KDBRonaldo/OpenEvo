@@ -7,6 +7,7 @@ import type {
   DiagnosticReportV1,
   HostKeyAcceptV1,
   LocalOperationV1,
+  OperationV1,
   ProfileCreateV1,
   ProfilePatchV1,
   ProjectCapabilitiesV1,
@@ -147,7 +148,7 @@ export interface DesktopProductProvider {
   getArtifactContent(artifactId: string): Promise<ArtifactContentV1>;
   getArtifactDiff(artifactId: string): Promise<ArtifactDiffV1>;
   repairProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
-  restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
+  restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<OperationV1>;
 }
 
 export class DesktopProductProviderUnavailableError extends Error {

@@ -11,11 +11,38 @@ It accepts a provider only after the Tauri bootstrap and `DesktopApiClientV1`
 agree on contract major, checked-in OpenAPI digest, provider kind, and required
 features. The contract simulator is test-only and is not a release fallback.
 
-The current native host does not yet return `DesktopBootstrapContextV1`, and no
-release adapter implements the converged high-level run or native source
-selection operations. Release startup therefore remains fail closed. Native
-folder selection must eventually return only `ProjectSourceV1` with an opaque
-`ContentRef`; renderer file inputs and raw filesystem strings are not accepted.
+`LocalApiDesktopProductProvider` is the release adapter. It aggregates all
+bounded cursor pages, reloads exact run details, and marks artifacts complete
+only when every run artifact page succeeds. Capabilities and validation are
+read only for the authoritative active project over its ready tunnel. Native
+folder and credential operations remain native-host calls whose results are
+strictly parsed as `ProjectSourceV1` and `RemoteProfileV1`; renderer file inputs,
+raw paths, and secret values are not accepted.
+
+The remaining bootstrap-retry integration point is `App.tsx`. It currently
+replaces a failed `createReleaseDesktopProductProvider` call with the unavailable
+provider. A later startup-state change must expose an explicit retry that calls
+the release factory again, obtaining a fresh `start_sidecar` bootstrap context;
+it must not retain or retry with a failed session token.
+
+The Local API release digest is
+`3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36`.
+The checked-in TypeScript mirror and contract fixtures use that frozen digest.
+The existing product UI and simulator fixture still require a separate consumer
+migration before the complete product UI suite can be treated as a release gate.
+
+## Provider behavior
+
+Refreshes have fixed page, resource, and concurrency budgets. Cursor cycles,
+inconsistent `has_more`, identity mismatches, and contract/authentication errors
+fail closed. A 503 or transport failure while reading active-project capability
+authority maps to `unavailable`; it never selects a local method table.
+
+Mutations pass renderer action IDs unchanged as idempotency keys and observed
+ETags unchanged as `If-Match`. Unknown network outcomes are not replayed. SSE
+uses one authenticated `ReadableStream`, bounded frames and reconnect attempts,
+monotonic sequence checks, duplicate suppression, gap-triggered reload, cursor
+reset on HTTP 410, and `AbortController` cancellation on final unsubscribe.
 
 ## Renderer recovery and authority
 

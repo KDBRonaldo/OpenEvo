@@ -3,7 +3,7 @@ import { defineDesktopProductReleaseContract } from "./provider";
 // Updated only with the reviewed, checked-in Desktop Local API snapshot.
 export const DESKTOP_PRODUCT_RELEASE_CONTRACT = defineDesktopProductReleaseContract({
   acceptedOpenApiDigests: [
-    "5a571f32c547063677533be9b4ccae417e2037b11963b5770d245f6c5419830e",
+    "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36",
   ],
   allowedProviderKinds: ["desktop_sidecar"],
   requiredFeatureFlags: [
