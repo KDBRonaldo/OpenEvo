@@ -325,25 +325,30 @@ known trust paths are redacted from returned remote-command stderr as defense in
 depth. Synchronous SSH and rsync subprocesses incrementally drain both streams
 under one 4 MiB aggregate byte cap. A timeout or cap overflow terminates and
 reaps the process before the existing typed error translation runs. Every such
-subprocess first reserves one of 32 ownership slots, then starts a new session
-whose leader PID is the process-group ID. The slot enters an ownership envelope
-immediately after `Popen`; process-group validation, `waitid`, Darwin `kqueue`,
-Linux `/proc/<pid>/stat` fallback setup, and capture all execute inside that
-envelope. There is no portable waiter thread that can call `wait()` early. If no
-non-reaping observer is available, closed capture pipes or the operation
+subprocess first creates one authority, inserts it in the 32-entry ownership
+registry, and transfers the entered known-host lease to it. Only that
+pre-published owner may call `Popen`. The child starts a new session, writes its
+PID, PGID, and SID to an anonymous owner-held birth-record FD, fsyncs it, and
+then execs the requested SSH or rsync argv. If `Popen` succeeds but its Python
+return is interrupted, the already registered authority reconstructs a
+non-reaping wait handle from the birth record; if birth cannot yet be proved, it
+retains the same bounded slot and lease fail closed. There is no semaphore to
+registry handoff and no portable waiter thread that can call `wait()` early.
+Process-group validation, `waitid`, Darwin `kqueue`, Linux
+`/proc/<pid>/stat` fallback setup, and capture all execute under that authority.
+If no non-reaping observer is available, closed capture pipes or the operation
 deadline initiate cleanup conservatively. Error and cancellation cleanup keeps
 the direct child unreaped while that PID fixes the group identity, sends
 `SIGTERM`, and then escalates to `SIGKILL`. Successful signals do not mark group
 cleanup confirmed. A bounded observer enumerates process state through Linux
 `/proc` or portable `ps`, requires the pinned leader to remain observable, and
 requires every member of that PGID to be dead or a zombie. Only then may the
-owner wait/reap the direct child, remove the registry entry, release the
-subprocess slot, and close the known-host lease. Any group signal, observation,
-reap, or lease cleanup failure retains the complete authority in the bounded
-process-local registry. Later command, tunnel, close, or recovery calls retry up
-to four retained entries synchronously. Full ownership capacity rejects a new
-command before `Popen`, so it cannot create an unrecorded process. All waits
-remain bounded.
+owner wait/reap the direct child, close its birth-record FD, remove the registry
+entry, release capacity, and close the known-host lease. Any group signal,
+observation, reap, record removal, or lease cleanup failure retains the complete
+authority. Later command, tunnel, close, or recovery calls retry up to four retained
+entries synchronously. Full ownership capacity rejects a new command before
+`Popen`, so it cannot create an unrecorded process. All waits remain bounded.
 
 Capture polls the unreaped leader at a bounded interval through `waitid`,
 `kqueue`, or Linux proc status instead of reaping it. Once the leader exits,
@@ -399,16 +404,20 @@ a unique owner-only `incoming-<bundle>-<transfer>` directory. Prepare, discard,
 and finalize validate that closed authority under the same publication lock;
 concurrent or exact retries never reuse an incoming pathname or inode. Staging
 admits at most 16 live incoming attempts and scans at most 32 staging entries.
-The transport independently reserves one of 16 local cleanup-authority slots
-before remote prepare. Full authority capacity fails before another incoming
-directory can be created; repeated malformed finalize receipts therefore retain
-recoverable exact authority but cannot grow local or remote work without bound.
-The transport retains every prepared exact transfer until publication or
-confirmed discard. Upload failure uses a separate bounded 10-second cleanup
-deadline instead of an exhausted staging deadline; failed cleanup remains
-retryable and runs before the next staging prepare. Once finalize starts, a
-timeout, authenticated failure, cancellation, or malformed receipt is an
-unknown outcome. Cleanup first repeats the exact idempotent finalize transaction
+The transport independently publishes one of 16 local ownership tokens before
+remote prepare. That same token remains the sole capacity owner while its state
+moves from pending receipt to exact prepared authority, active upload, finalize
+reconciliation, and publication or confirmed discard. There is no
+pending-to-cleanup slot transfer: an interruption immediately before or after
+the first authority update leaves the token inactive with the exact transfer
+identity, so the next same-process retry reclaims it. Full ownership capacity
+fails before another incoming directory can be created; repeated malformed
+finalize receipts therefore retain recoverable exact authority but cannot grow
+local or remote work without bound. Upload failure uses a separate bounded
+10-second cleanup deadline instead of an exhausted staging deadline; failed
+cleanup remains retryable and runs before the next staging prepare. Once
+finalize starts, a timeout, authenticated failure, cancellation, or malformed
+receipt is an unknown outcome. Cleanup first repeats the exact idempotent finalize transaction
 and validates its receipt. It discards only after that reconciliation completes
 with a definite non-publication result, so cleanup cannot remove an exact bundle
 that was published before the first response was lost. The upload-to-finalize

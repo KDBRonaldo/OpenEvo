@@ -1517,6 +1517,90 @@ def test_malformed_finalize_receipts_hit_cleanup_authority_backpressure(
 
 @pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("handoff_timing", ["before_update", "after_update"])
+def test_prepare_authority_handoff_interruptions_remain_bounded_and_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+    handoff_timing: str,
+) -> None:
+    assets = _assets(tmp_path)
+    runner = RecordingRunner()
+    transport = _transport(tmp_path, runner)
+    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID)
+    original_remember = transport._remember_core_asset_transfer
+    prepare_calls = 0
+    interrupted_handoffs = 0
+
+    def remote_response(
+        command: str,
+        *,
+        timeout_seconds: float,
+        remote_failure_code: SshTransportErrorCode,
+    ) -> SecretStr:
+        nonlocal prepare_calls
+        del timeout_seconds, remote_failure_code
+        if command == prepare_command:
+            prepare_calls += 1
+            return _stage_responses(
+                assets[1],
+                assets[3],
+                transfer_id=f"{prepare_calls:032x}",
+            )[0]
+        if shlex.quote(core_assets._REMOTE_DISCARD_SCRIPT) in command:
+            return SecretStr("")
+        if shlex.quote(core_assets._REMOTE_FINALIZE_SCRIPT) in command:
+            return _stage_responses(assets[1], assets[3])[1]
+        raise AssertionError("unexpected core asset command")
+
+    def interrupt_prepare_handoff(
+        authority: ssh_module._CoreAssetTransferAuthority,
+        *,
+        active: bool = False,
+        consume_admission: bool = False,
+    ) -> None:
+        nonlocal interrupted_handoffs
+        if not authority.finalize_started and consume_admission and interrupted_handoffs < 16:
+            if handoff_timing == "after_update":
+                original_remember(
+                    authority,
+                    active=active,
+                    consume_admission=consume_admission,
+                )
+            interrupted_handoffs += 1
+            raise interruption
+        original_remember(
+            authority,
+            active=active,
+            consume_admission=consume_admission,
+        )
+
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", remote_response)
+    monkeypatch.setattr(
+        transport,
+        "_remember_core_asset_transfer",
+        interrupt_prepare_handoff,
+    )
+
+    for _index in range(16):
+        with pytest.raises(interruption):
+            _stage(transport, assets)
+        assert transport._core_asset_active_transfers == set()
+        assert len(transport._core_asset_cleanup_authorities) <= 1
+        assert transport._core_asset_pending_admissions == 0
+
+    staged = _stage(transport, assets)
+
+    assert staged.bundle_inode == 12
+    assert interrupted_handoffs == 16
+    assert prepare_calls == 17
+    assert len(runner.calls) == 1
+    assert transport._core_asset_active_transfers == set()
+    assert transport._core_asset_cleanup_authorities == {}
+    assert transport._core_asset_pending_admissions == 0
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("handoff_timing", ["before_update", "after_update"])
 def test_finalize_authority_handoff_interruptions_remain_bounded_and_retryable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

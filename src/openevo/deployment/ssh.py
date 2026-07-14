@@ -13,6 +13,8 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -20,7 +22,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import NoReturn, Protocol
+from typing import BinaryIO, NoReturn, Protocol
 
 from pydantic import SecretStr
 
@@ -59,7 +61,6 @@ _SUBPROCESS_CAPTURE_CHUNK_BYTES = 64 * 1024
 _SUBPROCESS_TERMINATE_GRACE_SECONDS = 1.0
 _SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS = 0.1
 _SUBPROCESS_STATUS_INTERVAL_SECONDS = 0.05
-_SUBPROCESS_OWNERSHIP_ACQUIRE_SECONDS = 0.1
 _PROCESS_GROUP_OBSERVER_TIMEOUT_SECONDS = 0.5
 _MAX_PROCESS_GROUP_SCAN_ENTRIES = 131_072
 _MAX_PROCESS_GROUP_STATUS_BYTES = 4 * 1024 * 1024
@@ -73,7 +74,26 @@ _ORPHANED_CORE_TUNNELS: dict[int, "_CoreTunnelEndpoint"] = {}
 _ORPHANED_TRUST_LEASES: dict[int, AbstractContextManager[Path]] = {}
 _ORPHANED_SUBPROCESS_GUARD = threading.Lock()
 _ORPHANED_SUBPROCESSES: dict[int, "_OwnedSubprocessAuthority"] = {}
-_SUBPROCESS_OWNERSHIP_SLOTS = threading.BoundedSemaphore(_MAX_OWNED_SUBPROCESSES)
+
+_SUBPROCESS_BIRTH_LAUNCHER = """
+import os
+import sys
+
+birth_fd = int(sys.argv[1])
+argv = sys.argv[2:]
+try:
+    os.fchmod(birth_fd, 0o600)
+    os.ftruncate(birth_fd, 0)
+    os.lseek(birth_fd, 0, os.SEEK_SET)
+    payload = f"{os.getpid()} {os.getpgrp()} {os.getsid(0)}\\n".encode("ascii")
+    offset = 0
+    while offset < len(payload):
+        offset += os.write(birth_fd, payload[offset:])
+    os.fsync(birth_fd)
+finally:
+    os.close(birth_fd)
+os.execvp(argv[0], argv)
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +124,14 @@ class _CoreAssetTransferAuthority:
             framework_lock_size=self.framework_lock_size,
             finalize_started=True,
         )
+
+
+class _CoreAssetTransferAdmission:
+    __slots__ = ("active", "authority")
+
+    def __init__(self) -> None:
+        self.active = False
+        self.authority: _CoreAssetTransferAuthority | None = None
 
 
 class SshTransportErrorCode(str, Enum):
@@ -149,6 +177,17 @@ class TunnelProcess(Protocol):
     def terminate(self) -> None: ...
 
     def kill(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+
+class _OwnedSubprocessProcess(Protocol):
+    pid: int
+    returncode: int | None
+    stdout: BinaryIO | None
+    stderr: BinaryIO | None
+
+    def poll(self) -> int | None: ...
 
     def wait(self, timeout: float | None = None) -> int: ...
 
@@ -662,11 +701,7 @@ class SshRemoteExecutorTransport:
         )
         self._core_asset_authority_lock = threading.Lock()
         self._core_asset_authorities: dict[str, StagedCoreBootstrapAssets] = {}
-        self._core_asset_cleanup_authorities: dict[
-            tuple[str, str, str], _CoreAssetTransferAuthority
-        ] = {}
-        self._core_asset_active_transfers: set[tuple[str, str, str]] = set()
-        self._core_asset_pending_admissions = 0
+        self._core_asset_transfer_ownerships: set[_CoreAssetTransferAdmission] = set()
 
     def _run_trusted_subprocess(
         self,
@@ -848,8 +883,9 @@ class SshRemoteExecutorTransport:
                 self._retry_core_asset_transfer_cleanup(
                     deadline=time.monotonic() + _CORE_ASSET_CLEANUP_SECONDS
                 )
-                self._admit_core_asset_transfer()
+                admission = _CoreAssetTransferAdmission()
                 try:
+                    self._admit_core_asset_transfer(admission)
                     prepare_payload = self._run_secret_with_remote_failure(
                         prepare_command,
                         timeout_seconds=_stage_remaining(deadline),
@@ -860,23 +896,40 @@ class SshRemoteExecutorTransport:
                         bundle_id=bundle_id,
                     )
                 except BaseException:
-                    self._release_core_asset_admission()
+                    self._release_core_asset_admission(admission)
                     raise
-                authority = _CoreAssetTransferAuthority(
-                    service_root=service_root,
-                    bundle_id=bundle_id,
-                    transfer_id=transfer_id,
-                    wheel_filename=snapshot.wheel_filename,
-                    wheel_sha256=wheel_sha256,
-                    wheel_size=wheel_size,
-                    framework_lock_sha256=framework_lock_sha256,
-                    framework_lock_size=framework_lock_size,
-                )
-                self._remember_core_asset_transfer(
-                    authority,
-                    active=True,
-                    consume_admission=True,
-                )
+                authority: _CoreAssetTransferAuthority | None = None
+                try:
+                    authority = _CoreAssetTransferAuthority(
+                        service_root=service_root,
+                        bundle_id=bundle_id,
+                        transfer_id=transfer_id,
+                        wheel_filename=snapshot.wheel_filename,
+                        wheel_sha256=wheel_sha256,
+                        wheel_size=wheel_size,
+                        framework_lock_sha256=framework_lock_sha256,
+                        framework_lock_size=framework_lock_size,
+                    )
+                    self._bind_core_asset_admission(admission, authority)
+                    self._remember_core_asset_transfer(
+                        authority,
+                        active=True,
+                        consume_admission=True,
+                    )
+                except BaseException:
+                    if authority is None:
+                        authority = _CoreAssetTransferAuthority(
+                            service_root=service_root,
+                            bundle_id=bundle_id,
+                            transfer_id=transfer_id,
+                            wheel_filename=snapshot.wheel_filename,
+                            wheel_sha256=wheel_sha256,
+                            wheel_size=wheel_size,
+                            framework_lock_sha256=framework_lock_sha256,
+                            framework_lock_size=framework_lock_size,
+                        )
+                    self._recover_core_asset_prepare_handoff(admission, authority)
+                    raise
                 try:
                     self._upload_core_asset_snapshot(
                         snapshot.root,
@@ -949,37 +1002,116 @@ class SshRemoteExecutorTransport:
         consume_admission: bool = False,
     ) -> None:
         with self._core_asset_authority_lock:
-            if consume_admission:
-                if self._core_asset_pending_admissions <= 0:
-                    raise RuntimeError("Core asset admission ownership is missing")
-                self._core_asset_pending_admissions -= 1
-            existing = self._core_asset_cleanup_authorities.get(authority.key)
-            if existing is not None and (
-                consume_admission or authority not in (existing, existing.with_finalize_started())
+            admission = self._find_core_asset_admission_locked(authority.key)
+            if admission is None or admission.authority is None:
+                raise RuntimeError("Core asset admission ownership is missing")
+            existing = admission.authority
+            if consume_admission and existing != authority:
+                raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
+            if not consume_admission and authority not in (
+                existing,
+                existing.with_finalize_started(),
             ):
                 raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
-            self._core_asset_cleanup_authorities[authority.key] = authority
+            admission.authority = authority
             if active:
-                self._core_asset_active_transfers.add(authority.key)
+                admission.active = True
 
-    def _admit_core_asset_transfer(self) -> None:
+    @property
+    def _core_asset_cleanup_authorities(
+        self,
+    ) -> dict[tuple[str, str, str], _CoreAssetTransferAuthority]:
         with self._core_asset_authority_lock:
-            owned = len(self._core_asset_cleanup_authorities) + self._core_asset_pending_admissions
-            if owned >= _MAX_CORE_ASSET_CLEANUP_AUTHORITIES:
+            return {
+                admission.authority.key: admission.authority
+                for admission in self._core_asset_transfer_ownerships
+                if admission.authority is not None
+            }
+
+    @property
+    def _core_asset_active_transfers(self) -> set[tuple[str, str, str]]:
+        with self._core_asset_authority_lock:
+            return {
+                admission.authority.key
+                for admission in self._core_asset_transfer_ownerships
+                if admission.active and admission.authority is not None
+            }
+
+    @property
+    def _core_asset_pending_admissions(self) -> int:
+        with self._core_asset_authority_lock:
+            return sum(
+                admission.authority is None for admission in self._core_asset_transfer_ownerships
+            )
+
+    def _admit_core_asset_transfer(self, admission: _CoreAssetTransferAdmission) -> None:
+        with self._core_asset_authority_lock:
+            if len(self._core_asset_transfer_ownerships) >= _MAX_CORE_ASSET_CLEANUP_AUTHORITIES:
                 raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
-            self._core_asset_pending_admissions += 1
+            if admission in self._core_asset_transfer_ownerships:
+                raise RuntimeError("Core asset admission is already owned")
+            self._core_asset_transfer_ownerships.add(admission)
 
-    def _release_core_asset_admission(self) -> None:
+    def _bind_core_asset_admission(
+        self,
+        admission: _CoreAssetTransferAdmission,
+        authority: _CoreAssetTransferAuthority,
+    ) -> None:
         with self._core_asset_authority_lock:
-            if self._core_asset_pending_admissions > 0:
-                self._core_asset_pending_admissions -= 1
+            if (
+                admission not in self._core_asset_transfer_ownerships
+                or admission.authority is not None
+                or self._find_core_asset_admission_locked(authority.key) is not None
+            ):
+                raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
+            admission.authority = authority
+
+    def _release_core_asset_admission(
+        self,
+        admission: _CoreAssetTransferAdmission,
+    ) -> None:
+        with self._core_asset_authority_lock:
+            if admission.authority is None:
+                self._core_asset_transfer_ownerships.discard(admission)
+
+    def _recover_core_asset_prepare_handoff(
+        self,
+        admission: _CoreAssetTransferAdmission,
+        authority: _CoreAssetTransferAuthority,
+    ) -> None:
+        with self._core_asset_authority_lock:
+            if admission not in self._core_asset_transfer_ownerships:
+                raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
+            admission.active = False
+            existing = admission.authority
+            if existing is not None and existing != authority:
+                raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
+            conflicting = self._find_core_asset_admission_locked(authority.key)
+            if conflicting not in {None, admission}:
+                raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
+            admission.authority = authority
+
+    def _find_core_asset_admission_locked(
+        self,
+        key: tuple[str, str, str],
+    ) -> _CoreAssetTransferAdmission | None:
+        return next(
+            (
+                admission
+                for admission in self._core_asset_transfer_ownerships
+                if admission.authority is not None and admission.authority.key == key
+            ),
+            None,
+        )
 
     def _mark_core_asset_transfer_inactive(
         self,
         authority: _CoreAssetTransferAuthority,
     ) -> None:
         with self._core_asset_authority_lock:
-            self._core_asset_active_transfers.discard(authority.key)
+            admission = self._find_core_asset_admission_locked(authority.key)
+            if admission is not None:
+                admission.active = False
 
     def _publish_core_asset_authority(
         self,
@@ -989,8 +1121,10 @@ class SshRemoteExecutorTransport:
         final_root = str(Path(staged.wheel_path).parent)
         with self._core_asset_authority_lock:
             self._core_asset_authorities[final_root] = staged
-            self._core_asset_cleanup_authorities.pop(authority.key, None)
-            self._core_asset_active_transfers.discard(authority.key)
+            admission = self._find_core_asset_admission_locked(authority.key)
+            if admission is not None:
+                admission.active = False
+                self._core_asset_transfer_ownerships.discard(admission)
 
     def _finalize_core_asset_transfer(
         self,
@@ -1045,9 +1179,9 @@ class SshRemoteExecutorTransport:
     def _retry_core_asset_transfer_cleanup(self, *, deadline: float) -> None:
         with self._core_asset_authority_lock:
             authorities = tuple(
-                authority
-                for authority in self._core_asset_cleanup_authorities.values()
-                if authority.key not in self._core_asset_active_transfers
+                admission.authority
+                for admission in self._core_asset_transfer_ownerships
+                if not admission.active and admission.authority is not None
             )
         for authority in authorities:
             if time.monotonic() >= deadline:
@@ -1079,8 +1213,10 @@ class SshRemoteExecutorTransport:
                 raise
             return False
         with self._core_asset_authority_lock:
-            self._core_asset_cleanup_authorities.pop(authority.key, None)
-            self._core_asset_active_transfers.discard(authority.key)
+            admission = self._find_core_asset_admission_locked(authority.key)
+            if admission is not None:
+                admission.active = False
+                self._core_asset_transfer_ownerships.discard(admission)
         return True
 
     def _upload_core_asset_snapshot(
@@ -1498,21 +1634,77 @@ class _KnownHostsLeaseOwnership:
         return True
 
 
+class _NonReapingPopen(subprocess.Popen):
+    """Leave wait ownership with `_OwnedSubprocessAuthority`."""
+
+    def __del__(self) -> None:
+        return
+
+
+_OWNED_SUBPROCESS_POPEN = _NonReapingPopen
+
+
+class _RecoveredSubprocess:
+    """Minimal wait handle rebuilt from the child-published birth record."""
+
+    stdout: BinaryIO | None = None
+    stderr: BinaryIO | None = None
+
+    def __init__(self, process_id: int) -> None:
+        self.pid = process_id
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        return self._waitpid(os.WNOHANG)
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            return_code = self._waitpid(os.WNOHANG if deadline is not None else 0)
+            if return_code is not None:
+                return return_code
+            if deadline is None:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.pid, timeout)
+            time.sleep(min(_SUBPROCESS_STATUS_INTERVAL_SECONDS, remaining))
+
+    def _waitpid(self, options: int) -> int | None:
+        try:
+            waited_pid, status = os.waitpid(self.pid, options)
+        except InterruptedError:
+            return None
+        except ChildProcessError as exc:
+            raise RuntimeError("subprocess wait ownership was lost") from exc
+        if waited_pid == 0:
+            return None
+        if waited_pid != self.pid:
+            raise RuntimeError("subprocess wait returned an unexpected child")
+        self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+
 class _OwnedSubprocessAuthority:
-    """Retain one spawned process group until bounded cleanup confirms reaping."""
+    """Own one registry slot and lease before allowing subprocess birth."""
 
     def __init__(
         self,
-        process: subprocess.Popen[bytes],
         *,
         trust_ownership: _KnownHostsLeaseOwnership | None,
     ) -> None:
-        self.process = process
-        self.process_group_id = process.pid
+        self.process: _OwnedSubprocessProcess | None = None
+        self.process_group_id: int | None = None
         self.exit_observer: _SubprocessExitObserver | None = None
         self._trust_ownership = trust_ownership
+        self._birth_record: BinaryIO | None = None
+        self._spawn_outcome_unknown = False
         self._group_cleanup_confirmed = False
-        self._slot_held = True
+        self._slot_held = False
         self._retained = False
         self._cleanup_guard = threading.Lock()
 
@@ -1530,54 +1722,124 @@ class _OwnedSubprocessAuthority:
             _KnownHostsLeaseOwnership(trust_lease) if trust_lease is not None else None
         )
         active_ownership = trust_ownership or caller_ownership
+        authority = cls(trust_ownership=active_ownership)
         try:
             _retry_orphaned_subprocess_cleanup()
-            if not _SUBPROCESS_OWNERSHIP_SLOTS.acquire(
-                timeout=_SUBPROCESS_OWNERSHIP_ACQUIRE_SECONDS
-            ):
-                raise RuntimeError("subprocess ownership capacity is exhausted")
             try:
-                process = subprocess.Popen(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=False,
-                    start_new_session=True,
-                )
+                authority._reserve_slot()
             except BaseException:
-                _SUBPROCESS_OWNERSHIP_SLOTS.release()
+                authority._group_cleanup_confirmed = True
+                try:
+                    authority.release()
+                except BaseException:
+                    authority.retain()
                 raise
-            authority = cls(process, trust_ownership=active_ownership)
             try:
                 if active_ownership is not None:
                     active_ownership.transfer_to(authority)
             except BaseException:
+                authority._group_cleanup_confirmed = True
+                authority.release()
+                raise
+            try:
+                authority._spawn(argv)
+            except BaseException:
                 try:
+                    if authority.process is None:
+                        authority._recover_spawned_process(
+                            deadline=(time.monotonic() + _SUBPROCESS_TERMINATE_GRACE_SECONDS)
+                        )
                     authority.cleanup()
                 except BaseException:
                     authority.retain()
+                    _log_transport_failure(SshTransportErrorCode.START_FAILED)
                 raise
             return authority
         finally:
             if caller_ownership is not None:
                 caller_ownership.release_if_caller_owned()
 
+    def _reserve_slot(self) -> None:
+        with _ORPHANED_SUBPROCESS_GUARD:
+            if len(_ORPHANED_SUBPROCESSES) >= _MAX_OWNED_SUBPROCESSES:
+                raise RuntimeError("subprocess ownership capacity is exhausted")
+            self._slot_held = True
+            _ORPHANED_SUBPROCESSES[id(self)] = self
+            birth_record = tempfile.TemporaryFile(prefix="openevo-subprocess-birth-")
+            self._birth_record = birth_record
+            os.fchmod(birth_record.fileno(), 0o600)
+
+    def _spawn(self, argv: list[str]) -> None:
+        birth_record = self._birth_record
+        if birth_record is None:
+            raise RuntimeError("subprocess birth authority is unavailable")
+        birth_record_fd = birth_record.fileno()
+        self._spawn_outcome_unknown = True
+        process = _OWNED_SUBPROCESS_POPEN(
+            _subprocess_birth_argv(argv, birth_record_fd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            start_new_session=True,
+            pass_fds=(birth_record_fd,),
+        )
+        self.process_group_id = process.pid
+        self.process = process
+        self._spawn_outcome_unknown = False
+
+    def _recover_spawned_process(self, *, deadline: float) -> bool:
+        if self.process is not None:
+            if self.process_group_id is None:
+                self.process_group_id = self.process.pid
+            return True
+        while True:
+            process_id = _read_subprocess_birth_record(self._birth_record)
+            if process_id is not None:
+                self.process = _RecoveredSubprocess(process_id)
+                self.process_group_id = process_id
+                self._spawn_outcome_unknown = False
+                return True
+            if self.process_group_id is not None:
+                self.process = _RecoveredSubprocess(self.process_group_id)
+                self._spawn_outcome_unknown = False
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.01, remaining))
+
     def initialize_observer(self) -> None:
-        self.process_group_id = _owned_process_group_id(self.process)
-        self.exit_observer = _SubprocessExitObserver(self.process)
+        process = self.process
+        if process is None:
+            raise RuntimeError("subprocess birth has not been observed")
+        self.process_group_id = _owned_process_group_id(process)
+        self.exit_observer = _SubprocessExitObserver(process)
 
     def cleanup(self) -> None:
         with self._cleanup_guard:
+            if self.process is None and not self._recover_spawned_process(
+                deadline=time.monotonic() + _SUBPROCESS_TERMINATE_GRACE_SECONDS
+            ):
+                self.retain()
+                raise RuntimeError("subprocess birth outcome could not be confirmed")
             if self._group_cleanup_confirmed and self._is_reaped():
                 if not self.release():
                     self.retain()
                 return
+            process = self.process
+            process_group_id = self.process_group_id
+            if process is not None and process_group_id is None:
+                process_group_id = process.pid
+                self.process_group_id = process_group_id
+            if process is None or process_group_id is None:
+                self.retain()
+                raise RuntimeError("subprocess cleanup authority is incomplete")
             failure: BaseException | None = None
             try:
                 _terminate_and_reap_subprocess(
-                    self.process,
-                    process_group_id=self.process_group_id,
+                    process,
+                    process_group_id=process_group_id,
                     exit_observer=self.exit_observer,
                     on_group_cleanup_confirmed=self.mark_group_cleanup_confirmed,
                 )
@@ -1610,6 +1872,12 @@ class _OwnedSubprocessAuthority:
         if not self._group_cleanup_confirmed or not self._is_reaped():
             self.retain()
             return False
+        birth_record = self._birth_record
+        if not _discard_subprocess_birth_record(birth_record):
+            self.retain()
+            return False
+        if self._birth_record is birth_record:
+            self._birth_record = None
         trust_ownership = self._trust_ownership
         if trust_ownership is not None and not trust_ownership.release_for(self):
             self.retain()
@@ -1621,7 +1889,6 @@ class _OwnedSubprocessAuthority:
             self._retained = False
             self._slot_held = False
             self._trust_ownership = None
-        _SUBPROCESS_OWNERSHIP_SLOTS.release()
         return True
 
     def release_if_reaped(self) -> bool:
@@ -1631,12 +1898,73 @@ class _OwnedSubprocessAuthority:
         return self.release()
 
     def _is_reaped(self) -> bool:
-        if self.process.returncode is not None:
+        process = self.process
+        if process is None:
+            return not self._spawn_outcome_unknown
+        if process.returncode is not None:
             return True
         try:
-            return self.process.poll() is not None
+            return process.poll() is not None
         except BaseException:
             return False
+
+
+def _subprocess_birth_argv(argv: list[str], birth_record_fd: int) -> list[str]:
+    if not argv:
+        raise RuntimeError("subprocess argv is empty")
+    return [
+        sys.executable,
+        "-I",
+        "-c",
+        _SUBPROCESS_BIRTH_LAUNCHER,
+        str(birth_record_fd),
+        *argv,
+    ]
+
+
+def _read_subprocess_birth_record(birth_record: BinaryIO | None) -> int | None:
+    if birth_record is None:
+        return None
+    try:
+        descriptor = birth_record.fileno()
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > 128
+        ):
+            raise RuntimeError("subprocess birth record identity is invalid")
+        payload = os.pread(descriptor, 129, 0)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("subprocess birth record is unavailable") from exc
+    if not payload.endswith(b"\n"):
+        return None
+    fields = payload[:-1].split(b" ")
+    if len(fields) != 3 or any(not field.isdigit() for field in fields):
+        raise RuntimeError("subprocess birth record is malformed")
+    process_id, process_group_id, session_id = (int(field) for field in fields)
+    if (
+        process_id <= 1
+        or process_id != process_group_id
+        or process_id != session_id
+        or process_group_id == os.getpgrp()
+    ):
+        raise RuntimeError("subprocess birth record ownership is invalid")
+    return process_id
+
+
+def _discard_subprocess_birth_record(birth_record: BinaryIO | None) -> bool:
+    if birth_record is None:
+        return True
+    try:
+        birth_record.close()
+    except BaseException:
+        if birth_record.closed:
+            return True
+        _log_transport_failure(SshTransportErrorCode.START_FAILED)
+        return False
+    return True
 
 
 def _run_subprocess(
@@ -1656,6 +1984,8 @@ def _run_subprocess(
             trust_ownership=active_ownership,
         )
         process = authority.process
+        if process is None:
+            raise RuntimeError("subprocess birth has not been observed")
         stdout = b""
         stderr = b""
         try:
@@ -1713,7 +2043,7 @@ class _KnownHostsSpawnFailure(RuntimeError):
 
 
 def _capture_subprocess_output(
-    process: subprocess.Popen[bytes],
+    process: _OwnedSubprocessProcess,
     *,
     argv: list[str],
     timeout_seconds: float,
@@ -1802,7 +2132,7 @@ def _capture_subprocess_output(
     return b"".join(chunks["stdout"]), b"".join(chunks["stderr"])
 
 
-def _owned_process_group_id(process: subprocess.Popen[bytes]) -> int:
+def _owned_process_group_id(process: _OwnedSubprocessProcess) -> int:
     process_group_id = process.pid
     if (
         process_group_id <= 1
@@ -1816,7 +2146,7 @@ def _owned_process_group_id(process: subprocess.Popen[bytes]) -> int:
 class _SubprocessExitObserver:
     """Observe one leader exit while retaining its status for the owning Popen."""
 
-    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+    def __init__(self, process: _OwnedSubprocessProcess) -> None:
         self._process = process
         waitid = getattr(os, "waitid", None)
         self._waitid = (
@@ -1907,7 +2237,7 @@ class _SubprocessExitObserver:
 
 
 def _signal_owned_process_group(
-    process: subprocess.Popen[bytes],
+    process: _OwnedSubprocessProcess,
     *,
     process_group_id: int,
     signal_number: int,
@@ -1925,7 +2255,7 @@ def _signal_owned_process_group(
 
 
 def _confirm_owned_process_group_terminated(
-    process: subprocess.Popen[bytes],
+    process: _OwnedSubprocessProcess,
     *,
     process_group_id: int,
 ) -> None:
@@ -1952,7 +2282,7 @@ def _confirm_owned_process_group_terminated(
 
 
 def _observe_owned_process_group_states(
-    process: subprocess.Popen[bytes],
+    process: _OwnedSubprocessProcess,
     *,
     process_group_id: int,
 ) -> dict[int, str]:
@@ -2057,7 +2387,7 @@ def _read_ps_process_group_states() -> dict[int, tuple[int, str]]:
 
 
 def _terminate_and_reap_subprocess(
-    process: subprocess.Popen[bytes],
+    process: _OwnedSubprocessProcess,
     *,
     process_group_id: int,
     exit_observer: _SubprocessExitObserver | None,
@@ -2240,7 +2570,9 @@ def _retry_orphaned_tunnel_cleanup() -> None:
 
 def _retry_orphaned_subprocess_cleanup() -> None:
     with _ORPHANED_SUBPROCESS_GUARD:
-        authorities = tuple(_ORPHANED_SUBPROCESSES.values())[:_MAX_SUBPROCESS_ORPHAN_RETRIES]
+        authorities = tuple(
+            authority for authority in _ORPHANED_SUBPROCESSES.values() if authority._retained
+        )[:_MAX_SUBPROCESS_ORPHAN_RETRIES]
     for authority in authorities:
         try:
             authority.cleanup()

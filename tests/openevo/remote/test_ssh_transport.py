@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import struct
@@ -2546,6 +2547,115 @@ def test_default_runner_entry_cancellation_releases_caller_owned_trust_lease(
     assert set(ssh_module._ORPHANED_TRUST_LEASES) == orphan_trust_ids
 
 
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_secret_popen_return_cancellation_publishes_one_recoverable_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+) -> None:
+    transport = _transport(tmp_path)
+    original_popen = ssh_module._OWNED_SUBPROCESS_POPEN
+    original_observe_group = ssh_module._observe_owned_process_group_states
+    orphan_ids = set(ssh_module._ORPHANED_SUBPROCESSES)
+    orphan_trust_ids = set(ssh_module._ORPHANED_TRUST_LEASES)
+    lease_paths: list[Path] = []
+    started: list[subprocess.Popen[bytes]] = []
+
+    def local_argv(_command: str, known_hosts_file: Path) -> list[str]:
+        lease_paths.append(known_hosts_file)
+        return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+    def spawn_then_cancel(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = original_popen(*args, **kwargs)
+        started.append(process)
+        raise interruption
+
+    def report_uninterruptible_member(
+        process: subprocess.Popen[bytes],
+        *,
+        process_group_id: int,
+    ) -> dict[int, str]:
+        assert process_group_id == process.pid
+        return {process.pid: "Z", process.pid + 1: "D"}
+
+    monkeypatch.setattr(transport, "_ssh_argv", local_argv)
+    monkeypatch.setattr(ssh_module, "_MAX_OWNED_SUBPROCESSES", 1)
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", spawn_then_cancel)
+    monkeypatch.setattr(
+        ssh_module,
+        "_observe_owned_process_group_states",
+        report_uninterruptible_member,
+    )
+
+    retained: ssh_module._OwnedSubprocessAuthority | None = None
+    try:
+        with pytest.raises(interruption):
+            transport.run_secret("private command")
+
+        new_authorities = tuple(
+            authority
+            for authority_id, authority in ssh_module._ORPHANED_SUBPROCESSES.items()
+            if authority_id not in orphan_ids
+        )
+        assert len(started) == 1
+        assert len(new_authorities) == 1
+        retained = new_authorities[0]
+        birth_record = retained._birth_record
+        assert birth_record is not None
+        assert birth_record.closed is False
+        assert retained.process.pid == started[0].pid
+        assert retained.process.returncode is None
+        assert len(lease_paths) == 1
+        assert lease_paths[0].exists()
+        assert set(ssh_module._ORPHANED_TRUST_LEASES) == orphan_trust_ids
+        with pytest.raises(RuntimeError, match="ownership capacity"):
+            ssh_module._OwnedSubprocessAuthority.spawn(
+                [sys.executable, "-c", "raise SystemExit(0)"],
+            )
+
+        monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", original_popen)
+        monkeypatch.setattr(
+            ssh_module,
+            "_observe_owned_process_group_states",
+            original_observe_group,
+        )
+        ssh_module._retry_orphaned_subprocess_cleanup()
+
+        assert retained.process.returncode is not None
+        assert birth_record.closed is True
+        assert retained._birth_record is None
+        assert id(retained) not in ssh_module._ORPHANED_SUBPROCESSES
+        assert not lease_paths[0].exists()
+        assert (
+            ssh_module._run_subprocess(
+                [sys.executable, "-c", "raise SystemExit(0)"],
+                1,
+            ).returncode
+            == 0
+        )
+    finally:
+        monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", original_popen)
+        monkeypatch.setattr(
+            ssh_module,
+            "_observe_owned_process_group_states",
+            original_observe_group,
+        )
+        if retained is not None and id(retained) in ssh_module._ORPHANED_SUBPROCESSES:
+            retained.cleanup()
+        for process in started:
+            if process.returncode is not None:
+                continue
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=3)
+            except ChildProcessError:
+                pass
+
+
 def test_secret_runner_retains_lease_until_group_termination_is_observed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2714,7 +2824,7 @@ def test_default_runner_bounds_multiple_cleanup_orphans_and_reaps_on_retry(
         pass
 
     original_cleanup = ssh_module._terminate_and_reap_subprocess
-    original_popen = subprocess.Popen
+    original_popen = ssh_module._OWNED_SUBPROCESS_POPEN
     cleanup_fails = True
     started: list[subprocess.Popen[bytes]] = []
 
@@ -2731,12 +2841,8 @@ def test_default_runner_bounds_multiple_cleanup_orphans_and_reaps_on_retry(
             raise OSError("cleanup failed")
         original_cleanup(*args, **kwargs)
 
-    monkeypatch.setattr(
-        ssh_module,
-        "_SUBPROCESS_OWNERSHIP_SLOTS",
-        threading.BoundedSemaphore(3),
-    )
-    monkeypatch.setattr(ssh_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(ssh_module, "_MAX_OWNED_SUBPROCESSES", 3)
+    monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", recording_popen)
     monkeypatch.setattr(ssh_module, "_capture_subprocess_output", cancel_capture)
     monkeypatch.setattr(
         ssh_module,

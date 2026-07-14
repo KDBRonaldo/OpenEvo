@@ -18,12 +18,15 @@ descendant-pipe drain and signal the owned process group on leader exit,
 timeout, or cancellation. Signal success is not termination evidence. A bounded
 Linux `/proc` or portable `ps` observer must still find the pinned leader and
 must prove that every member of that PGID is dead or a zombie before the leader
-is reaped. Ownership capacity is reserved before `Popen`; observer construction,
-capture, and cleanup `BaseException` paths cannot lose the PID or PGID. The
-entered known-host lease remains caller-owned until the subprocess authority is
-constructed and explicitly accepts it. Unconfirmed cleanup retains its
-subprocess slot, registry entry, and known-host lease in a bounded process-local
-registry for later command/tunnel/close recovery. All waits remain bounded.
+is reaped. Before `Popen`, one subprocess authority is constructed, inserted in
+the bounded ownership registry, and given the entered known-host lease. The
+child first publishes its PID, PGID, and SID to that authority's anonymous birth
+record FD and then execs the requested command. Losing the `Popen` return to a
+`BaseException` therefore leaves the same pre-published owner able to recover
+the child without a Python return-to-constructor handoff. Observer construction,
+capture, and cleanup failures cannot split the child, registry capacity, or
+lease. Unconfirmed cleanup retains that complete owner for later
+command/tunnel/close recovery. All waits remain bounded.
 This local portability does not extend the remote contract: the Core host must
 be Linux and the preflight rejects every other remote platform.
 
@@ -174,8 +177,10 @@ the canonical owner-only `~/.openevo/core` subdirectories and performs the
 rsync on the same authenticated transport. A remote standard-library verifier
 requires an exact two-file payload, owner/mode/link identity, both digests, the
 closed lock-to-wheel binding, and an internal transfer lease. Every transfer
-uses a unique random incoming authority. The local transport admits at most 16
-retained or active cleanup authorities and rejects new prepare work at capacity.
+uses a unique random incoming authority. Before prepare, the local transport
+publishes one of 16 ownership tokens. The same token owns pending receipt,
+active upload, and inactive cleanup/reconciliation state until confirmed
+publication or discard, and new prepare work is rejected at capacity.
 Finalize copies verified bytes into an owner-only private
 candidate whose inode and pathname were never exposed to rsync. Members are
 created as `0400` and populated only through publisher-held writer FDs that are
@@ -190,7 +195,10 @@ and its nested pip child run. Same-name replacement cannot redirect consumer
 reads, and post-consumption revalidation fails closed on mutation or pathname
 replacement. An already published exact sealed bundle is an idempotent retry.
 The transport retains each prepared transfer until confirmed publication or
-discard. Upload cleanup has an independent 10-second deadline. Once finalize
+discard. An interruption immediately before or after the first prepared
+authority update leaves that same token inactive and retryable instead of
+stranding pending or active capacity. Upload cleanup has an independent
+10-second deadline. Once finalize
 starts, timeout, cancellation, authenticated failure, or malformed receipt first
 replays the exact finalize transaction and validates its receipt; only a
 definitive non-publication result permits incoming discard. A later staging call
