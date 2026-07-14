@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 import hashlib
@@ -18,10 +18,12 @@ import time
 from typing import Any, BinaryIO, Literal, Protocol, TypeVar
 
 import httpx
+from pydantic import ValidationError
 
 from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.core_client_v1 import (
     CoreBootstrapTunnelConnectionV1,
+    CoreClientErrorV1,
     CoreControlClientV1,
     CoreProjectBootstrapClientV1,
     CoreTunnelConnectionV1,
@@ -372,6 +374,7 @@ class CoreProjectCreateOperationV1:
     idempotency_key: str
     state: CoreProjectCreateStateV1 = CoreProjectCreateStateV1.PRE_CREATE
     core_project_id: str | None = None
+    project_immutable_authority: CoreProjectPatchImmutableAuthorityV1 | None = None
     workspace_upload_id: str | None = None
     workspace_upload_project_snapshot: core_v1.ImmutableSnapshotRefV1 | None = None
     workspace_upload_abort: CoreWorkspaceUploadAbortOperationV1 | None = None
@@ -382,6 +385,13 @@ class CoreProjectCreateOperationV1:
             raise ValueError("project create request digest does not match canonical request")
         if (self.state is CoreProjectCreateStateV1.BOUND) != (self.core_project_id is not None):
             raise ValueError("only a bound create operation has a Core project ID")
+        if (self.core_project_id is None) != (self.project_immutable_authority is None):
+            raise ValueError("a bound create operation must retain immutable project authority")
+        if self.project_immutable_authority is not None and (
+            self.project_immutable_authority.project_id != self.core_project_id
+            or self.project_immutable_authority.project_create != self.project_create
+        ):
+            raise ValueError("create immutable authority must match the bound Core project")
         if (self.workspace_upload_id is None) != (self.workspace_upload_project_snapshot is None):
             raise ValueError("workspace upload ID and project snapshot must be paired")
         if self.workspace_upload_abort is not None and (
@@ -491,6 +501,8 @@ class CoreProjectPatchOperationV1:
             raise ValueError("only an applied project patch has complete durable authority")
         if self.outcome is not None and self.outcome.id != self.core_project_id:
             raise ValueError("project patch outcome belongs to another project")
+        if self.outcome is not None and self.outcome.created_at != self.base_project.created_at:
+            raise ValueError("project patch outcome changed immutable project creation time")
         if self.outcome is not None and not _project_identity_matches(
             self.outcome, self.new_project_create
         ):
@@ -517,6 +529,8 @@ class CoreProjectMappingV1:
     project_etag: str
     active_revision: core_v1.RevisionRefV1
     project_updated_at: str
+    immutable_authority: CoreProjectPatchImmutableAuthorityV1
+    mutable_authority: CoreProjectPatchMutableAuthorityV1
     mapping_generation: int
     predecessor_request_sha256: str | None
 
@@ -525,6 +539,11 @@ class CoreProjectMappingV1:
             raise ValueError("mapping generation must be positive")
         if (self.mapping_generation == 1) != (self.predecessor_request_sha256 is None):
             raise ValueError("only the first mapping has no predecessor")
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _CoreActivationAuthorityV1:
+    """Process-local capability proving one bridge-produced activation."""
 
 
 class DesktopCoreBridgePersistence(Protocol):
@@ -563,6 +582,8 @@ class DesktopCoreBridgePersistence(Protocol):
         self,
         operation: CoreProjectCreateOperationV1,
         core_project_id: str,
+        *,
+        immutable_authority: CoreProjectPatchImmutableAuthorityV1,
     ) -> CoreProjectCreateOperationV1: ...
 
     def update_create(
@@ -601,11 +622,16 @@ class DesktopCoreBridgePersistence(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class CoreActivationV1:
+    generation: int
     local_project_id: str
+    profile_id: str
+    local_project_etag: str
+    local_project_intent_sha256: str
     core_project: core_v1.ProjectV1
     capabilities: core_v1.CapabilitiesResponseV1
     revision_head: core_v1.RevisionHeadV1
     validation: core_v1.ProjectValidationResponseV1
+    _authority: _CoreActivationAuthorityV1 = field(repr=False)
 
 
 @dataclass(slots=True, repr=False)
@@ -614,12 +640,17 @@ class DesktopCoreActiveSessionV1:
     generation: int
     local_project_id: str
     profile_id: str
+    local_project_etag: str
+    local_project_intent_sha256: str
+    mapping: CoreProjectMappingV1
     attachment: CoreHostAttachmentV1
     tunnel: CoreTunnelHandleV1
     client: CoreControlClientV1
     project: core_v1.ProjectV1
     capabilities: core_v1.CapabilitiesResponseV1
     revision_head: core_v1.RevisionHeadV1
+    activation: CoreActivationV1
+    committed_local_project: local_v1.ProjectV1 | None = None
 
 
 class DesktopCoreBridgeErrorV1(RuntimeError):
@@ -631,6 +662,17 @@ class DesktopCoreBridgeErrorV1(RuntimeError):
 def map_project_create_v1(project: local_v1.ProjectV1) -> core_v1.ProjectCreateV1:
     """Map saved Local project intent into the one frozen Core create contract."""
 
+    try:
+        return _map_project_create_v1(project)
+    except ValidationError:
+        raise _bridge_error(
+            "invalid_local_project",
+            "The saved project cannot be represented by the Core project contract.",
+            status=422,
+        ) from None
+
+
+def _map_project_create_v1(project: local_v1.ProjectV1) -> core_v1.ProjectCreateV1:
     execution = project.execution
     if execution.mode == "codex_subscription_transcript":
         execution_mode = core_v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
@@ -1034,44 +1076,140 @@ class DesktopCoreBridgeV1:
                     ),
                     label="project mapping commit",
                 )
+            activation = CoreActivationV1(
+                generation=generation,
+                local_project_id=project.project_id,
+                profile_id=project.profile_id,
+                local_project_etag=project.etag,
+                local_project_intent_sha256=request_sha256,
+                core_project=core_project,
+                capabilities=capabilities,
+                revision_head=revision_head,
+                validation=validation,
+                _authority=_CoreActivationAuthorityV1(),
+            )
             candidate = DesktopCoreActiveSessionV1(
                 token=token,
                 generation=generation,
                 local_project_id=project.project_id,
                 profile_id=project.profile_id,
+                local_project_etag=project.etag,
+                local_project_intent_sha256=request_sha256,
+                mapping=completed_mapping,
                 attachment=attachment,
                 tunnel=tunnel,
                 client=client,
                 project=core_project,
                 capabilities=capabilities,
                 revision_head=revision_head,
+                activation=activation,
             )
             self._publish_activation(candidate)
-            return CoreActivationV1(
-                local_project_id=project.project_id,
-                core_project=core_project,
-                capabilities=capabilities,
-                revision_head=revision_head,
-                validation=validation,
-            )
+            return activation
         except BaseException as exc:
             try:
                 self._cleanup_failed_candidate(token, deadline=deadline)
             except BaseException as cleanup_exc:
                 raise cleanup_exc from exc
+            if isinstance(exc, CoreClientErrorV1):
+                raise _bridge_client_error(exc) from None
             raise
 
-    def capabilities(self, local_project_id: str) -> core_v1.CapabilitiesResponseV1:
-        def call(session: DesktopCoreActiveSessionV1) -> core_v1.CapabilitiesResponseV1:
-            return session.client.capabilities(session.project.spec.execution_mode)
+    def commit_local_activation(
+        self,
+        project: local_v1.ProjectV1,
+        *,
+        activation: CoreActivationV1,
+    ) -> None:
+        """Bind the durable post-activation Desktop projection to the live session."""
 
-        return self._invoke(local_project_id, call)
+        deadline = time.monotonic() + self._timeout
+        self._acquire_transition(deadline)
+        try:
+            session, generation = self._session()
+            with self._lock:
+                self._ensure_generation(session, generation)
+                self._ensure_activation_acknowledgement(session, generation, activation)
+                self._ensure_local_activation_projection(session, project)
+                if project.etag == activation.local_project_etag:
+                    raise _bridge_error(
+                        "local_activation_source_etag_mismatch",
+                        "The durable Desktop activation did not advance its Local ETag.",
+                        status=409,
+                    )
+                if session.committed_local_project is None:
+                    if session.local_project_etag != activation.local_project_etag:
+                        raise _bridge_error(
+                            "local_activation_source_etag_mismatch",
+                            "The activation no longer owns the Local project ETag transition.",
+                            status=409,
+                        )
+                    session.local_project_etag = project.etag
+                    session.committed_local_project = project
+                elif (
+                    session.local_project_etag != project.etag
+                    or session.committed_local_project != project
+                ):
+                    raise _bridge_error(
+                        "local_activation_already_committed",
+                        "The activation was already acknowledged with a different result.",
+                        status=409,
+                    )
+        finally:
+            self._transition_lock.release()
+
+    def deactivate_project(self, local_project_id: str) -> None:
+        """Retire one published project session without closing the bridge."""
+
+        deadline = time.monotonic() + self._timeout
+        self._acquire_transition(deadline)
+        try:
+            with self._lock:
+                if self._closed or self._close_requested:
+                    raise _bridge_error(
+                        "desktop_core_bridge_closed",
+                        "The Desktop Core bridge is closed.",
+                    )
+                if self._candidate is not None:
+                    raise _bridge_error(
+                        "active_project_transition_in_progress",
+                        "The active project transition is still in progress.",
+                        status=409,
+                        retryable=True,
+                    )
+                session = self._active
+                if session is None:
+                    return
+                if session.local_project_id != local_project_id:
+                    raise _bridge_error(
+                        "active_project_mismatch",
+                        "The requested project does not own the active Core session.",
+                        status=409,
+                    )
+                token = session.token
+            self._retire_token(token, deadline=deadline)
+            with self._lock:
+                self._generation += 1
+        finally:
+            self._transition_lock.release()
+
+    def capabilities(self, project: local_v1.ProjectV1) -> core_v1.CapabilitiesResponseV1:
+        def call(
+            session: DesktopCoreActiveSessionV1,
+            deadline: float,
+        ) -> core_v1.CapabilitiesResponseV1:
+            _project, capabilities = self._refresh_authority(session, deadline)
+            return capabilities
+
+        return self._invoke_project(project, call)
 
     def validate_project(
-        self, local_project_id: str, *, idempotency_key: str
+        self, project: local_v1.ProjectV1, *, idempotency_key: str
     ) -> core_v1.ProjectValidationResponseV1:
-        def call(session: DesktopCoreActiveSessionV1) -> core_v1.ProjectValidationResponseV1:
-            deadline = time.monotonic() + self._timeout
+        def call(
+            session: DesktopCoreActiveSessionV1,
+            deadline: float,
+        ) -> core_v1.ProjectValidationResponseV1:
             project, capabilities = self._refresh_authority(session, deadline)
             return self._validate_current(
                 session.token,
@@ -1082,11 +1220,15 @@ class DesktopCoreBridgeV1:
                 idempotency_key=idempotency_key,
             )
 
-        return self._invoke(local_project_id, call)
+        return self._invoke_project(project, call)
 
-    def create_run(self, local_project_id: str, *, idempotency_key: str) -> core_v1.RunV1:
-        def call(session: DesktopCoreActiveSessionV1) -> core_v1.RunV1:
-            deadline = time.monotonic() + self._timeout
+    def create_run(
+        self,
+        project: local_v1.ProjectV1,
+        *,
+        idempotency_key: str,
+    ) -> core_v1.RunV1:
+        def call(session: DesktopCoreActiveSessionV1, deadline: float) -> core_v1.RunV1:
             project, capabilities = self._refresh_authority(session, deadline)
             head = self._core_external(session.token, deadline, session.client.revision_head)
             if head.active_revision != project.active_revision:
@@ -1133,7 +1275,7 @@ class DesktopCoreBridgeV1:
                 ),
             )
 
-        return self._invoke(local_project_id, call)
+        return self._invoke_project(project, call)
 
     def list_runs(self, **kwargs: Any) -> core_v1.RunPageV1:
         return self._invoke_active(lambda session: session.client.list_runs(**kwargs))
@@ -1333,7 +1475,7 @@ class DesktopCoreBridgeV1:
         )
 
     def events(self, *, last_event_id: str | None = None):
-        session, generation = self._session(None)
+        session, generation = self._session()
         return _BridgeEventContext(self, session, generation, last_event_id)
 
     def _begin_activation(self, deadline: float) -> _GenerationToken:
@@ -1517,7 +1659,10 @@ class DesktopCoreBridgeV1:
         deadline: float,
         action: Callable[[], _ResponseT],
     ) -> _ResponseT:
-        return self._external_call(token, deadline, action)
+        try:
+            return self._external_call(token, deadline, action)
+        except CoreClientErrorV1 as exc:
+            raise _bridge_client_error(exc) from None
 
     def _adapter_external(
         self,
@@ -1577,6 +1722,8 @@ class DesktopCoreBridgeV1:
             ) from None
         except DesktopCoreBridgeErrorV1:
             raise
+        except CoreClientErrorV1 as exc:
+            raise _bridge_client_error(exc) from None
         except BaseException:
             raise _bridge_error(
                 "core_bridge_adapter_failed",
@@ -1672,10 +1819,13 @@ class DesktopCoreBridgeV1:
                     idempotency_key=operation.idempotency_key,
                 ),
             )
+            _ensure_project_identity(result.project, request)
+            immutable_authority = _patch_immutable_authority(result.project)
             expected_bound = replace(
                 operation,
                 state=CoreProjectCreateStateV1.BOUND,
                 core_project_id=result.project.id,
+                project_immutable_authority=immutable_authority,
             )
             stored_bound = self._adapter_external(
                 token,
@@ -1683,6 +1833,7 @@ class DesktopCoreBridgeV1:
                 lambda: self._persistence.bind_created_project(
                     operation,
                     result.project.id,
+                    immutable_authority=immutable_authority,
                 ),
                 label="project create binding",
             )
@@ -1712,11 +1863,23 @@ class DesktopCoreBridgeV1:
         request_sha256: str,
         core_host_identity: str,
     ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1 | None]:
-        _ensure_revision_authority_successor(
-            mapping.active_revision,
-            current.active_revision,
+        _ensure_immutable_authority_transition(
+            _mapping_immutable_authority(mapping),
+            _patch_immutable_authority(current),
+            mismatch_code="core_project_mapping_mismatch",
+            mismatch_message=(
+                "Core immutable authority does not match the durable project mapping."
+            ),
+        )
+        _ensure_mutable_authority_transition(
+            _mapping_mutable_authority(mapping),
+            _patch_mutable_authority(current),
             project_id=mapping.core_project_id,
             label="durable project mapping",
+            mismatch_code="core_project_mapping_mismatch",
+            mismatch_message=(
+                "Core mutable authority does not descend from the durable project mapping."
+            ),
         )
         if mapping.request_sha256 == request_sha256:
             _ensure_project_identity(current, requested)
@@ -1757,6 +1920,14 @@ class DesktopCoreBridgeV1:
         request_sha256: str,
         core_host_identity: str,
     ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1 | None]:
+        _ensure_immutable_authority_transition(
+            _create_immutable_authority(operation),
+            _patch_immutable_authority(current),
+            mismatch_code="core_project_create_binding_mismatch",
+            mismatch_message=(
+                "Core immutable authority does not match the durable project create."
+            ),
+        )
         if _project_identity_matches(current, requested):
             raise _bridge_error(
                 "core_project_patch_proof_missing",
@@ -1846,6 +2017,15 @@ class DesktopCoreBridgeV1:
         CoreProjectPatchOperationV1,
         tuple[core_v1.RevisionRefV1 | None, ...],
     ]:
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(operation.base_project),
+            _patch_immutable_authority(current),
+            allow_project_patch=True,
+            mismatch_code="core_project_patch_replay_mismatch",
+            mismatch_message=(
+                "Current Core project changed immutable patch base identity."
+            ),
+        )
         if operation.state is CoreProjectPatchStateV1.APPLIED:
             assert operation.outcome is not None
             finalize_authority: CoreWorkspaceUploadFinalizeAuthorityV1 | None = None
@@ -2105,6 +2285,12 @@ class DesktopCoreBridgeV1:
                 idempotency_key=_derived_key(upload_key_seed, "finalize"),
             ),
         )
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(core_project),
+            _patch_immutable_authority(finalized.project),
+            mismatch_code="workspace_finalize_authority_mismatch",
+            mismatch_message="Core workspace finalize changed immutable project authority.",
+        )
         finalize_authority = CoreWorkspaceUploadFinalizeAuthorityV1(
             upload=upload,
             request_sha256=_model_digest(finalize_request),
@@ -2333,8 +2519,39 @@ class DesktopCoreBridgeV1:
             deadline,
             session.client.get_project,
         )
+        self._ensure_refreshed_project_authority(session, project)
         self._ensure_project_ready(project, capabilities)
+        session.project = project
+        session.capabilities = capabilities
         return project, capabilities
+
+    @staticmethod
+    def _ensure_refreshed_project_authority(
+        session: DesktopCoreActiveSessionV1,
+        project: core_v1.ProjectV1,
+    ) -> None:
+        previous = session.project
+        mapping = session.mapping
+        _ensure_project_identity(project, mapping.project_create)
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(previous),
+            _patch_immutable_authority(project),
+            mismatch_code="core_project_identity_mismatch",
+            mismatch_message=(
+                "The refreshed Core project changed immutable project authority."
+            ),
+        )
+        _ensure_mapping_content_snapshots(mapping, project)
+        _ensure_mutable_authority_transition(
+            _patch_mutable_authority(previous),
+            _patch_mutable_authority(project),
+            project_id=mapping.core_project_id,
+            label="active project session",
+            mismatch_code="core_project_refresh_authority_mismatch",
+            mismatch_message=(
+                "The refreshed Core project changed outside successor publication authority."
+            ),
+        )
 
     def _validate_current(
         self,
@@ -2384,7 +2601,7 @@ class DesktopCoreBridgeV1:
                 retryable=True,
             )
 
-    def _session(self, local_project_id: str | None) -> tuple[DesktopCoreActiveSessionV1, int]:
+    def _session(self) -> tuple[DesktopCoreActiveSessionV1, int]:
         with self._lock:
             if self._closed or self._close_requested:
                 raise _bridge_error(
@@ -2398,37 +2615,105 @@ class DesktopCoreBridgeV1:
                     "Desktop has no active project Core tunnel.",
                     retryable=True,
                 )
-            if local_project_id is not None and session.local_project_id != local_project_id:
-                raise _bridge_error(
-                    "active_project_mismatch",
-                    "The requested resource does not belong to the active local project.",
-                    status=409,
-                )
             return session, self._generation
 
-    def _invoke(
+    def _invoke_project(
         self,
-        local_project_id: str,
-        call: Callable[[DesktopCoreActiveSessionV1], _ResponseT],
+        project: local_v1.ProjectV1,
+        call: Callable[[DesktopCoreActiveSessionV1, float], _ResponseT],
     ) -> _ResponseT:
-        session, _generation = self._session(local_project_id)
+        session, _generation = self._session()
         deadline = time.monotonic() + self._timeout
-        return self._external_call(
-            session.token,
-            deadline,
-            lambda: call(session),
-        )
+
+        def bound_call() -> _ResponseT:
+            self._ensure_local_project_binding(session, project)
+            return call(session, deadline)
+
+        return self._core_external(session.token, deadline, bound_call)
 
     def _invoke_active(
         self, call: Callable[[DesktopCoreActiveSessionV1], _ResponseT]
     ) -> _ResponseT:
-        session, _generation = self._session(None)
+        session, _generation = self._session()
         deadline = time.monotonic() + self._timeout
-        return self._external_call(
+        return self._core_external(
             session.token,
             deadline,
             lambda: call(session),
         )
+
+    @staticmethod
+    def _ensure_local_project_binding(
+        session: DesktopCoreActiveSessionV1,
+        project: local_v1.ProjectV1,
+    ) -> None:
+        if session.local_project_id != project.project_id:
+            raise _bridge_error(
+                "active_project_mismatch",
+                "The requested resource does not belong to the active local project.",
+                status=409,
+            )
+        if (
+            session.profile_id != project.profile_id
+            or session.local_project_etag != project.etag
+        ):
+            raise _bridge_error(
+                "active_local_project_version_mismatch",
+                "The saved local project changed after this Core session was activated.",
+                status=409,
+            )
+        intent_sha256 = _model_digest(map_project_create_v1(project))
+        if session.local_project_intent_sha256 != intent_sha256:
+            raise _bridge_error(
+                "active_local_project_version_mismatch",
+                "The saved local project changed after this Core session was activated.",
+                status=409,
+            )
+
+    @staticmethod
+    def _ensure_activation_acknowledgement(
+        session: DesktopCoreActiveSessionV1,
+        generation: int,
+        activation: CoreActivationV1,
+    ) -> None:
+        if (
+            activation.generation != generation
+            or activation.generation != session.generation
+            or activation._authority is not session.activation._authority
+            or activation != session.activation
+        ):
+            raise _bridge_error(
+                "local_activation_acknowledgement_mismatch",
+                "The acknowledgement was not produced by the active project generation.",
+                status=409,
+            )
+
+    @staticmethod
+    def _ensure_local_activation_projection(
+        session: DesktopCoreActiveSessionV1,
+        project: local_v1.ProjectV1,
+    ) -> None:
+        remote = project.remote
+        intent_sha256 = _model_digest(map_project_create_v1(project))
+        if (
+            project.project_id != session.local_project_id
+            or project.profile_id != session.profile_id
+            or project.state != "active"
+            or intent_sha256 != session.local_project_intent_sha256
+            or remote is None
+            or remote.status != "ready"
+            or remote.core_project_id != session.project.id
+            or remote.active_revision != session.project.active_revision
+            or remote.registry_digest != session.capabilities.registry_digest
+            or remote.registry_digest != session.project.registry_digest
+            or remote.model_preparation != session.project.model_preparation
+            or remote.etag != session.project.etag
+        ):
+            raise _bridge_error(
+                "local_activation_projection_mismatch",
+                "The durable Desktop project does not match the active Core session.",
+                status=409,
+            )
 
     def _ensure_generation(self, session: DesktopCoreActiveSessionV1, generation: int) -> None:
         with self._lock:
@@ -2473,10 +2758,16 @@ class _BridgeEventContext:
             return self._context.__enter__()
 
         try:
-            return self._bridge._core_external(
+            stream = self._bridge._core_external(
                 self._session.token,
                 deadline,
                 enter,
+            )
+            return _BridgeEventIterator(
+                self._bridge,
+                self._session,
+                self._generation,
+                iter(stream),
             )
         except BaseException:
             if self._context is not None:
@@ -2496,6 +2787,32 @@ class _BridgeEventContext:
                 lambda: self._context.__exit__(*exc),
                 label="Core event stream close",
             )
+
+
+class _BridgeEventIterator:
+    def __init__(
+        self,
+        bridge: DesktopCoreBridgeV1,
+        session: DesktopCoreActiveSessionV1,
+        generation: int,
+        stream: Iterator[core_v1.SseFrameV1],
+    ) -> None:
+        self._bridge = bridge
+        self._session = session
+        self._generation = generation
+        self._stream = stream
+
+    def __iter__(self) -> _BridgeEventIterator:
+        return self
+
+    def __next__(self) -> core_v1.SseFrameV1:
+        self._bridge._ensure_generation(self._session, self._generation)
+        try:
+            frame = next(self._stream)
+        except CoreClientErrorV1 as exc:
+            raise _bridge_client_error(exc) from None
+        self._bridge._ensure_generation(self._session, self._generation)
+        return frame
 
 
 def _workspace_archive_policy() -> core_v1.WorkspaceArchivePolicyV1:
@@ -2588,6 +2905,20 @@ def _ensure_create_operation(
     if operation.workspace_upload_finalize is not None:
         _ensure_workspace_finalize_authority_binding(operation.workspace_upload_finalize)
     bound = operation.state is CoreProjectCreateStateV1.BOUND
+    if bound:
+        create_immutable = _create_immutable_authority(operation)
+        if operation.workspace_upload_finalize is not None:
+            _ensure_immutable_authority_transition(
+                create_immutable,
+                _patch_immutable_authority(
+                    operation.workspace_upload_finalize.outcome.project
+                ),
+                allow_project_patch=True,
+                mismatch_code="core_project_create_replay_mismatch",
+                mismatch_message=(
+                    "Workspace finalize changed immutable project create identity."
+                ),
+            )
     if (
         operation.local_project_id != project.project_id
         or operation.profile_id != project.profile_id
@@ -2657,16 +2988,36 @@ def _ensure_patch_operation_authority(
             status=409,
         )
     if mapping is None:
+        _ensure_immutable_authority_transition(
+            _create_immutable_authority(operation),
+            _patch_immutable_authority(patch.base_project),
+            mismatch_code="core_project_patch_replay_mismatch",
+            mismatch_message=(
+                "The durable Core project patch base does not descend from the create authority."
+            ),
+        )
         base_matches = (
             patch.old_request_sha256 == operation.request_sha256
             and patch.old_project_create == operation.project_create
         )
     else:
-        _ensure_revision_authority_successor(
-            mapping.active_revision,
-            patch.base_project.active_revision,
+        _ensure_immutable_authority_transition(
+            _mapping_immutable_authority(mapping),
+            _patch_immutable_authority(patch.base_project),
+            mismatch_code="core_project_patch_replay_mismatch",
+            mismatch_message=(
+                "The durable Core project patch base does not descend from the mapping."
+            ),
+        )
+        _ensure_mutable_authority_transition(
+            _mapping_mutable_authority(mapping),
+            _patch_mutable_authority(patch.base_project),
             project_id=patch.core_project_id,
             label="durable project patch base",
+            mismatch_code="core_project_patch_replay_mismatch",
+            mismatch_message=(
+                "The durable Core project patch base does not descend from the mapping."
+            ),
         )
         base_matches = (
             patch.old_request_sha256 == mapping.request_sha256
@@ -2692,12 +3043,14 @@ def _ensure_persisted_patch_outcome(
     assert operation.outcome is not None
     assert operation.outcome_immutable is not None
     assert operation.outcome_mutable is not None
-    if _patch_immutable_authority(current) != operation.outcome_immutable:
-        raise _bridge_error(
-            "core_project_patch_outcome_mismatch",
-            "Core no longer matches the immutable applied project patch authority.",
-            status=409,
-        )
+    _ensure_immutable_authority_transition(
+        operation.outcome_immutable,
+        _patch_immutable_authority(current),
+        mismatch_code="core_project_patch_outcome_mismatch",
+        mismatch_message=(
+            "Core no longer matches the immutable applied project patch authority."
+        ),
+    )
     _ensure_project_identity(operation.outcome, operation.new_project_create)
     _ensure_patch_signed_new_snapshots(
         operation.base_project,
@@ -2718,39 +3071,21 @@ def _ensure_persisted_patch_outcome(
         effective_authority,
     )
     current_mutable = _patch_mutable_authority(current)
-    if current_mutable == operation.outcome_mutable:
-        _ensure_revision_authority_successor(
-            effective_authority,
-            current.active_revision,
-            project_id=operation.core_project_id,
-            label="durable applied patch outcome",
-        )
-        return revision_authorities
-    if _utc_timestamp(current.updated_at) < _utc_timestamp(
-        operation.outcome_mutable.updated_at
-    ):
-        raise _bridge_error(
-            "core_project_patch_outcome_mismatch",
-            "Core project mutable authority moved backward after the applied patch.",
-            status=409,
-        )
-    if current.etag == operation.outcome_mutable.etag:
-        raise _bridge_error(
-            "core_project_patch_outcome_mismatch",
-            "Core changed project authority without issuing a new ETag.",
-            status=409,
-        )
     same_content_authority = (
         current.current_project_snapshot == operation.outcome_mutable.project_snapshot
         and current.current_workspace_snapshot == operation.outcome_mutable.workspace_snapshot
         and current.workspace_publication == operation.outcome_mutable.workspace_publication
     )
     if same_content_authority:
-        _ensure_revision_authority_successor(
-            effective_authority,
-            current.active_revision,
+        _ensure_mutable_authority_transition(
+            operation.outcome_mutable,
+            current_mutable,
             project_id=operation.core_project_id,
             label="durable applied patch outcome",
+            mismatch_code="core_project_patch_outcome_mismatch",
+            mismatch_message=(
+                "Core mutable authority does not descend from the applied project patch."
+            ),
         )
         return revision_authorities
     finalized_revision = _ensure_workspace_finalize_proof(
@@ -2787,6 +3122,23 @@ def _ensure_workspace_finalize_proof(
     requested_workspace = operation.new_project_create.workspace
     upload = authority.upload if authority is not None else None
     finalized_project = authority.outcome.project if authority is not None else None
+    if finalized_project is not None:
+        _ensure_immutable_authority_transition(
+            operation.outcome_immutable,
+            _patch_immutable_authority(finalized_project),
+            mismatch_code="core_project_patch_outcome_mismatch",
+            mismatch_message=(
+                "Core workspace finalize changed immutable applied patch authority."
+            ),
+        )
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(finalized_project),
+            _patch_immutable_authority(current),
+            mismatch_code="core_project_patch_outcome_mismatch",
+            mismatch_message=(
+                "Core no longer matches immutable workspace finalize authority."
+            ),
+        )
     if not isinstance(requested_workspace, core_v1.ImportedWorkspaceSpecV1) or (
         authority is None
         or upload is None
@@ -2802,7 +3154,6 @@ def _ensure_workspace_finalize_proof(
         or finalized_project.current_project_snapshot != current.current_project_snapshot
         or finalized_project.current_workspace_snapshot != current.current_workspace_snapshot
         or finalized_project.workspace_publication != current.workspace_publication
-        or _patch_immutable_authority(finalized_project) != operation.outcome_immutable
     ):
         raise _bridge_error(
             "core_project_patch_outcome_mismatch",
@@ -2811,27 +3162,24 @@ def _ensure_workspace_finalize_proof(
         )
     finalized_mutable = _patch_mutable_authority(finalized_project)
     current_mutable = _patch_mutable_authority(current)
-    _ensure_revision_authority_chain(
-        (
-            _effective_applied_revision_authority(operation),
-            finalized_mutable.active_revision,
-            current_mutable.active_revision,
-        ),
+    _ensure_revision_authority_successor(
+        _effective_applied_revision_authority(operation),
+        finalized_mutable.active_revision,
         project_id=operation.core_project_id,
-        labels=(
-            "durable applied patch outcome (durable workspace finalize predecessor)",
-            "durable workspace finalize",
+        label=(
+            "durable applied patch outcome (durable workspace finalize predecessor)"
         ),
     )
-    if current_mutable != finalized_mutable and (
-        _utc_timestamp(current.updated_at) < _utc_timestamp(finalized_project.updated_at)
-        or current.etag == finalized_project.etag
-    ):
-        raise _bridge_error(
-            "core_project_patch_outcome_mismatch",
-            "Core mutable authority does not descend from the durable workspace finalize.",
-            status=409,
-        )
+    _ensure_mutable_authority_transition(
+        finalized_mutable,
+        current_mutable,
+        project_id=operation.core_project_id,
+        label="durable workspace finalize",
+        mismatch_code="core_project_patch_outcome_mismatch",
+        mismatch_message=(
+            "Core mutable authority does not descend from the durable workspace finalize."
+        ),
+    )
     return finalized_mutable.active_revision
 
 
@@ -2883,12 +3231,72 @@ def _utc_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
 
 
+def _create_immutable_authority(
+    operation: CoreProjectCreateOperationV1,
+) -> CoreProjectPatchImmutableAuthorityV1:
+    authority = operation.project_immutable_authority
+    if (
+        operation.state is not CoreProjectCreateStateV1.BOUND
+        or operation.core_project_id is None
+        or authority is None
+        or authority.project_id != operation.core_project_id
+        or authority.project_create != operation.project_create
+    ):
+        raise _bridge_error(
+            "core_project_create_binding_mismatch",
+            "The durable project create binding has incomplete immutable authority.",
+            status=409,
+        )
+    return authority
+
+
+def _mapping_immutable_authority(
+    mapping: CoreProjectMappingV1,
+) -> CoreProjectPatchImmutableAuthorityV1:
+    authority = mapping.immutable_authority
+    if (
+        authority.project_id != mapping.core_project_id
+        or authority.project_create != mapping.project_create
+        or authority.task_snapshot != mapping.task_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_mapping_mismatch",
+            "The durable Core project mapping has inconsistent immutable authority.",
+            status=409,
+        )
+    return authority
+
+
+def _mapping_mutable_authority(
+    mapping: CoreProjectMappingV1,
+) -> CoreProjectPatchMutableAuthorityV1:
+    authority = mapping.mutable_authority
+    if (
+        authority.project_snapshot != mapping.project_snapshot
+        or authority.workspace_snapshot != mapping.workspace_snapshot
+        or authority.registry_digest != mapping.registry_digest
+        or authority.etag != mapping.project_etag
+        or authority.active_revision != mapping.active_revision
+        or authority.updated_at != mapping.project_updated_at
+        or authority.active_revision is None
+        or authority.active_revision.project_id != mapping.core_project_id
+    ):
+        raise _bridge_error(
+            "core_project_mapping_mismatch",
+            "The durable Core project mapping has inconsistent mutable authority.",
+            status=409,
+        )
+    return authority
+
+
 def _ensure_mapping_authority(
     mapping: CoreProjectMappingV1,
     project: local_v1.ProjectV1,
     *,
     core_host_identity: str,
 ) -> None:
+    _mapping_immutable_authority(mapping)
+    _mapping_mutable_authority(mapping)
     if (
         mapping.local_project_id != project.project_id
         or mapping.profile_id != project.profile_id
@@ -2921,6 +3329,26 @@ def _ensure_bound_operation(
         )
     if operation.workspace_upload_finalize is not None:
         _ensure_workspace_finalize_authority_binding(operation.workspace_upload_finalize)
+        _ensure_immutable_authority_transition(
+            _create_immutable_authority(operation),
+            _patch_immutable_authority(
+                operation.workspace_upload_finalize.outcome.project
+            ),
+            allow_project_patch=True,
+            mismatch_code="core_project_create_binding_mismatch",
+            mismatch_message=(
+                "Workspace finalize changed immutable project create identity."
+            ),
+        )
+    _ensure_immutable_authority_transition(
+        _create_immutable_authority(operation),
+        _mapping_immutable_authority(mapping),
+        allow_project_patch=True,
+        mismatch_code="core_project_create_binding_mismatch",
+        mismatch_message=(
+            "The Core mapping changed immutable project create identity."
+        ),
+    )
     return operation
 
 
@@ -2966,18 +3394,45 @@ def _ensure_initial_publication_authority(
             "The durable project create binding does not own the publication authority.",
             status=409,
         )
+    create_immutable = _create_immutable_authority(operation)
+    _ensure_immutable_authority_transition(
+        create_immutable,
+        _patch_immutable_authority(descendant),
+        mismatch_code="core_project_initial_publication_mismatch",
+        mismatch_message=(
+            "Core does not match the immutable project create authority."
+        ),
+    )
     finalize = operation.workspace_upload_finalize
     finalized_project: core_v1.ProjectV1 | None = None
     if finalize is not None:
         _ensure_workspace_finalize_authority_binding(finalize)
         candidate = finalize.outcome.project
         if _project_identity_matches(candidate, operation.project_create):
+            _ensure_immutable_authority_transition(
+                create_immutable,
+                _patch_immutable_authority(candidate),
+                mismatch_code="core_project_initial_publication_mismatch",
+                mismatch_message=(
+                    "The durable workspace finalize changed project create authority."
+                ),
+            )
             finalized_project = candidate
-        elif not (
+        elif (
             pending_patch is not None
             and pending_patch.state is CoreProjectPatchStateV1.APPLIED
+            and pending_patch.outcome_immutable is not None
             and _project_identity_matches(candidate, pending_patch.new_project_create)
         ):
+            _ensure_immutable_authority_transition(
+                pending_patch.outcome_immutable,
+                _patch_immutable_authority(candidate),
+                mismatch_code="core_project_initial_publication_mismatch",
+                mismatch_message=(
+                    "The durable workspace finalize changed applied patch authority."
+                ),
+            )
+        else:
             raise _bridge_error(
                 "core_project_initial_publication_mismatch",
                 "The durable workspace publication does not match a proven project intent.",
@@ -2986,35 +3441,45 @@ def _ensure_initial_publication_authority(
 
     authority = finalized_project.active_revision if finalized_project is not None else None
     if finalized_project is not None:
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(finalized_project),
+            _patch_immutable_authority(descendant),
+            mismatch_code="core_project_initial_publication_mismatch",
+            mismatch_message=(
+                "Core no longer matches immutable initial workspace publication authority."
+            ),
+        )
         same_content_authority = (
             finalized_project.id == operation.core_project_id == descendant.id
-            and _patch_immutable_authority(descendant)
-            == _patch_immutable_authority(finalized_project)
             and descendant.current_project_snapshot
             == finalized_project.current_project_snapshot
             and descendant.current_workspace_snapshot
             == finalized_project.current_workspace_snapshot
             and descendant.workspace_publication == finalized_project.workspace_publication
         )
-        descendant_mutable = _patch_mutable_authority(descendant)
-        finalized_mutable = _patch_mutable_authority(finalized_project)
-        valid_mutable_descent = descendant_mutable == finalized_mutable or (
-            _utc_timestamp(descendant.updated_at) >= _utc_timestamp(finalized_project.updated_at)
-            and descendant.etag != finalized_project.etag
-        )
-        if not same_content_authority or not valid_mutable_descent:
+        if not same_content_authority:
             raise _bridge_error(
                 "core_project_initial_publication_mismatch",
                 "Core no longer descends from the durable initial workspace publication.",
                 status=409,
             )
-
-    _ensure_revision_authority_successor(
-        authority,
-        descendant.active_revision,
-        project_id=operation.core_project_id,
-        label="durable initial workspace publication",
-    )
+        _ensure_mutable_authority_transition(
+            _patch_mutable_authority(finalized_project),
+            _patch_mutable_authority(descendant),
+            project_id=operation.core_project_id,
+            label="durable initial workspace publication",
+            mismatch_code="core_project_initial_publication_mismatch",
+            mismatch_message=(
+                "Core no longer descends from the durable initial workspace publication."
+            ),
+        )
+    else:
+        _ensure_revision_authority_successor(
+            authority,
+            descendant.active_revision,
+            project_id=operation.core_project_id,
+            label="durable initial workspace publication",
+        )
     return authority
 
 
@@ -3023,6 +3488,13 @@ def _ensure_patch_signed_new_snapshots(
     patched: core_v1.ProjectV1,
     requested: core_v1.ProjectCreateV1,
 ) -> None:
+    _ensure_immutable_authority_transition(
+        _patch_immutable_authority(previous),
+        _patch_immutable_authority(patched),
+        allow_project_patch=True,
+        mismatch_code="core_project_patch_outcome_mismatch",
+        mismatch_message="Core patch changed immutable project identity.",
+    )
     if patched.current_project_snapshot == previous.current_project_snapshot:
         raise _bridge_error(
             "core_project_patch_not_versioned",
@@ -3073,6 +3545,14 @@ def _ensure_mapping_content_snapshots(
     mapping: CoreProjectMappingV1,
     project: core_v1.ProjectV1,
 ) -> None:
+    _ensure_immutable_authority_transition(
+        _mapping_immutable_authority(mapping),
+        _patch_immutable_authority(project),
+        mismatch_code="core_project_mapping_mismatch",
+        mismatch_message=(
+            "The Core project changed immutable authority outside Desktop authority."
+        ),
+    )
     if (
         mapping.core_project_id != project.id
         or mapping.project_snapshot != project.current_project_snapshot
@@ -3111,6 +3591,68 @@ def _ensure_revision_authority_successor(
         raise _bridge_error(
             "core_project_revision_authority_mismatch",
             f"Core active revision does not directly descend from the {label} authority.",
+            status=409,
+        )
+
+
+def _ensure_immutable_authority_transition(
+    authority: CoreProjectPatchImmutableAuthorityV1,
+    current: CoreProjectPatchImmutableAuthorityV1,
+    *,
+    allow_project_patch: bool = False,
+    mismatch_code: str,
+    mismatch_message: str,
+) -> None:
+    if allow_project_patch:
+        expected_authority = replace(
+            authority,
+            project_create=current.project_create,
+            task_snapshot=current.task_snapshot,
+        )
+    else:
+        expected_authority = authority
+    if current != expected_authority:
+        raise _bridge_error(
+            mismatch_code,
+            mismatch_message,
+            status=409,
+        )
+
+
+def _ensure_mutable_authority_transition(
+    authority: CoreProjectPatchMutableAuthorityV1,
+    current: CoreProjectPatchMutableAuthorityV1,
+    *,
+    project_id: str,
+    label: str,
+    mismatch_code: str,
+    mismatch_message: str,
+) -> None:
+    _ensure_revision_authority_successor(
+        authority.active_revision,
+        current.active_revision,
+        project_id=project_id,
+        label=label,
+    )
+    if current.active_revision == authority.active_revision:
+        valid_transition = current == authority
+    else:
+        expected_successor = replace(
+            authority,
+            active_revision=current.active_revision,
+            registry_digest=current.registry_digest,
+            updated_at=current.updated_at,
+            etag=current.etag,
+        )
+        valid_transition = (
+            current == expected_successor
+            and current.etag != authority.etag
+            and _utc_timestamp(current.updated_at) > _utc_timestamp(authority.updated_at)
+        )
+    if not valid_transition:
+        raise _bridge_error(
+            mismatch_code,
+            mismatch_message,
             status=409,
         )
 
@@ -3197,6 +3739,11 @@ def _mapping_from_request(
             "core_project_not_ready",
             "Core has not published the project workspace snapshot and active revision.",
         )
+    immutable_authority = _patch_immutable_authority(project)
+    mutable_authority = _patch_mutable_authority(project)
+    if previous_mapping is not None:
+        _mapping_immutable_authority(previous_mapping)
+        _mapping_mutable_authority(previous_mapping)
     chain_start = (
         previous_mapping.active_revision
         if previous_mapping is not None
@@ -3222,9 +3769,8 @@ def _mapping_from_request(
         and previous_mapping.task_snapshot == project.current_task_snapshot
         and previous_mapping.workspace_snapshot == workspace_snapshot
         and previous_mapping.registry_digest == capabilities.registry_digest
-        and previous_mapping.project_etag == project.etag
-        and previous_mapping.active_revision == active_revision
-        and previous_mapping.project_updated_at == project.updated_at
+        and previous_mapping.immutable_authority == immutable_authority
+        and previous_mapping.mutable_authority == mutable_authority
     ):
         mapping_generation = previous_mapping.mapping_generation
         predecessor_request_sha256 = previous_mapping.predecessor_request_sha256
@@ -3245,6 +3791,8 @@ def _mapping_from_request(
         project_etag=project.etag,
         active_revision=active_revision,
         project_updated_at=project.updated_at,
+        immutable_authority=immutable_authority,
+        mutable_authority=mutable_authority,
         mapping_generation=mapping_generation,
         predecessor_request_sha256=predecessor_request_sha256,
     )
@@ -3301,6 +3849,33 @@ def _bridge_error(
             next_action=(
                 "Retry after the active Core session is ready."
                 if retryable
+                else "Reconnect and activate the saved project."
+            ),
+        )
+    )
+
+
+def _bridge_client_error(exc: CoreClientErrorV1) -> DesktopCoreBridgeErrorV1:
+    if isinstance(exc.error, core_v1.ApiErrorV1):
+        return DesktopCoreBridgeErrorV1(exc.error)
+    error = exc.error
+    return DesktopCoreBridgeErrorV1(
+        core_v1.ApiErrorV1(
+            request_id=f"desktop-core-client-{secrets.token_hex(8)}",
+            code=error.code.value,
+            http_status=exc.status_code,
+            message=error.message,
+            severity=core_v1.ErrorSeverity.BLOCKING,
+            category=core_v1.ErrorCategory.CONTRACT,
+            retryable=error.retryable,
+            repair_action=(
+                core_v1.RepairAction.OPENEVO_CAN_RETRY
+                if error.retryable
+                else core_v1.RepairAction.UNSUPPORTED
+            ),
+            next_action=(
+                "Retry after reconnecting the active Core session."
+                if error.retryable
                 else "Reconnect and activate the saved project."
             ),
         )
