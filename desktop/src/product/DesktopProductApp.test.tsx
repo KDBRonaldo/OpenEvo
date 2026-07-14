@@ -84,7 +84,7 @@ describe("DesktopProductApp", () => {
     expect(button("Start session").disabled).toBe(false);
   });
 
-  it("renders fixture successor states and the later pinned revision", async () => {
+  it("commits the later revision and pins it in the next session", async () => {
     vi.useFakeTimers();
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, stepDelayMs: 20 });
     root = await renderProduct(provider);
@@ -96,9 +96,10 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Running");
     await advance(60);
     expect(screenText()).toContain("Preparing next revision");
-    expect(screenText()).toContain("Revision 3");
+    expect(screenText()).toContain("Revision 2");
     await advance(25);
-    expect(screenText()).toContain("Revision 3 is active");
+    expect(screenText()).toContain("Revision 3");
+    expect(screenText()).toContain("Latest session complete");
 
     await clickButton("Start session");
     expect(screenText()).toContain("Pinned context");
@@ -186,7 +187,7 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("unsupported for this project and mode");
     await clickAria("Project settings");
     expect(screenText()).toContain("removed_text_memory (no longer available)");
-    const staleToggle = document.querySelector<HTMLInputElement>('.target-toggle input[role="switch"]');
+    const staleToggle = document.querySelector<HTMLInputElement>('.target-toggle[data-target-id="text_memory"] input[role="switch"]');
     if (!staleToggle) throw new Error("Unsupported target toggle was not found.");
     await act(async () => staleToggle.click());
     expect(staleToggle.checked).toBe(false);
@@ -413,7 +414,7 @@ describe("DesktopProductApp", () => {
     provider.failNextRunStartWithConflict({
       code: "idempotency_key_reused",
       retryable: false,
-      repairAction: "none",
+      repairAction: "unsupported",
     });
     await clickButton("Start session");
     expect(screenText()).toContain("That action identity belongs to another request.");
@@ -547,7 +548,7 @@ describe("DesktopProductApp", () => {
     expect(refreshed.snapshot.projects[0]?.source).toMatchObject({
       kind: "native_folder_snapshot",
       display_name: "Selected research folder",
-      source_ref: { content_id: "source-fixture-1" },
+      import_ref: { import_id: "source-fixture-1" },
     });
   });
 

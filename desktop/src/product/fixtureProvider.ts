@@ -8,6 +8,7 @@ import {
   desktopStateV1Schema,
   diagnosticReportV1Schema,
   localOperationV1Schema,
+  operationV1Schema,
   projectCapabilitiesV1Schema,
   projectSourceV1Schema,
   projectValidationV1Schema,
@@ -23,6 +24,7 @@ import {
   type DiagnosticReportV1,
   type HostKeyAcceptV1,
   type LocalOperationV1,
+  type OperationV1,
   type ProfileCreateV1,
   type ProfilePatchV1,
   type ProjectCapabilitiesV1,
@@ -99,7 +101,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     code: string;
     message: string;
     retryable: boolean;
-    repairAction: "none" | "openevo_can_retry" | "user_input_required" | "reconnect_required" | "upgrade_required";
+    repairAction: "openevo_can_retry" | "openevo_can_install" | "openevo_can_reconfigure" | "user_action_required" | "unsupported";
     addEquivalentRun: boolean;
   } | null = null;
   private refreshAttempts = 0;
@@ -164,7 +166,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       ? this.projects.find((item) => item.project_id === this.state.active_project?.project_id) ?? null
       : this.projects[0] ?? null;
     const capability = this.capabilities
-      ? { status: "ready" as const, projectId: this.capabilities.project_id, executionMode: this.capabilities.execution_mode, value: this.capabilities }
+      ? { status: "ready" as const, projectId: this.capabilities.project_id, executionMode: capabilityExecutionMode(this.capabilities), value: this.capabilities }
       : contextProject
         ? { status: "unavailable" as const, projectId: contextProject.project_id, executionMode: contextProject.execution.mode, error: null }
         : null;
@@ -350,7 +352,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       project_id: `project-fixture-${this.projects.length + 1}`,
       ...input,
       state: "draft",
-      current_revision_id: "revision-fixture-1",
       etag: ETAG_D,
       created_at: NOW,
       updated_at: NOW,
@@ -432,7 +433,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return projectSourceV1Schema.parse({
       kind: "native_folder_snapshot",
       display_name: "Selected research folder",
-      source_ref: { content_id: "source-fixture-1", sha256: C, byte_size: 4096 },
+      import_ref: { ...structuredClone(CONTRACT_FIXTURE_V1.workspaceImport), import_id: "source-fixture-1", content_sha256: C, byte_size: 4096 },
     });
   }
 
@@ -462,56 +463,69 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     if (this.state.core.state !== "online") {
       throw new Error("Reconnect the remote workspace before starting a session.");
     }
-    if (this.runs.some((run) => !isTerminal(run.state))) {
+    if (this.runs.some((run) => !isTerminal(run.status))) {
       throw new Error("A session is already active.");
     }
 
     const generation = this.currentGeneration(project);
     const runNumber = this.runs.length + 1;
     const runId = `run-fixture-${runNumber}`;
-    const run = runV1Schema.parse({
-      schema_version: "1",
+    const revision = this.revision(generation, projectId);
+    const attempt = {
+      id: `attempt-fixture-${runNumber}`,
       run_id: runId,
-      project_id: projectId,
-      state: "queued",
+      number: 1,
+      status: "queued" as const,
       queued_reason: {
-        code: "service_starting",
+        code: "service_starting" as const,
         summary: "Preparing the remote workspace.",
         retry_after_seconds: 1,
       },
-      project_snapshot: { snapshot_id: `project-snapshot-${runNumber}`, digest: A },
-      task_snapshot: { snapshot_id: `task-snapshot-${runNumber}`, digest: B },
-      workspace_snapshot: { snapshot_id: `workspace-snapshot-${runNumber}`, digest: C },
-      capability_registry_digest: B,
-      pinned_revision: this.revision(generation, "active"),
-      successor_revision: null,
-      latest_attempt: {
-        attempt_id: `attempt-fixture-${runNumber}`,
-        number: 1,
-        state: "queued",
-        started_at: null,
-        finished_at: null,
-      },
       created_at: NOW,
       updated_at: NOW,
-      etag: ETAG_A,
+      started_at: null,
+      finished_at: null,
       error: null,
+    };
+    const run = runV1Schema.parse({
+      ...structuredClone(CONTRACT_FIXTURE_V1.run),
+      id: runId,
+      project_id: projectId,
+      project_snapshot: { id: `project-snapshot-${runNumber}`, kind: "project", content_sha256: A, created_at: NOW },
+      task_snapshot: { id: `task-snapshot-${runNumber}`, kind: "task", content_sha256: B, created_at: NOW },
+      workspace_snapshot: { id: `workspace-snapshot-${runNumber}`, kind: "workspace", content_sha256: C, created_at: NOW },
+      registry_digest: B,
+      execution_mode: project.execution.mode,
+      status: "queued",
+      queued_reason: attempt.queued_reason,
+      current_attempt_id: attempt.id,
+      current_attempt: attempt,
+      attempt_count: 1,
+      current_error: null,
+      pinned_revision: revision,
+      required_revision: { revision, reachable_from_revision_id: revision.id, relation: "active" },
+      revision_transition: null,
+      attempts: [attempt],
+      created_at: NOW,
+      updated_at: NOW,
+      admitted_at: NOW,
+      started_at: null,
+      finished_at: null,
+      etag: ETAG_A,
     });
     this.runs = [run, ...this.runs];
     this.timelines[runId] = [
-      this.timeline(runNumber, "admission", "queued", "Session admitted", `Waiting for Revision ${generation}.`),
+      this.timeline(runNumber, "admission", "pending", "Session admitted", `Waiting for Revision ${generation}.`),
     ];
     this.emit();
 
-    this.schedule(1, () => this.transitionRun(runId, "preparing", "workspace", "running", "Preparing workspace", "The project snapshot is being prepared."));
-    this.schedule(2, () => this.transitionRun(runId, "running", "agent", "running", "Research task", "The task is running with its pinned revision."));
+    this.schedule(1, () => this.transitionRun(runId, "preparing", "preparation", "running", "Preparing workspace", "The project snapshot is being prepared."));
+    this.schedule(2, () => this.transitionRun(runId, "running", "execution", "running", "Research task", "The task is running with its pinned revision."));
     this.schedule(3, () => this.appendTimeline(runId, "capture", "succeeded", "Session captured", "The session record is sealed."));
     this.schedule(4, () => {
-      this.setSuccessor(runId, generation + 1, "queued");
       this.appendTimeline(runId, "evolution", "running", "Updating evolution targets", "Memory, skills, and instructions are being updated.");
     });
     this.schedule(5, () => {
-      this.setSuccessor(runId, generation + 1, "preparing");
       this.appendTimeline(runId, "materialization", "running", "Preparing next revision", "Validated outputs are being assembled atomically.");
     });
     this.schedule(6, () => this.finishRun(runId, generation + 1));
@@ -521,19 +535,25 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   async cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1> {
     const run = this.requireRun(runId);
     this.checkIntent(intent, `run:cancel:${runId}`, run.etag);
-    if (isTerminal(run.state)) return structuredClone(run);
+    if (isTerminal(run.status)) return structuredClone(run);
+    const attempt = {
+      ...run.current_attempt!,
+      status: "cancelled" as const,
+      queued_reason: null,
+      updated_at: NOW,
+      finished_at: NOW,
+    };
     const cancelled = runV1Schema.parse({
       ...run,
-      state: "cancelled",
+      status: "cancelled",
       queued_reason: null,
-      successor_revision: run.successor_revision
-        ? { ...run.successor_revision, state: "cancelled" }
-        : null,
-      latest_attempt: { ...run.latest_attempt, state: "cancelled", finished_at: NOW },
+      current_attempt: attempt,
+      attempts: [...run.attempts.slice(0, -1), attempt],
+      finished_at: NOW,
       updated_at: NOW,
     });
     this.replaceRun(cancelled);
-    this.appendTimeline(runId, "agent", "cancelled", "Session cancelled", "No successor revision was activated.");
+    this.appendTimeline(runId, "terminal", "cancelled", "Session cancelled", "No successor revision was activated.");
     return structuredClone(cancelled);
   }
 
@@ -564,23 +584,29 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(this.activeOperation);
   }
 
-  async restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
-    const service = this.services.find((item) => item.service_id === serviceId);
-    if (!service || !service.restart_supported) throw new Error("This service cannot be restarted here.");
+  async restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<OperationV1> {
+    const service = this.services.find((item) => item.id === serviceId);
+    if (!service || !service.restartable) throw new Error("This service cannot be restarted here.");
     this.checkIntent(intent, `service:restart:${serviceId}`, service.etag);
     this.services = this.services.map((item) =>
-      item.service_id === serviceId ? serviceV1Schema.parse({ ...item, state: "starting", health_summary: "Restarting." }) : item,
+      item.id === serviceId ? serviceV1Schema.parse({ ...item, status: "starting", status_message: "Restarting." }) : item,
     );
-    this.activeOperation = this.makeOperation("service_restart", "running", "Restarting service", 1, 2);
+    const operation = operationV1Schema.parse({
+      ...structuredClone(CONTRACT_FIXTURE_V1.serviceOperation),
+      id: `operation-service-restart-${serviceId}`,
+      status: "running",
+      request: { kind: "service_restart", service_id: serviceId, request: { schema_version: "1", reason: "Restart requested from OpenEvo Desktop." } },
+      result: null,
+      finished_at: null,
+    });
     this.emit();
     this.schedule(1, () => {
       this.services = this.services.map((item) =>
-        item.service_id === serviceId ? serviceV1Schema.parse({ ...item, state: "healthy", health_summary: "Ready." }) : item,
+        item.id === serviceId ? serviceV1Schema.parse({ ...item, status: "running", status_message: "Ready." }) : item,
       );
-      this.activeOperation = null;
       this.emit();
     });
-    return structuredClone(this.activeOperation);
+    return structuredClone(operation);
   }
 
   dispose(): void {
@@ -592,44 +618,68 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private seedCompletedRun(): void {
     const project = this.projects[0];
     if (!project) return;
+    const predecessor = this.revision(1, project.project_id);
+    const successor = this.revision(2, project.project_id);
+    const base = structuredClone(CONTRACT_FIXTURE_V1.run);
+    const attempt = { ...base.attempts[0], status: "succeeded" as const, finished_at: NOW };
     const run = runV1Schema.parse({
-      ...structuredClone(CONTRACT_FIXTURE_V1.run),
-      state: "succeeded",
+      ...base,
+      status: "succeeded",
       queued_reason: null,
-      pinned_revision: this.revision(1, "active"),
-      successor_revision: this.revision(2, "active"),
-      latest_attempt: {
-        ...structuredClone(CONTRACT_FIXTURE_V1.run.latest_attempt),
-        state: "succeeded",
-        finished_at: NOW,
+      current_attempt: attempt,
+      current_error: null,
+      pinned_revision: successor,
+      required_revision: { revision: successor, reachable_from_revision_id: predecessor.id, relation: "successor" },
+      revision_transition: {
+        state: "active",
+        predecessor_revision: predecessor,
+        successor_revision: successor,
+        progress_completed: 4,
+        progress_total: 4,
+        message: "The successor revision is active.",
+        error: null,
+        updated_at: NOW,
       },
+      attempts: [attempt],
+      finished_at: NOW,
     });
     this.runs = [run];
-    this.timelines[run.run_id] = [
-      this.timeline(1, "revision", "succeeded", "Revision 2 active", "The next session will use the new revision."),
+    this.timelines[run.id] = [
+      this.timeline(1, "revision", "succeeded", "Revision 2 active", "The next session will use the new revision.", run.id),
     ];
-    this.projects = [{ ...project, current_revision_id: "revision-fixture-2" }];
-    this.createArtifacts(run.run_id, 2);
+    this.projects = [projectV1Schema.parse({
+      ...project,
+      remote: project.remote ? { ...project.remote, active_revision: successor, observed_at: NOW } : null,
+    })];
+    this.createArtifacts(run.id, 2);
   }
 
   private finishRun(runId: string, successorGeneration: number): void {
     const run = this.requireRun(runId);
+    const attempt = {
+      ...run.current_attempt!,
+      status: "succeeded" as const,
+      queued_reason: null,
+      updated_at: NOW,
+      finished_at: NOW,
+    };
     const succeeded = runV1Schema.parse({
       ...run,
-      state: "succeeded",
+      status: "succeeded",
       queued_reason: null,
-      successor_revision: this.revision(successorGeneration, "active"),
-      latest_attempt: {
-        ...run.latest_attempt,
-        state: "succeeded",
-        finished_at: NOW,
-      },
+      current_attempt: attempt,
+      attempts: [...run.attempts.slice(0, -1), attempt],
       updated_at: NOW,
+      finished_at: NOW,
     });
     this.replaceRun(succeeded);
     this.projects = this.projects.map((project) =>
       project.project_id === run.project_id
-        ? { ...project, current_revision_id: `revision-fixture-${successorGeneration}`, updated_at: NOW }
+        ? projectV1Schema.parse({
+            ...project,
+            remote: project.remote ? { ...project.remote, active_revision: this.revision(successorGeneration, project.project_id), observed_at: NOW } : null,
+            updated_at: NOW,
+          })
         : project,
     );
     this.createArtifacts(runId, successorGeneration);
@@ -639,65 +689,52 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private createArtifacts(runId: string, generation: number): void {
     const prior = this.artifacts;
     const variants = [
-      {
-        artifact_type: "text_memory" as const,
-        format: "markdown" as const,
-        target_id: "text_memory",
-        display_name: "Research memory",
-        summary: "Durable findings and constraints from this session.",
-      },
-      {
-        artifact_type: "skill_bundle" as const,
-        skill_count: 2,
-        target_id: "skill_bundle",
-        display_name: "Research skills",
-        summary: "Reusable analysis and validation routines.",
-      },
-      {
-        artifact_type: "agent_system" as const,
-        instruction_kind: "agents" as const,
-        target_id: "agent_system",
-        display_name: "Agent guidance",
-        summary: "Updated operating guidance for the next session.",
-      },
-      {
-        artifact_type: "parametric_memory" as const,
-        release_enabled: false as const,
-        adapter_id: `adapter-fixture-${generation}`,
-        base_model_id: "fixture-model",
-        adapter_format: "lora",
-        target_id: "parametric_memory",
-        display_name: "Parametric memory",
-        summary: "Selected adapter state for the next session.",
-      },
+      { artifact_type: "text_memory" as const, target_id: "text_memory", display_name: "Research memory", summary: "Durable findings and constraints from this session." },
+      { artifact_type: "skill_bundle" as const, target_id: "skill_bundle", display_name: "Research skills", summary: "Reusable analysis and validation routines." },
+      { artifact_type: "agent_system" as const, target_id: "agent_system", display_name: "Agent guidance", summary: "Updated operating guidance for the next session." },
+      { artifact_type: "parametric_memory" as const, target_id: "parametric_memory", display_name: "Parametric memory", summary: "Selected adapter state for the next session." },
     ];
 
     for (const variant of variants) {
       const artifactId = `artifact-${variant.target_id}-${generation}`;
       const parent = prior.find((artifact) => artifact.target_id === variant.target_id);
+      const revision = this.revision(generation);
+      const metadata = variant.artifact_type === "text_memory"
+        ? { record_count: generation, source_dataset_ids: [`dataset-fixture-${generation}`] }
+        : variant.artifact_type === "skill_bundle"
+          ? { document_count: 2, root_document: "SKILL.md" as const }
+          : variant.artifact_type === "agent_system"
+            ? { target_path: "AGENTS.md" }
+            : { adapter_id: `adapter-fixture-${generation}`, base_model_ref: "open-models/research-model-fixture-1", adapter_format: "lora" as const };
       const artifact = artifactV1Schema.parse({
-        schema_version: "1",
-        artifact_id: artifactId,
+        id: artifactId,
         project_id: this.projects[0]?.project_id ?? "project-fixture-1",
         run_id: runId,
-        content_digest: generation % 2 === 0 ? A : D,
+        target_id: variant.target_id,
+        artifact_type: variant.artifact_type,
+        display_name: variant.display_name,
+        summary: variant.summary,
+        content_sha256: generation % 2 === 0 ? A : D,
         byte_size: 640 + generation,
+        produced_revision: revision,
+        membership_revisions: [revision],
         lineage: {
+          method_id: `reference_${variant.target_id}`,
+          job_id: `job-fixture-${generation}-${variant.target_id}`,
           source_dataset_ids: [`dataset-fixture-${generation}`],
-          parent_artifact_ids: parent ? [parent.artifact_id] : [],
-          producing_job_id: `job-fixture-${generation}-${variant.target_id}`,
+          source_artifact_ids: parent ? [parent.id] : [],
         },
         compatibility: {
           execution_modes: ["self-deployed"],
           harness_ids: ["codex"],
-          base_model_ids: [],
+          base_model_refs: ["open-models/research-model-fixture-1"],
         },
         scores: [{ name: "quality", value: 0.82 + generation / 100 }],
         selected: true,
         promoted: true,
-        revision_ids: [`revision-fixture-${generation}`],
+        release_enabled: variant.artifact_type !== "parametric_memory",
+        metadata,
         created_at: NOW,
-        ...variant,
       });
       this.artifacts = [artifact, ...this.artifacts];
       this.contents.set(artifactId, this.makeContent(artifact, generation));
@@ -707,42 +744,68 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   private makeContent(artifact: ArtifactV1, generation: number): ArtifactContentV1 {
-    const documents = artifact.artifact_type === "skill_bundle"
+    const rawDocuments = artifact.artifact_type === "skill_bundle"
       ? [
-          { document_id: `workflow-${generation}`, title: "Analysis workflow", media_type: "text/markdown" as const, content: "# Analysis workflow\n\nValidate assumptions before comparing candidates." },
-          { document_id: `verification-${generation}`, title: "Result verification", media_type: "text/markdown" as const, content: "# Result verification\n\nRecord evidence and unresolved uncertainty." },
+          { document_id: `workflow-${generation}`, display_name: "Analysis workflow", relative_path: "SKILL.md", content: "# Analysis workflow\n\nValidate assumptions before comparing candidates." },
+          { document_id: `verification-${generation}`, display_name: "Result verification", relative_path: "verification.md", content: "# Result verification\n\nRecord evidence and unresolved uncertainty." },
         ]
       : [{
           document_id: `${artifact.target_id}-${generation}`,
-          title: artifact.display_name,
-          media_type: "text/markdown" as const,
+          display_name: artifact.display_name,
+          relative_path: artifact.artifact_type === "agent_system" ? "AGENTS.md" : artifact.artifact_type === "text_memory" ? "memory.md" : "adapter.md",
           content: artifact.artifact_type === "text_memory"
             ? "# Research memory\n\n- Preserve validated constraints across sessions.\n- Recheck uncertain measurements before promotion."
             : "# Agent guidance\n\nPrefer reproducible evidence, surface uncertainty, and keep the final report concise.",
         }];
+    const documents = rawDocuments.map((document) => ({
+      ...document,
+      mime_type: "text/markdown",
+      content_sha256: A,
+      byte_size: utf8ByteLength(document.content),
+      truncated: false,
+    }));
+    const returnedBytes = documents.reduce((total, document) => total + document.byte_size, 0);
     return artifactContentV1Schema.parse({
       schema_version: "1",
-      artifact_id: artifact.artifact_id,
-      content_digest: artifact.content_digest,
+      artifact_id: artifact.id,
+      artifact_type: artifact.artifact_type,
       documents,
       total_documents: this.artifactTruncated ? documents.length + 2 : documents.length,
+      total_utf8_bytes: this.artifactTruncated ? returnedBytes + 128 : returnedBytes,
+      returned_utf8_bytes: returnedBytes,
       truncated: this.artifactTruncated,
     });
   }
 
   private makeDiff(artifact: ArtifactV1, parent: ArtifactV1 | null, generation: number): ArtifactDiffV1 {
+    const previousArtifactId = parent?.id ?? `artifact-${artifact.target_id}-${Math.max(0, generation - 1)}`;
+    const previousDigest = parent?.content_sha256 ?? B;
+    const relativePath = artifact.artifact_type === "skill_bundle" ? "SKILL.md" : artifact.artifact_type === "agent_system" ? "AGENTS.md" : artifact.artifact_type === "text_memory" ? "memory.md" : "adapter.md";
+    const oldDocument = { artifact_id: previousArtifactId, artifact_content_sha256: previousDigest, document_id: `document-${artifact.target_id}`, relative_path: relativePath, content_sha256: previousDigest };
+    const newDocument = { artifact_id: artifact.id, artifact_content_sha256: artifact.content_sha256, document_id: `document-${artifact.target_id}`, relative_path: relativePath, content_sha256: artifact.content_sha256 };
     return artifactDiffV1Schema.parse({
       schema_version: "1",
-      artifact_id: artifact.artifact_id,
-      base_artifact_id: parent?.artifact_id ?? null,
-      hunks: [{
-        hunk_id: `hunk-${artifact.target_id}-${generation}`,
-        heading: artifact.display_name,
-        lines: [
-          ...(parent ? [{ kind: "context" as const, old_line: 1, new_line: 1, text: "Validated guidance" }] : []),
-          { kind: "added" as const, old_line: null, new_line: parent ? 2 : 1, text: `Added for Revision ${generation}: preserve evidence and uncertainty.` },
-        ],
+      artifact_id: artifact.id,
+      artifact_content_sha256: artifact.content_sha256,
+      previous_artifact_id: previousArtifactId,
+      previous_artifact_content_sha256: previousDigest,
+      document_changes: [{
+        kind: "modified",
+        old_document: oldDocument,
+        new_document: newDocument,
+        hunks: [{
+          old_document: oldDocument,
+          new_document: newDocument,
+          old_start: 0,
+          old_count: 0,
+          new_start: 1,
+          new_count: 1,
+          lines: [{ kind: "added", old_line_number: null, new_line_number: 1, text: `Added for Revision ${generation}: preserve evidence and uncertainty.` }],
+        }],
       }],
+      total_document_changes: 1,
+      total_hunks: 1,
+      total_lines: 1,
       truncated: false,
     });
   }
@@ -750,62 +813,63 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private transitionRun(
     runId: string,
     state: "preparing" | "running",
-    stage: TimelineEntryV1["stage"],
-    timelineState: TimelineEntryV1["state"],
+    phase: TimelineEntryV1["phase"],
+    timelineStatus: TimelineEntryV1["status"],
     title: string,
     summary: string,
   ): void {
     const run = this.requireRun(runId);
     const next = runV1Schema.parse({
       ...run,
-      state,
+      status: state,
       queued_reason: null,
-      latest_attempt: {
-        ...run.latest_attempt,
-        state,
-        started_at: run.latest_attempt.started_at ?? NOW,
-      },
+      current_attempt: { ...run.current_attempt!, status: state, queued_reason: null, updated_at: NOW, started_at: run.current_attempt!.started_at ?? NOW },
+      attempts: [...run.attempts.slice(0, -1), { ...run.current_attempt!, status: state, queued_reason: null, updated_at: NOW, started_at: run.current_attempt!.started_at ?? NOW }],
+      started_at: run.started_at ?? NOW,
       updated_at: NOW,
     });
     this.replaceRun(next);
-    this.appendTimeline(runId, stage, timelineState, title, summary);
-  }
-
-  private setSuccessor(runId: string, generation: number, state: "queued" | "preparing"): void {
-    const run = this.requireRun(runId);
-    this.replaceRun(runV1Schema.parse({ ...run, successor_revision: this.revision(generation, state), updated_at: NOW }));
+    this.appendTimeline(runId, phase, timelineStatus, title, summary);
   }
 
   private appendTimeline(
     runId: string,
-    stage: TimelineEntryV1["stage"],
-    state: TimelineEntryV1["state"],
+    phase: TimelineEntryV1["phase"],
+    status: TimelineEntryV1["status"],
     title: string,
     summary: string,
   ): void {
     const sequence = (this.timelines[runId]?.length ?? 0) + 1;
     this.timelines[runId] = [
       ...(this.timelines[runId] ?? []),
-      this.timeline(sequence, stage, state, title, summary),
+      this.timeline(sequence, phase, status, title, summary, runId),
     ];
     this.emit();
   }
 
   private timeline(
     sequence: number,
-    stage: TimelineEntryV1["stage"],
-    state: TimelineEntryV1["state"],
+    phase: TimelineEntryV1["phase"],
+    status: TimelineEntryV1["status"],
     title: string,
-    summary: string,
+    message: string,
+    runId = "run-fixture-1",
   ): TimelineEntryV1 {
+    const run = this.runs.find((item) => item.id === runId);
     return timelineEntryV1Schema.parse({
-      entry_id: `timeline-fixture-${sequence}-${stage}`,
-      occurred_at: NOW,
-      stage,
-      state,
+      id: `timeline-fixture-${sequence}-${phase}`,
+      run_id: runId,
+      attempt_id: run?.current_attempt_id ?? null,
+      sequence,
+      service_id: "service-control-fixture-1",
+      phase,
+      status,
       title,
-      summary,
-      progress: null,
+      message,
+      occurred_at: NOW,
+      artifact_ids: [],
+      content_sha256: sequence % 2 === 0 ? B : A,
+      error: null,
     });
   }
 
@@ -830,7 +894,8 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     projectId: string,
     executionMode: ProjectV1["execution"]["mode"] = "self-deployed",
   ): ProjectCapabilitiesV1 {
-    const base = structuredClone(CONTRACT_FIXTURE_V1.capabilities.targets[0]);
+    const envelope = structuredClone(CONTRACT_FIXTURE_V1.capabilities);
+    const base = envelope.capabilities.targets[0];
     const target = (
       targetId: "text_memory" | "skill_bundle" | "agent_system",
       displayName: string,
@@ -845,19 +910,31 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         artifact_type: targetId,
         configured_default_method_id: methodId,
         effective_default_method_id: methodId,
-        methods: base.methods.map((method) => ({ ...method, method_id: methodId, display_name: displayName })),
+        methods: base.methods.map((method) => ({
+          ...method,
+          method_id: methodId,
+          display_name: displayName,
+          output_artifact_types: [targetId],
+          execution_modes: [executionMode === "self-deployed" ? "self_deployed" as const : "subscription" as const],
+        })),
         accepted_methods: base.accepted_methods.map((method) => ({ ...method, method_id: methodId })),
       };
     };
     return projectCapabilitiesV1Schema.parse({
-      ...structuredClone(CONTRACT_FIXTURE_V1.capabilities),
+      ...envelope,
       project_id: projectId,
-      execution_mode: executionMode,
-      targets: [
-        target("text_memory", "Text memory", "Preserve durable findings across sessions."),
-        target("skill_bundle", "Skills", "Build reusable research workflows."),
-        target("agent_system", "Agent guidance", "Improve instructions for future sessions."),
-      ],
+      capabilities: {
+        ...envelope.capabilities,
+        evaluated_profile: {
+          ...envelope.capabilities.evaluated_profile,
+          execution_mode: executionMode === "self-deployed" ? "self_deployed" : "subscription",
+        },
+        targets: [
+          target("agent_system", "Agent guidance", "Improve instructions for future sessions."),
+          target("skill_bundle", "Skills", "Build reusable research workflows."),
+          target("text_memory", "Text memory", "Preserve durable findings across sessions."),
+        ],
+      },
     });
   }
 
@@ -866,9 +943,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       schema_version: "1",
       project_id: project.project_id,
       project_etag: project.etag,
-      capability_registry_digest: capabilities.registry_digest,
+      registry_digest: capabilities.capabilities.registry_digest,
       valid: true,
-      issues: [],
+      checks: [{ id: "project.valid", status: "ok", message: "Project validation succeeded.", target_id: null, method_id: null }],
       validated_at: NOW,
     });
   }
@@ -951,17 +1028,24 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   private makeServices(online: boolean, degraded: boolean): ServiceV1[] {
-    const state: ServiceV1["state"] = online ? (degraded ? "degraded" : "healthy") : "unavailable";
+    const status: ServiceV1["status"] = online ? (degraded ? "degraded" : "running") : "unavailable";
     return [
-      { service_id: "service-runtime-fixture", display_name: "OpenEvo runtime", kind: "core" as const },
-      { service_id: "service-model-fixture", display_name: "Model service", kind: "model" as const },
-      { service_id: "service-artifacts-fixture", display_name: "Evolution storage", kind: "artifact_store" as const },
+      { id: "service-runtime-fixture", display_name: "OpenEvo runtime", kind: "control" as const },
+      { id: "service-model-fixture", display_name: "Model service", kind: "inference" as const },
+      { id: "service-artifacts-fixture", display_name: "Evolution storage", kind: "artifact_store" as const },
     ].map((service) => serviceV1Schema.parse({
-      schema_version: "1",
       ...service,
-      state,
-      health_summary: online ? (degraded ? "Needs attention." : "Ready.") : "Available after connection.",
-      restart_supported: service.kind !== "artifact_store",
+      status,
+      status_message: online ? (degraded ? "Needs attention." : "Ready.") : "Available after connection.",
+      restartable: service.kind !== "artifact_store",
+      error: null,
+      model_preparation: service.kind === "inference" ? {
+        ...structuredClone(CONTRACT_FIXTURE_V1.project.remote.model_preparation),
+        status: online ? "ready" : "unresolved",
+        downloaded_bytes: online ? 1_024 : null,
+        total_bytes: online ? 1_024 : null,
+      } : null,
+      updated_at: NOW,
       observed_at: NOW,
       etag: ETAG_D,
     }));
@@ -970,17 +1054,19 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private makeDiagnostic(degraded: boolean): DiagnosticReportV1 {
     return diagnosticReportV1Schema.parse({
       schema_version: "1",
-      diagnostic_id: "diagnostic-fixture-1",
-      status: degraded ? "degraded" : "healthy",
-      generated_at: NOW,
+      id: "diagnostic-fixture-1",
+      status: "succeeded",
+      scopes: ["environment", "services"],
+      target: { kind: "global" },
       checks: [
-        { check_id: "connection", label: "Remote connection", status: "passed", summary: "Secure connection is ready.", repair_action: "none" },
-        { check_id: "environment", label: "Research environment", status: degraded ? "warning" : "passed", summary: degraded ? "A service should be restarted." : "Required components are available.", repair_action: degraded ? "openevo_can_retry" : "none" },
-        { check_id: "model", label: "Model service", status: degraded ? "warning" : "passed", summary: degraded ? "Model service response is delayed." : "Model service is ready.", repair_action: degraded ? "openevo_can_retry" : "none" },
+        { id: "environment", scope: "environment", status: degraded ? "warning" : "ok", message: degraded ? "A service should be restarted." : "Required components are available.", repair_action: degraded ? "openevo_can_retry" : "unsupported", logs_ref: null },
+        { id: "services", scope: "services", status: degraded ? "warning" : "ok", message: degraded ? "Model service response is delayed." : "Model service is ready.", repair_action: degraded ? "openevo_can_retry" : "unsupported", logs_ref: null },
       ],
-      findings: degraded
-        ? [{ finding_id: "model-latency", severity: "warning", category: "model_service", summary: "Model service response is delayed.", next_action: "Restart the model service." }]
-        : [],
+      created_at: NOW,
+      updated_at: NOW,
+      observed_at: NOW,
+      finished_at: NOW,
+      error: null,
       etag: ETAG_D,
     });
   }
@@ -1018,7 +1104,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     category: "project" | "run",
     options: {
       retryable?: boolean;
-      repairAction?: "none" | "openevo_can_retry" | "user_input_required" | "reconnect_required" | "upgrade_required";
+      repairAction?: "openevo_can_retry" | "openevo_can_install" | "openevo_can_reconfigure" | "user_action_required" | "unsupported";
     } = {},
   ): DesktopApiError {
     return new DesktopApiError(apiErrorV1Schema.parse({
@@ -1040,45 +1126,53 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private addEquivalentQueuedRun(projectId: string): void {
     const project = this.requireProject(projectId);
     const base = structuredClone(CONTRACT_FIXTURE_V1.run);
+    const id = "run-equivalent-pending";
+    const revision = this.revision(this.currentGeneration(project), projectId);
+    const queuedReason = { code: "admission_pending" as const, summary: "The original session is already queued.", retry_after_seconds: null };
+    const attempt = {
+      ...base.attempts[0],
+      id: "attempt-equivalent-pending",
+      run_id: id,
+      status: "queued" as const,
+      queued_reason: queuedReason,
+      started_at: null,
+      finished_at: null,
+      error: null,
+    };
     const run = runV1Schema.parse({
       ...base,
-      run_id: "run-equivalent-pending",
+      id,
       project_id: projectId,
-      state: "queued",
-      queued_reason: {
-        code: "project_activation_pending",
-        summary: "The original session is already queued.",
-        retry_after_seconds: null,
-      },
-      pinned_revision: this.revision(this.currentGeneration(project), "active"),
-      successor_revision: null,
-      latest_attempt: {
-        ...base.latest_attempt,
-        attempt_id: "attempt-equivalent-pending",
-        state: "queued",
-        started_at: null,
-        finished_at: null,
-      },
+      status: "queued",
+      queued_reason: queuedReason,
+      current_attempt_id: attempt.id,
+      current_attempt: attempt,
+      current_error: null,
+      pinned_revision: revision,
+      required_revision: { revision, reachable_from_revision_id: revision.id, relation: "active" },
+      revision_transition: null,
+      attempts: [attempt],
       created_at: NOW,
       updated_at: NOW,
-      error: null,
+      admitted_at: NOW,
+      started_at: null,
+      finished_at: null,
     });
     this.runs = [run, ...this.runs];
-    this.timelines[run.run_id] = [this.timeline(1, "admission", "queued", "Session admitted", "The original session is already queued.")];
+    this.timelines[run.id] = [this.timeline(1, "admission", "pending", "Session admitted", "The original session is already queued.", run.id)];
   }
 
-  private revision(generation: number, state: "active" | "queued" | "preparing" | "cancelled") {
+  private revision(generation: number, projectId = this.projects[0]?.project_id ?? "project-fixture-1") {
     return {
-      revision_id: `revision-fixture-${generation}`,
+      id: `revision-fixture-${generation}`,
+      project_id: projectId,
       generation,
-      manifest_digest: generation % 2 === 0 ? C : A,
-      state,
+      manifest_sha256: generation % 2 === 0 ? C : A,
     } as const;
   }
 
   private currentGeneration(project: ProjectV1): number {
-    const activeSuccessor = this.runs.find((run) => run.successor_revision?.revision_id === project.current_revision_id)?.successor_revision;
-    return activeSuccessor?.generation ?? 1;
+    return project.remote?.active_revision?.generation ?? 1;
   }
 
   private requireProfile(profileId: string): RemoteProfileV1 {
@@ -1094,7 +1188,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   private requireRun(runId: string): RunV1 {
-    const run = this.runs.find((item) => item.run_id === runId);
+    const run = this.runs.find((item) => item.id === runId);
     if (!run) throw new Error("Session was not found.");
     return run;
   }
@@ -1106,7 +1200,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   private replaceRun(run: RunV1): void {
-    this.runs = this.runs.map((item) => (item.run_id === run.run_id ? run : item));
+    this.runs = this.runs.map((item) => (item.id === run.id ? run : item));
     this.emit();
   }
 
@@ -1207,14 +1301,17 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     };
     this.capabilities = projectCapabilitiesV1Schema.parse({
       ...capabilities,
-      targets: capabilities.targets.map((target) => target.target_id === "text_memory"
-        ? {
-            ...target,
-            methods: target.methods.map((method) => method.method_id === "reference_text_memory"
-              ? { ...method, config_schema: configSchema, default_config: defaultConfig }
-              : method),
-          }
-        : target),
+      capabilities: {
+        ...capabilities.capabilities,
+        targets: capabilities.capabilities.targets.map((target) => target.target_id === "text_memory"
+          ? {
+              ...target,
+              methods: target.methods.map((method) => method.method_id === "reference_text_memory"
+                ? { ...method, config_schema_json: canonicalJsonString(configSchema), default_config_json: canonicalJsonString(defaultConfig) }
+                : method),
+            }
+          : target),
+      },
     });
     const updated = projectV1Schema.parse({
       ...project,
@@ -1252,9 +1349,12 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     if (!project || !capabilities) return;
     this.capabilities = projectCapabilitiesV1Schema.parse({
       ...capabilities,
-      targets: capabilities.targets.map((target) => target.target_id === "text_memory"
-        ? { ...target, effective_default_method_id: null }
-        : target),
+      capabilities: {
+        ...capabilities.capabilities,
+        targets: capabilities.capabilities.targets.map((target) => target.target_id === "text_memory"
+          ? { ...target, effective_default_method_id: null }
+          : target),
+      },
     });
     const updated = projectV1Schema.parse({
       ...project,
@@ -1289,45 +1389,60 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   useRunStateReviewScenario(): void {
     const project = this.projects[0];
     if (!project) return;
-    const pinned = this.revision(2, "active");
+    const pinned = this.revision(2, project.project_id);
     const base = structuredClone(CONTRACT_FIXTURE_V1.run);
     const makeRun = (
       id: string,
-      state: RunV1["state"],
+      status: RunV1["status"],
       updatedAt: string,
       options: { queued?: boolean; failed?: boolean } = {},
-    ) => runV1Schema.parse({
-      ...base,
-      run_id: id,
-      project_id: project.project_id,
-      state,
-      queued_reason: options.queued ? {
+    ) => {
+      const error = options.failed ? this.apiError(409, "model_load_failed", "The model worker could not load the selected model.", "run").apiError : null;
+      const queuedReason = options.queued ? {
         code: "service_starting",
         summary: "The selected model is being prepared.",
         retry_after_seconds: 5,
-      } : null,
-      pinned_revision: pinned,
-      successor_revision: null,
-      latest_attempt: {
-        ...base.latest_attempt,
-        attempt_id: `attempt-${id}`,
-        state,
-        started_at: state === "queued" ? null : updatedAt,
-        finished_at: isTerminal(state) ? updatedAt : null,
-      },
-      created_at: "2026-07-14T10:00:00Z",
-      updated_at: updatedAt,
-      error: options.failed ? this.apiError(409, "model_load_failed", "The model worker could not load the selected model.", "run").apiError : null,
-    });
+      } as const : null;
+      const attempt = {
+        ...base.attempts[0],
+        id: `attempt-${id}`,
+        run_id: id,
+        status,
+        queued_reason: queuedReason,
+        updated_at: updatedAt,
+        started_at: status === "queued" ? null : updatedAt,
+        finished_at: isTerminal(status) ? updatedAt : null,
+        error,
+      };
+      return runV1Schema.parse({
+        ...base,
+        id,
+        project_id: project.project_id,
+        status,
+        queued_reason: queuedReason,
+        current_attempt_id: attempt.id,
+        current_attempt: attempt,
+        current_error: error,
+        pinned_revision: pinned,
+        required_revision: { revision: pinned, reachable_from_revision_id: pinned.id, relation: "active" },
+        revision_transition: null,
+        attempts: [attempt],
+        created_at: "2026-07-14T10:00:00Z",
+        updated_at: updatedAt,
+        admitted_at: NOW,
+        started_at: status === "queued" ? null : updatedAt,
+        finished_at: isTerminal(status) ? updatedAt : null,
+      });
+    };
     this.runs = [
       makeRun("run-succeeded", "succeeded", "2026-07-14T10:10:00Z"),
       makeRun("run-queued-model", "queued", "2026-07-14T10:40:00Z", { queued: true }),
       makeRun("run-cancelled", "cancelled", "2026-07-14T10:20:00Z"),
       makeRun("run-failed-model", "failed", "2026-07-14T10:30:00Z", { failed: true }),
     ];
-    this.timelines["run-queued-model"] = [this.timeline(1, "admission", "queued", "Model preparation", "The selected model is being prepared.")];
-    this.services = this.services.map((service) => service.kind === "model"
-      ? serviceV1Schema.parse({ ...service, state: "starting", health_summary: "Preparing the selected model." })
+    this.timelines["run-queued-model"] = [this.timeline(1, "admission", "pending", "Model preparation", "The selected model is being prepared.", "run-queued-model")];
+    this.services = this.services.map((service) => service.kind === "inference"
+      ? serviceV1Schema.parse({ ...service, status: "starting", status_message: "Preparing the selected model.", model_preparation: service.model_preparation ? { ...service.model_preparation, status: "downloading", downloaded_bytes: 512, total_bytes: 1_024 } : null })
       : service);
   }
 
@@ -1336,19 +1451,25 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     if (!project) return;
     const runId = "run-revision-4";
     const base = structuredClone(CONTRACT_FIXTURE_V1.run);
+    const pinned = this.revision(2, project.project_id);
+    const attempt = { ...base.attempts[0], id: "attempt-revision-4", run_id: runId, status: "succeeded" as const, finished_at: NOW };
     const run = runV1Schema.parse({
       ...base,
-      run_id: runId,
+      id: runId,
       project_id: project.project_id,
-      state: "succeeded",
+      status: "succeeded",
       queued_reason: null,
-      pinned_revision: this.revision(2, "active"),
-      successor_revision: this.revision(4, "active"),
-      latest_attempt: { ...base.latest_attempt, attempt_id: "attempt-revision-4", state: "succeeded", finished_at: NOW },
-      error: null,
+      current_attempt_id: attempt.id,
+      current_attempt: attempt,
+      current_error: null,
+      pinned_revision: pinned,
+      required_revision: { revision: pinned, reachable_from_revision_id: pinned.id, relation: "active" },
+      revision_transition: null,
+      attempts: [attempt],
+      finished_at: NOW,
     });
     this.runs = [run, ...this.runs];
-    this.projects = [{ ...project, current_revision_id: "revision-fixture-4" }, ...this.projects.slice(1)];
+    this.projects = [projectV1Schema.parse({ ...project, remote: project.remote ? { ...project.remote, active_revision: this.revision(4, project.project_id) } : null }), ...this.projects.slice(1)];
     this.createArtifacts(runId, 4);
     const times: Record<string, string> = {
       parametric_memory: "2026-07-14T12:04:00Z",
@@ -1356,24 +1477,24 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       text_memory: "2026-07-14T12:02:00Z",
       agent_system: "2026-07-14T12:01:00Z",
     };
-    this.artifacts = this.artifacts.map((artifact) => artifact.revision_ids.includes("revision-fixture-4")
+    this.artifacts = this.artifacts.map((artifact) => artifact.membership_revisions.some((revision) => revision.id === "revision-fixture-4")
       ? artifactV1Schema.parse({ ...artifact, created_at: times[artifact.target_id] ?? NOW })
       : artifact);
-    const source = this.artifacts.find((artifact) => artifact.target_id === "text_memory" && artifact.revision_ids.includes("revision-fixture-4"));
+    const source = this.artifacts.find((artifact) => artifact.target_id === "text_memory" && artifact.membership_revisions.some((revision) => revision.id === "revision-fixture-4"));
     if (source) {
       const additionalSelected = artifactV1Schema.parse({
         ...source,
-        artifact_id: "artifact-selected-additional-memory",
+        id: "artifact-selected-additional-memory",
         display_name: "Additional selected memory",
         summary: "Additional selected memory",
         selected: true,
         created_at: "2026-07-14T12:02:00Z",
       });
-      this.contents.set(additionalSelected.artifact_id, this.makeContent(additionalSelected, 4));
-      this.diffs.set(additionalSelected.artifact_id, this.makeDiff(additionalSelected, source, 4));
+      this.contents.set(additionalSelected.id, this.makeContent(additionalSelected, 4));
+      this.diffs.set(additionalSelected.id, this.makeDiff(additionalSelected, source, 4));
       this.artifacts = [artifactV1Schema.parse({
         ...source,
-        artifact_id: "artifact-unselected-newer",
+        id: "artifact-unselected-newer",
         display_name: "Unselected newer artifact",
         selected: false,
         created_at: "2026-07-14T12:04:00Z",
@@ -1388,7 +1509,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   makeRevisionEvidenceUnknown(): void {
     const project = this.projects[0];
     if (!project) return;
-    this.projects = [{ ...project, current_revision_id: "revision-unknown" }, ...this.projects.slice(1)];
+    this.projects = [projectV1Schema.parse({ ...project, remote: project.remote ? { ...project.remote, status: "blocked", active_revision: null } : null }), ...this.projects.slice(1)];
     this.emit();
   }
 
@@ -1403,7 +1524,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   failNextRunStartWithConflict(options: {
     code: string;
     retryable: boolean;
-    repairAction: "none" | "openevo_can_retry" | "user_input_required" | "reconnect_required" | "upgrade_required";
+    repairAction: "openevo_can_retry" | "openevo_can_install" | "openevo_can_reconfigure" | "user_action_required" | "unsupported";
     addEquivalentRun?: boolean;
   }): void {
     this.nextRunStartConflict = {
@@ -1471,7 +1592,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       name: "Second research project",
       task: { ...base.task, title: "Second research task" },
       state: "draft",
-      current_revision_id: null,
+      remote: null,
       etag: ETAG_A,
     });
     this.projects = [...this.projects, project];
@@ -1499,14 +1620,17 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   useAcceptedSavedMethod(): void {
     const project = this.projects[0];
     const capabilities = this.capabilities;
-    const target = capabilities?.targets.find((item) => item.target_id === "text_memory");
+    const target = capabilities?.capabilities.targets.find((item) => item.target_id === "text_memory");
     const accepted = target?.accepted_methods[0];
     if (!project || !capabilities || !target || !accepted) return;
     this.capabilities = projectCapabilitiesV1Schema.parse({
       ...capabilities,
-      targets: capabilities.targets.map((item) => item.target_id === target.target_id
-        ? { ...item, accepted_methods: [...item.accepted_methods, { ...accepted, method_id: "hidden_text_memory" }] }
-        : item),
+      capabilities: {
+        ...capabilities.capabilities,
+        targets: capabilities.capabilities.targets.map((item) => item.target_id === target.target_id
+          ? { ...item, accepted_methods: [...item.accepted_methods, { ...accepted, method_id: "hidden_text_memory" }].sort((left, right) => left.method_id.localeCompare(right.method_id)) }
+          : item),
+      },
     });
     const updated = projectV1Schema.parse({
       ...project,
@@ -1520,14 +1644,17 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   useResolverSavedMethod(): void {
     const project = this.projects[0];
     const capabilities = this.capabilities;
-    const target = capabilities?.targets.find((item) => item.target_id === "text_memory");
+    const target = capabilities?.capabilities.targets.find((item) => item.target_id === "text_memory");
     const resolved = target?.accepted_methods[0];
     if (!project || !capabilities || !target || !resolved) return;
     this.capabilities = projectCapabilitiesV1Schema.parse({
       ...capabilities,
-      targets: capabilities.targets.map((item) => item.target_id === target.target_id
-        ? { ...item, selection_resolvers: [{ selection_value: "auto", display_name: "Automatic", description: "Core selects from accepted methods.", resolved_methods: [resolved] }] }
-        : item),
+      capabilities: {
+        ...capabilities.capabilities,
+        targets: capabilities.capabilities.targets.map((item) => item.target_id === target.target_id
+          ? { ...item, selection_resolvers: [{ selection_value: "auto", display_name: "Automatic", description: "Core selects from accepted methods.", resolved_methods: [resolved] }] }
+          : item),
+      },
     });
     const updated = projectV1Schema.parse({
       ...project,
@@ -1554,7 +1681,7 @@ export function createFixtureDesktopProductProvider(
   return new FixtureDesktopProductProvider(options);
 }
 
-function isTerminal(state: RunV1["state"]): boolean {
+function isTerminal(state: RunV1["status"]): boolean {
   return state === "succeeded" || state === "failed" || state === "cancelled";
 }
 
@@ -1575,4 +1702,28 @@ function credentialKindsForProfile(
     ...(proxy?.http_url ? ["http_proxy_password" as const] : []),
     ...(proxy?.https_url ? ["https_proxy_password" as const] : []),
   ];
+}
+
+function capabilityExecutionMode(capabilities: ProjectCapabilitiesV1): ProjectV1["execution"]["mode"] {
+  return capabilities.capabilities.evaluated_profile.execution_mode === "self_deployed"
+    ? "self-deployed"
+    : "codex_subscription_transcript";
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function canonicalJsonString(value: unknown): string {
+  return JSON.stringify(sortCanonicalJson(value));
+}
+
+function sortCanonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortCanonicalJson);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, sortCanonicalJson(child)]),
+  );
 }

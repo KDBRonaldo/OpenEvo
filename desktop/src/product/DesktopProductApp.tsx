@@ -60,6 +60,7 @@ import {
 import { MethodConfigEditor, methodConfigErrors } from "./MethodConfigEditor";
 
 type ProductEvolutionTargets = ProjectV1["evolution"]["targets"];
+type EvolutionCapabilitiesV1 = ProjectCapabilitiesV1["capabilities"];
 
 type Workspace = "research" | "evolution" | "system";
 type AsyncState = "idle" | "working";
@@ -164,7 +165,7 @@ export function DesktopProductApp({
     ? snapshot?.profiles.find((item) => item.profile_id === project.profile_id) ?? null
     : snapshot?.profiles[0] ?? null;
   const projectRuns = stableRunOrder(snapshot?.runs.filter((run) => run.project_id === project?.project_id) ?? []);
-  const activeRun = projectRuns.find((run) => !isTerminal(run.state)) ?? null;
+  const activeRun = projectRuns.find((run) => !isTerminal(run.status)) ?? null;
 
   const act = useCallback(async (action: () => Promise<unknown>, conflictRecovery: ActionRecovery = null, refreshOnUnknown = false): Promise<ActionAttemptResult> => {
     setActionState("working");
@@ -302,12 +303,12 @@ export function DesktopProductApp({
               runs={projectRuns}
               activeRun={activeRun}
               timelines={snapshot.timelines}
-              modelService={snapshot.services.find((service) => service.kind === "model") ?? null}
+              modelService={snapshot.services.find((service) => service.kind === "inference") ?? null}
               canStart={canStart}
               startReason={startReason}
               busy={actionState === "working"}
               onStart={() => project && void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), { kind: "readmit_run", projectId: project.project_id })}
-              onCancel={() => activeRun && void act(() => provider.cancelRun(activeRun.run_id, resourceIntent(snapshot, activeRun.etag)))}
+              onCancel={() => activeRun && void act(() => provider.cancelRun(activeRun.id, resourceIntent(snapshot, activeRun.etag)))}
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
               onOpenEvolution={() => setWorkspace("evolution")}
               onOpenSystem={() => setWorkspace("system")}
@@ -333,7 +334,7 @@ export function DesktopProductApp({
               onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id, resourceIntent(snapshot, profile.etag)))}
               onRepair={() => project && void act(() => provider.repairProject(project.project_id, resourceIntent(snapshot, project.etag)))}
               onRestart={(serviceId) => {
-                const service = snapshot.services.find((item) => item.service_id === serviceId);
+                const service = snapshot.services.find((item) => item.id === serviceId);
                 if (service) void act(() => provider.restartService(serviceId, resourceIntent(snapshot, service.etag)));
               }}
               onConfigure={() => setConnectionSettingsOpen(true)}
@@ -362,8 +363,8 @@ export function DesktopProductApp({
                 const created = await provider.createProject({
                   name: input.name ?? "Untitled research",
                   profile_id: profile.profile_id,
-                  task: input.task ?? { title: "Research task", objective: "Describe the research objective.", task_ref: null },
-                  source: input.source ?? { kind: "scratch", display_name: "New workspace", source_ref: null },
+                  task: input.task ?? { title: "Research task", objective: "Describe the research objective." },
+                  source: input.source ?? { kind: "scratch", display_name: "New workspace" },
                   execution: input.execution ?? selfDeployedExecution("Qwen/Qwen3-8B"),
                   evolution: input.evolution ?? { targets: {} },
                 }, mutationIntent(snapshot, actionId));
@@ -582,11 +583,11 @@ function ResearchWorkspace({
   if (!project) {
     return <EmptyState icon={FolderOpen} title="Create a research project" detail="Define a task and source to begin a session." action="Create project" onAction={onOpenSettings} />;
   }
-  const latestTerminal = runs.find((run) => isTerminal(run.state));
+  const latestTerminal = runs.find((run) => isTerminal(run.status));
   const recover = (run: RunV1) => {
-    const action = run.error?.repair_action;
-    if (action === "reconnect_required" || action === "upgrade_required") return { label: "Open System", onClick: onOpenSystem };
-    if (action === "user_input_required") return { label: "Edit project", onClick: onOpenSettings };
+    const action = run.current_error?.repair_action;
+    if (action === "openevo_can_install" || action === "openevo_can_reconfigure" || action === "unsupported") return { label: "Open System", onClick: onOpenSystem };
+    if (action === "user_action_required") return { label: "Edit project", onClick: onOpenSettings };
     return { label: "Retry session", onClick: onStart };
   };
   return (
@@ -623,14 +624,14 @@ function ResearchWorkspace({
         <section className="product-panel active-run-panel">
           <div className="panel-heading">
             <div><span className="panel-kicker">Active session</span><h2>{activeRun ? sessionTitle(activeRun, runs) : "No session running"}</h2></div>
-            {activeRun ? <StatePill state={activeRun.state} /> : <span className="muted-pill">Ready</span>}
+            {activeRun ? <StatePill state={activeRun.status} /> : <span className="muted-pill">Ready</span>}
           </div>
           {activeRun ? (
             <>
               <RevisionPin run={activeRun} />
               <RunStatusDetail run={activeRun} modelService={modelService} onRefresh={onRefresh} />
-              <Timeline entries={timelines[activeRun.run_id] ?? []} />
-              <button className="danger-text-button" type="button" onClick={onCancel} disabled={busy || activeRun.state === "cancelling"} title={busy ? "Another action is running" : "Cancel this session"}>
+              <Timeline entries={timelines[activeRun.id] ?? []} />
+              <button className="danger-text-button" type="button" onClick={onCancel} disabled={busy || activeRun.status === "cancelling"} title={busy ? "Another action is running" : "Cancel this session"}>
                 <Square size={14} fill="currentColor" /> Cancel session
               </button>
             </>
@@ -651,24 +652,25 @@ function ResearchWorkspace({
 }
 
 function RevisionPin({ run }: { run: RunV1 }) {
+  const successor = run.revision_transition?.successor_revision ?? null;
   return (
     <div className="revision-pin">
-      <div><span>Pinned context</span><strong>Revision {run.pinned_revision.generation}</strong></div>
+      <div><span>Pinned context</span><strong>{run.pinned_revision ? `Revision ${run.pinned_revision.generation}` : "Admission pending"}</strong></div>
       <ArrowRight size={16} />
-      <div><span>Successor revision</span><strong>{run.successor_revision ? `Revision ${run.successor_revision.generation}` : "Not reported"}</strong></div>
-      {run.successor_revision ? <StatePill state={run.successor_revision.state} /> : null}
+      <div><span>Successor revision</span><strong>{successor ? `Revision ${successor.generation}` : "Not reported"}</strong></div>
+      {run.revision_transition ? <StatePill state={run.revision_transition.state} /> : null}
     </div>
   );
 }
 
 function Timeline({ entries }: { entries: readonly DesktopProductSnapshot["timelines"][string][number][] }) {
-  const visible = [...entries].sort((left, right) => compareTimestampAndId(left.occurred_at, left.entry_id, right.occurred_at, right.entry_id)).slice(-4);
+  const visible = [...entries].sort((left, right) => compareTimestampAndId(left.occurred_at, left.id, right.occurred_at, right.id)).slice(-4);
   return (
     <ol className="run-timeline">
       {visible.map((entry) => (
-        <li key={entry.entry_id} className={entry.state}>
-          <span className="timeline-marker">{entry.state === "succeeded" ? <Check size={11} /> : entry.state === "running" ? <LoaderCircle className="spin" size={11} /> : null}</span>
-          <div><strong>{entry.title}</strong><span>{entry.summary}</span></div>
+        <li key={entry.id} className={entry.status}>
+          <span className="timeline-marker">{entry.status === "succeeded" ? <Check size={11} /> : entry.status === "running" ? <LoaderCircle className="spin" size={11} /> : null}</span>
+          <div><strong>{entry.title}</strong><span>{entry.message}</span></div>
         </li>
       ))}
     </ol>
@@ -694,16 +696,16 @@ function SessionTable({
       {runs.map((run) => {
         const recovery = onRecover(run);
         return (
-        <div className="session-table-row" role="row" key={run.run_id}>
+        <div className="session-table-row" role="row" key={run.id}>
           <strong role="cell">{sessionTitle(run, runs)}</strong>
-          <span role="cell"><StatePill state={run.state} /></span>
+          <span role="cell"><StatePill state={run.status} /></span>
           <span role="cell" className="session-detail">
             <RunStatusText run={run} modelService={modelService} />
-            {run.state === "queued" ? <button type="button" className="text-button" onClick={onRefresh}><RefreshCw size={13} /> Refresh status</button> : null}
-            {run.state === "failed" ? <button type="button" className="text-button" onClick={recovery.onClick} disabled={activeRun !== null}>{recovery.label === "Retry session" ? <RotateCcw size={13} /> : <Wrench size={13} />} {recovery.label}</button> : null}
+            {run.status === "queued" ? <button type="button" className="text-button" onClick={onRefresh}><RefreshCw size={13} /> Refresh status</button> : null}
+            {run.status === "failed" ? <button type="button" className="text-button" onClick={recovery.onClick} disabled={activeRun !== null}>{recovery.label === "Retry session" ? <RotateCcw size={13} /> : <Wrench size={13} />} {recovery.label}</button> : null}
           </span>
-          <span role="cell">Revision {run.pinned_revision.generation}</span>
-          <span role="cell">{run.successor_revision ? `Revision ${run.successor_revision.generation}` : "Unknown"}</span>
+          <span role="cell">{run.pinned_revision ? `Revision ${run.pinned_revision.generation}` : "Pending"}</span>
+          <span role="cell">{run.revision_transition ? `Revision ${run.revision_transition.successor_revision.generation}` : "Unknown"}</span>
           <span role="cell">{formatTime(run.updated_at)}</span>
         </div>
         );
@@ -713,45 +715,45 @@ function SessionTable({
 }
 
 function RunStatusDetail({ run, modelService, onRefresh }: { run: RunV1; modelService: ServiceV1 | null; onRefresh: () => void }) {
-  if (run.state !== "queued" && run.state !== "failed") return null;
+  if (run.status !== "queued" && run.status !== "failed") return null;
   return (
-    <div className={`run-status-detail ${run.state}`}>
+    <div className={`run-status-detail ${run.status}`}>
       <div>
-        <strong>{run.state === "queued" && run.queued_reason ? queuedReasonLabel(run.queued_reason.code, modelService) : stateLabel(run.state)}</strong>
+        <strong>{run.status === "queued" && run.queued_reason ? queuedReasonLabel(run.queued_reason.code, modelService) : stateLabel(run.status)}</strong>
         <RunStatusText run={run} modelService={modelService} />
       </div>
-      {run.state === "queued" ? <button type="button" className="secondary-button" onClick={onRefresh}><RefreshCw size={14} /> Refresh status</button> : null}
+      {run.status === "queued" ? <button type="button" className="secondary-button" onClick={onRefresh}><RefreshCw size={14} /> Refresh status</button> : null}
     </div>
   );
 }
 
 function RunStatusText({ run, modelService }: { run: RunV1; modelService: ServiceV1 | null }) {
-  if (run.state === "queued" && run.queued_reason) {
+  if (run.status === "queued" && run.queued_reason) {
     const retry = run.queued_reason.retry_after_seconds === null ? "" : ` Check again in about ${run.queued_reason.retry_after_seconds} seconds.`;
-    const model = run.queued_reason.code === "service_starting" && modelService?.state === "starting" ? ` ${modelService.health_summary}` : "";
+    const model = run.queued_reason.code === "service_starting" && modelService?.status === "starting" ? ` ${modelService.status_message ?? ""}` : "";
     return <span>{run.queued_reason.summary}{model}{retry}</span>;
   }
-  if (run.state === "failed" && run.error) return <span>{run.error.message}{run.error.next_action ? ` ${run.error.next_action}` : ""}</span>;
-  if (run.state === "cancelled") return <span>Cancelled without reporting a successful successor.</span>;
-  if (run.state === "succeeded") return <span>{run.successor_revision?.state === "active" ? `Revision ${run.successor_revision.generation} is active.` : "The session succeeded; successor readiness is not yet known."}</span>;
-  return <span>{stateLabel(run.state)}</span>;
+  if (run.status === "failed" && run.current_error) return <span>{run.current_error.message}{run.current_error.next_action ? ` ${run.current_error.next_action}` : ""}</span>;
+  if (run.status === "cancelled") return <span>Cancelled without reporting a successful successor.</span>;
+  if (run.status === "succeeded") return <span>{run.revision_transition?.state === "active" ? `Revision ${run.revision_transition.successor_revision.generation} is active.` : "The session succeeded; successor readiness is not yet known."}</span>;
+  return <span>{stateLabel(run.status)}</span>;
 }
 
 function queuedReasonLabel(code: NonNullable<RunV1["queued_reason"]>["code"], modelService: ServiceV1 | null): string {
-  if (code === "capacity_unavailable") return "Waiting for capacity";
+  if (code === "capacity") return "Waiting for capacity";
   if (code === "required_revision_uncommitted") return "Waiting for revision";
-  if (code === "project_activation_pending") return "Project activation";
-  return modelService?.state === "starting" ? "Model preparation" : "Service preparation";
+  if (code === "admission_pending") return "Admission pending";
+  return modelService?.status === "starting" ? "Model preparation" : "Service preparation";
 }
 
 function RunOutcomeSummary({ run, onOpenEvolution, recovery }: { run: RunV1; onOpenEvolution: () => void; recovery: { label: string; onClick: () => void } }) {
-  const succeeded = run.state === "succeeded";
+  const succeeded = run.status === "succeeded";
   return (
-    <div className={`completed-summary ${run.state}`}>
-      {succeeded ? <CheckCircle2 size={25} /> : run.state === "failed" ? <XCircle size={25} /> : <Square size={22} />}
-      <div><strong>{succeeded ? "Latest session complete" : run.state === "failed" ? "Latest session failed" : "Latest session cancelled"}</strong><RunStatusText run={run} modelService={null} /></div>
-      {succeeded && run.successor_revision?.state === "active" ? <button className="text-button" type="button" onClick={onOpenEvolution}>View changes <ArrowRight size={14} /></button> : null}
-      {run.state === "failed" ? <button className="text-button" type="button" onClick={recovery.onClick}>{recovery.label === "Retry session" ? <RotateCcw size={14} /> : <Wrench size={14} />} {recovery.label}</button> : null}
+    <div className={`completed-summary ${run.status}`}>
+      {succeeded ? <CheckCircle2 size={25} /> : run.status === "failed" ? <XCircle size={25} /> : <Square size={22} />}
+      <div><strong>{succeeded ? "Latest session complete" : run.status === "failed" ? "Latest session failed" : "Latest session cancelled"}</strong><RunStatusText run={run} modelService={null} /></div>
+      {succeeded && run.revision_transition?.state === "active" ? <button className="text-button" type="button" onClick={onOpenEvolution}>View changes <ArrowRight size={14} /></button> : null}
+      {run.status === "failed" ? <button className="text-button" type="button" onClick={recovery.onClick}>{recovery.label === "Retry session" ? <RotateCcw size={14} /> : <Wrench size={14} />} {recovery.label}</button> : null}
     </div>
   );
 }
@@ -759,9 +761,9 @@ function RunOutcomeSummary({ run, onOpenEvolution, recovery }: { run: RunV1; onO
 function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, provider, onRefresh }: { project: ProjectV1 | null; runs: readonly RunV1[]; artifacts: readonly ArtifactV1[]; artifactCollection: ProductArtifactCollectionState; provider: DesktopProductProvider; onRefresh: () => void }) {
   const activeRevision = project ? authoritativeActiveRevision(project, runs) : null;
   const orderedArtifacts = activeRevision && artifactCollection.status === "complete"
-    ? selectedArtifactsForRevision(artifacts, activeRevision.revision_id)
+    ? selectedArtifactsForRevision(artifacts, activeRevision.id)
     : [];
-  const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(orderedArtifacts[0]?.artifact_id ?? null);
+  const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(orderedArtifacts[0]?.id ?? null);
   const [view, setView] = useState<"content" | "diff">("content");
   const [content, setContent] = useState<ArtifactContentV1 | null>(null);
   const [diff, setDiff] = useState<ArtifactDiffV1 | null>(null);
@@ -769,11 +771,11 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!selectedArtifactId || orderedArtifacts.some((artifact) => artifact.artifact_id === selectedArtifactId)) return;
-    setSelectedArtifactId(orderedArtifacts[0]?.artifact_id ?? null);
+    if (!selectedArtifactId || orderedArtifacts.some((artifact) => artifact.id === selectedArtifactId)) return;
+    setSelectedArtifactId(orderedArtifacts[0]?.id ?? null);
   }, [artifactCollection.status, artifacts, selectedArtifactId]);
   useEffect(() => {
-    if (!selectedArtifactId && orderedArtifacts[0]) setSelectedArtifactId(orderedArtifacts[0].artifact_id);
+    if (!selectedArtifactId && orderedArtifacts[0]) setSelectedArtifactId(orderedArtifacts[0].id);
   }, [artifacts, selectedArtifactId]);
   useEffect(() => {
     if (!selectedArtifactId) return;
@@ -792,7 +794,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
   }, [provider, selectedArtifactId, view]);
 
   if (!project) return <EmptyState icon={Sparkles} title="No evolution history" detail="Choose a project to inspect revisions and artifacts." />;
-  const selected = orderedArtifacts.find((artifact) => artifact.artifact_id === selectedArtifactId) ?? null;
+  const selected = orderedArtifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null;
   const activeGeneration = activeRevision?.generation ?? null;
   return (
     <div className="workspace-stack" data-testid="evolution-workspace">
@@ -813,7 +815,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
           <aside className="artifact-list" aria-label="Evolution artifacts">
             <div className="artifact-list-heading"><span>{activeGeneration === null ? "Revision unknown" : `Revision ${activeGeneration}`}</span><strong>{orderedArtifacts.length} selected</strong></div>
             {orderedArtifacts.map((artifact) => (
-              <button key={artifact.artifact_id} type="button" className={`artifact-list-item ${artifact.artifact_id === selected?.artifact_id ? "active" : ""}`} onClick={() => setSelectedArtifactId(artifact.artifact_id)}>
+              <button key={artifact.id} type="button" className={`artifact-list-item ${artifact.id === selected?.id ? "active" : ""}`} onClick={() => setSelectedArtifactId(artifact.id)}>
                 <span className={`artifact-icon ${artifact.artifact_type}`}>{artifactIcon(artifact.artifact_type)}</span>
                 <span><strong>{artifactTypeLabel(artifact.artifact_type)}</strong><small>{artifact.summary}</small></span>
                 <ArrowRight size={14} />
@@ -855,7 +857,7 @@ function ArtifactContent({ content }: { content: ArtifactContentV1 }) {
       {content.truncated ? <InlineNotice tone="warning" title="Preview is truncated" detail={`Showing ${content.documents.length} of ${content.total_documents} documents.`} /> : null}
       {content.documents.length > 1 ? (
         <div className="document-tabs" role="tablist" aria-label="Artifact documents">
-          {content.documents.map((item) => <button role="tab" aria-selected={item.document_id === document?.document_id} key={item.document_id} type="button" className={item.document_id === document?.document_id ? "active" : ""} onClick={() => setDocumentId(item.document_id)}>{item.title}</button>)}
+          {content.documents.map((item) => <button role="tab" aria-selected={item.document_id === document?.document_id} key={item.document_id} type="button" className={item.document_id === document?.document_id ? "active" : ""} onClick={() => setDocumentId(item.document_id)}>{item.display_name}</button>)}
         </div>
       ) : null}
       {document ? <pre className="artifact-document">{document.content}</pre> : null}
@@ -864,14 +866,19 @@ function ArtifactContent({ content }: { content: ArtifactContentV1 }) {
 }
 
 function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
-  if (diff.hunks.length === 0) return <div className="quiet-empty"><FileDiff size={22} /><p>No textual changes are available for this revision.</p></div>;
+  const hunks = diff.document_changes.flatMap((change, changeIndex) => change.hunks.map((hunk, hunkIndex) => ({
+    hunk,
+    key: `${change.kind}-${changeIndex}-${hunkIndex}`,
+    heading: ("new_document" in change ? change.new_document.relative_path : change.old_document.relative_path),
+  })));
+  if (hunks.length === 0) return <div className="quiet-empty"><FileDiff size={22} /><p>No textual changes are available for this revision.</p></div>;
   return (
     <div className="diff-view">
       {diff.truncated ? <InlineNotice tone="warning" title="Change preview is truncated" detail="Some changes are not shown in this preview." /> : null}
-      {diff.hunks.map((hunk) => (
-        <section key={hunk.hunk_id} className="diff-hunk">
-          <h3>{hunk.heading}</h3>
-          {hunk.lines.map((line, index) => <div key={`${hunk.hunk_id}-${index}`} className={`diff-line ${line.kind}`}><span>{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}</span><code>{line.text}</code></div>)}
+      {hunks.map(({ hunk, key, heading }) => (
+        <section key={key} className="diff-hunk">
+          <h3>{heading}</h3>
+          {hunk.lines.map((line, index) => <div key={`${key}-${index}`} className={`diff-line ${line.kind}`}><span>{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}</span><code>{line.text}</code></div>)}
         </section>
       ))}
     </div>
@@ -903,15 +910,15 @@ function SystemWorkspace({ snapshot, project, profile, busy, onConnect, onRepair
         <section className="product-panel checks-panel">
           <div className="panel-heading"><div><span className="panel-kicker">Environment checks</span><h2>{diagnostic ? diagnosticStatusLabel(diagnostic.status) : "Waiting for connection"}</h2></div>{diagnostic ? <StatePill state={diagnostic.status} /> : null}</div>
           <div className="check-list">
-            {diagnostic?.checks.map((check) => <div className="check-row" key={check.check_id}>{check.status === "passed" ? <CheckCircle2 className="good" size={18} /> : check.status === "warning" ? <AlertCircle className="warn" size={18} /> : <CircleDot size={18} />}<div><strong>{check.label}</strong><span>{check.summary}</span></div>{check.repair_action === "openevo_can_retry" ? <span className="repair-tag">Repairable</span> : null}</div>)}
+            {diagnostic?.checks.map((check) => <div className="check-row" key={check.id}>{check.status === "ok" ? <CheckCircle2 className="good" size={18} /> : check.status === "warning" ? <AlertCircle className="warn" size={18} /> : <CircleDot size={18} />}<div><strong>{stateLabel(check.scope)}</strong><span>{check.message}</span></div>{check.repair_action === "openevo_can_retry" ? <span className="repair-tag">Repairable</span> : null}</div>)}
             {!diagnostic ? <div className="empty-row">Checks run after the remote workspace connects.</div> : null}
           </div>
         </section>
       </div>
       <section className="services-section">
-        <div className="section-heading"><div><Activity size={17} /><h2>Services</h2></div><span>{snapshot.services.filter((service) => service.state === "healthy").length} of {snapshot.services.length} ready</span></div>
+        <div className="section-heading"><div><Activity size={17} /><h2>Services</h2></div><span>{snapshot.services.filter((service) => service.status === "running").length} of {snapshot.services.length} ready</span></div>
         <div className="service-list">
-          {snapshot.services.map((service) => <ServiceRow key={service.service_id} service={service} busy={busy} onRestart={() => onRestart(service.service_id)} />)}
+          {snapshot.services.map((service) => <ServiceRow key={service.id} service={service} busy={busy} onRestart={() => onRestart(service.id)} />)}
         </div>
       </section>
     </div>
@@ -921,10 +928,10 @@ function SystemWorkspace({ snapshot, project, profile, busy, onConnect, onRepair
 function ServiceRow({ service, busy, onRestart }: { service: ServiceV1; busy: boolean; onRestart: () => void }) {
   return (
     <div className="service-row">
-      <span className={`service-indicator ${service.state}`} />
-      <div><strong>{service.display_name}</strong><span>{service.health_summary}</span></div>
-      <StatePill state={service.state} />
-      {service.restart_supported && ["degraded", "failed", "stopped"].includes(service.state) ? <IconButton label={`Restart ${service.display_name}`} onClick={onRestart} disabled={busy}><RefreshCw size={15} /></IconButton> : <span className="service-spacer" />}
+      <span className={`service-indicator ${service.status}`} />
+      <div><strong>{service.display_name}</strong><span>{service.status_message ?? stateLabel(service.status)}</span></div>
+      <StatePill state={service.status} />
+      {service.restartable && ["degraded", "failed", "stopped"].includes(service.status) ? <IconButton label={`Restart ${service.display_name}`} onClick={onRestart} disabled={busy}><RefreshCw size={15} /></IconButton> : <span className="service-spacer" />}
     </div>
   );
 }
@@ -1044,7 +1051,7 @@ function SettingsDrawer({
   project: ProjectV1 | null;
   profileId: string | null;
   capability: DesktopProductSnapshot["capability"];
-  capabilities: ProjectCapabilitiesV1 | null;
+  capabilities: EvolutionCapabilitiesV1 | null;
   busy: boolean;
   onClose: () => void;
   onRetryCapabilities: () => Promise<unknown>;
@@ -1055,7 +1062,7 @@ function SettingsDrawer({
   const [name, setName] = useState(project?.name ?? "New research project");
   const [title, setTitle] = useState(project?.task.title ?? "Research task");
   const [objective, setObjective] = useState(project?.task.objective ?? "");
-  const [source, setSource] = useState<ProjectSourceV1>(project?.source ?? { kind: "scratch", display_name: "New workspace", source_ref: null });
+  const [source, setSource] = useState<ProjectSourceV1>(project?.source ?? { kind: "scratch", display_name: "New workspace", import_ref: null });
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [mode, setMode] = useState(project?.execution.mode ?? "self-deployed");
   const [hfModel, setHfModel] = useState(project?.execution.hf_model ?? "Qwen/Qwen3-8B");
@@ -1067,7 +1074,7 @@ function SettingsDrawer({
   const dialogRef = useDialogFocus(guardedClose.requestClose);
   const saveActionId = useRef(newActionId());
   const activeModel = mode === "self-deployed" ? hfModel : codexModel;
-  const modeCapabilities = capabilities?.execution_mode === mode ? capabilities : null;
+  const modeCapabilities = capabilities && capabilityExecutionMode(capabilities) === mode ? capabilities : null;
   const capabilityMatchesDraft = Boolean(project
     && capability
     && capability.projectId === project.project_id
@@ -1079,7 +1086,7 @@ function SettingsDrawer({
     setName(project?.name ?? "New research project");
     setTitle(project?.task.title ?? "Research task");
     setObjective(project?.task.objective ?? "");
-    setSource(project?.source ?? { kind: "scratch", display_name: "New workspace", source_ref: null });
+    setSource(project?.source ?? { kind: "scratch", display_name: "New workspace", import_ref: null });
     setMode(project?.execution.mode ?? "self-deployed");
     setHfModel(project?.execution.hf_model ?? "Qwen/Qwen3-8B");
     setCodexModel(project?.execution.codex_model ?? "Codex");
@@ -1116,7 +1123,7 @@ function SettingsDrawer({
           <section className="form-section">
             <h3>Research source</h3>
             <div className="segmented-control wide" role="tablist" aria-label="Research source">
-              <button type="button" role="tab" aria-selected={source.kind === "scratch"} tabIndex={source.kind === "scratch" ? 0 : -1} className={source.kind === "scratch" ? "active" : ""} onClick={() => { setSource({ kind: "scratch", display_name: "New workspace", source_ref: null }); setSourceError(null); markDirty(); }}>Scratch</button>
+              <button type="button" role="tab" aria-selected={source.kind === "scratch"} tabIndex={source.kind === "scratch" ? 0 : -1} className={source.kind === "scratch" ? "active" : ""} onClick={() => { setSource({ kind: "scratch", display_name: "New workspace", import_ref: null }); setSourceError(null); markDirty(); }}>Scratch</button>
               <button type="button" role="tab" aria-selected={source.kind === "native_folder_snapshot"} tabIndex={source.kind === "native_folder_snapshot" ? 0 : -1} className={source.kind === "native_folder_snapshot" ? "active" : ""} onClick={async () => {
                 setSourceError(null);
                 try { setSource(await onSelectSource()); markDirty(); } catch (error) { setSourceError(userMessage(error)); }
@@ -1173,7 +1180,7 @@ function SettingsDrawer({
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
         <div className="drawer-footer"><button className="secondary-button" type="button" onClick={reset} disabled={!dirty || busy} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" disabled={!valid || busy || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => void onSave({
           name: name.trim(),
-          task: { title: title.trim(), objective: objective.trim(), task_ref: project?.task.task_ref ?? null },
+          task: { title: title.trim(), objective: objective.trim() },
           source,
           execution: mode === "self-deployed" ? selfDeployedExecution(activeModel.trim()) : subscriptionExecution(activeModel.trim()),
           evolution: { targets: evolution },
@@ -1233,7 +1240,7 @@ interface EvolutionTargetConfigRow {
   readonly targetId: string;
   readonly displayName: string;
   readonly description: string;
-  readonly capability: ProjectCapabilitiesV1["targets"][number] | null;
+  readonly capability: EvolutionCapabilitiesV1["targets"][number] | null;
   readonly selection: ProductEvolutionTargets[string];
   readonly choices: readonly EvolutionChoiceRow[];
   readonly selectedChoice: EvolutionChoiceRow | null;
@@ -1243,7 +1250,7 @@ interface EvolutionTargetConfigRow {
 }
 
 function evolutionTargetRows(
-  capabilities: ProjectCapabilitiesV1 | null,
+  capabilities: EvolutionCapabilitiesV1 | null,
   selections: ProductEvolutionTargets,
 ): EvolutionTargetConfigRow[] {
   const remoteIds = capabilities?.targets.map((target) => target.target_id) ?? [];
@@ -1257,8 +1264,8 @@ function evolutionTargetRows(
       kind: "method",
       supported: method.support.overall === "supported",
       selectable: method.support.overall === "supported",
-      defaultConfig: method.default_config,
-      configSchema: method.config_schema as OpenEvoJsonObject,
+      defaultConfig: parseCapabilityJsonObject(method.default_config_json),
+      configSchema: parseCapabilityJsonObject(method.config_schema_json),
     })) ?? [];
     const resolverChoices: EvolutionChoiceRow[] = capability?.selection_resolvers.map((resolver) => {
       const supported = resolver.resolved_methods.length > 0 && resolver.resolved_methods.every((method) => method.support.overall === "supported");
@@ -1319,8 +1326,8 @@ function enableTarget(row: EvolutionTargetConfigRow): ProductEvolutionTargets[st
   return { enabled: true, method: defaultChoice.id, config: {} };
 }
 
-function defaultEvolution(capabilities: ProjectCapabilitiesV1 | null): ProductEvolutionTargets {
-  return Object.fromEntries((capabilities?.targets ?? []).filter((target) => target.release_enabled && target.effective_default_method_id !== null).map((target) => [target.target_id, {
+function defaultEvolution(capabilities: EvolutionCapabilitiesV1 | null): ProductEvolutionTargets {
+  return Object.fromEntries((capabilities?.targets ?? []).filter((target) => target.exposure === "desktop" && target.effective_default_method_id !== null).map((target) => [target.target_id, {
     enabled: true,
     method: target.effective_default_method_id,
     config: {},
@@ -1398,10 +1405,10 @@ function matchingProfile(snapshot: DesktopProductSnapshot | null, canonicalPaylo
 
 function selectedArtifactsForRevision(artifacts: readonly ArtifactV1[], revisionId: string): ArtifactV1[] {
   return artifacts
-    .filter((artifact) => artifact.selected && artifact.revision_ids.includes(revisionId))
+    .filter((artifact) => artifact.selected && artifact.membership_revisions.some((revision) => revision.id === revisionId))
     .sort((left, right) => {
       const time = Date.parse(right.created_at) - Date.parse(left.created_at);
-      return time || left.artifact_id.localeCompare(right.artifact_id);
+      return time || left.id.localeCompare(right.id);
     });
 }
 
@@ -1410,14 +1417,14 @@ function currentGeneration(project: ProjectV1, runs: readonly RunV1[]): number |
 }
 
 function authoritativeActiveRevision(project: ProjectV1, runs: readonly RunV1[]) {
-  if (project.current_revision_id === null) return null;
-  const revisions = runs
-    .flatMap((run) => [run.pinned_revision, ...(run.successor_revision ? [run.successor_revision] : [])])
-    .filter((item) => item.revision_id === project.current_revision_id);
-  if (revisions.length === 0) return null;
-  const identities = new Set(revisions.map((revision) => `${revision.generation}:${revision.manifest_digest}`));
-  if (identities.size !== 1) return null;
-  return revisions.find((revision) => revision.state === "active") ?? null;
+  const active = project.remote?.active_revision ?? null;
+  if (!active) return null;
+  const matchingRunRefs = runs.flatMap((run) => [
+    ...(run.pinned_revision ? [run.pinned_revision] : []),
+    ...(run.revision_transition ? [run.revision_transition.successor_revision] : []),
+  ]).filter((revision) => revision.id === active.id);
+  if (matchingRunRefs.some((revision) => revision.generation !== active.generation || revision.manifest_sha256 !== active.manifest_sha256)) return null;
+  return active;
 }
 
 function revisionLabel(project: ProjectV1 | null, runs: readonly RunV1[]): string {
@@ -1434,11 +1441,11 @@ function getStartReason(snapshot: DesktopProductSnapshot, project: ProjectV1 | n
   if (!active || active.project_id !== project.project_id || active.profile_id !== project.profile_id || active.project_etag !== project.etag || active.connection_state !== "ready") return "Activate this project on its assigned remote workspace before starting a session.";
   if (project.state !== "active") return "Activate this project before starting a session.";
   const capability = snapshot.capability;
-  if (!capability || capability.status !== "ready" || capability.projectId !== project.project_id || capability.executionMode !== project.execution.mode || capability.value.project_id !== project.project_id || capability.value.execution_mode !== project.execution.mode) return "Remote capabilities are unavailable for this project and mode.";
-  const invalidTarget = evolutionTargetRows(capability.value, project.evolution.targets).find((row) => row.selection.enabled && !row.valid);
+  if (!capability || capability.status !== "ready" || capability.projectId !== project.project_id || capability.executionMode !== project.execution.mode || capability.value.project_id !== project.project_id || capabilityExecutionMode(capability.value.capabilities) !== project.execution.mode) return "Remote capabilities are unavailable for this project and mode.";
+  const invalidTarget = evolutionTargetRows(capability.value.capabilities, project.evolution.targets).find((row) => row.selection.enabled && !row.valid);
   if (invalidTarget) return invalidTarget.reason;
   const validation = snapshot.validation;
-  if (!validation || validation.status !== "ready" || validation.projectId !== project.project_id || validation.executionMode !== project.execution.mode || validation.projectEtag !== project.etag || validation.value.project_id !== project.project_id || validation.value.project_etag !== project.etag || validation.value.capability_registry_digest !== capability.value.registry_digest || !validation.value.valid) return "Project validation is not current for this project and mode.";
+  if (!validation || validation.status !== "ready" || validation.projectId !== project.project_id || validation.executionMode !== project.execution.mode || validation.projectEtag !== project.etag || validation.value.project_id !== project.project_id || validation.value.project_etag !== project.etag || validation.value.registry_digest !== capability.value.capabilities.registry_digest || !validation.value.valid) return "Project validation is not current for this project and mode.";
   if (activeRun) return "Wait for the active session to finish or cancel it.";
   if (actionState === "working") return "Wait for the current action to finish.";
   return null;
@@ -1465,8 +1472,8 @@ function stateLabel(state: string): string {
   return labels[state] ?? state.replaceAll("_", " ");
 }
 
-function diagnosticStatusLabel(state: "healthy" | "degraded" | "blocked"): string {
-  return state === "healthy" ? "All checks passed" : state === "degraded" ? "Attention recommended" : "Action required";
+function diagnosticStatusLabel(state: "queued" | "running" | "succeeded" | "failed"): string {
+  return state === "succeeded" ? "All checks passed" : state === "failed" ? "Action required" : state === "running" ? "Checks in progress" : "Checks queued";
 }
 
 function artifactTypeLabel(type: string): string {
@@ -1475,14 +1482,14 @@ function artifactTypeLabel(type: string): string {
 }
 
 function sessionTitle(run: RunV1, runs: readonly RunV1[]): string {
-  const chronological = [...runs].sort((left, right) => compareTimestampAndId(left.created_at, left.run_id, right.created_at, right.run_id));
-  return `Session ${Math.max(1, chronological.findIndex((item) => item.run_id === run.run_id) + 1)}`;
+  const chronological = [...runs].sort((left, right) => compareTimestampAndId(left.created_at, left.id, right.created_at, right.id));
+  return `Session ${Math.max(1, chronological.findIndex((item) => item.id === run.id) + 1)}`;
 }
 
 function stableRunOrder(runs: readonly RunV1[]): RunV1[] {
   return [...runs].sort((left, right) => {
     const time = Date.parse(right.updated_at) - Date.parse(left.updated_at);
-    return time || left.run_id.localeCompare(right.run_id);
+    return time || left.id.localeCompare(right.id);
   });
 }
 
@@ -1495,7 +1502,7 @@ function formatTime(timestamp: string): string {
   return new Intl.DateTimeFormat("en", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: "UTC" }).format(new Date(timestamp));
 }
 
-function isTerminal(state: RunV1["state"]): boolean {
+function isTerminal(state: RunV1["status"]): boolean {
   return state === "succeeded" || state === "failed" || state === "cancelled";
 }
 
@@ -1510,7 +1517,7 @@ function canReadmitRun(
     && error.retryable
     && error.repair_action === "openevo_can_retry"
     && snapshot?.stream.status === "fresh"
-    && !snapshot.runs.some((run) => run.project_id === projectId && !isTerminal(run.state));
+    && !snapshot.runs.some((run) => run.project_id === projectId && !isTerminal(run.status));
 }
 
 function requestPreconditionChanged(
@@ -1535,10 +1542,30 @@ function userMessage(error: unknown): string {
   return "The request could not be completed.";
 }
 
-function readyCapabilities(snapshot: DesktopProductSnapshot, project: ProjectV1 | null): ProjectCapabilitiesV1 | null {
+function readyCapabilities(snapshot: DesktopProductSnapshot, project: ProjectV1 | null): EvolutionCapabilitiesV1 | null {
   const state = snapshot.capability;
   if (!project || !state || state.status !== "ready") return null;
-  return state.projectId === project.project_id && state.executionMode === project.execution.mode ? state.value : null;
+  return state.projectId === project.project_id && state.executionMode === project.execution.mode ? state.value.capabilities : null;
+}
+
+function capabilityExecutionMode(capabilities: EvolutionCapabilitiesV1): ProjectV1["execution"]["mode"] {
+  return capabilities.evaluated_profile.execution_mode === "self_deployed" ? "self-deployed" : "codex_subscription_transcript";
+}
+
+function parseCapabilityJsonObject(value: string): OpenEvoJsonObject {
+  const parsed: unknown = JSON.parse(value);
+  if (!isOpenEvoJsonObject(parsed)) throw new Error("Remote capability JSON must be an object.");
+  return parsed;
+}
+
+function isOpenEvoJsonObject(value: unknown): value is OpenEvoJsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && Object.values(value).every(isOpenEvoJsonValue);
+}
+
+function isOpenEvoJsonValue(value: unknown): boolean {
+  return value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))
+    || (Array.isArray(value) && value.every(isOpenEvoJsonValue)) || isOpenEvoJsonObject(value);
 }
 
 let actionSequence = 0;
@@ -1641,6 +1668,7 @@ function credentialLabel(kind: RemoteProfileV1["credential_slots"][number]["kind
     ssh_private_key_passphrase: "Key passphrase",
     http_proxy_password: "HTTP proxy credential",
     https_proxy_password: "HTTPS proxy credential",
+    hugging_face_token: "Hugging Face token",
   };
   return labels[kind];
 }

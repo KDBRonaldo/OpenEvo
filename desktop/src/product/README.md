@@ -28,8 +28,10 @@ it must not retain or retry with a failed session token.
 The Local API release digest is
 `3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36`.
 The checked-in TypeScript mirror and contract fixtures use that frozen digest.
-The existing product UI and simulator fixture still require a separate consumer
-migration before the complete product UI suite can be treated as a release gate.
+The product UI and simulator consume the final Local/Core v1 DTOs directly and
+construct simulator resources through the same strict Zod schemas as release
+responses. They do not use renderer-only compatibility wrappers or legacy
+field aliases.
 
 ## Provider behavior
 
@@ -49,17 +51,22 @@ reset on HTTP 410, and `AbortController` cancellation on final unsubscribe.
 The renderer treats capability payloads as project-and-execution-mode scoped.
 An unavailable payload has an explicit retry action and never falls back to a
 local method table. Visible method configuration is rendered from the remote
-closed JSON schema. The editor deterministically deep-merges a method's
-`default_config` with the project's partial override for display and
-validation, while persisting only the user override. A target with no effective
+closed JSON encoded by `config_schema_json`. The editor deterministically
+deep-merges the decoded `default_config_json` with the project's partial
+override for display and validation, while persisting only the user override.
+A target with no effective
 remote default can still be re-enabled when it retains a supported explicit
 method; an empty or invalid selection requires an effective default. Existing
 hidden accepted methods and Core-owned selection resolvers remain distinct
 from visible choices.
 
-Run outcomes are rendered from their typed states. Queued reasons and failed
-run errors remain visible, and recovery creates a fresh admission instead of
-rewriting a terminal attempt. HTTP 409, 410, and 412 responses trigger an
+Run outcomes are rendered from `RunV1.status`, `current_attempt`,
+`current_error`, exact revision refs, and `revision_transition`. Queued reasons
+and failed run errors remain visible, and recovery creates a fresh admission
+instead of rewriting a terminal attempt. Service rows consume `ServiceV1.id`,
+`status`, and `status_message`. Service restart returns the typed Core
+`OperationV1`; connection, activation, and workspace mutations continue to use
+the separate local `LocalOperationV1` lifecycle. HTTP 409, 410, and 412 responses trigger an
 authoritative snapshot reload; an expired cursor is reset before reload.
 Re-admission is offered only for an allowlisted retryable admission conflict
 when the refreshed snapshot has no equivalent active or pending run. Drawer
@@ -73,12 +80,15 @@ the draft or establishing a new update precondition creates a new
 route-appropriate intent. Drafts survive reloads and require confirmation
 before Escape, overlay, or close-button dismissal.
 
-Revision generation is shown only when `ProjectV1.current_revision_id` has a
-consistent active revision reference. Artifact lists use selected artifacts
-whose explicit revision membership includes that revision, without excluding
-any authoritative artifact type, and sort them by `created_at` and then
-`artifact_id`. This includes `parametric_memory`; multiple selected members for
-one target remain visible. The provider marks the collection complete only
-after all cursor pages have been aggregated. Partial collections and missing
-or conflicting revision evidence are shown as unknown with a refetch action
-rather than inferred from list order or a loaded run.
+Revision generation is shown only from the authoritative
+`ProjectV1.remote.active_revision`. Any matching run revision refs must agree
+with that identity. Artifact lists use selected artifacts whose
+`membership_revisions` include the active revision, without excluding any
+authoritative discriminated-union subtype, and sort them by `created_at` and
+then `id`. This includes `parametric_memory`; multiple selected members for one
+target remain visible. Content uses the artifact subtype plus
+`content_sha256`, while changes render the `ArtifactDiffV1.document_changes`
+union. The provider marks the collection complete only after all cursor pages
+have been aggregated. Partial collections and missing or conflicting revision
+evidence are shown as unknown with a refetch action rather than inferred from
+list order or a loaded run.
