@@ -313,8 +313,12 @@ reservation exactly once and updates the replay in the same recovery
 transaction, releasing all direct and implicit activation exclusions before
 new work is accepted. The release provider places activation reservations on one
 serialized executor with a hard 16-item admission bound. The HTTP route returns
-the durable queued operation without waiting for SSH or Core. The worker
-publishes `running`, calls the project-bound bridge outside SQLite transactions,
+the durable queued operation without waiting for SSH or Core. Once executor
+admission succeeds, a start gate first publishes `bootstrapping` with
+`active_tunnel=false` and the accepted operation ID; the worker cannot execute
+before that non-readable state is observable. Queue rejection fails only the new
+reservation and preserves the prior session authority. The worker then publishes
+`running`, calls the project-bound bridge outside SQLite transactions,
 validates the returned project/revision/registry identity, and commits the
 complete remote projection and terminal operation atomically. It then
 acknowledges that exact activation authority against the post-commit Local ETag
@@ -342,6 +346,16 @@ bridge. Run admission first matches the saved Local project ETag; capability and
 validation envelopes bind the returned Core authority to the current Local
 project identity and ETag. Typed Core failures are preserved without exposing a
 Core URL or bearer. Without an injected bridge these routes remain fail-closed.
+Ordinary bridge calls and the Core SSE relay report session loss through one
+provider callback carrying the exact project/profile/ETag and process-local
+session generation. Only the closed local allowlist (`core_client_closed`,
+`desktop_core_bridge_closed`, `active_project_session_unavailable`, and a
+generation-matched `active_project_session_superseded`) changes `core` to
+`offline`, clears `active_tunnel`, and publishes state invalidation. A stale
+generation cannot downgrade its replacement. Remote business errors and
+`core_connection_failed` do not change connection authority because the latter
+also represents request deadline expiry and therefore does not prove tunnel
+loss.
 
 When release composition also supplies `DesktopEventBrokerV1`, the provider
 serves its bounded SSE subscription directly and maps expired cursors to the
@@ -356,15 +370,19 @@ never falls back to a local method table, direct backend URL, fixture data, or a
 synthetic ready/success state.
 
 Every direct Core request first loads the one durable active Local
-`ProjectV1` while holding the provider's project-session transition lock and
-keeps that lock through bridge delivery. Editing or retiring that project must
+`ProjectV1` plus its exact process-local session binding while holding the
+provider's project-session transition lock, and it keeps that lock through
+bridge delivery. Editing or retiring that project must
 therefore wait for the in-flight result, after which the bridge generation is
 retired before another project can use the provider. The event relay separately
-passes the same complete active project to the bridge SSE boundary. It ignores
+passes the same complete active project and captured session generation to the
+bridge SSE boundary. It ignores
 Core heartbeats and translates every other validated Core frame into a Desktop
 state invalidation; it does not copy, reinterpret, or persist Core event
-payloads. The renderer reloads authoritative resources through the frozen Local
-API after each invalidation.
+payloads. A typed local session-loss error is returned to the provider owner
+through the same authority-bound callback used by ordinary calls. The renderer
+reloads authoritative resources through the frozen Local API after each
+invalidation.
 
 Local doctor/repair/workspace-sync operations and Local operation
 logs/cancellation remain outside this composition slice. A successful SSH check

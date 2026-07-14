@@ -510,6 +510,25 @@ phase: `disconnected`, `connecting`, `host_key_review`, `checking`,
 `bootstrapping`, `core_starting`, `online`, `degraded`, `reconnecting`, or
 `offline`. Native process startup phases remain Tauri-local and are mapped into
 the same renderer state machine; the renderer does not infer remote progress.
+Executor admission for project activation publishes a non-readable
+`bootstrapping` state with `active_tunnel=false` before the worker start gate is
+released. A rejected admission leaves the previous state untouched.
+
+The release owner binds readable state to the exact Local project ID, profile
+ID, ETag, and a process-local session generation. Ordinary Core calls and the
+event relay may invalidate that state only for closed local errors proving that
+the bound client/session no longer exists. Remote 503 responses, validation or
+capability failures, and `core_connection_failed` are not such proof; the last
+code also covers finite request deadline expiry. A matching loss atomically
+publishes `offline` with `active_tunnel=false`. A callback from an older project
+or generation cannot change the replacement session.
+
+The renderer independently requires the selected `ProjectV1` to match the
+active project ID, profile ID, and ETag and requires a ready compatible tunnel
+before exposing service rows or the inference-service projection. Restart is
+resolved only from that gated collection. Therefore selecting B cannot display
+or mutate A's services, and the same active project can request reactivation
+after its connection becomes unreadable.
 
 ### Sidecar Mapping
 

@@ -908,6 +908,44 @@ describe("DesktopProductApp", () => {
     expect(button("Start session").disabled).toBe(false);
   });
 
+  it("does not expose project A services or restart actions while project B is selected", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+    provider.addDraftProject();
+    root = await renderProduct(provider);
+
+    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+    if (!switcher) throw new Error("Project switcher was not found.");
+    await act(async () => {
+      switcher.value = "project-fixture-2";
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await clickButton("System");
+
+    expect(screenText()).toContain("Services are unavailable for this project.");
+    expect(screenText()).not.toContain("Model service");
+    expect(document.querySelector('button[aria-label="Restart Model service"]')).toBeNull();
+  });
+
+  it("hides stale services after tunnel loss and allows the active project to reactivate", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    provider.loseActiveCoreSession();
+    const activateProject = vi.spyOn(provider, "activateProject");
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("Activate this project");
+    expect(screenText()).not.toContain("Preparing the selected model.");
+    await clickButton("System");
+    expect(screenText()).toContain("Services are unavailable for this project.");
+    expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
+    expect(button("Activate project").disabled).toBe(false);
+    await clickButton("Activate project");
+    expect(activateProject).toHaveBeenCalledWith(
+      "project-fixture-1",
+      expect.objectContaining({ etag: expect.any(String) }),
+    );
+  });
+
   it("loads project B when selection changes while project A's drawer remains open", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     provider.addDraftProject({ subscription: true });

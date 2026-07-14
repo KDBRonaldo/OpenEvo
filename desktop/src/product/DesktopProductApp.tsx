@@ -239,6 +239,8 @@ export function DesktopProductApp({
   const settingsProject = creatingProject ? null : project;
   const settingsFormIdentity = settingsProject ? `project:${settingsProject.project_id}` : "create";
   const settingsCapability = projectCapability(snapshot, settingsProject);
+  const projectSessionReady = hasReadySelectedProjectSession(snapshot, project);
+  const projectServices = projectSessionReady ? snapshot.services : [];
   const startReason = getStartReason(snapshot, project, profile, activeRun, actionState);
   const canStart = startReason === null;
 
@@ -310,7 +312,7 @@ export function DesktopProductApp({
             }}
             onSetup={() => setConnectionSettingsOpen(true)}
           />
-          {project && (snapshot.state.active_project?.project_id !== project.project_id || project.state !== "active") ? (
+          {project && !projectSessionReady ? (
             <ProjectActivationGate
               project={project}
               busy={actionState === "working"}
@@ -327,7 +329,7 @@ export function DesktopProductApp({
               timelines={snapshot.timelines}
               provider={provider}
               streamEpoch={snapshot.stream.epoch}
-              modelService={snapshot.services.find((service) => service.kind === "inference") ?? null}
+              modelService={projectServices.find((service) => service.kind === "inference") ?? null}
               canStart={canStart}
               startReason={startReason}
               busy={actionState === "working"}
@@ -354,11 +356,13 @@ export function DesktopProductApp({
               snapshot={snapshot}
               project={project}
               profile={profile}
+              services={projectServices}
+              projectSessionReady={projectSessionReady}
               busy={actionState === "working"}
               onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id, resourceIntent(snapshot, profile.etag)))}
               onRepair={() => project && void act(() => provider.repairProject(project.project_id, resourceIntent(snapshot, project.etag)))}
               onRestart={(serviceId) => {
-                const service = snapshot.services.find((item) => item.id === serviceId);
+                const service = projectServices.find((item) => item.id === serviceId);
                 if (service) void act(() => provider.restartService(serviceId, resourceIntent(snapshot, service.etag)));
               }}
               onConfigure={() => setConnectionSettingsOpen(true)}
@@ -1114,9 +1118,9 @@ function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
   );
 }
 
-function SystemWorkspace({ snapshot, project, profile, busy, onConnect, onRepair, onRestart, onConfigure }: { snapshot: DesktopProductSnapshot; project: ProjectV1 | null; profile: RemoteProfileV1 | null; busy: boolean; onConnect: () => void; onRepair: () => void; onRestart: (serviceId: string) => void; onConfigure: () => void }) {
+function SystemWorkspace({ snapshot, project, profile, services, projectSessionReady, busy, onConnect, onRepair, onRestart, onConfigure }: { snapshot: DesktopProductSnapshot; project: ProjectV1 | null; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onRepair: () => void; onRestart: (serviceId: string) => void; onConfigure: () => void }) {
   const core = snapshot.state.core;
-  const diagnostic = snapshot.diagnostic;
+  const diagnostic = projectSessionReady ? snapshot.diagnostic : null;
   const actionable = diagnostic?.checks.some((check) => check.repair_action === "openevo_can_retry") ?? false;
   return (
     <div className="workspace-stack" data-testid="system-workspace">
@@ -1128,7 +1132,7 @@ function SystemWorkspace({ snapshot, project, profile, busy, onConnect, onRepair
             <div><dt>Server</dt><dd>{profile ? `${profile.host}:${profile.port}` : "Not configured"}</dd></div>
             <div><dt>Secure connection</dt><dd>{core.active_tunnel ? "Active" : "Not connected"}</dd></div>
             <div><dt>Compatibility</dt><dd>{snapshot.state.contract.compatible ? "Compatible" : "Needs update"}</dd></div>
-            <div><dt>Project access</dt><dd>{snapshot.state.active_project?.connection_state === "ready" ? "Ready" : "Unavailable"}</dd></div>
+            <div><dt>Project access</dt><dd>{projectSessionReady ? "Ready" : "Unavailable"}</dd></div>
           </dl>
           {profile?.credential_slots.length ? <div className="credential-summary">{profile.credential_slots.map((slot) => <CredentialStatus key={slot.kind} slot={slot} />)}</div> : null}
           <div className="system-button-row">
@@ -1145,9 +1149,10 @@ function SystemWorkspace({ snapshot, project, profile, busy, onConnect, onRepair
         </section>
       </div>
       <section className="services-section">
-        <div className="section-heading"><div><Activity size={17} /><h2>Services</h2></div><span>{snapshot.services.filter((service) => service.status === "running").length} of {snapshot.services.length} ready</span></div>
+        <div className="section-heading"><div><Activity size={17} /><h2>Services</h2></div><span>{services.filter((service) => service.status === "running").length} of {services.length} ready</span></div>
         <div className="service-list">
-          {snapshot.services.map((service) => <ServiceRow key={service.id} service={service} busy={busy} onRestart={() => onRestart(service.id)} />)}
+          {services.map((service) => <ServiceRow key={service.id} service={service} busy={busy} onRestart={() => onRestart(service.id)} />)}
+          {!services.length ? <div className="empty-row">Services are unavailable for this project.</div> : null}
         </div>
       </section>
     </div>
@@ -1811,6 +1816,24 @@ function getStartReason(snapshot: DesktopProductSnapshot, project: ProjectV1 | n
   if (activeRun) return "Wait for the active session to finish or cancel it.";
   if (actionState === "working") return "Wait for the current action to finish.";
   return null;
+}
+
+function hasReadySelectedProjectSession(
+  snapshot: DesktopProductSnapshot,
+  project: ProjectV1 | null,
+): boolean {
+  if (!project || project.state !== "active") return false;
+  const active = snapshot.state.active_project;
+  const core = snapshot.state.core;
+  return active !== null
+    && active.project_id === project.project_id
+    && active.profile_id === project.profile_id
+    && active.project_etag === project.etag
+    && active.connection_state === "ready"
+    && core.profile_id === project.profile_id
+    && core.active_tunnel
+    && core.core !== null
+    && ["online", "degraded"].includes(core.state);
 }
 
 function isConnectionBusy(state: DesktopProductSnapshot["state"]["core"]["state"]): boolean {

@@ -1931,6 +1931,30 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(project);
   }
 
+  loseActiveCoreSession(): void {
+    this.state = desktopStateV1Schema.parse({
+      ...this.state,
+      core: {
+        state: "offline",
+        profile_id: this.state.active_project?.profile_id ?? CONTRACT_FIXTURE_V1.profile.profile_id,
+        active_tunnel: false,
+        operation_id: null,
+        host_key_review: null,
+        core: null,
+        failure: {
+          code: "core_client_closed",
+          message: "The active Core client closed.",
+          retryable: true,
+          next_action: "Reactivate the project.",
+        },
+      },
+      active_project: this.state.active_project
+        ? { ...this.state.active_project, connection_state: "offline" }
+        : null,
+    });
+    this.emit();
+  }
+
   useUnsupportedSavedMethod(): void {
     const project = this.projects[0];
     if (!project) return;

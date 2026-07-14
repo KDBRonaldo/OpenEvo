@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from fastapi.responses import JSONResponse
+import pytest
 
 from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.core_bridge_v1 import (
@@ -17,6 +18,7 @@ from desktop.sidecar.core_bridge_v1 import (
 )
 from desktop.sidecar.provider_store import DesktopProviderStore
 from desktop.sidecar.release_provider import DesktopReleaseProvider
+from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
 from desktop.sidecar.workspace_imports import WorkspaceImportStore
 from openevo.backend.contracts.v1 import models as core_v1
 from openevo.evolution.framework.profiles import execution_profile_for_release_mode
@@ -49,6 +51,8 @@ def _snapshot(
 def _provider(
     tmp_path: Path,
     bridge: Mock,
+    *,
+    event_broker: object | None = None,
 ) -> tuple[DesktopReleaseProvider, DesktopProviderStore, local_v1.ProjectV1]:
     state_root = tmp_path / "state"
     store = DesktopProviderStore(state_root)
@@ -90,6 +94,7 @@ def _provider(
         readiness_key=b"r" * 32,
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,  # type: ignore[arg-type]
+        event_broker=event_broker,  # type: ignore[arg-type]
         clock=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
     )
     return provider, store, project
@@ -174,6 +179,22 @@ def _activate_arguments(project: local_v1.ProjectV1) -> dict[str, object]:
     }
 
 
+def _bridge_error(code: str, *, status: int = 503) -> DesktopCoreBridgeErrorV1:
+    return DesktopCoreBridgeErrorV1(
+        core_v1.ApiErrorV1(
+            request_id=f"request-{code}",
+            code=code,
+            http_status=status,
+            message="The Core request failed.",
+            severity=core_v1.ErrorSeverity.BLOCKING,
+            category=core_v1.ErrorCategory.SERVICE,
+            retryable=True,
+            repair_action=core_v1.RepairAction.OPENEVO_CAN_RETRY,
+            next_action="Retry the request.",
+        )
+    )
+
+
 def test_activation_returns_queued_and_commits_remote_projection(tmp_path: Path) -> None:
     bridge = Mock(spec=DesktopCoreBridgeV1)
     provider, store, project = _provider(tmp_path, bridge)
@@ -193,6 +214,10 @@ def test_activation_returns_queued_and_commits_remote_projection(tmp_path: Path)
         assert response.status_code == 202
         operation = local_v1.LocalOperationV1.model_validate_json(response.body)
         assert operation.state == "queued"
+        transition = provider.invoke("getDesktopState", {})
+        assert transition.core.state == "bootstrapping"
+        assert transition.core.active_tunnel is False
+        assert transition.core.operation_id == operation.operation_id
         assert entered.wait(timeout=5)
         assert store.get_local_operation(operation.operation_id).state == "running"
         assert operation.operation_id in store.pending_operation_ids()
@@ -259,6 +284,140 @@ def test_activation_persists_typed_bridge_failure(tmp_path: Path) -> None:
         assert state.core.failure.code == "core_environment_blocked"
         assert state.pending_operation_ids == ()
         bridge.commit_local_activation.assert_not_called()
+    finally:
+        provider.close()
+
+
+def test_queue_rejection_preserves_the_existing_active_session(tmp_path: Path) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    profile = store.get_profile(project.profile_id)
+    second = store.create_project(
+        local_v1.ProjectCreateV1(
+            name="Second project",
+            profile_id=profile.profile_id,
+            task=local_v1.ProjectTaskV1(title="Second task", objective="Second objective."),
+            source=local_v1.ProjectSourceV1(kind="scratch", display_name="Second workspace"),
+            execution=project.execution,
+            evolution=project.evolution,
+        ),
+        idempotency_key="project-create-runtime-0002",
+    )
+    bridge.activate_project.return_value = _activation(project)
+    try:
+        first_response = provider.invoke("activateProject", _activate_arguments(project))
+        first = local_v1.LocalOperationV1.model_validate_json(first_response.body)
+        _wait_for_operation(store, first.operation_id, "succeeded")
+        active = store.get_project(project.project_id)
+        binding = provider._core_session_binding
+        assert binding is not None
+
+        class RejectingExecutor:
+            def submit(self, *_args: object, **_kwargs: object) -> bool:
+                return False
+
+            def close(self) -> None:
+                return None
+
+        provider._project_executor.close()
+        provider._project_executor = RejectingExecutor()  # type: ignore[assignment]
+
+        second_response = provider.invoke(
+            "activateProject",
+            {
+                "project_id": second.project_id,
+                "if_match": second.etag,
+                "idempotency_key": "project-activate-runtime-0002",
+            },
+        )
+        rejected = local_v1.LocalOperationV1.model_validate_json(second_response.body)
+        state = provider.invoke("getDesktopState", {})
+
+        assert rejected.state == "failed"
+        assert rejected.error is not None
+        assert rejected.error.code == "project_operation_capacity_exhausted"
+        assert state.core.state == "online"
+        assert state.core.active_tunnel is True
+        assert state.active_project is not None
+        assert state.active_project.project_id == active.project_id
+        assert state.active_project.connection_state == "ready"
+        assert provider._core_session_binding == binding
+        assert bridge.activate_project.call_count == 1
+    finally:
+        provider.close()
+
+
+def test_local_client_loss_invalidates_only_the_matching_active_session(tmp_path: Path) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    broker = Mock()
+    provider, store, project = _provider(tmp_path, bridge, event_broker=broker)
+    bridge.activate_project.return_value = _activation(project)
+    response = provider.invoke("activateProject", _activate_arguments(project))
+    operation = local_v1.LocalOperationV1.model_validate_json(response.body)
+    _wait_for_operation(store, operation.operation_id, "succeeded")
+    active = store.get_project(project.project_id)
+    binding = provider._core_session_binding
+    assert binding is not None
+    bridge.list_services.side_effect = _bridge_error("core_client_closed")
+    broker.publish.reset_mock()
+    try:
+        with pytest.raises(DesktopCoreBridgeErrorV1):
+            provider.invoke(
+                "listServices",
+                {"limit": 50, "after": None, "sort": "display_name", "direction": "asc"},
+            )
+        state = provider.invoke("getDesktopState", {})
+        assert state.core.state == "offline"
+        assert state.core.active_tunnel is False
+        assert state.active_project is not None
+        assert state.active_project.connection_state == "offline"
+        assert broker.publish.called
+        published = broker.publish.call_args.args[0]
+        assert published.state.core.state == "offline"
+        assert published.state.core.active_tunnel is False
+
+        provider._core_session_binding = CoreRuntimeSessionBinding(
+            project=active,
+            generation=binding.generation + 1,
+        )
+        provider._core_state = local_v1.CoreConnectionStateV1(
+            state="online",
+            profile_id=active.profile_id,
+            active_tunnel=True,
+            core=local_v1.CoreCompatibilityV1(
+                contract_digest="3" * 64,
+                core_version="0.1.0",
+            ),
+        )
+        provider._handle_core_session_loss(binding, _bridge_error("core_client_closed"))
+        assert provider.invoke("getDesktopState", {}).core.state == "online"
+    finally:
+        provider.close()
+
+
+@pytest.mark.parametrize("code", ["core_connection_failed", "core_business_unavailable"])
+def test_unproven_core_failures_do_not_invalidate_the_active_session(
+    tmp_path: Path,
+    code: str,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    bridge.activate_project.return_value = _activation(project)
+    response = provider.invoke("activateProject", _activate_arguments(project))
+    operation = local_v1.LocalOperationV1.model_validate_json(response.body)
+    _wait_for_operation(store, operation.operation_id, "succeeded")
+    bridge.list_services.side_effect = _bridge_error(code)
+    try:
+        with pytest.raises(DesktopCoreBridgeErrorV1):
+            provider.invoke(
+                "listServices",
+                {"limit": 50, "after": None, "sort": "display_name", "direction": "asc"},
+            )
+        state = provider.invoke("getDesktopState", {})
+        assert state.core.state == "online"
+        assert state.core.active_tunnel is True
+        assert state.active_project is not None
+        assert state.active_project.connection_state == "ready"
     finally:
         provider.close()
 

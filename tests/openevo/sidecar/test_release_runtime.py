@@ -11,9 +11,11 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 import pytest
 
+from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1
 from desktop.sidecar.provider_store import DesktopProviderStore
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_runtime import (
+    CoreRuntimeSessionBinding,
     DesktopCoreEventRelayV1,
     ReleaseRuntimeConfigurationError,
     bundled_core_asset_root,
@@ -117,7 +119,11 @@ def test_release_runtime_composes_and_closes_owned_resources(tmp_path: Path) -> 
         asset_root=assets,
         source_commit=SOURCE_COMMIT,
     )
-    runtime.start(active_project=lambda: None, publish=lambda: None)
+    runtime.start(
+        active_project=lambda: None,
+        publish=lambda: None,
+        session_lost=lambda _binding, _error: None,
+    )
     runtime.close()
     runtime.close()
     lifecycle.close()
@@ -211,18 +217,72 @@ def test_core_event_relay_skips_heartbeat_and_invalidates_on_change() -> None:
     published = threading.Event()
     publish_count = 0
 
+    binding = CoreRuntimeSessionBinding(project=project, generation=1)  # type: ignore[arg-type]
+
     def active_project():
-        return None if published.is_set() else project
+        return None if published.is_set() else binding
 
     def publish() -> None:
         nonlocal publish_count
         publish_count += 1
         published.set()
 
-    relay.start(active_project=active_project, publish=publish)  # type: ignore[arg-type]
+    relay.start(
+        active_project=active_project,
+        publish=publish,
+        session_lost=lambda _binding, _error: None,
+    )
     assert published.wait(timeout=2)
     relay.request_stop()
     relay.join()
 
     assert publish_count == 1
     assert bridge.calls == [(project, None)]
+
+
+def test_core_event_relay_reports_typed_session_loss_with_captured_authority() -> None:
+    error = DesktopCoreBridgeErrorV1(
+        core_v1.ApiErrorV1(
+            request_id="relay-client-closed",
+            code="core_client_closed",
+            http_status=503,
+            message="The Core client is closed.",
+            severity=core_v1.ErrorSeverity.BLOCKING,
+            category=core_v1.ErrorCategory.SERVICE,
+            retryable=True,
+            repair_action=core_v1.RepairAction.OPENEVO_CAN_RETRY,
+            next_action="Reactivate the project.",
+        )
+    )
+
+    class Bridge:
+        def events(self, _project: object, *, last_event_id: str | None = None):
+            del last_event_id
+            raise error
+
+    project = SimpleNamespace(project_id="project-1", etag='"' + "a" * 64 + '"')
+    binding = CoreRuntimeSessionBinding(project=project, generation=7)  # type: ignore[arg-type]
+    lost = threading.Event()
+    observed: list[tuple[CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1]] = []
+    relay = DesktopCoreEventRelayV1(Bridge())  # type: ignore[arg-type]
+
+    def active_project():
+        return None if lost.is_set() else binding
+
+    def session_lost(
+        candidate: CoreRuntimeSessionBinding,
+        exc: DesktopCoreBridgeErrorV1,
+    ) -> None:
+        observed.append((candidate, exc))
+        lost.set()
+
+    relay.start(
+        active_project=active_project,
+        publish=lambda: None,
+        session_lost=session_lost,
+    )
+    assert lost.wait(timeout=2)
+    relay.request_stop()
+    relay.join()
+
+    assert observed == [(binding, error)]

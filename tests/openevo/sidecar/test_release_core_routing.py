@@ -19,6 +19,7 @@ from desktop.sidecar.event_broker_v1 import (
 from desktop.sidecar.provider_store import DesktopProviderStore, ETagConflictError
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import DesktopReleaseProvider
+from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
 from desktop.sidecar.workspace_imports import WorkspaceImportStore
 from openevo.backend.contracts.v1 import models as core_v1
 from openevo.backend.contracts.v1.models import (
@@ -88,7 +89,9 @@ def _provider(
         clock=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
     )
     if bridge is not None:
-        provider._active_project_for_runtime = lambda: project  # type: ignore[method-assign]
+        provider._active_project_for_runtime = (  # type: ignore[method-assign]
+            lambda: CoreRuntimeSessionBinding(project=project, generation=1)
+        )
     return provider, store, project
 
 
@@ -126,7 +129,10 @@ def _bind_app_project(app: object) -> local_v1.ProjectV1:
         ),
         idempotency_key="app-project-create-routing-0001",
     )
-    provider._active_project_for_runtime = lambda: project
+    provider._active_project_for_runtime = lambda: CoreRuntimeSessionBinding(  # type: ignore[method-assign]
+        project=project,
+        generation=1,
+    )
     return project
 
 

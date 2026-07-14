@@ -57,6 +57,14 @@ class _SealedFile:
     payload: bytes | None
 
 
+@dataclass(frozen=True, slots=True)
+class CoreRuntimeSessionBinding:
+    """Process-local authority for one provider-published Core session."""
+
+    project: local_v1.ProjectV1
+    generation: int
+
+
 class ProviderWorkspaceArchiveSourceV1:
     """Resolve the current durable project/import binding for every read."""
 
@@ -100,22 +108,29 @@ class DesktopCoreEventRelayV1:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._active_project: Callable[[], local_v1.ProjectV1 | None] | None = None
+        self._active_project: Callable[[], CoreRuntimeSessionBinding | None] | None = None
         self._publish: Callable[[], None] | None = None
+        self._session_lost: (
+            Callable[[CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1], None] | None
+        ) = None
 
     def start(
         self,
         *,
-        active_project: Callable[[], local_v1.ProjectV1 | None],
+        active_project: Callable[[], CoreRuntimeSessionBinding | None],
         publish: Callable[[], None],
+        session_lost: Callable[
+            [CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1], None
+        ],
     ) -> None:
-        if not callable(active_project) or not callable(publish):
+        if not callable(active_project) or not callable(publish) or not callable(session_lost):
             raise TypeError("event relay callbacks must be callable")
         with self._lock:
             if self._thread is not None:
                 raise RuntimeError("Core event relay was already started")
             self._active_project = active_project
             self._publish = publish
+            self._session_lost = session_lost
             self._thread = threading.Thread(
                 target=self._run,
                 name="openevo-core-event-relay",
@@ -133,23 +148,26 @@ class DesktopCoreEventRelayV1:
             thread.join()
 
     def _run(self) -> None:
-        identity: tuple[str, str] | None = None
+        identity: tuple[str, str, int] | None = None
         last_event_id: str | None = None
         backoff = _RELAY_MIN_BACKOFF_SECONDS
         while not self._stop.is_set():
             active_project = self._active_project
             publish = self._publish
-            if active_project is None or publish is None:
+            session_lost = self._session_lost
+            if active_project is None or publish is None or session_lost is None:
                 return
+            binding: CoreRuntimeSessionBinding | None = None
             try:
-                project = active_project()
-                if project is None:
+                binding = active_project()
+                if binding is None:
                     identity = None
                     last_event_id = None
                     self._stop.wait(backoff)
                     backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
                     continue
-                current_identity = (project.project_id, project.etag)
+                project = binding.project
+                current_identity = (project.project_id, project.etag, binding.generation)
                 if current_identity != identity:
                     identity = current_identity
                     last_event_id = None
@@ -161,7 +179,13 @@ class DesktopCoreEventRelayV1:
                         last_event_id = frame.id
                         if not isinstance(frame.data.root, core_v1.HeartbeatEventV1):
                             publish()
-            except (DesktopCoreBridgeErrorV1, ProviderStoreError, OSError):
+            except DesktopCoreBridgeErrorV1 as exc:
+                if binding is not None:
+                    session_lost(binding, exc)
+                if self._stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
+            except (ProviderStoreError, OSError):
                 if self._stop.wait(backoff):
                     return
                 backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
@@ -193,13 +217,20 @@ class DesktopReleaseCoreRuntimeV1:
     def start(
         self,
         *,
-        active_project: Callable[[], local_v1.ProjectV1 | None],
+        active_project: Callable[[], CoreRuntimeSessionBinding | None],
         publish: Callable[[], None],
+        session_lost: Callable[
+            [CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1], None
+        ],
     ) -> None:
         with self._close_lock:
             if self._closed:
                 raise RuntimeError("release Core runtime is closed")
-            self._relay.start(active_project=active_project, publish=publish)
+            self._relay.start(
+                active_project=active_project,
+                publish=publish,
+                session_lost=session_lost,
+            )
 
     def stop(self) -> None:
         with self._close_lock:
@@ -435,6 +466,7 @@ def _validate_framework_lock(
 
 
 __all__ = (
+    "CoreRuntimeSessionBinding",
     "DesktopReleaseCoreRuntimeV1",
     "ProviderWorkspaceArchiveSourceV1",
     "ReleaseRuntimeConfigurationError",

@@ -122,9 +122,16 @@ Run outcomes are rendered from `RunV1.status`, `current_attempt`,
 `current_error`, exact revision refs, and `revision_transition`. Queued reasons
 and failed run errors remain visible, and recovery creates a fresh admission
 instead of rewriting a terminal attempt. Service rows consume `ServiceV1.id`,
-`status`, and `status_message`. Service restart returns the typed Core
-`OperationV1`; connection, activation, and workspace mutations continue to use
-the separate local `LocalOperationV1` lifecycle. HTTP 409, 410, and 412 responses trigger an
+`status`, and `status_message`. The renderer exposes those rows and the Research
+model-service projection only when the selected `ProjectV1` exactly matches the
+active project's project ID, profile ID, and ETag and that connection is ready.
+Selecting project B while A is active, or losing A's tunnel, produces an empty
+service view; restart lookup uses that same gated collection and cannot target
+A through B's screen. An active project whose connection is no longer ready
+shows activation again so it can establish a new session. Service restart
+returns the typed Core `OperationV1`; connection, activation, and workspace
+mutations continue to use the separate local `LocalOperationV1` lifecycle. HTTP
+409, 410, and 412 responses trigger an
 authoritative snapshot reload; an expired cursor is reset before reload.
 Re-admission is offered only for an allowlisted retryable admission conflict
 when the refreshed snapshot has no equivalent active or pending run. Drawer
