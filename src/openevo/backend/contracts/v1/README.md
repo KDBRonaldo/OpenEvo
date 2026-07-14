@@ -70,7 +70,13 @@ constructs its framework profile from the persisted execution mode, capture
 mode, and harness ID. SQLite/workspace recovery is descriptor-bound and
 quota-limited across every persisted TEXT/BLOB value. The Linux provider opens
 SQLite through its held `/proc/self/fd` authority path and verifies the resolved
-managed path around connection setup. Workspace publication ownership is unique
+managed path around connection setup. It fixes any pre-existing rollback
+journal by no-follow FD before that connection and accepts recovery only when
+the same inode remains canonically bound or SQLite consumes that inode without a
+replacement pathname. Fresh, legacy, and pending identity binds hold both
+managed-root FDs across the initial inventory, durable identity-marker
+publication, and the final pre-bound inventory; a new node or root replacement
+fails before cleanup. Workspace publication ownership is unique
 to one project/upload pair and is enforced by a signed, transactionally inserted
 private owner row. Abort/delete success persists cleanup intents; exact replay
 and startup must converge them before dropping those intents. Linux cleanup uses random

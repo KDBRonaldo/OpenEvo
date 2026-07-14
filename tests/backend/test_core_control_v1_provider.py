@@ -2656,6 +2656,138 @@ def test_fresh_database_cannot_claim_existing_managed_workspace(tmp_path: Path) 
     assert not (root / "provider.identity").exists()
 
 
+def _prepare_unbound_identity_store(state_root: Path, identity_kind: str) -> None:
+    root = state_root / "core-control-v1"
+    database = root / "provider.sqlite3"
+    if identity_kind == "pending":
+        CoreControlStoreV1(state_root).close()
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE store_identity SET binding_state = 'pending', "
+                "marker_dev = NULL, marker_ino = NULL WHERE singleton = 1"
+            )
+        return
+
+    root.mkdir(parents=True, mode=0o700)
+    if identity_kind == "fresh":
+        database.touch(mode=0o600)
+        return
+    if identity_kind != "legacy":
+        raise AssertionError(f"unknown identity kind: {identity_kind}")
+    with sqlite3.connect(database) as connection:
+        for statement in store_module._LEGACY_SCHEMA:
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES ('signing_key', ?)",
+            (b"l" * 32,),
+        )
+    database.chmod(0o600)
+
+
+@pytest.mark.parametrize("identity_kind", ["fresh", "legacy", "pending"])
+@pytest.mark.parametrize(
+    "insertion_point",
+    ["after_initial_inventory", "after_marker_durable", "after_final_inventory"],
+)
+def test_identity_binding_rejects_managed_state_created_after_empty_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity_kind: str,
+    insertion_point: str,
+) -> None:
+    _prepare_unbound_identity_store(tmp_path, identity_kind)
+    root = tmp_path / "core-control-v1"
+    injected = root / "workspace-snapshots" / "workspace-snapshot-raced"
+    cleanup_calls = 0
+    injected_once = False
+
+    def inject() -> None:
+        nonlocal injected_once
+        if injected_once:
+            return
+        injected_once = True
+        injected.mkdir(mode=0o700)
+        (injected / "keep.txt").write_text("keep", encoding="utf-8")
+
+    def after_inventory(stage: str) -> None:
+        if insertion_point == f"after_{stage}_inventory":
+            inject()
+
+    def after_marker() -> None:
+        if insertion_point == "after_marker_durable":
+            inject()
+
+    def observe_cleanup(*args, **kwargs) -> None:
+        nonlocal cleanup_calls
+        del args, kwargs
+        cleanup_calls += 1
+
+    monkeypatch.setattr(
+        store_module,
+        "_after_unbound_managed_inventory",
+        after_inventory,
+    )
+    monkeypatch.setattr(
+        store_module,
+        "_after_store_identity_marker_durable",
+        after_marker,
+    )
+    monkeypatch.setattr(store_module, "_verify_managed_disk_quota", observe_cleanup)
+
+    with pytest.raises(StoreCorruptionError, match="unbound managed state"):
+        CoreControlStoreV1(tmp_path)
+
+    assert injected_once
+    assert cleanup_calls == 0
+    assert (injected / "keep.txt").read_text(encoding="utf-8") == "keep"
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT binding_state FROM store_identity WHERE singleton = 1"
+        ).fetchone() == ("pending",)
+
+
+@pytest.mark.parametrize("identity_kind", ["fresh", "legacy", "pending"])
+def test_identity_binding_keeps_one_managed_root_authority_across_inventory_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity_kind: str,
+) -> None:
+    _prepare_unbound_identity_store(tmp_path, identity_kind)
+    root = tmp_path / "core-control-v1"
+    workspace_root = root / "workspace-snapshots"
+    displaced = root / "workspace-snapshots.displaced"
+    replaced = False
+    cleanup_calls = 0
+
+    def replace_after_initial(stage: str) -> None:
+        nonlocal replaced
+        if stage != "initial" or replaced:
+            return
+        replaced = True
+        workspace_root.rename(displaced)
+        workspace_root.mkdir(mode=0o700)
+
+    def observe_cleanup(*args, **kwargs) -> None:
+        nonlocal cleanup_calls
+        del args, kwargs
+        cleanup_calls += 1
+
+    monkeypatch.setattr(
+        store_module,
+        "_after_unbound_managed_inventory",
+        replace_after_initial,
+    )
+    monkeypatch.setattr(store_module, "_verify_managed_disk_quota", observe_cleanup)
+
+    with pytest.raises(StoreCorruptionError, match="managed entry binding"):
+        CoreControlStoreV1(tmp_path)
+
+    assert replaced
+    assert cleanup_calls == 0
+    assert displaced.is_dir()
+    assert workspace_root.is_dir()
+
+
 def test_swapped_store_identity_marker_fails_before_workspace_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2897,6 +3029,152 @@ def test_live_store_rejects_database_hardlink_alias(tmp_path: Path) -> None:
     finally:
         alias.unlink(missing_ok=True)
         store.close()
+
+
+def _leave_hot_provider_journal(state_root: Path) -> tuple[Path, bytes]:
+    store = CoreControlStoreV1(state_root)
+    signing_key = store._signing_key
+    store.close()
+    database = state_root / "core-control-v1" / "provider.sqlite3"
+    script = """
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], isolation_level=None)
+connection.execute("PRAGMA journal_mode = DELETE")
+connection.execute("PRAGMA synchronous = FULL")
+connection.execute("PRAGMA cache_size = 2")
+connection.execute("PRAGMA cache_spill = ON")
+connection.execute("BEGIN IMMEDIATE")
+connection.execute("UPDATE metadata SET value = ? WHERE key = 'signing_key'", (b'x' * 32,))
+for index in range(64):
+    connection.execute(
+        "INSERT INTO events(event_id, frame_json, created_at_epoch) VALUES (?, ?, ?)",
+        (f"uncommitted-{index}", b"x" * 65536, index),
+    )
+os._exit(91)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, os.fspath(database)],
+        check=False,
+        cwd=Path(__file__).parents[2],
+    )
+    assert completed.returncode == 91
+    journal = database.with_name("provider.sqlite3-journal")
+    assert journal.is_file()
+    return journal, signing_key
+
+
+def test_startup_pins_and_recovers_real_hot_rollback_journal(tmp_path: Path) -> None:
+    journal, signing_key = _leave_hot_provider_journal(tmp_path)
+    journal_identity = journal.stat(follow_symlinks=False)
+
+    recovered = CoreControlStoreV1(tmp_path)
+    try:
+        assert recovered._signing_key == signing_key
+        authority_name = "provider.sqlite3-journal"
+        assert authority_name in recovered._database_fds
+        consumed = os.fstat(recovered._database_fds[authority_name])
+        assert (consumed.st_dev, consumed.st_ino) == (
+            journal_identity.st_dev,
+            journal_identity.st_ino,
+        )
+        assert consumed.st_nlink == 0
+        assert not journal.exists()
+    finally:
+        recovered.close()
+
+
+@pytest.mark.parametrize("damage", ["symlink", "owner", "mode", "hardlink"])
+def test_startup_rejects_unsafe_rollback_journal_before_sqlite_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    journal, _signing_key = _leave_hot_provider_journal(tmp_path)
+    alias = tmp_path / "journal-alias"
+    if damage == "symlink":
+        journal.rename(alias)
+        journal.symlink_to(alias)
+    elif damage == "owner":
+        if os.geteuid() != 0:
+            pytest.skip("changing journal ownership requires root")
+        os.chown(journal, 1, -1)
+    elif damage == "mode":
+        journal.chmod(0o644)
+    else:
+        os.link(journal, alias)
+    connect_calls = 0
+    real_connect = store_module.sqlite3.connect
+
+    def observe_connect(*args, **kwargs):
+        nonlocal connect_calls
+        connect_calls += 1
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", observe_connect)
+    try:
+        with pytest.raises(CoreControlStoreError):
+            CoreControlStoreV1(tmp_path)
+        assert connect_calls == 0
+    finally:
+        if damage == "symlink":
+            journal.unlink(missing_ok=True)
+        alias.unlink(missing_ok=True)
+
+
+def test_hot_journal_replacement_during_sqlite_recovery_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal, _signing_key = _leave_hot_provider_journal(tmp_path)
+    original_identity = journal.stat(follow_symlinks=False)
+    replacement_identity: os.stat_result | None = None
+
+    def replace_after_recovery() -> None:
+        nonlocal replacement_identity
+        assert not journal.exists()
+        journal.write_bytes(b"replacement journal")
+        journal.chmod(0o600)
+        replacement_identity = journal.stat(follow_symlinks=False)
+
+    monkeypatch.setattr(
+        store_module,
+        "_after_sqlite_recovery",
+        replace_after_recovery,
+    )
+
+    with pytest.raises(StoreCorruptionError, match="journal.*replaced"):
+        CoreControlStoreV1(tmp_path)
+
+    assert replacement_identity is not None
+    assert (replacement_identity.st_dev, replacement_identity.st_ino) != (
+        original_identity.st_dev,
+        original_identity.st_ino,
+    )
+    assert journal.read_bytes() == b"replacement journal"
+
+
+def test_hot_journal_authority_coexists_with_wal_and_shm_entries(tmp_path: Path) -> None:
+    journal, signing_key = _leave_hot_provider_journal(tmp_path)
+    root = journal.parent
+    wal = root / "provider.sqlite3-wal"
+    shm = root / "provider.sqlite3-shm"
+    wal.touch(mode=0o600)
+    shm.touch(mode=0o600)
+
+    recovered = CoreControlStoreV1(tmp_path)
+    try:
+        assert recovered._signing_key == signing_key
+        assert set(recovered._database_fds) == {
+            "provider.sqlite3",
+            "provider.sqlite3-journal",
+            "provider.sqlite3-wal",
+            "provider.sqlite3-shm",
+        }
+    finally:
+        recovered.close()
 
 
 def test_sqlite_connection_remains_bound_to_authority_inode_during_path_swap(

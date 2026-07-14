@@ -37,6 +37,7 @@ _IDEMPOTENCY_LIMIT = 10_000
 _CURSOR_TTL_SECONDS = 15 * 60
 _MAX_DATABASE_BYTES = 256 * 1024 * 1024
 _MAX_WAL_BYTES = 64 * 1024 * 1024
+_MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 _MAX_MANAGED_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_STARTUP_ROWS = 128_000
 _MAX_STARTUP_BLOB_BYTES = 128 * 1024 * 1024
@@ -364,6 +365,7 @@ class CoreControlStoreV1:
         self._closed = False
         self._database_fds: dict[str, int] = {}
         self._database_identities: dict[str, os.stat_result] = {}
+        self._consumed_database_sidecars: set[str] = set()
         try:
             self._open_parent_anchor()
             self._prepare_root()
@@ -2977,6 +2979,7 @@ class CoreControlStoreV1:
                 pass
         self._database_fds.clear()
         self._database_identities.clear()
+        self._consumed_database_sidecars.clear()
         for name in ("_workspace_root_fd", "_upload_root_fd"):
             descriptor = getattr(self, name, None)
             if descriptor is not None:
@@ -3064,6 +3067,9 @@ class CoreControlStoreV1:
         self._marker_identity = marker_identity
 
     def _prepare_managed_roots(self) -> None:
+        if hasattr(self, "_upload_root_fd"):
+            self._verify_lifecycle_storage()
+            return
         directory_flags = (
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
@@ -3112,7 +3118,9 @@ class CoreControlStoreV1:
                 raise StoreCorruptionError(
                     "Core Control store identity marker has no database identity"
                 )
+            self._prepare_managed_roots()
             self._require_unbound_managed_roots_empty()
+            _after_unbound_managed_inventory("initial")
             self._create_pending_store_identity(include_base_schema=True)
         elif fingerprint == legacy_fingerprint:
             if hasattr(self, "_marker_fd"):
@@ -3121,7 +3129,9 @@ class CoreControlStoreV1:
                 )
             self._verify_database_integrity()
             self._require_legacy_migration_is_unconflicted()
+            self._prepare_managed_roots()
             self._require_unbound_managed_roots_empty()
+            _after_unbound_managed_inventory("initial")
             self._create_pending_store_identity(include_base_schema=False)
         elif fingerprint != current_fingerprint:
             raise StoreCorruptionError(
@@ -3132,15 +3142,23 @@ class CoreControlStoreV1:
         self._require_store_identity_root(row)
         self._store_id = row["store_id"]
         if row["binding_state"] == "pending":
+            if not hasattr(self, "_upload_root_fd"):
+                self._prepare_managed_roots()
+                self._require_unbound_managed_roots_empty()
+                _after_unbound_managed_inventory("initial")
             self._require_pending_database_is_unconflicted()
             self._require_unbound_managed_roots_empty()
             marker_identity = self._ensure_store_identity_marker(row)
+            _after_store_identity_marker_durable()
+            self._require_unbound_managed_roots_empty()
+            _after_unbound_managed_inventory("final")
             with self._transaction():
                 current = self._read_store_identity_row()
                 if current["binding_state"] != "pending" or current["store_id"] != self._store_id:
                     raise StoreCorruptionError(
                         "Core Control pending store identity changed during binding"
                     )
+                self._require_unbound_managed_roots_empty()
                 self._connection.execute(
                     "UPDATE store_identity SET binding_state = 'bound', marker_dev = ?, "
                     "marker_ino = ? WHERE singleton = 1 AND binding_state = 'pending'",
@@ -3291,26 +3309,23 @@ class CoreControlStoreV1:
         _require_entry_binding(self._root_fd, _STORE_IDENTITY_MARKER, self._marker_identity)
 
     def _require_unbound_managed_roots_empty(self) -> None:
-        directory_flags = (
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        roots = (
+            ("workspace-uploads", self._upload_root_fd, self._upload_root_identity),
+            ("workspace-snapshots", self._workspace_root_fd, self._workspace_root_identity),
         )
-        for name in ("workspace-uploads", "workspace-snapshots"):
-            try:
-                directory_fd = os.open(name, directory_flags, dir_fd=self._root_fd)
-            except FileNotFoundError:
-                continue
-            try:
-                identity = os.fstat(directory_fd)
-                _require_private_directory_metadata(identity)
-                _require_entry_binding(self._root_fd, name, identity)
-                with os.scandir(directory_fd) as entries:
-                    if next(entries, None) is not None:
-                        raise StoreCorruptionError(
-                            "Core Control unbound managed state cannot be claimed"
-                        )
-                _require_entry_binding(self._root_fd, name, identity)
-            finally:
-                os.close(directory_fd)
+        for name, directory_fd, identity in roots:
+            before = os.fstat(directory_fd)
+            _require_private_directory_metadata(before)
+            _require_same_identity(before, identity, f"unbound {name} root")
+            _require_entry_binding(self._root_fd, name, identity)
+            with os.scandir(directory_fd) as entries:
+                if next(entries, None) is not None:
+                    raise StoreCorruptionError(
+                        "Core Control unbound managed state cannot be claimed"
+                    )
+            after = os.fstat(directory_fd)
+            _require_same_file_state(after, before, f"unbound {name} inventory")
+            _require_entry_binding(self._root_fd, name, identity)
 
     def _require_legacy_migration_is_unconflicted(self) -> None:
         self._require_database_has_no_business_rows("legacy")
@@ -3382,7 +3397,7 @@ class CoreControlStoreV1:
             raise
         self._database_fds[name] = fd
         self._database_identities[name] = metadata
-        for suffix in ("-wal", "-shm"):
+        for suffix in ("-journal", "-wal", "-shm"):
             sidecar = name + suffix
             try:
                 sidecar_fd = os.open(sidecar, flags, dir_fd=self._root_fd)
@@ -3429,6 +3444,9 @@ class CoreControlStoreV1:
             return
         for name, fd in self._database_fds.items():
             current = os.fstat(fd)
+            if name in self._consumed_database_sidecars:
+                self._verify_consumed_database_sidecar(name, current)
+                continue
             try:
                 _require_private_regular_metadata(current)
             except StoreCorruptionError as exc:
@@ -3437,8 +3455,63 @@ class CoreControlStoreV1:
             _require_entry_binding(self._root_fd, name, self._database_identities[name])
             if name.endswith("-wal") and current.st_size > _MAX_WAL_BYTES:
                 raise StoreCorruptionError("Core Control database WAL quota is exceeded")
+            if name.endswith("-journal") and current.st_size > _MAX_JOURNAL_BYTES:
+                raise StoreCorruptionError(
+                    "Core Control database rollback journal quota is exceeded"
+                )
             if name == "provider.sqlite3" and current.st_size > _MAX_DATABASE_BYTES:
                 raise StoreCorruptionError("Core Control database size quota is exceeded")
+
+    def _reconcile_rollback_journal_authority(self) -> None:
+        name = "provider.sqlite3-journal"
+        fd = self._database_fds.get(name)
+        if fd is None:
+            return
+        expected = self._database_identities[name]
+        current = os.fstat(fd)
+        _require_same_identity(current, expected, "database rollback journal")
+        try:
+            path_identity = os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_uid != os.geteuid()
+                or stat.S_IMODE(current.st_mode) != 0o600
+                or current.st_nlink != 0
+            ):
+                raise StoreCorruptionError(
+                    "Core Control rollback journal consumption is invalid"
+                )
+            self._consumed_database_sidecars.add(name)
+            return
+        if not _same_identity(path_identity, expected):
+            raise StoreCorruptionError(
+                "Core Control rollback journal was replaced during SQLite recovery"
+            )
+        _require_private_regular_metadata(current)
+        _require_entry_binding(self._root_fd, name, expected)
+
+    def _verify_consumed_database_sidecar(
+        self, name: str, current: os.stat_result
+    ) -> None:
+        expected = self._database_identities[name]
+        _require_same_identity(current, expected, f"consumed database {name}")
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or current.st_nlink != 0
+        ):
+            raise StoreCorruptionError(
+                "Core Control consumed rollback journal inode is unsafe"
+            )
+        try:
+            os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise StoreCorruptionError(
+            "Core Control rollback journal path was replaced after SQLite recovery"
+        )
 
     def _verify_schema_fingerprint(self) -> None:
         if _schema_fingerprint(self._connection) != _expected_schema_fingerprint():
@@ -3508,6 +3581,8 @@ class CoreControlStoreV1:
                     )
                 self._verify_database_authority()
                 schema_row = connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
+                _after_sqlite_recovery()
+                self._reconcile_rollback_journal_authority()
                 if (
                     schema_row is not None
                     and _schema_fingerprint(connection)
@@ -4788,6 +4863,18 @@ def _after_managed_quarantine(
     quarantine_name: str,
 ) -> None:
     del root_kind, parent_fd, original_name, quarantine_name
+
+
+def _after_unbound_managed_inventory(stage: Literal["initial", "final"]) -> None:
+    del stage
+
+
+def _after_store_identity_marker_durable() -> None:
+    pass
+
+
+def _after_sqlite_recovery() -> None:
+    pass
 
 
 def _verify_managed_disk_quota(

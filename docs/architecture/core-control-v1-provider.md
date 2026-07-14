@@ -91,10 +91,16 @@ three durable phases: one SQLite transaction creates the complete schema and
 the `pending` identity row; a random private temporary marker is completely
 written and fsynced, atomically published with no-replace rename, and followed
 by a provider-root fsync; a second SQLite transaction records the published
-marker inode and changes the row to `bound`. A crash with a pending row and no
-marker republishes it; a pending row with the exact published marker completes
-the second transaction. Unpublished temporary marker inodes are conservatively
-retained instead of deleted by pathname.
+marker inode and changes the row to `bound`. Before any identity row is created,
+Core creates or opens both canonical managed roots, fixes their private directory
+inodes by FD, and verifies an empty immediate inventory. The same held FDs and
+pathname identities are rechecked after durable marker publication and again
+inside the final `pending -> bound` transaction. A crash with a pending row and
+no marker republishes it; a pending row with the exact published marker repeats
+the same managed-root checks before completing the second transaction. Any new
+node or root replacement fails closed while the identity remains pending, before
+orphan reconciliation can run. Unpublished temporary marker inodes are
+conservatively retained instead of deleted by pathname.
 
 Startup recovery runs while the provider holds its exclusive process lock. The
 store retains provider-root, identity-marker, owner-lock, upload-root, and
@@ -108,8 +114,9 @@ parent-anchored owner is alive. For a current bound store, startup attaches the
 held database authority and verifies the DB/root/marker identity before it
 creates or opens either managed root, enables WAL, traverses workspace state, or
 performs recovery mutation. Fresh and legacy bootstrap may descriptor-open an
-existing managed root only to prove that its immediate inventory is empty before
-writing any identity state; it does not traverse children or clean entries.
+existing managed root, or create a missing canonical root, only to prove through
+the continuously held FD that its immediate inventory remains empty through the
+identity bind; it does not traverse children or clean entries.
 Copying a legitimate `provider.sqlite3` to another root, swapping markers,
 removing a bound marker, or presenting a fresh database beside existing managed
 state therefore fails closed without orphan cleanup. Recovery then reuses the
@@ -130,8 +137,15 @@ operation replay but does not count it as live quota. Managed disk quota is
 then evaluated only over database-owned live entries. Unsafe or unrecognized
 entry metadata still fails closed.
 
-The main SQLite database authority FD, WAL, and SHM are opened no-follow
-relative to the held provider-root FD and retained for the store lifetime.
+The main SQLite database authority FD and every pre-existing rollback journal,
+WAL, and SHM sidecar are opened no-follow relative to the held provider-root FD
+before SQLite connects and are retained for the store lifetime. Each starts as
+an owner-owned, link-count-one `0600` regular file at the exact canonical
+pathname. After hot-journal recovery, the original rollback-journal inode must
+either remain bound there or be the now-unlinked inode SQLite consumed while the
+canonical pathname remains absent. A replacement pathname, unsafe original
+inode, or ambiguous consumption fails closed. Journal, WAL, and main-database
+byte budgets are checked independently.
 Python sqlite has no native attach-existing-FD API, so on Linux Core opens the
 main connection through `/proc/self/fd/<authority-fd>`, verifies SQLite's
 resolved `main` path, and rechecks the held root, pathname, and inode around
