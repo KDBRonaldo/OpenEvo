@@ -65,9 +65,15 @@ may attach to a stale or partially verified release.
 
 Linux supervision binds process state to PID, kernel boot ID, and `/proc` start
 time. Signalling uses a pidfd after rechecking that full identity, so a reused
-PID is never treated as the managed process. Before `Popen`, the supervisor
-publishes a generation-specific spawn intent containing the pinned spawn-lock
-inode. The child inherits the already locked FD and replaces that intent with
+PID is never treated as the managed process. CPython's optional
+`os.pidfd_open` and `signal.pidfd_send_signal` wrappers are not a release-host
+requirement: on x86-64 and AArch64 Linux, Core uses the same kernel pidfd ABI
+through a closed, errno-preserving `syscall(2)` adapter when either wrapper is
+absent. Unknown architectures, missing kernel syscalls, and failed probes remain
+typed startup failures; Core never falls back to PID-only `kill(2)`. Before
+`Popen`, the supervisor publishes a generation-specific spawn intent containing
+the pinned spawn-lock inode. The child inherits the already locked FD and
+replaces that intent with
 its PID/boot/start-time claim before loading the registry or starting ASGI.
 If the supervisor receives `SIGKILL` anywhere after fork, either the claim is
 already recoverable or the inherited lock still identifies the unclaimed child.

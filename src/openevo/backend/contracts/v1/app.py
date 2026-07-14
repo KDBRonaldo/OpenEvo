@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from functools import wraps
 import re
 import secrets
 from typing import Annotated, Literal, Protocol
@@ -93,12 +94,34 @@ def _provider_error_response(exc: CoreControlHTTPError) -> JSONResponse:
     )
 
 
+def _iter_api_routes(routes: Iterable[object]) -> Iterator[APIRoute]:
+    visited_routers: set[int] = set()
+
+    def visit(items: Iterable[object]) -> Iterator[APIRoute]:
+        for route in items:
+            if isinstance(route, APIRoute):
+                yield route
+                continue
+            original_router = getattr(route, "original_router", None)
+            if not isinstance(original_router, APIRouter):
+                continue
+            identity = id(original_router)
+            if identity in visited_routers:
+                continue
+            visited_routers.add(identity)
+            yield from visit(original_router.routes)
+
+    yield from visit(routes)
+
+
 def _bind_provider(app: FastAPI, provider: CoreControlApiProviderV1) -> None:
-    for route in app.routes:
-        if not isinstance(route, APIRoute) or route.operation_id is None:
+    for route in _iter_api_routes(app.routes):
+        if route.operation_id is None:
             continue
         operation_id = route.operation_id
+        original_endpoint = route.endpoint
 
+        @wraps(original_endpoint)
         async def invoke_provider(
             _operation_id: str = operation_id, **arguments: object
         ) -> object:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass, field
 from enum import StrEnum
 import errno
@@ -54,6 +55,12 @@ _SERVICE_GENERATION_HEADER = "X-OpenEvo-Core-Generation"
 _RELEASE_IDENTITY_HEADER = "X-OpenEvo-Core-Release-Identity"
 _ORPHANED_SERVICE_CHILDREN_GUARD = threading.Lock()
 _ORPHANED_SERVICE_CHILDREN: dict[int, subprocess.Popen[bytes]] = {}
+_PIDFD_SYSCALL_NUMBERS = {
+    "aarch64": (434, 424),
+    "arm64": (434, 424),
+    "amd64": (434, 424),
+    "x86_64": (434, 424),
+}
 
 
 class CoreServiceErrorCode(StrEnum):
@@ -131,13 +138,63 @@ class _EndpointHTTPConnection(http.client.HTTPConnection):
         self.sock = self._endpoint.open_verified_socket(timeout_seconds=timeout)
 
 
+def _linux_syscall(number: int, *arguments: object) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    syscall = libc.syscall
+    syscall.restype = ctypes.c_long
+    ctypes.set_errno(0)
+    result = syscall(ctypes.c_long(number), *arguments)
+    if result == -1:
+        error = ctypes.get_errno() or errno.EIO
+        raise OSError(error, os.strerror(error))
+    return int(result)
+
+
+def _pidfd_syscall_numbers() -> tuple[int, int]:
+    try:
+        machine = os.uname().machine.lower()
+    except (AttributeError, OSError) as exc:
+        raise OSError(errno.ENOSYS, "Linux architecture is unavailable") from exc
+    numbers = _PIDFD_SYSCALL_NUMBERS.get(machine)
+    if numbers is None:
+        raise OSError(errno.ENOSYS, "Linux pidfd syscall ABI is unsupported")
+    return numbers
+
+
+def _pidfd_open_via_syscall(pid: int, flags: int) -> int:
+    open_number, _ = _pidfd_syscall_numbers()
+    return _linux_syscall(open_number, ctypes.c_int(pid), ctypes.c_uint(flags))
+
+
+def _pidfd_send_signal_via_syscall(pid_fd: int, sig: int, flags: int) -> None:
+    _, send_signal_number = _pidfd_syscall_numbers()
+    _linux_syscall(
+        send_signal_number,
+        ctypes.c_int(pid_fd),
+        ctypes.c_int(sig),
+        ctypes.c_void_p(),
+        ctypes.c_uint(flags),
+    )
+
+
+def _pidfd_open(pid: int, flags: int) -> int:
+    native = getattr(os, "pidfd_open", None)
+    if callable(native):
+        return native(pid, flags)
+    return _pidfd_open_via_syscall(pid, flags)
+
+
+def _pidfd_send_signal(pid_fd: int, sig: int, flags: int) -> None:
+    native = getattr(signal, "pidfd_send_signal", None)
+    if callable(native):
+        native(pid_fd, sig, None, flags)
+        return
+    _pidfd_send_signal_via_syscall(pid_fd, sig, flags)
+
+
 class LinuxProcessController:
     def __init__(self) -> None:
-        if (
-            sys.platform != "linux"
-            or not hasattr(os, "pidfd_open")
-            or not hasattr(signal, "pidfd_send_signal")
-        ):
+        if sys.platform != "linux":
             raise CoreServiceError(
                 CoreServiceErrorCode.START_FAILED,
                 "Core service supervision requires Linux pidfd support.",
@@ -158,7 +215,14 @@ class LinuxProcessController:
                 retryable=False,
             )
         self.boot_id = boot_id
-        probe = os.pidfd_open(os.getpid(), 0)
+        try:
+            probe = _pidfd_open(os.getpid(), 0)
+        except OSError as exc:
+            raise CoreServiceError(
+                CoreServiceErrorCode.START_FAILED,
+                "Core service supervision requires Linux pidfd support.",
+                retryable=False,
+            ) from exc
         os.close(probe)
 
     def capture(self, pid: int) -> ProcessIdentity:
@@ -259,7 +323,7 @@ class LinuxProcessController:
 
     def terminate(self, identity: ProcessIdentity, *, deadline: float) -> None:
         try:
-            pid_fd = os.pidfd_open(identity.pid, 0)
+            pid_fd = _pidfd_open(identity.pid, 0)
         except ProcessLookupError:
             return
         try:
@@ -269,7 +333,7 @@ class LinuxProcessController:
             except ProcessLookupError:
                 return
             try:
-                signal.pidfd_send_signal(pid_fd, signal.SIGTERM)
+                _pidfd_send_signal(pid_fd, signal.SIGTERM, 0)
             except OSError as exc:
                 if exc.errno == errno.ESRCH:
                     return
