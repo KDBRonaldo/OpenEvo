@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import stat
 import struct
 import subprocess
 import sys
@@ -48,6 +49,7 @@ def _run_crashing_core_export(
     lock: Path,
     mode: str,
     cleanup_name: str = "",
+    stage_window: str = "",
 ) -> subprocess.CompletedProcess[bytes]:
     script = f"""
 import importlib.util
@@ -61,6 +63,7 @@ spec.loader.exec_module(module)
 
 mode = sys.argv[1]
 cleanup_name = sys.argv[2]
+stage_window = sys.argv[3]
 
 def crash_after_publish(authority, member):
     del authority, member
@@ -72,8 +75,27 @@ def crash_during_cleanup(authority, source):
     if mode in {{"recovery", "rollback"}} and source.name == cleanup_name:
         os._exit(74)
 
+def crash_during_stage(authority, source, window):
+    del authority
+    if mode == "stage" and source.name == cleanup_name and window == stage_window:
+        os._exit(75)
+
+def crash_during_marker(authority, payload, window):
+    del authority
+    marker = module._decode_marker(payload)
+    bound_count = sum("inode" in member for member in marker.get("members", []))
+    if (
+        mode == "marker"
+        and marker.get("phase") == "preparing"
+        and bound_count == int(cleanup_name)
+        and window == stage_window
+    ):
+        os._exit(76)
+
 module._after_core_release_member_published = crash_after_publish
 module._after_core_release_member_cleaned = crash_during_cleanup
+module._after_core_release_stage_window = crash_during_stage
+module._after_core_release_marker_window = crash_during_marker
 with module._open_core_release_output(Path({str(output)!r})) as authority:
     module._export_core_release_inputs(
         authority,
@@ -84,7 +106,7 @@ with module._open_core_release_output(Path({str(output)!r})) as authority:
         raise OSError("trigger rollback")
 """
     return subprocess.run(
-        [sys.executable, "-c", script, mode, cleanup_name],
+        [sys.executable, "-c", script, mode, cleanup_name, stage_window],
         check=False,
     )
 
@@ -683,6 +705,123 @@ def test_build_sidecar_rejects_symlink_wheel_output_directory(
     assert list(real_output.iterdir()) == []
 
 
+@pytest.mark.parametrize("mode", [0o720, 0o702, 0o777])
+def test_core_release_output_rejects_group_or_world_writable_directory(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    output.mkdir(mode=mode)
+    output.chmod(mode)
+
+    with pytest.raises(RuntimeError, match="owner, or private permissions"):
+        with builder._open_core_release_output(output):
+            pass
+
+
+def test_core_release_output_rejects_directory_not_owned_by_current_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(builder.os, "geteuid", lambda: actual_euid + 1)
+
+    with pytest.raises(RuntimeError, match="owner, or private permissions"):
+        with builder._open_core_release_output(output):
+            pass
+
+
+def test_core_release_output_is_created_private_and_stays_pinned(tmp_path: Path) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+
+    with pytest.raises(RuntimeError, match="owner, or private permissions"):
+        with builder._open_core_release_output(output):
+            assert stat.S_IMODE(output.stat().st_mode) == 0o700
+            output.chmod(0o777)
+
+    assert list(output.iterdir()) == []
+
+
+def test_bounded_directory_scan_stops_at_limit_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    yielded = 0
+
+    class Entry:
+        name = "entry"
+
+    class Entries:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal yielded
+            yielded += 1
+            if yielded > 5:
+                raise AssertionError("enumeration continued past limit + 1")
+            return Entry()
+
+    monkeypatch.setattr(builder.os, "scandir", lambda _: Entries())
+
+    with pytest.raises(RuntimeError, match="too many entries"):
+        builder._bounded_directory_scan(-1, limit=4, container="test directory")
+
+    assert yielded == 5
+
+
+def test_bounded_directory_scan_rejects_large_real_directory(tmp_path: Path) -> None:
+    builder = _load_builder()
+    directory = tmp_path / "large"
+    directory.mkdir()
+    for index in range(2_000):
+        (directory / f"entry-{index:04d}").touch()
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(RuntimeError, match="too many entries"):
+            builder._bounded_listdir(directory_fd, limit=4, container="test directory")
+    finally:
+        os.close(directory_fd)
+
+
+def test_bounded_directory_scan_rejects_concurrent_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    directory = tmp_path / "concurrent"
+    directory.mkdir()
+    original_scan = builder._bounded_directory_scan
+    calls = 0
+
+    def scan_and_fill(directory_fd: int, *, limit: int, container: str):
+        nonlocal calls
+        names = original_scan(directory_fd, limit=limit, container=container)
+        calls += 1
+        if calls == 1:
+            (directory / "late-entry").touch()
+        return names
+
+    monkeypatch.setattr(builder, "_bounded_directory_scan", scan_and_fill)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(RuntimeError, match="changed while it was enumerated"):
+            builder._bounded_listdir(directory_fd, limit=4, container="test directory")
+    finally:
+        os.close(directory_fd)
+
+
 def test_core_release_export_stays_bound_to_original_output_directory(
     tmp_path: Path,
 ) -> None:
@@ -795,6 +934,9 @@ def test_core_release_commit_verifies_exact_member_contract(tmp_path: Path) -> N
     assert sorted(path.name for path in output.iterdir()) == sorted(
         (wheel.name, builder.CORE_FRAMEWORK_LOCK_BASENAME)
     )
+    output_descriptor = output.stat()
+    assert output_descriptor.st_uid == os.geteuid()
+    assert output_descriptor.st_mode & (stat.S_IWGRP | stat.S_IWOTH) == 0
     for source, exported in ((wheel, output / wheel.name), (lock, output / lock.name)):
         descriptor = exported.stat()
         assert descriptor.st_nlink == 1
@@ -979,15 +1121,16 @@ def test_core_release_recovery_resumes_after_second_cleanup_crash(
     marker = json.loads(
         (transactions[0] / builder.CORE_RELEASE_TRANSACTION_MARKER).read_text(encoding="utf-8")
     )
+    staging_names = {member["name"]: member["staging_name"] for member in marker["members"]}
     assert marker["phase"] == "cleaning"
     assert marker["cleanup_index"] == cleanup_index
     assert not (output / wheel.name).exists()
-    assert not (transactions[0] / wheel.name).exists()
+    assert not (transactions[0] / staging_names[wheel.name]).exists()
     if cleanup_member == "wheel":
-        assert (transactions[0] / lock.name).read_bytes() == lock.read_bytes()
+        assert (transactions[0] / staging_names[lock.name]).read_bytes() == lock.read_bytes()
     else:
         assert not (output / lock.name).exists()
-        assert not (transactions[0] / lock.name).exists()
+        assert not (transactions[0] / staging_names[lock.name]).exists()
 
     with builder._open_core_release_output(output) as authority:
         builder._export_core_release_inputs(authority, wheel, lock)
@@ -1071,15 +1214,21 @@ def test_core_release_cleaning_recovery_rejects_unbound_hardlink(tmp_path: Path)
     assert second.returncode == 74
     transactions = list(output.glob(".openevo-core-release-*"))
     assert len(transactions) == 1
+    marker = json.loads(
+        (transactions[0] / builder.CORE_RELEASE_TRANSACTION_MARKER).read_text(encoding="utf-8")
+    )
+    lock_staging_name = next(
+        member["staging_name"] for member in marker["members"] if member["name"] == lock.name
+    )
     hidden_lock = tmp_path / "hidden-framework-lock.json"
-    os.link(transactions[0] / lock.name, hidden_lock)
+    os.link(transactions[0] / lock_staging_name, hidden_lock)
 
     with pytest.raises(RuntimeError, match="identity or permissions changed"):
         with builder._open_core_release_output(output) as authority:
             builder._export_core_release_inputs(authority, wheel, lock)
 
     assert hidden_lock.read_bytes() == lock.read_bytes()
-    assert (transactions[0] / lock.name).read_bytes() == lock.read_bytes()
+    assert (transactions[0] / lock_staging_name).read_bytes() == lock.read_bytes()
     marker = json.loads(
         (transactions[0] / builder.CORE_RELEASE_TRANSACTION_MARKER).read_text(encoding="utf-8")
     )
@@ -1150,15 +1299,94 @@ def test_core_release_bootstrap_crash_is_reconciled_before_publication(
     assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
 
 
-def test_preparing_recovery_preserves_inode_unbound_staged_member(tmp_path: Path) -> None:
+@pytest.mark.parametrize("member", ["wheel", "lock"])
+@pytest.mark.parametrize(
+    "stage_window",
+    [
+        "intent-durable",
+        "file-created",
+        "inode-bound",
+        "bytes-fsynced",
+        "mode-fsynced",
+    ],
+)
+def test_preparing_member_crash_windows_recover_repeatedly(
+    tmp_path: Path,
+    member: str,
+    stage_window: str,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    member_name = wheel.name if member == "wheel" else lock.name
+
+    for _ in range(2):
+        crashed = _run_crashing_core_export(
+            builder_path=builder_path,
+            output=output,
+            wheel=wheel,
+            lock=lock,
+            mode="stage",
+            cleanup_name=member_name,
+            stage_window=stage_window,
+        )
+        assert crashed.returncode == 75
+        assert len(list(output.glob(".openevo-core-release-*"))) == 1
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+
+
+@pytest.mark.parametrize("bound_count", [1, 2])
+@pytest.mark.parametrize(
+    "marker_window",
+    ["candidate-durable", "marker-replaced", "marker-durable"],
+)
+def test_preparing_marker_crash_windows_recover_repeatedly(
+    tmp_path: Path,
+    bound_count: int,
+    marker_window: str,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    for _ in range(2):
+        crashed = _run_crashing_core_export(
+            builder_path=builder_path,
+            output=output,
+            wheel=wheel,
+            lock=lock,
+            mode="marker",
+            cleanup_name=str(bound_count),
+            stage_window=marker_window,
+        )
+        assert crashed.returncode == 76
+        assert len(list(output.glob(".openevo-core-release-*"))) == 1
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+
+
+def test_preparing_recovery_preserves_path_outside_durable_member_intents(tmp_path: Path) -> None:
     builder = _load_builder()
     output = tmp_path / "output"
     output.mkdir()
     transaction = output / f".openevo-core-release-{'b' * 32}"
     transaction.mkdir(mode=0o700)
     wheel, lock = _write_export_inputs(builder, tmp_path)
+    staging_names = {
+        wheel.name: f".member-{'c' * 32}",
+        lock.name: f".member-{'d' * 32}",
+    }
     marker_payload = {
-        "schema_version": "1",
+        "schema_version": "2",
         "phase": "preparing",
         "output_device": output.stat().st_dev,
         "output_inode": output.stat().st_ino,
@@ -1167,6 +1395,7 @@ def test_preparing_recovery_preserves_inode_unbound_staged_member(tmp_path: Path
         "members": [
             {
                 "name": source.name,
+                "staging_name": staging_names[source.name],
                 "byte_size": source.stat().st_size,
                 "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             }
@@ -1182,12 +1411,56 @@ def test_preparing_recovery_preserves_inode_unbound_staged_member(tmp_path: Path
     staged.write_bytes(b"partial staged bytes")
     staged.chmod(0o600)
 
-    with pytest.raises(RuntimeError, match="inode-unbound entry"):
+    with pytest.raises(RuntimeError, match="unknown transaction member"):
         with builder._open_core_release_output(output) as authority:
             builder._export_core_release_inputs(authority, wheel, lock)
 
     assert staged.read_bytes() == b"partial staged bytes"
     assert marker.exists()
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "hardlink"])
+def test_preparing_recovery_preserves_replaced_unbound_intent(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    crashed = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="stage",
+        cleanup_name=wheel.name,
+        stage_window="file-created",
+    )
+    assert crashed.returncode == 75
+    transaction = next(output.glob(".openevo-core-release-*"))
+    marker = json.loads(
+        (transaction / builder.CORE_RELEASE_TRANSACTION_MARKER).read_text(encoding="utf-8")
+    )
+    staging_name = next(
+        member["staging_name"] for member in marker["members"] if member["name"] == wheel.name
+    )
+    staged = transaction / staging_name
+    staged.unlink()
+    attacker_path = tmp_path / "attacker-owned"
+    attacker_path.write_bytes(b"do not remove")
+    attacker_path.chmod(0o600)
+    if replacement == "symlink":
+        staged.symlink_to(attacker_path)
+    else:
+        os.link(attacker_path, staged)
+
+    with pytest.raises((OSError, RuntimeError)):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert attacker_path.read_bytes() == b"do not remove"
+    assert staged.exists()
 
 
 def test_temporary_directory_cleanup_failure_rolls_back_release_pair(

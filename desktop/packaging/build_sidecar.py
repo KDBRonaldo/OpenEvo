@@ -37,6 +37,7 @@ CORE_FRAMEWORK_LOCK_BASENAME = "framework-lock.json"
 CORE_RELEASE_TRANSACTION_MARKER = "transaction.json"
 CORE_RELEASE_TRANSACTION_READY = "transaction.ready"
 _CORE_RELEASE_TRANSACTION_PATTERN = re.compile(r"\.openevo-core-release-([0-9a-f]{32})")
+_CORE_RELEASE_STAGING_PATTERN = re.compile(r"\.member-([0-9a-f]{32})")
 _MAX_CORE_RELEASE_ROOT_MEMBERS = 4
 _MAX_CORE_RELEASE_TRANSACTION_MEMBERS = 4
 _MAX_CORE_RELEASE_MARKER_BYTES = 4096
@@ -867,7 +868,7 @@ def _prepare_core_wheel_output_dir(output_dir: Path) -> None:
         raise RuntimeError(f"Core wheel output must not be a symbolic link: {output_dir}")
     if output_dir.exists() and not output_dir.is_dir():
         raise RuntimeError(f"Core wheel output is not a directory: {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -894,6 +895,7 @@ class _CoreReleaseOutput:
         "transaction_fd",
         "marker_fd",
         "marker_identity",
+        "member_intents",
         "sources",
         "members",
         "preexisting",
@@ -919,6 +921,7 @@ class _CoreReleaseOutput:
         self.transaction_fd = -1
         self.marker_fd = -1
         self.marker_identity: tuple[int, int] | None = None
+        self.member_intents: dict[str, str] = {}
         self.sources: list[_CoreReleaseSource] = []
         self.members: list[_CoreReleaseMember] = []
         self.preexisting = False
@@ -941,8 +944,14 @@ class _CoreReleaseOutput:
             or (pinned.st_dev, pinned.st_ino) != expected_identity
             or not stat.S_ISDIR(current.st_mode)
             or not stat.S_ISDIR(pinned.st_mode)
+            or current.st_uid != os.geteuid()
+            or pinned.st_uid != os.geteuid()
+            or current.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or pinned.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         ):
-            raise RuntimeError("Core wheel output path changed during the sidecar build")
+            raise RuntimeError(
+                "Core wheel output path, owner, or private permissions changed during the sidecar build"
+            )
 
     def close(self) -> None:
         for member in self.members:
@@ -1001,11 +1010,28 @@ class _CoreReleaseMember:
         self.inode = inode
 
 
+def _bounded_directory_scan(
+    directory_fd: int,
+    *,
+    limit: int,
+    container: str,
+) -> tuple[str, ...]:
+    names: list[str] = []
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            names.append(entry.name)
+            if len(names) > limit:
+                raise RuntimeError(f"{container} contains too many entries")
+    names.sort()
+    return tuple(names)
+
+
 def _bounded_listdir(directory_fd: int, *, limit: int, container: str) -> tuple[str, ...]:
-    names = tuple(sorted(os.listdir(directory_fd)))
-    if len(names) > limit:
-        raise RuntimeError(f"{container} contains too many entries")
-    return names
+    first = _bounded_directory_scan(directory_fd, limit=limit, container=container)
+    second = _bounded_directory_scan(directory_fd, limit=limit, container=container)
+    if first != second:
+        raise RuntimeError(f"{container} changed while it was enumerated")
+    return second
 
 
 def _classify_core_release_inventory(directory_fd: int) -> tuple[str, ...]:
@@ -1076,9 +1102,14 @@ def _open_core_release_source(path: Path, *, name: str) -> _CoreReleaseSource:
         raise
 
 
-def _source_marker_entry(source: _CoreReleaseSource) -> dict[str, object]:
+def _source_marker_entry(
+    source: _CoreReleaseSource,
+    *,
+    staging_name: str,
+) -> dict[str, object]:
     return {
         "name": source.name,
+        "staging_name": staging_name,
         "byte_size": source.byte_size,
         "sha256": source.sha256,
     }
@@ -1100,14 +1131,18 @@ def _marker_bytes(
         raise RuntimeError("Core release marker has cleanup progress outside cleaning")
     members: list[dict[str, object]] = []
     for source in authority.sources:
-        entry = _source_marker_entry(source)
+        try:
+            staging_name = authority.member_intents[source.name]
+        except KeyError as exc:
+            raise RuntimeError("Core release member intent is incomplete") from exc
+        entry = _source_marker_entry(source, staging_name=staging_name)
         if member_identities is not None and source.name in member_identities:
             device, inode = member_identities[source.name]
             entry["device"] = device
             entry["inode"] = inode
         members.append(entry)
     payload = {
-        "schema_version": "1",
+        "schema_version": "2",
         "phase": phase,
         "output_device": authority.device,
         "output_inode": authority.inode,
@@ -1436,6 +1471,28 @@ def _decode_marker(payload: bytes) -> dict[str, object]:
     return marker
 
 
+def _adopt_marker_intents(authority: _CoreReleaseOutput, payload: bytes) -> None:
+    marker = _decode_marker(payload)
+    raw_members = marker.get("members")
+    if not isinstance(raw_members, list) or len(raw_members) != len(authority.sources):
+        raise RuntimeError("Core release marker member intents are invalid")
+    intents: dict[str, str] = {}
+    for source, entry in zip(authority.sources, raw_members, strict=True):
+        if not isinstance(entry, dict) or entry.get("name") != source.name:
+            raise RuntimeError("Core release marker member intents are invalid")
+        staging_name = entry.get("staging_name")
+        if (
+            not isinstance(staging_name, str)
+            or _CORE_RELEASE_STAGING_PATTERN.fullmatch(staging_name) is None
+            or staging_name in intents.values()
+        ):
+            raise RuntimeError("Core release marker member intents are invalid")
+        intents[source.name] = staging_name
+    if authority.member_intents and authority.member_intents != intents:
+        raise RuntimeError("Core release marker member intents changed")
+    authority.member_intents = intents
+
+
 def _bound_marker_state(
     authority: _CoreReleaseOutput,
     marker: dict[str, object],
@@ -1443,7 +1500,7 @@ def _bound_marker_state(
     transaction_identity: tuple[int, int],
 ) -> tuple[dict[str, tuple[int, int]], int]:
     phase = marker.get("phase")
-    if phase not in {"ready", "cleaning"}:
+    if phase not in {"preparing", "ready", "cleaning"}:
         raise RuntimeError("Core release bound marker phase is invalid")
     raw_members = marker.get("members")
     if not isinstance(raw_members, list) or len(raw_members) != len(authority.sources):
@@ -1454,7 +1511,7 @@ def _bound_marker_state(
         if not isinstance(entry, dict):
             raise RuntimeError("Core release bound marker member is invalid")
         keys = frozenset(entry)
-        base_keys = frozenset({"name", "byte_size", "sha256"})
+        base_keys = frozenset({"name", "staging_name", "byte_size", "sha256"})
         bound_keys = frozenset({*base_keys, "device", "inode"})
         if phase == "ready" and keys != bound_keys:
             raise RuntimeError("Core release ready marker member is invalid")
@@ -1462,6 +1519,13 @@ def _bound_marker_state(
             raise RuntimeError("Core release cleaning marker member is invalid")
         if entry.get("name") != source.name:
             raise RuntimeError("Core release bound marker member name is invalid")
+        staging_name = entry.get("staging_name")
+        if (
+            not isinstance(staging_name, str)
+            or _CORE_RELEASE_STAGING_PATTERN.fullmatch(staging_name) is None
+            or authority.member_intents.get(source.name) != staging_name
+        ):
+            raise RuntimeError("Core release member staging intent is invalid")
         if keys == bound_keys:
             if saw_unbound:
                 raise RuntimeError("Core release cleaning marker identities are not a prefix")
@@ -1478,7 +1542,7 @@ def _bound_marker_state(
         if (
             type(raw_cleanup_index) is not int
             or raw_cleanup_index < 0
-            or raw_cleanup_index > len(identities)
+            or raw_cleanup_index > len(authority.sources)
         ):
             raise RuntimeError("Core release cleaning marker progress is invalid")
         cleanup_index = raw_cleanup_index
@@ -1520,6 +1584,7 @@ def _replace_transaction_marker(
             mode=0o600,
         )
         os.fsync(transaction_fd)
+        _after_core_release_marker_window(authority, payload, "candidate-durable")
         current = os.stat(
             CORE_RELEASE_TRANSACTION_MARKER,
             dir_fd=transaction_fd,
@@ -1541,6 +1606,7 @@ def _replace_transaction_marker(
             dst_dir_fd=transaction_fd,
         )
         replaced = True
+        _after_core_release_marker_window(authority, payload, "marker-replaced")
         published_payload, published_identity = _read_marker(
             transaction_fd,
             CORE_RELEASE_TRANSACTION_MARKER,
@@ -1548,6 +1614,7 @@ def _replace_transaction_marker(
         if published_payload != payload or published_identity != candidate_identity:
             raise RuntimeError("Core release replacement marker changed")
         os.fsync(transaction_fd)
+        _after_core_release_marker_window(authority, payload, "marker-durable")
         if (
             authority.transaction_fd == transaction_fd
             and authority.marker_identity == current_identity
@@ -1574,6 +1641,14 @@ def _replace_transaction_marker(
             os.close(candidate_fd)
 
 
+def _after_core_release_marker_window(
+    authority: _CoreReleaseOutput,
+    payload: bytes,
+    window: str,
+) -> None:
+    del authority, payload, window
+
+
 def _validate_marker_payload(
     authority: _CoreReleaseOutput,
     payload: bytes,
@@ -1583,15 +1658,12 @@ def _validate_marker_payload(
     marker = _decode_marker(payload)
     phase = marker.get("phase")
     if phase == "preparing":
-        expected = _marker_bytes(
+        identities, cleanup_index = _bound_marker_state(
             authority,
-            phase="preparing",
-            transaction_device=transaction_identity[0],
-            transaction_inode=transaction_identity[1],
+            marker,
+            transaction_identity=transaction_identity,
         )
-        if payload != expected:
-            raise RuntimeError("Core release preparing marker does not match current inputs")
-        return phase, {}, 0
+        return phase, identities, cleanup_index
     if phase in {"ready", "cleaning"}:
         identities, cleanup_index = _bound_marker_state(
             authority,
@@ -1612,6 +1684,12 @@ def _recover_pending_marker_replacement(
         transaction_fd,
         CORE_RELEASE_TRANSACTION_MARKER,
     )
+    try:
+        _adopt_marker_intents(authority, marker_payload)
+    except RuntimeError:
+        if CORE_RELEASE_TRANSACTION_READY in transaction_names:
+            raise
+        return marker_payload, marker_identity
     if CORE_RELEASE_TRANSACTION_READY not in transaction_names:
         return marker_payload, marker_identity
     candidate_payload, candidate_identity = _read_marker(
@@ -1629,10 +1707,24 @@ def _recover_pending_marker_replacement(
         transaction_identity=transaction_identity,
     )
     valid_transition = False
-    if phase == "preparing" and candidate_phase == "ready":
-        valid_transition = len(candidate_identities) == len(authority.sources)
+    if phase == "preparing" and candidate_phase == "preparing":
+        current_items = tuple(identities.items())
+        candidate_items = tuple(candidate_identities.items())
+        valid_transition = (
+            len(candidate_items) == len(current_items) + 1
+            and candidate_items[: len(current_items)] == current_items
+        )
+    elif phase == "preparing" and candidate_phase == "ready":
+        valid_transition = (
+            len(candidate_identities) == len(authority.sources)
+            and tuple(candidate_identities.items())[: len(identities)]
+            == tuple(identities.items())
+        )
     elif phase == "preparing" and candidate_phase == "cleaning":
-        valid_transition = candidate_cleanup_index == min(1, len(candidate_identities))
+        valid_transition = (
+            candidate_identities == identities
+            and candidate_cleanup_index == min(1, len(authority.sources))
+        )
     elif phase == "ready" and candidate_phase == "cleaning":
         valid_transition = candidate_identities == identities and candidate_cleanup_index == 1
     elif phase == "cleaning" and candidate_phase == "cleaning":
@@ -1679,43 +1771,14 @@ def _recover_preparing_transaction(
     marker_payload: bytes,
     marker_identity: tuple[int, int],
 ) -> None:
-    expected = _marker_bytes(
+    _cleanup_core_release_transaction(
         authority,
-        phase="preparing",
-        transaction_device=transaction_identity[0],
-        transaction_inode=transaction_identity[1],
-    )
-    if marker_payload != expected:
-        raise RuntimeError("Core release preparing marker does not match current inputs")
-    root_names = _bounded_listdir(
-        authority.directory_fd,
-        limit=_MAX_CORE_RELEASE_ROOT_MEMBERS,
-        container="Core wheel output",
-    )
-    if root_names != (transaction_name,):
-        raise RuntimeError("Core release preparing transaction has published root members")
-    transaction_names = _bounded_listdir(
         transaction_fd,
-        limit=_MAX_CORE_RELEASE_TRANSACTION_MEMBERS,
-        container="Core release transaction",
-    )
-    if transaction_names != (CORE_RELEASE_TRANSACTION_MARKER,):
-        raise RuntimeError(
-            "Core release preparing transaction contains an inode-unbound entry; "
-            "recovery preserved it"
-        )
-    _remove_regular_path(
-        transaction_fd,
-        CORE_RELEASE_TRANSACTION_MARKER,
-        identity=marker_identity,
-        modes=frozenset({0o600}),
-    )
-    _remove_transaction_directory(
-        authority,
         transaction_name,
-        identity=transaction_identity,
+        transaction_identity,
+        marker_payload,
+        marker_identity,
     )
-    os.fsync(authority.directory_fd)
 
 
 def _after_core_release_member_cleaned(
@@ -1732,21 +1795,12 @@ def _cleanup_core_release_transaction(
     transaction_identity: tuple[int, int],
     marker_payload: bytes,
     marker_identity: tuple[int, int],
-    *,
-    rollback_identities: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     phase, identities, cleanup_index = _validate_marker_payload(
         authority,
         marker_payload,
         transaction_identity=transaction_identity,
     )
-    if phase == "preparing":
-        if rollback_identities is None:
-            raise RuntimeError("Core release preparing cleanup has no bound members")
-        identities = rollback_identities
-        cleanup_index = 0
-    elif rollback_identities is not None and identities != rollback_identities:
-        raise RuntimeError("Core release rollback marker identities changed")
     root_names = _bounded_listdir(
         authority.directory_fd,
         limit=_MAX_CORE_RELEASE_ROOT_MEMBERS,
@@ -1757,58 +1811,106 @@ def _cleanup_core_release_transaction(
         limit=_MAX_CORE_RELEASE_TRANSACTION_MEMBERS,
         container="Core release transaction",
     )
-    cleanup_sources = [source for source in authority.sources if source.name in identities]
-    if [source.name for source in cleanup_sources] != list(identities):
+    cleanup_sources = list(authority.sources)
+    if list(identities) != [source.name for source in cleanup_sources[: len(identities)]]:
         raise RuntimeError("Core release cleanup identity order changed")
     ordinary_locations = [
-        (authority.directory_fd, name) for name in root_names if name != transaction_name
+        (authority.directory_fd, name, True) for name in root_names if name != transaction_name
     ]
     ordinary_locations.extend(
-        (transaction_fd, name)
+        (transaction_fd, name, False)
         for name in transaction_names
         if name != CORE_RELEASE_TRANSACTION_MARKER
     )
-    consumed_locations: set[tuple[int, str]] = set()
-    member_locations: dict[str, list[tuple[int, str]]] = {}
+    consumed_locations: set[tuple[int, str, bool]] = set()
+    member_locations: dict[
+        str,
+        list[tuple[int, str, tuple[int, int], frozenset[int]]],
+    ] = {}
     for index, source in enumerate(cleanup_sources):
-        expected_identity = identities[source.name]
-        allow_identity_alias = index < cleanup_index or rollback_identities is not None
-        locations: list[tuple[int, str]] = []
-        for directory_fd, name in ordinary_locations:
-            if (directory_fd, name) in consumed_locations:
+        expected_identity = identities.get(source.name)
+        staging_name = authority.member_intents[source.name]
+        candidates: list[tuple[int, str, bool]] = []
+        for directory_fd, name, at_root in ordinary_locations:
+            location = (directory_fd, name, at_root)
+            if location in consumed_locations:
+                continue
+            actual_identity: tuple[int, int] | None = None
+            if expected_identity is not None:
+                descriptor = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                actual_identity = (descriptor.st_dev, descriptor.st_ino)
+            if (
+                expected_identity is not None and actual_identity == expected_identity
+            ) or (at_root and name == source.name) or (not at_root and name == staging_name):
+                candidates.append(location)
+                consumed_locations.add(location)
+        locations: list[tuple[int, str, tuple[int, int], frozenset[int]]] = []
+        expected_links = len(candidates)
+        for directory_fd, name, at_root in candidates:
+            if expected_identity is None:
+                if at_root:
+                    raise RuntimeError("Core release unbound intent escaped its transaction")
+                file_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    descriptor = os.fstat(file_fd)
+                    observed_identity = (descriptor.st_dev, descriptor.st_ino)
+                    _require_member_attributes(
+                        descriptor,
+                        name=name,
+                        mode=0o600,
+                        identity=observed_identity,
+                    )
+                    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) != observed_identity:
+                        raise RuntimeError(f"Core release staging intent changed: {source.name}")
+                finally:
+                    os.close(file_fd)
+                locations.append((directory_fd, name, observed_identity, frozenset({0o600})))
                 continue
             descriptor = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            actual_identity = (descriptor.st_dev, descriptor.st_ino)
-            if name == source.name or (
-                allow_identity_alias and actual_identity == expected_identity
+            if (
+                not at_root
+                and stat.S_ISREG(descriptor.st_mode)
+                and stat.S_IMODE(descriptor.st_mode) == 0o600
             ):
-                locations.append((directory_fd, name))
-                consumed_locations.add((directory_fd, name))
-        if not locations and index >= cleanup_index:
+                _require_member_attributes(
+                    descriptor,
+                    name=name,
+                    mode=0o600,
+                    identity=expected_identity,
+                    link_counts=frozenset({expected_links}),
+                )
+            else:
+                _verify_member_path(
+                    directory_fd,
+                    source,
+                    name=name,
+                    identity=expected_identity,
+                    link_counts=frozenset({expected_links}),
+                )
+            locations.append(
+                (directory_fd, name, expected_identity, frozenset({0o600, 0o644}))
+            )
+        if not locations and expected_identity is not None and index >= cleanup_index:
             held_member = next(
                 (
                     member
                     for member in authority.members
                     if member.source.name == source.name
-                    and (member.device, member.inode) == identities[source.name]
+                    and (member.device, member.inode) == expected_identity
                 ),
                 None,
             )
             if held_member is None or os.fstat(held_member.file_fd).st_nlink != 0:
                 raise RuntimeError(f"Core release recovery cannot locate {source.name}")
-        for directory_fd, name in locations:
-            _verify_member_path(
-                directory_fd,
-                source,
-                name=name,
-                identity=expected_identity,
-                link_counts=frozenset({len(locations)}),
-            )
         member_locations[source.name] = locations
     if len(consumed_locations) != len(ordinary_locations):
         raise RuntimeError("Core release cleanup found an unknown transaction member")
     for index, source in enumerate(cleanup_sources):
-        expected_identity = identities[source.name]
         locations = member_locations[source.name]
         if index >= cleanup_index:
             payload = _marker_bytes(
@@ -1826,17 +1928,17 @@ def _cleanup_core_release_transaction(
                 current_identity=marker_identity,
             )
             cleanup_index = index + 1
-        for directory_fd, name in locations:
+        for directory_fd, name, location_identity, modes in locations:
             _remove_regular_path(
                 directory_fd,
                 name,
-                identity=expected_identity,
-                modes=frozenset({0o644}),
+                identity=location_identity,
+                modes=modes,
             )
         os.fsync(transaction_fd)
         os.fsync(authority.directory_fd)
         for member in authority.members:
-            if (member.device, member.inode) == expected_identity:
+            if (member.device, member.inode) == identities.get(source.name):
                 if os.fstat(member.file_fd).st_nlink != 0:
                     raise RuntimeError(f"Core release member {source.name} was not fully unlinked")
                 break
@@ -1993,6 +2095,9 @@ def _create_core_release_transaction(authority: _CoreReleaseOutput) -> None:
     transaction_fd, descriptor = _open_transaction_directory(authority, name)
     authority.transaction_name = name
     authority.transaction_fd = transaction_fd
+    authority.member_intents = {
+        source.name: f".member-{secrets.token_hex(16)}" for source in authority.sources
+    }
     payload = _marker_bytes(
         authority,
         phase="preparing",
@@ -2011,12 +2116,52 @@ def _create_core_release_transaction(authority: _CoreReleaseOutput) -> None:
     os.fsync(authority.directory_fd)
 
 
+def _after_core_release_stage_window(
+    authority: _CoreReleaseOutput,
+    source: _CoreReleaseSource,
+    window: str,
+) -> None:
+    del authority, source, window
+
+
+def _publish_preparing_member_identity(
+    authority: _CoreReleaseOutput,
+    source: _CoreReleaseSource,
+    identity: tuple[int, int],
+) -> None:
+    if authority.marker_identity is None:
+        raise RuntimeError("Core release preparing marker is not bound")
+    transaction = os.fstat(authority.transaction_fd)
+    identities = {
+        member.source.name: (member.device, member.inode) for member in authority.members
+    }
+    identities[source.name] = identity
+    payload = _marker_bytes(
+        authority,
+        phase="preparing",
+        transaction_device=transaction.st_dev,
+        transaction_inode=transaction.st_ino,
+        member_identities=identities,
+    )
+    _replace_transaction_marker(
+        authority,
+        authority.transaction_fd,
+        payload,
+        current_identity=authority.marker_identity,
+    )
+
+
 def _copy_core_release_member(
     authority: _CoreReleaseOutput,
     source: _CoreReleaseSource,
 ) -> _CoreReleaseMember:
+    try:
+        staging_name = authority.member_intents[source.name]
+    except KeyError as exc:
+        raise RuntimeError("Core release member has no durable staging intent") from exc
+    _after_core_release_stage_window(authority, source, "intent-durable")
     destination_fd = os.open(
-        source.name,
+        staging_name,
         os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
         0o600,
         dir_fd=authority.transaction_fd,
@@ -2025,6 +2170,18 @@ def _copy_core_release_member(
     try:
         descriptor = os.fstat(destination_fd)
         identity = (descriptor.st_dev, descriptor.st_ino)
+        _require_member_attributes(
+            descriptor,
+            name=staging_name,
+            mode=0o600,
+            identity=identity,
+        )
+        current = os.stat(staging_name, dir_fd=authority.transaction_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != identity:
+            raise RuntimeError(f"Core release staging intent changed: {source.name}")
+        _after_core_release_stage_window(authority, source, "file-created")
+        _publish_preparing_member_identity(authority, source, identity)
+        _after_core_release_stage_window(authority, source, "inode-bound")
         os.lseek(source.file_fd, 0, os.SEEK_SET)
         with os.fdopen(os.dup(source.file_fd), "rb") as source_file, os.fdopen(
             os.dup(destination_fd), "wb"
@@ -2032,8 +2189,10 @@ def _copy_core_release_member(
             shutil.copyfileobj(source_file, destination_file)
             destination_file.flush()
         os.fsync(destination_fd)
+        _after_core_release_stage_window(authority, source, "bytes-fsynced")
         os.fchmod(destination_fd, 0o644)
         os.fsync(destination_fd)
+        _after_core_release_stage_window(authority, source, "mode-fsynced")
         _require_member_attributes(
             os.fstat(destination_fd),
             name=source.name,
@@ -2043,7 +2202,7 @@ def _copy_core_release_member(
         byte_size, sha256 = _sha256_fd(destination_fd)
         if byte_size != source.byte_size or sha256 != source.sha256:
             raise RuntimeError(f"Copied Core release member differs from source: {source.name}")
-        current = os.stat(source.name, dir_fd=authority.transaction_fd, follow_symlinks=False)
+        current = os.stat(staging_name, dir_fd=authority.transaction_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != identity:
             raise RuntimeError(f"Core release transaction member pathname changed: {source.name}")
         return _CoreReleaseMember(
@@ -2053,16 +2212,6 @@ def _copy_core_release_member(
             inode=identity[1],
         )
     except BaseException:
-        if identity is not None:
-            try:
-                _remove_regular_path(
-                    authority.transaction_fd,
-                    source.name,
-                    identity=identity,
-                    modes=frozenset({0o600, 0o644}),
-                )
-            except BaseException:
-                pass
         os.close(destination_fd)
         raise
 
@@ -2099,14 +2248,16 @@ def _after_core_release_member_published(
 def _publish_core_release_members(authority: _CoreReleaseOutput) -> None:
     for member in authority.members:
         source = member.source
+        staging_name = authority.member_intents[source.name]
         staged_identity = _verify_member_path(
             authority.transaction_fd,
             source,
+            name=staging_name,
             identity=(member.device, member.inode),
         )
         try:
             os.link(
-                source.name,
+                staging_name,
                 source.name,
                 src_dir_fd=authority.transaction_fd,
                 dst_dir_fd=authority.directory_fd,
@@ -2121,13 +2272,13 @@ def _publish_core_release_members(authority: _CoreReleaseOutput) -> None:
             link_counts=frozenset({2}),
         )
         current = os.stat(
-            source.name,
+            staging_name,
             dir_fd=authority.transaction_fd,
             follow_symlinks=False,
         )
         if (current.st_dev, current.st_ino) != staged_identity:
             raise RuntimeError(f"Core release staged member changed: {source.name}")
-        os.unlink(source.name, dir_fd=authority.transaction_fd)
+        os.unlink(staging_name, dir_fd=authority.transaction_fd)
         if os.fstat(member.file_fd).st_nlink != 1:
             raise RuntimeError(f"Core release member link count changed: {source.name}")
         os.fsync(authority.transaction_fd)
@@ -2247,9 +2398,6 @@ def _rollback_core_release_inputs(authority: _CoreReleaseOutput) -> None:
         transaction_identity,
         transaction_names,
     )
-    rollback_identities = {
-        member.source.name: (member.device, member.inode) for member in authority.members
-    }
     _cleanup_core_release_transaction(
         authority,
         authority.transaction_fd,
@@ -2257,7 +2405,6 @@ def _rollback_core_release_inputs(authority: _CoreReleaseOutput) -> None:
         transaction_identity,
         marker_payload,
         marker_identity,
-        rollback_identities=rollback_identities,
     )
     if _bounded_listdir(
         authority.directory_fd,

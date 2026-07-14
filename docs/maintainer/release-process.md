@@ -60,6 +60,13 @@ the remote server.
 9. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
    dependency checks.
 
+The exact Core wheel export directory must be owned by the build user and must
+not be group/world writable; a newly created directory is `0700`. After an
+interrupted build, rerun the same builder with the same wheel inputs so its
+durable transaction recovery can complete. Do not manually remove a preserved
+unknown path, hardlink, symlink, or inode-mismatched replacement without first
+investigating the release workspace.
+
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
 best stochastic result.

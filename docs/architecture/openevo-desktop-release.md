@@ -43,25 +43,37 @@ The repository currently provides:
   root to be the closed set of exactly one wheel and one lock, rejects additional
   and path-escaping members, rechecks both source digests, and reloads the
   extracted pair through the Core lock loader. Raw CArchive TOC multiplicity is
-  verified before accepting PyInstaller's parsed inventory.
-  `--core-wheel-output-dir` exports the same pair
-  only to a path with no symbolic-link component that is empty or contains one
-  recognized recoverable transaction/exact pair. The builder pins that directory
-  by an open no-follow descriptor and inode for the complete build.
+  verified before accepting PyInstaller's parsed inventory. `--core-wheel-output-dir`
+  exports the same pair
+  only to a current-user-owned path with no symbolic-link component that is not
+  group/world writable and is empty or contains one recognized recoverable
+  transaction/exact pair. Newly created output directories use `0700`. The
+  builder pins that directory by an open no-follow descriptor and revalidates
+  its inode, owner, and private permissions through final return, so another
+  local user cannot replace the committed files through the output directory.
   Core wheel construction fixes `SOURCE_DATE_EPOCH` to the trusted source commit
   time so a retry can reproduce and recognize a fully committed pair.
-  It stages the pair under a private `0700` transaction directory whose bounded,
-  canonical marker records the output and transaction identities plus each
-  member's name, inode, size, and SHA-256. Publication uses no-replace hard links,
+  It stages the pair under a private `0700` transaction directory. Before any
+  member is created, its bounded canonical v2 marker durably records the output and
+  transaction identities plus a random per-member staging intent, name, size,
+  and SHA-256. Each new member inode is added monotonically to that marker before
+  its bytes are copied and fsynced. Publication uses no-replace hard links,
   retains the source and destination descriptors, and commits only after the
   temporary build tree has cleaned up and an exact root inventory revalidates
   both regular, link-count-one, owner-only-written members against the source and
   lock contract. A crash after the ready marker but before both names are
   published leaves complete inode-bound recovery authority; the next build
-  removes only that exact transaction and retries. Empty or marker-only bootstrap
-  transactions are also bounded recovery states. Any inode-unbound staged entry,
-  unknown root entry, or identity-mismatched replacement is preserved and fails
-  closed. An empty marker-less transaction directory beside an exact complete
+  removes only that exact transaction and retries. Preparing transactions at
+  every member create/copy/fsync boundary are also automatically and idempotently
+  recovered: a random intent authorizes only its private `0600` transaction path,
+  while a persisted inode receipt authorizes only that exact inode. Empty or
+  marker-only bootstrap transactions remain bounded recovery states. Any path
+  outside the durable intents, unknown root entry, symlink/hardlink fault, or
+  identity-mismatched replacement is preserved and fails closed. Root and
+  transaction inventories are read through bounded FD-based iterative scans;
+  each scan rejects on `limit + 1`, and changing consecutive snapshots fail
+  closed without first materializing or sorting an unbounded directory. An empty
+  marker-less transaction directory beside an exact complete
   pair is the bounded crash state after marker removal and is removed before that
   pair is accepted;
 - source-level frontend, sidecar, Rust, and package-inventory tests;
