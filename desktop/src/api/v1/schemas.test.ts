@@ -10,11 +10,17 @@ import {
   desktopStateV1Schema,
   diagnosticReportV1Schema,
   eventEnvelopeV1Schema,
+  executionSettingsV1Schema,
   healthV1Schema,
   localOperationV1Schema,
   logEntryV1Schema,
   profilePageV1Schema,
+  profileCreateV1Schema,
+  profilePatchV1Schema,
   projectCapabilitiesV1Schema,
+  projectCreateV1Schema,
+  projectPatchV1Schema,
+  projectValidateRequestV1Schema,
   projectV1Schema,
   projectValidationV1Schema,
   remoteProfileV1Schema,
@@ -59,6 +65,11 @@ describe("Desktop Local API v1 schemas", () => {
     expect(healthV1Schema.parse(criticalFixture.health).protocol).toBe("openevo-native-sidecar-v1");
     expect(desktopStateV1Schema.parse(criticalFixture.state).core.state).toBe("online");
     expect(runCreateV1Schema.parse(criticalFixture.run_create).required_revision.state).toBe("queued");
+    expect(profileCreateV1Schema.parse(criticalFixture.profile_create.wire)).toEqual(criticalFixture.profile_create.normalized);
+    expect(executionSettingsV1Schema.parse(criticalFixture.execution.wire)).toEqual(criticalFixture.execution.normalized);
+    expect(profilePatchV1Schema.parse(criticalFixture.profile_patch.wire)).toEqual(criticalFixture.profile_patch.normalized);
+    expect(localOperationV1Schema.parse(criticalFixture.operation_defaults.wire)).toEqual(criticalFixture.operation_defaults.normalized);
+    expect(serviceV1Schema.parse(criticalFixture.service_defaults.wire)).toEqual(criticalFixture.service_defaults.normalized);
     expect(artifactContentV1Schema.parse(criticalFixture.artifact_content).total_documents).toBe(1);
     expect(artifactDiffV1Schema.parse(criticalFixture.artifact_diff).hunks[0]?.lines[0]?.text).toBe("");
   });
@@ -78,23 +89,29 @@ describe("Desktop Local API v1 schemas", () => {
     ).toThrow();
   });
 
-  it("rejects secret-like fields inside explicitly dynamic config slots", () => {
-    expect(() =>
-      projectV1Schema.parse({
-        ...CONTRACT_FIXTURE_V1.project,
-        evolution: {
-          ...CONTRACT_FIXTURE_V1.project.evolution,
+  it("preserves unknown method config fields without field-name heuristics", () => {
+    const config = {
+      password: "algorithm-owned-value",
+      command: { strategy: "reflect" },
+      future_plugin_field: [1, true, null],
+    };
+    const project = projectV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.project,
+      evolution: {
+        targets: {
+          ...CONTRACT_FIXTURE_V1.project.evolution.targets,
           text_memory: {
-            ...CONTRACT_FIXTURE_V1.project.evolution.text_memory,
-            config: { password: "must-not-enter-react" },
+            ...CONTRACT_FIXTURE_V1.project.evolution.targets.text_memory,
+            config,
           },
         },
-      }),
-    ).toThrow(/sensitive or implementation-detail/i);
+      },
+    });
+    expect(project.evolution.targets.text_memory?.config).toEqual(config);
   });
 
-  it("accepts a follow-up run while its required revision is still queued", () => {
-    const run = runCreateV1Schema.parse({
+  it("uses a dedicated reachable required-revision wire schema", () => {
+    const wire = {
       project_id: "project-1",
       project_snapshot: { snapshot_id: "project-snapshot-1", digest: "a".repeat(64) },
       task_snapshot: { snapshot_id: "task-snapshot-1", digest: "b".repeat(64) },
@@ -104,10 +121,107 @@ describe("Desktop Local API v1 schemas", () => {
         revision_id: "revision-2",
         generation: 2,
         manifest_digest: "e".repeat(64),
-        state: "queued",
+        state: "active",
       },
+    } as const;
+
+    for (const state of ["active", "queued", "preparing"] as const) {
+      expect(runCreateV1Schema.parse({ ...wire, required_revision: { ...wire.required_revision, state } }).required_revision.state).toBe(state);
+    }
+    for (const state of ["failed", "cancelled"] as const) {
+      expect(() => runCreateV1Schema.parse({ ...wire, required_revision: { ...wire.required_revision, state } })).toThrow();
+    }
+  });
+
+  it("normalizes declared defaults and distinguishes omitted patch fields from null", () => {
+    expect(
+      profileCreateV1Schema.parse({ name: "Lab GPU", host: "gpu.example.org", user: "researcher" }),
+    ).toEqual({
+      name: "Lab GPU",
+      host: "gpu.example.org",
+      port: 22,
+      user: "researcher",
+      authentication_kind: "ssh_agent",
+      proxy: { http_url: null, https_url: null, no_proxy: [] },
     });
-    expect(run.required_revision.state).toBe("queued");
+    expect(executionSettingsV1Schema.parse({ mode: "self-deployed", hf_model: "open-models/model-1" })).toEqual({
+      mode: "self-deployed",
+      capture_mode: "transcript",
+      token_level_metrics_available: false,
+      codex_model: null,
+      hf_model: "open-models/model-1",
+    });
+    expect(profilePatchV1Schema.parse({ name: "Renamed" })).toEqual({ name: "Renamed" });
+    expect(profilePatchV1Schema.parse({ proxy: { https_url: null } })).toEqual({
+      proxy: { http_url: null, https_url: null, no_proxy: [] },
+    });
+    expect(() => profilePatchV1Schema.parse({ host: null })).toThrow();
+    expect(() => profilePatchV1Schema.parse({ proxy: null })).toThrow();
+    expect(() => projectPatchV1Schema.parse({ execution: null })).toThrow();
+  });
+
+  it("uses only the closed evolution.targets wrapper for projects and validation", () => {
+    const target = {
+      enabled: true,
+      method: "reference_text_memory",
+      config: { password: "algorithm-owned-value", future_field: 1 },
+    } as const;
+    const project = {
+      name: "Protein Design",
+      profile_id: "profile-1",
+      task: { title: "Design", objective: "Produce a candidate." },
+      source: { kind: "scratch", display_name: "New workspace" },
+      execution: { mode: "self-deployed", hf_model: "open-models/model-1" },
+      evolution: { targets: { text_memory: target } },
+    } as const;
+    expect(projectCreateV1Schema.parse(project).evolution.targets.text_memory?.config).toEqual(target.config);
+    expect(
+      projectValidateRequestV1Schema.parse({
+        project_etag: `"${"a".repeat(64)}"`,
+        capability_registry_digest: "b".repeat(64),
+        execution: project.execution,
+        evolution: project.evolution,
+      }).evolution.targets.text_memory?.method,
+    ).toBe("reference_text_memory");
+    expect(() => projectCreateV1Schema.parse({ ...project, evolution: { text_memory: target } })).toThrow();
+  });
+
+  it("uses a bounded trimmed hf_model only for self-deployed execution", () => {
+    expect(executionSettingsV1Schema.parse({ mode: "self-deployed", hf_model: "open-models/model-1" }).hf_model).toBe(
+      "open-models/model-1",
+    );
+    for (const hf_model of ["", " open-models/model-1", "open-models/model-1\n"]) {
+      expect(() => executionSettingsV1Schema.parse({ mode: "self-deployed", hf_model })).toThrow();
+    }
+    expect(() => executionSettingsV1Schema.parse({ mode: "self-deployed", managed_model_id: "legacy-model" })).toThrow();
+    expect(() =>
+      executionSettingsV1Schema.parse({ mode: "codex_subscription_transcript", codex_model: "gpt-5", hf_model: "open-models/model-1" }),
+    ).toThrow();
+  });
+
+  it("matches Python network host and remote user validation", () => {
+    for (const [host, user] of [
+      ["gpu.example.org", "researcher"],
+      ["gpu.example.org.", "researcher.name"],
+      ["192.0.2.10", "researcher-1"],
+      ["2001:db8::10", "researcher_1"],
+      ["127.1", "researcher"],
+    ] as const) {
+      expect(profileCreateV1Schema.parse({ name: "Lab GPU", host, user }).host).toBe(host);
+    }
+
+    for (const [field, value] of [
+      ["host", "gpu_name.example.org"],
+      ["host", "-gpu.example.org"],
+      ["host", "https://gpu.example.org"],
+      ["user", "researcher name"],
+      ["user", "researcher@lab"],
+      ["user", "../researcher"],
+    ] as const) {
+      expect(() =>
+        profileCreateV1Schema.parse({ name: "Lab GPU", host: "gpu.example.org", user: "researcher", [field]: value }),
+      ).toThrow();
+    }
   });
 
   it("accepts empty context lines in a bounded artifact diff", () => {

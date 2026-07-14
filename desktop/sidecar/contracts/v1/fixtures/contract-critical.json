@@ -41,6 +41,138 @@
     "service": "openevo-sidecar",
     "status": "ok"
   },
+  "profile_create": {
+    "normalized": {
+      "authentication_kind": "ssh_agent",
+      "host": "gpu.example.test",
+      "name": "Research GPU",
+      "port": 22,
+      "proxy": {
+        "http_url": null,
+        "https_url": null,
+        "no_proxy": []
+      },
+      "user": "researcher"
+    },
+    "wire": {
+      "host": "gpu.example.test",
+      "name": "Research GPU",
+      "user": "researcher"
+    }
+  },
+  "execution": {
+    "normalized": {
+      "capture_mode": "transcript",
+      "codex_model": null,
+      "hf_model": "open-models/research-model-fixture-1",
+      "mode": "self-deployed",
+      "token_level_metrics_available": false
+    },
+    "wire": {
+      "hf_model": "open-models/research-model-fixture-1",
+      "mode": "self-deployed"
+    }
+  },
+  "project_create": {
+    "evolution": {
+      "targets": {
+        "text_memory": {
+          "config": {
+            "future_plugin_field": [
+              1,
+              true,
+              null
+            ],
+            "password": "algorithm-owned-value"
+          },
+          "enabled": true,
+          "method": "reference_text_memory"
+        }
+      }
+    },
+    "execution": {
+      "hf_model": "open-models/research-model-fixture-1",
+      "mode": "self-deployed"
+    },
+    "name": "Protein Design",
+    "profile_id": "profile-fixture-1",
+    "source": {
+      "display_name": "New workspace",
+      "kind": "scratch"
+    },
+    "task": {
+      "objective": "Produce and validate a candidate.",
+      "title": "Design task"
+    }
+  },
+  "profile_patch": {
+    "normalized": {
+      "proxy": {
+        "http_url": null,
+        "https_url": null,
+        "no_proxy": []
+      }
+    },
+    "wire": {
+      "proxy": {
+        "https_url": null
+      }
+    }
+  },
+  "operation_defaults": {
+    "normalized": {
+      "checks": [],
+      "created_at": "2026-07-14T12:00:00Z",
+      "error": null,
+      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+      "finished_at": null,
+      "operation_id": "operation-fixture-1",
+      "operation_kind": "cache_cleanup",
+      "progress": null,
+      "resource": {
+        "resource_id": "maintenance-fixture-1",
+        "resource_type": "maintenance"
+      },
+      "result": null,
+      "schema_version": "1",
+      "started_at": null,
+      "state": "queued"
+    },
+    "wire": {
+      "created_at": "2026-07-14T12:00:00Z",
+      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+      "operation_id": "operation-fixture-1",
+      "operation_kind": "cache_cleanup",
+      "resource": {
+        "resource_id": "maintenance-fixture-1",
+        "resource_type": "maintenance"
+      },
+      "state": "queued"
+    }
+  },
+  "service_defaults": {
+    "normalized": {
+      "display_name": "OpenEvo Core",
+      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+      "health_summary": "Core is ready.",
+      "kind": "core",
+      "observed_at": "2026-07-14T12:00:00Z",
+      "restart_supported": true,
+      "schema_version": "1",
+      "service_id": "service-core-fixture-1",
+      "state": "healthy"
+    },
+    "wire": {
+      "display_name": "OpenEvo Core",
+      "etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+      "health_summary": "Core is ready.",
+      "kind": "core",
+      "observed_at": "2026-07-14T12:00:00Z",
+      "restart_supported": true,
+      "service_id": "service-core-fixture-1",
+      "state": "healthy"
+    }
+  },
   "run_create": {
     "capability_registry_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "project_id": "project-fixture-1",

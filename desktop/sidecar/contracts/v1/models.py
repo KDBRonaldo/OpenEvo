@@ -4,7 +4,7 @@ from datetime import datetime
 from ipaddress import ip_address
 from math import isfinite
 import re
-from typing import Annotated, Generic, Literal, TypeVar
+from typing import Annotated, Any, Generic, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -13,8 +13,10 @@ from pydantic import (
     ConfigDict,
     Field,
     RootModel,
+    SerializerFunctionWrapHandler,
     StringConstraints,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from typing_extensions import TypeAliasType
@@ -81,6 +83,12 @@ def _validate_remote_user(value: str) -> str:
     return value
 
 
+def _validate_hugging_face_model(value: str) -> str:
+    if value != value.strip() or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError("hf_model must be trimmed text without control characters")
+    return value
+
+
 OpaqueId = Annotated[
     str,
     StringConstraints(strict=True, min_length=1, max_length=256),
@@ -130,6 +138,11 @@ RemoteUser = Annotated[
     StringConstraints(strict=True, min_length=1, max_length=128),
     AfterValidator(_validate_remote_user),
 ]
+HuggingFaceModel = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=1, max_length=512),
+    AfterValidator(_validate_hugging_face_model),
+]
 
 
 class StrictModel(BaseModel):
@@ -140,6 +153,40 @@ class StrictModel(BaseModel):
         validate_default=True,
         use_enum_values=True,
     )
+
+
+def _non_nullable_patch_json_schema(schema: dict[str, Any]) -> None:
+    for property_schema in schema.get("properties", {}).values():
+        property_schema.pop("default", None)
+        any_of = property_schema.get("anyOf")
+        if not any_of:
+            continue
+        non_null = [entry for entry in any_of if entry.get("type") != "null"]
+        if len(non_null) != 1 or len(non_null) == len(any_of):
+            continue
+        title = property_schema.get("title")
+        property_schema.clear()
+        property_schema.update(non_null[0])
+        if title is not None:
+            property_schema["title"] = title
+
+
+class PatchModel(StrictModel):
+    model_config = ConfigDict(json_schema_extra=_non_nullable_patch_json_schema)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_explicit_null(cls, value: Any) -> Any:
+        if isinstance(value, dict) and any(child is None for child in value.values()):
+            raise ValueError("patch properties may be omitted but must not be null")
+        return value
+
+    @model_serializer(mode="wrap")
+    def _serialize_only_set_fields(self, handler: SerializerFunctionWrapHandler) -> Any:
+        serialized = handler(self)
+        if not isinstance(serialized, dict):  # pragma: no cover - model handlers return dicts.
+            return serialized
+        return {key: value for key, value in serialized.items() if key in self.model_fields_set}
 
 
 class BoundedJsonObjectV1(RootModel[dict[str, JsonValueV1]]):
@@ -448,7 +495,7 @@ class RemoteProfileCreateV1(StrictModel):
     proxy: NetworkProxyV1 = Field(default_factory=NetworkProxyV1)
 
 
-class RemoteProfilePatchV1(StrictModel):
+class RemoteProfilePatchV1(PatchModel):
     name: ShortText | None = None
     host: NetworkHost | None = None
     port: int | None = Field(default=None, ge=1, le=65_535)
@@ -532,15 +579,15 @@ class ExecutionSettingsV1(StrictModel):
     capture_mode: Literal["transcript"] = "transcript"
     token_level_metrics_available: Literal[False] = False
     codex_model: ShortText | None = None
-    managed_model_id: OpaqueId | None = None
+    hf_model: HuggingFaceModel | None = None
 
     @model_validator(mode="after")
     def _mode_fields(self) -> ExecutionSettingsV1:
         if self.mode == "codex_subscription_transcript":
-            if self.codex_model is None or self.managed_model_id is not None:
+            if self.codex_model is None or self.hf_model is not None:
                 raise ValueError("subscription mode requires only codex_model")
-        elif self.managed_model_id is None or self.codex_model is not None:
-            raise ValueError("self-deployed mode requires only managed_model_id")
+        elif self.hf_model is None or self.codex_model is not None:
+            raise ValueError("self-deployed mode requires only hf_model")
         return self
 
 
@@ -595,22 +642,26 @@ class EvolutionSelectionsV1(RootModel[dict[str, EvolutionTargetSelectionV1]]):
         return self
 
 
+class EvolutionConfigV1(StrictModel):
+    targets: EvolutionSelectionsV1
+
+
 class ProjectCreateV1(StrictModel):
     name: ShortText
     profile_id: OpaqueId
     task: ProjectTaskV1
     source: ProjectSourceV1
     execution: ExecutionSettingsV1
-    evolution: EvolutionSelectionsV1
+    evolution: EvolutionConfigV1
 
 
-class ProjectPatchV1(StrictModel):
+class ProjectPatchV1(PatchModel):
     name: ShortText | None = None
     profile_id: OpaqueId | None = None
     task: ProjectTaskV1 | None = None
     source: ProjectSourceV1 | None = None
     execution: ExecutionSettingsV1 | None = None
-    evolution: EvolutionSelectionsV1 | None = None
+    evolution: EvolutionConfigV1 | None = None
 
     @model_validator(mode="after")
     def _not_empty(self) -> ProjectPatchV1:
@@ -627,7 +678,7 @@ class ProjectV1(StrictModel):
     task: ProjectTaskV1
     source: ProjectSourceV1
     execution: ExecutionSettingsV1
-    evolution: EvolutionSelectionsV1
+    evolution: EvolutionConfigV1
     state: Literal["draft", "active", "archived", "blocked"]
     current_revision_id: OpaqueId | None = None
     etag: ETag
@@ -823,7 +874,7 @@ class ProjectValidationRequestV1(StrictModel):
     project_etag: ETag
     capability_registry_digest: Digest
     execution: ExecutionSettingsV1
-    evolution: EvolutionSelectionsV1
+    evolution: EvolutionConfigV1
 
 
 class ValidationIssueV1(StrictModel):
@@ -864,19 +915,20 @@ class RevisionRefV1(StrictModel):
     state: Literal["active", "queued", "preparing", "failed", "cancelled"]
 
 
+class RequiredRevisionV1(StrictModel):
+    revision_id: OpaqueId
+    generation: int = Field(ge=0)
+    manifest_digest: Digest
+    state: Literal["active", "queued", "preparing"]
+
+
 class RunCreateV1(StrictModel):
     project_id: OpaqueId
     project_snapshot: ImmutableSnapshotRefV1
     task_snapshot: ImmutableSnapshotRefV1
     workspace_snapshot: ImmutableSnapshotRefV1
     capability_registry_digest: Digest
-    required_revision: RevisionRefV1
-
-    @model_validator(mode="after")
-    def _required_revision_must_be_reachable(self) -> RunCreateV1:
-        if self.required_revision.state in {"failed", "cancelled"}:
-            raise ValueError("a run cannot require a terminal revision")
-        return self
+    required_revision: RequiredRevisionV1
 
 
 class RunQueuedReasonV1(StrictModel):

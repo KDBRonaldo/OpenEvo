@@ -125,11 +125,13 @@ export const CONTRACT_FIXTURE_V1 = {
       capture_mode: "transcript",
       token_level_metrics_available: false,
       codex_model: null,
-      managed_model_id: "managed-model-fixture-1",
+      hf_model: "open-models/research-model-fixture-1",
     },
     evolution: {
-      text_memory: { enabled: true, method: "reference_text_memory", config: { max_records: 100 } },
-      skill_bundle: { enabled: false, method: null, config: {} },
+      targets: {
+        text_memory: { enabled: true, method: "reference_text_memory", config: { max_records: 100 } },
+        skill_bundle: { enabled: false, method: null, config: {} },
+      },
     },
     state: "active",
     current_revision_id: "revision-fixture-1",
@@ -158,6 +160,7 @@ export const CONTRACT_FIXTURE_V1 = {
     created_at: NOW,
     started_at: NOW,
     finished_at: null,
+    etag: ETAG_A,
   },
   run: {
     schema_version: "1",
@@ -300,6 +303,7 @@ export const CONTRACT_FIXTURE_V1 = {
     health_summary: "Core is ready.",
     restart_supported: true,
     observed_at: NOW,
+    etag: ETAG_B,
   },
   diagnostic: {
     schema_version: "1",

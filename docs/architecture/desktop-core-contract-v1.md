@@ -168,6 +168,29 @@ of those operations.
 Local profile responses expose an authentication kind and an opaque native
 credential slot status, never a credential reference or secret. Network proxy
 URLs must not contain user information; proxy credentials use native slots.
+Profile creation defaults an omitted port to `22`, authentication kind to
+`ssh_agent`, and proxy configuration to an empty proxy. Execution settings
+default omitted capture fields to `capture_mode="transcript"` and
+`token_level_metrics_available=false`. Subscription execution carries only
+`codex_model`; self-deployed execution carries only the bounded, trimmed
+user-provided Hugging Face `hf_model`. The sidecar maps `hf_model` to Core's
+stable `agent_model_ref` boundary.
+
+PATCH request properties are optional but not nullable: omission means the
+stored value is unchanged, while an explicit top-level `null` is invalid.
+Nullable members inside an included value retain their declared meaning; for
+example, `proxy.https_url=null` clears that proxy URL. Response fields with
+schema defaults may be omitted on the wire and consumers normalize them to the
+declared default. Mutable operation and service responses always carry an
+ETag.
+
+Evolution method config is a bounded JSON object whose unknown fields are
+preserved losslessly. Desktop does not infer sensitivity or ownership from a
+config field name; secret material remains excluded by dedicated closed
+credential contracts and Core-owned method schemas.
+Project create, patch, response, and validation payloads expose evolution only
+as the closed `evolution.targets.<target_id> = {enabled, method, config}`
+object. There is no flat target-map compatibility form.
 Backend and bootstrap reports are normalized into typed checks, progress, and
 user-safe logs. Raw commands, stdout/stderr blobs, PIDs, and remote paths are
 not renderer contracts.

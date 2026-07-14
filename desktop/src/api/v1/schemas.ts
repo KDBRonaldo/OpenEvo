@@ -10,9 +10,8 @@ export const MAX_JSON_TOTAL_BYTES = 1_048_576;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const UTC_RFC3339 = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?Z$/;
 const SHA256 = /^[0-9a-f]{64}$/;
-const SENSITIVE_DYNAMIC_KEY = /(^|_)(password|passphrase|secret|access_token|refresh_token|bearer_token|authorization|private_key|credential_ref|command|stdout|stderr|host_path|remote_path|backend_url|core_url|file_uri)($|_)/i;
 
-export const schemaVersionV1Schema = z.literal("1");
+export const schemaVersionV1Schema = z.literal("1").default("1");
 export const opaqueIdSchema = z
   .string()
   .min(1)
@@ -25,6 +24,11 @@ export const utcTimestampSchema = z.string().regex(UTC_RFC3339, "must be a UTC R
 export const sha256DigestSchema = z.string().regex(SHA256, "must be lowercase SHA-256 hex");
 export const etagSchema = z.string().regex(/^"[0-9a-f]{64}"$/);
 export const executionModeV1Schema = z.enum(["codex_subscription_transcript", "self-deployed"]);
+const huggingFaceModelSchema = z
+  .string()
+  .min(1)
+  .max(512)
+  .refine((value) => value === value.trim() && !CONTROL_CHARACTERS.test(value), "hf_model must be trimmed text without control characters");
 
 export type SafeJsonValue = null | boolean | number | string | SafeJsonValue[] | { [key: string]: SafeJsonValue };
 
@@ -60,15 +64,15 @@ export const featureFlagV1Schema = z.enum([
 export const versionInfoV1Schema = z
   .object({
     schema_version: schemaVersionV1Schema,
-    api_name: z.literal("openevo-desktop-local-api"),
-    preferred_major: z.literal(1),
-    supported_majors: z.array(z.literal(1)).min(1),
+    api_name: z.literal("openevo-desktop-local-api").default("openevo-desktop-local-api"),
+    preferred_major: z.literal(1).default(1),
+    supported_majors: z.array(z.literal(1)).min(1).default([1]),
     openapi_sha256: sha256DigestSchema,
     build_version: shortTextSchema,
     source_commit: z.string().regex(/^[0-9a-f]{7,40}$/),
     build_channel: z.enum(["release", "development", "test"]),
     provider_kind: providerKindSchema,
-    feature_flags: z.array(featureFlagV1Schema),
+    feature_flags: z.array(featureFlagV1Schema).default([]),
   })
   .strict()
   .superRefine((value, context) => {
@@ -96,7 +100,7 @@ export const desktopBootstrapContextV1Schema = z
 
 export const healthV1Schema = z
   .object({
-    service: z.literal("openevo-sidecar"),
+    service: z.literal("openevo-sidecar").default("openevo-sidecar"),
     status: z.enum(["ok", "degraded", "starting"]),
     protocol: z.literal("openevo-native-sidecar-v1").nullable().default(null),
     instance_id: z.string().regex(/^[0-9a-f]{32}$/).nullable().default(null),
@@ -192,19 +196,15 @@ export const networkProxyV1Schema = z
     }
   });
 const authenticationKindSchema = z.enum(["ssh_agent", "native_private_key", "native_password"]);
-const trimmedNetworkText = (maximum: number) =>
-  z
-    .string()
-    .min(1)
-    .max(maximum)
-    .refine((value) => value === value.trim() && !CONTROL_CHARACTERS.test(value));
+const networkHostSchema = z.string().min(1).max(253).refine(isNetworkHost, "host must be a valid hostname or IP address");
+const remoteUserSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/, "user must be a remote account name, not a path");
 const remoteProfileFields = {
   name: shortTextSchema,
-  host: trimmedNetworkText(253),
-  port: z.number().int().min(1).max(65_535),
-  user: trimmedNetworkText(128),
-  authentication_kind: authenticationKindSchema,
-  proxy: networkProxyV1Schema,
+  host: networkHostSchema,
+  port: z.number().int().min(1).max(65_535).default(22),
+  user: remoteUserSchema,
+  authentication_kind: authenticationKindSchema.default("ssh_agent"),
+  proxy: networkProxyV1Schema.default({}),
 };
 export const profileCreateV1Schema = z.object(remoteProfileFields).strict();
 export const profilePatchV1Schema = z.object(remoteProfileFields).partial().strict().refine((value) => Object.keys(value).length > 0, "profile patch must not be empty");
@@ -214,7 +214,7 @@ export const remoteProfileV1Schema = z
     profile_id: opaqueIdSchema,
     ...remoteProfileFields,
     credential_slots: z.array(credentialSlotStatusSchema).default([]),
-    connection_state: z.enum(["disconnected", "connecting", "host_key_required", "connected", "failed"]),
+    connection_state: z.enum(["disconnected", "connecting", "host_key_required", "connected", "failed"]).default("disconnected"),
     host_key_fingerprint: shortTextSchema.nullable().default(null),
     etag: etagSchema,
     created_at: utcTimestampSchema,
@@ -233,15 +233,15 @@ export const contentRefV1Schema = z.object({ content_id: opaqueIdSchema, sha256:
 export const executionSettingsV1Schema = z
   .object({
     mode: executionModeV1Schema,
-    capture_mode: z.literal("transcript"),
-    token_level_metrics_available: z.literal(false),
+    capture_mode: z.literal("transcript").default("transcript"),
+    token_level_metrics_available: z.literal(false).default(false),
     codex_model: shortTextSchema.nullable().default(null),
-    managed_model_id: opaqueIdSchema.nullable().default(null),
+    hf_model: huggingFaceModelSchema.nullable().default(null),
   })
   .strict()
   .superRefine((value, context) => {
     const subscription = value.mode === "codex_subscription_transcript";
-    if (subscription !== (value.codex_model !== null) || subscription === (value.managed_model_id !== null)) issue(context, [], "execution mode and model fields do not agree");
+    if (subscription !== (value.codex_model !== null) || subscription === (value.hf_model !== null)) issue(context, [], "execution mode and model fields do not agree");
   });
 export const projectTaskV1Schema = z.object({ title: shortTextSchema, objective: longTextSchema, task_ref: contentRefV1Schema.nullable().default(null) }).strict();
 export const projectSourceV1Schema = z
@@ -257,13 +257,14 @@ export const evolutionTargetSelectionV1Schema = z
 export const evolutionSelectionsV1Schema = z
   .record(opaqueIdSchema, evolutionTargetSelectionV1Schema)
   .refine((value) => Object.keys(value).length <= 128, "at most 128 evolution targets are allowed");
+export const evolutionConfigV1Schema = z.object({ targets: evolutionSelectionsV1Schema }).strict();
 const projectFields = {
   name: shortTextSchema,
   profile_id: opaqueIdSchema,
   task: projectTaskV1Schema,
   source: projectSourceV1Schema,
   execution: executionSettingsV1Schema,
-  evolution: evolutionSelectionsV1Schema,
+  evolution: evolutionConfigV1Schema,
 };
 export const projectCreateV1Schema = z.object(projectFields).strict();
 export const projectPatchV1Schema = z.object(projectFields).partial().strict().refine((value) => Object.keys(value).length > 0, "project patch must not be empty");
@@ -293,7 +294,7 @@ export const normalizedCheckV1Schema = z
     label: shortTextSchema,
     status: z.enum(["pending", "running", "passed", "warning", "failed", "skipped"]),
     summary: shortTextSchema,
-    repair_action: z.enum(["none", "openevo_can_retry", "user_input_required", "reconnect_required"]),
+    repair_action: z.enum(["none", "openevo_can_retry", "user_input_required", "reconnect_required"]).default("none"),
   })
   .strict();
 export const diagnosticFindingV1Schema = z
@@ -321,6 +322,7 @@ export const localOperationV1Schema = z
     created_at: utcTimestampSchema,
     started_at: utcTimestampSchema.nullable().default(null),
     finished_at: utcTimestampSchema.nullable().default(null),
+    etag: etagSchema,
   })
   .strict()
   .superRefine((value, context) => {
@@ -352,11 +354,11 @@ export const targetCapabilityV1Schema = z
   .object({ target_id: opaqueIdSchema, display_name: shortTextSchema, description: shortTextSchema, artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system", "parametric_memory"]), release_enabled: z.boolean(), configured_default_method_id: opaqueIdSchema, effective_default_method_id: opaqueIdSchema.nullable().default(null), methods: z.array(methodCapabilityV1Schema), accepted_methods: z.array(resolvedMethodCapabilityV1Schema), selection_resolvers: z.array(selectionResolverCapabilityV1Schema).default([]) })
   .strict();
 export const projectCapabilitiesV1Schema = z
-  .object({ schema_version: schemaVersionV1Schema, project_id: opaqueIdSchema, execution_mode: executionModeV1Schema, source: z.literal("verified_remote_core"), registry_verified: z.literal(true), registry_digest: sha256DigestSchema, core_version: shortTextSchema, fetched_at: utcTimestampSchema, targets: z.array(targetCapabilityV1Schema) })
+  .object({ schema_version: schemaVersionV1Schema, project_id: opaqueIdSchema, execution_mode: executionModeV1Schema, source: z.literal("verified_remote_core").default("verified_remote_core"), registry_verified: z.literal(true).default(true), registry_digest: sha256DigestSchema, core_version: shortTextSchema, fetched_at: utcTimestampSchema, targets: z.array(targetCapabilityV1Schema) })
   .strict();
 
 export const projectValidateRequestV1Schema = z
-  .object({ project_etag: etagSchema, capability_registry_digest: sha256DigestSchema, execution: executionSettingsV1Schema, evolution: evolutionSelectionsV1Schema })
+  .object({ project_etag: etagSchema, capability_registry_digest: sha256DigestSchema, execution: executionSettingsV1Schema, evolution: evolutionConfigV1Schema })
   .strict();
 export const validationIssueV1Schema = z
   .object({ issue_id: opaqueIdSchema, severity: z.enum(["warning", "blocking"]), field: shortTextSchema, code: shortTextSchema, message: shortTextSchema, next_action: shortTextSchema.nullable().default(null) })
@@ -370,10 +372,12 @@ export const immutableSnapshotRefV1Schema = z.object({ snapshot_id: opaqueIdSche
 export const revisionRefV1Schema = z
   .object({ revision_id: opaqueIdSchema, generation: z.number().int().nonnegative(), manifest_digest: sha256DigestSchema, state: z.enum(["active", "queued", "preparing", "failed", "cancelled"]) })
   .strict();
+export const requiredRevisionV1Schema = z
+  .object({ revision_id: opaqueIdSchema, generation: z.number().int().nonnegative(), manifest_digest: sha256DigestSchema, state: z.enum(["active", "queued", "preparing"]) })
+  .strict();
 export const runCreateV1Schema = z
-  .object({ project_id: opaqueIdSchema, project_snapshot: immutableSnapshotRefV1Schema, task_snapshot: immutableSnapshotRefV1Schema, workspace_snapshot: immutableSnapshotRefV1Schema, capability_registry_digest: sha256DigestSchema, required_revision: revisionRefV1Schema })
-  .strict()
-  .refine((value) => !["failed", "cancelled"].includes(value.required_revision.state), { path: ["required_revision", "state"], message: "required revision must be reachable" });
+  .object({ project_id: opaqueIdSchema, project_snapshot: immutableSnapshotRefV1Schema, task_snapshot: immutableSnapshotRefV1Schema, workspace_snapshot: immutableSnapshotRefV1Schema, capability_registry_digest: sha256DigestSchema, required_revision: requiredRevisionV1Schema })
+  .strict();
 export const runQueuedReasonV1Schema = z
   .object({ code: z.enum(["capacity_unavailable", "required_revision_uncommitted", "service_starting", "project_activation_pending"]), summary: shortTextSchema, retry_after_seconds: z.number().int().min(1).max(86_400).nullable().default(null) })
   .strict();
@@ -458,7 +462,7 @@ export const diffLineV1Schema = z.object({ kind: z.enum(["context", "added", "re
 export const diffHunkV1Schema = z.object({ hunk_id: opaqueIdSchema, heading: shortTextSchema, lines: z.array(diffLineV1Schema).max(10_000) }).strict();
 export const artifactDiffV1Schema = z.object({ schema_version: schemaVersionV1Schema, artifact_id: opaqueIdSchema, base_artifact_id: opaqueIdSchema.nullable().default(null), hunks: z.array(diffHunkV1Schema).max(1_024), truncated: z.boolean() }).strict();
 export const serviceV1Schema = z
-  .object({ schema_version: schemaVersionV1Schema, service_id: opaqueIdSchema, display_name: shortTextSchema, kind: z.enum(["core", "gateway", "model", "worker", "artifact_store"]), state: z.enum(["starting", "healthy", "degraded", "stopped", "failed", "unavailable"]), health_summary: shortTextSchema, restart_supported: z.boolean(), observed_at: utcTimestampSchema })
+  .object({ schema_version: schemaVersionV1Schema, service_id: opaqueIdSchema, display_name: shortTextSchema, kind: z.enum(["core", "gateway", "model", "worker", "artifact_store"]), state: z.enum(["starting", "healthy", "degraded", "stopped", "failed", "unavailable"]), health_summary: shortTextSchema, restart_supported: z.boolean(), observed_at: utcTimestampSchema, etag: etagSchema })
   .strict();
 export const diagnosticCreateV1Schema = z
   .object({ scope: z.enum(["active_project", "connection", "core", "run", "services"]), resource_id: opaqueIdSchema.nullable().default(null) })
@@ -588,7 +592,6 @@ function validateBoundedJson(value: Record<string, SafeJsonValue>, context: z.Re
       if (entries.length > MAX_JSON_COLLECTION_ITEMS) return issue(context, path, "JSON object exceeds the item budget");
       for (const [key, child] of entries) {
         if (!key || key.length > 256 || key !== key.trim()) return issue(context, [...path, key], "JSON keys must be short trimmed strings");
-        if (SENSITIVE_DYNAMIC_KEY.test(key)) return issue(context, [...path, key], "sensitive or implementation-detail fields are forbidden");
         const size = new TextEncoder().encode(key).byteLength;
         textBytes += size;
         encodedBytes += size + 4;
@@ -604,4 +607,38 @@ function validateBoundedJson(value: Record<string, SafeJsonValue>, context: z.Re
     if (textBytes > MAX_JSON_TEXT_BYTES) return issue(context, path, "JSON exceeds the text budget");
     if (encodedBytes > MAX_JSON_TOTAL_BYTES) return issue(context, path, "JSON exceeds the byte budget");
   }
+}
+
+function isNetworkHost(value: string): boolean {
+  if (value !== value.trim() || CONTROL_CHARACTERS.test(value) || ["/", "\\", "://", "@"].some((marker) => value.includes(marker))) return false;
+  if (isIpv6Address(value)) return true;
+  const hostname = value.endsWith(".") ? value.slice(0, -1) : value;
+  return hostname.length > 0 && hostname.split(".").every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label));
+}
+
+function isIpv6Address(value: string): boolean {
+  const scopeSeparator = value.indexOf("%");
+  const address = scopeSeparator === -1 ? value : value.slice(0, scopeSeparator);
+  const scope = scopeSeparator === -1 ? null : value.slice(scopeSeparator + 1);
+  if (scope === "" || (scope !== null && scope.includes("%")) || !address.includes(":")) return false;
+
+  const compressed = address.split("::");
+  if (compressed.length > 2) return false;
+  const groups = compressed.flatMap((side) => (side === "" ? [] : side.split(":")));
+  let units = 0;
+  for (const [index, group] of groups.entries()) {
+    if (group.includes(".")) {
+      if (index !== groups.length - 1 || !isIpv4Address(group)) return false;
+      units += 2;
+    } else {
+      if (!/^[0-9A-Fa-f]{1,4}$/.test(group)) return false;
+      units += 1;
+    }
+  }
+  return compressed.length === 2 ? units < 8 : units === 8;
+}
+
+function isIpv4Address(value: string): boolean {
+  const octets = value.split(".");
+  return octets.length === 4 && octets.every((octet) => /^(?:0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
 }

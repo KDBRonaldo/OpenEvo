@@ -19,10 +19,16 @@ from desktop.sidecar.contracts.v1 import (
     EventEnvelopeV1,
     ExecutionSettingsV1,
     HealthV1,
+    LocalOperationV1,
     PageV1,
+    ProjectCreateV1,
+    ProjectPatchV1,
+    ProjectValidationRequestV1,
     RemoteProfileCreateV1,
+    RemoteProfilePatchV1,
     RemoteProfileV1,
     RunCreateV1,
+    ServiceV1,
     SseFrameV1,
     VersionV1,
     canonical_json_bytes,
@@ -227,7 +233,7 @@ def test_snapshots_are_canonical_and_digests_are_stable() -> None:
 
     assert openapi_digest == DESKTOP_OPENAPI_SHA256
     assert events_digest == DESKTOP_EVENTS_SCHEMA_SHA256
-    assert openapi_digest == "e877eab5b97a540486a82a4dfadf123b3324022460403362710bc06cecd6a051"
+    assert openapi_digest == "5a571f32c547063677533be9b4ccae417e2037b11963b5770d245f6c5419830e"
     assert events_digest == "dd425b6050f1cb329d8a178ba77e0012aba7bbfc612cf04e258c0f9cd8480ad7"
     snapshot_root = Path(__file__).parents[3] / "desktop/sidecar/contracts/v1"
     assert (snapshot_root / "openapi.json").read_bytes() == canonical_json_bytes(
@@ -236,6 +242,61 @@ def test_snapshots_are_canonical_and_digests_are_stable() -> None:
     assert (snapshot_root / "events.schema.json").read_bytes() == canonical_json_bytes(
         desktop_events_schema_document()
     )
+
+
+def test_openapi_exposes_defaults_patch_nullability_and_required_revision_states() -> None:
+    schemas = desktop_openapi_document()["components"]["schemas"]
+
+    profile_create = schemas["RemoteProfileCreateV1"]
+    assert set(profile_create["required"]) == {"name", "host", "user"}
+    assert profile_create["properties"]["port"]["default"] == 22
+    assert profile_create["properties"]["authentication_kind"]["default"] == "ssh_agent"
+    assert "proxy" not in profile_create["required"]
+
+    execution = schemas["ExecutionSettingsV1"]
+    assert execution["properties"]["capture_mode"]["default"] == "transcript"
+    assert execution["properties"]["token_level_metrics_available"]["default"] is False
+    assert {"capture_mode", "token_level_metrics_available"}.isdisjoint(
+        execution["required"]
+    )
+    assert "hf_model" in execution["properties"]
+    assert "managed_model_id" not in execution["properties"]
+
+    for schema_name in (
+        "ProjectCreateV1",
+        "ProjectPatchV1",
+        "ProjectV1",
+        "ProjectValidationRequestV1",
+    ):
+        assert schemas[schema_name]["properties"]["evolution"]["$ref"] == (
+            "#/components/schemas/EvolutionConfigV1"
+        )
+    assert schemas["EvolutionConfigV1"]["required"] == ["targets"]
+    assert schemas["EvolutionConfigV1"]["additionalProperties"] is False
+
+    for schema_name in ("RemoteProfilePatchV1", "ProjectPatchV1"):
+        patch_schema = schemas[schema_name]
+        assert "required" not in patch_schema
+        for property_schema in patch_schema["properties"].values():
+            assert {entry.get("type") for entry in property_schema.get("anyOf", ())} != {
+                "null"
+            }
+            assert not any(
+                entry.get("type") == "null" for entry in property_schema.get("anyOf", ())
+            )
+
+    run_create = schemas["RunCreateV1"]
+    assert run_create["properties"]["required_revision"] == {
+        "$ref": "#/components/schemas/RequiredRevisionV1"
+    }
+    assert schemas["RequiredRevisionV1"]["properties"]["state"]["enum"] == [
+        "active",
+        "queued",
+        "preparing",
+    ]
+
+    assert "etag" in schemas["LocalOperationV1"]["required"]
+    assert "etag" in schemas["ServiceV1"]["required"]
 
 
 def test_models_are_closed_and_profile_never_accepts_secret_or_path_fields() -> None:
@@ -286,6 +347,135 @@ def test_models_are_closed_and_profile_never_accepts_secret_or_path_fields() -> 
                 "credential_ref": "native/keychain/item",
             }
         )
+
+
+def test_profile_execution_defaults_and_patch_semantics_are_canonical() -> None:
+    profile = RemoteProfileCreateV1.model_validate(
+        {"name": "Lab GPU", "host": "gpu.example.org", "user": "researcher"}
+    )
+    assert profile.model_dump() == {
+        "name": "Lab GPU",
+        "host": "gpu.example.org",
+        "port": 22,
+        "user": "researcher",
+        "authentication_kind": "ssh_agent",
+        "proxy": {"http_url": None, "https_url": None, "no_proxy": ()},
+    }
+
+    execution = ExecutionSettingsV1.model_validate(
+        {"mode": "self-deployed", "hf_model": "open-models/research-model-1"}
+    )
+    assert execution.capture_mode == "transcript"
+    assert execution.token_level_metrics_available is False
+
+    for invalid in ("", " open-models/research-model-1", "open-models/model\n"):
+        with pytest.raises(ValidationError):
+            ExecutionSettingsV1.model_validate(
+                {"mode": "self-deployed", "hf_model": invalid}
+            )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExecutionSettingsV1.model_validate(
+            {"mode": "self-deployed", "managed_model_id": "legacy-model"}
+        )
+    subscription = ExecutionSettingsV1.model_validate(
+        {"mode": "codex_subscription_transcript", "codex_model": "gpt-5"}
+    )
+    assert subscription.hf_model is None
+    with pytest.raises(ValidationError, match="requires only codex_model"):
+        ExecutionSettingsV1.model_validate(
+            {
+                "mode": "codex_subscription_transcript",
+                "codex_model": "gpt-5",
+                "hf_model": "open-models/model-1",
+            }
+        )
+
+    patch = RemoteProfilePatchV1.model_validate(
+        {"proxy": {"https_url": None}}
+    )
+    assert patch.model_dump() == {
+        "proxy": {"http_url": None, "https_url": None, "no_proxy": ()}
+    }
+    assert patch.model_dump(exclude_unset=True) == {"proxy": {"https_url": None}}
+
+    for model, field in (
+        (RemoteProfilePatchV1, "host"),
+        (RemoteProfilePatchV1, "proxy"),
+        (ProjectPatchV1, "execution"),
+    ):
+        with pytest.raises(ValidationError):
+            model.model_validate({field: None})
+
+    with pytest.raises(ValidationError, match="at least one field"):
+        RemoteProfilePatchV1.model_validate({})
+
+
+def test_project_evolution_uses_only_the_closed_targets_wrapper() -> None:
+    target = {
+        "enabled": True,
+        "method": "reference_text_memory",
+        "config": {"password": "algorithm-owned-value", "future_field": 1},
+    }
+    project = {
+        "name": "Protein Design",
+        "profile_id": "profile-1",
+        "task": {"title": "Design", "objective": "Produce a candidate."},
+        "source": {"kind": "scratch", "display_name": "New workspace"},
+        "execution": {"mode": "self-deployed", "hf_model": "open-models/model-1"},
+        "evolution": {"targets": {"text_memory": target}},
+    }
+    parsed = ProjectCreateV1.model_validate(project)
+    assert parsed.evolution.targets.root["text_memory"].config.model_dump() == target[
+        "config"
+    ]
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ProjectCreateV1.model_validate(project | {"evolution": {"text_memory": target}})
+
+    request = ProjectValidationRequestV1.model_validate(
+        {
+            "project_etag": _ETAG,
+            "capability_registry_digest": _DIGEST,
+            "execution": project["execution"],
+            "evolution": project["evolution"],
+        }
+    )
+    assert set(request.evolution.targets.root) == {"text_memory"}
+
+
+@pytest.mark.parametrize(
+    ("host", "user"),
+    (
+        ("gpu.example.org", "researcher"),
+        ("gpu.example.org.", "researcher.name"),
+        ("192.0.2.10", "researcher-1"),
+        ("2001:db8::10", "researcher_1"),
+        ("127.1", "researcher"),
+    ),
+)
+def test_profile_accepts_python_network_host_and_remote_user_boundaries(
+    host: str, user: str
+) -> None:
+    RemoteProfileCreateV1.model_validate(
+        {"name": "Lab GPU", "host": host, "user": user}
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("host", "gpu_name.example.org"),
+        ("host", "-gpu.example.org"),
+        ("host", "https://gpu.example.org"),
+        ("user", "researcher name"),
+        ("user", "researcher@lab"),
+        ("user", "../researcher"),
+    ),
+)
+def test_profile_rejects_invalid_python_network_identity(field: str, value: str) -> None:
+    payload = {"name": "Lab GPU", "host": "gpu.example.org", "user": "researcher"}
+    with pytest.raises(ValidationError):
+        RemoteProfileCreateV1.model_validate(payload | {field: value})
 
 
 def test_openapi_has_no_forbidden_renderer_property_names() -> None:
@@ -346,14 +536,14 @@ def test_execution_mode_uses_exact_hyphenated_release_value() -> None:
             "mode": "self-deployed",
             "capture_mode": "transcript",
             "token_level_metrics_available": False,
-            "managed_model_id": "managed-model-1",
+            "hf_model": "open-models/model-1",
         }
     )
     assert settings.mode == "self-deployed"
 
     with pytest.raises(ValidationError, match="self-deployed"):
         ExecutionSettingsV1.model_validate(
-            {"mode": "self_deployed", "managed_model_id": "managed-model-1"}
+            {"mode": "self_deployed", "hf_model": "open-models/model-1"}
         )
 
 
@@ -371,15 +561,27 @@ def test_run_contract_rejects_runtime_model_path_and_command_overrides() -> None
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             RunCreateV1.model_validate(valid | {field: value})
 
-    queued = RunCreateV1.model_validate(
-        valid | {"required_revision": valid["required_revision"] | {"state": "queued"}}
-    )
-    assert queued.required_revision.state == "queued"
-
-    with pytest.raises(ValidationError, match="cannot require a terminal revision"):
-        RunCreateV1.model_validate(
-            valid | {"required_revision": valid["required_revision"] | {"state": "failed"}}
+    for state in ("active", "queued", "preparing"):
+        run = RunCreateV1.model_validate(
+            valid | {"required_revision": valid["required_revision"] | {"state": state}}
         )
+        assert run.required_revision.state == state
+
+    for state in ("failed", "cancelled"):
+        with pytest.raises(ValidationError):
+            RunCreateV1.model_validate(
+                valid | {"required_revision": valid["required_revision"] | {"state": state}}
+            )
+
+
+def test_dynamic_method_config_preserves_unknown_fields_without_name_heuristics() -> None:
+    config = {
+        "password": "algorithm-owned-value",
+        "command": {"strategy": "reflect"},
+        "future_plugin_field": [1, True, None],
+    }
+    parsed = BoundedJsonObjectV1.model_validate(config)
+    assert parsed.model_dump() == config
 
 
 def test_connection_contract_uses_the_renderer_remote_connection_phases() -> None:
@@ -481,6 +683,26 @@ def test_cross_language_critical_fixture_matches_python_contract() -> None:
     HealthV1.model_validate_json(json.dumps(fixture["health"]))
     DesktopStateV1.model_validate_json(json.dumps(fixture["state"]))
     RunCreateV1.model_validate_json(json.dumps(fixture["run_create"]))
+    assert RemoteProfileCreateV1.model_validate(
+        fixture["profile_create"]["wire"]
+    ).model_dump(mode="json") == fixture["profile_create"]["normalized"]
+    assert ExecutionSettingsV1.model_validate(
+        fixture["execution"]["wire"]
+    ).model_dump(mode="json") == fixture["execution"]["normalized"]
+    assert RemoteProfilePatchV1.model_validate(
+        fixture["profile_patch"]["wire"]
+    ).model_dump(mode="json") == fixture["profile_patch"]["normalized"]
+    assert ProjectCreateV1.model_validate(
+        fixture["project_create"]
+    ).evolution.targets.root["text_memory"].config.model_dump() == fixture[
+        "project_create"
+    ]["evolution"]["targets"]["text_memory"]["config"]
+    assert LocalOperationV1.model_validate(
+        fixture["operation_defaults"]["wire"]
+    ).model_dump(mode="json") == fixture["operation_defaults"]["normalized"]
+    assert ServiceV1.model_validate(
+        fixture["service_defaults"]["wire"]
+    ).model_dump(mode="json") == fixture["service_defaults"]["normalized"]
     ArtifactContentV1.model_validate_json(json.dumps(fixture["artifact_content"]))
     assert fixture["artifact_diff"]["hunks"][0]["lines"][0]["text"] == ""
 
