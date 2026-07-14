@@ -234,7 +234,7 @@ The v1 release profiles are:
 
 - `codex_subscription_transcript`: remote Codex subscription, mandatory
   transcript capture, no token-level metrics, non-parametric evolution only.
-- `self_deployed`: remote Core-managed inference, transcript capture for the
+- `self-deployed`: remote Core-managed inference, transcript capture for the
   current three non-parametric targets. A provider must report unavailable
   until the configured model service is genuinely healthy.
 
