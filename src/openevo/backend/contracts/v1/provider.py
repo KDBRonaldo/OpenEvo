@@ -11,7 +11,6 @@ import threading
 from typing import Any, NoReturn, cast
 
 from fastapi import FastAPI
-from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from openevo import __version__
@@ -31,7 +30,7 @@ from openevo.experiments import (
 )
 
 from . import models as m
-from .app import CoreControlHTTPError, create_core_control_contract_app
+from .app import CoreControlHTTPError, _iter_api_routes, create_core_control_contract_app
 from .snapshots import openapi_sha256
 from .store import (
     CoreControlStoreError,
@@ -655,8 +654,8 @@ def create_core_control_app(
         app = create_core_control_contract_app(provider)
         contract_operation_ids = frozenset(
             route.operation_id
-            for route in app.routes
-            if isinstance(route, APIRoute) and route.operation_id is not None
+            for route in _iter_api_routes(app.routes)
+            if route.operation_id is not None
         )
         if provider.operation_ids != contract_operation_ids:
             raise RuntimeError("Core Control provider ownership does not cover the frozen routes")

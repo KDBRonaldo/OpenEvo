@@ -1033,28 +1033,7 @@ with HostServiceRoot(root_path) as root:
             assert time.monotonic() < deadline
             time.sleep(0.01)
         child_pid = int(child_pid_path.read_text(encoding="ascii"))
-        if hasattr(os, "pidfd_open") and hasattr(service.signal, "pidfd_send_signal"):
-            controller = service.LinuxProcessController()
-        else:
-
-            class ProbeController(service.LinuxProcessController):
-                def __init__(self) -> None:
-                    self.boot_id = Path(service._BOOT_ID_PATH).read_text(encoding="ascii").strip()
-
-                def terminate(
-                    self,
-                    identity: ProcessIdentity,
-                    *,
-                    deadline: float,
-                ) -> None:
-                    if not self.is_alive(identity):
-                        return
-                    os.kill(identity.pid, service.signal.SIGTERM)
-                    while self.is_alive(identity):
-                        assert time.monotonic() < deadline
-                        time.sleep(0.01)
-
-            controller = ProbeController()
+        controller = service.LinuxProcessController()
         child_identity = controller.capture(child_pid)
         assert controller.is_alive(child_identity)
         with HostServiceRoot(root) as pinned:
@@ -1194,6 +1173,58 @@ def test_pidfd_esrch_is_already_stopped_and_stop_cleans_publication(
     assert not (root / "service.json").exists()
     assert not (root / "ready.json").exists()
     assert not (root / "pending.json").exists()
+
+
+def test_pidfd_helpers_fall_back_to_linux_syscalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[tuple[int, int]] = []
+    signalled: list[tuple[int, int, int]] = []
+    monkeypatch.delattr(service.os, "pidfd_open", raising=False)
+    monkeypatch.delattr(service.signal, "pidfd_send_signal", raising=False)
+    monkeypatch.setattr(
+        service,
+        "_pidfd_open_via_syscall",
+        lambda pid, flags: opened.append((pid, flags)) or 91,
+    )
+    monkeypatch.setattr(
+        service,
+        "_pidfd_send_signal_via_syscall",
+        lambda pid_fd, sig, flags: signalled.append((pid_fd, sig, flags)),
+    )
+
+    assert service._pidfd_open(123, 0) == 91
+    service._pidfd_send_signal(91, service.signal.SIGTERM, 0)
+
+    assert opened == [(123, 0)]
+    assert signalled == [(91, service.signal.SIGTERM, 0)]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux pidfd ABI only")
+def test_pidfd_syscall_fallback_works_without_cpython_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(service.os, "pidfd_open", raising=False)
+    monkeypatch.delattr(service.signal, "pidfd_send_signal", raising=False)
+
+    pid_fd = service._pidfd_open(os.getpid(), 0)
+    try:
+        service._pidfd_send_signal(pid_fd, 0, 0)
+    finally:
+        os.close(pid_fd)
+
+
+def test_process_controller_fails_closed_when_pidfd_probe_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        service,
+        "_pidfd_open",
+        lambda _pid, _flags: (_ for _ in ()).throw(OSError(errno.ENOSYS, "missing")),
+    )
+
+    with pytest.raises(CoreServiceError, match="requires Linux pidfd support"):
+        service.LinuxProcessController()
 
 
 @pytest.mark.asyncio

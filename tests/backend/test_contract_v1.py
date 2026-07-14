@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from typing import Any
 
 import pytest
+from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+import openevo.backend.contracts.v1.app as contract_app_module
 from openevo.backend.contracts.v1.app import create_core_control_contract_app
 from openevo.backend.contracts.v1.models import (
     ArtifactContentV1,
@@ -108,6 +111,59 @@ EXPECTED_OPERATIONS = {
     ("POST", "/v1/maintenance/cache-cleanup"),
     ("GET", "/v1/events"),
 }
+
+
+def test_provider_route_iteration_recurses_deferred_included_router() -> None:
+    app = FastAPI()
+    router = APIRouter(prefix="/v1")
+
+    @app.get("/version", operation_id="topLevelOperation")
+    def top_level() -> None:
+        return None
+
+    @router.get("/status", operation_id="nestedOperation")
+    def nested() -> None:
+        return None
+
+    class DeferredIncludedRouter:
+        original_router = router
+
+    routes = [app.routes[-1], DeferredIncludedRouter()]
+
+    assert {
+        route.operation_id for route in contract_app_module._iter_api_routes(routes)
+    } == {"topLevelOperation", "nestedOperation"}
+
+
+def test_provider_binding_preserves_frozen_endpoint_signatures() -> None:
+    class Provider:
+        def authenticate(self, _authorization_values: tuple[bytes, ...]) -> bool:
+            return True
+
+        def invoke(self, _operation_id: str, _arguments: dict[str, object]) -> object:
+            raise AssertionError("sync provider dispatch is not used")
+
+        async def invoke_async(
+            self, _operation_id: str, _arguments: dict[str, object]
+        ) -> object:
+            raise AssertionError("provider dispatch is not part of this test")
+
+    contract_app = create_core_control_contract_app()
+    provider_app = create_core_control_contract_app(Provider())
+    contract_routes = {
+        route.operation_id: route
+        for route in contract_app_module._iter_api_routes(contract_app.routes)
+    }
+    provider_routes = {
+        route.operation_id: route
+        for route in contract_app_module._iter_api_routes(provider_app.routes)
+    }
+
+    assert provider_routes.keys() == contract_routes.keys()
+    for operation_id, route in provider_routes.items():
+        assert inspect.signature(route.endpoint) == inspect.signature(
+            contract_routes[operation_id].endpoint
+        )
 
 
 def _operations(openapi: dict[str, Any]) -> set[tuple[str, str]]:

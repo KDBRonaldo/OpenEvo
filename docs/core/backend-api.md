@@ -39,6 +39,13 @@ The external framework lock names the exact installed Core wheel and pins its
 version and SHA-256. Startup fails before serving capabilities when the lock,
 wheel, installed inventory, or entry points do not match.
 
+Release startup also proves that the provider owns exactly the frozen operation
+IDs before listening. Route discovery traverses both eagerly expanded
+`APIRoute` entries and FastAPI's deferred included-router representation; this
+keeps clean installs on supported FastAPI versions from silently leaving nested
+`/v1` routes unbound. Unknown route container types remain excluded and the
+exact-set check fails startup rather than weakening provider ownership.
+
 The canonical host service root is `~/.openevo/core`; project and task state is
 owned inside that one Core instance. The backend must
 report its version, descriptor SHA256, artifact SHA256, source commit, and state
