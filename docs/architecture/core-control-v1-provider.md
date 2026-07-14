@@ -38,12 +38,12 @@ before releasing the threads.
 | `/version`, `/health`, `/v1/status` | Implemented by the Core provider. Health is not ready and status is degraded when no verified executable registry is installed. |
 | `/v1/capabilities` | Direct `build_evolution_capabilities` projection of the injected `VerifiedExecutableRegistry`; missing registry returns typed 503. |
 | `/v1/projects` and `/v1/projects/{id}` | Durable list/create/get/patch/delete with strong ETags, conditional mutations, bounded signed cursors, and persisted idempotency responses. |
+| Revision reads | Durable project-owned active revision ledger. List uses bounded signed cursors; head and revision reads return their authoritative ETags. |
 | `/v1/projects/{id}/workspace-uploads/*` | Durable begin/status/ordered chunk/finalize/abort with project and upload CAS, restart recovery, digest validation, canonical ustar verification, and extracted snapshot publication. |
 | `/v1/projects/{id}/validate` | Validates exact current project/workspace snapshots and registry digest, then delegates evolution selection validation to the existing framework compiler validator. |
 | `/v1/services`, `/v1/services/{id}` | Reports the observable `core-control` process state. No other service is inferred from files or legacy scaffold state. |
 | `/v1/events` | Durable ordered SSE with signed opaque record IDs, at-least-once replay, a 10,000-record maximum window, 15-second durable heartbeats, and typed 400/410 cursor errors. |
 | Environment doctor/repair | Typed 503 until a real environment owner and recoverable operation implementation are wired. |
-| Revision reads | Typed 503 until successor readiness and activation have a production issuer. |
 | Run, timeline, run log, and run context routes | Typed 503. Phase one does not create a run or synthesize admission, attempts, pins, progress, or success. |
 | Artifact routes | Typed 503 until run ownership exposes authoritative v1 artifact projections. |
 | Service restart/log routes | Typed 503. The provider does not invoke Desktop SSH lifecycle or pretend it supervises services it cannot observe. |
@@ -64,7 +64,7 @@ workspace-uploads/<upload-id>.part
 workspace-snapshots/<snapshot-id>/...
 ```
 
-SQLite stores closed project and upload documents, resource versions,
+SQLite stores closed project, active revision, and upload documents, resource versions,
 idempotency responses, publication-owner audit bindings, pending managed-file
 cleanup intents, a persistent cursor/event signing key, and SSE frames.
 Persisted documents are revalidated against their exact v1 models at startup.
@@ -73,13 +73,18 @@ the bearer, host paths in API resources, model credentials, commands, or open
 metadata.
 
 The private schema is exact-fingerprinted. Startup accepts only an empty
-database, the current schema, or the one exact preceding phase-one schema.
+database, the current schema, the exact preceding provider schema, or the older
+empty pre-identity schema.
 Near-match DDL, extra tables/indexes/views/triggers, and partially altered
-schemas are rejected. The preceding schema can migrate only when every business
-table and both managed roots are empty and no identity marker exists. Core does
-not infer or backfill missing idempotency request envelopes, and a legacy store
-with projects, uploads, events, idempotency state, or managed files requires an
-explicit offline migration rather than being claimed at startup.
+schemas are rejected. The exact preceding bound provider schema is upgraded in
+one SQLite transaction by adding the empty revision ledger; existing projects,
+uploads, events, and idempotency records remain authoritative and are then
+checked by the normal bounded recovery pass. Such older projects stay draft
+until a later verified mutation can publish a revision; startup does not infer
+readiness or synthesize events. The older pre-identity schema can migrate only
+when every business table and both managed roots are empty and no identity
+marker exists. Core does not infer or backfill missing idempotency request
+envelopes.
 
 `store_identity` contains one closed row with a random `store_id`, the bound
 provider-root device/inode, a `pending|bound` state, and, once bound, the marker
@@ -165,7 +170,17 @@ fixed-size rowid keyset pages: every persisted TEXT or BLOB value is included in
 the SQL aggregate and per-value length budgets before a guarded value enters
 Python. Metadata is a one-key closed set; signing-key key/value lengths are
 checked before the value is read, and unknown metadata fails startup. Provider
-recovery and project listing do not use unbounded `fetchall()`.
+recovery and project/revision listing do not use unbounded `fetchall()`.
+
+`project_revisions` is an immutable per-project ledger with a unique contiguous
+generation and exact predecessor. Its Core-owned revision ID authenticates a
+canonical manifest digest over project/task/workspace snapshots, registry
+digest, generation, and predecessor. Recovery recomputes that identity, every
+snapshot identity and revision ETag, the complete predecessor chain, and the
+ProjectV1 active-head binding. Missing rows, gaps, cross-project predecessors,
+noncanonical active transitions, and project/head divergence fail startup
+closed. Revision documents count against the same irreversible startup row,
+per-value, and aggregate byte budgets as other provider state.
 
 Project and upload ETags hash the complete validated canonical resource model,
 including model-populated defaults, plus an internal monotonic resource version.
@@ -194,9 +209,17 @@ the same validator. A canonical response from another resource is therefore
 corruption, not an authoritative success.
 
 Project creation signs Core-owned project and task snapshots. Scratch projects
-also receive an immutable empty workspace snapshot. Imported projects remain
-draft until their declared archive is finalized. The provider does not invent
-an active revision, so projects cannot become `ready` in this phase.
+also receive an immutable empty workspace snapshot. When and only when a
+verified registry digest, ready model preparation, and workspace snapshot are
+all present, the creation transaction also stores generation-zero active
+`RevisionV1`, updates the complete ready `ProjectV1`, appends project and
+revision activation events, and stores the idempotency response. Codex
+subscription supplies ready model preparation; self-deployed model preparation
+remains unresolved in this provider slice. Imported projects remain draft until
+their declared archive is finalized. A ready project PATCH publishes exactly
+one direct active successor in the same transaction and retains every older
+revision. If a PATCH removes a readiness input, the prior active head is
+retained while the changed project is draft; no successor is fabricated.
 Snapshot and publication content IDs are deterministic HMAC identities over
 their canonical digest, timestamp, publication fields, and, for imported
 workspace publications, the exact project/upload owner pair. Startup recomputes
@@ -245,7 +268,9 @@ and `fsync`ed. Linux `renameat2(RENAME_NOREPLACE)` publishes the owner-scoped
 snapshot without replacing an existing name. A final SQLite transaction
 rechecks both mutable resources, inserts the unique signed project/upload owner
 row, stores one `WorkspacePublicationV1`, signs a new project snapshot, updates
-the project and upload, and appends the project event. Recovery verifies the
+the project and upload, and, when registry/model readiness is complete, stores
+generation zero or the direct successor revision. It appends the project event
+and any revision activation event in that same transaction. Recovery verifies the
 published owner, modes, link counts, exact entry set, sizes, and bytes against
 the retained canonical archive before serving projects. No run consumes this
 snapshot until the later run-owner phase.
@@ -277,7 +302,9 @@ platforms fail closed rather than falling back to a replacing rename.
 
 Every stored frame is validated as `SseFrameV1`; wire `id` and `event` therefore
 match the typed envelope. Project mutations emit `project.updated.v1` with the
-authoritative project ETag. Frame sequence is monotonic and the opaque ID is
+authoritative project ETag. A revision publication additionally emits the
+frozen `revision.activated.v1` envelope with the immutable revision ETag and
+project parent identity. Frame sequence is monotonic and the opaque ID is
 authenticated by the store key. A retained `Last-Event-ID` resumes after that
 sequence. A valid cursor older than the window returns 410 so the sidecar
 reloads snapshots; malformed, tampered, or future cursors return 400.
@@ -299,4 +326,6 @@ requires user action; detected durable-state corruption is non-retryable.
 Provider coverage is in
 `tests/backend/test_core_control_v1_provider.py`. The frozen contract tests in
 `tests/backend/test_contract_v1.py` continue to prove exact OpenAPI and event
-schema bytes and digests.
+schema bytes and digests. This owner does not implement run admission,
+evolution-produced queued successors, serving preparation, or cross-session
+activation; those remain fail closed behind their existing routes and owners.

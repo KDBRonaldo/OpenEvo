@@ -62,8 +62,10 @@ closure and active transition state.
 `CapabilitiesResponseV1` remains the framework-owned `EvolutionCapabilitiesV1`
 type without a local copy or projection.
 
-The provider's private SQLite schema is fresh-only and exact-fingerprinted; it
-is not part of the frozen HTTP schema. Successful idempotency rows retain the
+The provider's private SQLite schema is exact-fingerprinted and is not part of
+the frozen HTTP schema. The exact preceding bound schema is upgraded
+transactionally by adding the revision ledger; near matches and older
+state-bearing schemas fail closed. Successful idempotency rows retain the
 canonical request and semantic headers and validate each operation's
 request/response relationship during replay and startup. Project validation
 constructs its framework profile from the persisted execution mode, capture
@@ -83,10 +85,22 @@ and startup must converge them before dropping those intents. Linux cleanup uses
 atomic no-replace quarantine names, revalidates the first observed inode after
 rename, and applies one cumulative recovery budget before quota is checked over
 live owned entries only.
+
+Verified Codex subscription projects with a ready workspace atomically publish
+generation-zero active `RevisionV1`; ready project PATCH and final workspace
+publication atomically publish one direct successor while retaining history.
+The private ledger authenticates canonical manifests, enforces contiguous
+predecessors and active ProjectV1 head closure during bounded startup recovery,
+and backs the frozen revision list/head/get routes with signed cursors and
+strong ETags. Missing registry, unresolved self-deployed model preparation, or
+an unpublished imported workspace remains draft and does not synthesize a
+revision. Project and revision activation events commit with the mutation and
+idempotency response.
 Synchronous store work runs on a bounded executor rather than the ASGI event
 loop.
 
 See `docs/architecture/desktop-core-contract-v1.md` for the product boundary and
 `docs/architecture/core-control-v1-provider.md` for implemented ownership. The
-provider does not implement the run owner, successor activation, service
-restart, diagnostics, or artifact exhibition paths; those routes fail closed.
+provider does not implement the run owner, evolution-produced queued successor
+orchestration, serving preparation, service restart, diagnostics, or artifact
+exhibition paths; those routes fail closed.

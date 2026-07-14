@@ -63,9 +63,6 @@ _UNAVAILABLE_OPERATIONS = frozenset(
     {
         "doctorCoreEnvironmentV1",
         "repairCoreEnvironmentV1",
-        "listCoreProjectRevisionsV1",
-        "getCoreProjectRevisionHeadV1",
-        "getCoreRevisionV1",
         "listCoreRunsV1",
         "createCoreRunV1",
         "getCoreRunV1",
@@ -150,6 +147,9 @@ class CoreControlProviderV1:
             "getCoreProjectV1": self._get_project,
             "patchCoreProjectV1": self._patch_project,
             "deleteCoreProjectV1": self._delete_project,
+            "listCoreProjectRevisionsV1": self._list_project_revisions,
+            "getCoreProjectRevisionHeadV1": self._get_project_revision_head,
+            "getCoreRevisionV1": self._get_revision,
             "createCoreWorkspaceUploadV1": self._create_upload,
             "getCoreWorkspaceUploadV1": self._get_upload,
             "putCoreWorkspaceUploadChunkV1": self._put_upload_chunk,
@@ -396,6 +396,23 @@ class CoreControlProviderV1:
             )
         )
 
+    def _list_project_revisions(self, arguments: Mapping[str, object]) -> m.RevisionPageV1:
+        return self.store.list_project_revisions(
+            cast(str, arguments["project_id"]),
+            limit=cast(int, arguments["limit"]),
+            after=cast(str | None, arguments["after"]),
+            sort=cast(Any, arguments["sort"]),
+            direction=cast(Any, arguments["direction"]),
+        )
+
+    def _get_project_revision_head(self, arguments: Mapping[str, object]) -> Response:
+        head = self.store.get_revision_head(cast(str, arguments["project_id"]))
+        return _model_response(head, etag=head.etag)
+
+    def _get_revision(self, arguments: Mapping[str, object]) -> Response:
+        revision = self.store.get_revision(cast(str, arguments["revision_id"]))
+        return _model_response(revision, etag=revision.etag)
+
     def _create_upload(self, arguments: Mapping[str, object]) -> Response:
         return _stored_response(
             self.store.create_upload(
@@ -432,6 +449,7 @@ class CoreControlProviderV1:
                 if_match=cast(str, arguments["if_match"]),
                 if_project_match=cast(str, arguments["if_project_match"]),
                 idempotency_key=cast(str, arguments["idempotency_key"]),
+                registry_digest=self._registry_digest(),
             )
         )
 
@@ -716,7 +734,13 @@ def _error(
 
 
 def _category_for_resource(resource_type: str) -> m.ErrorCategory:
-    if resource_type in {"project", "finalize_project", "workspace_upload"}:
+    if resource_type in {
+        "project",
+        "finalize_project",
+        "workspace_upload",
+        "revision",
+        "revision_head",
+    }:
         return m.ErrorCategory.PROJECT
     if resource_type == "service":
         return m.ErrorCategory.SERVICE

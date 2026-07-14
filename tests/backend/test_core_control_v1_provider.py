@@ -2414,6 +2414,17 @@ def test_project_patch_publishes_a_durable_direct_successor_revision(
         assert successor_ref["project_id"] == project["id"]
         assert successor_ref["generation"] == 1
         assert successor_ref["id"] != initial_ref["id"]
+        replay = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-revision-0001",
+                "If-Match": project_etag,
+            },
+            json={"schema_version": "1", "name": "Protein memory successor"},
+        )
+        assert replay.status_code == 200
+        assert replay.json() == patched.json()
 
         revisions = client.get(
             f"/v1/projects/{project['id']}/revisions",
@@ -2436,6 +2447,268 @@ def test_project_patch_publishes_a_durable_direct_successor_revision(
         )
         assert head.status_code == 200
         assert head.json()["active_revision"] == successor_ref
+
+
+def test_project_revision_readiness_fails_closed_until_all_inputs_are_ready(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path / "no-registry")) as client:
+        project, _ = _create_project(client, _project_create())
+        assert project["status"] == "draft"
+        assert project["active_revision"] is None
+        assert project["registry_digest"] is None
+
+    with TestClient(_app(tmp_path / "self-deployed", registry=registry)) as client:
+        project, _ = _create_project(
+            client,
+            _project_create(
+                execution_mode="self-deployed",
+                capture_mode="token_level",
+                harness_id="openhands",
+            ),
+        )
+        assert project["status"] == "draft"
+        assert project["active_revision"] is None
+        assert project["model_preparation"]["status"] == "unresolved"
+
+    with TestClient(_app(tmp_path / "demoted", registry=registry)) as client:
+        project, etag = _create_project(client, _project_create())
+        head_before = client.get(
+            f"/v1/projects/{project['id']}/revisions/head",
+            headers=AUTH,
+        )
+        self_deployed_spec = _project_create(
+            execution_mode="self-deployed",
+            capture_mode="token_level",
+            harness_id="openhands",
+        )["spec"]
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-unready-model",
+                "If-Match": etag,
+            },
+            json={"schema_version": "1", "spec": self_deployed_spec},
+        )
+        assert patched.status_code == 200
+        assert patched.json()["status"] == "draft"
+        assert patched.json()["active_revision"] == project["active_revision"]
+        head_after = client.get(
+            f"/v1/projects/{project['id']}/revisions/head",
+            headers=AUTH,
+        )
+        assert head_after.json() == head_before.json()
+        assert head_after.headers["etag"] == head_before.headers["etag"]
+
+    archive = _workspace_archive()
+    payload = _project_create(archive=archive)
+    with TestClient(_app(tmp_path / "imported", registry=registry)) as client:
+        project, project_etag = _create_project(client, payload)
+        assert project["status"] == "draft"
+        assert project["active_revision"] is None
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "begin-ready-workspace",
+                "If-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": payload["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-ready-workspace",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+        finalized = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/finalize",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "finalize-ready-workspace",
+                "If-Match": chunk.headers["etag"],
+                "If-Project-Match": project_etag,
+            },
+            json={"schema_version": "1", "content_sha256": hashlib.sha256(archive).hexdigest()},
+        )
+        assert finalized.status_code == 201, finalized.text
+        published = finalized.json()["project"]
+        assert published["status"] == "ready"
+        assert published["active_revision"]["generation"] == 0
+        assert published["current_workspace_snapshot"] is not None
+
+
+def test_project_revision_reads_paginate_and_return_typed_not_found(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path / "draft")) as draft_client:
+        draft, _ = _create_project(draft_client, _project_create())
+        empty = draft_client.get(f"/v1/projects/{draft['id']}/revisions", headers=AUTH)
+        assert empty.status_code == 200
+        assert empty.json()["items"] == []
+        missing_head = draft_client.get(
+            f"/v1/projects/{draft['id']}/revisions/head", headers=AUTH
+        )
+        assert missing_head.status_code == 404
+        assert missing_head.json()["code"] == "revision_head_not_found"
+        missing_revision = draft_client.get("/v1/revisions/revision-missing", headers=AUTH)
+        assert missing_revision.status_code == 404
+        assert missing_revision.json()["code"] == "revision_not_found"
+
+    with TestClient(_app(tmp_path / "ready", registry=registry)) as client:
+        project, etag = _create_project(client, _project_create())
+        for index in range(2):
+            patched = client.patch(
+                f"/v1/projects/{project['id']}",
+                headers={
+                    **AUTH,
+                    "Idempotency-Key": f"patch-page-revision-{index}",
+                    "If-Match": etag,
+                },
+                json={"schema_version": "1", "name": f"Revision page {index}"},
+            )
+            assert patched.status_code == 200
+            etag = patched.headers["etag"]
+        first = client.get(
+            f"/v1/projects/{project['id']}/revisions",
+            headers=AUTH,
+            params={"limit": 1, "sort": "generation", "direction": "asc"},
+        )
+        assert first.status_code == 200
+        assert first.json()["items"][0]["revision"]["generation"] == 0
+        assert first.json()["has_more"] is True
+        second = client.get(
+            f"/v1/projects/{project['id']}/revisions",
+            headers=AUTH,
+            params={
+                "limit": 1,
+                "sort": "generation",
+                "direction": "asc",
+                "after": first.json()["next_cursor"],
+            },
+        )
+        assert second.status_code == 200
+        assert second.json()["items"][0]["revision"]["generation"] == 1
+        tampered = client.get(
+            f"/v1/projects/{project['id']}/revisions",
+            headers=AUTH,
+            params={"after": first.json()["next_cursor"] + "x"},
+        )
+        assert tampered.status_code == 400
+        revision_id = second.json()["items"][0]["revision"]["id"]
+        revision = client.get(f"/v1/revisions/{revision_id}", headers=AUTH)
+        assert revision.headers["etag"] == revision.json()["etag"]
+
+
+def test_project_revision_schema_migrates_exact_previous_store_with_state(
+    tmp_path: Path,
+) -> None:
+    payload = _project_create()
+    with TestClient(_app(tmp_path)) as client:
+        project, _ = _create_project(client, payload)
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE project_revisions")
+
+    with TestClient(_app(tmp_path)) as restarted:
+        recovered = restarted.get(f"/v1/projects/{project['id']}", headers=AUTH)
+        assert recovered.status_code == 200
+        replay = restarted.post(
+            "/v1/projects",
+            headers={**AUTH, "Idempotency-Key": "create-project-0001"},
+            json=payload,
+        )
+        assert replay.status_code == 201
+        assert replay.json() == project
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_revisions"
+        ).fetchone()[0] == 0
+
+
+def test_project_revision_manifest_corruption_fails_closed_on_restart(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, _ = _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT document_json FROM project_revisions WHERE revision_id = ?",
+            (project["active_revision"]["id"],),
+        ).fetchone()
+        revision = store_module._validate_bytes(store_module.m.RevisionV1, row["document_json"])
+        data = revision.model_dump(mode="python", exclude={"etag"})
+        data["revision"]["manifest_sha256"] = "0" * 64
+        damaged = store_module._model_with_etag(store_module.m.RevisionV1, data, version=1)
+        connection.execute(
+            "UPDATE project_revisions SET document_json = ? WHERE revision_id = ?",
+            (store_module._model_bytes(damaged), project["active_revision"]["id"]),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="revision"):
+        CoreControlStoreV1(tmp_path)
+
+
+def test_project_revision_recovery_length_guards_before_document_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        project_bytes = int(
+            connection.execute(
+                "SELECT MAX(length(CAST(document_json AS BLOB))) FROM projects"
+            ).fetchone()[0]
+        )
+        limit = project_bytes + 128
+        connection.execute(
+            "UPDATE project_revisions SET document_json = zeroblob(?)",
+            (limit + 1,),
+        )
+
+    monkeypatch.setattr(store_module, "_MAX_STARTUP_VALUE_BYTES", limit)
+    with pytest.raises(StoreCorruptionError, match="project_revisions recovery quota"):
+        CoreControlStoreV1(tmp_path)
+
+
+def test_revision_activation_event_is_durable_and_canonical(tmp_path: Path) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    app = _app(tmp_path, registry=registry)
+    provider = app.state.core_control_provider
+    with TestClient(app) as client:
+        project, _ = _create_project(client, _project_create())
+        frames = provider.store.replay_events(None)
+        assert [frame["event"] for frame in frames] == [
+            "project.updated.v1",
+            "revision.activated.v1",
+        ]
+        activated = SseFrameV1.model_validate_json(json.dumps(frames[-1]))
+        assert activated.data.root.payload.revision.id == project["active_revision"]["id"]
+
+    restarted = _app(tmp_path, registry=registry)
+    with TestClient(restarted):
+        frames = restarted.state.core_control_provider.store.replay_events(None)
+        assert frames[-1]["event"] == "revision.activated.v1"
 
 
 def test_project_validation_uses_the_exact_persisted_execution_profile(
