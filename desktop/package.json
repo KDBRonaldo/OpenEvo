@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "build:openevo": "vite build --mode openevo-desktop",
+    "build:openevo": "vite build --mode openevo-desktop && node scripts/package-openevo-product.mjs",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "build:sidecar": "python packaging/build_sidecar.py",

@@ -84,7 +84,7 @@ describe("DesktopProductApp", () => {
     expect(button("Start session").disabled).toBe(false);
   });
 
-  it("runs a session through successor activation and pins it on the next session", async () => {
+  it("renders fixture successor states and the later pinned revision", async () => {
     vi.useFakeTimers();
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, stepDelayMs: 20 });
     root = await renderProduct(provider);
@@ -143,6 +143,151 @@ describe("DesktopProductApp", () => {
     }
     expect(document.querySelector('input[type="password"]')).toBeNull();
     expect(screenText()).toContain("Stored securely");
+  });
+
+  it("blocks mutations while the event stream is stale and recovers from a snapshot refresh", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+
+    await act(async () => provider?.markStreamStale());
+    await flush();
+    expect(button("Start session").disabled).toBe(true);
+    expect(screenText()).toContain("Refresh this view");
+
+    await clickButton("Refresh");
+    expect(button("Start session").disabled).toBe(false);
+
+    await act(async () => provider?.resetEventCursor());
+    await flush();
+    expect(button("Start session").disabled).toBe(false);
+
+    provider.failNextRefresh();
+    await act(async () => provider?.resetEventCursor());
+    await flush();
+    expect(button("Start session").disabled).toBe(true);
+    expect(screenText()).not.toContain("internal refresh details");
+  });
+
+  it("shows remote targets for an empty project map and blocks an unsupported saved method", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.clearEvolutionSelections();
+    root = await renderProduct(provider);
+    await clickAria("Project settings");
+
+    expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
+    expect(screenText()).toContain("Text memory");
+    await clickAria("Close settings");
+
+    provider.useUnsupportedSavedMethod();
+    await flush();
+    expect(button("Start session").disabled).toBe(true);
+    expect(screenText()).toContain("unsupported for this project and mode");
+    await clickAria("Project settings");
+    expect(screenText()).toContain("removed_text_memory (no longer available)");
+    const staleToggle = document.querySelector<HTMLInputElement>('.target-toggle input[role="switch"]');
+    if (!staleToggle) throw new Error("Unsupported target toggle was not found.");
+    await act(async () => staleToggle.click());
+    expect(staleToggle.checked).toBe(false);
+    await act(async () => staleToggle.click());
+    const repairedMethod = document.querySelector<HTMLSelectElement>('.target-toggle select[aria-label="Text memory method"]');
+    expect(staleToggle.checked).toBe(true);
+    expect(repairedMethod?.value).toBe("reference_text_memory");
+  });
+
+  it("preserves accepted existing methods and offers supported Core selection resolvers", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useAcceptedSavedMethod();
+    root = await renderProduct(provider);
+
+    expect(button("Start session").disabled).toBe(false);
+    await clickAria("Project settings");
+    expect(screenText()).toContain("hidden_text_memory (existing selection)");
+    const hiddenOption = Array.from(document.querySelectorAll<HTMLOptionElement>("option")).find((item) => item.value === "hidden_text_memory");
+    expect(hiddenOption?.disabled).toBe(true);
+    await clickAria("Close settings");
+
+    provider.useResolverSavedMethod();
+    await flush();
+    expect(button("Start session").disabled).toBe(false);
+    await clickAria("Project settings");
+    const resolver = Array.from(document.querySelectorAll<HTMLOptionElement>("option")).find((item) => item.value === "auto");
+    expect(resolver?.disabled).toBe(false);
+    expect(resolver?.textContent).toContain("Automatic");
+  });
+
+  it("fails closed across mode changes until the saved project receives matching capabilities", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    await clickButton("Subscription");
+    expect(screenText()).toContain("Capabilities are unavailable for this project and mode.");
+    await clickButton("Save");
+
+    expect(screenText()).not.toContain("Research configuration");
+    expect(button("Start session").disabled).toBe(false);
+  });
+
+  it("requires explicit activation after a project switch", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.addDraftProject();
+    root = await renderProduct(provider);
+
+    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+    if (!switcher) throw new Error("Project switcher was not found.");
+    await act(async () => {
+      switcher.value = "project-fixture-2";
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(screenText()).toContain("Activate this project");
+    expect(button("Start session").disabled).toBe(true);
+
+    await clickButton("Activate project");
+    expect(screenText()).toContain("Second research task");
+    expect(button("Start session").disabled).toBe(false);
+  });
+
+  it("selects and syncs a native folder through opaque source references", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    await clickButton("Folder snapshot");
+    expect(screenText()).toContain("Selected research folder");
+    expect(document.querySelector('input[type="file"]')).toBeNull();
+    await clickButton("Save");
+    await clickAria("Project settings");
+    await clickButton("Sync snapshot");
+    await clickAria("Close settings");
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
+    expect(refreshed.snapshot.projects[0]?.source).toMatchObject({
+      kind: "native_folder_snapshot",
+      display_name: "Selected research folder",
+      source_ref: { content_id: "source-fixture-1" },
+    });
+  });
+
+  it("keeps drawers and drafts after save failures and restores focus on Escape", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+    const opener = document.querySelector<HTMLButtonElement>('button[aria-label="Project settings"]');
+    if (!opener) throw new Error("Project settings opener was not found.");
+    opener.focus();
+    await clickAria("Project settings");
+    setInput("Objective", "A retained draft objective.");
+    provider.failNextProjectSaveWithUnknownError();
+    await clickButton("Save");
+
+    expect(screenText()).toContain("A retained draft objective.");
+    expect(screenText()).toContain("The request could not be completed.");
+    expect(screenText()).not.toContain("internal host path");
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(opener);
   });
 });
 

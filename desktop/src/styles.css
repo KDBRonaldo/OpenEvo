@@ -467,6 +467,10 @@ pre.json {
   font-size: 12px;
 }
 
+.disabled-reason .text-button {
+  margin-left: 4px;
+}
+
 .connection-gate {
   display: grid;
   grid-template-columns: 38px minmax(0, 1fr) auto;
@@ -1597,13 +1601,20 @@ pre.json {
 
 .target-toggle {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   min-height: 54px;
   align-items: center;
   gap: 9px;
   padding: 7px 9px;
   border: 1px solid var(--line);
   border-radius: 6px;
+}
+
+.target-toggle > label {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
   cursor: pointer;
 }
 
@@ -1650,6 +1661,52 @@ pre.json {
 
 .target-toggle input:disabled + .switch-track {
   opacity: 0.45;
+}
+
+.target-toggle select {
+  margin-top: 1px;
+}
+
+.target-toggle.invalid {
+  border-color: #d6a1a1;
+}
+
+.target-toggle .target-error,
+.form-error {
+  color: var(--danger);
+}
+
+.source-summary {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+
+.source-summary strong,
+.source-summary small {
+  display: block;
+}
+
+.source-summary strong {
+  font-size: 12px;
+}
+
+.source-summary small,
+.form-error {
+  margin-top: 2px;
+  font-size: 10px;
+}
+
+.product-shell :focus-visible,
+.product-boot :focus-visible {
+  outline: 3px solid #7abca5;
+  outline-offset: 2px;
 }
 
 .target-toggle strong,

@@ -1,4 +1,5 @@
 import type {
+  ApiErrorV1,
   ArtifactContentV1,
   ArtifactDiffV1,
   ArtifactV1,
@@ -11,6 +12,8 @@ import type {
   ProjectCapabilitiesV1,
   ProjectCreateV1,
   ProjectPatchV1,
+  ProjectSourceV1,
+  ProjectValidationV1,
   ProjectV1,
   RemoteProfileV1,
   RunV1,
@@ -20,7 +23,6 @@ import type {
 } from "../api/v1/schemas";
 
 export interface DesktopProductReleaseContract {
-  // Populated from checked-in release metadata, never from provider discovery.
   readonly acceptedOpenApiDigests: readonly [string, ...string[]];
   readonly allowedProviderKinds: readonly ["desktop_sidecar"];
   readonly requiredFeatureFlags: readonly VersionInfoV1["feature_flags"][number][];
@@ -48,40 +50,99 @@ export function defineDesktopProductReleaseContract(
   });
 }
 
+export type ProductStreamState =
+  | { readonly status: "fresh"; readonly epoch: number; readonly lastEventId: string | null }
+  | { readonly status: "stale"; readonly epoch: number; readonly reason: "event_gap" | "refresh_pending" }
+  | { readonly status: "error"; readonly epoch: number; readonly error: ApiErrorV1 | null }
+  | { readonly status: "cursor_reset"; readonly epoch: number; readonly resumeFromEventId: null };
+
+export type ProjectCapabilityState =
+  | { readonly status: "loading"; readonly projectId: string; readonly executionMode: ProjectV1["execution"]["mode"] }
+  | { readonly status: "unavailable"; readonly projectId: string; readonly executionMode: ProjectV1["execution"]["mode"]; readonly error: ApiErrorV1 | null }
+  | { readonly status: "ready"; readonly projectId: string; readonly executionMode: ProjectV1["execution"]["mode"]; readonly value: ProjectCapabilitiesV1 };
+
+export type ProjectValidationState =
+  | { readonly status: "loading"; readonly projectId: string; readonly executionMode: ProjectV1["execution"]["mode"]; readonly projectEtag: string }
+  | { readonly status: "unavailable"; readonly projectId: string; readonly executionMode: ProjectV1["execution"]["mode"]; readonly projectEtag: string; readonly error: ApiErrorV1 | null }
+  | { readonly status: "ready"; readonly projectId: string; readonly executionMode: ProjectV1["execution"]["mode"]; readonly projectEtag: string; readonly value: ProjectValidationV1 };
+
 export interface DesktopProductSnapshot {
-  state: DesktopStateV1;
-  profiles: readonly RemoteProfileV1[];
-  projects: readonly ProjectV1[];
-  runs: readonly RunV1[];
-  timelines: Readonly<Record<string, readonly TimelineEntryV1[]>>;
-  artifacts: readonly ArtifactV1[];
-  services: readonly ServiceV1[];
-  capabilities: ProjectCapabilitiesV1 | null;
-  diagnostic: DiagnosticReportV1 | null;
-  activeOperation: LocalOperationV1 | null;
+  readonly state: DesktopStateV1;
+  readonly profiles: readonly RemoteProfileV1[];
+  readonly projects: readonly ProjectV1[];
+  readonly runs: readonly RunV1[];
+  readonly timelines: Readonly<Record<string, readonly TimelineEntryV1[]>>;
+  readonly artifacts: readonly ArtifactV1[];
+  readonly services: readonly ServiceV1[];
+  readonly capability: ProjectCapabilityState | null;
+  readonly validation: ProjectValidationState | null;
+  readonly diagnostic: DiagnosticReportV1 | null;
+  readonly activeOperation: LocalOperationV1 | null;
+  readonly stream: ProductStreamState;
+}
+
+export type ProductRefreshResult =
+  | { readonly status: "fresh"; readonly snapshot: DesktopProductSnapshot }
+  | { readonly status: "stale"; readonly stream: Extract<ProductStreamState, { status: "stale" }> }
+  | { readonly status: "error"; readonly stream: Extract<ProductStreamState, { status: "error" }> }
+  | { readonly status: "cursor_reset"; readonly stream: Extract<ProductStreamState, { status: "cursor_reset" }> };
+
+export type ProductSubscriptionSignal =
+  | { readonly kind: "snapshot_changed" }
+  | { readonly kind: "stream_stale"; readonly reason: "event_gap" | "refresh_pending" }
+  | { readonly kind: "stream_error"; readonly error: ApiErrorV1 | null }
+  | { readonly kind: "cursor_reset"; readonly resumeFromEventId: null };
+
+export interface ProductMutationIntent {
+  readonly actionId: string;
+  readonly streamEpoch: number;
+}
+
+export interface ProductResourceMutationIntent extends ProductMutationIntent {
+  readonly etag: string;
+}
+
+export interface ProductRunIntent extends ProductResourceMutationIntent {
+  readonly projectId: string;
+}
+
+export class ProductRefreshOrder {
+  private sequence = 0;
+
+  begin(): number {
+    this.sequence += 1;
+    return this.sequence;
+  }
+
+  isCurrent(sequence: number): boolean {
+    return sequence === this.sequence;
+  }
+}
+
+export interface ProjectSourceSelectionIntent extends ProductMutationIntent {
+  readonly kind: "native_folder_snapshot";
 }
 
 export interface DesktopProductProvider {
   readonly providerKind: VersionInfoV1["provider_kind"];
-  getSnapshot(): Promise<DesktopProductSnapshot>;
-  subscribe(listener: () => void): () => void;
-  createProfile(input: ProfileCreateV1): Promise<RemoteProfileV1>;
-  updateProfile(profileId: string, input: ProfilePatchV1): Promise<RemoteProfileV1>;
-  configureCredential(
-    profileId: string,
-    slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
-  ): Promise<RemoteProfileV1>;
-  connectProfile(profileId: string): Promise<LocalOperationV1>;
-  acceptHostKey(profileId: string, input: HostKeyAcceptV1): Promise<LocalOperationV1>;
-  createProject(input: ProjectCreateV1): Promise<ProjectV1>;
-  updateProject(projectId: string, input: ProjectPatchV1): Promise<ProjectV1>;
-  activateProject(projectId: string): Promise<LocalOperationV1>;
-  startRun(projectId: string): Promise<RunV1>;
-  cancelRun(runId: string): Promise<RunV1>;
+  refresh(): Promise<ProductRefreshResult>;
+  subscribe(listener: (signal: ProductSubscriptionSignal) => void): () => void;
+  createProfile(input: ProfileCreateV1, intent: ProductMutationIntent): Promise<RemoteProfileV1>;
+  updateProfile(profileId: string, input: ProfilePatchV1, intent: ProductResourceMutationIntent): Promise<RemoteProfileV1>;
+  configureCredential(profileId: string, slotKind: RemoteProfileV1["credential_slots"][number]["kind"], intent: ProductResourceMutationIntent): Promise<RemoteProfileV1>;
+  connectProfile(profileId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
+  acceptHostKey(profileId: string, input: HostKeyAcceptV1, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
+  createProject(input: ProjectCreateV1, intent: ProductMutationIntent): Promise<ProjectV1>;
+  updateProject(projectId: string, input: ProjectPatchV1, intent: ProductResourceMutationIntent): Promise<ProjectV1>;
+  activateProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
+  syncProjectWorkspace(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
+  selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
+  startRun(intent: ProductRunIntent): Promise<RunV1>;
+  cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
   getArtifactContent(artifactId: string): Promise<ArtifactContentV1>;
   getArtifactDiff(artifactId: string): Promise<ArtifactDiffV1>;
-  repairProject(projectId: string): Promise<LocalOperationV1>;
-  restartService(serviceId: string): Promise<LocalOperationV1>;
+  repairProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
+  restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
 }
 
 export class DesktopProductProviderUnavailableError extends Error {
@@ -91,54 +152,37 @@ export class DesktopProductProviderUnavailableError extends Error {
   }
 }
 
+export class DesktopProductUserError extends Error {
+  constructor(readonly userMessage: string) {
+    super(userMessage);
+    this.name = "DesktopProductUserError";
+  }
+}
+
+const unavailable = async (): Promise<never> => {
+  throw new DesktopProductProviderUnavailableError();
+};
+
 export const unavailableDesktopProductProvider: DesktopProductProvider = {
   providerKind: "desktop_sidecar",
-  async getSnapshot() {
-    throw new DesktopProductProviderUnavailableError();
-  },
+  refresh: unavailable,
   subscribe() {
     return () => undefined;
   },
-  async createProfile() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async updateProfile() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async configureCredential() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async connectProfile() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async acceptHostKey() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async createProject() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async updateProject() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async activateProject() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async startRun() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async cancelRun() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async getArtifactContent() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async getArtifactDiff() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async repairProject() {
-    throw new DesktopProductProviderUnavailableError();
-  },
-  async restartService() {
-    throw new DesktopProductProviderUnavailableError();
-  },
+  createProfile: unavailable,
+  updateProfile: unavailable,
+  configureCredential: unavailable,
+  connectProfile: unavailable,
+  acceptHostKey: unavailable,
+  createProject: unavailable,
+  updateProject: unavailable,
+  activateProject: unavailable,
+  syncProjectWorkspace: unavailable,
+  selectProjectSource: unavailable,
+  startRun: unavailable,
+  cancelRun: unavailable,
+  getArtifactContent: unavailable,
+  getArtifactDiff: unavailable,
+  repairProject: unavailable,
+  restartService: unavailable,
 };

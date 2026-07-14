@@ -29,13 +29,16 @@ import {
   XCircle,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DesktopApiError } from "../api/v1/client";
 import type {
   ArtifactContentV1,
   ArtifactDiffV1,
   ArtifactV1,
   ProfileCreateV1,
+  ProjectCapabilitiesV1,
   ProjectPatchV1,
+  ProjectSourceV1,
   ProjectV1,
   RemoteProfileV1,
   RunV1,
@@ -43,8 +46,12 @@ import type {
 } from "../api/v1/schemas";
 import {
   DesktopProductProviderUnavailableError,
+  DesktopProductUserError,
   type DesktopProductProvider,
   type DesktopProductSnapshot,
+  type ProductMutationIntent,
+  type ProductResourceMutationIntent,
+  ProductRefreshOrder,
   unavailableDesktopProductProvider,
 } from "./provider";
 
@@ -69,10 +76,19 @@ export function DesktopProductApp({
   const [creatingProject, setCreatingProject] = useState(false);
   const [actionState, setActionState] = useState<AsyncState>("idle");
   const [actionError, setActionError] = useState<string | null>(null);
+  const refreshOrder = useRef(new ProductRefreshOrder());
 
   const refresh = useCallback(async () => {
+    const sequence = refreshOrder.current.begin();
     try {
-      const next = await provider.getSnapshot();
+      const result = await provider.refresh();
+      if (!refreshOrder.current.isCurrent(sequence)) return;
+      if (result.status !== "fresh") {
+        setSnapshot((current) => current ? { ...current, stream: result.stream } : current);
+        if (result.status === "error") setLoadError(userMessage(result.stream.error));
+        return;
+      }
+      const next = result.snapshot;
       setSnapshot(next);
       setLoadError(null);
       setSelectedProjectId((current) => {
@@ -82,7 +98,13 @@ export function DesktopProductApp({
         return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
       });
     } catch (error) {
-      setLoadError(userMessage(error));
+      if (refreshOrder.current.isCurrent(sequence)) {
+        setSnapshot((current) => current ? {
+          ...current,
+          stream: { status: "error", epoch: current.stream.epoch, error: error instanceof DesktopApiError ? error.apiError : null },
+        } : current);
+        setLoadError(userMessage(error));
+      }
     }
   }, [provider]);
 
@@ -93,7 +115,19 @@ export function DesktopProductApp({
       await refresh();
     };
     void load();
-    const unsubscribe = provider.subscribe(() => void load());
+    const unsubscribe = provider.subscribe((signal) => {
+      if (signal.kind === "snapshot_changed") {
+        setSnapshot((current) => current ? { ...current, stream: { status: "stale", epoch: current.stream.epoch, reason: "refresh_pending" } } : current);
+        void load();
+      } else if (signal.kind === "stream_stale") {
+        setSnapshot((current) => current ? { ...current, stream: { status: "stale", epoch: current.stream.epoch, reason: signal.reason } } : current);
+      } else if (signal.kind === "stream_error") {
+        setSnapshot((current) => current ? { ...current, stream: { status: "error", epoch: current.stream.epoch, error: signal.error } } : current);
+      } else {
+        setSnapshot((current) => current ? { ...current, stream: { status: "cursor_reset", epoch: current.stream.epoch, resumeFromEventId: null } } : current);
+        void load();
+      }
+    });
     return () => {
       active = false;
       unsubscribe();
@@ -104,18 +138,22 @@ export function DesktopProductApp({
     () => snapshot?.projects.find((item) => item.project_id === selectedProjectId) ?? snapshot?.projects[0] ?? null,
     [selectedProjectId, snapshot],
   );
-  const profile = snapshot?.profiles.find((item) => item.profile_id === project?.profile_id) ?? snapshot?.profiles[0] ?? null;
+  const profile = project
+    ? snapshot?.profiles.find((item) => item.profile_id === project.profile_id) ?? null
+    : snapshot?.profiles[0] ?? null;
   const projectRuns = snapshot?.runs.filter((run) => run.project_id === project?.project_id) ?? [];
   const activeRun = projectRuns.find((run) => !isTerminal(run.state)) ?? null;
 
-  const act = useCallback(async (action: () => Promise<unknown>) => {
+  const act = useCallback(async (action: () => Promise<unknown>): Promise<boolean> => {
     setActionState("working");
     setActionError(null);
     try {
       await action();
       await refresh();
+      return true;
     } catch (error) {
       setActionError(userMessage(error));
+      return false;
     } finally {
       setActionState("idle");
     }
@@ -139,8 +177,12 @@ export function DesktopProductApp({
   }
 
   const connection = snapshot.state.core;
-  const canStart = connection.state === "online" && project?.state === "active" && !activeRun && actionState !== "working";
-  const startReason = getStartReason(connection.state, project, activeRun, actionState);
+  const displayedConnectionState = connection.state === "online" && profile && connection.profile_id !== profile.profile_id
+    ? "disconnected"
+    : connection.state;
+  const capabilities = readyCapabilities(snapshot, project);
+  const startReason = getStartReason(snapshot, project, profile, activeRun, actionState);
+  const canStart = startReason === null;
 
   return (
     <div className="product-shell">
@@ -182,7 +224,7 @@ export function DesktopProductApp({
             <IconButton label="Create project" onClick={() => { setCreatingProject(true); setSettingsOpen(true); }}><Plus size={17} /></IconButton>
           </div>
           <div className="topbar-actions">
-            <ConnectionBadge state={connection.state} profileName={profile?.name ?? "Remote workspace"} />
+            <ConnectionBadge state={displayedConnectionState} profileName={profile?.name ?? "Remote workspace"} />
             <IconButton label="Remote workspace settings" onClick={() => setConnectionSettingsOpen(true)}><PanelLeft size={17} /></IconButton>
             <IconButton label="Project settings" onClick={() => { setCreatingProject(false); setSettingsOpen(true); }} disabled={!project}><Settings size={17} /></IconButton>
           </div>
@@ -194,13 +236,21 @@ export function DesktopProductApp({
             snapshot={snapshot}
             profile={profile}
             busy={actionState === "working"}
-            onConnect={(profileId) => void act(() => provider.connectProfile(profileId))}
+            onConnect={(selectedProfile) => void act(() => provider.connectProfile(selectedProfile.profile_id, resourceIntent(snapshot, selectedProfile.etag)))}
             onAccept={(profileId) => {
               const review = snapshot.state.core.host_key_review;
-              if (review) void act(() => provider.acceptHostKey(profileId, review));
+              if (review && profile) void act(() => provider.acceptHostKey(profileId, review, resourceIntent(snapshot, profile.etag)));
             }}
             onSetup={() => setConnectionSettingsOpen(true)}
           />
+          {project && (snapshot.state.active_project?.project_id !== project.project_id || project.state !== "active") ? (
+            <ProjectActivationGate
+              project={project}
+              busy={actionState === "working"}
+              onActivate={() => void act(() => provider.activateProject(project.project_id, resourceIntent(snapshot, project.etag)))}
+              onRepair={() => void act(() => provider.repairProject(project.project_id, resourceIntent(snapshot, project.etag)))}
+            />
+          ) : null}
 
           {workspace === "research" ? (
             <ResearchWorkspace
@@ -211,10 +261,11 @@ export function DesktopProductApp({
               canStart={canStart}
               startReason={startReason}
               busy={actionState === "working"}
-              onStart={() => project && void act(() => provider.startRun(project.project_id))}
-              onCancel={() => activeRun && void act(() => provider.cancelRun(activeRun.run_id))}
+              onStart={() => project && void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }))}
+              onCancel={() => activeRun && void act(() => provider.cancelRun(activeRun.run_id, resourceIntent(snapshot, activeRun.etag)))}
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
               onOpenEvolution={() => setWorkspace("evolution")}
+              onRefresh={() => void refresh()}
             />
           ) : null}
           {workspace === "evolution" ? (
@@ -231,9 +282,12 @@ export function DesktopProductApp({
               project={project}
               profile={profile}
               busy={actionState === "working"}
-              onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id))}
-              onRepair={() => project && void act(() => provider.repairProject(project.project_id))}
-              onRestart={(serviceId) => void act(() => provider.restartService(serviceId))}
+              onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id, resourceIntent(snapshot, profile.etag)))}
+              onRepair={() => project && void act(() => provider.repairProject(project.project_id, resourceIntent(snapshot, project.etag)))}
+              onRestart={(serviceId) => {
+                const service = snapshot.services.find((item) => item.service_id === serviceId);
+                if (service) void act(() => provider.restartService(serviceId, resourceIntent(snapshot, service.etag)));
+              }}
               onConfigure={() => setConnectionSettingsOpen(true)}
             />
           ) : null}
@@ -244,15 +298,16 @@ export function DesktopProductApp({
         <SettingsDrawer
           project={creatingProject ? null : project}
           profileId={profile?.profile_id ?? null}
-          capabilities={snapshot.capabilities}
+          capability={snapshot.capability}
+          capabilities={capabilities}
           busy={actionState === "working"}
           onClose={() => setSettingsOpen(false)}
-          onSave={async (input) => {
-            await act(async () => {
+          onSave={async (input, actionId) => {
+            const saved = await act(async () => {
               if (project && !creatingProject) {
-                await provider.updateProject(project.project_id, input);
+                await provider.updateProject(project.project_id, input, resourceIntent(snapshot, project.etag, actionId));
               } else {
-                if (!profile) throw new Error("Add a remote workspace before creating a project.");
+                if (!profile) throw new DesktopProductUserError("Add a remote workspace before creating a project.");
                 const created = await provider.createProject({
                   name: input.name ?? "Untitled research",
                   profile_id: profile.profile_id,
@@ -260,13 +315,15 @@ export function DesktopProductApp({
                   source: input.source ?? { kind: "scratch", display_name: "New workspace", source_ref: null },
                   execution: input.execution ?? selfDeployedExecution("Qwen/Qwen3-8B"),
                   evolution: input.evolution ?? { targets: {} },
-                });
-                await provider.activateProject(created.project_id);
+                }, mutationIntent(snapshot, actionId));
+                await provider.activateProject(created.project_id, resourceIntent(snapshot, created.etag, `${actionId}-activate`));
                 setSelectedProjectId(created.project_id);
               }
             });
-            setSettingsOpen(false);
+            if (saved) setSettingsOpen(false);
           }}
+          onSelectSource={() => provider.selectProjectSource({ ...mutationIntent(snapshot), kind: "native_folder_snapshot" })}
+          onSyncSource={project?.source.kind === "native_folder_snapshot" ? () => act(() => provider.syncProjectWorkspace(project.project_id, resourceIntent(snapshot, project.etag))) : undefined}
         />
       ) : null}
       {connectionSettingsOpen ? (
@@ -274,14 +331,14 @@ export function DesktopProductApp({
           profile={profile}
           busy={actionState === "working"}
           onClose={() => setConnectionSettingsOpen(false)}
-          onSave={async (input) => {
-            await act(() => profile
-              ? provider.updateProfile(profile.profile_id, input)
-              : provider.createProfile(input));
-            setConnectionSettingsOpen(false);
+          onSave={async (input, actionId) => {
+            const saved = await act(() => profile
+              ? provider.updateProfile(profile.profile_id, input, resourceIntent(snapshot, profile.etag, actionId))
+              : provider.createProfile(input, mutationIntent(snapshot, actionId)));
+            if (saved) setConnectionSettingsOpen(false);
           }}
           onConfigureCredential={(slotKind) => profile
-            ? act(() => provider.configureCredential(profile.profile_id, slotKind))
+            ? act(() => provider.configureCredential(profile.profile_id, slotKind, resourceIntent(snapshot, profile.etag))).then(() => undefined)
             : Promise.resolve()}
         />
       ) : null}
@@ -324,13 +381,13 @@ function ConnectionGate({
   snapshot: DesktopProductSnapshot;
   profile: RemoteProfileV1 | null;
   busy: boolean;
-  onConnect: (profileId: string) => void;
+  onConnect: (profile: RemoteProfileV1) => void;
   onAccept: (profileId: string) => void;
   onSetup: () => void;
 }) {
   const core = snapshot.state.core;
   const profileId = profile?.profile_id ?? null;
-  if (core.state === "online") return null;
+  if (core.state === "online" && core.profile_id === profileId) return null;
   if (core.state === "degraded") {
     return <InlineNotice tone="warning" title="Remote workspace needs attention" detail={core.failure?.message ?? "Open System to review available repairs."} />;
   }
@@ -376,11 +433,37 @@ function ConnectionGate({
     <section className="connection-gate" aria-live="polite">
       <div className="gate-icon"><PanelLeft size={21} /></div>
       <div className="gate-copy">
-        <h2>Remote workspace is offline</h2>
-        <p>{credentialReason ?? core.failure?.message ?? "Connect to run research sessions and inspect evolution."}</p>
+        <h2>{core.state === "online" ? "Switch remote workspace" : "Remote workspace is offline"}</h2>
+        <p>{credentialReason ?? (core.state === "online" ? "Connect this project's assigned workspace before activating or running it." : core.failure?.message ?? "Connect to run research sessions and inspect evolution.")}</p>
       </div>
-      <button className="primary-button" type="button" onClick={() => credentialReason ? onSetup() : profileId && onConnect(profileId)} disabled={busy} title={busy ? "A connection action is already running" : credentialReason ? "Configure the required credential" : "Connect remote workspace"}>
+      <button className="primary-button" type="button" onClick={() => credentialReason ? onSetup() : onConnect(profile)} disabled={busy} title={busy ? "A connection action is already running" : credentialReason ? "Configure the required credential" : "Connect remote workspace"}>
         {credentialReason ? <Settings size={16} /> : <ArrowRight size={16} />} {credentialReason ? "Configure" : "Connect"}
+      </button>
+    </section>
+  );
+}
+
+function ProjectActivationGate({
+  project,
+  busy,
+  onActivate,
+  onRepair,
+}: {
+  project: ProjectV1;
+  busy: boolean;
+  onActivate: () => void;
+  onRepair: () => void;
+}) {
+  const blocked = project.state === "blocked";
+  return (
+    <section className="connection-gate" aria-live="polite">
+      <div className="gate-icon"><FolderOpen size={21} /></div>
+      <div className="gate-copy">
+        <h2>{blocked ? "Project needs attention" : "Activate this project"}</h2>
+        <p>{blocked ? "Repair this project before it can use its assigned remote workspace." : "Activation binds this project to its own profile and tunnel."}</p>
+      </div>
+      <button className="primary-button" type="button" onClick={blocked ? onRepair : onActivate} disabled={busy || project.state === "archived"}>
+        {blocked ? <Wrench size={16} /> : <ArrowRight size={16} />} {blocked ? "Repair project" : "Activate project"}
       </button>
     </section>
   );
@@ -398,6 +481,7 @@ function ResearchWorkspace({
   onCancel,
   onOpenSettings,
   onOpenEvolution,
+  onRefresh,
 }: {
   project: ProjectV1 | null;
   runs: readonly RunV1[];
@@ -410,6 +494,7 @@ function ResearchWorkspace({
   onCancel: () => void;
   onOpenSettings: () => void;
   onOpenEvolution: () => void;
+  onRefresh: () => void;
 }) {
   if (!project) {
     return <EmptyState icon={FolderOpen} title="Create a research project" detail="Define a task and source to begin a session." action="Create project" onAction={onOpenSettings} />;
@@ -430,7 +515,7 @@ function ResearchWorkspace({
           </button>
         </div>
       </div>
-      {startReason && !activeRun ? <div className="disabled-reason"><AlertCircle size={14} /> {startReason}</div> : null}
+      {startReason && !activeRun ? <div className="disabled-reason"><AlertCircle size={14} /> <span>{startReason}</span>{startReason.startsWith("Refresh") ? <button type="button" className="text-button" onClick={onRefresh}><RefreshCw size={14} /> Refresh</button> : null}</div> : null}
 
       <div className="research-grid">
         <section className="product-panel task-panel">
@@ -462,7 +547,7 @@ function ResearchWorkspace({
           ) : latestCompleted ? (
             <div className="completed-summary">
               <CheckCircle2 size={25} />
-              <div><strong>Latest session complete</strong><span>{latestCompleted.successor_revision ? `Revision ${latestCompleted.successor_revision.generation} is active.` : "No successor revision was created."}</span></div>
+              <div><strong>Latest session complete</strong><span>{latestCompleted.successor_revision?.state === "active" ? `Revision ${latestCompleted.successor_revision.generation} is active.` : latestCompleted.successor_revision ? `Successor revision is ${stateLabel(latestCompleted.successor_revision.state)}.` : "No successor revision was reported."}</span></div>
               {latestCompleted.successor_revision?.state === "active" ? <button className="text-button" type="button" onClick={onOpenEvolution}>View changes <ArrowRight size={14} /></button> : null}
             </div>
           ) : (
@@ -484,7 +569,7 @@ function RevisionPin({ run }: { run: RunV1 }) {
     <div className="revision-pin">
       <div><span>Pinned context</span><strong>Revision {run.pinned_revision.generation}</strong></div>
       <ArrowRight size={16} />
-      <div><span>Next revision</span><strong>{run.successor_revision ? `Revision ${run.successor_revision.generation}` : "Pending"}</strong></div>
+      <div><span>Successor revision</span><strong>{run.successor_revision ? `Revision ${run.successor_revision.generation}` : "Not reported"}</strong></div>
       {run.successor_revision ? <StatePill state={run.successor_revision.state} /> : null}
     </div>
   );
@@ -553,24 +638,22 @@ function EvolutionWorkspace({ project, runs, artifacts, provider }: { project: P
 
   if (!project) return <EmptyState icon={Sparkles} title="No evolution history" detail="Choose a project to inspect revisions and artifacts." />;
   const selected = artifacts.find((artifact) => artifact.artifact_id === selectedArtifactId) ?? artifacts[0] ?? null;
-  const activeGeneration = currentGeneration(project, runs);
-  const previousGeneration = Math.max(0, activeGeneration - 1);
+  const activeRevision = authoritativeActiveRevision(project, runs);
+  const activeGeneration = activeRevision?.generation ?? null;
   return (
     <div className="workspace-stack" data-testid="evolution-workspace">
       <div className="workspace-heading">
         <div><p className="eyebrow">Evolution</p><h1>Cross-session changes</h1><p>Review what changed and which revision the next session will use.</p></div>
       </div>
       <section className="revision-strip">
-        <div className="revision-node previous"><span>Previous</span><strong>Revision {previousGeneration}</strong></div>
-        <div className="revision-line"><ArrowRight size={17} /></div>
-        <div className="revision-node active"><span>Active</span><strong>Revision {activeGeneration}</strong><small>Used by the next session</small></div>
+        {activeRevision ? <div className="revision-node active"><span>Active</span><strong>Revision {activeRevision.generation}</strong><small>Used by the next session</small></div> : <div className="revision-node"><span>Active revision</span><strong>Unavailable</strong><small>Waiting for an authoritative revision reference</small></div>}
       </section>
       {artifacts.length === 0 ? (
         <EmptyState icon={MemoryStick} title="No evolved artifacts yet" detail="Complete a session to create memory, skills, and agent guidance for the next revision." />
       ) : (
         <div className="artifact-layout">
           <aside className="artifact-list" aria-label="Evolution artifacts">
-            <div className="artifact-list-heading"><span>Revision {activeGeneration}</span><strong>{orderedArtifacts.filter((item) => revisionGeneration(item, runs) === activeGeneration).length || orderedArtifacts.length} changes</strong></div>
+            <div className="artifact-list-heading"><span>{activeGeneration === null ? "Revision unavailable" : `Revision ${activeGeneration}`}</span><strong>{activeGeneration === null ? orderedArtifacts.length : orderedArtifacts.filter((item) => revisionGeneration(item, runs) === activeGeneration).length} changes</strong></div>
             {orderedArtifacts.map((artifact) => (
               <button key={artifact.artifact_id} type="button" className={`artifact-list-item ${artifact.artifact_id === selected?.artifact_id ? "active" : ""}`} onClick={() => setSelectedArtifactId(artifact.artifact_id)}>
                 <span className={`artifact-icon ${artifact.artifact_type}`}>{artifactIcon(artifact.artifact_type)}</span>
@@ -584,7 +667,7 @@ function EvolutionWorkspace({ project, runs, artifacts, provider }: { project: P
               <>
                 <div className="artifact-viewer-head">
                   <div><span className="panel-kicker">{artifactTypeLabel(selected.artifact_type)}</span><h2>{selected.display_name}</h2><p>{selected.summary}</p></div>
-                  <div className="artifact-meta"><span>Revision {revisionGeneration(selected, runs)}</span>{selected.scores[0] ? <span>Quality {Math.round(selected.scores[0].value * 100)}%</span> : null}</div>
+                  <div className="artifact-meta"><span>{revisionGeneration(selected, runs) === null ? "Revision unavailable" : `Revision ${revisionGeneration(selected, runs)}`}</span>{selected.scores[0] ? <span>Quality {Math.round(selected.scores[0].value * 100)}%</span> : null}</div>
                 </div>
                 <div className="segmented-control" aria-label="Artifact view">
                   <button type="button" className={view === "content" ? "active" : ""} onClick={() => setView("content")}><FileText size={14} /> Content</button>
@@ -698,9 +781,10 @@ function RemoteWorkspaceDrawer({
   profile: RemoteProfileV1 | null;
   busy: boolean;
   onClose: () => void;
-  onSave: (input: ProfileCreateV1) => Promise<void>;
+  onSave: (input: ProfileCreateV1, actionId: string) => Promise<void>;
   onConfigureCredential: (slotKind: RemoteProfileV1["credential_slots"][number]["kind"]) => Promise<unknown>;
 }) {
+  const dialogRef = useDialogFocus(onClose);
   const [name, setName] = useState(profile?.name ?? "Research server");
   const [host, setHost] = useState(profile?.host ?? "");
   const [port, setPort] = useState(String(profile?.port ?? 22));
@@ -710,13 +794,15 @@ function RemoteWorkspaceDrawer({
   const [httpsProxy, setHttpsProxy] = useState(profile?.proxy.https_url ?? "");
   const [noProxy, setNoProxy] = useState(profile?.proxy.no_proxy.join(", ") ?? "");
   const [dirty, setDirty] = useState(false);
+  const saveActionId = useRef(newActionId());
   const parsedPort = Number(port);
   const valid = name.trim() !== "" && host.trim() !== "" && user.trim() !== "" && Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65_535;
-  const update = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement>) => { setter(event.target.value); setDirty(true); };
+  const markDirty = () => { saveActionId.current = newActionId(); setDirty(true); };
+  const update = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement>) => { setter(event.target.value); markDirty(); };
   const visibleSlots = credentialSlotsForAuth(profile, authenticationKind);
   return (
     <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <aside className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="workspace-settings-title">
+      <aside ref={dialogRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="workspace-settings-title" tabIndex={-1}>
         <div className="drawer-head"><div><span className="panel-kicker">Remote workspace</span><h2 id="workspace-settings-title">Server connection</h2></div><IconButton label="Close connection settings" onClick={onClose}><X size={18} /></IconButton></div>
         <div className="drawer-content">
           <section className="form-section">
@@ -727,7 +813,7 @@ function RemoteWorkspaceDrawer({
           </section>
           <section className="form-section">
             <h3>Authentication</h3>
-            <label>Method<select value={authenticationKind} onChange={(event) => { setAuthenticationKind(event.target.value as RemoteProfileV1["authentication_kind"]); setDirty(true); }}><option value="ssh_agent">System agent</option><option value="native_private_key">Private key</option><option value="native_password">Password</option></select></label>
+            <label>Method<select value={authenticationKind} onChange={(event) => { setAuthenticationKind(event.target.value as RemoteProfileV1["authentication_kind"]); markDirty(); }}><option value="ssh_agent">System agent</option><option value="native_private_key">Private key</option><option value="native_password">Password</option></select></label>
             <p className="form-help">Secrets are stored by macOS and are never shown in the app.</p>
             {visibleSlots.length ? <div className="credential-list">{visibleSlots.map((slot) => <div className="credential-row" key={slot.kind}><CredentialStatus slot={slot} /><button type="button" className="secondary-button" disabled={!profile || busy} title={!profile ? "Save this workspace before configuring credentials" : `Configure ${credentialLabel(slot.kind)}`} onClick={() => void onConfigureCredential(slot.kind)}>{slot.status === "stored" ? "Replace" : "Configure"}</button></div>)}</div> : <div className="agent-note"><ShieldCheck size={17} /><span>The system agent will provide authentication.</span></div>}
           </section>
@@ -749,7 +835,7 @@ function RemoteWorkspaceDrawer({
             https_url: httpsProxy.trim() || null,
             no_proxy: noProxy.split(",").map((value) => value.trim()).filter(Boolean),
           },
-        })}><Save size={15} /> {busy ? "Saving..." : "Save workspace"}</button></div>
+        }, saveActionId.current)}><Save size={15} /> {busy ? "Saving..." : "Save workspace"}</button></div>
       </aside>
     </div>
   );
@@ -759,50 +845,121 @@ function CredentialStatus({ slot }: { slot: RemoteProfileV1["credential_slots"][
   return <div className={`credential-status ${slot.status}`}>{slot.status === "stored" ? <CheckCircle2 size={16} /> : slot.status === "unavailable" ? <AlertCircle size={16} /> : <CircleDot size={16} />}<span><strong>{credentialLabel(slot.kind)}</strong><small>{slot.status === "stored" ? "Stored securely" : slot.status === "unavailable" ? "Unavailable" : "Not configured"}</small></span></div>;
 }
 
-function SettingsDrawer({ project, profileId, capabilities, busy, onClose, onSave }: { project: ProjectV1 | null; profileId: string | null; capabilities: DesktopProductSnapshot["capabilities"]; busy: boolean; onClose: () => void; onSave: (input: ProjectPatchV1) => Promise<void> }) {
+function SettingsDrawer({
+  project,
+  profileId,
+  capability,
+  capabilities,
+  busy,
+  onClose,
+  onSave,
+  onSelectSource,
+  onSyncSource,
+}: {
+  project: ProjectV1 | null;
+  profileId: string | null;
+  capability: DesktopProductSnapshot["capability"];
+  capabilities: ProjectCapabilitiesV1 | null;
+  busy: boolean;
+  onClose: () => void;
+  onSave: (input: ProjectPatchV1, actionId: string) => Promise<void>;
+  onSelectSource: () => Promise<ProjectSourceV1>;
+  onSyncSource?: () => Promise<boolean>;
+}) {
+  const dialogRef = useDialogFocus(onClose);
   const [name, setName] = useState(project?.name ?? "New research project");
   const [title, setTitle] = useState(project?.task.title ?? "Research task");
   const [objective, setObjective] = useState(project?.task.objective ?? "");
-  const [sourceName, setSourceName] = useState(project?.source.display_name ?? "New workspace");
+  const [source, setSource] = useState<ProjectSourceV1>(project?.source ?? { kind: "scratch", display_name: "New workspace", source_ref: null });
+  const [sourceError, setSourceError] = useState<string | null>(null);
   const [mode, setMode] = useState(project?.execution.mode ?? "self-deployed");
   const [hfModel, setHfModel] = useState(project?.execution.hf_model ?? "Qwen/Qwen3-8B");
   const [codexModel, setCodexModel] = useState(project?.execution.codex_model ?? "Codex");
   const [evolution, setEvolution] = useState<ProductEvolutionTargets>(project?.evolution.targets ?? defaultEvolution(capabilities));
   const [dirty, setDirty] = useState(false);
+  const saveActionId = useRef(newActionId());
   const activeModel = mode === "self-deployed" ? hfModel : codexModel;
+  const modeCapabilities = capabilities?.execution_mode === mode ? capabilities : null;
   const valid = name.trim().length > 0 && title.trim().length > 0 && objective.trim().length > 0 && activeModel.trim().length > 0 && profileId !== null;
-  const change = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => { setter(event.target.value); setDirty(true); };
+  const markDirty = () => { saveActionId.current = newActionId(); setDirty(true); };
+  const change = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => { setter(event.target.value); markDirty(); };
   const reset = () => {
     setName(project?.name ?? "New research project");
     setTitle(project?.task.title ?? "Research task");
     setObjective(project?.task.objective ?? "");
-    setSourceName(project?.source.display_name ?? "New workspace");
+    setSource(project?.source ?? { kind: "scratch", display_name: "New workspace", source_ref: null });
     setMode(project?.execution.mode ?? "self-deployed");
     setHfModel(project?.execution.hf_model ?? "Qwen/Qwen3-8B");
     setCodexModel(project?.execution.codex_model ?? "Codex");
     setEvolution(project?.evolution.targets ?? defaultEvolution(capabilities));
     setDirty(false);
+    setSourceError(null);
   };
+  const rows = evolutionTargetRows(modeCapabilities, evolution);
   return (
     <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <aside className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <aside ref={dialogRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabIndex={-1}>
         <div className="drawer-head"><div><span className="panel-kicker">{project ? "Project settings" : "New project"}</span><h2 id="settings-title">Research configuration</h2></div><IconButton label="Close settings" onClick={onClose}><X size={18} /></IconButton></div>
         <div className="drawer-content">
-          <section className="form-section"><h3>Project</h3><label>Project name<input value={name} onChange={change(setName)} /></label><label>Task title<input value={title} onChange={change(setTitle)} /></label><label>Objective<textarea rows={5} value={objective} onChange={change(setObjective)} /></label><label>Source name<input value={sourceName} onChange={change(setSourceName)} /></label></section>
-          <section className="form-section"><h3>Model mode</h3><div className="segmented-control wide" aria-label="Model mode"><button type="button" className={mode === "self-deployed" ? "active" : ""} onClick={() => { setMode("self-deployed"); setDirty(true); }}>Managed model</button><button type="button" className={mode === "codex_subscription_transcript" ? "active" : ""} onClick={() => { setMode("codex_subscription_transcript"); setDirty(true); }}>Subscription</button></div>{mode === "self-deployed" ? <label>Hugging Face model<input value={hfModel} onChange={change(setHfModel)} placeholder="organization/model" /></label> : <label>Codex model<input value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>}<p className="form-help">Sessions use transcript capture. Token-level metrics are unavailable in this mode.</p></section>
-          <section className="form-section"><h3>Evolution targets</h3><div className="target-list">{Object.entries(evolution).map(([targetId, target]) => {
-            const capability = capabilities?.targets.find((item) => item.target_id === targetId);
-            const canEnable = target.method !== null || capability?.effective_default_method_id != null;
-            return <label className="target-toggle" key={targetId}><input type="checkbox" role="switch" checked={target.enabled} disabled={!canEnable} onChange={(event) => { const enabled = event.target.checked; setEvolution((current) => ({ ...current, [targetId]: { ...target, enabled, method: target.method ?? capability?.effective_default_method_id ?? null, config: target.method ? target.config : capability?.methods.find((method) => method.method_id === capability.effective_default_method_id)?.default_config ?? target.config } })); setDirty(true); }} /><span className="switch-track"><span /></span><span><strong>{capability?.display_name ?? artifactTypeLabel(targetId)}</strong><small>{capability?.description ?? (canEnable ? "Available for future sessions." : "Not available for this model mode.")}</small></span></label>;
-          })}</div></section>
+          <section className="form-section">
+            <h3>Project</h3>
+            <label>Project name<input value={name} onChange={change(setName)} /></label>
+            <label>Task title<input value={title} onChange={change(setTitle)} /></label>
+            <label>Objective<textarea rows={5} value={objective} onChange={change(setObjective)} /></label>
+          </section>
+          <section className="form-section">
+            <h3>Research source</h3>
+            <div className="segmented-control wide" aria-label="Research source">
+              <button type="button" className={source.kind === "scratch" ? "active" : ""} onClick={() => { setSource({ kind: "scratch", display_name: "New workspace", source_ref: null }); setSourceError(null); markDirty(); }}>Scratch</button>
+              <button type="button" className={source.kind === "native_folder_snapshot" ? "active" : ""} onClick={async () => {
+                setSourceError(null);
+                try { setSource(await onSelectSource()); markDirty(); } catch (error) { setSourceError(userMessage(error)); }
+              }}>Folder snapshot</button>
+            </div>
+            <div className="source-summary"><FolderOpen size={17} /><span><strong>{source.display_name}</strong><small>{source.kind === "scratch" ? "A new managed workspace will be created." : "A native snapshot reference is ready."}</small></span></div>
+            {sourceError ? <p className="form-error" role="alert">{sourceError}</p> : null}
+            {source.kind === "native_folder_snapshot" && onSyncSource ? <button type="button" className="secondary-button" disabled={busy} onClick={() => void onSyncSource()}><RefreshCw size={15} /> Sync snapshot</button> : null}
+          </section>
+          <section className="form-section">
+            <h3>Model mode</h3>
+            <div className="segmented-control wide" aria-label="Model mode"><button type="button" className={mode === "self-deployed" ? "active" : ""} onClick={() => { setMode("self-deployed"); markDirty(); }}>Managed model</button><button type="button" className={mode === "codex_subscription_transcript" ? "active" : ""} onClick={() => { setMode("codex_subscription_transcript"); markDirty(); }}>Subscription</button></div>
+            {mode === "self-deployed" ? <label>Hugging Face model<input value={hfModel} onChange={change(setHfModel)} placeholder="organization/model" /></label> : <label>Codex model<input value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>}
+            <p className="form-help">Sessions use transcript capture. Token-level metrics are unavailable in this mode.</p>
+          </section>
+          <section className="form-section">
+            <h3>Evolution targets</h3>
+            {!modeCapabilities ? <p className="form-help" role="status">{capability?.status === "loading" ? "Capabilities are loading for this project and mode." : "Capabilities are unavailable for this project and mode."}</p> : null}
+            <div className="target-list">{rows.map((row) => (
+              <div className={`target-toggle ${row.valid ? "" : "invalid"}`} key={row.targetId}>
+                <label>
+                  <input type="checkbox" role="switch" checked={row.selection.enabled} disabled={!row.selection.enabled && !row.canEnable} onChange={(event) => {
+                    const enabled = event.currentTarget.checked;
+                    setEvolution((current) => ({ ...current, [row.targetId]: enabled ? enableTarget(row) : { ...row.selection, enabled: false } }));
+                    markDirty();
+                  }} />
+                  <span className="switch-track"><span /></span>
+                  <span><strong>{row.displayName}</strong><small>{row.description}</small></span>
+                </label>
+                <select aria-label={`${row.displayName} method`} value={row.selection.method ?? ""} disabled={!row.capability || !row.selection.enabled} onChange={(event) => {
+                  const selected = row.choices.find((choice) => choice.id === event.currentTarget.value);
+                  if (!selected?.selectable) return;
+                  setEvolution((current) => ({ ...current, [row.targetId]: { enabled: row.selection.enabled, method: selected.id, config: selected.defaultConfig } }));
+                  markDirty();
+                }}>
+                  {row.choices.map((choice) => <option key={`${choice.kind}-${choice.id}`} value={choice.id ?? ""} disabled={!choice.selectable}>{choice.label}{choice.supported ? "" : " (unavailable)"}</option>)}
+                </select>
+                {!row.valid && row.selection.enabled ? <small className="target-error">{row.reason}</small> : null}
+              </div>
+            ))}</div>
+          </section>
         </div>
         <div className="drawer-footer"><button className="secondary-button" type="button" onClick={reset} disabled={!dirty || busy} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" disabled={!valid || busy || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : !valid ? "Complete all required fields" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => void onSave({
           name: name.trim(),
           task: { title: title.trim(), objective: objective.trim(), task_ref: project?.task.task_ref ?? null },
-          source: { kind: project?.source.kind ?? "scratch", display_name: sourceName.trim() || "New workspace", source_ref: project?.source.source_ref ?? null },
+          source,
           execution: mode === "self-deployed" ? selfDeployedExecution(activeModel.trim()) : subscriptionExecution(activeModel.trim()),
           evolution: { targets: evolution },
-        })}><Save size={15} /> {busy ? "Saving..." : "Save"}</button></div>
+        }, saveActionId.current)}><Save size={15} /> {busy ? "Saving..." : "Save"}</button></div>
       </aside>
     </div>
   );
@@ -834,7 +991,96 @@ function artifactIcon(type: string) {
   return <TerminalSquare size={17} />;
 }
 
-function defaultEvolution(capabilities: DesktopProductSnapshot["capabilities"]): ProductEvolutionTargets {
+interface EvolutionChoiceRow {
+  readonly id: string | null;
+  readonly label: string;
+  readonly kind: "method" | "resolver" | "accepted" | "missing";
+  readonly supported: boolean;
+  readonly selectable: boolean;
+  readonly defaultConfig: ProjectV1["evolution"]["targets"][string]["config"];
+}
+
+interface EvolutionTargetConfigRow {
+  readonly targetId: string;
+  readonly displayName: string;
+  readonly description: string;
+  readonly capability: ProjectCapabilitiesV1["targets"][number] | null;
+  readonly selection: ProductEvolutionTargets[string];
+  readonly choices: readonly EvolutionChoiceRow[];
+  readonly valid: boolean;
+  readonly canEnable: boolean;
+  readonly reason: string;
+}
+
+function evolutionTargetRows(
+  capabilities: ProjectCapabilitiesV1 | null,
+  selections: ProductEvolutionTargets,
+): EvolutionTargetConfigRow[] {
+  const remoteIds = capabilities?.targets.map((target) => target.target_id) ?? [];
+  const targetIds = [...remoteIds, ...Object.keys(selections).filter((targetId) => !remoteIds.includes(targetId))];
+  return targetIds.map((targetId) => {
+    const capability = capabilities?.targets.find((target) => target.target_id === targetId) ?? null;
+    const selection = selections[targetId] ?? { enabled: false, method: null, config: {} };
+    const visibleChoices: EvolutionChoiceRow[] = capability?.methods.map((method) => ({
+      id: method.method_id,
+      label: method.display_name,
+      kind: "method",
+      supported: method.support.overall === "supported",
+      selectable: method.support.overall === "supported",
+      defaultConfig: method.default_config,
+    })) ?? [];
+    const resolverChoices: EvolutionChoiceRow[] = capability?.selection_resolvers.map((resolver) => {
+      const supported = resolver.resolved_methods.length > 0 && resolver.resolved_methods.every((method) => method.support.overall === "supported");
+      return { id: resolver.selection_value, label: resolver.display_name, kind: "resolver", supported, selectable: supported, defaultConfig: {} };
+    }) ?? [];
+    const choices = [...visibleChoices, ...resolverChoices];
+    const selected = choices.find((choice) => choice.id === selection.method);
+    if (!selected && selection.method !== null) {
+      const accepted = capability?.accepted_methods.find((method) => method.method_id === selection.method);
+      choices.unshift({
+        id: selection.method,
+        label: accepted ? `${selection.method} (existing selection)` : `${selection.method} (no longer available)`,
+        kind: accepted ? "accepted" : "missing",
+        supported: accepted?.support.overall === "supported",
+        selectable: false,
+        defaultConfig: selection.config,
+      });
+    }
+    if (selection.method === null) {
+      choices.unshift({ id: null, label: "No method selected", kind: "missing", supported: false, selectable: false, defaultConfig: {} });
+    }
+    const selectedChoice = choices.find((choice) => choice.id === selection.method);
+    const defaultChoice = choices.find((choice) => choice.id === capability?.effective_default_method_id && choice.kind === "method" && choice.supported);
+    const valid = !selection.enabled || Boolean(selectedChoice?.supported);
+    return {
+      targetId,
+      displayName: capability?.display_name ?? artifactTypeLabel(targetId),
+      description: capability?.description ?? "This saved target is absent from current remote capabilities.",
+      capability,
+      selection,
+      choices,
+      valid,
+      canEnable: Boolean((selectedChoice?.supported && selection.method) || defaultChoice),
+      reason: capability
+        ? selection.method === null
+          ? "Choose a supported method before running."
+          : selectedChoice?.supported
+            ? ""
+            : "The saved method is unsupported for this project and mode. Disable the target or choose a supported method."
+        : "This target is unavailable in the remote registry. Disable it before running.",
+    };
+  });
+}
+
+function enableTarget(row: EvolutionTargetConfigRow): ProductEvolutionTargets[string] {
+  const selected = row.choices.find((choice) => choice.id === row.selection.method);
+  if (selected?.supported && row.selection.method !== null) return { ...row.selection, enabled: true };
+  const defaultChoice = row.choices.find((choice) => choice.id === row.capability?.effective_default_method_id && choice.kind === "method" && choice.supported);
+  if (!defaultChoice?.id) return row.selection;
+  return { enabled: true, method: defaultChoice.id, config: structuredClone(defaultChoice.defaultConfig) };
+}
+
+function defaultEvolution(capabilities: ProjectCapabilitiesV1 | null): ProductEvolutionTargets {
   return Object.fromEntries((capabilities?.targets ?? []).filter((target) => target.release_enabled).map((target) => [target.target_id, {
     enabled: true,
     method: target.effective_default_method_id,
@@ -873,25 +1119,40 @@ function latestArtifactsByTarget(artifacts: readonly ArtifactV1[]): ArtifactV1[]
   return latest.sort((left, right) => (order.get(left.artifact_type) ?? 99) - (order.get(right.artifact_type) ?? 99));
 }
 
-function currentGeneration(project: ProjectV1, runs: readonly RunV1[]): number {
-  const revision = runs.flatMap((run) => [run.pinned_revision, ...(run.successor_revision ? [run.successor_revision] : [])]).find((item) => item.revision_id === project.current_revision_id);
-  return revision?.generation ?? 1;
+function currentGeneration(project: ProjectV1, runs: readonly RunV1[]): number | null {
+  return authoritativeActiveRevision(project, runs)?.generation ?? null;
 }
 
-function revisionGeneration(artifact: ArtifactV1, runs: readonly RunV1[]): number {
+function authoritativeActiveRevision(project: ProjectV1, runs: readonly RunV1[]) {
+  if (project.current_revision_id === null) return null;
+  const revision = runs.flatMap((run) => [run.pinned_revision, ...(run.successor_revision ? [run.successor_revision] : [])]).find((item) => item.revision_id === project.current_revision_id);
+  return revision?.state === "active" ? revision : null;
+}
+
+function revisionGeneration(artifact: ArtifactV1, runs: readonly RunV1[]): number | null {
   const revisionId = artifact.revision_ids[0];
-  return runs.flatMap((run) => [run.pinned_revision, ...(run.successor_revision ? [run.successor_revision] : [])]).find((item) => item.revision_id === revisionId)?.generation ?? 1;
+  return runs.flatMap((run) => [run.pinned_revision, ...(run.successor_revision ? [run.successor_revision] : [])]).find((item) => item.revision_id === revisionId)?.generation ?? null;
 }
 
 function revisionLabel(project: ProjectV1 | null, runs: readonly RunV1[]): string {
   if (!project) return "Not available";
-  return `Revision ${currentGeneration(project, runs)}`;
+  const generation = currentGeneration(project, runs);
+  return generation === null ? "Revision unavailable" : `Revision ${generation}`;
 }
 
-function getStartReason(connection: DesktopProductSnapshot["state"]["core"]["state"], project: ProjectV1 | null, activeRun: RunV1 | null, actionState: AsyncState): string | null {
+function getStartReason(snapshot: DesktopProductSnapshot, project: ProjectV1 | null, profile: RemoteProfileV1 | null, activeRun: RunV1 | null, actionState: AsyncState): string | null {
   if (!project) return "Create or select a project first.";
-  if (connection !== "online") return "Connect the remote workspace before starting a session.";
+  if (snapshot.stream.status !== "fresh") return "Refresh this view before starting a session.";
+  if (!profile || snapshot.state.core.state !== "online" || !snapshot.state.core.active_tunnel || snapshot.state.core.profile_id !== profile.profile_id) return "Connect this project's remote workspace before starting a session.";
+  const active = snapshot.state.active_project;
+  if (!active || active.project_id !== project.project_id || active.profile_id !== project.profile_id || active.project_etag !== project.etag || active.connection_state !== "ready") return "Activate this project on its assigned remote workspace before starting a session.";
   if (project.state !== "active") return "Activate this project before starting a session.";
+  const capability = snapshot.capability;
+  if (!capability || capability.status !== "ready" || capability.projectId !== project.project_id || capability.executionMode !== project.execution.mode || capability.value.project_id !== project.project_id || capability.value.execution_mode !== project.execution.mode) return "Remote capabilities are unavailable for this project and mode.";
+  const invalidTarget = evolutionTargetRows(capability.value, project.evolution.targets).find((row) => row.selection.enabled && !row.valid);
+  if (invalidTarget) return invalidTarget.reason;
+  const validation = snapshot.validation;
+  if (!validation || validation.status !== "ready" || validation.projectId !== project.project_id || validation.executionMode !== project.execution.mode || validation.projectEtag !== project.etag || validation.value.project_id !== project.project_id || validation.value.project_etag !== project.etag || validation.value.capability_registry_digest !== capability.value.registry_digest || !validation.value.valid) return "Project validation is not current for this project and mode.";
   if (activeRun) return "Wait for the active session to finish or cancel it.";
   if (actionState === "working") return "Wait for the current action to finish.";
   return null;
@@ -941,8 +1202,65 @@ function isTerminal(state: RunV1["state"]): boolean {
 
 function userMessage(error: unknown): string {
   if (error instanceof DesktopProductProviderUnavailableError) return "The local Desktop service is not ready. Restart OpenEvo Desktop and try again.";
-  if (error instanceof Error && error.message) return error.message;
+  if (error instanceof DesktopApiError) return error.apiError.message;
+  if (error instanceof DesktopProductUserError) return error.userMessage;
   return "The request could not be completed.";
+}
+
+function readyCapabilities(snapshot: DesktopProductSnapshot, project: ProjectV1 | null): ProjectCapabilitiesV1 | null {
+  const state = snapshot.capability;
+  if (!project || !state || state.status !== "ready") return null;
+  return state.projectId === project.project_id && state.executionMode === project.execution.mode ? state.value : null;
+}
+
+let actionSequence = 0;
+function newActionId(): string {
+  actionSequence += 1;
+  return `renderer-action-${Date.now().toString(36)}-${actionSequence.toString(36)}`;
+}
+
+function mutationIntent(snapshot: DesktopProductSnapshot, actionId = newActionId()): ProductMutationIntent {
+  if (snapshot.stream.status !== "fresh") throw new DesktopProductUserError("Refresh this view before trying again.");
+  return { actionId, streamEpoch: snapshot.stream.epoch };
+}
+
+function resourceIntent(snapshot: DesktopProductSnapshot, etag: string, actionId = newActionId()): ProductResourceMutationIntent {
+  return { ...mutationIntent(snapshot, actionId), etag };
+}
+
+function useDialogFocus(onClose: () => void) {
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => {
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    const focusable = dialog?.querySelector<HTMLElement>("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex='0']");
+    (focusable ?? dialog)?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current();
+      } else if (event.key === "Tab" && dialog) {
+        const items = Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex='0']"));
+        const first = items[0];
+        const last = items.at(-1);
+        if (event.shiftKey && document.activeElement === first && last) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last && first) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      previous?.focus();
+    };
+  }, []);
+  return dialogRef;
 }
 
 function missingCredentialReason(profile: RemoteProfileV1): string | null {

@@ -7,6 +7,8 @@ import {
   diagnosticReportV1Schema,
   localOperationV1Schema,
   projectCapabilitiesV1Schema,
+  projectSourceV1Schema,
+  projectValidationV1Schema,
   projectV1Schema,
   remoteProfileV1Schema,
   runV1Schema,
@@ -24,13 +26,25 @@ import {
   type ProjectCapabilitiesV1,
   type ProjectCreateV1,
   type ProjectPatchV1,
+  type ProjectSourceV1,
+  type ProjectValidationV1,
   type ProjectV1,
   type RemoteProfileV1,
   type RunV1,
   type ServiceV1,
   type TimelineEntryV1,
 } from "../api/v1/schemas";
-import type { DesktopProductProvider, DesktopProductSnapshot } from "./provider";
+import {
+  DesktopProductUserError,
+  type DesktopProductProvider,
+  type DesktopProductSnapshot,
+  type ProductMutationIntent,
+  type ProductRefreshResult,
+  type ProductResourceMutationIntent,
+  type ProductRunIntent,
+  type ProductSubscriptionSignal,
+  type ProjectSourceSelectionIntent,
+} from "./provider";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -51,7 +65,7 @@ export interface FixtureProviderOptions {
 
 export class FixtureDesktopProductProvider implements DesktopProductProvider {
   readonly providerKind = "contract_simulator" as const;
-  private readonly listeners = new Set<() => void>();
+  private readonly listeners = new Set<(signal: ProductSubscriptionSignal) => void>();
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
   private readonly stepDelayMs: number;
   private readonly artifactTruncated: boolean;
@@ -63,6 +77,12 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private artifacts: ArtifactV1[] = [];
   private services: ServiceV1[];
   private capabilities: ProjectCapabilitiesV1 | null;
+  private validation: ProjectValidationV1 | null;
+  private stream: DesktopProductSnapshot["stream"] = { status: "fresh", epoch: 1, lastEventId: null };
+  private readonly actionSignatures = new Map<string, string>();
+  private failProjectSave = false;
+  private failProjectSaveWithUnknownError = false;
+  private failRefresh = false;
   private diagnostic: DiagnosticReportV1 | null;
   private activeOperation: LocalOperationV1 | null = null;
   private readonly contents = new Map<string, ArtifactContentV1>();
@@ -82,6 +102,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.capabilities = online
       ? this.makeCapabilities(this.projects[0]?.project_id ?? "project-fixture-1")
       : null;
+    this.validation = this.capabilities && this.projects[0]
+      ? this.makeValidation(this.projects[0], this.capabilities)
+      : null;
     this.services = newUser ? [] : this.makeServices(online, options.degraded ?? false);
     this.diagnostic = online ? this.makeDiagnostic(options.degraded ?? false) : null;
 
@@ -90,7 +113,34 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     }
   }
 
-  async getSnapshot(): Promise<DesktopProductSnapshot> {
+  async refresh(): Promise<ProductRefreshResult> {
+    if (this.failRefresh) {
+      this.failRefresh = false;
+      throw new Error("internal refresh details");
+    }
+    if (this.stream.status !== "fresh") {
+      this.stream = { status: "fresh", epoch: this.stream.epoch + 1, lastEventId: null };
+    }
+    return { status: "fresh", snapshot: this.snapshot() };
+  }
+
+  private snapshot(): DesktopProductSnapshot {
+    const contextProject = this.state.active_project
+      ? this.projects.find((item) => item.project_id === this.state.active_project?.project_id) ?? null
+      : this.projects[0] ?? null;
+    const capability = this.capabilities
+      ? { status: "ready" as const, projectId: this.capabilities.project_id, executionMode: this.capabilities.execution_mode, value: this.capabilities }
+      : contextProject
+        ? { status: "unavailable" as const, projectId: contextProject.project_id, executionMode: contextProject.execution.mode, error: null }
+        : null;
+    const project = this.capabilities
+      ? this.projects.find((item) => item.project_id === this.capabilities?.project_id)
+      : null;
+    const validation = this.validation && project
+      ? { status: "ready" as const, projectId: project.project_id, executionMode: project.execution.mode, projectEtag: project.etag, value: this.validation }
+      : contextProject
+        ? { status: "unavailable" as const, projectId: contextProject.project_id, executionMode: contextProject.execution.mode, projectEtag: contextProject.etag, error: null }
+        : null;
     return structuredClone({
       state: this.state,
       profiles: this.profiles,
@@ -99,18 +149,21 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       timelines: this.timelines,
       artifacts: this.artifacts,
       services: this.services,
-      capabilities: this.capabilities,
+      capability,
+      validation,
       diagnostic: this.diagnostic,
       activeOperation: this.activeOperation,
+      stream: this.stream,
     });
   }
 
-  subscribe(listener: () => void): () => void {
+  subscribe(listener: (signal: ProductSubscriptionSignal) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
-  async createProfile(input: ProfileCreateV1): Promise<RemoteProfileV1> {
+  async createProfile(input: ProfileCreateV1, intent: ProductMutationIntent): Promise<RemoteProfileV1> {
+    this.checkIntent(intent, "profile:create");
     const credentialKinds = credentialKindsForProfile(input.authentication_kind ?? "ssh_agent", input.proxy);
     const profile = remoteProfileV1Schema.parse({
       schema_version: "1",
@@ -140,8 +193,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(profile);
   }
 
-  async updateProfile(profileId: string, input: ProfilePatchV1): Promise<RemoteProfileV1> {
+  async updateProfile(profileId: string, input: ProfilePatchV1, intent: ProductResourceMutationIntent): Promise<RemoteProfileV1> {
     const current = this.requireProfile(profileId);
+    this.checkIntent(intent, `profile:update:${profileId}`, current.etag);
     const authenticationKind = input.authentication_kind ?? current.authentication_kind;
     const proxy = input.proxy ?? current.proxy;
     const requiredKinds = credentialKindsForProfile(authenticationKind, proxy);
@@ -165,8 +219,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   async configureCredential(
     profileId: string,
     slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
+    intent: ProductResourceMutationIntent,
   ): Promise<RemoteProfileV1> {
     const current = this.requireProfile(profileId);
+    this.checkIntent(intent, `profile:credential:${profileId}:${slotKind}`, current.etag);
     const slot = current.credential_slots.find((item) => item.kind === slotKind);
     if (!slot) throw new Error("This credential is not used by the selected authentication method.");
     const updated = remoteProfileV1Schema.parse({
@@ -180,8 +236,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(updated);
   }
 
-  async connectProfile(profileId: string): Promise<LocalOperationV1> {
+  async connectProfile(profileId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
     const profile = this.requireProfile(profileId);
+    this.checkIntent(intent, `profile:connect:${profileId}`, profile.etag);
     const requiredCredential = credentialKindsForAuth(profile.authentication_kind)[0];
     if (requiredCredential && profile.credential_slots.find((slot) => slot.kind === requiredCredential)?.status !== "stored") {
       throw new Error("Configure the required credential before connecting.");
@@ -201,8 +258,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(this.activeOperation);
   }
 
-  async acceptHostKey(profileId: string, input: HostKeyAcceptV1): Promise<LocalOperationV1> {
-    this.requireProfile(profileId);
+  async acceptHostKey(profileId: string, input: HostKeyAcceptV1, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
+    const profile = this.requireProfile(profileId);
+    this.checkIntent(intent, `profile:host-key:${profileId}`, profile.etag);
     const review = this.state.core.host_key_review;
     if (!review || review.algorithm !== input.algorithm || review.fingerprint !== input.fingerprint) {
       throw new Error("The server identity changed before it was accepted.");
@@ -221,6 +279,8 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       this.updateProfileConnection(profileId, "connected");
       this.projects = this.projects.map((project) => ({ ...project, state: "active" }));
       this.capabilities = this.makeCapabilities(this.projects[0]?.project_id ?? "project-fixture-1");
+      const activeProject = this.projects[0];
+      this.validation = activeProject ? this.makeValidation(activeProject, this.capabilities) : null;
       this.services = this.makeServices(true, false);
       this.diagnostic = this.makeDiagnostic(false);
       this.emit();
@@ -228,12 +288,13 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(this.activeOperation);
   }
 
-  async createProject(input: ProjectCreateV1): Promise<ProjectV1> {
+  async createProject(input: ProjectCreateV1, intent: ProductMutationIntent): Promise<ProjectV1> {
+    this.checkIntent(intent, "project:create");
     const project = projectV1Schema.parse({
       schema_version: "1",
       project_id: `project-fixture-${this.projects.length + 1}`,
       ...input,
-      state: this.state.core.state === "online" ? "active" : "draft",
+      state: "draft",
       current_revision_id: "revision-fixture-1",
       etag: ETAG_D,
       created_at: NOW,
@@ -243,26 +304,46 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.capabilities = this.state.core.state === "online"
       ? this.makeCapabilities(project.project_id)
       : null;
+    this.validation = this.capabilities ? this.makeValidation(project, this.capabilities) : null;
     this.emit();
     return structuredClone(project);
   }
 
-  async updateProject(projectId: string, input: ProjectPatchV1): Promise<ProjectV1> {
+  async updateProject(projectId: string, input: ProjectPatchV1, intent: ProductResourceMutationIntent): Promise<ProjectV1> {
     const current = this.requireProject(projectId);
+    this.checkIntent(intent, `project:update:${projectId}`, current.etag);
+    if (this.failProjectSave) {
+      this.failProjectSave = false;
+      throw new DesktopProductUserError("The project could not be saved. Try again.");
+    }
+    if (this.failProjectSaveWithUnknownError) {
+      this.failProjectSaveWithUnknownError = false;
+      throw new Error("internal host path and process details");
+    }
     const updated = projectV1Schema.parse({ ...current, ...input, etag: ETAG_D, updated_at: NOW });
     this.projects = this.projects.map((project) => (project.project_id === projectId ? updated : project));
+    this.capabilities = this.state.core.state === "online" ? this.makeCapabilities(projectId, updated.execution.mode) : null;
+    this.validation = this.capabilities ? this.makeValidation(updated, this.capabilities) : null;
+    if (this.state.active_project?.project_id === projectId) {
+      this.state = desktopStateV1Schema.parse({ ...this.state, active_project: { ...this.state.active_project, project_etag: updated.etag } });
+    }
     this.emit();
     return structuredClone(updated);
   }
 
-  async activateProject(projectId: string): Promise<LocalOperationV1> {
+  async activateProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
     const project = this.requireProject(projectId);
+    this.checkIntent(intent, `project:activate:${projectId}`, project.etag);
+    const activated = projectV1Schema.parse({ ...project, state: "active", updated_at: NOW });
+    this.projects = this.projects.map((item) => item.project_id === projectId ? activated : item);
+    this.capabilities = this.state.core.state === "online" ? this.makeCapabilities(projectId, activated.execution.mode) : null;
+    this.validation = this.capabilities ? this.makeValidation(activated, this.capabilities) : null;
     this.activeOperation = this.makeOperation("project_activate", "succeeded", "Project ready", 1, 1, project.project_id);
     this.state = desktopStateV1Schema.parse({
       ...this.state,
       active_project: {
         project_id: project.project_id,
-        project_etag: project.etag,
+        project_etag: activated.etag,
         profile_id: project.profile_id,
         connection_state: this.state.core.state === "online" ? "ready" : "offline",
       },
@@ -271,8 +352,27 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(this.activeOperation);
   }
 
-  async startRun(projectId: string): Promise<RunV1> {
+  async syncProjectWorkspace(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
     const project = this.requireProject(projectId);
+    this.checkIntent(intent, `project:workspace-sync:${projectId}`, project.etag);
+    this.activeOperation = this.makeOperation("workspace_sync", "succeeded", "Workspace ready", 1, 1, projectId);
+    this.emit();
+    return structuredClone(this.activeOperation);
+  }
+
+  async selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1> {
+    this.checkIntent(intent, "project:source-select");
+    return projectSourceV1Schema.parse({
+      kind: "native_folder_snapshot",
+      display_name: "Selected research folder",
+      source_ref: { content_id: "source-fixture-1", sha256: C, byte_size: 4096 },
+    });
+  }
+
+  async startRun(intent: ProductRunIntent): Promise<RunV1> {
+    const projectId = intent.projectId;
+    const project = this.requireProject(projectId);
+    this.checkIntent(intent, `run:start:${projectId}`, project.etag);
     if (this.state.core.state !== "online") {
       throw new Error("Reconnect the remote workspace before starting a session.");
     }
@@ -332,8 +432,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(run);
   }
 
-  async cancelRun(runId: string): Promise<RunV1> {
+  async cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1> {
     const run = this.requireRun(runId);
+    this.checkIntent(intent, `run:cancel:${runId}`, run.etag);
     if (isTerminal(run.state)) return structuredClone(run);
     const cancelled = runV1Schema.parse({
       ...run,
@@ -362,8 +463,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(value);
   }
 
-  async repairProject(projectId: string): Promise<LocalOperationV1> {
-    this.requireProject(projectId);
+  async repairProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
+    const project = this.requireProject(projectId);
+    this.checkIntent(intent, `project:repair:${projectId}`, project.etag);
     this.activeOperation = this.makeOperation("project_repair", "running", "Applying repair", 1, 2, projectId);
     this.emit();
     this.schedule(1, () => {
@@ -376,9 +478,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(this.activeOperation);
   }
 
-  async restartService(serviceId: string): Promise<LocalOperationV1> {
+  async restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
     const service = this.services.find((item) => item.service_id === serviceId);
     if (!service || !service.restart_supported) throw new Error("This service cannot be restarted here.");
+    this.checkIntent(intent, `service:restart:${serviceId}`, service.etag);
     this.services = this.services.map((item) =>
       item.service_id === serviceId ? serviceV1Schema.parse({ ...item, state: "starting", health_summary: "Restarting." }) : item,
     );
@@ -627,7 +730,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     });
   }
 
-  private makeCapabilities(projectId: string): ProjectCapabilitiesV1 {
+  private makeCapabilities(
+    projectId: string,
+    executionMode: ProjectV1["execution"]["mode"] = "self-deployed",
+  ): ProjectCapabilitiesV1 {
     const base = structuredClone(CONTRACT_FIXTURE_V1.capabilities.targets[0]);
     const target = (
       targetId: "text_memory" | "skill_bundle" | "agent_system",
@@ -650,11 +756,24 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return projectCapabilitiesV1Schema.parse({
       ...structuredClone(CONTRACT_FIXTURE_V1.capabilities),
       project_id: projectId,
+      execution_mode: executionMode,
       targets: [
         target("text_memory", "Text memory", "Preserve durable findings across sessions."),
         target("skill_bundle", "Skills", "Build reusable research workflows."),
         target("agent_system", "Agent guidance", "Improve instructions for future sessions."),
       ],
+    });
+  }
+
+  private makeValidation(project: ProjectV1, capabilities: ProjectCapabilitiesV1): ProjectValidationV1 {
+    return projectValidationV1Schema.parse({
+      schema_version: "1",
+      project_id: project.project_id,
+      project_etag: project.etag,
+      capability_registry_digest: capabilities.registry_digest,
+      valid: true,
+      issues: [],
+      validated_at: NOW,
     });
   }
 
@@ -848,7 +967,131 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   private emit(): void {
-    for (const listener of this.listeners) listener();
+    for (const listener of this.listeners) listener({ kind: "snapshot_changed" });
+  }
+
+  private checkIntent(
+    intent: ProductMutationIntent | ProductResourceMutationIntent,
+    signature: string,
+    expectedEtag?: string,
+  ): void {
+    if (this.stream.status !== "fresh" || intent.streamEpoch !== this.stream.epoch) {
+      throw new DesktopProductUserError("This view is out of date. Refresh before trying again.");
+    }
+    if (expectedEtag !== undefined && (!("etag" in intent) || intent.etag !== expectedEtag)) {
+      throw new DesktopProductUserError("This item changed remotely. Refresh before trying again.");
+    }
+    const previous = this.actionSignatures.get(intent.actionId);
+    if (previous !== undefined && previous !== signature) {
+      throw new DesktopProductUserError("This action identity was already used for a different request.");
+    }
+    this.actionSignatures.set(intent.actionId, signature);
+  }
+
+  markStreamStale(): void {
+    this.stream = { status: "stale", epoch: this.stream.epoch, reason: "event_gap" };
+    for (const listener of this.listeners) listener({ kind: "stream_stale", reason: "event_gap" });
+  }
+
+  resetEventCursor(): void {
+    this.stream = { status: "cursor_reset", epoch: this.stream.epoch, resumeFromEventId: null };
+    for (const listener of this.listeners) listener({ kind: "cursor_reset", resumeFromEventId: null });
+  }
+
+  failNextProjectSave(): void {
+    this.failProjectSave = true;
+  }
+
+  failNextProjectSaveWithUnknownError(): void {
+    this.failProjectSaveWithUnknownError = true;
+  }
+
+  failNextRefresh(): void {
+    this.failRefresh = true;
+  }
+
+  addDraftProject(): ProjectV1 {
+    const base = this.makeProjectFixture();
+    const project = projectV1Schema.parse({
+      ...base,
+      project_id: "project-fixture-2",
+      name: "Second research project",
+      task: { ...base.task, title: "Second research task" },
+      state: "draft",
+      current_revision_id: null,
+      etag: ETAG_A,
+    });
+    this.projects = [...this.projects, project];
+    this.emit();
+    return structuredClone(project);
+  }
+
+  useUnsupportedSavedMethod(): void {
+    const project = this.projects[0];
+    if (!project) return;
+    const updated = projectV1Schema.parse({
+      ...project,
+      evolution: {
+        targets: {
+          ...project.evolution.targets,
+          text_memory: { enabled: true, method: "removed_text_memory", config: { retained: true } },
+        },
+      },
+    });
+    this.projects = [updated, ...this.projects.slice(1)];
+    this.validation = this.capabilities ? this.makeValidation(updated, this.capabilities) : null;
+    this.emit();
+  }
+
+  useAcceptedSavedMethod(): void {
+    const project = this.projects[0];
+    const capabilities = this.capabilities;
+    const target = capabilities?.targets.find((item) => item.target_id === "text_memory");
+    const accepted = target?.accepted_methods[0];
+    if (!project || !capabilities || !target || !accepted) return;
+    this.capabilities = projectCapabilitiesV1Schema.parse({
+      ...capabilities,
+      targets: capabilities.targets.map((item) => item.target_id === target.target_id
+        ? { ...item, accepted_methods: [...item.accepted_methods, { ...accepted, method_id: "hidden_text_memory" }] }
+        : item),
+    });
+    const updated = projectV1Schema.parse({
+      ...project,
+      evolution: { targets: { ...project.evolution.targets, text_memory: { enabled: true, method: "hidden_text_memory", config: { retained: true } } } },
+    });
+    this.projects = [updated, ...this.projects.slice(1)];
+    this.validation = this.makeValidation(updated, this.capabilities);
+    this.emit();
+  }
+
+  useResolverSavedMethod(): void {
+    const project = this.projects[0];
+    const capabilities = this.capabilities;
+    const target = capabilities?.targets.find((item) => item.target_id === "text_memory");
+    const resolved = target?.accepted_methods[0];
+    if (!project || !capabilities || !target || !resolved) return;
+    this.capabilities = projectCapabilitiesV1Schema.parse({
+      ...capabilities,
+      targets: capabilities.targets.map((item) => item.target_id === target.target_id
+        ? { ...item, selection_resolvers: [{ selection_value: "auto", display_name: "Automatic", description: "Core selects from accepted methods.", resolved_methods: [resolved] }] }
+        : item),
+    });
+    const updated = projectV1Schema.parse({
+      ...project,
+      evolution: { targets: { ...project.evolution.targets, text_memory: { enabled: true, method: "auto", config: {} } } },
+    });
+    this.projects = [updated, ...this.projects.slice(1)];
+    this.validation = this.makeValidation(updated, this.capabilities);
+    this.emit();
+  }
+
+  clearEvolutionSelections(): void {
+    const project = this.projects[0];
+    if (!project) return;
+    const updated = projectV1Schema.parse({ ...project, evolution: { targets: {} } });
+    this.projects = [updated, ...this.projects.slice(1)];
+    this.validation = this.capabilities ? this.makeValidation(updated, this.capabilities) : null;
+    this.emit();
   }
 }
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 from io import BytesIO
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -30,7 +32,30 @@ def _write_core_wheel(path: Path, *, name: str = "openevo", version: str = "0.1.
 
 
 def _write_repo_skeleton(repo: Path) -> None:
-    (repo / "desktop/packaging/web").mkdir(parents=True)
+    _write_product_web(repo / "desktop/dist")
+    _write_product_web(repo / "desktop/packaging/web")
+    (repo / "desktop/packaging/product-web-policy.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "forbidden_text": [
+                    "dashboard",
+                    "benchmark",
+                    "developer mode",
+                    "developer_mode",
+                    "dry-run",
+                    "dry_run",
+                    "stdout",
+                    "stderr",
+                    "host path",
+                    "host_path",
+                    "host-path",
+                    "command",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     (repo / "desktop/packaging/sidecar_entry.py").write_text("", encoding="utf-8")
     (repo / "README.md").write_text("# OpenEvo\n", encoding="utf-8")
     (repo / "LICENSE").write_text("test license\n", encoding="utf-8")
@@ -38,6 +63,34 @@ def _write_repo_skeleton(repo: Path) -> None:
     (repo / "src/openevo/__init__.py").write_text("", encoding="utf-8")
     (repo / "pyproject.toml").write_text(
         '[project]\nname = "openevo"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+
+
+def _write_product_web(root: Path, *, javascript: str = "product workspace") -> None:
+    files = {
+        "assets/app.js": javascript.encode(),
+        "index.html": b'<main id="root"></main>',
+    }
+    for name, payload in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    entries = [
+        {
+            "path": name,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "byte_size": len(payload),
+        }
+        for name, payload in sorted(files.items())
+    ]
+    build_digest = hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode()).hexdigest()
+    (root / ".openevo-product-web.json").write_text(
+        json.dumps(
+            {"schema_version": "1", "build_digest": build_digest, "files": entries},
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -107,6 +160,75 @@ def test_validate_core_wheel_allows_unrelated_similar_module_name(
     builder._validate_core_wheel(wheel, name="openevo", version="0.1.0")
 
 
+def test_product_web_build_requires_exact_audited_dist_and_packaged_assets(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+
+    digest = builder._validate_product_web_build(repo / "desktop")
+    assert len(digest) == 64
+
+    (repo / "desktop/packaging/web/assets/app.js").write_text(
+        "stale product workspace", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="manifest digest differs|does not exactly match"):
+        builder._validate_product_web_build(repo / "desktop")
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "dashboard",
+        "benchmark",
+        "developer mode",
+        "developer_mode",
+        "dry-run",
+        "stdout",
+        "stderr",
+        "host path",
+        "host_path",
+        "host-path",
+        "command",
+    ],
+)
+def test_product_web_build_rejects_forbidden_static_text(
+    tmp_path: Path,
+    forbidden: str,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    _write_product_web(repo / "desktop/dist", javascript=f"product {forbidden} text")
+    _write_product_web(repo / "desktop/packaging/web", javascript=f"product {forbidden} text")
+
+    with pytest.raises(RuntimeError, match="forbidden product text"):
+        builder._validate_product_web_build(repo / "desktop")
+
+
+def test_sidecar_archive_product_web_matches_audited_build_and_rejects_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    executable = repo / "sidecar"
+    executable.write_bytes(b"sidecar")
+    digest = builder._validate_product_web_build(repo / "desktop")
+    source = builder._product_web_files(repo / "desktop/packaging/web")
+    payloads = {f"desktop/packaging/web/{name}": value for name, value in source.items()}
+    monkeypatch.setattr(builder, "_archive_member_names", lambda _: tuple(payloads))
+    monkeypatch.setattr(builder, "_archive_member_bytes", lambda _, name: payloads[name])
+
+    builder._validate_embedded_product_web(executable, repo / "desktop", digest)
+
+    payloads["desktop/packaging/web/assets/app.js"] = b"tampered"
+    with pytest.raises(RuntimeError, match="differs from the audited build"):
+        builder._validate_embedded_product_web(executable, repo / "desktop", digest)
+
+
 @pytest.mark.parametrize("clean", [False, True])
 def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     tmp_path: Path,
@@ -133,7 +255,11 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     def fake_run(command, *, check, cwd, **kwargs):
         nonlocal embedded_bytes, embedded_wheel
         assert check is True
-        if command[2] == "build":
+        if command[:3] == ["npm", "run", "build:openevo"]:
+            assert not kwargs
+            assert Path(cwd) == repo / "desktop"
+            commands.append("product-web")
+        elif command[2] == "build":
             assert not kwargs
             commands.append("build")
             source = Path(cwd)
@@ -186,12 +312,26 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     monkeypatch.setattr(
         builder,
         "_archive_member_names",
-        lambda _: ("openevo/wheels/openevo-0.1.0-py3-none-any.whl",),
+        lambda _: (
+            "openevo/wheels/openevo-0.1.0-py3-none-any.whl",
+            *(
+                f"desktop/packaging/web/{path.relative_to(repo / 'desktop/packaging/web').as_posix()}"
+                for path in sorted((repo / "desktop/packaging/web").rglob("*"))
+                if path.is_file()
+            ),
+        ),
     )
+    web_payloads = {
+        f"desktop/packaging/web/{path.relative_to(repo / 'desktop/packaging/web').as_posix()}": path.read_bytes()
+        for path in (repo / "desktop/packaging/web").rglob("*")
+        if path.is_file()
+    }
     monkeypatch.setattr(
         builder,
         "_archive_member_bytes",
-        lambda *_: embedded_bytes,
+        lambda _, member: (
+            embedded_bytes if member.startswith("openevo/wheels/") else web_payloads[member]
+        ),
     )
 
     wheel_output = repo / ".openevo-remote-wheel"
@@ -201,7 +341,7 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         core_wheel_output_dir=wheel_output,
     )
 
-    assert commands == ["build", "PyInstaller"]
+    assert commands == ["build", "product-web", "PyInstaller"]
     assert target == (repo / "desktop/src-tauri/binaries" / "openevo-desktop-sidecar-test-target")
     assert target.read_bytes() == b"packaged-sidecar"
     assert target.stat().st_mode & 0o777 == 0o755

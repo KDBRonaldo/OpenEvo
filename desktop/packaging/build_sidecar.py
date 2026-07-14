@@ -8,6 +8,7 @@ from email.parser import Parser
 import hashlib
 from io import BytesIO
 from importlib.metadata import version as distribution_version
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -33,6 +34,7 @@ FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
 FORBIDDEN_LEGACY_SIDECAR_MODULES = frozenset(
     path.removesuffix(".py").replace("/", ".") for path in FORBIDDEN_LEGACY_CORE_MODULE_FILES
 )
+PRODUCT_WEB_MANIFEST = ".openevo-product-web.json"
 
 
 def _validate_core_inventory(names: set[str], *, container: str) -> None:
@@ -50,6 +52,121 @@ def _validate_core_inventory(names: set[str], *, container: str) -> None:
         raise RuntimeError(
             f"{container} must not contain removed Terminal Bench Core modules: {legacy_modules}"
         )
+
+
+def _product_web_files(root: Path) -> dict[str, bytes]:
+    if not root.is_dir():
+        raise RuntimeError(f"Desktop product web root is missing: {root}")
+    files: dict[str, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise RuntimeError(f"Desktop product web must not contain symlinks: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise RuntimeError(f"Desktop product web contains a non-regular entry: {path}")
+        files[path.relative_to(root).as_posix()] = path.read_bytes()
+    return files
+
+
+def _product_web_forbidden_text(desktop_root: Path) -> tuple[str, ...]:
+    policy_path = desktop_root / "packaging/product-web-policy.json"
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Desktop product web audit policy is unreadable") from exc
+    forbidden = policy.get("forbidden_text") if isinstance(policy, dict) else None
+    if (
+        not isinstance(policy, dict)
+        or policy.get("schema_version") != "1"
+        or not isinstance(forbidden, list)
+        or not forbidden
+    ):
+        raise RuntimeError("Desktop product web audit policy is invalid")
+    if not all(isinstance(value, str) and value for value in forbidden):
+        raise RuntimeError("Desktop product web audit policy contains invalid text")
+    return tuple(value.lower() for value in forbidden)
+
+
+def _audit_product_web_bytes(
+    files: dict[str, bytes],
+    *,
+    forbidden: tuple[str, ...],
+    container: str,
+) -> None:
+    if "index.html" not in files:
+        raise RuntimeError(f"{container} is missing index.html")
+    for name, payload in files.items():
+        if Path(name).suffix.lower() not in {".css", ".html", ".js", ".json", ".map", ".txt"}:
+            continue
+        try:
+            text = payload.decode("utf-8").lower()
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"{container} contains non-UTF-8 static text: {name}") from exc
+        for value in forbidden:
+            if value in text:
+                raise RuntimeError(
+                    f"{container} contains forbidden product text in {name}: {value}"
+                )
+
+
+def _validate_product_web_manifest(files: dict[str, bytes], *, container: str) -> str:
+    try:
+        manifest = json.loads(files[PRODUCT_WEB_MANIFEST].decode("utf-8"))
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{container} has no readable product build manifest") from exc
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema_version",
+        "build_digest",
+        "files",
+    }:
+        raise RuntimeError(f"{container} product build manifest is not closed")
+    entries = manifest.get("files")
+    if manifest.get("schema_version") != "1" or not isinstance(entries, list):
+        raise RuntimeError(f"{container} product build manifest is invalid")
+    expected_names = sorted(name for name in files if name != PRODUCT_WEB_MANIFEST)
+    if [
+        entry.get("path") if isinstance(entry, dict) else None for entry in entries
+    ] != expected_names:
+        raise RuntimeError(f"{container} product build manifest inventory differs from its files")
+    canonical_entries: list[dict[str, object]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "byte_size"}:
+            raise RuntimeError(f"{container} product build manifest entry is invalid")
+        name = entry["path"]
+        if not isinstance(name, str) or name not in files:
+            raise RuntimeError(f"{container} product build manifest path is invalid")
+        payload = files[name]
+        expected = {"path": name, "sha256": _sha256_bytes(payload), "byte_size": len(payload)}
+        if entry != expected:
+            raise RuntimeError(f"{container} product build manifest digest differs for {name}")
+        canonical_entries.append(expected)
+    build_digest = _sha256_bytes(
+        json.dumps(canonical_entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    if manifest.get("build_digest") != build_digest:
+        raise RuntimeError(f"{container} product build digest is invalid")
+    return build_digest
+
+
+def _validate_product_web_build(desktop_root: Path) -> str:
+    dist_files = _product_web_files(desktop_root / "dist")
+    packaged_files = _product_web_files(desktop_root / "packaging/web")
+    forbidden = _product_web_forbidden_text(desktop_root)
+    _audit_product_web_bytes(dist_files, forbidden=forbidden, container="Desktop dist")
+    _audit_product_web_bytes(packaged_files, forbidden=forbidden, container="Desktop packaged web")
+    dist_digest = _validate_product_web_manifest(dist_files, container="Desktop dist")
+    packaged_digest = _validate_product_web_manifest(
+        packaged_files, container="Desktop packaged web"
+    )
+    if dist_files != packaged_files or dist_digest != packaged_digest:
+        raise RuntimeError("Desktop packaged web does not exactly match the audited product build")
+    return dist_digest
+
+
+def _build_product_web(desktop_root: Path) -> str:
+    subprocess.run(["npm", "run", "build:openevo"], check=True, cwd=desktop_root)
+    return _validate_product_web_build(desktop_root)
 
 
 NATIVE_EXECUTABLE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"
@@ -481,6 +598,44 @@ def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
     return source_digest
 
 
+def _validate_embedded_product_web(
+    executable: Path,
+    desktop_root: Path,
+    expected_build_digest: str,
+) -> None:
+    static_root = desktop_root / "packaging/web"
+    source_files = _product_web_files(static_root)
+    archive_root = "desktop/packaging/web"
+    expected_members = {
+        f"{archive_root}/{name}": payload for name, payload in source_files.items()
+    }
+    archive_members = {
+        name for name in _archive_member_names(executable) if name.startswith(f"{archive_root}/")
+    }
+    if archive_members != set(expected_members):
+        raise RuntimeError("Desktop sidecar product web inventory differs from the audited build")
+    embedded_files: dict[str, bytes] = {}
+    for member, expected_payload in expected_members.items():
+        payload = _archive_member_bytes(executable, member)
+        if payload != expected_payload:
+            raise RuntimeError(
+                f"Desktop sidecar product web differs from the audited build: {member}"
+            )
+        embedded_files[member.removeprefix(f"{archive_root}/")] = payload
+    forbidden = _product_web_forbidden_text(desktop_root)
+    _audit_product_web_bytes(
+        embedded_files,
+        forbidden=forbidden,
+        container="Desktop sidecar product web",
+    )
+    embedded_digest = _validate_product_web_manifest(
+        embedded_files,
+        container="Desktop sidecar product web",
+    )
+    if embedded_digest != expected_build_digest:
+        raise RuntimeError("Desktop sidecar product web build digest differs from dist")
+
+
 def build_sidecar(
     *,
     clean: bool,
@@ -515,6 +670,7 @@ def build_sidecar(
     with TemporaryDirectory(prefix="openevo-sidecar-build-") as temporary_dir:
         temporary_root = Path(temporary_dir)
         core_wheel = _build_core_wheel(repo, temporary_root / "core")
+        product_web_digest = _build_product_web(desktop_root)
         pyinstaller_root = _prepare_fd_bound_pyinstaller(
             repo,
             temporary_root / "pyinstaller",
@@ -579,6 +735,7 @@ def build_sidecar(
             raise RuntimeError(f"PyInstaller did not produce expected sidecar: {built}")
         _validate_fd_bound_bootloader(built)
         _validate_embedded_core_wheel(built, core_wheel)
+        _validate_embedded_product_web(built, desktop_root, product_web_digest)
 
         if core_wheel_output_dir is not None:
             _copy_exclusive(core_wheel, core_wheel_output_dir / core_wheel.name)

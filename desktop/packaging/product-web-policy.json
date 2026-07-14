@@ -1,0 +1,18 @@
+{
+  "schema_version": "1",
+  "forbidden_text": [
+    "OpenEvo Observability",
+    "dashboard",
+    "benchmark",
+    "developer mode",
+    "developer_mode",
+    "dry-run",
+    "dry_run",
+    "stdout",
+    "stderr",
+    "host path",
+    "host_path",
+    "host-path",
+    "command"
+  ]
+}

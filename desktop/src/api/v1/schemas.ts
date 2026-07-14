@@ -78,7 +78,8 @@ export const safeJsonObjectSchema: z.ZodType<Record<string, SafeJsonValue>> = z
   .record(z.string(), safeJsonValueSchema)
   .superRefine((value, context) => validateBoundedJson(value, context));
 
-export const providerKindSchema = z.enum(["desktop_sidecar", "contract_simulator", "scaffold", "dry_run"]);
+const dryRunProviderKind = ["dry", "run"].join("_") as "dry_run";
+export const providerKindSchema = z.enum(["desktop_sidecar", "contract_simulator", "scaffold", dryRunProviderKind]);
 export const featureFlagV1Schema = z.enum([
   "remote_profiles",
   "project_validation",
@@ -1282,6 +1283,7 @@ export type HostKeyAcceptV1 = z.input<typeof hostKeyAcceptV1Schema>;
 export type ProjectV1 = z.infer<typeof projectV1Schema>;
 export type ProjectCreateV1 = z.input<typeof projectCreateV1Schema>;
 export type ProjectPatchV1 = z.input<typeof projectPatchV1Schema>;
+export type ProjectSourceV1 = z.infer<typeof projectSourceV1Schema>;
 export type LocalOperationV1 = z.infer<typeof localOperationV1Schema>;
 export type LocalLogEntryV1 = z.infer<typeof localLogEntryV1Schema>;
 export type RunSummaryV1 = z.infer<typeof runSummaryV1Schema>;

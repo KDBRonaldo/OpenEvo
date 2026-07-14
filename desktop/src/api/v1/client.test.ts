@@ -154,6 +154,21 @@ describe("Desktop Local API v1 client", () => {
     });
   });
 
+  it.each([409, 412] as const)("normalizes HTTP %s conflict responses as typed API errors", async (status) => {
+    const payload = {
+      ...CONTRACT_FIXTURE_V1.error,
+      code: status === 412 ? "etag_precondition_failed" : "idempotency_key_reused",
+      http_status: status,
+    };
+    const client = fixtureClient(vi.fn<FetchLike>().mockResolvedValue(jsonResponse(payload, status)));
+
+    await expect(client.state()).rejects.toMatchObject({
+      name: "DesktopApiError",
+      status,
+      apiError: { code: payload.code },
+    });
+  });
+
   it("rejects error envelopes whose status does not match the HTTP response", async () => {
     const fetchMock = vi.fn<FetchLike>().mockResolvedValue(
       jsonResponse({ ...CONTRACT_FIXTURE_V1.error, http_status: 400 }, 409),

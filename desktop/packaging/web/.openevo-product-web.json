@@ -1,0 +1,21 @@
+{
+  "schema_version": "1",
+  "build_digest": "5062bbf179f2726a18dc8dc24e58cca17c7d2639e7b7c749d5d632d0cd89b88f",
+  "files": [
+    {
+      "path": "assets/index-Dd07vNEm.js",
+      "sha256": "9ada45180585e847a94c7296e48695400ac6278dd43324d93d275e8393421ccf",
+      "byte_size": 378042
+    },
+    {
+      "path": "assets/index-PQXO0Xy0.css",
+      "sha256": "5a23f4f8b1681c7f6a22f52f1513254f3c2225ab927c3f8376d245319f5dddbf",
+      "byte_size": 45398
+    },
+    {
+      "path": "index.html",
+      "sha256": "93305b7328fd7a2294c9ed68004d8f9d9b56005ec58f2832388242faa71a599e",
+      "byte_size": 435
+    }
+  ]
+}
