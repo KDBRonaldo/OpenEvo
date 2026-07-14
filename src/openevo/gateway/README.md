@@ -130,10 +130,16 @@ construction until after that proof. In both cases, only after absence proof
 does Core perform the final capture scan and permit result delivery.
 Evaluator and post-run execution are enclosed by teardown `finally` blocks, so
 `CancelledError` and other `BaseException` exits still drain evaluator prewarm
-and stop both evaluator and main runtimes. A requested cancellation remains the
+and stop both evaluator and main runtimes. The standard and subscription paths
+share this drain/stop primitive. Standard-path primary and cleanup base errors
+are preserved together; an unproven stop retains durable cleanup ownership for
+retry. A requested cancellation remains the
 published terminal outcome even when evaluation already produced a completed
 result. The current cancel/result finalization authority is journaled before
-runtime stop so a later interruption preserves the same outcome on recovery.
+`runtime.cancel()` or runtime stop, so a later interruption preserves the same
+outcome on recovery. A failed cancel-authority fsync performs no runtime side
+effect and returns a typed fail-closed error. Durable cancel authority is
+monotonic across concurrent completed-result transitions.
 Core pins
 the full absolute chain of an unmounted, node-scoped Core log authority. Step
 stdout/stderr is first written there through a held root descriptor into a
@@ -172,7 +178,10 @@ copy-on-write: a durable pending marker, candidate fsync, atomic replace, and
 directory fsync complete before the new phase or proof enters live memory.
 The previous record, pending marker, candidate, destination, rollback candidate,
 unlink, replace, and directory fsync operations are all relative to the same
-no-follow root descriptor acquired before the transition. A concurrent root
+no-follow root descriptor acquired before the transition and are serialized by
+a bounded cross-process `flock` on an owner-only `0600`, link-count-one inode in
+that root. Lock owner/mode/link/device/inode and root binding are verified before
+successful return; exceptional exits always close the lock FD. A concurrent root
 rename or replacement therefore cannot receive journal bytes; pathname binding
 failure retains the displaced authority and its pending recovery marker.
 Replace/fsync failures roll back the old authority and retain the pending marker,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from openevo.harness.capture import canonicalize_capture_mode
 from openevo.harness.models import AgentRunResult, AgentSpec
 from openevo.runtime.base import BaseRuntime
 from openevo.runtime.models import ExecInput
@@ -23,6 +24,7 @@ class BaseHarness(ABC):
         self.agent_spec = agent_spec
         self.model_name = agent_spec.model_name
         self.settings = agent_spec.settings
+        canonicalize_capture_mode(self.settings)
         self.env = agent_spec.env
         self.mcp_servers = agent_spec.mcp_servers
         self.skills_path = agent_spec.skills_path

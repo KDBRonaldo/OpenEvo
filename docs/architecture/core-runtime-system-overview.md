@@ -210,14 +210,19 @@ reconciliation 继续。private v6 cleanup journal 除 runtime/container/session
 identities 和 exact staged auth identity 外，还保存显式 recovery phase、闭集且已脱敏的
 request/agent terminal/optional result/pending status/timer finalization authority，以及 canonical
 result digest 和单调的 export/callback success proof；agent terminal state 必须先 fsync 该
-authority 再落入 live memory，不保存 auth bytes。Required evolution export 还绑定 normalized
+authority 再落入 live memory，不保存 auth bytes。cancel authority 同样必须在
+`runtime.cancel()`/stop 之前 durable commit；提交失败不产生 runtime side effect，并返回 typed
+fail-closed error。已提交 cancel 对并发 completed result transition 单调生效，recovery 也不能降级。
+Required evolution export 还绑定 normalized
 backend URL、finite positive timeout、fail-open policy 及其 canonical identity digest。
 Journal transition 使用 durable pending marker、candidate fsync、atomic replace 和 directory
 fsync；全部成功后才 copy-on-write 发布 live phase/proof。replace/fsync 失败会回滚旧 journal 并
 保留 pending marker，restart 因而不能把不确定 terminal transition 当成删除 completion/root 的
 授权，live pending status/error 也保持不变，exact retry 成功后才清 marker。
 previous record、pending、candidate、final、rollback、unlink、replace 和 directory fsync 全部
-相对 transition 开始时同一个 no-follow held journal-root FD 执行；过程中 root pathname 被
+相对 transition 开始时同一个 no-follow held journal-root FD 执行，并由该 root 内 owner-only、
+`0600`、link-count-one inode 上的有界跨进程 `flock` 串行化。成功返回前重新验证 lock
+owner/mode/link/device/inode 与 root binding，异常路径关闭 lock FD；过程中 root pathname 被
 rename/replacement 时，不得向 replacement 写入 journal bytes，并保留 displaced authority 与
 pending recovery marker 后 fail closed。
 journal 的 private parent 另有 immutable root marker，绑定 normalized absolute path、从 `/`

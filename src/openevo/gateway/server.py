@@ -19,7 +19,7 @@ from openevo.config import GatewayNodeConfig, TopologyConfig
 from openevo.gateway.completion_writer import CompletionWriter
 from openevo.gateway.detection import APIType, detect, extract_model
 from openevo.gateway.engine import get_engine
-from openevo.gateway.node import GatewayNodeManager
+from openevo.gateway.node import CancelAuthorityPersistenceError, GatewayNodeManager
 from openevo.gateway.proxy import (
     InferenceClient,
     UpstreamError,
@@ -673,7 +673,16 @@ async def delete_session(session_id: str):
     if safe_session_id is None:
         raise HTTPException(status_code=400, detail="Session ID cannot be empty")
 
-    await state.node_manager.cancel(safe_session_id)
+    try:
+        await state.node_manager.cancel(safe_session_id)
+    except CancelAuthorityPersistenceError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "type": "cancel_authority_persistence_failed",
+                "message": str(exc),
+            },
+        ) from exc
     info = state.session_registry.get(safe_session_id)
     deleted_count = state.storage.delete_session(safe_session_id)
     if info is None and deleted_count == 0:

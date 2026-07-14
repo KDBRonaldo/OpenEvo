@@ -153,13 +153,17 @@ def test_subscription_agents_must_set_capture_mode_explicitly() -> None:
         ExperimentConfig.model_validate(payload)
 
 
-@pytest.mark.parametrize("capture_mode", ["agent_transcript", "pure_text"])
-def test_subscription_agents_normalize_transcript_capture_aliases(capture_mode: str) -> None:
+@pytest.mark.parametrize("auth", ["proxy", "subscription"])
+@pytest.mark.parametrize("capture_mode", ["transcript", "agent_transcript", "pure_text"])
+def test_agents_normalize_transcript_capture_aliases(
+    auth: str,
+    capture_mode: str,
+) -> None:
     payload = _minimal_payload()
     payload["agent"] = {
         "preset": "codex",
         "model": "gpt-5.1-codex-mini",
-        "auth": "subscription",
+        "auth": auth,
         "settings": {"capture_mode": capture_mode},
     }
     payload["runtime"] = {

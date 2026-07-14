@@ -180,7 +180,11 @@ canonical result digest and monotonic
 evolution-export/callback success proofs; an unknown callback or failed export
 retains completion data, transcript/session, log, credential roots, and the
 journal. Stable event identity and callback idempotency headers make retries
-non-polluting. Terminal pending status/error is published to live memory only
+non-polluting. Journal transitions and recovery scans use a bounded
+cross-process `flock` bound to the same held no-follow journal root; lock and root
+identity are rechecked before durable success. Cancel authority is committed
+before runtime cancellation, remains monotonic over completed evaluation, and a
+failed commit leaves the runtime untouched. Terminal pending status/error is published to live memory only
 after the journal transition is durable. Cleanup begins only after both required
 phases are durably successful. A separate bounded no-follow recursive scan first
 finds and scrubs the journal-bound auth inode even after a nested rename; a limit,

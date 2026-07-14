@@ -19,7 +19,7 @@ from openevo.evolution.framework import (
     ProjectEvolutionTargetMap,
     ProjectEvolutionTargetSelection,
 )
-from openevo.harness.capture import transcript_capture_enabled
+from openevo.harness.capture import canonicalize_capture_mode, transcript_capture_enabled
 from openevo.projects.evolution_defaults import default_project_evolution_targets
 from openevo.runtime.managed import (
     ManagedRuntimeProfile,
@@ -88,8 +88,7 @@ class AgentConfig(_StrictModel):
         ):
             raise ValueError("agent.settings.auth_mode must match agent.auth")
         capture_mode = self.settings.get("capture_mode")
-        if transcript_capture_enabled(capture_mode):
-            self.settings["capture_mode"] = "transcript"
+        canonicalize_capture_mode(self.settings)
         if self.auth in _SUBSCRIPTION_AUTH_MODES and not transcript_capture_enabled(capture_mode):
             raise ValueError(
                 "subscription agents require transcript capture; "

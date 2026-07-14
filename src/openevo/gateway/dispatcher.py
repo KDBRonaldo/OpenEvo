@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 StageCallback = Callable[["ManagedSession"], Awaitable[None]]
 StageTransitionCallback = Callable[["ManagedSession"], None]
+BeforeCancelCallback = Callable[["ManagedSession"], None]
 _STOP = object()
 _SUBSCRIPTION_AUTH_MODES: Final[frozenset[str]] = frozenset(
     {"subscription", "chatgpt_subscription"}
@@ -195,7 +196,12 @@ class SessionDispatcher:
             self._sessions[managed.session_id] = managed
         await self._init_queue.put(managed.session_id)
 
-    async def cancel(self, session_id: str) -> bool:
+    async def cancel(
+        self,
+        session_id: str,
+        *,
+        before_cancel: BeforeCancelCallback | None = None,
+    ) -> bool:
         should_enqueue_postrun = False
         async with self._lock:
             managed = self._sessions.get(session_id)
@@ -203,6 +209,8 @@ class SessionDispatcher:
                 return False
             if managed.cancel_requested:
                 return True
+            if before_cancel is not None:
+                before_cancel(managed)
             managed.cancel_requested = True
             managed.cancel_event.set()
             # If the session is parked in READY (holding a ready slot), release it

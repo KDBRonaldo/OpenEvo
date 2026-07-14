@@ -323,6 +323,23 @@ def test_codex_subscription_auth_mode_accepts_shared_transcript_aliases(
     step = harness.run_steps("Do work.")[0]
 
     assert step.command.startswith("env -u")
+    assert harness.settings["capture_mode"] == "transcript"
+
+
+@pytest.mark.parametrize("capture_mode", ["transcript", "agent_transcript", "pure_text"])
+def test_codex_proxy_mode_writes_back_canonical_transcript_capture(
+    capture_mode: str,
+) -> None:
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "proxy", "capture_mode": capture_mode},
+        )
+    )
+
+    harness.run_steps("Do work.")
+
+    assert harness.settings["capture_mode"] == "transcript"
 
 
 def test_codex_subscription_auth_mode_rejects_token_capture() -> None:

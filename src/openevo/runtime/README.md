@@ -149,7 +149,9 @@ post-run uses bounded immediate retries and then periodic reconciliation. Its
 private v6 journal also carries the exact staged auth identity, an explicit recovery phase, redacted
 finalization state, and a canonical result digest with monotonic export/callback
 success proofs. The terminal agent result is journaled before its in-memory
-terminal transition. Required export authority includes the normalized backend
+terminal transition. Cancellation uses the same rule: its authority is fsynced
+before `runtime.cancel()` or any stop side effect, and a persistence failure
+leaves the runtime running and fails the request closed. Required export authority includes the normalized backend
 URL, timeout, fail-open policy, and canonical identity digest; recovery requires
 the current config/client to match it exactly. Evolution export is idempotent by
 stable source event identity; callback retries carry a stable result-derived
@@ -162,7 +164,9 @@ restart cleanup until the exact transition is successfully retried. Live termina
 status/error authority changes only after that durable transition succeeds.
 Every record read, pending/candidate/rollback write, replace, unlink, and
 directory fsync in a transition is relative to one no-follow held journal-root
-descriptor. A root pathname rename or replacement therefore fails closed while
+descriptor and runs while holding a bounded cross-process `flock` on a persistent
+owner-only, link-count-one lock inode in that root. The lock inode and root
+binding are revalidated before a transition can return success. A root pathname rename or replacement therefore fails closed while
 retaining the displaced authority and never writes journal bytes into the
 replacement.
 An immutable marker in the journal's private parent binds its normalized path,

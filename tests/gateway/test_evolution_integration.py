@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
+import multiprocessing
 import os
 import threading
 import time
@@ -21,7 +23,9 @@ from openevo.evolution.models import (
 )
 from openevo.evolution.store import EvolutionStore
 from openevo.gateway.dispatcher import ManagedSession
+from openevo.gateway.dispatcher import SessionDispatcher, SessionStage
 from openevo.gateway.node import (
+    CancelAuthorityPersistenceError,
     GatewayExecutionTimeout,
     GatewayNodeManager,
     build_evolution_session_event,
@@ -468,6 +472,28 @@ def test_gateway_subscription_admission_rejects_token_capture(tmp_path: Path) ->
             request.runtime,
             session_dir,
         )
+
+
+@pytest.mark.parametrize("auth_mode", ["proxy", "subscription"])
+@pytest.mark.parametrize("capture_mode", ["transcript", "agent_transcript", "pure_text"])
+def test_gateway_boundary_writes_back_canonical_capture_mode(
+    auth_mode: str,
+    capture_mode: str,
+) -> None:
+    request = SessionDispatchRequest(
+        session_id="gateway-capture-matrix",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": auth_mode, "capture_mode": capture_mode},
+        ),
+    )
+
+    GatewayNodeManager._canonicalize_request_capture_mode(request)
+
+    assert request.agent.settings["capture_mode"] == "transcript"
 
 
 @pytest.mark.asyncio
@@ -1269,6 +1295,152 @@ async def test_subscription_postrun_base_exception_still_stops_all_runtimes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [asyncio.CancelledError, _PostrunBaseException])
+async def test_standard_postrun_base_exception_drains_and_stops_all_runtimes(
+    tmp_path: Path,
+    failure_type: type[BaseException],
+) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    main_runtime = FakeRuntime()
+    eval_runtime = FakeRuntime()
+    stopped: list[BaseRuntime] = []
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="standard-base-exception"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.runtime = main_runtime
+
+    async def fail_postrun(_: ManagedSession) -> None:
+        raise failure_type("postrun interrupted")
+
+    async def drain(_: ManagedSession) -> BaseRuntime:
+        calls.append("drain")
+        return eval_runtime
+
+    async def stop_runtime(
+        runtime: BaseRuntime,
+        session_id: str,
+        label: str,
+    ) -> bool:
+        assert session_id == managed.session_id
+        assert label in {"eval runtime", "runtime"}
+        stopped.append(runtime)
+        return True
+
+    manager._run_postrun_steps = fail_postrun
+    manager._drain_eval_prewarm_task = drain
+    manager._stop_runtime_best_effort = stop_runtime
+
+    with pytest.raises(failure_type):
+        await manager._handle_standard_postrun(managed)
+
+    assert calls[-1] == "drain"
+    assert set(stopped) == {eval_runtime, main_runtime}
+    assert managed.session_id in manager._cleanup_retries
+    assert list(manager._cleanup_journal_dir.glob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_standard_postrun_combines_primary_and_cleanup_base_exceptions(
+    tmp_path: Path,
+) -> None:
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    main_runtime = FakeRuntime()
+    eval_runtime = FakeRuntime()
+    stopped: list[BaseRuntime] = []
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="standard-combined-failure"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.runtime = main_runtime
+
+    async def fail_postrun(_: ManagedSession) -> None:
+        raise _PostrunBaseException("primary postrun failure")
+
+    async def drain(_: ManagedSession) -> BaseRuntime:
+        return eval_runtime
+
+    async def stop_runtime(
+        runtime: BaseRuntime,
+        session_id: str,
+        label: str,
+    ) -> bool:
+        del session_id, label
+        stopped.append(runtime)
+        if runtime is eval_runtime:
+            raise _PostrunBaseException("eval cleanup failure")
+        return True
+
+    manager._run_postrun_steps = fail_postrun
+    manager._drain_eval_prewarm_task = drain
+    manager._stop_runtime_best_effort = stop_runtime
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        await manager._handle_standard_postrun(managed)
+
+    assert [str(error) for error in captured.value.exceptions] == [
+        "primary postrun failure",
+        "eval cleanup failure",
+    ]
+    assert stopped == [eval_runtime, main_runtime]
+    assert managed.session_id in manager._cleanup_retries
+
+
+@pytest.mark.asyncio
+async def test_standard_postrun_cancellation_during_stop_waits_for_all_cleanup(
+    tmp_path: Path,
+) -> None:
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    main_runtime = FakeRuntime()
+    eval_runtime = FakeRuntime()
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="standard-stop-cancel"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.runtime = main_runtime
+    handler_task = asyncio.current_task()
+    assert handler_task is not None
+    stopped: list[BaseRuntime] = []
+
+    async def drain(_: ManagedSession) -> BaseRuntime:
+        return eval_runtime
+
+    async def stop_runtime(
+        runtime: BaseRuntime,
+        session_id: str,
+        label: str,
+    ) -> bool:
+        del session_id, label
+        if runtime is eval_runtime:
+            handler_task.cancel()
+            await asyncio.sleep(0)
+        stopped.append(runtime)
+        return True
+
+    manager._drain_eval_prewarm_task = drain
+    manager._stop_runtime_best_effort = stop_runtime
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager._handle_standard_postrun(managed)
+
+    assert set(stopped) == {eval_runtime, main_runtime}
+    assert managed.session_id in manager._cleanup_retries
+
+
+@pytest.mark.asyncio
 async def test_subscription_cancel_overrides_existing_evaluator_result(
     tmp_path: Path,
 ) -> None:
@@ -1306,6 +1478,176 @@ async def test_subscription_cancel_overrides_existing_evaluator_result(
     assert result is not None
     assert result.status == SessionStatus.ERROR
     assert result.error == "session cancelled"
+
+
+def _attach_cancellable_subscription(
+    manager: GatewayNodeManager,
+    managed: ManagedSession,
+) -> None:
+    manager._dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    manager._dispatcher._started = True
+    manager._dispatcher._sessions[managed.session_id] = managed
+    managed.stage = SessionStage.RUNNING
+    manager._register_cleanup_retry(managed, finalize_subscription=True)
+
+
+@pytest.mark.asyncio
+async def test_cancel_authority_is_durable_before_runtime_side_effect(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+
+    class InspectingRuntime(FakeRuntime):
+        async def cancel(self) -> None:
+            journal = json.loads(next(manager._cleanup_journal_dir.glob("*.json")).read_text())
+            assert journal["subscription_finalization"]["cancel_requested"] is True
+            calls.append("runtime_cancel")
+
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="durable-cancel-before-side-effect"),
+    )
+    managed.request.agent = AgentSpec(
+        harness="codex",
+        settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.runtime = InspectingRuntime()
+    _attach_cancellable_subscription(manager, managed)
+
+    assert await manager.cancel(managed.session_id) is True
+
+    assert calls == ["runtime_cancel"]
+    assert managed.cancel_requested is True
+    persisted = json.loads(next(manager._cleanup_journal_dir.glob("*.json")).read_text())
+    assert persisted["subscription_finalization"]["cancel_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_persistence_failure_does_not_touch_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+
+    class ObservedRuntime(FakeRuntime):
+        cancel_called = False
+
+        async def cancel(self) -> None:
+            self.cancel_called = True
+
+    runtime = ObservedRuntime()
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="cancel-fsync-failure"),
+    )
+    managed.request.agent = AgentSpec(
+        harness="codex",
+        settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.runtime = runtime
+    _attach_cancellable_subscription(manager, managed)
+
+    def fail_fsync(root_fd: int) -> None:
+        del root_fd
+        raise OSError("injected cancel fsync failure")
+
+    monkeypatch.setattr(manager, "_fsync_cleanup_journal_directory", fail_fsync)
+
+    with pytest.raises(CancelAuthorityPersistenceError) as captured:
+        await manager.cancel(managed.session_id)
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert runtime.cancel_called is False
+    assert managed.cancel_requested is False
+    assert managed.cancel_event.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_crash_window_recovers_durable_cancel_authority(
+    tmp_path: Path,
+) -> None:
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+
+    class CrashingRuntime(FakeRuntime):
+        async def cancel(self) -> None:
+            raise _PostrunBaseException("crash after runtime cancel began")
+
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="cancel-crash-window"),
+    )
+    managed.request.agent = AgentSpec(
+        harness="codex",
+        settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.runtime = CrashingRuntime()
+    _attach_cancellable_subscription(manager, managed)
+
+    with pytest.raises(_PostrunBaseException):
+        await manager.cancel(managed.session_id)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = manager._cleanup_journal_dir
+    restarted._load_cleanup_retries()
+    recovered = restarted._cleanup_retries[managed.session_id]
+    assert recovered.finalization_state is not None
+    assert recovered.finalization_state.cancel_requested is True
+
+
+def test_durable_cancel_is_monotonic_over_completed_result_transition(
+    tmp_path: Path,
+) -> None:
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="cancel-complete-race"),
+    )
+    managed.request.agent = AgentSpec(
+        harness="codex",
+        settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    manager._register_cleanup_retry(managed, finalize_subscription=True)
+
+    manager._persist_subscription_finalization_authority(
+        managed,
+        cancel_requested=True,
+    )
+    manager._record_terminal_agent_result(
+        managed,
+        AgentRunResult(status="completed", return_code=0),
+    )
+
+    persisted = json.loads(next(manager._cleanup_journal_dir.glob("*.json")).read_text())
+    assert persisted["subscription_finalization"]["cancel_requested"] is True
+    assert manager._cleanup_retries[managed.session_id].finalization_state.cancel_requested is True
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = manager._cleanup_journal_dir
+    restarted._load_cleanup_retries()
+    recovered = restarted._cleanup_retries[managed.session_id]
+    assert recovered.finalization_state is not None
+    assert recovered.finalization_state.cancel_requested is True
 
 
 def test_subscription_capture_redaction_never_modifies_workspace_files(
@@ -2449,6 +2791,131 @@ def test_terminal_failure_publish_is_copy_on_write(
     assert manager._cleanup_retries[managed.session_id] is original_ownership
     assert journal_path.read_bytes() == original_journal
     assert list(journal_dir.glob("*.pending"))
+
+
+def test_cleanup_journal_lock_serializes_replace_fsync_rollback_transition(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="journal-transition-barrier"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    initial_manager = _postrun_manager(calls=[])
+    initial_manager._cleanup_journal_dir = journal_dir
+    initial_manager._register_cleanup_retry(managed)
+    initial = initial_manager._cleanup_retries[managed.session_id]
+
+    failing_manager = _postrun_manager(calls=[])
+    failing_manager._cleanup_journal_dir = journal_dir
+    successful_manager = _postrun_manager(calls=[])
+    successful_manager._cleanup_journal_dir = journal_dir
+    entered_failed_fsync = threading.Event()
+    release_failed_fsync = threading.Event()
+    original_fsync = failing_manager._fsync_cleanup_journal_directory
+    injected = False
+
+    def fail_after_replace(root_fd: int) -> None:
+        nonlocal injected
+        if not injected:
+            injected = True
+            entered_failed_fsync.set()
+            assert release_failed_fsync.wait(timeout=2)
+            raise OSError("injected transition fsync failure")
+        original_fsync(root_fd)
+
+    failing_manager._fsync_cleanup_journal_directory = fail_after_replace
+    failures: list[BaseException] = []
+
+    def run_failure() -> None:
+        try:
+            failing_manager._persist_cleanup_ownership(
+                replace(initial, runtime_id="failed-transition")
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    def run_success() -> None:
+        try:
+            successful_manager._persist_cleanup_ownership(
+                replace(initial, runtime_id="committed-transition")
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    failed_thread = threading.Thread(target=run_failure)
+    successful_thread = threading.Thread(target=run_success)
+    failed_thread.start()
+    assert entered_failed_fsync.wait(timeout=2)
+    successful_thread.start()
+    time.sleep(0.05)
+    assert successful_thread.is_alive()
+    release_failed_fsync.set()
+    failed_thread.join(timeout=2)
+    successful_thread.join(timeout=2)
+
+    assert not failed_thread.is_alive()
+    assert not successful_thread.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], OSError)
+    payload = json.loads(next(journal_dir.glob("*.json")).read_text())
+    assert payload["runtime"]["runtime_id"] == "committed-transition"
+    assert list(journal_dir.glob("*.pending")) == []
+
+
+def test_cleanup_journal_process_lock_is_bounded_and_released_after_holder_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="journal-process-lock"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+    manager._register_cleanup_retry(managed)
+    ownership = manager._cleanup_retries[managed.session_id]
+
+    context = multiprocessing.get_context("fork")
+    acquired = context.Event()
+    release = context.Event()
+
+    def hold_process_lock() -> None:
+        holder = GatewayNodeManager.__new__(GatewayNodeManager)
+        holder._cleanup_journal_dir = journal_dir
+        authority = holder._open_cleanup_journal_authority(initialize=False)
+        assert authority is not None
+        descriptor = holder._acquire_cleanup_journal_lock(authority)
+        acquired.set()
+        release.wait(timeout=5)
+        holder._release_cleanup_journal_lock(descriptor)
+        authority.close()
+
+    process = context.Process(target=hold_process_lock)
+    process.start()
+    assert acquired.wait(timeout=2)
+    monkeypatch.setattr(node_module, "_CLEANUP_JOURNAL_LOCK_TIMEOUT_SECONDS", 0.05)
+
+    contender = _postrun_manager(calls=[])
+    contender._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="process lock timed out"):
+        contender._persist_cleanup_ownership(replace(ownership, runtime_id="contender"))
+
+    release.set()
+    process.join(timeout=2)
+    assert process.exitcode == 0
+
+    committed = contender._persist_cleanup_ownership(
+        replace(ownership, runtime_id="after-holder-exit")
+    )
+    assert committed.runtime_id == "after-holder-exit"
 
 
 @pytest.mark.asyncio

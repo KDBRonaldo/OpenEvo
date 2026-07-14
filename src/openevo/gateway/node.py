@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -12,6 +13,7 @@ import re
 import shlex
 import shutil
 import stat
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory, mkdtemp
@@ -45,7 +47,7 @@ from openevo.gateway.session_files import (
     write_verified_session_log,
 )
 from openevo.gateway.storage import SessionStore
-from openevo.harness.capture import transcript_capture_enabled
+from openevo.harness.capture import canonicalize_capture_mode, transcript_capture_enabled
 from openevo.harness.base import BaseHarness
 from openevo.harness.factory import create_harness
 from openevo.harness.models import AgentRunResult
@@ -100,6 +102,9 @@ _CLEANUP_JOURNAL_MAX_FILENAME_BYTES = 128
 _CLEANUP_JOURNAL_MAX_METADATA_BYTES = 1024 * 1024
 _CLEANUP_JOURNAL_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _CLEANUP_JOURNAL_ROOT_MARKER_MAX_BYTES = 64 * 1024
+_CLEANUP_JOURNAL_LOCK_NAME = ".journal.lock"
+_CLEANUP_JOURNAL_LOCK_TIMEOUT_SECONDS = 2.0
+_CLEANUP_JOURNAL_LOCK_POLL_SECONDS = 0.01
 _CLEANUP_JOURNAL_RECORD_RE = re.compile(r"[0-9a-f]{64}\.json")
 _CLEANUP_JOURNAL_PENDING_RE = re.compile(r"[0-9a-f]{64}\.pending")
 _CLEANUP_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -116,6 +121,10 @@ _UNSET = object()
 
 class GatewayExecutionTimeout(TimeoutError):
     """Raised when a session exhausts its shared gateway execution budget."""
+
+
+class CancelAuthorityPersistenceError(RuntimeError):
+    """Raised when cancellation cannot be made durable before runtime effects."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -701,6 +710,7 @@ class GatewayNodeManager:
             return False, "gateway could not authenticate rollout health"
 
     async def dispatch(self, request: SessionDispatchRequest) -> None:
+        self._canonicalize_request_capture_mode(request)
         session_id = request.session_id
         if self.session_registry.get(session_id) is not None:
             raise ValueError(
@@ -771,7 +781,23 @@ class GatewayNodeManager:
             raise
 
     async def cancel(self, session_id: str) -> bool:
-        return await self._dispatcher.cancel(session_id)
+        def persist_cancel_authority(managed: ManagedSession) -> None:
+            if not _is_codex_subscription_agent(managed.request.agent):
+                return
+            try:
+                self._persist_subscription_finalization_authority(
+                    managed,
+                    cancel_requested=True,
+                )
+            except BaseException as exc:
+                raise CancelAuthorityPersistenceError(
+                    f"cancel authority persistence failed for session {session_id}"
+                ) from exc
+
+        return await self._dispatcher.cancel(
+            session_id,
+            before_cancel=persist_cancel_authority,
+        )
 
     async def active_sessions(self) -> int:
         return await self._dispatcher.active_count()
@@ -978,6 +1004,10 @@ class GatewayNodeManager:
             raise RuntimeError(str(exc)) from exc
 
     @staticmethod
+    def _canonicalize_request_capture_mode(request: SessionDispatchRequest) -> None:
+        canonicalize_capture_mode(request.agent.settings)
+
+    @staticmethod
     def _validate_subscription_admission(
         request: SessionDispatchRequest,
         runtime_spec: RuntimeSpec,
@@ -985,6 +1015,7 @@ class GatewayNodeManager:
     ) -> None:
         if not _is_subscription_agent(request.agent):
             return
+        GatewayNodeManager._canonicalize_request_capture_mode(request)
         if request.agent.harness != "codex":
             raise RuntimeError(
                 "managed subscription execution currently requires the Codex harness"
@@ -992,7 +1023,6 @@ class GatewayNodeManager:
         capture_mode = request.agent.settings.get("capture_mode")
         if not transcript_capture_enabled(capture_mode):
             raise RuntimeError("subscription execution requires transcript capture")
-        request.agent.settings["capture_mode"] = "transcript"
         try:
             reject_managed_subscription_env(request.agent.env, owner="agent")
             reject_managed_subscription_env(
@@ -1437,6 +1467,7 @@ class GatewayNodeManager:
         agent_result: AgentRunResult | None = None,
         pending_status: SessionStatus | None | object = _UNSET,
         pending_error: str | None | object = _UNSET,
+        cancel_requested: bool | object = _UNSET,
     ) -> None:
         retries = getattr(self, "_cleanup_retries", None)
         if retries is None:
@@ -1459,9 +1490,10 @@ class GatewayNodeManager:
                 agent_result=agent_result,
                 pending_status=pending_status,
                 pending_error=pending_error,
+                cancel_requested=cancel_requested,
             ),
         )
-        self._persist_cleanup_ownership(updated)
+        updated = self._persist_cleanup_ownership(updated)
         retries[managed.session_id] = updated
 
     # ------------------------------------------------------------------
@@ -1563,6 +1595,88 @@ class GatewayNodeManager:
         except (asyncio.CancelledError, Exception):
             return None
 
+    async def _drain_and_stop_postrun_runtimes(
+        self,
+        managed: ManagedSession,
+        *,
+        subscription_retry: bool,
+    ) -> tuple[bool, list[BaseException]]:
+        """Drain prewarm and attempt every runtime stop despite cancellation."""
+
+        errors: list[BaseException] = []
+        eval_runtime = managed.eval_runtime
+        drained, drain_errors = await self._await_cleanup_to_completion(
+            self._drain_eval_prewarm_task(managed)
+        )
+        errors.extend(drain_errors)
+        if drained is not None:
+            eval_runtime = drained
+
+        targets = [
+            (eval_runtime, "eval runtime"),
+            (managed.runtime, "runtime"),
+        ]
+        runtimes_removed = not managed.runtime_cleanup_blocked
+        if subscription_retry:
+            stopped, stop_errors = await self._await_cleanup_to_completion(
+                self._stop_subscription_runtimes_with_retry(
+                    targets,
+                    managed.session_id,
+                )
+            )
+            errors.extend(stop_errors)
+            runtimes_removed = runtimes_removed and stopped is True
+        else:
+            stop_results, stop_errors = await self._await_cleanup_to_completion(
+                asyncio.gather(
+                    *(
+                        self._stop_runtime_best_effort(
+                            runtime,
+                            managed.session_id,
+                            label,
+                        )
+                        for runtime, label in targets
+                        if runtime is not None
+                    ),
+                    return_exceptions=True,
+                )
+            )
+            errors.extend(stop_errors)
+            if isinstance(stop_results, list):
+                for outcome in stop_results:
+                    if isinstance(outcome, BaseException):
+                        errors.append(outcome)
+                runtimes_removed = runtimes_removed and all(
+                    outcome is True for outcome in stop_results
+                )
+            else:
+                runtimes_removed = False
+        return runtimes_removed, errors
+
+    @staticmethod
+    async def _await_cleanup_to_completion(awaitable) -> tuple[Any, list[BaseException]]:
+        """Keep one cleanup operation alive while preserving caller cancellation."""
+
+        future = asyncio.ensure_future(awaitable)
+        errors: list[BaseException] = []
+        while True:
+            try:
+                return await asyncio.shield(future), errors
+            except asyncio.CancelledError as exc:
+                errors.append(exc)
+                if not future.done():
+                    continue
+                try:
+                    return future.result(), errors
+                except asyncio.CancelledError:
+                    return None, errors
+                except BaseException as operation_error:
+                    errors.append(operation_error)
+                    return None, errors
+            except BaseException as exc:
+                errors.append(exc)
+                return None, errors
+
     # ------------------------------------------------------------------
     # POSTRUN stage
     # ------------------------------------------------------------------
@@ -1576,7 +1690,9 @@ class GatewayNodeManager:
     async def _handle_standard_postrun(self, managed: ManagedSession) -> None:
         request = managed.request
         result: SessionResult | None = managed.final_result
-        runtimes_removed = not managed.runtime_cleanup_blocked
+        runtimes_removed = False
+        primary_error: BaseException | None = None
+        teardown_errors: list[BaseException] = []
         managed.timer.mark("postrun", "started")
         try:
             if result is None:
@@ -1602,10 +1718,15 @@ class GatewayNodeManager:
             else:
                 logger.exception("Post-run handling failed for session %s", request.session_id)
             result = self._error_result(request, managed.timer, f"post-run failed: {exc}")
+        except BaseException as exc:
+            primary_error = exc
         finally:
             managed.timer.mark("postrun", "finished")
             managed.timer.mark("teardown", "started")
-            await self._run_postrun_steps(managed)
+            try:
+                await self._run_postrun_steps(managed)
+            except BaseException as exc:
+                teardown_errors.append(exc)
             try:
                 self._redact_core_capture_authority(managed)
             except Exception as exc:
@@ -1619,28 +1740,28 @@ class GatewayNodeManager:
                     managed.timer,
                     f"credential capture redaction failed: {exc}",
                 )
-            stop_tasks = []
-            eval_runtime = await self._drain_eval_prewarm_task(managed) or managed.eval_runtime
-            if eval_runtime is not None:
-                stop_tasks.append(
-                    self._stop_runtime_best_effort(
-                        eval_runtime, request.session_id, "eval runtime"
-                    )
-                )
-            if managed.runtime is not None:
-                stop_tasks.append(
-                    self._stop_runtime_best_effort(managed.runtime, request.session_id, "runtime")
-                )
-            if stop_tasks:
-                stop_results = await asyncio.gather(
-                    *stop_tasks,
-                    return_exceptions=True,
-                )
-                runtimes_removed = runtimes_removed and all(
-                    outcome is True for outcome in stop_results
-                )
+            except BaseException as exc:
+                teardown_errors.append(exc)
+            runtimes_removed, stop_errors = await self._drain_and_stop_postrun_runtimes(
+                managed,
+                subscription_retry=False,
+            )
+            teardown_errors.extend(stop_errors)
             managed.timer.mark("teardown", "finished")
             managed.timer.mark("return", "finished")
+
+        if primary_error is not None or teardown_errors:
+            try:
+                self._register_cleanup_retry(managed, eval_runtime=managed.eval_runtime)
+            except BaseException as exc:
+                teardown_errors.append(exc)
+            failures: list[BaseException] = []
+            if primary_error is not None:
+                failures.append(primary_error)
+            failures.extend(teardown_errors)
+            if len(failures) == 1:
+                raise failures[0]
+            raise BaseExceptionGroup("post-run failed and cleanup did not complete", failures)
 
         if result is None:
             result = self._error_result(
@@ -1695,31 +1816,16 @@ class GatewayNodeManager:
         finally:
             managed.timer.mark("teardown", "started")
             try:
-                try:
-                    eval_runtime = (
-                        await self._drain_eval_prewarm_task(managed)
-                        or managed.eval_runtime
-                    )
-                finally:
-                    try:
-                        self._register_cleanup_retry(
-                            managed,
-                            eval_runtime=eval_runtime or managed.eval_runtime,
-                            finalize_subscription=True,
-                        )
-                    finally:
-                        stop_targets = [
-                            (eval_runtime or managed.eval_runtime, "eval runtime"),
-                            (managed.runtime, "runtime"),
-                        ]
-                        runtimes_removed = (
-                            not managed.runtime_cleanup_blocked
-                            and await self._stop_subscription_runtimes_with_retry(
-                                stop_targets,
-                                request.session_id,
-                            )
-                        )
+                self._register_cleanup_retry(
+                    managed,
+                    eval_runtime=managed.eval_runtime,
+                    finalize_subscription=True,
+                )
             finally:
+                runtimes_removed, teardown_errors = await self._drain_and_stop_postrun_runtimes(
+                    managed,
+                    subscription_retry=True,
+                )
                 managed.timer.mark("teardown", "finished")
                 if runtimes_removed:
                     self._record_cleanup_runtimes_absent(managed)
@@ -1732,6 +1838,13 @@ class GatewayNodeManager:
                     logger.error(
                         "Retaining subscription cleanup ownership because runtime absence "
                         "was not proven for session %s",
+                        request.session_id,
+                    )
+                if teardown_errors:
+                    logger.error(
+                        "Subscription teardown retained cleanup retry after %d base error(s) "
+                        "for session %s",
+                        len(teardown_errors),
                         request.session_id,
                     )
 
@@ -2572,7 +2685,7 @@ class GatewayNodeManager:
                 ownership.finalize_subscription = previous.finalize_subscription
                 if previous.finalization_state is not None:
                     ownership.phase = previous.phase
-        self._persist_cleanup_ownership(ownership)
+        ownership = self._persist_cleanup_ownership(ownership)
         retries[managed.session_id] = ownership
 
     def _record_cleanup_runtimes_absent(self, managed: ManagedSession) -> None:
@@ -2595,7 +2708,7 @@ class GatewayNodeManager:
             runtime=None,
             eval_runtime=None,
         )
-        self._persist_cleanup_ownership(updated)
+        updated = self._persist_cleanup_ownership(updated)
         self._cleanup_retries[ownership.session_id] = updated
         return updated
 
@@ -2641,7 +2754,7 @@ class GatewayNodeManager:
             delivery_state=state,
             phase=_RECOVERY_PHASE_TERMINAL_DELIVERY,
         )
-        self._persist_cleanup_ownership(updated)
+        updated = self._persist_cleanup_ownership(updated)
         retries[managed.session_id] = updated
         return updated
 
@@ -2735,7 +2848,7 @@ class GatewayNodeManager:
             callback_succeeded=state.callback_succeeded or callback_succeeded,
         )
         updated_ownership = replace(ownership, delivery_state=updated)
-        self._persist_cleanup_ownership(updated_ownership)
+        updated_ownership = self._persist_cleanup_ownership(updated_ownership)
         self._cleanup_retries[ownership.session_id] = updated_ownership
         return updated_ownership
 
@@ -2767,6 +2880,7 @@ class GatewayNodeManager:
         agent_result: AgentRunResult | None = None,
         pending_status: SessionStatus | None | object = _UNSET,
         pending_error: str | None | object = _UNSET,
+        cancel_requested: bool | object = _UNSET,
     ) -> SubscriptionFinalizationState:
         redactor = managed.credential_redactor
 
@@ -2798,7 +2912,11 @@ class GatewayNodeManager:
             final_result=redacted_model(managed.final_result, SessionResult),
             pending_status=effective_pending_status,
             pending_error=effective_pending_error,
-            cancel_requested=managed.cancel_requested,
+            cancel_requested=(
+                managed.cancel_requested
+                if cancel_requested is _UNSET
+                else cast(bool, cancel_requested)
+            ),
             timer_marks=dict(managed.timer._marks),
         )
 
@@ -3110,6 +3228,108 @@ class GatewayNodeManager:
         finally:
             reopened.close()
 
+    def _acquire_cleanup_journal_lock(
+        self,
+        authority: _CleanupJournalAuthority,
+    ) -> int:
+        """Acquire the bounded process lock bound to one held journal root."""
+
+        self._verify_cleanup_journal_authority(authority)
+        created = False
+        try:
+            descriptor = os.open(
+                _CLEANUP_JOURNAL_LOCK_NAME,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=authority.root_fd,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(
+                _CLEANUP_JOURNAL_LOCK_NAME,
+                os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=authority.root_fd,
+            )
+        try:
+            opened = os.fstat(descriptor)
+            rebound = os.stat(
+                _CLEANUP_JOURNAL_LOCK_NAME,
+                dir_fd=authority.root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or self._cleanup_journal_identity(opened)
+                != self._cleanup_journal_identity(rebound)
+            ):
+                raise RuntimeError("cleanup journal process lock is invalid")
+            if created:
+                os.fsync(descriptor)
+                self._fsync_cleanup_journal_directory(authority.root_fd)
+
+            deadline = time.monotonic() + _CLEANUP_JOURNAL_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except InterruptedError:
+                    continue
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("cleanup journal process lock timed out")
+                    time.sleep(_CLEANUP_JOURNAL_LOCK_POLL_SECONDS)
+
+            locked = os.fstat(descriptor)
+            rebound = os.stat(
+                _CLEANUP_JOURNAL_LOCK_NAME,
+                dir_fd=authority.root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                self._cleanup_journal_identity(locked) != self._cleanup_journal_identity(opened)
+                or self._cleanup_journal_identity(rebound)
+                != self._cleanup_journal_identity(opened)
+                or locked.st_nlink != 1
+                or stat.S_IMODE(locked.st_mode) != 0o600
+            ):
+                raise RuntimeError("cleanup journal process lock changed during acquisition")
+            self._verify_cleanup_journal_authority(authority)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _release_cleanup_journal_lock(descriptor: int) -> None:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def _verify_cleanup_journal_lock(
+        self,
+        authority: _CleanupJournalAuthority,
+        descriptor: int,
+    ) -> None:
+        opened = os.fstat(descriptor)
+        rebound = os.stat(
+            _CLEANUP_JOURNAL_LOCK_NAME,
+            dir_fd=authority.root_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or self._cleanup_journal_identity(opened)
+            != self._cleanup_journal_identity(rebound)
+        ):
+            raise RuntimeError("cleanup journal process lock identity changed")
+
     def _cleanup_journal_path(self, session_id: str) -> Path:
         return self._cleanup_journal_dir / self._cleanup_journal_name(session_id)
 
@@ -3118,10 +3338,13 @@ class GatewayNodeManager:
         name = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
         return f"{name}.json"
 
-    def _persist_cleanup_ownership(self, ownership: CleanupRetryOwnership) -> None:
+    def _persist_cleanup_ownership(
+        self,
+        ownership: CleanupRetryOwnership,
+    ) -> CleanupRetryOwnership:
         journal_dir = getattr(self, "_cleanup_journal_dir", None)
         if journal_dir is None:
-            return
+            return ownership
         state = ownership.finalization_state
         delivery = ownership.delivery_state
         payload = {
@@ -3220,18 +3443,63 @@ class GatewayNodeManager:
         except Exception:
             authority.close()
             raise
+        lock_fd = -1
         destination = self._cleanup_journal_name(ownership.session_id)
         temporary = f".{destination}.{os.getpid()}.{id(ownership)}.tmp"
         pending = f"{destination.removesuffix('.json')}.pending"
         rollback = f".{destination}.rollback.tmp"
         try:
+            lock_fd = self._acquire_cleanup_journal_lock(authority)
             previous = self._read_private_cleanup_file(
                 destination,
                 root_fd=authority.root_fd,
                 max_bytes=_CLEANUP_JOURNAL_MAX_BYTES,
                 allow_missing=True,
             )
-        except Exception:
+            if previous is not None:
+                try:
+                    previous_payload = json.loads(previous.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    previous_payload = None
+                previous_finalization = (
+                    previous_payload.get("subscription_finalization")
+                    if isinstance(previous_payload, dict)
+                    else None
+                )
+                previous_cancelled = (
+                    isinstance(previous_finalization, dict)
+                    and previous_finalization.get("cancel_requested") is True
+                )
+                if previous_cancelled:
+                    candidate_finalization = payload["subscription_finalization"]
+                    if not isinstance(candidate_finalization, dict):
+                        raise RuntimeError(
+                            "cleanup journal transition cannot discard cancel authority"
+                        )
+                    if candidate_finalization["cancel_requested"] is not True:
+                        candidate_finalization["cancel_requested"] = True
+                        if ownership.finalization_state is None:
+                            raise RuntimeError(
+                                "cleanup journal cancel authority is internally inconsistent"
+                            )
+                        ownership = replace(
+                            ownership,
+                            finalization_state=replace(
+                                ownership.finalization_state,
+                                cancel_requested=True,
+                            ),
+                        )
+                        encoded = json.dumps(
+                            payload,
+                            ensure_ascii=True,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        if len(encoded) > _CLEANUP_JOURNAL_MAX_BYTES:
+                            raise RuntimeError("cleanup ownership journal exceeds the byte limit")
+        except BaseException:
+            if lock_fd >= 0:
+                self._release_cleanup_journal_lock(lock_fd)
             authority.close()
             raise
         replaced = False
@@ -3266,6 +3534,8 @@ class GatewayNodeManager:
             os.unlink(pending, dir_fd=authority.root_fd)
             self._fsync_cleanup_journal_directory(authority.root_fd)
             self._verify_cleanup_journal_authority(authority)
+            self._verify_cleanup_journal_lock(authority, lock_fd)
+            return ownership
         except Exception:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -3324,6 +3594,8 @@ class GatewayNodeManager:
                     os.unlink(leftover, dir_fd=authority.root_fd)
                 except FileNotFoundError:
                     pass
+            if lock_fd >= 0:
+                self._release_cleanup_journal_lock(lock_fd)
             authority.close()
 
     @staticmethod
@@ -3467,7 +3739,9 @@ class GatewayNodeManager:
         authority = self._open_cleanup_journal_authority(initialize=False)
         if authority is None:
             return
+        lock_fd = -1
         try:
+            lock_fd = self._acquire_cleanup_journal_lock(authority)
             records: list[tuple[str, tuple[int, int, int, int, int, int]]] = []
             row_count = 0
             metadata_bytes = 0
@@ -3484,6 +3758,8 @@ class GatewayNodeManager:
                     metadata_bytes += len(filename_bytes) + 6 * 8
                     if metadata_bytes > _CLEANUP_JOURNAL_MAX_METADATA_BYTES:
                         raise RuntimeError("cleanup ownership journal exceeds the metadata budget")
+                    if name == _CLEANUP_JOURNAL_LOCK_NAME:
+                        continue
                     if _CLEANUP_JOURNAL_PENDING_RE.fullmatch(name) is not None:
                         raise RuntimeError("cleanup ownership journal has an incomplete update")
                     if _CLEANUP_JOURNAL_RECORD_RE.fullmatch(name) is None:
@@ -3536,8 +3812,11 @@ class GatewayNodeManager:
                     raise RuntimeError("cleanup ownership journal session identity is duplicated")
                 recovered[ownership.session_id] = ownership
             self._verify_cleanup_journal_authority(authority)
+            self._verify_cleanup_journal_lock(authority, lock_fd)
             self._cleanup_retries.update(recovered)
         finally:
+            if lock_fd >= 0:
+                self._release_cleanup_journal_lock(lock_fd)
             authority.close()
 
     @staticmethod
@@ -3858,15 +4137,20 @@ class GatewayNodeManager:
         authority = self._open_cleanup_journal_authority(initialize=False)
         if authority is None:
             return
+        lock_fd = -1
         try:
+            lock_fd = self._acquire_cleanup_journal_lock(authority)
             name = self._cleanup_journal_path(session_id).name
             try:
                 os.unlink(name, dir_fd=authority.root_fd)
             except FileNotFoundError:
                 return
-            os.fsync(authority.root_fd)
+            self._fsync_cleanup_journal_directory(authority.root_fd)
             self._verify_cleanup_journal_authority(authority)
+            self._verify_cleanup_journal_lock(authority, lock_fd)
         finally:
+            if lock_fd >= 0:
+                self._release_cleanup_journal_lock(lock_fd)
             authority.close()
 
     async def _stop_recovered_container(
