@@ -91,6 +91,7 @@ class _CoreTunnelEndpoint:
         self._guard = threading.RLock()
         self._close_guard = threading.Lock()
         self._children: dict[int, TunnelProcess] = {}
+        self._pending_child: TunnelProcess | None = None
         self._next_generation = 0
         self._close_requested = False
         self._finalized = threading.Event()
@@ -126,6 +127,7 @@ class _CoreTunnelEndpoint:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         local_stream: socket.socket | None = None
         child_stream: socket.socket | None = None
+        process: TunnelProcess | None = None
         failure: BaseException | None = None
         with self._guard:
             if self._close_requested or self._finalized.is_set():
@@ -143,6 +145,7 @@ class _CoreTunnelEndpoint:
                     list(self._connection_argv),
                     child_stream.fileno(),
                 )
+                self._pending_child = process
                 generation = self._next_generation
                 self._next_generation += 1
                 self._children[generation] = process
@@ -161,10 +164,11 @@ class _CoreTunnelEndpoint:
                     local_stream,
                     expected_identity=local_identity,
                 )
+                self._pending_child = None
                 return local_stream
             except BaseException as exc:
                 failure = exc
-                self._poison_locked()
+                self._poison_locked(pending_child=process)
         if failure is None:
             raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
         self._finish_failed_operation(
@@ -172,7 +176,9 @@ class _CoreTunnelEndpoint:
             streams=(local_stream, child_stream),
         )
 
-    def _poison_locked(self) -> None:
+    def _poison_locked(self, *, pending_child: TunnelProcess | None = None) -> None:
+        if pending_child is not None:
+            self._pending_child = pending_child
         self._close_requested = True
         self._retain_orphan()
 
@@ -209,7 +215,12 @@ class _CoreTunnelEndpoint:
             failures: list[BaseException] = []
             with self._guard:
                 self._close_requested = True
-                children = tuple(self._children.values())
+                children = list(self._children.values())
+                pending_child = self._pending_child
+                if pending_child is not None and not any(
+                    process is pending_child for process in children
+                ):
+                    children.append(pending_child)
             all_exited = True
             for process in children:
                 exited, failure = _terminate_tunnel_process(process)
@@ -278,6 +289,7 @@ class _CoreTunnelEndpoint:
             finalized = self._unregister is None and self._trust_lease is None
             if finalized:
                 self._children.clear()
+                self._pending_child = None
                 self._orphaned = False
                 self._finalized.set()
         if finalized:

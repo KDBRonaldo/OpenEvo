@@ -934,6 +934,7 @@ def test_core_tunnel_uses_parent_owned_socketpair_and_per_connection_ssh_child(
     connection = tunnel.open_verified_socket(timeout_seconds=1.0)
     second_connection = tunnel.open_verified_socket(timeout_seconds=1.0)
     assert len(starter.calls) == 2
+    assert tunnel._endpoint._pending_child is None
     for argv, (family, declared_type, kernel_type, uid, identity, local_name) in starter.calls:
         assert argv[-4:] == ["-W", "127.0.0.1:8765", "--", "gpu.example.edu"]
         assert "-L" not in argv
@@ -1172,6 +1173,197 @@ def test_core_tunnel_child_authority_poll_failure_fails_closed_and_cleans_up(
     assert process.waited is True
     assert tunnel._endpoint._children == {}
     tunnel.close()
+
+
+def test_core_tunnel_pre_registration_cancellation_quarantines_pending_child(
+    tmp_path: Path,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    cancelled = Cancelled()
+
+    class CancelOnIncrement(int):
+        def __add__(self, other: object) -> int:
+            assert other == 1
+            raise cancelled
+
+    class RecoverablePendingProcess(FakeTunnelProcess):
+        cleanup_fails = True
+
+        def poll(self) -> int | None:
+            return None if self.cleanup_fails else super().poll()
+
+        def terminate(self) -> None:
+            self.terminated = True
+            if not self.cleanup_fails:
+                self.return_code = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            cleanup_started.set()
+            if self.cleanup_fails:
+                release_cleanup.wait(timeout=5)
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            assert self.return_code is not None
+            return self.return_code
+
+        def kill(self) -> None:
+            self.killed = True
+            if not self.cleanup_fails:
+                self.return_code = -9
+
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    process = RecoverablePendingProcess()
+    starts = 0
+
+    def start(_argv: list[str], _stream_fd: int) -> FakeTunnelProcess:
+        nonlocal starts
+        starts += 1
+        return process
+
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=start,
+    ).open_core_tunnel(remote_port=8765)
+    tunnel._endpoint._next_generation = CancelOnIncrement(0)
+    results: dict[str, BaseException | object] = {}
+    first_done = threading.Event()
+    second_done = threading.Event()
+
+    def open_connection(name: str, done: threading.Event) -> None:
+        try:
+            results[name] = tunnel.open_verified_socket(timeout_seconds=1.0)
+        except BaseException as exc:
+            results[name] = exc
+        finally:
+            done.set()
+
+    first = threading.Thread(target=open_connection, args=("first", first_done))
+    second = threading.Thread(target=open_connection, args=("second", second_done))
+    try:
+        first.start()
+        assert cleanup_started.wait(timeout=2)
+        assert tunnel._endpoint._pending_child is process
+        assert tunnel._endpoint._close_requested is True
+        assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
+
+        second.start()
+        assert second_done.wait(timeout=2)
+        assert isinstance(results["second"], SshTransportError)
+        assert results["second"].code is SshTransportErrorCode.CONNECTION_FAILED
+        assert starts == 1
+
+        release_cleanup.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert first_done.is_set()
+        assert results["first"] is cancelled
+        assert process.terminated is True
+        assert process.waited is True
+        assert process.killed is True
+        assert tunnel._endpoint._children == {}
+        assert tunnel._endpoint._pending_child is process
+        assert tunnel._endpoint._trust_lease is not None
+        assert tunnel.closed is False
+
+        process.cleanup_fails = False
+        process.return_code = -9
+        ssh_module._retry_orphaned_tunnel_cleanup()
+        assert tunnel.closed is True
+        assert tunnel._endpoint._pending_child is None
+        assert tunnel._endpoint._trust_lease is None
+        assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+    finally:
+        release_cleanup.set()
+        first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+        process.cleanup_fails = False
+        process.return_code = -9
+        if not tunnel.closed:
+            try:
+                tunnel.close()
+            except BaseException:
+                pass
+
+
+@pytest.mark.parametrize("insert_before_failure", [False, True])
+def test_core_tunnel_registry_insertion_failure_cleans_unregistered_child(
+    tmp_path: Path,
+    insert_before_failure: bool,
+) -> None:
+    class FailingChildRegistry(dict[int, FakeTunnelProcess]):
+        attempts = 0
+
+        def __setitem__(self, key: int, value: FakeTunnelProcess) -> None:
+            self.attempts += 1
+            if insert_before_failure:
+                super().__setitem__(key, value)
+            raise OSError("child registry insertion failed")
+
+    class KillConfirmedProcess(FakeTunnelProcess):
+        terminate_calls = 0
+        wait_calls = 0
+        kill_calls = 0
+
+        def poll(self) -> int | None:
+            return self.return_code
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            self.waited = True
+            if self.return_code is None:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            return self.return_code
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.killed = True
+            self.return_code = -9
+
+    registry = FailingChildRegistry()
+    process = KillConfirmedProcess()
+    starts = 0
+
+    def start(_argv: list[str], _stream_fd: int) -> FakeTunnelProcess:
+        nonlocal starts
+        starts += 1
+        return process
+
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=start,
+    ).open_core_tunnel(remote_port=8765)
+    tunnel._endpoint._children = registry
+
+    with pytest.raises(SshTransportError) as rejected:
+        tunnel.open_verified_socket(timeout_seconds=1.0)
+
+    assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+    assert rejected.value.__cause__ is None
+    assert rejected.value.__context__ is None
+    assert registry.attempts == 1
+    assert process.terminated is True
+    assert process.waited is True
+    assert process.killed is True
+    assert process.terminate_calls == 1
+    assert process.wait_calls == 2
+    assert process.kill_calls == 1
+    assert tunnel._endpoint._pending_child is None
+    assert tunnel.closed is True
+
+    with pytest.raises(SshTransportError) as closed:
+        tunnel.open_verified_socket(timeout_seconds=1.0)
+
+    assert closed.value.code is SshTransportErrorCode.CONNECTION_FAILED
+    assert starts == 1
 
 
 def test_core_tunnel_verify_authority_failure_permanently_poisons_endpoint(

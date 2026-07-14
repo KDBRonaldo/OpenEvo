@@ -224,7 +224,13 @@ socket endpoints closed independently and bounded child cleanup attempted, so an
 process cleanup. A concurrent open observes the poison before cleanup completes
 and cannot create another child generation. The endpoint finalizes immediately
 when every owned child exit is confirmed; otherwise quarantine retains it for
-later retry.
+later retry. A child returned by the connection starter is first held in the
+endpoint's single pending-child ownership slot before generation advancement or
+insertion into the registered-child map. Cancellation and registry insertion
+failure therefore poison the endpoint while retaining that exact child. Close
+deduplicates pending and registered references by object identity, and neither
+unregisters the closer nor releases the trust lease until bounded cleanup proves
+that every such child exited.
 
 `SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
 it before building every command. A release call without a binding fails closed.

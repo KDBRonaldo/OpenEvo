@@ -165,7 +165,12 @@ closed. Each socket close and the bounded child cleanup then run independently,
 so `EBADF` cannot replace the original typed failure or skip process ownership
 cleanup. Concurrent opens observe the poison and cannot create another child.
 Confirmed child exit completes endpoint closure; otherwise quarantine retains
-the endpoint until a later bounded retry can prove exit.
+the endpoint until a later bounded retry can prove exit. The starter's returned
+child enters a single endpoint-owned pending slot before generation advancement
+or registered-child map insertion. A cancellation or insertion failure retains
+that exact child under the poisoned endpoint. Close deduplicates pending and
+registered references by identity and cannot release trust or finalize until
+bounded terminate/wait/kill proves every owned child exited.
 
 The exhibition release path uses this attachment for subscription execution and
 transcript capture. After attach, this bootstrap layer does not start a science run, Gateway,
