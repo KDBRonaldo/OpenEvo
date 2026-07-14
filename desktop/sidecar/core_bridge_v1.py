@@ -6,7 +6,7 @@ import base64
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 import hashlib
@@ -541,6 +541,11 @@ class CoreProjectMappingV1:
             raise ValueError("only the first mapping has no predecessor")
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _CoreActivationAuthorityV1:
+    """Process-local capability proving one bridge-produced activation."""
+
+
 class DesktopCoreBridgePersistence(Protocol):
     """Durable callback boundary for create, patch, upload, and mapping state.
 
@@ -617,6 +622,7 @@ class DesktopCoreBridgePersistence(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class CoreActivationV1:
+    generation: int
     local_project_id: str
     profile_id: str
     local_project_etag: str
@@ -625,6 +631,7 @@ class CoreActivationV1:
     capabilities: core_v1.CapabilitiesResponseV1
     revision_head: core_v1.RevisionHeadV1
     validation: core_v1.ProjectValidationResponseV1
+    _authority: _CoreActivationAuthorityV1 = field(repr=False)
 
 
 @dataclass(slots=True, repr=False)
@@ -642,6 +649,8 @@ class DesktopCoreActiveSessionV1:
     project: core_v1.ProjectV1
     capabilities: core_v1.CapabilitiesResponseV1
     revision_head: core_v1.RevisionHeadV1
+    activation: CoreActivationV1
+    committed_local_project: local_v1.ProjectV1 | None = None
 
 
 class DesktopCoreBridgeErrorV1(RuntimeError):
@@ -1067,6 +1076,18 @@ class DesktopCoreBridgeV1:
                     ),
                     label="project mapping commit",
                 )
+            activation = CoreActivationV1(
+                generation=generation,
+                local_project_id=project.project_id,
+                profile_id=project.profile_id,
+                local_project_etag=project.etag,
+                local_project_intent_sha256=request_sha256,
+                core_project=core_project,
+                capabilities=capabilities,
+                revision_head=revision_head,
+                validation=validation,
+                _authority=_CoreActivationAuthorityV1(),
+            )
             candidate = DesktopCoreActiveSessionV1(
                 token=token,
                 generation=generation,
@@ -1081,18 +1102,10 @@ class DesktopCoreBridgeV1:
                 project=core_project,
                 capabilities=capabilities,
                 revision_head=revision_head,
+                activation=activation,
             )
             self._publish_activation(candidate)
-            return CoreActivationV1(
-                local_project_id=project.project_id,
-                profile_id=project.profile_id,
-                local_project_etag=project.etag,
-                local_project_intent_sha256=request_sha256,
-                core_project=core_project,
-                capabilities=capabilities,
-                revision_head=revision_head,
-                validation=validation,
-            )
+            return activation
         except BaseException as exc:
             try:
                 self._cleanup_failed_candidate(token, deadline=deadline)
@@ -1102,20 +1115,48 @@ class DesktopCoreBridgeV1:
                 raise _bridge_client_error(exc) from None
             raise
 
-    def commit_local_activation(self, project: local_v1.ProjectV1) -> None:
+    def commit_local_activation(
+        self,
+        project: local_v1.ProjectV1,
+        *,
+        activation: CoreActivationV1,
+    ) -> None:
         """Bind the durable post-activation Desktop projection to the live session."""
 
-        session, generation = self._session()
         deadline = time.monotonic() + self._timeout
-
-        def commit() -> None:
-            self._ensure_generation(session, generation)
-            self._ensure_local_activation_projection(session, project)
+        self._acquire_transition(deadline)
+        try:
+            session, generation = self._session()
             with self._lock:
                 self._ensure_generation(session, generation)
-                session.local_project_etag = project.etag
-
-        self._core_external(session.token, deadline, commit)
+                self._ensure_activation_acknowledgement(session, generation, activation)
+                self._ensure_local_activation_projection(session, project)
+                if project.etag == activation.local_project_etag:
+                    raise _bridge_error(
+                        "local_activation_source_etag_mismatch",
+                        "The durable Desktop activation did not advance its Local ETag.",
+                        status=409,
+                    )
+                if session.committed_local_project is None:
+                    if session.local_project_etag != activation.local_project_etag:
+                        raise _bridge_error(
+                            "local_activation_source_etag_mismatch",
+                            "The activation no longer owns the Local project ETag transition.",
+                            status=409,
+                        )
+                    session.local_project_etag = project.etag
+                    session.committed_local_project = project
+                elif (
+                    session.local_project_etag != project.etag
+                    or session.committed_local_project != project
+                ):
+                    raise _bridge_error(
+                        "local_activation_already_committed",
+                        "The activation was already acknowledged with a different result.",
+                        status=409,
+                    )
+        finally:
+            self._transition_lock.release()
 
     def deactivate_project(self, local_project_id: str) -> None:
         """Retire one published project session without closing the bridge."""
@@ -2626,6 +2667,24 @@ class DesktopCoreBridgeV1:
             raise _bridge_error(
                 "active_local_project_version_mismatch",
                 "The saved local project changed after this Core session was activated.",
+                status=409,
+            )
+
+    @staticmethod
+    def _ensure_activation_acknowledgement(
+        session: DesktopCoreActiveSessionV1,
+        generation: int,
+        activation: CoreActivationV1,
+    ) -> None:
+        if (
+            activation.generation != generation
+            or activation.generation != session.generation
+            or activation._authority is not session.activation._authority
+            or activation != session.activation
+        ):
+            raise _bridge_error(
+                "local_activation_acknowledgement_mismatch",
+                "The acknowledgement was not produced by the active project generation.",
                 status=409,
             )
 

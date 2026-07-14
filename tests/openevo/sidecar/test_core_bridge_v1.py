@@ -956,12 +956,12 @@ def test_durable_activation_projection_rebinds_the_live_local_etag() -> None:
         bridge.capabilities(committed)
     assert stale.value.error.code == "active_local_project_version_mismatch"
 
-    bridge.commit_local_activation(committed)
+    bridge.commit_local_activation(committed, activation=activation)
 
     assert bridge.capabilities(committed) == activation.capabilities
     assert bridge._active is not None
     assert bridge._active.local_project_etag == committed.etag
-    bridge.commit_local_activation(committed)
+    bridge.commit_local_activation(committed, activation=activation)
     bridge.close()
 
 
@@ -995,12 +995,103 @@ def test_local_activation_rebind_rejects_a_mismatched_projection(mutation: str) 
         committed = committed.model_copy(update={"state": "draft"})
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
-        bridge.commit_local_activation(committed)
+        bridge.commit_local_activation(committed, activation=activation)
 
     assert exc_info.value.error.code == "local_activation_projection_mismatch"
     assert bridge._active is not None
     assert bridge._active.local_project_etag == local_project.etag
     assert bridge.capabilities(local_project) == activation.capabilities
+    bridge.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["generation", "source_etag", "authority", "core_projection"],
+)
+def test_local_activation_acknowledgement_rejects_substituted_authority(
+    mutation: str,
+) -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    activation = bridge.activate_project(
+        local_project,
+        idempotency_key="activate-authority-binding-0001",
+    )
+    committed = _committed_local_activation(local_project, activation)
+    if mutation == "generation":
+        acknowledgement = replace(activation, generation=activation.generation + 1)
+    elif mutation == "source_etag":
+        acknowledgement = replace(activation, local_project_etag=ETAG_C)
+    elif mutation == "authority":
+        acknowledgement = replace(
+            activation,
+            _authority=bridge_module._CoreActivationAuthorityV1(),
+        )
+    else:
+        acknowledgement = replace(
+            activation,
+            core_project=activation.core_project.model_copy(
+                update={"etag": '"' + "d" * 64 + '"'}
+            ),
+        )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.commit_local_activation(committed, activation=acknowledgement)
+
+    assert exc_info.value.error.code == "local_activation_acknowledgement_mismatch"
+    assert bridge._active is not None
+    assert bridge._active.local_project_etag == local_project.etag
+    bridge.close()
+
+
+def test_local_activation_etag_cas_accepts_only_the_same_committed_retry() -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    activation = bridge.activate_project(
+        local_project,
+        idempotency_key="activate-local-cas-0001",
+    )
+    committed = _committed_local_activation(local_project, activation)
+
+    bridge.commit_local_activation(committed, activation=activation)
+    bridge.commit_local_activation(committed, activation=activation)
+
+    conflicting = committed.model_copy(update={"etag": ETAG_C})
+    with pytest.raises(DesktopCoreBridgeErrorV1) as conflict:
+        bridge.commit_local_activation(conflicting, activation=activation)
+    assert conflict.value.error.code == "local_activation_already_committed"
+
+    unadvanced = _committed_local_activation(local_project, activation, etag=ETAG_A)
+    with pytest.raises(DesktopCoreBridgeErrorV1) as source:
+        bridge.commit_local_activation(unadvanced, activation=activation)
+    assert source.value.error.code == "local_activation_source_etag_mismatch"
+    assert bridge._active is not None
+    assert bridge._active.local_project_etag == ETAG_B
+    bridge.close()
+
+
+def test_late_activation_acknowledgement_cannot_roll_back_a_new_session_etag() -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    old_activation = bridge.activate_project(
+        local_project,
+        idempotency_key="activate-before-late-ack-0001",
+    )
+    project_b = _committed_local_activation(local_project, old_activation, etag=ETAG_B)
+    new_activation = bridge.activate_project(
+        project_b,
+        idempotency_key="activate-before-late-ack-0002",
+    )
+    project_c = _committed_local_activation(project_b, new_activation, etag=ETAG_C)
+    bridge.commit_local_activation(project_c, activation=new_activation)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as stale:
+        bridge.commit_local_activation(project_b, activation=old_activation)
+
+    assert stale.value.error.code == "local_activation_acknowledgement_mismatch"
+    assert bridge._active is not None
+    assert bridge._active.local_project_etag == ETAG_C
+    assert bridge.capabilities(project_c) == new_activation.capabilities
     bridge.close()
 
 
@@ -3648,6 +3739,87 @@ def test_switch_and_close_seal_old_client_before_new_delivery(
     assert tunnels.handles[0].closed is True
     assert isinstance(result[0], DesktopCoreBridgeErrorV1)
     assert result[0].error.code == "active_project_session_superseded"
+
+
+@pytest.mark.parametrize("transition", ["deactivate", "close", "activate"])
+def test_activation_acknowledgement_is_linearized_with_session_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    transition: str,
+) -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    activation = bridge.activate_project(
+        local_project,
+        idempotency_key="activate-before-ack-race-0001",
+    )
+    committed = _committed_local_activation(local_project, activation)
+    old_session = bridge._active
+    assert old_session is not None
+    entered = threading.Event()
+    release = threading.Event()
+    original_projection_check = bridge._ensure_local_activation_projection
+
+    def blocked_projection_check(
+        session: bridge_module.DesktopCoreActiveSessionV1,
+        project: local_v1.ProjectV1,
+    ) -> None:
+        entered.set()
+        assert release.wait(timeout=2)
+        original_projection_check(session, project)
+
+    monkeypatch.setattr(
+        bridge,
+        "_ensure_local_activation_projection",
+        blocked_projection_check,
+    )
+    acknowledgement_result: list[object] = []
+    transition_result: list[object] = []
+
+    def acknowledge() -> None:
+        try:
+            bridge.commit_local_activation(committed, activation=activation)
+            acknowledgement_result.append("committed")
+        except BaseException as exc:
+            acknowledgement_result.append(exc)
+
+    def run_transition() -> None:
+        try:
+            if transition == "deactivate":
+                bridge.deactivate_project(local_project.project_id)
+                transition_result.append("deactivated")
+            elif transition == "close":
+                bridge.close()
+                transition_result.append("closed")
+            else:
+                transition_result.append(
+                    bridge.activate_project(
+                        committed,
+                        idempotency_key="activate-during-ack-race-0002",
+                    )
+                )
+        except BaseException as exc:
+            transition_result.append(exc)
+
+    acknowledgement_thread = threading.Thread(target=acknowledge)
+    acknowledgement_thread.start()
+    assert entered.wait(timeout=1)
+    transition_thread = threading.Thread(target=run_transition)
+    transition_thread.start()
+    time.sleep(0.05)
+    assert transition_thread.is_alive()
+    release.set()
+    acknowledgement_thread.join(timeout=2)
+    transition_thread.join(timeout=2)
+
+    assert acknowledgement_result == ["committed"]
+    assert old_session.local_project_etag == ETAG_B
+    assert old_session.committed_local_project == committed
+    assert not isinstance(transition_result[0], BaseException)
+    if transition == "activate":
+        assert isinstance(transition_result[0], bridge_module.CoreActivationV1)
+        assert bridge._active is not None
+        assert bridge._active.local_project_etag == ETAG_B
+        bridge.close()
 
 
 def test_new_activation_retires_an_inflight_candidate_before_starting_core_work() -> None:
