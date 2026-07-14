@@ -18,7 +18,10 @@ from desktop.sidecar.core_bridge_v1 import (
     CoreProjectCreateOperationV1,
     CoreProjectCreateStateV1,
     CoreProjectMappingV1,
+    CoreProjectPatchOperationV1,
+    CoreProjectPatchStateV1,
     CoreTunnelHandleV1,
+    CoreWorkspaceUploadAbortStateV1,
     DesktopCoreBridgeErrorV1,
     DesktopCoreBridgeV1,
     map_project_create_v1,
@@ -245,6 +248,7 @@ class FakePersistence:
         self.operation: CoreProjectCreateOperationV1 | None = None
         self.mapping: CoreProjectMappingV1 | None = None
         self.mapping_history: list[CoreProjectMappingV1] = []
+        self.patch_operation: CoreProjectPatchOperationV1 | None = None
         self.events: list[str] = []
         self.fail_commit_once = False
         self.block_commit = False
@@ -258,6 +262,10 @@ class FakePersistence:
     def load_create(self, local_project_id: str) -> CoreProjectCreateOperationV1 | None:
         assert local_project_id == LOCAL_PROJECT_ID
         return self.operation
+
+    def load_patch(self, local_project_id: str) -> CoreProjectPatchOperationV1 | None:
+        assert local_project_id == LOCAL_PROJECT_ID
+        return self.patch_operation
 
     def reserve_create(
         self, operation: CoreProjectCreateOperationV1
@@ -297,11 +305,43 @@ class FakePersistence:
         return self.operation
 
     def update_create(
-        self, operation: CoreProjectCreateOperationV1
+        self,
+        operation: CoreProjectCreateOperationV1,
+        *,
+        expected_previous: CoreProjectCreateOperationV1,
     ) -> CoreProjectCreateOperationV1:
         self.events.append("update_create")
+        assert self.operation == expected_previous
         self.operation = operation
         return operation
+
+    def reserve_patch(self, operation: CoreProjectPatchOperationV1) -> CoreProjectPatchOperationV1:
+        self.events.append("reserve_patch")
+        if self.patch_operation is None:
+            self.patch_operation = operation
+        return self.patch_operation
+
+    def mark_patch_unknown(
+        self, operation: CoreProjectPatchOperationV1
+    ) -> CoreProjectPatchOperationV1:
+        self.events.append("mark_patch_unknown")
+        assert self.patch_operation == operation
+        self.patch_operation = replace(operation, state=CoreProjectPatchStateV1.UNKNOWN)
+        return self.patch_operation
+
+    def record_patch_applied(
+        self,
+        operation: CoreProjectPatchOperationV1,
+        outcome: core_v1.ProjectV1,
+    ) -> CoreProjectPatchOperationV1:
+        self.events.append("record_patch_applied")
+        assert self.patch_operation == operation
+        self.patch_operation = replace(
+            operation,
+            state=CoreProjectPatchStateV1.APPLIED,
+            outcome=outcome,
+        )
+        return self.patch_operation
 
     def commit_mapping(
         self,
@@ -309,6 +349,7 @@ class FakePersistence:
         mapping: CoreProjectMappingV1,
         *,
         expected_previous: CoreProjectMappingV1 | None,
+        completed_patch: CoreProjectPatchOperationV1 | None,
     ) -> None:
         self.events.append("commit_mapping")
         if self.block_commit:
@@ -319,6 +360,10 @@ class FakePersistence:
         if self.fail_commit_once:
             self.fail_commit_once = False
             raise RuntimeError("injected mapping commit failure")
+        if completed_patch is not None:
+            assert self.patch_operation == completed_patch
+            assert completed_patch.state is CoreProjectPatchStateV1.APPLIED
+            self.patch_operation = None
         self.operation = operation
         self.mapping = mapping
         self.mapping_history.append(mapping)
@@ -373,7 +418,12 @@ class FakeCore:
         self.lose_create_response_once = False
         self.lose_patch_before_apply_once = False
         self.lose_patch_after_apply_once = False
+        self.lose_finalize_before_apply_once = False
+        self.lose_abort_after_apply_once = False
         self.upload: core_v1.WorkspaceUploadSessionV1 | None = None
+        self.uploads: dict[str, core_v1.WorkspaceUploadSessionV1] = {}
+        self.abort_requests: list[tuple[str, core_v1.WorkspaceUploadAbortV1, str, str]] = []
+        self.abort_replays: dict[str, core_v1.WorkspaceUploadSessionV1] = {}
         self.head = _head()
         self.block_method: str | None = None
         self.block_path: str | None = None
@@ -381,6 +431,8 @@ class FakeCore:
         self.block_release = threading.Event()
         self.block_once = True
         self.patch_requests: list[tuple[core_v1.ProjectPatchV1, str, str]] = []
+        self.patch_apply_count = 0
+        self.patch_replays: dict[str, core_v1.ProjectV1] = {}
         self.upload_count = 0
         self.project_snapshot = READY_PROJECT_SNAPSHOT
         self.task_snapshot = TASK_SNAPSHOT
@@ -404,9 +456,7 @@ class FakeCore:
                 return httpx.Response(503, json=_core_error())
             return httpx.Response(
                 200,
-                json=_capabilities(
-                    registry_digest=self.registry_digest
-                ).model_dump(mode="json"),
+                json=_capabilities(registry_digest=self.registry_digest).model_dump(mode="json"),
             )
         if path == "/v1/projects" and request.method == "POST":
             assert "Idempotency-Key" in request.headers
@@ -428,10 +478,15 @@ class FakeCore:
                         request.headers["Idempotency-Key"],
                     )
                 )
+                replay = self.patch_replays.get(request.headers["Idempotency-Key"])
+                if replay is not None:
+                    return httpx.Response(200, json=replay.model_dump(mode="json"))
                 if self.lose_patch_before_apply_once:
                     self.lose_patch_before_apply_once = False
                     raise httpx.ReadError("patch response lost", request=request)
                 prior = self.request
+                self.patch_apply_count += 1
+                patch_digest_char = f"{(7 + self.patch_apply_count) % 16:x}"
                 self.request = core_v1.ProjectCreateV1(
                     name=patch.name if patch.name is not None else prior.name,
                     description=(
@@ -446,37 +501,45 @@ class FakeCore:
                     ),
                 )
                 self.project_snapshot = _snapshot(
-                    "project-snapshot-patched", core_v1.SnapshotKind.PROJECT, "8"
+                    f"project-snapshot-patched-{self.patch_apply_count}",
+                    core_v1.SnapshotKind.PROJECT,
+                    patch_digest_char,
                 )
                 if self.request.task != prior.task:
                     self.task_snapshot = _snapshot(
-                        "task-snapshot-patched", core_v1.SnapshotKind.TASK, "9"
+                        f"task-snapshot-patched-{self.patch_apply_count}",
+                        core_v1.SnapshotKind.TASK,
+                        patch_digest_char,
                     )
                 if self.request.workspace != prior.workspace:
                     self.workspace_snapshot = _snapshot(
-                        "workspace-snapshot-patched", core_v1.SnapshotKind.WORKSPACE, "a"
+                        f"workspace-snapshot-patched-{self.patch_apply_count}",
+                        core_v1.SnapshotKind.WORKSPACE,
+                        patch_digest_char,
                     )
                     self.upload = None
-                self.project_etag = '"' + "e" * 64 + '"'
+                self.project_etag = '"' + patch_digest_char * 64 + '"'
                 imported_patch = isinstance(
                     self.request.workspace, core_v1.ImportedWorkspaceSpecV1
                 )
+                patched_project = _project(
+                    self.request,
+                    ready=not imported_patch,
+                    project_snapshot=self.project_snapshot,
+                    task_snapshot=self.task_snapshot,
+                    workspace_snapshot=self.workspace_snapshot,
+                    etag=self.project_etag,
+                    active_revision=self.active_revision,
+                    registry_digest=self.registry_digest,
+                    updated_at=self.project_updated_at,
+                )
+                self.patch_replays[request.headers["Idempotency-Key"]] = patched_project
                 if self.lose_patch_after_apply_once:
                     self.lose_patch_after_apply_once = False
                     raise httpx.ReadError("patch response lost", request=request)
                 return httpx.Response(
                     200,
-                    json=_project(
-                        self.request,
-                        ready=not imported_patch,
-                        project_snapshot=self.project_snapshot,
-                        task_snapshot=self.task_snapshot,
-                        workspace_snapshot=self.workspace_snapshot,
-                        etag=self.project_etag,
-                        active_revision=self.active_revision,
-                        registry_digest=self.registry_digest,
-                        updated_at=self.project_updated_at,
-                    ).model_dump(mode="json"),
+                    json=patched_project.model_dump(mode="json"),
                 )
             imported = isinstance(self.request.workspace, core_v1.ImportedWorkspaceSpecV1)
             published = (
@@ -506,11 +569,12 @@ class FakeCore:
                 project_snapshot=self.project_snapshot,
                 project_etag=self.project_etag,
             )
+            self.uploads[self.upload.id] = self.upload
             return httpx.Response(201, json=self.upload.model_dump(mode="json"))
         if "/workspace-uploads/" in path and request.method == "GET":
-            assert self.upload is not None
-            assert path.endswith(f"/workspace-uploads/{self.upload.id}")
-            return httpx.Response(200, json=self.upload.model_dump(mode="json"))
+            upload_id = path.rsplit("/", 1)[-1]
+            upload = self.uploads[upload_id]
+            return httpx.Response(200, json=upload.model_dump(mode="json"))
         if path.endswith("/chunk") and "/workspace-uploads/" in path:
             assert self.upload is not None
             assert path.endswith(f"/workspace-uploads/{self.upload.id}/chunk")
@@ -524,10 +588,14 @@ class FakeCore:
                     "etag": ETAG_C,
                 }
             )
+            self.uploads[self.upload.id] = self.upload
             return httpx.Response(200, json=self.upload.model_dump(mode="json"))
         if path.endswith("/finalize") and "/workspace-uploads/" in path:
             assert self.upload is not None
             assert path.endswith(f"/workspace-uploads/{self.upload.id}/finalize")
+            if self.lose_finalize_before_apply_once:
+                self.lose_finalize_before_apply_once = False
+                raise httpx.ReadError("finalize response lost", request=request)
             if self.upload_count == 1:
                 self.project_snapshot = _snapshot(
                     "project-snapshot-finalized", core_v1.SnapshotKind.PROJECT, "b"
@@ -559,6 +627,7 @@ class FakeCore:
                 }
             )
             self.upload = finalized_upload
+            self.uploads[finalized_upload.id] = finalized_upload
             return httpx.Response(
                 201,
                 json=core_v1.WorkspaceUploadFinalizeResponseV1(
@@ -568,6 +637,38 @@ class FakeCore:
                     project=published,
                 ).model_dump(mode="json"),
             )
+        if path.endswith("/abort") and "/workspace-uploads/" in path:
+            upload_id = path.rsplit("/", 2)[-2]
+            abort_request = core_v1.WorkspaceUploadAbortV1.model_validate_json(
+                request.content, strict=True
+            )
+            self.abort_requests.append(
+                (
+                    upload_id,
+                    abort_request,
+                    request.headers["If-Match"],
+                    request.headers["Idempotency-Key"],
+                )
+            )
+            replay = self.abort_replays.get(request.headers["Idempotency-Key"])
+            if replay is not None:
+                return httpx.Response(200, json=replay.model_dump(mode="json"))
+            upload = self.uploads[upload_id]
+            assert upload.status is core_v1.WorkspaceUploadStatus.OPEN
+            assert request.headers["If-Match"] == upload.etag
+            aborted = upload.model_copy(
+                update={
+                    "status": core_v1.WorkspaceUploadStatus.ABORTED,
+                    "updated_at": "2026-07-14T12:00:03Z",
+                    "etag": '"' + "1" * 64 + '"',
+                }
+            )
+            self.uploads[upload_id] = aborted
+            self.abort_replays[request.headers["Idempotency-Key"]] = aborted
+            if self.lose_abort_after_apply_once:
+                self.lose_abort_after_apply_once = False
+                raise httpx.ReadError("abort response lost", request=request)
+            return httpx.Response(200, json=aborted.model_dump(mode="json"))
         if path.endswith("/revisions/head"):
             return httpx.Response(200, json=self.head.model_dump(mode="json"))
         if path.endswith("/validate"):
@@ -1185,6 +1286,89 @@ def test_imported_workspace_patch_uses_a_new_snapshot_bound_upload() -> None:
     )
 
 
+def test_unfinalized_import_patch_aborts_stale_upload_and_only_finalizes_new_workspace() -> None:
+    original = _local_project(imported=True)
+    persistence = FakePersistence()
+    fake_core = FakeCore(original)
+    first, _, _, _ = _bridge(
+        original,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(b"\2" * 1024),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        first.activate_project(original, idempotency_key="draft-import-a-0001")
+
+    assert exc_info.value.error.code == "workspace_archive_mismatch"
+    assert persistence.mapping is None
+    assert persistence.operation is not None
+    assert persistence.operation.workspace_upload_id == "upload-1"
+    assert fake_core.uploads["upload-1"].status is core_v1.WorkspaceUploadStatus.OPEN
+    assert not any(request.url.path.endswith("/finalize") for request in fake_core.calls)
+
+    archive_b = b"\1" * 1024
+    source_b = local_v1.ProjectSourceV1(
+        kind="native_folder_snapshot",
+        display_name="Imported workspace B",
+        import_ref=local_v1.WorkspaceImportRefV1(
+            import_id="adopted-import-b",
+            content_sha256=hashlib.sha256(archive_b).hexdigest(),
+            byte_size=len(archive_b),
+            entry_count=0,
+            extracted_byte_size=0,
+        ),
+    )
+    modified = original.model_copy(
+        update={"source": source_b, "updated_at": "2026-07-14T12:30:00Z"}
+    )
+    fake_core.lose_abort_after_apply_once = True
+    second, _, _, _ = _bridge(
+        modified,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive_b),
+    )
+
+    with pytest.raises(CoreClientErrorV1):
+        second.activate_project(modified, idempotency_key="draft-import-b-0002")
+
+    assert fake_core.uploads["upload-1"].status is core_v1.WorkspaceUploadStatus.ABORTED
+    assert persistence.operation is not None
+    assert persistence.operation.workspace_upload_abort is not None
+    assert (
+        persistence.operation.workspace_upload_abort.state
+        is CoreWorkspaceUploadAbortStateV1.UNKNOWN
+    )
+    third, _, _, _ = _bridge(
+        modified,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive_b),
+    )
+    activation = third.activate_project(
+        modified,
+        idempotency_key="draft-import-b-retry-0003",
+    )
+
+    assert len(fake_core.abort_requests) == 2
+    assert fake_core.abort_requests[0] == fake_core.abort_requests[1]
+    assert fake_core.upload_count == 2
+    finalize_paths = [
+        request.url.path
+        for request in fake_core.calls
+        if request.method == "POST" and request.url.path.endswith("/finalize")
+    ]
+    assert finalize_paths == [
+        f"/v1/projects/{CORE_PROJECT_ID}/workspace-uploads/upload-2/finalize"
+    ]
+    assert activation.core_project.workspace == map_project_create_v1(modified).workspace
+    assert activation.core_project.workspace_publication is not None
+    assert persistence.mapping is not None
+    assert persistence.mapping.project_create == map_project_create_v1(modified)
+    assert persistence.operation.workspace_upload_abort is None
+
+
 def test_unknown_patch_outcome_replays_the_exact_versioned_request_key() -> None:
     original = _local_project()
     bridge, persistence, fake_core, _ = _bridge(original)
@@ -1221,7 +1405,7 @@ def test_unknown_patch_outcome_replays_the_exact_versioned_request_key() -> None
     assert persistence.mapping.request_sha256 != original_mapping.request_sha256
 
 
-def test_unknown_patch_outcome_already_applied_is_reconciled_without_duplicate_patch() -> None:
+def test_unknown_patch_outcome_already_applied_is_replayed_exactly() -> None:
     original = _local_project()
     bridge, persistence, fake_core, _ = _bridge(original)
     bridge.activate_project(original, idempotency_key="applied-patch-base-0001")
@@ -1246,11 +1430,95 @@ def test_unknown_patch_outcome_already_applied_is_reconciled_without_duplicate_p
         idempotency_key="applied-patch-action-0002",
     )
 
-    assert len(fake_core.patch_requests) == 1
+    assert len(fake_core.patch_requests) == 2
+    assert fake_core.patch_requests[0] == fake_core.patch_requests[1]
+    assert fake_core.patch_apply_count == 1
     assert activation.core_project.spec == map_project_create_v1(modified).spec
     assert persistence.mapping is not None
     assert persistence.mapping.mapping_generation == 2
     assert persistence.mapping.predecessor_request_sha256 == original_mapping.request_sha256
+
+
+def test_patch_commit_crash_adopts_applied_a_before_patching_new_local_b() -> None:
+    original = _local_project()
+    first, persistence, fake_core, _ = _bridge(original)
+    first.activate_project(original, idempotency_key="patch-chain-o-0001")
+    first.close()
+    mapping_o = persistence.mapping
+    assert mapping_o is not None
+
+    edited_a = original.model_copy(
+        update={
+            "task": local_v1.ProjectTaskV1(
+                title="Patch A",
+                objective="First durable edit.",
+            ),
+            "updated_at": "2026-07-14T12:40:00Z",
+        }
+    )
+    persistence.fail_commit_once = True
+    second, _, _, _ = _bridge(
+        edited_a,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        second.activate_project(edited_a, idempotency_key="patch-chain-a-0002")
+
+    assert exc_info.value.error.code == "core_bridge_adapter_failed"
+    assert persistence.mapping == mapping_o
+    assert persistence.patch_operation is not None
+    assert persistence.patch_operation.state is CoreProjectPatchStateV1.APPLIED
+    assert persistence.patch_operation.new_project_create == map_project_create_v1(edited_a)
+    assert fake_core.request == map_project_create_v1(edited_a)
+    assert len(fake_core.patch_requests) == 1
+
+    edited_b = edited_a.model_copy(
+        update={
+            "task": local_v1.ProjectTaskV1(
+                title="Patch B",
+                objective="Second durable edit after A commit recovery.",
+            ),
+            "updated_at": "2026-07-14T12:41:00Z",
+        }
+    )
+    third, _, _, _ = _bridge(
+        edited_b,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    activation = third.activate_project(
+        edited_b,
+        idempotency_key="patch-chain-b-0003",
+    )
+
+    assert len(fake_core.patch_requests) == 2
+    patch_a, _, key_a = fake_core.patch_requests[0]
+    patch_b, _, key_b = fake_core.patch_requests[1]
+    assert patch_a.task == map_project_create_v1(edited_a).task
+    assert patch_b.task == map_project_create_v1(edited_b).task
+    assert key_a != key_b
+    assert (
+        len(
+            [
+                request
+                for request in fake_core.calls
+                if request.method == "POST" and request.url.path == "/v1/projects"
+            ]
+        )
+        == 1
+    )
+    assert activation.core_project.task == map_project_create_v1(edited_b).task
+    assert persistence.mapping is not None
+    assert persistence.mapping.project_create == map_project_create_v1(edited_b)
+    assert persistence.mapping.mapping_generation == mapping_o.mapping_generation + 2
+    assert persistence.patch_operation is None
+    assert [mapping.project_create for mapping in persistence.mapping_history] == [
+        map_project_create_v1(original),
+        map_project_create_v1(edited_a),
+        map_project_create_v1(edited_b),
+    ]
 
 
 def test_core_503_is_preserved_without_synthetic_capability_success() -> None:
@@ -1571,6 +1839,63 @@ def test_tunnel_close_timeout_boundary_consumes_a_completed_success(
     assert handle.closed is True
     assert handle.close_failure is None
     assert attempts == 1
+
+
+def test_tunnel_close_deadline_after_submit_retains_and_reuses_the_same_future(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback_attempts = 0
+    submit_attempts = 0
+    submitted: list[tuple[Future[None], object]] = []
+    remaining_calls = 0
+
+    def close_callback() -> None:
+        nonlocal callback_attempts
+        callback_attempts += 1
+
+    def submit(action):
+        nonlocal submit_attempts
+        submit_attempts += 1
+        future: Future[None] = Future()
+        submitted.append((future, action))
+        return future
+
+    def remaining(_deadline: float) -> float:
+        nonlocal remaining_calls
+        remaining_calls += 1
+        if remaining_calls == 1:
+            raise bridge_module._bridge_error(
+                "desktop_core_bridge_deadline_exceeded",
+                "The Desktop Core bridge operation deadline expired.",
+                retryable=True,
+            )
+        return 1.0
+
+    monkeypatch.setattr(bridge_module._ADAPTER_EXECUTOR, "submit", submit)
+    monkeypatch.setattr(bridge_module, "_remaining_seconds", remaining)
+    handle = CoreTunnelHandleV1(
+        endpoint="http://127.0.0.1:48767",
+        session_id="session-close-post-submit-deadline",
+        close_callback=close_callback,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        handle.close(deadline=1.0)
+
+    assert exc_info.value.error.code == "desktop_core_bridge_deadline_exceeded"
+    assert handle.closed is False
+    assert handle.close_failure == "deadline_exceeded"
+    assert submit_attempts == 1
+    future, action = submitted[0]
+    action()
+    future.set_result(None)
+
+    handle.close(deadline=2.0)
+
+    assert handle.closed is True
+    assert handle.close_failure is None
+    assert submit_attempts == 1
+    assert callback_attempts == 1
 
 
 def test_bridge_close_is_bounded_and_not_announced_until_tunnel_closes() -> None:

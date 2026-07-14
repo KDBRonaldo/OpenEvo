@@ -221,7 +221,13 @@ class CoreTunnelHandleV1:
                 if token is not None:
                     token.track_future(future)
         try:
-            future.result(timeout=_remaining_seconds(deadline))
+            wait_timeout = _remaining_seconds(deadline)
+        except DesktopCoreBridgeErrorV1:
+            with self._lock:
+                self._close_failure = "deadline_exceeded"
+            raise
+        try:
+            future.result(timeout=wait_timeout)
         except FutureTimeoutError:
             if future.done():
                 try:
@@ -294,6 +300,26 @@ class CoreProjectCreateStateV1(StrEnum):
     BOUND = "bound"
 
 
+class CoreWorkspaceUploadAbortStateV1(StrEnum):
+    PRE_ABORT = "pre_abort"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class CoreWorkspaceUploadAbortOperationV1:
+    upload: core_v1.WorkspaceUploadSessionV1
+    request_sha256: str
+    request: core_v1.WorkspaceUploadAbortV1
+    idempotency_key: str
+    state: CoreWorkspaceUploadAbortStateV1 = CoreWorkspaceUploadAbortStateV1.PRE_ABORT
+
+    def __post_init__(self) -> None:
+        if self.upload.status is not core_v1.WorkspaceUploadStatus.OPEN:
+            raise ValueError("a durable abort operation must retain the open upload authority")
+        if _model_digest(self.request) != self.request_sha256:
+            raise ValueError("workspace abort request digest does not match canonical request")
+
+
 @dataclass(frozen=True, slots=True)
 class CoreProjectCreateOperationV1:
     local_project_id: str
@@ -306,6 +332,7 @@ class CoreProjectCreateOperationV1:
     core_project_id: str | None = None
     workspace_upload_id: str | None = None
     workspace_upload_project_snapshot: core_v1.ImmutableSnapshotRefV1 | None = None
+    workspace_upload_abort: CoreWorkspaceUploadAbortOperationV1 | None = None
 
     def __post_init__(self) -> None:
         if _model_digest(self.project_create) != self.request_sha256:
@@ -314,6 +341,68 @@ class CoreProjectCreateOperationV1:
             raise ValueError("only a bound create operation has a Core project ID")
         if (self.workspace_upload_id is None) != (self.workspace_upload_project_snapshot is None):
             raise ValueError("workspace upload ID and project snapshot must be paired")
+        if self.workspace_upload_abort is not None and (
+            self.workspace_upload_id != self.workspace_upload_abort.upload.id
+            or self.workspace_upload_project_snapshot
+            != self.workspace_upload_abort.upload.project_snapshot
+            or self.core_project_id != self.workspace_upload_abort.upload.project_id
+        ):
+            raise ValueError("workspace abort authority must match the bound upload")
+
+
+class CoreProjectPatchStateV1(StrEnum):
+    PRE_PATCH = "pre_patch"
+    UNKNOWN = "unknown"
+    APPLIED = "applied"
+
+
+@dataclass(frozen=True, slots=True)
+class CoreProjectPatchOperationV1:
+    local_project_id: str
+    profile_id: str
+    core_host_identity: str
+    core_project_id: str
+    old_request_sha256: str
+    old_project_create: core_v1.ProjectCreateV1
+    new_request_sha256: str
+    new_project_create: core_v1.ProjectCreateV1
+    patch_request_sha256: str
+    patch: core_v1.ProjectPatchV1
+    idempotency_key: str
+    base_project: core_v1.ProjectV1
+    state: CoreProjectPatchStateV1 = CoreProjectPatchStateV1.PRE_PATCH
+    outcome: core_v1.ProjectV1 | None = None
+
+    def __post_init__(self) -> None:
+        if _model_digest(self.old_project_create) != self.old_request_sha256:
+            raise ValueError("old project intent digest does not match canonical request")
+        if _model_digest(self.new_project_create) != self.new_request_sha256:
+            raise ValueError("new project intent digest does not match canonical request")
+        if _model_digest(self.patch) != self.patch_request_sha256:
+            raise ValueError("project patch digest does not match canonical request")
+        expected_patch = core_v1.ProjectPatchV1(
+            name=self.new_project_create.name,
+            description=self.new_project_create.description,
+            spec=self.new_project_create.spec,
+            task=self.new_project_create.task,
+            workspace=self.new_project_create.workspace,
+        )
+        if self.patch != expected_patch:
+            raise ValueError("project patch is not the canonical new Local intent")
+        if self.old_request_sha256 == self.new_request_sha256:
+            raise ValueError("a project patch must change canonical Local intent")
+        if self.base_project.id != self.core_project_id:
+            raise ValueError("project patch base authority belongs to another project")
+        if not _project_identity_matches(self.base_project, self.old_project_create):
+            raise ValueError("project patch base authority does not match old Local intent")
+        if (self.state is CoreProjectPatchStateV1.APPLIED) != (self.outcome is not None):
+            raise ValueError("only an applied project patch has a durable outcome")
+        if self.outcome is not None and self.outcome.id != self.core_project_id:
+            raise ValueError("project patch outcome belongs to another project")
+        if self.outcome is not None and not _project_identity_matches(
+            self.outcome, self.new_project_create
+        ):
+            raise ValueError("project patch outcome does not match new Local intent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,18 +431,28 @@ class CoreProjectMappingV1:
 
 
 class DesktopCoreBridgePersistence(Protocol):
-    """Durable callback boundary with atomic create transitions and mapping CAS.
+    """Durable callback boundary for create, patch, upload, and mapping state.
 
     A pre-create reservation may be replaced by a later Local action. Unknown
     outcomes require the exact request and key. A bound operation preserves its
     original canonical request and Core project identity while later Local
-    intent converges through patching. Mapping commits compare the complete
-    previous mapping and retain ordered audit history without lost updates.
+    intent converges through patching. Create updates compare the complete prior
+    operation, including upload/abort authority.
+
+    One patch operation may be pending per Local project. Reservation must not
+    replace a different pending operation. The pre-patch -> unknown -> applied
+    transitions are exact full-row CAS operations; applied stores the complete
+    validated Core outcome. Mapping commit compares the complete previous
+    mapping, appends ordered audit history, and atomically removes only the
+    supplied matching applied patch. A failed transaction leaves both the old
+    mapping and pending patch unchanged for recovery.
     """
 
     def load_mapping(self, local_project_id: str) -> CoreProjectMappingV1 | None: ...
 
     def load_create(self, local_project_id: str) -> CoreProjectCreateOperationV1 | None: ...
+
+    def load_patch(self, local_project_id: str) -> CoreProjectPatchOperationV1 | None: ...
 
     def reserve_create(
         self, operation: CoreProjectCreateOperationV1
@@ -370,8 +469,25 @@ class DesktopCoreBridgePersistence(Protocol):
     ) -> CoreProjectCreateOperationV1: ...
 
     def update_create(
-        self, operation: CoreProjectCreateOperationV1
+        self,
+        operation: CoreProjectCreateOperationV1,
+        *,
+        expected_previous: CoreProjectCreateOperationV1,
     ) -> CoreProjectCreateOperationV1: ...
+
+    def reserve_patch(
+        self, operation: CoreProjectPatchOperationV1
+    ) -> CoreProjectPatchOperationV1: ...
+
+    def mark_patch_unknown(
+        self, operation: CoreProjectPatchOperationV1
+    ) -> CoreProjectPatchOperationV1: ...
+
+    def record_patch_applied(
+        self,
+        operation: CoreProjectPatchOperationV1,
+        outcome: core_v1.ProjectV1,
+    ) -> CoreProjectPatchOperationV1: ...
 
     def commit_mapping(
         self,
@@ -379,6 +495,7 @@ class DesktopCoreBridgePersistence(Protocol):
         mapping: CoreProjectMappingV1,
         *,
         expected_previous: CoreProjectMappingV1 | None,
+        completed_patch: CoreProjectPatchOperationV1 | None,
     ) -> None: ...
 
 
@@ -627,8 +744,82 @@ class DesktopCoreBridgeV1:
                 lambda: client.capabilities(create_request.spec.execution_mode),
             )
             core_project = self._core_external(token, deadline, client.get_project)
-            if mapping is not None:
-                core_project = self._reconcile_mapped_project(
+            pending_patch = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.load_patch(project.project_id),
+                label="project patch operation read",
+            )
+            completed_patch: CoreProjectPatchOperationV1 | None = None
+            recovered_requested_patch = False
+            if pending_patch is not None:
+                _ensure_patch_operation_authority(
+                    pending_patch,
+                    project,
+                    operation=operation,
+                    mapping=mapping,
+                    core_host_identity=attachment.bearer_identity,
+                )
+                core_project, pending_patch = self._resume_project_patch(
+                    token=token,
+                    deadline=deadline,
+                    client=client,
+                    current=core_project,
+                    operation=pending_patch,
+                )
+                completed_patch = pending_patch
+                recovered_requested_patch = pending_patch.new_request_sha256 == request_sha256
+                if pending_patch.new_request_sha256 != request_sha256:
+                    self._ensure_project_ready(core_project, capabilities)
+                    recovered_head = self._core_external(token, deadline, client.revision_head)
+                    if recovered_head.active_revision != core_project.active_revision:
+                        raise _bridge_error(
+                            "core_project_revision_mismatch",
+                            "Core project and revision head disagree.",
+                        )
+                    recovered_validation = self._validate_current(
+                        token,
+                        deadline,
+                        client,
+                        core_project,
+                        capabilities,
+                        idempotency_key=_derived_key(
+                            pending_patch.idempotency_key, "recover-validate"
+                        ),
+                    )
+                    if not recovered_validation.valid:
+                        raise _bridge_error(
+                            "core_project_validation_failed",
+                            "Core rejected the recovered project configuration.",
+                            status=422,
+                        )
+                    recovered_mapping = _mapping_from_request(
+                        local_project_id=project.project_id,
+                        profile_id=project.profile_id,
+                        request=pending_patch.new_project_create,
+                        request_sha256=pending_patch.new_request_sha256,
+                        project=core_project,
+                        capabilities=capabilities,
+                        core_host_identity=attachment.bearer_identity,
+                        previous_mapping=mapping,
+                    )
+                    self._adapter_external(
+                        token,
+                        deadline,
+                        lambda: self._persistence.commit_mapping(
+                            operation,
+                            recovered_mapping,
+                            expected_previous=mapping,
+                            completed_patch=pending_patch,
+                        ),
+                        label="recovered project patch mapping commit",
+                    )
+                    mapping = recovered_mapping
+                    completed_patch = None
+            if recovered_requested_patch:
+                pass
+            elif mapping is not None:
+                core_project, new_patch = self._reconcile_mapped_project(
                     token=token,
                     deadline=deadline,
                     client=client,
@@ -636,9 +827,11 @@ class DesktopCoreBridgeV1:
                     current=core_project,
                     requested=create_request,
                     request_sha256=request_sha256,
+                    core_host_identity=attachment.bearer_identity,
                 )
+                completed_patch = new_patch or completed_patch
             elif operation.request_sha256 != request_sha256:
-                core_project = self._reconcile_bound_project(
+                core_project, new_patch = self._reconcile_bound_project(
                     token=token,
                     deadline=deadline,
                     client=client,
@@ -646,7 +839,9 @@ class DesktopCoreBridgeV1:
                     current=core_project,
                     requested=create_request,
                     request_sha256=request_sha256,
+                    core_host_identity=attachment.bearer_identity,
                 )
+                completed_patch = new_patch or completed_patch
             else:
                 _ensure_project_identity(core_project, create_request)
             if isinstance(create_request.workspace, core_v1.ImportedWorkspaceSpecV1) and (
@@ -697,6 +892,7 @@ class DesktopCoreBridgeV1:
                         operation,
                         completed_mapping,
                         expected_previous=mapping,
+                        completed_patch=completed_patch,
                     ),
                     label="project mapping commit",
                 )
@@ -1376,15 +1572,19 @@ class DesktopCoreBridgeV1:
         current: core_v1.ProjectV1,
         requested: core_v1.ProjectCreateV1,
         request_sha256: str,
-    ) -> core_v1.ProjectV1:
+        core_host_identity: str,
+    ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1 | None]:
         if mapping.request_sha256 == request_sha256:
             _ensure_project_identity(current, requested)
             _ensure_mapping_content_snapshots(mapping, current)
-            return current
+            return current, None
 
         if _project_identity_matches(current, requested):
-            _ensure_mapping_was_versioned(mapping, current, requested)
-            return current
+            raise _bridge_error(
+                "core_project_patch_proof_missing",
+                "Core matches edited Local intent without a durable patch operation.",
+                status=409,
+            )
 
         _ensure_mapping_content_snapshots(mapping, current)
         _ensure_project_identity(current, mapping.project_create)
@@ -1394,9 +1594,11 @@ class DesktopCoreBridgeV1:
             client=client,
             current=current,
             requested=requested,
-            previous_request_sha256=mapping.request_sha256,
-            request_sha256=request_sha256,
+            previous_request=mapping.project_create,
+            requested_request_sha256=request_sha256,
             local_project_id=mapping.local_project_id,
+            profile_id=mapping.profile_id,
+            core_host_identity=core_host_identity,
         )
 
     def _reconcile_bound_project(
@@ -1409,9 +1611,14 @@ class DesktopCoreBridgeV1:
         current: core_v1.ProjectV1,
         requested: core_v1.ProjectCreateV1,
         request_sha256: str,
-    ) -> core_v1.ProjectV1:
+        core_host_identity: str,
+    ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1 | None]:
         if _project_identity_matches(current, requested):
-            return current
+            raise _bridge_error(
+                "core_project_patch_proof_missing",
+                "Core matches edited Local intent without a durable patch operation.",
+                status=409,
+            )
         _ensure_project_identity(current, operation.project_create)
         return self._patch_current_project(
             token=token,
@@ -1419,9 +1626,11 @@ class DesktopCoreBridgeV1:
             client=client,
             current=current,
             requested=requested,
-            previous_request_sha256=operation.request_sha256,
-            request_sha256=request_sha256,
+            previous_request=operation.project_create,
+            requested_request_sha256=request_sha256,
             local_project_id=operation.local_project_id,
+            profile_id=operation.profile_id,
+            core_host_identity=core_host_identity,
         )
 
     def _patch_current_project(
@@ -1432,10 +1641,12 @@ class DesktopCoreBridgeV1:
         client: CoreControlClientV1,
         current: core_v1.ProjectV1,
         requested: core_v1.ProjectCreateV1,
-        previous_request_sha256: str,
-        request_sha256: str,
+        previous_request: core_v1.ProjectCreateV1,
+        requested_request_sha256: str,
         local_project_id: str,
-    ) -> core_v1.ProjectV1:
+        profile_id: str,
+        core_host_identity: str,
+    ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1]:
         patch = core_v1.ProjectPatchV1(
             name=requested.name,
             description=requested.description,
@@ -1443,22 +1654,101 @@ class DesktopCoreBridgeV1:
             task=requested.task,
             workspace=requested.workspace,
         )
-        previous = current
+        previous_request_sha256 = _model_digest(previous_request)
+        proposed = CoreProjectPatchOperationV1(
+            local_project_id=local_project_id,
+            profile_id=profile_id,
+            core_host_identity=core_host_identity,
+            core_project_id=current.id,
+            old_request_sha256=previous_request_sha256,
+            old_project_create=previous_request,
+            new_request_sha256=requested_request_sha256,
+            new_project_create=requested,
+            patch_request_sha256=_model_digest(patch),
+            patch=patch,
+            idempotency_key=_derived_key(
+                local_project_id,
+                f"project-patch-{previous_request_sha256}-{requested_request_sha256}",
+            ),
+            base_project=current,
+        )
+        stored = self._adapter_external(
+            token,
+            deadline,
+            lambda: self._persistence.reserve_patch(proposed),
+            label="project patch reservation",
+        )
+        operation = _ensure_patch_transition(stored, proposed, label="reservation")
+        patched, operation = self._resume_project_patch(
+            token=token,
+            deadline=deadline,
+            client=client,
+            current=current,
+            operation=operation,
+        )
+        return patched, operation
+
+    def _resume_project_patch(
+        self,
+        *,
+        token: _GenerationToken,
+        deadline: float,
+        client: CoreControlClientV1,
+        current: core_v1.ProjectV1,
+        operation: CoreProjectPatchOperationV1,
+    ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1]:
+        if operation.state is CoreProjectPatchStateV1.APPLIED:
+            assert operation.outcome is not None
+            _ensure_persisted_patch_outcome(operation, current)
+            return current, operation
+        if operation.state is CoreProjectPatchStateV1.PRE_PATCH:
+            expected_unknown = replace(
+                operation,
+                state=CoreProjectPatchStateV1.UNKNOWN,
+            )
+            stored_unknown = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.mark_patch_unknown(operation),
+                label="project patch outcome transition",
+            )
+            operation = _ensure_patch_transition(
+                stored_unknown,
+                expected_unknown,
+                label="unknown-outcome",
+            )
         patched = self._core_external(
             token,
             deadline,
             lambda: client.patch_project(
-                patch,
-                if_match=previous.etag,
-                idempotency_key=_derived_key(
-                    local_project_id,
-                    f"project-patch-{previous_request_sha256}-{request_sha256}",
-                ),
+                operation.patch,
+                if_match=operation.base_project.etag,
+                idempotency_key=operation.idempotency_key,
             ),
         )
-        _ensure_project_identity(patched, requested)
-        _ensure_patch_signed_new_snapshots(previous, patched, requested)
-        return patched
+        _ensure_project_identity(patched, operation.new_project_create)
+        _ensure_patch_signed_new_snapshots(
+            operation.base_project,
+            patched,
+            operation.new_project_create,
+        )
+        expected_applied = replace(
+            operation,
+            state=CoreProjectPatchStateV1.APPLIED,
+            outcome=patched,
+        )
+        stored_applied = self._adapter_external(
+            token,
+            deadline,
+            lambda: self._persistence.record_patch_applied(operation, patched),
+            label="project patch outcome commit",
+        )
+        operation = _ensure_patch_transition(
+            stored_applied,
+            expected_applied,
+            label="applied-outcome",
+        )
+        return patched, operation
 
     def _publish_imported_workspace(
         self,
@@ -1484,21 +1774,11 @@ class DesktopCoreBridgeV1:
             and operation.workspace_upload_project_snapshot
             != core_project.current_project_snapshot
         ):
-            cleared_operation = replace(
-                operation,
-                workspace_upload_id=None,
-                workspace_upload_project_snapshot=None,
-            )
-            stored_operation = self._adapter_external(
-                token,
-                deadline,
-                lambda: self._persistence.update_create(cleared_operation),
-                label="stale workspace upload binding clear",
-            )
-            operation = _ensure_create_transition(
-                stored_operation,
-                cleared_operation,
-                label="workspace-upload-clear",
+            operation = self._abort_stale_workspace_upload(
+                token=token,
+                deadline=deadline,
+                client=client,
+                operation=operation,
             )
 
         upload_key_seed = _derived_key(
@@ -1528,7 +1808,10 @@ class DesktopCoreBridgeV1:
             stored_operation = self._adapter_external(
                 token,
                 deadline,
-                lambda: self._persistence.update_create(upload_operation),
+                lambda: self._persistence.update_create(
+                    upload_operation,
+                    expected_previous=operation,
+                ),
                 label="workspace upload binding",
             )
             operation = _ensure_create_transition(
@@ -1654,6 +1937,154 @@ class DesktopCoreBridgeV1:
             ),
         )
         return finalized.project, operation
+
+    def _abort_stale_workspace_upload(
+        self,
+        *,
+        token: _GenerationToken,
+        deadline: float,
+        client: CoreControlClientV1,
+        operation: CoreProjectCreateOperationV1,
+    ) -> CoreProjectCreateOperationV1:
+        upload_id = operation.workspace_upload_id
+        upload_snapshot = operation.workspace_upload_project_snapshot
+        assert upload_id is not None and upload_snapshot is not None
+        abort = operation.workspace_upload_abort
+        if abort is None:
+            upload = self._core_external(
+                token,
+                deadline,
+                lambda: client.get_workspace_upload(upload_id),
+            )
+            if (
+                upload.project_id != operation.core_project_id
+                or upload.project_snapshot != upload_snapshot
+            ):
+                raise _bridge_error(
+                    "workspace_upload_authority_mismatch",
+                    "The stale workspace upload no longer matches its durable authority.",
+                    status=409,
+                )
+            if upload.status is not core_v1.WorkspaceUploadStatus.OPEN:
+                cleared = replace(
+                    operation,
+                    workspace_upload_id=None,
+                    workspace_upload_project_snapshot=None,
+                )
+                stored = self._adapter_external(
+                    token,
+                    deadline,
+                    lambda: self._persistence.update_create(
+                        cleared,
+                        expected_previous=operation,
+                    ),
+                    label="terminal stale workspace upload binding clear",
+                )
+                return _ensure_create_transition(
+                    stored,
+                    cleared,
+                    label="terminal-workspace-upload-clear",
+                )
+            if upload.publication is not None:
+                raise _bridge_error(
+                    "workspace_upload_authority_mismatch",
+                    "An open stale workspace upload unexpectedly has a publication.",
+                    status=409,
+                )
+            request = core_v1.WorkspaceUploadAbortV1(
+                reason="Desktop superseded this imported workspace draft."
+            )
+            abort = CoreWorkspaceUploadAbortOperationV1(
+                upload=upload,
+                request_sha256=_model_digest(request),
+                request=request,
+                idempotency_key=_derived_key(
+                    operation.idempotency_key,
+                    f"workspace-upload-abort-{upload.id}-{_model_digest(upload.project_snapshot)}",
+                ),
+            )
+            proposed = replace(operation, workspace_upload_abort=abort)
+            stored = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.update_create(
+                    proposed,
+                    expected_previous=operation,
+                ),
+                label="stale workspace upload abort reservation",
+            )
+            operation = _ensure_create_transition(
+                stored,
+                proposed,
+                label="workspace-upload-abort-reservation",
+            )
+        if abort.state is CoreWorkspaceUploadAbortStateV1.PRE_ABORT:
+            unknown_abort = replace(
+                abort,
+                state=CoreWorkspaceUploadAbortStateV1.UNKNOWN,
+            )
+            proposed = replace(operation, workspace_upload_abort=unknown_abort)
+            stored = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.update_create(
+                    proposed,
+                    expected_previous=operation,
+                ),
+                label="stale workspace upload abort outcome transition",
+            )
+            operation = _ensure_create_transition(
+                stored,
+                proposed,
+                label="workspace-upload-abort-unknown",
+            )
+            abort = unknown_abort
+
+        # A restarted strict client has no cache entry for the superseded open
+        # upload. Restore only the exact persisted pre-abort representation so
+        # an unknown transport outcome can replay the original mutation.
+        client._register_workspace_upload(abort.upload, exact_replay=True)
+        aborted = self._core_external(
+            token,
+            deadline,
+            lambda: client.abort_workspace_upload(
+                abort.upload.id,
+                abort.request,
+                if_match=abort.upload.etag,
+                idempotency_key=abort.idempotency_key,
+            ),
+        )
+        if (
+            aborted.status is not core_v1.WorkspaceUploadStatus.ABORTED
+            or aborted.id != abort.upload.id
+            or aborted.project_id != abort.upload.project_id
+            or aborted.accepted_offset != abort.upload.accepted_offset
+            or aborted.publication is not None
+        ):
+            raise _bridge_error(
+                "workspace_upload_abort_mismatch",
+                "Core returned an invalid stale workspace upload abort outcome.",
+            )
+        cleared = replace(
+            operation,
+            workspace_upload_id=None,
+            workspace_upload_project_snapshot=None,
+            workspace_upload_abort=None,
+        )
+        stored = self._adapter_external(
+            token,
+            deadline,
+            lambda: self._persistence.update_create(
+                cleared,
+                expected_previous=operation,
+            ),
+            label="stale workspace upload abort commit",
+        )
+        return _ensure_create_transition(
+            stored,
+            cleared,
+            label="workspace-upload-abort-commit",
+        )
 
     def _new_client(
         self, connection: CoreTunnelConnectionV1, deadline: float
@@ -1980,6 +2411,82 @@ def _ensure_create_transition(
     return actual
 
 
+def _ensure_patch_transition(
+    actual: CoreProjectPatchOperationV1,
+    expected: CoreProjectPatchOperationV1,
+    *,
+    label: str,
+) -> CoreProjectPatchOperationV1:
+    if actual != expected:
+        raise _bridge_error(
+            "core_project_patch_transition_mismatch",
+            f"The durable project patch {label} transition was not atomic.",
+            status=409,
+        )
+    return actual
+
+
+def _ensure_patch_operation_authority(
+    patch: CoreProjectPatchOperationV1,
+    project: local_v1.ProjectV1,
+    *,
+    operation: CoreProjectCreateOperationV1,
+    mapping: CoreProjectMappingV1 | None,
+    core_host_identity: str,
+) -> None:
+    if (
+        patch.local_project_id != project.project_id
+        or patch.profile_id != project.profile_id
+        or patch.core_host_identity != core_host_identity
+        or patch.core_project_id != operation.core_project_id
+        or _model_digest(patch.old_project_create) != patch.old_request_sha256
+        or _model_digest(patch.new_project_create) != patch.new_request_sha256
+        or _model_digest(patch.patch) != patch.patch_request_sha256
+    ):
+        raise _bridge_error(
+            "core_project_patch_replay_mismatch",
+            "The durable Core project patch operation has invalid authority.",
+            status=409,
+        )
+    if mapping is None:
+        base_matches = (
+            patch.old_request_sha256 == operation.request_sha256
+            and patch.old_project_create == operation.project_create
+        )
+    else:
+        base_matches = (
+            patch.old_request_sha256 == mapping.request_sha256
+            and patch.old_project_create == mapping.project_create
+            and patch.base_project.current_project_snapshot == mapping.project_snapshot
+            and patch.base_project.current_task_snapshot == mapping.task_snapshot
+            and patch.base_project.current_workspace_snapshot == mapping.workspace_snapshot
+        )
+    if not base_matches:
+        raise _bridge_error(
+            "core_project_patch_replay_mismatch",
+            "The durable Core project patch does not descend from the current mapping.",
+            status=409,
+        )
+
+
+def _ensure_persisted_patch_outcome(
+    operation: CoreProjectPatchOperationV1,
+    current: core_v1.ProjectV1,
+) -> None:
+    if operation.outcome != current:
+        raise _bridge_error(
+            "core_project_patch_outcome_mismatch",
+            "Core no longer matches the durable applied project patch outcome.",
+            status=409,
+        )
+    _ensure_project_identity(current, operation.new_project_create)
+    _ensure_patch_signed_new_snapshots(
+        operation.base_project,
+        current,
+        operation.new_project_create,
+    )
+
+
 def _ensure_mapping_authority(
     mapping: CoreProjectMappingV1,
     project: local_v1.ProjectV1,
@@ -2045,55 +2552,6 @@ def _ensure_project_identity(project: core_v1.ProjectV1, request: core_v1.Projec
         )
 
 
-def _ensure_mapping_was_versioned(
-    mapping: CoreProjectMappingV1,
-    current: core_v1.ProjectV1,
-    requested: core_v1.ProjectCreateV1,
-) -> None:
-    if (
-        current.id != mapping.core_project_id
-        or (current.current_project_snapshot == mapping.project_snapshot)
-        or current.etag == mapping.project_etag
-    ):
-        raise _bridge_error(
-            "core_project_mapping_mismatch",
-            "Core reports changed project content without a new immutable snapshot.",
-            status=409,
-        )
-    if mapping.project_create.task != requested.task and (
-        current.current_task_snapshot == mapping.task_snapshot
-    ):
-        raise _bridge_error(
-            "core_project_mapping_mismatch",
-            "Core reports changed task content without a new immutable snapshot.",
-            status=409,
-        )
-    if mapping.project_create.task == requested.task and (
-        current.current_task_snapshot != mapping.task_snapshot
-    ):
-        raise _bridge_error(
-            "core_project_mapping_mismatch",
-            "Core changed the immutable task snapshot for unchanged task content.",
-            status=409,
-        )
-    if mapping.project_create.workspace != requested.workspace and (
-        current.current_workspace_snapshot == mapping.workspace_snapshot
-    ):
-        raise _bridge_error(
-            "core_project_mapping_mismatch",
-            "Core reports changed workspace content without new snapshot state.",
-            status=409,
-        )
-    if mapping.project_create.workspace == requested.workspace and (
-        current.current_workspace_snapshot != mapping.workspace_snapshot
-    ):
-        raise _bridge_error(
-            "core_project_mapping_mismatch",
-            "Core changed the immutable workspace snapshot for unchanged workspace content.",
-            status=409,
-        )
-
-
 def _ensure_patch_signed_new_snapshots(
     previous: core_v1.ProjectV1,
     patched: core_v1.ProjectV1,
@@ -2123,8 +2581,14 @@ def _ensure_patch_signed_new_snapshots(
             "core_project_patch_not_versioned",
             "Core changed the task snapshot without changing task content.",
         )
-    if previous.workspace != requested.workspace and (
-        patched.current_workspace_snapshot == previous.current_workspace_snapshot
+    if (
+        previous.workspace != requested.workspace
+        and (patched.current_workspace_snapshot == previous.current_workspace_snapshot)
+        and not (
+            patched.current_workspace_snapshot is None
+            and isinstance(previous.workspace, core_v1.ImportedWorkspaceSpecV1)
+            and isinstance(requested.workspace, core_v1.ImportedWorkspaceSpecV1)
+        )
     ):
         raise _bridge_error(
             "core_project_patch_not_versioned",
@@ -2185,6 +2649,29 @@ def _mapping_from_project(
     core_host_identity: str,
     previous_mapping: CoreProjectMappingV1 | None,
 ) -> CoreProjectMappingV1:
+    return _mapping_from_request(
+        local_project_id=local_project.project_id,
+        profile_id=local_project.profile_id,
+        request=map_project_create_v1(local_project),
+        request_sha256=request_sha256,
+        project=project,
+        capabilities=capabilities,
+        core_host_identity=core_host_identity,
+        previous_mapping=previous_mapping,
+    )
+
+
+def _mapping_from_request(
+    *,
+    local_project_id: str,
+    profile_id: str,
+    request: core_v1.ProjectCreateV1,
+    request_sha256: str,
+    project: core_v1.ProjectV1,
+    capabilities: core_v1.CapabilitiesResponseV1,
+    core_host_identity: str,
+    previous_mapping: CoreProjectMappingV1 | None,
+) -> CoreProjectMappingV1:
     workspace_snapshot = project.current_workspace_snapshot
     active_revision = project.active_revision
     if workspace_snapshot is None or active_revision is None:
@@ -2211,12 +2698,12 @@ def _mapping_from_project(
         mapping_generation = previous_mapping.mapping_generation + 1
         predecessor_request_sha256 = previous_mapping.request_sha256
     return CoreProjectMappingV1(
-        local_project_id=local_project.project_id,
-        profile_id=local_project.profile_id,
+        local_project_id=local_project_id,
+        profile_id=profile_id,
         core_host_identity=core_host_identity,
         core_project_id=project.id,
         request_sha256=request_sha256,
-        project_create=map_project_create_v1(local_project),
+        project_create=request,
         project_snapshot=project.current_project_snapshot,
         task_snapshot=project.current_task_snapshot,
         workspace_snapshot=workspace_snapshot,
@@ -2291,13 +2778,18 @@ __all__ = (
     "CoreHostAttachmentV1",
     "CoreHostService",
     "CoreProjectCreateOperationV1",
+    "CoreProjectCreateStateV1",
     "CoreProjectMappingV1",
+    "CoreProjectPatchOperationV1",
+    "CoreProjectPatchStateV1",
     "CoreTunnelFactory",
     "CoreTunnelHandleV1",
     "DesktopCoreActiveSessionV1",
     "DesktopCoreBridgeErrorV1",
     "DesktopCoreBridgePersistence",
     "DesktopCoreBridgeV1",
+    "CoreWorkspaceUploadAbortOperationV1",
+    "CoreWorkspaceUploadAbortStateV1",
     "WorkspaceArchiveSource",
     "map_project_create_v1",
 )

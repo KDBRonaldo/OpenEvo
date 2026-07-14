@@ -87,7 +87,9 @@ generation/deadline gate before and after external work. Tunnel close is
 bounded, observable, and retryable: a timeout or callback failure leaves the
 handle and bridge unclosed and blocks a replacement session. A close future
 that succeeds at the timeout boundary is consumed as success and is not
-resubmitted; only a callback exception permits a new attempt. The tunnel factory
+resubmitted. Deadline expiry immediately after submit also retains that future,
+so retry waits for the same callback; only a callback exception permits a new
+attempt. The tunnel factory
 receives only the profile identity and remote Core port, while the bearer
 remains between the host service and the strict client and is excluded from
 dataclass representations and normalized errors.
@@ -118,7 +120,20 @@ the previous version in adapter-owned history; an authority-only version may
 repeat the predecessor request digest. Core must sign the required new snapshots
 before Desktop accepts task, model/execution, evolution, or workspace changes.
 Imported workspace upload IDs are additionally bound to the exact Core project
-snapshot, so a workspace revision cannot reuse an earlier upload session.
+snapshot, so a workspace revision cannot reuse an earlier upload session. A
+superseded open upload is durably aborted before its binding is cleared. Its
+canonical request, digest, original ETag/key, open upload authority, and unknown
+state survive restart, and every unknown result is replayed exactly before the
+new workspace is uploaded or finalized.
+
+Project patches use a separate durable `pre_patch`/`unknown`/`applied`
+operation. It binds canonical old/new Local intent, patch digest and key, the
+pre-patch Core project/ETag/snapshots, and the validated Core outcome. Reads are
+not used to infer an unknown result; the exact mutation is replayed. Mapping CAS
+and matching applied-operation cleanup are atomic. After an O-to-A patch whose
+mapping commit failed, a later Local B edit first commits the proven A mapping
+generation, then issues one distinct A-to-B patch without another project
+create.
 
 Host, tunnel, archive open/read/close, and persistence callbacks run through a
 fixed bounded executor. A deadline stops result delivery, while any callback
@@ -135,7 +150,7 @@ maintenance, and event methods preserve the strict Core DTOs and project
 membership checks.
 
 This module is not yet wired into `DesktopReleaseProvider` or
-`DesktopProviderStore`. The store has no durable Core mapping/create-operation
+`DesktopProviderStore`. The store has no durable Core mapping/create/patch-operation
 schema, and the release app has no production host-service, tunnel-factory, or
 adopted-archive adapter. Consequently the provider routes above intentionally
 remain typed 503 and the release feature flags remain unchanged. Tests use
