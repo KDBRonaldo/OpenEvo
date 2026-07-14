@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
+import hashlib
 import json
 import re
 import threading
@@ -19,6 +20,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from openevo.backend.contracts.v1 import models as v1
+from openevo.evolution.framework.profiles import execution_profile_for_release_mode
 
 
 MAX_CORE_ERROR_RESPONSE_BYTES = 64 * 1024
@@ -30,6 +32,7 @@ MAX_CORE_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_CORE_WORKSPACE_CHUNK_REQUEST_BYTES = ((v1.MAX_WORKSPACE_CHUNK_BYTES + 2) // 3) * 4 + 4096
 MAX_CORE_SSE_FRAME_BYTES = 4 * 1024 * 1024
 MAX_CORE_SSE_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_CORE_SSE_EVENT_BINDINGS = 10_000
 MAX_CORE_CLOSE_WAIT_SECONDS = 5.0
 
 _BEARER = re.compile(r"[A-Za-z0-9._~+/\-]{43,510}={0,2}\Z", re.ASCII)
@@ -158,13 +161,13 @@ class CoreSseStreamV1:
         self,
         chunks: Iterator[bytes],
         *,
-        validate_event: Callable[[v1.EventEnvelopeV1], None],
+        validate_frame: Callable[[v1.SseFrameV1], None],
         private_values: tuple[str, ...],
         declared_length: int | None,
         close_started: Callable[[], bool],
     ) -> None:
         self._chunks = chunks
-        self._validate_event = validate_event
+        self._validate_frame = validate_frame
         self._private_values = private_values
         self._declared_length = declared_length
         self._close_started = close_started
@@ -181,7 +184,7 @@ class CoreSseStreamV1:
                 declared_length=self._declared_length,
             ):
                 validated_frame = _validate_sse_frame(frame, self._private_values)
-                self._validate_event(validated_frame.data)
+                self._validate_frame(validated_frame)
                 yield validated_frame
         except CoreClientErrorV1:
             raise
@@ -228,6 +231,8 @@ class CoreControlClientV1:
         self._membership_lock = threading.RLock()
         self._closing = False
         self._closed = False
+        self._close_tasks_pending = 0
+        self._close_failed = False
         self._leases = 0
         self._lease_owners: dict[int, int] = {}
         self._active_responses: set[httpx.Response] = set()
@@ -239,6 +244,7 @@ class CoreControlClientV1:
         self._artifacts: dict[str, v1.ArtifactSummaryBaseV1] = {}
         self._operations: dict[str, v1.OperationV1] = {}
         self._diagnostics: dict[str, v1.DiagnosticV1] = {}
+        self._sse_event_digests: dict[str, str] = {}
         self._http = httpx.Client(
             base_url=f"{connection.origin}/",
             transport=transport,
@@ -270,30 +276,48 @@ class CoreControlClientV1:
                     self._state.wait(remaining)
                 return
             self._closing = True
-            responses = tuple(self._active_responses)
-
-        close_failed = False
-        for response in responses:
-            try:
-                response.close()
-            except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError):
-                close_failed = True
-        try:
-            self._http.close()
-        except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError):
-            close_failed = True
+            close_actions = [response.close for response in self._active_responses]
+            close_actions.append(self._http.close)
+            self._close_tasks_pending = len(close_actions)
+            for close_action in close_actions:
+                worker = threading.Thread(
+                    target=self._close_resource,
+                    args=(close_action,),
+                    name="openevo-core-client-close",
+                    daemon=True,
+                )
+                try:
+                    worker.start()
+                except RuntimeError:
+                    self._close_tasks_pending -= 1
+                    self._close_failed = True
 
         with self._state:
             caller_leases = self._lease_owners.get(threading.get_ident(), 0)
-            while self._leases > caller_leases:
+            while self._leases > caller_leases or self._close_tasks_pending:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._state.wait(remaining)
             self._closed = True
+            self._active_responses.clear()
             self._state.notify_all()
+            close_failed = self._close_failed
         if close_failed:
             raise _local_exception(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503) from None
+
+    def _close_resource(self, close_action: Callable[[], None]) -> None:
+        failed = False
+        try:
+            close_action()
+        except Exception:
+            failed = True
+        finally:
+            with self._state:
+                if failed:
+                    self._close_failed = True
+                self._close_tasks_pending -= 1
+                self._state.notify_all()
 
     def version(self) -> v1.VersionResponseV1:
         return self._json("GET", "/version", v1.VersionResponseV1, authenticated=False)
@@ -346,13 +370,16 @@ class CoreControlClientV1:
 
     def capabilities(self, execution_mode: v1.ExecutionMode) -> v1.CapabilitiesResponseV1:
         mode = _enum_query(execution_mode, v1.ExecutionMode)
-        return self._json(
+        result = self._json(
             "GET",
             "/v1/capabilities",
             v1.CapabilitiesResponseV1,
             params={"execution_mode": mode},
             max_response_bytes=MAX_CORE_CAPABILITIES_RESPONSE_BYTES,
         )
+        if result.evaluated_profile != execution_profile_for_release_mode(execution_mode):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        return result
 
     def list_projects(
         self,
@@ -508,6 +535,12 @@ class CoreControlClientV1:
         )
         self._validate_new_workspace_upload(result, request, project_id, if_match)
         with self._membership_lock:
+            prior = self._workspace_uploads.get(result.id)
+            if prior is None:
+                if result.etag == project.etag:
+                    _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            elif prior != result:
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
             self._workspace_uploads[result.id] = result
         return result
 
@@ -569,6 +602,7 @@ class CoreControlClientV1:
             or result.accepted_offset != request.offset + decoded_length
         ):
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        _ensure_upload_etag_transition(upload, result)
         with self._membership_lock:
             self._workspace_uploads[upload_id] = result
         return result
@@ -621,9 +655,10 @@ class CoreControlClientV1:
             or result.project.current_workspace_snapshot != result.publication.workspace_snapshot
         ):
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        _ensure_upload_etag_transition(upload, result.upload)
         with self._membership_lock:
             self._workspace_uploads[upload_id] = result.upload
-        self._register_project(result.project, expected_id=project_id)
+            self._register_project(result.project, expected_id=project_id)
         return result
 
     def abort_workspace_upload(
@@ -657,6 +692,7 @@ class CoreControlClientV1:
             or result.publication is not None
         ):
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        _ensure_upload_etag_transition(upload, result)
         with self._membership_lock:
             self._workspace_uploads[upload_id] = result
         return result
@@ -669,7 +705,7 @@ class CoreControlClientV1:
         project_id: str | None = None,
     ) -> v1.ProjectValidationResponseV1:
         project_id = self._active_project(project_id)
-        return self._mutation(
+        result = self._mutation(
             "POST",
             f"/v1/projects/{_segment(project_id)}/validate",
             request,
@@ -677,6 +713,9 @@ class CoreControlClientV1:
             v1.ProjectValidationResponseV1,
             idempotency_key=idempotency_key,
         )
+        if result.registry_digest != request.expected_registry_digest:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        return result
 
     def list_runs(
         self,
@@ -722,6 +761,7 @@ class CoreControlClientV1:
             result.project_snapshot != request.project_snapshot
             or result.task_snapshot != request.task_snapshot
             or result.workspace_snapshot != request.workspace_snapshot
+            or result.registry_digest != request.expected_registry_digest
             or result.required_revision != request.required_revision
         ):
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
@@ -1204,7 +1244,7 @@ class CoreControlClientV1:
                         )
                         yield CoreSseStreamV1(
                             response.iter_bytes(),
-                            validate_event=self._validate_event_membership,
+                            validate_frame=self._validate_sse_frame,
                             private_values=self._private_values(),
                             declared_length=declared_length,
                             close_started=self._close_started,
@@ -1339,8 +1379,8 @@ class CoreControlClientV1:
         validation_failed = False
         try:
             if isinstance(response_model, type) and issubclass(response_model, BaseModel):
-                return response_model.model_validate_json(body, strict=True)
-            return TypeAdapter(response_model).validate_json(body, strict=True)
+                return response_model.model_validate_json(body)
+            return TypeAdapter(response_model).validate_json(body)
         except (ValidationError, ValueError, TypeError, RecursionError):
             validation_failed = True
         if validation_failed:
@@ -1354,7 +1394,7 @@ class CoreControlClientV1:
         )
         validation_failed = False
         try:
-            error = v1.ApiErrorV1.model_validate_json(body, strict=True)
+            error = v1.ApiErrorV1.model_validate_json(body)
         except (ValidationError, ValueError, TypeError, RecursionError):
             validation_failed = True
             error = None
@@ -1450,23 +1490,41 @@ class CoreControlClientV1:
         parent_type: v1.ResourceChangeType | None = None,
         parent_id: str | None = None,
     ) -> None:
+        with self._membership_lock:
+            key, binding = self._validated_resource_binding_locked(
+                resource_type,
+                resource_id,
+                parent_type=parent_type,
+                parent_id=parent_id,
+            )
+            self._members[key] = binding
+
+    def _validated_resource_binding_locked(
+        self,
+        resource_type: v1.ResourceChangeType,
+        resource_id: str,
+        *,
+        parent_type: v1.ResourceChangeType | None = None,
+        parent_id: str | None = None,
+    ) -> tuple[tuple[v1.ResourceChangeType, str], _ResourceBinding]:
         resource_id = _opaque_or_response_error(resource_id)
         if (parent_type is None) != (parent_id is None):
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         if parent_type is not None and parent_id is not None:
             parent_id = _opaque_or_response_error(parent_id)
-            self._require_member(parent_type, parent_id)
+            parent = self._members.get((parent_type, parent_id))
+            if parent is None or parent.project_id != self._connection.project_id:
+                _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
         binding = _ResourceBinding(
             project_id=self._connection.project_id,
             parent_type=parent_type,
             parent_id=parent_id,
         )
         key = (resource_type, resource_id)
-        with self._membership_lock:
-            existing = self._members.get(key)
-            if existing is not None and existing != binding:
-                _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
-            self._members[key] = binding
+        existing = self._members.get(key)
+        if existing is not None and existing != binding:
+            _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+        return key, binding
 
     def _require_member(self, resource_type: v1.ResourceChangeType, resource_id: str) -> None:
         resource_id = _opaque_request(resource_id)
@@ -1481,13 +1539,28 @@ class CoreControlClientV1:
         parent_type: v1.ResourceChangeType,
         parent_id: str,
     ) -> None:
-        self._require_member(parent_type, parent_id)
-        binding = _LogRefBinding(self._connection.project_id, parent_type, parent_id)
         with self._membership_lock:
-            existing = self._log_refs.get(logs_ref)
-            if existing is not None and existing != binding:
-                _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+            logs_ref, binding = self._validated_log_ref_binding_locked(
+                logs_ref, parent_type, parent_id
+            )
             self._log_refs[logs_ref] = binding
+
+    def _validated_log_ref_binding_locked(
+        self,
+        logs_ref: str,
+        parent_type: v1.ResourceChangeType,
+        parent_id: str,
+    ) -> tuple[str, _LogRefBinding]:
+        logs_ref = _opaque_or_response_error(logs_ref)
+        parent_id = _opaque_or_response_error(parent_id)
+        parent = self._members.get((parent_type, parent_id))
+        if parent is None or parent.project_id != self._connection.project_id:
+            _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+        binding = _LogRefBinding(self._connection.project_id, parent_type, parent_id)
+        existing = self._log_refs.get(logs_ref)
+        if existing is not None and existing != binding:
+            _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+        return logs_ref, binding
 
     def _register_run(self, run: v1.RunSummaryV1, *, expected_id: str | None = None) -> None:
         self._ensure_active_project(run.project_id)
@@ -1570,14 +1643,22 @@ class CoreControlClientV1:
         if isinstance(operation.request, v1.ServiceRestartOperationRequestV1):
             parent_type = v1.ResourceChangeType.SERVICE
             parent_id = operation.request.service_id
-        self._bind_resource(
-            v1.ResourceChangeType.OPERATION,
-            operation.id,
-            parent_type=parent_type,
-            parent_id=parent_id,
-        )
-        self._bind_log_ref(operation.logs_ref, v1.ResourceChangeType.OPERATION, operation.id)
         with self._membership_lock:
+            member_key, member_binding = self._validated_resource_binding_locked(
+                v1.ResourceChangeType.OPERATION,
+                operation.id,
+                parent_type=parent_type,
+                parent_id=parent_id,
+            )
+            logs_ref = _opaque_or_response_error(operation.logs_ref)
+            log_binding = _LogRefBinding(
+                self._connection.project_id,
+                v1.ResourceChangeType.OPERATION,
+                operation.id,
+            )
+            existing_log = self._log_refs.get(logs_ref)
+            if existing_log is not None and existing_log != log_binding:
+                _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
             previous = self._operations.get(operation.id)
             if previous is not None and (
                 previous.kind is not operation.kind
@@ -1587,6 +1668,8 @@ class CoreControlClientV1:
                 or previous.created_at != operation.created_at
             ):
                 _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            self._members[member_key] = member_binding
+            self._log_refs[logs_ref] = log_binding
             self._operations[operation.id] = operation
 
     def _register_diagnostic(
@@ -1596,18 +1679,35 @@ class CoreControlClientV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         _ensure_diagnostic_project(diagnostic, self._connection.project_id)
         target = diagnostic.target
-        if isinstance(target, v1.RunDiagnosticTargetV1):
-            self._require_member(v1.ResourceChangeType.RUN, target.run_id)
-        self._bind_resource(
-            v1.ResourceChangeType.DIAGNOSTIC,
-            diagnostic.id,
-            parent_type=v1.ResourceChangeType.PROJECT,
-            parent_id=self._connection.project_id,
-        )
-        for check in diagnostic.checks:
-            if check.logs_ref is not None:
-                self._bind_log_ref(check.logs_ref, v1.ResourceChangeType.DIAGNOSTIC, diagnostic.id)
         with self._membership_lock:
+            if isinstance(target, v1.RunDiagnosticTargetV1):
+                target_id = _opaque_or_response_error(target.run_id)
+                target_binding = self._members.get((v1.ResourceChangeType.RUN, target_id))
+                if (
+                    target_binding is None
+                    or target_binding.project_id != self._connection.project_id
+                ):
+                    _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+            member_key, member_binding = self._validated_resource_binding_locked(
+                v1.ResourceChangeType.DIAGNOSTIC,
+                diagnostic.id,
+                parent_type=v1.ResourceChangeType.PROJECT,
+                parent_id=self._connection.project_id,
+            )
+            log_bindings: list[tuple[str, _LogRefBinding]] = []
+            for check in diagnostic.checks:
+                if check.logs_ref is None:
+                    continue
+                logs_ref = _opaque_or_response_error(check.logs_ref)
+                log_binding = _LogRefBinding(
+                    self._connection.project_id,
+                    v1.ResourceChangeType.DIAGNOSTIC,
+                    diagnostic.id,
+                )
+                existing_log = self._log_refs.get(logs_ref)
+                if existing_log is not None and existing_log != log_binding:
+                    _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+                log_bindings.append((logs_ref, log_binding))
             previous = self._diagnostics.get(diagnostic.id)
             if previous is not None and (
                 previous.scopes != diagnostic.scopes
@@ -1615,6 +1715,8 @@ class CoreControlClientV1:
                 or previous.created_at != diagnostic.created_at
             ):
                 _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            self._members[member_key] = member_binding
+            self._log_refs.update(log_bindings)
             self._diagnostics[diagnostic.id] = diagnostic
 
     def _validate_new_workspace_upload(
@@ -1718,6 +1820,27 @@ class CoreControlClientV1:
             self._register_operation(event.payload, expected_id=event.change.resource_id)
             return
         _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
+
+    def _validate_sse_frame(self, frame: v1.SseFrameV1) -> None:
+        canonical_event = json.dumps(
+            frame.data.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        event_digest = hashlib.sha256(canonical_event).hexdigest()
+        with self._membership_lock:
+            previous_digest = self._sse_event_digests.get(frame.id)
+            if previous_digest is not None and previous_digest != event_digest:
+                _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
+            if (
+                previous_digest is None
+                and len(self._sse_event_digests) >= MAX_CORE_SSE_EVENT_BINDINGS
+            ):
+                _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
+            self._validate_event_membership(frame.data)
+            self._sse_event_digests[frame.id] = event_digest
 
     def _active_project(self, project_id: str | None) -> str:
         if project_id is None:
@@ -1836,6 +1959,17 @@ def _ensure_upload_stable(
         or current.base_workspace_snapshot != previous.base_workspace_snapshot
         or current.created_at != previous.created_at
     ):
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+
+
+def _ensure_upload_etag_transition(
+    previous: v1.WorkspaceUploadSessionV1,
+    current: v1.WorkspaceUploadSessionV1,
+) -> None:
+    _ensure_upload_stable(previous, current)
+    previous_representation = previous.model_dump(mode="json", exclude={"etag"})
+    current_representation = current.model_dump(mode="json", exclude={"etag"})
+    if previous_representation != current_representation and current.etag == previous.etag:
         _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
 
 
@@ -2061,7 +2195,7 @@ def _validate_sse_frame(frame: bytes, private_values: tuple[str, ...]) -> v1.Sse
     _decode_json_checked(
         fields["data"], private_values, CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR
     )
-    envelope = v1.EventEnvelopeV1.model_validate_json(fields["data"], strict=True)
+    envelope = v1.EventEnvelopeV1.model_validate_json(fields["data"])
     return v1.SseFrameV1.model_validate(
         {"id": event_id, "event": event_name, "data": envelope},
         strict=True,

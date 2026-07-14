@@ -5,6 +5,7 @@ import hashlib
 import json
 import secrets
 import threading
+import time
 
 import httpx
 import pytest
@@ -21,6 +22,7 @@ from desktop.sidecar.core_client_v1 import (
     MAX_CORE_SSE_RESPONSE_BYTES,
 )
 from openevo.backend.contracts.v1 import models as v1
+from openevo.evolution.framework.profiles import execution_profile_for_release_mode
 
 
 PROJECT_ID = "project/active?one"
@@ -59,6 +61,17 @@ def _health_payload() -> dict[str, object]:
         "ready": True,
         "checked_at": "2026-07-14T12:00:00Z",
     }
+
+
+def _capabilities(
+    execution_mode: v1.ExecutionMode = v1.ExecutionMode.SELF_DEPLOYED,
+) -> v1.CapabilitiesResponseV1:
+    return v1.CapabilitiesResponseV1(
+        core_version="0.1.0",
+        registry_digest="4" * 64,
+        evaluated_profile=execution_profile_for_release_mode(execution_mode),
+        targets=(),
+    )
 
 
 def _api_error_payload(status: int = 409) -> dict[str, object]:
@@ -153,6 +166,18 @@ def _run(run_id: str = "run-1", project_id: str = PROJECT_ID) -> v1.RunV1:
     )
 
 
+def _run_create(run: v1.RunV1 | None = None) -> v1.RunCreateV1:
+    run = run or _run()
+    return v1.RunCreateV1(
+        project_id=run.project_id,
+        project_snapshot=run.project_snapshot,
+        task_snapshot=run.task_snapshot,
+        workspace_snapshot=run.workspace_snapshot,
+        expected_registry_digest=run.registry_digest,
+        required_revision=run.required_revision,
+    )
+
+
 def _service(service_id: str = "service-1") -> v1.ServiceSummaryV1:
     return v1.ServiceSummaryV1(
         id=service_id,
@@ -236,6 +261,16 @@ def _archive() -> v1.WorkspaceArchiveDeclarationV1:
             max_file_bytes=8_589_934_591,
             max_extracted_bytes=17_179_869_184,
         ),
+    )
+
+
+def _chunk() -> v1.WorkspaceUploadChunkV1:
+    content = b"x" * 1024
+    return v1.WorkspaceUploadChunkV1(
+        offset=0,
+        byte_length=len(content),
+        content_base64=base64.b64encode(content).decode(),
+        content_sha256=hashlib.sha256(content).hexdigest(),
     )
 
 
@@ -335,6 +370,26 @@ def _diagnostic(diagnostic_id: str = "diagnostic-1") -> v1.DiagnosticV1:
         updated_at="2026-07-14T12:00:00Z",
         observed_at="2026-07-14T12:00:00Z",
         etag=ETAG,
+    )
+
+
+def _diagnostic_with_log(
+    diagnostic_id: str = "diagnostic-1",
+    logs_ref: str = "diagnostic-1-logs",
+) -> v1.DiagnosticV1:
+    return _diagnostic(diagnostic_id).model_copy(
+        update={
+            "checks": [
+                v1.DiagnosticCheckV1(
+                    id=f"{diagnostic_id}-check",
+                    scope=v1.DiagnosticScope.PROJECT,
+                    status=v1.CheckStatus.OK,
+                    message="Project state is valid.",
+                    repair_action=v1.RepairAction.OPENEVO_CAN_RETRY,
+                    logs_ref=logs_ref,
+                )
+            ]
+        }
     )
 
 
@@ -632,6 +687,51 @@ def test_success_requires_exact_strict_response_dto(content: bytes) -> None:
         assert decoded not in str(exc_info.value)
 
 
+def test_capabilities_accepts_standard_json_arrays_from_model_dump_json() -> None:
+    capabilities = _capabilities()
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=capabilities.model_dump_json(),
+        )
+    )
+
+    assert client.capabilities(v1.ExecutionMode.SELF_DEPLOYED) == capabilities
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"unknown": True},
+        {"core_version": 1},
+        {"targets": {}},
+    ],
+    ids=["unknown-field", "wrong-scalar-type", "wrong-collection-type"],
+)
+def test_capabilities_still_rejects_non_contract_json(update: dict[str, object]) -> None:
+    payload = _capabilities().model_dump(mode="json")
+    payload.update(update)
+    client = _client(lambda _request: httpx.Response(200, json=payload))
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.capabilities(v1.ExecutionMode.SELF_DEPLOYED)
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_capabilities_response_profile_matches_requested_release_mode() -> None:
+    capabilities = _capabilities(v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT)
+    client = _client(
+        lambda _request: httpx.Response(200, json=capabilities.model_dump(mode="json"))
+    )
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.capabilities(v1.ExecutionMode.SELF_DEPLOYED)
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
 def test_valid_api_error_is_returned_as_exact_contract_type() -> None:
     payload = _api_error_payload()
     client = _client(lambda _request: httpx.Response(409, json=payload))
@@ -741,6 +841,43 @@ def test_environment_repair_maps_to_final_operation_resource() -> None:
 
     assert result == operation
     assert result.request.request == request_model
+
+
+def test_project_validation_response_binds_expected_registry_digest() -> None:
+    run = _run()
+    request = v1.ProjectValidationRequestV1(
+        project_snapshot=run.project_snapshot,
+        workspace_snapshot=run.workspace_snapshot,
+        expected_registry_digest="5" * 64,
+    )
+    response = v1.ProjectValidationResponseV1(
+        valid=True,
+        registry_digest="6" * 64,
+        checks=[],
+        validated_at="2026-07-14T12:00:00Z",
+    )
+    client = _client(lambda _request: httpx.Response(200, json=response.model_dump(mode="json")))
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.validate_project(request, idempotency_key="validate-1")
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_run_create_response_binds_expected_registry_digest() -> None:
+    run = _run()
+    request = _run_create(run).model_copy(update={"expected_registry_digest": "5" * 64})
+    client = _client(
+        lambda _request: httpx.Response(
+            202,
+            json=run.model_dump(mode="json"),
+        )
+    )
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.create_run(request, idempotency_key="run-1")
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
 
 
 def test_final_mutation_routes_send_exact_precondition_headers() -> None:
@@ -1036,6 +1173,80 @@ def test_close_failure_is_typed_and_has_no_raw_exception_chain() -> None:
     assert "private close failure" not in str(exc_info.value)
 
 
+def test_close_deadline_covers_blocking_transport_close(monkeypatch) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
+
+    class BlockingCloseTransport(httpx.BaseTransport):
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_health_payload(), request=request)
+
+        def close(self) -> None:
+            self.started.set()
+            self.release.wait(1)
+
+    transport = BlockingCloseTransport()
+    client = CoreControlClientV1(_connection(), transport=transport)
+    assert client.health().ready is True
+
+    started_at = time.monotonic()
+    try:
+        client.close()
+        elapsed = time.monotonic() - started_at
+    finally:
+        transport.release.set()
+
+    assert transport.started.is_set()
+    assert elapsed < 0.25
+    with pytest.raises(CoreClientErrorV1):
+        client.health()
+
+
+def test_close_deadline_covers_blocking_response_close(monkeypatch) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
+
+    class BlockingCloseStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def __iter__(self):
+            yield b""
+
+        def close(self) -> None:
+            self.started.set()
+            self.release.wait(1)
+
+    body = BlockingCloseStream()
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=body,
+        )
+    )
+
+    with client.events():
+        started_at = time.monotonic()
+        try:
+            client.close()
+            elapsed = time.monotonic() - started_at
+        finally:
+            body.release.set()
+
+    assert body.started.is_set()
+    assert elapsed < 0.25
+    with pytest.raises(CoreClientErrorV1):
+        client.health()
+
+
 def test_sse_stream_validates_and_yields_final_wire_frame() -> None:
     payload = {
         "schema_version": "1",
@@ -1065,6 +1276,68 @@ def test_sse_stream_validates_and_yields_final_wire_frame() -> None:
     assert isinstance(events[0], v1.SseFrameV1)
     assert events[0].event == "heartbeat.v1"
     assert events[0].data.root.event == "heartbeat.v1"
+
+
+def test_sse_event_id_is_bound_to_canonical_payload_across_reconnects() -> None:
+    first = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    changed = {**first, "payload": {"active_run_count": 1}}
+    alternate_data = json.dumps(first, sort_keys=True).encode()
+    alternate_frame = b"id: event-1\nevent: heartbeat.v1\ndata: " + alternate_data + b"\n\n"
+    frames = iter([_sse_bytes(first), alternate_frame, _sse_bytes(changed)])
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=next(frames),
+        )
+    )
+
+    with client.events() as stream:
+        assert len(list(stream)) == 1
+    with client.events(last_event_id="event-1") as stream:
+        assert len(list(stream)) == 1
+    with client.events(last_event_id="event-1") as stream:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            list(stream)
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR
+
+
+def test_sse_event_identity_ledger_fails_closed_at_bound(monkeypatch) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    monkeypatch.setattr(core_client_module, "MAX_CORE_SSE_EVENT_BINDINGS", 1)
+    first = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    second = {**first, "id": "event-2", "sequence": 2}
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=_sse_bytes(first) + _sse_bytes(second),
+        )
+    )
+
+    with client.events() as stream:
+        iterator = iter(stream)
+        assert next(iterator).id == "event-1"
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            next(iterator)
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR
 
 
 def test_sse_rejects_cross_wired_metadata_without_rebuilding_payload() -> None:
@@ -1550,6 +1823,188 @@ def test_workspace_abort_and_wrong_upload_response_are_bound_to_route() -> None:
     assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
 
 
+def test_workspace_upload_create_requires_a_new_resource_etag() -> None:
+    project = _project()
+    upload = _upload(etag=project.etag)
+    responses = iter([project, upload])
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        value = next(responses)
+        status = 200 if isinstance(value, v1.ProjectV1) else 201
+        return httpx.Response(status, json=value.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.get_project()
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.create_workspace_upload(
+            v1.WorkspaceUploadCreateV1(
+                project_snapshot=project.current_project_snapshot,
+                archive=_archive(),
+            ),
+            if_match=project.etag,
+            idempotency_key="workspace-create-etag",
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_workspace_upload_create_exact_idempotent_replay_may_keep_etag() -> None:
+    project = _project()
+    upload = _upload()
+    responses = iter([project, upload, upload])
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        value = next(responses)
+        status = 200 if isinstance(value, v1.ProjectV1) else 201
+        return httpx.Response(status, json=value.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.get_project()
+    request = v1.WorkspaceUploadCreateV1(
+        project_snapshot=project.current_project_snapshot,
+        archive=_archive(),
+    )
+
+    first = client.create_workspace_upload(
+        request,
+        if_match=project.etag,
+        idempotency_key="workspace-create-replay",
+    )
+    replay = client.create_workspace_upload(
+        request,
+        if_match=project.etag,
+        idempotency_key="workspace-create-replay",
+    )
+
+    assert replay == first
+    assert replay.etag == first.etag
+
+
+def test_workspace_upload_create_replay_rejects_changed_representation() -> None:
+    project = _project()
+    upload = _upload()
+    changed = upload.model_copy(
+        update={
+            "updated_at": "2026-07-14T12:00:02Z",
+            "etag": '"' + ("d" * 64) + '"',
+        }
+    )
+    responses = iter([project, upload, changed])
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        value = next(responses)
+        status = 200 if isinstance(value, v1.ProjectV1) else 201
+        return httpx.Response(status, json=value.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.get_project()
+    request = v1.WorkspaceUploadCreateV1(
+        project_snapshot=project.current_project_snapshot,
+        archive=_archive(),
+    )
+    client.create_workspace_upload(
+        request,
+        if_match=project.etag,
+        idempotency_key="workspace-create-replay-changed",
+    )
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.create_workspace_upload(
+            request,
+            if_match=project.etag,
+            idempotency_key="workspace-create-replay-changed",
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_workspace_upload_chunk_state_change_requires_new_etag() -> None:
+    open_upload = _upload()
+    advanced = _upload(accepted_offset=1024, etag=open_upload.etag)
+    responses = iter([open_upload, advanced])
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            json=next(responses).model_dump(mode="json"),
+        )
+    )
+    client.get_workspace_upload(open_upload.id)
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.put_workspace_upload_chunk(
+            open_upload.id,
+            _chunk(),
+            if_match=open_upload.etag,
+            idempotency_key="workspace-chunk-etag",
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_workspace_upload_abort_state_change_requires_new_etag() -> None:
+    open_upload = _upload()
+    aborted = _upload(status=v1.WorkspaceUploadStatus.ABORTED, etag=open_upload.etag)
+    responses = iter([open_upload, aborted])
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            json=next(responses).model_dump(mode="json"),
+        )
+    )
+    client.get_workspace_upload(open_upload.id)
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.abort_workspace_upload(
+            open_upload.id,
+            v1.WorkspaceUploadAbortV1(reason="User cancelled."),
+            if_match=open_upload.etag,
+            idempotency_key="workspace-abort-etag",
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_workspace_upload_finalize_state_change_requires_new_etag() -> None:
+    publication = _publication()
+    complete = _upload(accepted_offset=1024, etag='"' + ("d" * 64) + '"')
+    finalized = _upload(
+        accepted_offset=1024,
+        status=v1.WorkspaceUploadStatus.FINALIZED,
+        etag=complete.etag,
+        publication=publication,
+    )
+    response = v1.WorkspaceUploadFinalizeResponseV1(
+        project_id=PROJECT_ID,
+        upload=finalized,
+        publication=publication,
+        project=_project(publication=publication),
+    )
+    responses: list[v1.WorkspaceUploadSessionV1 | v1.WorkspaceUploadFinalizeResponseV1] = [
+        complete,
+        response,
+    ]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        value = responses.pop(0)
+        status = 201 if isinstance(value, v1.WorkspaceUploadFinalizeResponseV1) else 200
+        return httpx.Response(status, json=value.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.get_workspace_upload(complete.id)
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.finalize_workspace_upload(
+            complete.id,
+            v1.WorkspaceUploadFinalizeV1(content_sha256=_archive().content_sha256),
+            if_match=complete.etag,
+            if_project_match=complete.project_etag,
+            idempotency_key="workspace-finalize-etag",
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
 @pytest.mark.parametrize(
     ("route", "expected_code"),
     [
@@ -1599,6 +2054,65 @@ def test_detail_reads_reject_wrong_resource_identity(
         call(client)
 
     assert exc_info.value.error.code is expected_code
+
+
+def test_operation_registration_failure_does_not_grant_member_or_log_access() -> None:
+    request = v1.EnvironmentRepairRequestV1(
+        execution_mode=v1.ExecutionMode.SELF_DEPLOYED,
+        actions=[v1.EnvironmentRepairAction.RETRY_NETWORK],
+    )
+    original = _queued_environment_operation(request)
+    colliding_log = original.model_copy(update={"id": "operation-2"})
+    changed_request = v1.EnvironmentRepairOperationRequestV1(
+        kind=v1.OperationKind.ENVIRONMENT_REPAIR,
+        request=request.model_copy(
+            update={"actions": [v1.EnvironmentRepairAction.RESTART_MODEL_SERVICE]}
+        ),
+    )
+    changed_identity = original.model_copy(
+        update={"request": changed_request, "logs_ref": "operation-poison-logs"}
+    )
+    responses = iter([original, colliding_log, changed_identity])
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            json=next(responses).model_dump(mode="json"),
+        )
+    )
+
+    client.get_operation(original.id)
+    with pytest.raises(CoreClientErrorV1):
+        client.get_operation(colliding_log.id)
+    with pytest.raises(CoreClientErrorV1):
+        client.get_operation(original.id)
+
+    assert (v1.ResourceChangeType.OPERATION, colliding_log.id) not in client._members
+    assert changed_identity.logs_ref not in client._log_refs
+
+
+def test_diagnostic_registration_failure_does_not_grant_member_or_log_access() -> None:
+    original = _diagnostic_with_log()
+    colliding_log = _diagnostic_with_log("diagnostic-2", original.checks[0].logs_ref)
+    changed_identity = _diagnostic_with_log(
+        original.id,
+        "diagnostic-poison-logs",
+    ).model_copy(update={"created_at": "2026-07-14T12:00:01Z"})
+    responses = iter([original, colliding_log, changed_identity])
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            json=next(responses).model_dump(mode="json"),
+        )
+    )
+
+    client.get_diagnostic(original.id)
+    with pytest.raises(CoreClientErrorV1):
+        client.get_diagnostic(colliding_log.id)
+    with pytest.raises(CoreClientErrorV1):
+        client.get_diagnostic(original.id)
+
+    assert (v1.ResourceChangeType.DIAGNOSTIC, colliding_log.id) not in client._members
+    assert changed_identity.checks[0].logs_ref not in client._log_refs
 
 
 def test_run_child_and_artifact_content_bind_requested_parent_ids() -> None:

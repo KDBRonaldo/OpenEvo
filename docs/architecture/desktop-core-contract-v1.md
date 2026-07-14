@@ -229,9 +229,13 @@ Capability responses wrap the complete framework-owned
 `EvolutionCapabilitiesV1`; they preserve `supported`, `unsupported`, and
 `unavailable`, the evaluated profile, accepted methods, selection resolvers,
 identity digests, canonical config JSON, defaults, and all support axes. The
-sidecar has no reduced method table. Project responses expose typed remote
-model preparation and active-revision state rather than asking React to infer
-them.
+sidecar has no reduced method table. The evaluated profile must equal the
+profile selected by the requested release execution mode. Core project
+validation must return the request's exact expected registry digest, and run
+admission must return that digest together with the request's exact project,
+task, workspace, and required-revision references. Project responses expose
+typed remote model preparation and active-revision state rather than asking
+React to infer them.
 
 Local SSE carries Desktop state changes and resource invalidations. Every
 resource invalidation includes the authoritative ETag or content digest and
@@ -381,6 +385,13 @@ and updated `ProjectV1` persist that same publication, the project receives a ne
 snapshot, and its successful ETag must differ from `upload.project_etag`. A stale
 upload cannot overwrite a later project workspace declaration. No workspace
 request accepts a host path, URI, command, or setup script.
+
+Every upload representation change is ETag-visible. Initial upload creation
+issues an upload ETag distinct from the project ETag used as `If-Match`. An exact
+idempotent replay of the complete create response may preserve that upload ETag;
+the same upload ID cannot return a different representation as a create replay.
+Accepted chunks, abort, and finalize each change the upload representation and
+must therefore issue an upload ETag different from the preconditioned session.
 
 `workspace.kind=scratch` is closed during project creation: Core atomically
 creates and returns an immutable empty workspace snapshot, so scratch never
@@ -533,6 +544,17 @@ remains stable if that mutation is retried, replayed, or emitted in a later stre
 record with a different frame ID. `Last-Event-ID` remains opaque;
 delivery is at least once with a 10,000-event bounded replay window, and an
 expired cursor returns HTTP 410 so Desktop reloads snapshots before resuming.
+Within one active-tunnel client lifetime, including reconnects, the sidecar
+binds each SSE frame ID to the digest of canonical validated event bytes. The
+same ID and semantic payload may replay with different JSON formatting; the
+same ID with different payload fails closed before event authorization state
+changes. The client ledger is bounded and fails closed before accepting a new
+ID once full.
+
+Operation and diagnostic responses are authorization-bearing snapshots. The
+sidecar validates immutable identity, parent membership, and all log references
+under one lock, then commits the resource member, log references, and snapshot
+as one in-memory update. A failed response contributes no member or log access.
 
 ## Capability And Mode Rules
 
