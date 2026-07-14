@@ -18,9 +18,9 @@ child services over SSH.
   local-to-Core mapping while retaining adapter-owned history.
 
 The persisted create operation binds local project, profile, Core host
-identity, canonical Core `ProjectCreateV1` digest, idempotency key, returned
-Core project ID, and workspace upload ID plus its owning project snapshot. Its
-state is explicit:
+identity, the full canonical Core `ProjectCreateV1`, its digest, idempotency
+key, returned Core project ID, and workspace upload ID plus its owning project
+snapshot. Its state is explicit:
 
 - `pre_create` proves no create request has been dispatched. A deterministic
   failure in version/capability/bootstrap preparation leaves this state, so a
@@ -28,14 +28,18 @@ state is explicit:
 - `unknown` is persisted immediately before project create transport. Only the
   exact canonical request and original key may replay it.
 - `bound` records the Core-assigned project ID. Later Local activation keys
-  resume that binding and never issue another project create.
+  resume that binding and never issue another project create. The original
+  canonical request remains durable even if the Local draft changes before a
+  completed mapping can be committed; recovery verifies that request against
+  the bound Core project before patching the edited Local intent.
 
 The completed mapping also stores the canonical mapped request, exact
-project/task/workspace snapshots, project ETag, registry digest, monotonic
-mapping generation, and predecessor request digest. Mapping commit receives the
-complete expected prior mapping; a durable adapter must retain the ordered audit
-history and reject lost updates. Every load recomputes the canonical request
-digest before Core transport.
+project/task/workspace content snapshots, project ETag, active revision,
+project `updated_at`, registry digest, monotonic mapping generation, and
+predecessor request digest. Mapping commit receives the complete expected prior
+mapping; a durable adapter must retain the ordered audit history and reject lost
+updates. Every load recomputes the canonical request digest before Core
+transport.
 
 ## Session Ownership
 
@@ -55,7 +59,10 @@ later capability, create, upload, validation, or persistence work. A failed or
 timed-out cleanup does not mark the bridge or tunnel closed and prevents a new
 session from publishing. Cleanup is observable through a typed retryable error
 and tunnel `close_failure`; calling close or activation again retries ownership
-of the same close operation.
+of the same close operation. If the close future completes at the timeout
+boundary, the bridge consumes its actual result: success closes the handle once,
+while only an actual callback exception clears the future for a new callback
+attempt.
 
 The forward activation path uses one finite wall-clock deadline across host
 attach, tunnel open, version negotiation, capabilities, project create/read,
@@ -94,15 +101,23 @@ archive declaration, and base workspace snapshot. A changed imported workspace
 therefore gets a new upload instead of reusing the prior version's session.
 
 For an existing mapping, Desktop first rereads the exact Core project. Unchanged
-intent must match the stored canonical request, snapshots, ETag, and registry.
+intent must match the stored canonical request and immutable content snapshots.
+Project ETag, active revision, `updated_at`, and registry digest are mutable Core
+authority: cross-session successor activation may legitimately update them
+without changing Local intent or content snapshots. Desktop accepts and CAS
+versions that authority only after capabilities, project readiness,
+revision-head agreement, and Core validation all succeed.
+
 Changed name, task, model/execution, evolution config, or workspace is sent
-through frozen Core `patch_project` with the stored ETag and a deterministic key
-derived from old and new canonical request digests. Core must return a new
-project snapshot and ETag, plus a new task/workspace snapshot state when those
-inputs changed. Unknown patch outcomes are recovered by rereading Core; if the
-patch did not apply, retry uses the exact same key. Mapping CAS occurs only
-after workspace publication, readiness, revision-head agreement, and Core
-validation, preserving the prior mapping as traceable history until then.
+through frozen Core `patch_project` with the freshly read Core ETag and a
+deterministic key derived from old and new canonical request digests. Core must
+return a new project snapshot and ETag, plus a new task/workspace snapshot state
+when those inputs changed. Unknown patch outcomes are recovered by rereading
+Core; if the patch did not apply, retry uses the exact same key. Mapping CAS
+occurs only after workspace publication, readiness, revision-head agreement,
+and Core validation, preserving the prior mapping as traceable history until
+then. Authority-only CAS versions increment the mapping generation even though
+their predecessor request digest equals the current request digest.
 
 ## Run And Resource Proxy
 

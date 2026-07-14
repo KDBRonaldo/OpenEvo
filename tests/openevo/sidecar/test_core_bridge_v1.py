@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import replace
 import hashlib
 import io
@@ -76,10 +77,12 @@ def _version() -> dict[str, object]:
 
 def _capabilities(
     mode: core_v1.ExecutionMode = core_v1.ExecutionMode.SELF_DEPLOYED,
+    *,
+    registry_digest: str = REGISTRY_DIGEST,
 ) -> core_v1.CapabilitiesResponseV1:
     return core_v1.CapabilitiesResponseV1(
         core_version="0.1.0",
-        registry_digest=REGISTRY_DIGEST,
+        registry_digest=registry_digest,
         evaluated_profile=execution_profile_for_release_mode(mode),
         targets=(),
     )
@@ -134,6 +137,9 @@ def _project(
     task_snapshot: core_v1.ImmutableSnapshotRefV1 = TASK_SNAPSHOT,
     workspace_snapshot: core_v1.ImmutableSnapshotRefV1 = WORKSPACE_SNAPSHOT,
     etag: str | None = None,
+    active_revision: core_v1.RevisionRefV1 = REVISION,
+    registry_digest: str = REGISTRY_DIGEST,
+    updated_at: str = NOW,
 ) -> core_v1.ProjectV1:
     imported = isinstance(request.workspace, core_v1.ImportedWorkspaceSpecV1)
     current_workspace_snapshot = workspace_snapshot if ready or not imported else None
@@ -164,8 +170,8 @@ def _project(
         current_task_snapshot=task_snapshot,
         current_workspace_snapshot=current_workspace_snapshot,
         workspace_publication=publication,
-        active_revision=REVISION if ready else None,
-        registry_digest=REGISTRY_DIGEST if ready or imported else None,
+        active_revision=active_revision if ready else None,
+        registry_digest=registry_digest if ready or imported else None,
         model_preparation=core_v1.ModelPreparationV1(
             model_ref=request.spec.agent_model_ref,
             status=(
@@ -176,7 +182,7 @@ def _project(
             updated_at=NOW,
         ),
         created_at=NOW,
-        updated_at=NOW,
+        updated_at=updated_at,
         etag=etag or (ETAG_C if ready else ETAG_A),
         spec=request.spec,
         task=request.task,
@@ -380,6 +386,9 @@ class FakeCore:
         self.task_snapshot = TASK_SNAPSHOT
         self.workspace_snapshot = WORKSPACE_SNAPSHOT
         self.project_etag = ETAG_C
+        self.active_revision = REVISION
+        self.registry_digest = REGISTRY_DIGEST
+        self.project_updated_at = NOW
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request)
@@ -393,7 +402,12 @@ class FakeCore:
         if path == "/v1/capabilities":
             if self.fail_capabilities_with_503:
                 return httpx.Response(503, json=_core_error())
-            return httpx.Response(200, json=_capabilities().model_dump(mode="json"))
+            return httpx.Response(
+                200,
+                json=_capabilities(
+                    registry_digest=self.registry_digest
+                ).model_dump(mode="json"),
+            )
         if path == "/v1/projects" and request.method == "POST":
             assert "Idempotency-Key" in request.headers
             self.created = True
@@ -459,6 +473,9 @@ class FakeCore:
                         task_snapshot=self.task_snapshot,
                         workspace_snapshot=self.workspace_snapshot,
                         etag=self.project_etag,
+                        active_revision=self.active_revision,
+                        registry_digest=self.registry_digest,
+                        updated_at=self.project_updated_at,
                     ).model_dump(mode="json"),
                 )
             imported = isinstance(self.request.workspace, core_v1.ImportedWorkspaceSpecV1)
@@ -476,6 +493,9 @@ class FakeCore:
                     task_snapshot=self.task_snapshot,
                     workspace_snapshot=self.workspace_snapshot,
                     etag=self.project_etag,
+                    active_revision=self.active_revision,
+                    registry_digest=self.registry_digest,
+                    updated_at=self.project_updated_at,
                 ).model_dump(mode="json"),
             )
         if path.endswith("/workspace-uploads") and request.method == "POST":
@@ -555,7 +575,7 @@ class FakeCore:
                 200,
                 json=core_v1.ProjectValidationResponseV1(
                     valid=True,
-                    registry_digest=REGISTRY_DIGEST,
+                    registry_digest=self.registry_digest,
                     checks=[],
                     validated_at=NOW,
                 ).model_dump(mode="json"),
@@ -767,6 +787,78 @@ def test_existing_mapping_is_reopened_without_project_create() -> None:
         request.method == "POST" and request.url.path == "/v1/projects"
         for request in fake_core.calls
     )
+
+
+def test_reactivation_versions_mutable_successor_authority_and_patches_current_etag() -> None:
+    original = _local_project()
+    first, persistence, fake_core, _ = _bridge(original)
+    first.activate_project(original, idempotency_key="successor-authority-base-0001")
+    first.close()
+    original_mapping = persistence.mapping
+    assert original_mapping is not None
+
+    successor = core_v1.RevisionRefV1(
+        id="revision-1",
+        project_id=CORE_PROJECT_ID,
+        generation=1,
+        manifest_sha256="7" * 64,
+    )
+    successor_etag = '"' + "7" * 64 + '"'
+    successor_registry = "8" * 64
+    fake_core.active_revision = successor
+    fake_core.project_etag = successor_etag
+    fake_core.registry_digest = successor_registry
+    fake_core.project_updated_at = "2026-07-14T12:10:00Z"
+    fake_core.head = core_v1.RevisionHeadV1(
+        project_id=CORE_PROJECT_ID,
+        active_revision=successor,
+        successor_revision=None,
+        transition=None,
+        updated_at="2026-07-14T12:10:00Z",
+        etag=successor_etag,
+    )
+
+    second, _, _, _ = _bridge(
+        original,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    activation = second.activate_project(
+        original,
+        idempotency_key="successor-authority-refresh-0002",
+    )
+    second.close()
+
+    refreshed_mapping = persistence.mapping
+    assert refreshed_mapping is not None
+    assert activation.core_project.active_revision == successor
+    assert refreshed_mapping.project_snapshot == original_mapping.project_snapshot
+    assert refreshed_mapping.task_snapshot == original_mapping.task_snapshot
+    assert refreshed_mapping.workspace_snapshot == original_mapping.workspace_snapshot
+    assert refreshed_mapping.project_etag == successor_etag
+    assert refreshed_mapping.registry_digest == successor_registry
+    assert refreshed_mapping.active_revision == successor
+    assert refreshed_mapping.project_updated_at == "2026-07-14T12:10:00Z"
+    assert refreshed_mapping.mapping_generation == original_mapping.mapping_generation + 1
+    assert refreshed_mapping.predecessor_request_sha256 == original_mapping.request_sha256
+
+    modified = original.model_copy(
+        update={
+            "task": local_v1.ProjectTaskV1(
+                title="Successor-aware edit",
+                objective="Patch from the current Core authority.",
+            ),
+            "updated_at": "2026-07-14T12:11:00Z",
+        }
+    )
+    third, _, _, _ = _bridge(
+        modified,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    third.activate_project(modified, idempotency_key="successor-authority-edit-0003")
+
+    assert fake_core.patch_requests[-1][1] == successor_etag
 
 
 def test_import_activation_reads_only_opaque_archive_and_finalizes_workspace() -> None:
@@ -1442,6 +1534,45 @@ def test_tunnel_close_failure_is_observable_and_retryable(
     assert attempts == 2
 
 
+def test_tunnel_close_timeout_boundary_consumes_a_completed_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class BoundaryFuture(Future[None]):
+        def __init__(self) -> None:
+            super().__init__()
+            self._boundary = True
+
+        def result(self, timeout: float | None = None) -> None:
+            if self._boundary:
+                self._boundary = False
+                raise FutureTimeoutError
+            return super().result(timeout=timeout)
+
+    def submit(action):
+        nonlocal attempts
+        future = BoundaryFuture()
+        action()
+        attempts += 1
+        future.set_result(None)
+        return future
+
+    monkeypatch.setattr(bridge_module._ADAPTER_EXECUTOR, "submit", submit)
+    handle = CoreTunnelHandleV1(
+        endpoint="http://127.0.0.1:48766",
+        session_id="session-close-boundary",
+        close_callback=lambda: None,
+    )
+
+    handle.close(deadline=bridge_module.time.monotonic() + 1)
+    handle.close(deadline=bridge_module.time.monotonic() + 1)
+
+    assert handle.closed is True
+    assert handle.close_failure is None
+    assert attempts == 1
+
+
 def test_bridge_close_is_bounded_and_not_announced_until_tunnel_closes() -> None:
     local_project = _local_project()
     bridge, _, _, tunnels = _bridge(local_project, timeout=0.1)
@@ -1852,6 +1983,56 @@ def test_bound_create_resumes_with_new_local_action_without_duplicate_create() -
         )
         == 1
     )
+
+
+def test_bound_create_crash_recovers_original_authority_then_patches_edited_intent() -> None:
+    original = _local_project()
+    persistence = FakePersistence()
+    persistence.fail_commit_once = True
+    fake_core = FakeCore(original)
+    first, _, _, _ = _bridge(
+        original,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    with pytest.raises(DesktopCoreBridgeErrorV1):
+        first.activate_project(original, idempotency_key="bound-edit-base-0001")
+
+    assert persistence.operation is not None
+    assert persistence.operation.state is CoreProjectCreateStateV1.BOUND
+    assert persistence.operation.project_create == map_project_create_v1(original)
+    assert persistence.mapping is None
+    modified = original.model_copy(
+        update={
+            "name": "Protein design edited after recovery",
+            "task": local_v1.ProjectTaskV1(
+                title="Recovered edit",
+                objective="Converge the edited Local intent without another create.",
+            ),
+            "updated_at": "2026-07-14T12:20:00Z",
+        }
+    )
+    second, _, _, _ = _bridge(
+        modified,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    activation = second.activate_project(
+        modified,
+        idempotency_key="bound-edit-recovery-0002",
+    )
+
+    create_calls = [
+        request
+        for request in fake_core.calls
+        if request.method == "POST" and request.url.path == "/v1/projects"
+    ]
+    assert len(create_calls) == 1
+    assert len(fake_core.patch_requests) == 1
+    assert fake_core.patch_requests[0][1] == ETAG_C
+    assert activation.core_project.name == modified.name
+    assert persistence.mapping is not None
+    assert persistence.mapping.project_create == map_project_create_v1(modified)
 
 
 def test_deadline_is_shared_with_host_and_rejects_expired_activation(

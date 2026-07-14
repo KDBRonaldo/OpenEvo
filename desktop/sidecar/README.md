@@ -85,7 +85,9 @@ new session can publish. Candidate and active generations also own tunnel,
 archive-context, and blocking-adapter cleanup. Core and adapter calls pass a
 generation/deadline gate before and after external work. Tunnel close is
 bounded, observable, and retryable: a timeout or callback failure leaves the
-handle and bridge unclosed and blocks a replacement session. The tunnel factory
+handle and bridge unclosed and blocks a replacement session. A close future
+that succeeds at the timeout boundary is consumed as success and is not
+resubmitted; only a callback exception permits a new attempt. The tunnel factory
 receives only the profile identity and remote Core port, while the bearer
 remains between the host service and the strict client and is excluded from
 dataclass representations and normalized errors.
@@ -97,20 +99,26 @@ authoritative project/head, and persists the host-bound Core mapping. Scratch
 projects use Core's signed initial empty workspace. Imported projects accept
 only `WorkspaceImportRefV1` and a read-only stream from the archive source; the
 bridge contract contains no host path. A lost create response can be retried
-only with the persisted request digest and idempotency key. Durable create state
-distinguishes `pre_create`, `unknown`, and `bound`: a proven pre-transport
-failure may accept a new Local action key, unknown outcome requires exact
-replay, and a bound project resumes without another create.
+only with the persisted canonical create request, its digest, and its
+idempotency key. Durable create state distinguishes `pre_create`, `unknown`,
+and `bound`: a proven pre-transport failure may accept a new Local action key,
+unknown outcome requires exact replay, and a bound project resumes without
+another create. If mapping commit is interrupted and the Local draft is edited,
+the bound operation first verifies the original request against that Core
+project and then converges the new intent through a versioned patch.
 
-Mapped Local edits use Core `patch_project`, the stored project ETag, and a
-deterministic old/new request key. The mapping records canonical mapped intent,
-Core ETag, registry, project/task/workspace snapshots, monotonic mapping
-generation, and predecessor request digest; compare-and-swap commit retains the
-previous version in adapter-owned history. Core must sign the required new
-snapshots before Desktop accepts task, model/execution, evolution, or workspace
-changes. Imported workspace upload IDs are additionally bound to the exact Core
-project snapshot, so a workspace revision cannot reuse an earlier upload
-session.
+Mapped Local edits use Core `patch_project`, the freshly read project ETag, and
+a deterministic old/new request key. The mapping records canonical mapped
+intent and immutable project/task/workspace content snapshots separately from
+mutable Core authority: project ETag, active revision, project `updated_at`, and
+registry digest. A legitimate cross-session successor may change only that
+mutable authority. After capabilities, project/head agreement, and validation
+succeed, compare-and-swap commit increments the mapping generation and retains
+the previous version in adapter-owned history; an authority-only version may
+repeat the predecessor request digest. Core must sign the required new snapshots
+before Desktop accepts task, model/execution, evolution, or workspace changes.
+Imported workspace upload IDs are additionally bound to the exact Core project
+snapshot, so a workspace revision cannot reuse an earlier upload session.
 
 Host, tunnel, archive open/read/close, and persistence callbacks run through a
 fixed bounded executor. A deadline stops result delivery, while any callback

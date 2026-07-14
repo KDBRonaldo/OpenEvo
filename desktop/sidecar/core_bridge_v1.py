@@ -224,24 +224,30 @@ class CoreTunnelHandleV1:
             future.result(timeout=_remaining_seconds(deadline))
         except FutureTimeoutError:
             if future.done():
-                if token is not None:
-                    token.untrack_future(future)
+                try:
+                    future.result()
+                except BaseException:
+                    if token is not None:
+                        token.untrack_future(future)
+                    with self._lock:
+                        if self._close_future is future:
+                            self._close_future = None
+                        self._close_failure = "callback_failed"
+                    raise _bridge_error(
+                        "core_tunnel_close_failed",
+                        "The active Core tunnel close operation failed.",
+                        retryable=True,
+                    ) from None
+                # The callback won the timeout boundary. Consume its success
+                # below without clearing ownership or submitting it again.
+            else:
                 with self._lock:
-                    if self._close_future is future:
-                        self._close_future = None
-                    self._close_failure = "callback_failed"
+                    self._close_failure = "deadline_exceeded"
                 raise _bridge_error(
-                    "core_tunnel_close_failed",
-                    "The active Core tunnel close operation failed.",
+                    "core_tunnel_close_deadline_exceeded",
+                    "The active Core tunnel did not close before the deadline.",
                     retryable=True,
                 ) from None
-            with self._lock:
-                self._close_failure = "deadline_exceeded"
-            raise _bridge_error(
-                "core_tunnel_close_deadline_exceeded",
-                "The active Core tunnel did not close before the deadline.",
-                retryable=True,
-            ) from None
         except BaseException:
             if token is not None:
                 token.untrack_future(future)
@@ -294,6 +300,7 @@ class CoreProjectCreateOperationV1:
     profile_id: str
     core_host_identity: str
     request_sha256: str
+    project_create: core_v1.ProjectCreateV1
     idempotency_key: str
     state: CoreProjectCreateStateV1 = CoreProjectCreateStateV1.PRE_CREATE
     core_project_id: str | None = None
@@ -301,6 +308,8 @@ class CoreProjectCreateOperationV1:
     workspace_upload_project_snapshot: core_v1.ImmutableSnapshotRefV1 | None = None
 
     def __post_init__(self) -> None:
+        if _model_digest(self.project_create) != self.request_sha256:
+            raise ValueError("project create request digest does not match canonical request")
         if (self.state is CoreProjectCreateStateV1.BOUND) != (self.core_project_id is not None):
             raise ValueError("only a bound create operation has a Core project ID")
         if (self.workspace_upload_id is None) != (self.workspace_upload_project_snapshot is None):
@@ -320,6 +329,8 @@ class CoreProjectMappingV1:
     workspace_snapshot: core_v1.ImmutableSnapshotRefV1
     registry_digest: str
     project_etag: str
+    active_revision: core_v1.RevisionRefV1
+    project_updated_at: str
     mapping_generation: int
     predecessor_request_sha256: str | None
 
@@ -334,9 +345,10 @@ class DesktopCoreBridgePersistence(Protocol):
     """Durable callback boundary with atomic create transitions and mapping CAS.
 
     A pre-create reservation may be replaced by a later Local action. Unknown
-    outcomes require the exact request and key, while a bound Core project is
-    immutable. Mapping commits compare the complete previous mapping and the
-    adapter must retain an ordered audit history without lost updates.
+    outcomes require the exact request and key. A bound operation preserves its
+    original canonical request and Core project identity while later Local
+    intent converges through patching. Mapping commits compare the complete
+    previous mapping and retain ordered audit history without lost updates.
     """
 
     def load_mapping(self, local_project_id: str) -> CoreProjectMappingV1 | None: ...
@@ -557,6 +569,7 @@ class DesktopCoreBridgeV1:
                     profile_id=project.profile_id,
                     core_host_identity=attachment.bearer_identity,
                     request_sha256=request_sha256,
+                    project_create=create_request,
                     idempotency_key=idempotency_key,
                 )
                 operation = self._adapter_external(
@@ -620,6 +633,16 @@ class DesktopCoreBridgeV1:
                     deadline=deadline,
                     client=client,
                     mapping=mapping,
+                    current=core_project,
+                    requested=create_request,
+                    request_sha256=request_sha256,
+                )
+            elif operation.request_sha256 != request_sha256:
+                core_project = self._reconcile_bound_project(
+                    token=token,
+                    deadline=deadline,
+                    client=client,
+                    operation=operation,
                     current=core_project,
                     requested=create_request,
                     request_sha256=request_sha256,
@@ -1356,15 +1379,63 @@ class DesktopCoreBridgeV1:
     ) -> core_v1.ProjectV1:
         if mapping.request_sha256 == request_sha256:
             _ensure_project_identity(current, requested)
-            _ensure_mapping_snapshots(mapping, current)
+            _ensure_mapping_content_snapshots(mapping, current)
             return current
 
         if _project_identity_matches(current, requested):
             _ensure_mapping_was_versioned(mapping, current, requested)
             return current
 
-        _ensure_mapping_snapshots(mapping, current)
+        _ensure_mapping_content_snapshots(mapping, current)
         _ensure_project_identity(current, mapping.project_create)
+        return self._patch_current_project(
+            token=token,
+            deadline=deadline,
+            client=client,
+            current=current,
+            requested=requested,
+            previous_request_sha256=mapping.request_sha256,
+            request_sha256=request_sha256,
+            local_project_id=mapping.local_project_id,
+        )
+
+    def _reconcile_bound_project(
+        self,
+        *,
+        token: _GenerationToken,
+        deadline: float,
+        client: CoreControlClientV1,
+        operation: CoreProjectCreateOperationV1,
+        current: core_v1.ProjectV1,
+        requested: core_v1.ProjectCreateV1,
+        request_sha256: str,
+    ) -> core_v1.ProjectV1:
+        if _project_identity_matches(current, requested):
+            return current
+        _ensure_project_identity(current, operation.project_create)
+        return self._patch_current_project(
+            token=token,
+            deadline=deadline,
+            client=client,
+            current=current,
+            requested=requested,
+            previous_request_sha256=operation.request_sha256,
+            request_sha256=request_sha256,
+            local_project_id=operation.local_project_id,
+        )
+
+    def _patch_current_project(
+        self,
+        *,
+        token: _GenerationToken,
+        deadline: float,
+        client: CoreControlClientV1,
+        current: core_v1.ProjectV1,
+        requested: core_v1.ProjectCreateV1,
+        previous_request_sha256: str,
+        request_sha256: str,
+        local_project_id: str,
+    ) -> core_v1.ProjectV1:
         patch = core_v1.ProjectPatchV1(
             name=requested.name,
             description=requested.description,
@@ -1380,8 +1451,8 @@ class DesktopCoreBridgeV1:
                 patch,
                 if_match=previous.etag,
                 idempotency_key=_derived_key(
-                    mapping.local_project_id,
-                    f"project-patch-{mapping.request_sha256}-{request_sha256}",
+                    local_project_id,
+                    f"project-patch-{previous_request_sha256}-{request_sha256}",
                 ),
             ),
         )
@@ -1877,15 +1948,15 @@ def _ensure_create_operation(
     idempotency_key: str,
     core_host_identity: str,
 ) -> None:
+    bound = operation.state is CoreProjectCreateStateV1.BOUND
     if (
         operation.local_project_id != project.project_id
         or operation.profile_id != project.profile_id
         or operation.core_host_identity != core_host_identity
-        or operation.request_sha256 != request_sha256
-        or (
-            operation.state is not CoreProjectCreateStateV1.BOUND
-            and operation.idempotency_key != idempotency_key
-        )
+        or _model_digest(operation.project_create) != operation.request_sha256
+        or (not bound and operation.request_sha256 != request_sha256)
+        or (not bound and operation.project_create != map_project_create_v1(project))
+        or (not bound and operation.idempotency_key != idempotency_key)
     ):
         raise _bridge_error(
             "core_project_create_replay_mismatch",
@@ -1997,12 +2068,28 @@ def _ensure_mapping_was_versioned(
             "Core reports changed task content without a new immutable snapshot.",
             status=409,
         )
+    if mapping.project_create.task == requested.task and (
+        current.current_task_snapshot != mapping.task_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_mapping_mismatch",
+            "Core changed the immutable task snapshot for unchanged task content.",
+            status=409,
+        )
     if mapping.project_create.workspace != requested.workspace and (
         current.current_workspace_snapshot == mapping.workspace_snapshot
     ):
         raise _bridge_error(
             "core_project_mapping_mismatch",
             "Core reports changed workspace content without new snapshot state.",
+            status=409,
+        )
+    if mapping.project_create.workspace == requested.workspace and (
+        current.current_workspace_snapshot != mapping.workspace_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_mapping_mismatch",
+            "Core changed the immutable workspace snapshot for unchanged workspace content.",
             status=409,
         )
 
@@ -2029,6 +2116,13 @@ def _ensure_patch_signed_new_snapshots(
             "core_project_patch_not_versioned",
             "Core patched the task without signing a new task snapshot.",
         )
+    if previous.task == requested.task and (
+        patched.current_task_snapshot != previous.current_task_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_patch_not_versioned",
+            "Core changed the task snapshot without changing task content.",
+        )
     if previous.workspace != requested.workspace and (
         patched.current_workspace_snapshot == previous.current_workspace_snapshot
     ):
@@ -2036,20 +2130,28 @@ def _ensure_patch_signed_new_snapshots(
             "core_project_patch_not_versioned",
             "Core patched the workspace without changing its snapshot state.",
         )
+    if previous.workspace == requested.workspace and (
+        patched.current_workspace_snapshot != previous.current_workspace_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_patch_not_versioned",
+            "Core changed the workspace snapshot without changing workspace content.",
+        )
 
 
-def _ensure_mapping_snapshots(mapping: CoreProjectMappingV1, project: core_v1.ProjectV1) -> None:
+def _ensure_mapping_content_snapshots(
+    mapping: CoreProjectMappingV1,
+    project: core_v1.ProjectV1,
+) -> None:
     if (
         mapping.core_project_id != project.id
         or mapping.project_snapshot != project.current_project_snapshot
         or mapping.task_snapshot != project.current_task_snapshot
         or mapping.workspace_snapshot != project.current_workspace_snapshot
-        or mapping.registry_digest != project.registry_digest
-        or mapping.project_etag != project.etag
     ):
         raise _bridge_error(
             "core_project_mapping_mismatch",
-            "The Core project identity or immutable snapshots changed outside Desktop authority.",
+            "The Core project identity or immutable content snapshots changed outside Desktop authority.",
             status=409,
         )
 
@@ -2084,15 +2186,25 @@ def _mapping_from_project(
     previous_mapping: CoreProjectMappingV1 | None,
 ) -> CoreProjectMappingV1:
     workspace_snapshot = project.current_workspace_snapshot
-    if workspace_snapshot is None:
+    active_revision = project.active_revision
+    if workspace_snapshot is None or active_revision is None:
         raise _bridge_error(
             "core_project_not_ready",
-            "Core has not published the project workspace snapshot.",
+            "Core has not published the project workspace snapshot and active revision.",
         )
     if previous_mapping is None:
         mapping_generation = 1
         predecessor_request_sha256 = None
-    elif previous_mapping.request_sha256 == request_sha256:
+    elif (
+        previous_mapping.request_sha256 == request_sha256
+        and previous_mapping.project_snapshot == project.current_project_snapshot
+        and previous_mapping.task_snapshot == project.current_task_snapshot
+        and previous_mapping.workspace_snapshot == workspace_snapshot
+        and previous_mapping.registry_digest == capabilities.registry_digest
+        and previous_mapping.project_etag == project.etag
+        and previous_mapping.active_revision == active_revision
+        and previous_mapping.project_updated_at == project.updated_at
+    ):
         mapping_generation = previous_mapping.mapping_generation
         predecessor_request_sha256 = previous_mapping.predecessor_request_sha256
     else:
@@ -2110,6 +2222,8 @@ def _mapping_from_project(
         workspace_snapshot=workspace_snapshot,
         registry_digest=capabilities.registry_digest,
         project_etag=project.etag,
+        active_revision=active_revision,
+        project_updated_at=project.updated_at,
         mapping_generation=mapping_generation,
         predecessor_request_sha256=predecessor_request_sha256,
     )
