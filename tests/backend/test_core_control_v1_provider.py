@@ -2328,6 +2328,116 @@ def test_capabilities_and_project_validation_use_verified_registry(tmp_path: Pat
         assert unavailable.json()["code"] == "evolution_registry_unavailable"
 
 
+def test_verified_subscription_project_publishes_durable_initial_revision(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(state_root, registry=registry)) as client:
+        project, _ = _create_project(client, _project_create())
+        assert project["status"] == "ready"
+        assert project["registry_digest"] == registry.snapshot.registry_digest
+        assert project["model_preparation"]["status"] == "ready"
+        initial_ref = project["active_revision"]
+        assert initial_ref is not None
+        assert initial_ref["project_id"] == project["id"]
+        assert initial_ref["generation"] == 0
+
+        head = client.get(
+            f"/v1/projects/{project['id']}/revisions/head",
+            headers=AUTH,
+        )
+        assert head.status_code == 200, head.text
+        assert head.headers["etag"] == head.json()["etag"]
+        assert head.json() == {
+            "schema_version": "1",
+            "project_id": project["id"],
+            "active_revision": initial_ref,
+            "successor_revision": None,
+            "transition": None,
+            "updated_at": project["updated_at"],
+            "etag": head.headers["etag"],
+        }
+
+        revision = client.get(f"/v1/revisions/{initial_ref['id']}", headers=AUTH)
+        assert revision.status_code == 200, revision.text
+        assert revision.headers["etag"] == revision.json()["etag"]
+        assert revision.json()["revision"] == initial_ref
+        assert revision.json()["status"] == "active"
+        assert revision.json()["project_snapshot"] == project["current_project_snapshot"]
+        assert revision.json()["task_snapshot"] == project["current_task_snapshot"]
+        assert revision.json()["workspace_snapshot"] == project["current_workspace_snapshot"]
+        assert revision.json()["registry_digest"] == registry.snapshot.registry_digest
+
+        revisions = client.get(
+            f"/v1/projects/{project['id']}/revisions",
+            headers=AUTH,
+        )
+        assert revisions.status_code == 200, revisions.text
+        assert [item["revision"] for item in revisions.json()["items"]] == [initial_ref]
+
+    with TestClient(_app(state_root, registry=registry)) as restarted:
+        project_after_restart = restarted.get(
+            f"/v1/projects/{project['id']}",
+            headers=AUTH,
+        )
+        assert project_after_restart.status_code == 200
+        assert project_after_restart.json()["active_revision"] == initial_ref
+        head_after_restart = restarted.get(
+            f"/v1/projects/{project['id']}/revisions/head",
+            headers=AUTH,
+        )
+        assert head_after_restart.status_code == 200
+        assert head_after_restart.json()["active_revision"] == initial_ref
+
+
+def test_project_patch_publishes_a_durable_direct_successor_revision(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(state_root, registry=registry)) as client:
+        project, project_etag = _create_project(client, _project_create())
+        initial_ref = project["active_revision"]
+        assert initial_ref is not None
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-revision-0001",
+                "If-Match": project_etag,
+            },
+            json={"schema_version": "1", "name": "Protein memory successor"},
+        )
+        assert patched.status_code == 200, patched.text
+        successor_ref = patched.json()["active_revision"]
+        assert successor_ref["project_id"] == project["id"]
+        assert successor_ref["generation"] == 1
+        assert successor_ref["id"] != initial_ref["id"]
+
+        revisions = client.get(
+            f"/v1/projects/{project['id']}/revisions",
+            headers=AUTH,
+            params={"sort": "generation", "direction": "asc"},
+        )
+        assert revisions.status_code == 200, revisions.text
+        assert [item["revision"] for item in revisions.json()["items"]] == [
+            initial_ref,
+            successor_ref,
+        ]
+        historical = client.get(f"/v1/revisions/{initial_ref['id']}", headers=AUTH)
+        assert historical.status_code == 200
+        assert historical.json()["status"] == "active"
+
+    with TestClient(_app(state_root, registry=registry)) as restarted:
+        head = restarted.get(
+            f"/v1/projects/{project['id']}/revisions/head",
+            headers=AUTH,
+        )
+        assert head.status_code == 200
+        assert head.json()["active_revision"] == successor_ref
+
+
 def test_project_validation_uses_the_exact_persisted_execution_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
