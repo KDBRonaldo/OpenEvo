@@ -40,6 +40,55 @@ def _write_export_inputs(builder: ModuleType, root: Path) -> tuple[Path, Path]:
     return wheel, lock
 
 
+def _run_crashing_core_export(
+    *,
+    builder_path: Path,
+    output: Path,
+    wheel: Path,
+    lock: Path,
+    mode: str,
+    cleanup_name: str = "",
+) -> subprocess.CompletedProcess[bytes]:
+    script = f"""
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("crash_build_sidecar", {str(builder_path)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+mode = sys.argv[1]
+cleanup_name = sys.argv[2]
+
+def crash_after_publish(authority, member):
+    del authority, member
+    if mode == "publish":
+        os._exit(73)
+
+def crash_during_cleanup(authority, source):
+    del authority
+    if mode in {{"recovery", "rollback"}} and source.name == cleanup_name:
+        os._exit(74)
+
+module._after_core_release_member_published = crash_after_publish
+module._after_core_release_member_cleaned = crash_during_cleanup
+with module._open_core_release_output(Path({str(output)!r})) as authority:
+    module._export_core_release_inputs(
+        authority,
+        Path({str(wheel)!r}),
+        Path({str(lock)!r}),
+    )
+    if mode == "rollback":
+        raise OSError("trigger rollback")
+"""
+    return subprocess.run(
+        [sys.executable, "-c", script, mode, cleanup_name],
+        check=False,
+    )
+
+
 def _write_repo_skeleton(repo: Path) -> None:
     _write_product_web(repo / "desktop/dist")
     _write_product_web(repo / "desktop/packaging/web")
@@ -883,6 +932,193 @@ with module._open_core_release_output(Path({str(output)!r})) as authority:
     assert (output / wheel.name).read_bytes() == wheel.read_bytes()
     assert not (output / lock.name).exists()
     assert len(list(output.glob(".openevo-core-release-*"))) == 1
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+    assert (output / wheel.name).read_bytes() == wheel.read_bytes()
+    assert (output / lock.name).read_bytes() == lock.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("cleanup_member", "cleanup_index"),
+    (("wheel", 1), ("lock", 2)),
+)
+def test_core_release_recovery_resumes_after_second_cleanup_crash(
+    tmp_path: Path,
+    cleanup_member: str,
+    cleanup_index: int,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    cleanup_name = wheel.name if cleanup_member == "wheel" else lock.name
+
+    first = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="publish",
+    )
+    assert first.returncode == 73
+
+    second = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="recovery",
+        cleanup_name=cleanup_name,
+    )
+    assert second.returncode == 74
+    transactions = list(output.glob(".openevo-core-release-*"))
+    assert len(transactions) == 1
+    marker = json.loads(
+        (transactions[0] / builder.CORE_RELEASE_TRANSACTION_MARKER).read_text(encoding="utf-8")
+    )
+    assert marker["phase"] == "cleaning"
+    assert marker["cleanup_index"] == cleanup_index
+    assert not (output / wheel.name).exists()
+    assert not (transactions[0] / wheel.name).exists()
+    if cleanup_member == "wheel":
+        assert (transactions[0] / lock.name).read_bytes() == lock.read_bytes()
+    else:
+        assert not (output / lock.name).exists()
+        assert not (transactions[0] / lock.name).exists()
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+    assert (output / wheel.name).read_bytes() == wheel.read_bytes()
+    assert (output / lock.name).read_bytes() == lock.read_bytes()
+
+
+def test_core_release_recovery_adopts_fsynced_cleanup_marker_candidate(
+    tmp_path: Path,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    first = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="publish",
+    )
+    assert first.returncode == 73
+    transactions = list(output.glob(".openevo-core-release-*"))
+    assert len(transactions) == 1
+    transaction = transactions[0]
+    marker = json.loads(
+        (transaction / builder.CORE_RELEASE_TRANSACTION_MARKER).read_text(encoding="utf-8")
+    )
+    marker["phase"] = "cleaning"
+    marker["cleanup_index"] = 1
+    candidate_payload = (json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    candidate_fd = os.open(
+        transaction / builder.CORE_RELEASE_TRANSACTION_READY,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        assert os.write(candidate_fd, candidate_payload) == len(candidate_payload)
+        os.fsync(candidate_fd)
+    finally:
+        os.close(candidate_fd)
+    transaction_fd = os.open(transaction, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(transaction_fd)
+    finally:
+        os.close(transaction_fd)
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+    assert (output / wheel.name).read_bytes() == wheel.read_bytes()
+    assert (output / lock.name).read_bytes() == lock.read_bytes()
+
+
+def test_core_release_cleaning_recovery_rejects_unbound_hardlink(tmp_path: Path) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    first = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="publish",
+    )
+    assert first.returncode == 73
+    second = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="recovery",
+        cleanup_name=wheel.name,
+    )
+    assert second.returncode == 74
+    transactions = list(output.glob(".openevo-core-release-*"))
+    assert len(transactions) == 1
+    hidden_lock = tmp_path / "hidden-framework-lock.json"
+    os.link(transactions[0] / lock.name, hidden_lock)
+
+    with pytest.raises(RuntimeError, match="identity or permissions changed"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert hidden_lock.read_bytes() == lock.read_bytes()
+    assert (transactions[0] / lock.name).read_bytes() == lock.read_bytes()
+    marker = json.loads(
+        (transactions[0] / builder.CORE_RELEASE_TRANSACTION_MARKER).read_text(encoding="utf-8")
+    )
+    assert marker["phase"] == "cleaning"
+    assert marker["cleanup_index"] == 1
+
+
+@pytest.mark.parametrize(
+    ("cleanup_member", "cleanup_index"),
+    (("wheel", 1), ("lock", 2)),
+)
+def test_core_release_rollback_resumes_after_cleanup_crash(
+    tmp_path: Path,
+    cleanup_member: str,
+    cleanup_index: int,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    cleanup_name = wheel.name if cleanup_member == "wheel" else lock.name
+
+    crashed = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="rollback",
+        cleanup_name=cleanup_name,
+    )
+
+    assert crashed.returncode == 74
+    transactions = list(output.glob(".openevo-core-release-*"))
+    assert len(transactions) == 1
+    marker = json.loads(
+        (transactions[0] / builder.CORE_RELEASE_TRANSACTION_MARKER).read_text(encoding="utf-8")
+    )
+    assert marker["phase"] == "cleaning"
+    assert marker["cleanup_index"] == cleanup_index
 
     with builder._open_core_release_output(output) as authority:
         builder._export_core_release_inputs(authority, wheel, lock)

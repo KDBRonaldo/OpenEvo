@@ -150,11 +150,29 @@ Failure injection covers partial copy, second-member failure, output-path
 replacement, exported-member unlink/rename/same-name replacement, and extra
 members. A real child-process crash after the wheel name is published but before
 the lock name is published must leave a bounded marker-authorized state that the
-next run reconciles and replaces with one complete pair. Rollback may remove only
-the inode it recorded. If a pathname contains an identity-mismatched replacement
-or an owned inode has an unbound residual link, cleanup reports an unverifiable
-rollback, preserves the unknown entry and transaction marker, and subsequent
-retries remain fail closed until a maintainer resolves that output directory.
+next run reconciles and replaces with one complete pair. Recovery and rollback
+move the canonical marker to a monotonic `cleaning` phase before unlinking any
+member. Its identity prefix records every cleanup-owned inode and its
+`cleanup_index` durably authorizes only an ordered prefix to have zero remaining
+links. Each progress update is file-fsynced, directory-fsynced, atomically
+installed through `transaction.ready`, and directory-fsynced again before the
+authorized unlink. Restart may adopt that temporary marker only when both files
+are closed, canonical, identity-bound markers and they describe the exact next
+phase or cleanup index.
+
+An unauthorized member must retain at least one canonical binding. An authorized
+member may be absent or may still have names after an interrupted unlink, but
+every remaining name must resolve no-follow to the recorded inode and must still
+pass owner, mode, aggregate link-count, byte-size, and SHA-256 checks. Rollback
+may remove only an inode it recorded; its held descriptor is the only additional
+proof allowed to authorize an already-unlinked member or a bounded same-inode
+rename. If a pathname contains an identity-mismatched replacement or an owned
+inode has an unbound residual link, cleanup reports an unverifiable rollback,
+preserves the unknown entry and transaction marker, and subsequent retries remain
+fail closed until a maintainer resolves that output directory. Real subprocess
+tests interrupt initial publication, interrupt the following recovery after
+wheel or lock cleanup, and require a third process to finish; the same wheel/lock
+cleanup points are exercised through live rollback.
 The same preservation rule applies to a `preparing` transaction containing a
 staged entry whose inode has not yet reached the ready marker; only empty and
 marker-only bootstrap remnants are automatically reclaimed before readiness.
