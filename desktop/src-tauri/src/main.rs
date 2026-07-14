@@ -586,6 +586,19 @@ struct NativeWorkspaceImportRequest<'a> {
     kind: &'static str,
     action_id: &'a str,
     selected_path: &'a str,
+    selected_device: u64,
+    selected_inode: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
+}
+
+struct NativeWorkspaceSelection<'a> {
+    kind: &'a str,
+    action_id: &'a str,
+    selected_path: &'a Path,
+    selected_device: u64,
+    selected_inode: u64,
+    project_id: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2166,9 +2179,15 @@ fn pre_exec_error() -> std::io::Error {
     std::io::Error::from_raw_os_error(libc::EIO)
 }
 
+#[derive(Debug)]
 struct LoopbackHttpResponse {
     status: u16,
     body: String,
+}
+
+struct ActiveSidecarConnection {
+    stream: TcpStream,
+    session_token: String,
 }
 
 fn loopback_http_get(
@@ -2206,15 +2225,72 @@ fn loopback_http_request(
     {
         return Err(sidecar_health_error());
     }
+    let deadline = Instant::now() + timeout;
+    let mut stream = connect_loopback_until(port, deadline)?;
+    loopback_http_request_on_stream(
+        &mut stream,
+        method,
+        path,
+        header,
+        body,
+        deadline,
+        response_limit,
+    )
+}
+
+fn connect_loopback_until(port: u16, deadline: Instant) -> HostResult<TcpStream> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream =
-        TcpStream::connect_timeout(&addr, timeout).map_err(|_| sidecar_health_error())?;
+    TcpStream::connect_timeout(&addr, remaining_deadline(deadline)?)
+        .map_err(|_| sidecar_health_error())
+}
+
+fn remaining_deadline(deadline: Instant) -> HostResult<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(sidecar_health_error)
+}
+
+fn write_all_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> HostResult<()> {
+    while !bytes.is_empty() {
+        stream
+            .set_write_timeout(Some(remaining_deadline(deadline)?))
+            .map_err(|_| sidecar_health_error())?;
+        let written = stream.write(bytes).map_err(|_| sidecar_health_error())?;
+        if written == 0 {
+            return Err(sidecar_health_error());
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+fn read_until(stream: &mut TcpStream, buffer: &mut [u8], deadline: Instant) -> HostResult<usize> {
     stream
-        .set_read_timeout(Some(timeout))
+        .set_read_timeout(Some(remaining_deadline(deadline)?))
         .map_err(|_| sidecar_health_error())?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|_| sidecar_health_error())?;
+    stream.read(buffer).map_err(|_| sidecar_health_error())
+}
+
+fn loopback_http_request_on_stream(
+    stream: &mut TcpStream,
+    method: &str,
+    path: &str,
+    header: Option<(&str, &str)>,
+    body: Option<&[u8]>,
+    deadline: Instant,
+    response_limit: usize,
+) -> HostResult<LoopbackHttpResponse> {
+    if !matches!(method, "GET" | "POST")
+        || !path.starts_with('/')
+        || path.contains(['\r', '\n'])
+        || header.is_some_and(|(name, value)| {
+            name.is_empty() || name.contains([':', '\r', '\n']) || value.contains(['\r', '\n'])
+        })
+        || response_limit == 0
+    {
+        return Err(sidecar_health_error());
+    }
     let extra_header = header
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .unwrap_or_default();
@@ -2230,26 +2306,30 @@ fn loopback_http_request(
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_header}{content_headers}Connection: close\r\n\r\n"
     );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|_| sidecar_health_error())?;
+    write_all_until(stream, request.as_bytes(), deadline)?;
     if !body.is_empty() {
-        stream.write_all(body).map_err(|_| sidecar_health_error())?;
+        write_all_until(stream, body, deadline)?;
     }
-    let mut response = Vec::new();
-    stream
-        .take((response_limit + 1) as u64)
-        .read_to_end(&mut response)
-        .map_err(|_| sidecar_health_error())?;
-    if response.len() > response_limit {
-        return Err(sidecar_health_error());
-    }
-    let response = String::from_utf8(response).map_err(|_| sidecar_health_error())?;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(sidecar_health_error)?;
-    let mut status_fields = headers
-        .lines()
+
+    let mut response = Vec::with_capacity(response_limit.min(4096));
+    let header_end = loop {
+        if let Some(index) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+        if response.len() >= response_limit {
+            return Err(sidecar_health_error());
+        }
+        let mut chunk = [0_u8; 1024];
+        let read = read_until(stream, &mut chunk, deadline)?;
+        if read == 0 || response.len().saturating_add(read) > response_limit {
+            return Err(sidecar_health_error());
+        }
+        response.extend_from_slice(&chunk[..read]);
+    };
+    let headers =
+        std::str::from_utf8(&response[..header_end - 4]).map_err(|_| sidecar_health_error())?;
+    let mut lines = headers.split("\r\n");
+    let mut status_fields = lines
         .next()
         .ok_or_else(sidecar_health_error)?
         .split_whitespace();
@@ -2261,9 +2341,46 @@ fn loopback_http_request(
     if protocol != "HTTP/1.1" && protocol != "HTTP/1.0" {
         return Err(sidecar_health_error());
     }
+
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line.split_once(':').ok_or_else(sidecar_health_error)?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(sidecar_health_error());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() || value.trim().is_empty() {
+                return Err(sidecar_health_error());
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| sidecar_health_error())?,
+            );
+        }
+    }
+    let content_length = content_length.ok_or_else(sidecar_health_error)?;
+    if content_length > response_limit.saturating_sub(header_end) {
+        return Err(sidecar_health_error());
+    }
+    let mut response_body = response.split_off(header_end);
+    if response_body.len() > content_length {
+        return Err(sidecar_health_error());
+    }
+    while response_body.len() < content_length {
+        let remaining = content_length - response_body.len();
+        let mut chunk = [0_u8; 1024];
+        let chunk_limit = remaining.min(chunk.len());
+        let read = read_until(stream, &mut chunk[..chunk_limit], deadline)?;
+        if read == 0 {
+            return Err(sidecar_health_error());
+        }
+        response_body.extend_from_slice(&chunk[..read]);
+    }
     Ok(LoopbackHttpResponse {
         status,
-        body: body.to_string(),
+        body: String::from_utf8(response_body).map_err(|_| sidecar_health_error())?,
     })
 }
 
@@ -2397,39 +2514,46 @@ fn check_sidecar_session_binding(port: u16, session_token: &str) -> HostResult<(
 }
 
 fn register_native_workspace_source(
-    port: u16,
+    stream: &mut TcpStream,
     session_token: &str,
-    kind: &str,
-    action_id: &str,
-    selected_path: &Path,
+    selection: NativeWorkspaceSelection<'_>,
 ) -> HostResult<NativeProjectSourceV1> {
-    if kind != "native_folder_snapshot"
-        || action_id.len() < 16
-        || action_id.len() > 256
-        || action_id.trim() != action_id
-        || action_id
+    if selection.kind != "native_folder_snapshot"
+        || selection.action_id.len() < 16
+        || selection.action_id.len() > 256
+        || selection.action_id.trim() != selection.action_id
+        || selection
+            .action_id
             .chars()
             .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+        || selection.selected_inode == 0
+        || selection
+            .project_id
+            .is_some_and(|value| !is_valid_native_text(value))
     {
         return Err(workspace_selection_error());
     }
-    let selected_path = selected_path
+    let selected_path = selection
+        .selected_path
         .to_str()
         .ok_or_else(workspace_selection_error)?;
     let request = NativeWorkspaceImportRequest {
         schema_version: "1",
         kind: "native_folder_snapshot",
-        action_id,
+        action_id: selection.action_id,
         selected_path,
+        selected_device: selection.selected_device,
+        selected_inode: selection.selected_inode,
+        project_id: selection.project_id,
     };
     let body = serde_json::to_vec(&request).map_err(|_| workspace_import_error())?;
-    let response = loopback_http_request(
-        port,
+    let response = loopback_http_request_on_stream(
+        stream,
         "POST",
         NATIVE_WORKSPACE_IMPORT_ROUTE,
         Some((NATIVE_SESSION_HEADER, session_token)),
         Some(&body),
-        NATIVE_WORKSPACE_IMPORT_TIMEOUT,
+        Instant::now() + NATIVE_WORKSPACE_IMPORT_TIMEOUT,
         NATIVE_WORKSPACE_RESPONSE_MAX_BYTES,
     )
     .map_err(|_| workspace_import_error())?;
@@ -2452,6 +2576,8 @@ fn validate_native_project_source(source: &NativeProjectSourceV1) -> HostResult<
         || source.display_name.is_empty()
         || source.display_name.len() > 256
         || source.display_name.trim() != source.display_name
+        || matches!(source.display_name.as_str(), "." | "..")
+        || source.display_name.contains(['/', '\\'])
         || source
             .display_name
             .chars()
@@ -2471,7 +2597,16 @@ fn validate_native_project_source(source: &NativeProjectSourceV1) -> HostResult<
     Ok(())
 }
 
-fn active_sidecar_session(state: &DesktopHostState) -> HostResult<(u16, String)> {
+fn is_valid_native_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value
+            .chars()
+            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+}
+
+fn active_sidecar_connection(state: &DesktopHostState) -> HostResult<ActiveSidecarConnection> {
     let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
     let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
     if managed.lifecycle != ManagedLifecycle::Running {
@@ -2479,7 +2614,11 @@ fn active_sidecar_session(state: &DesktopHostState) -> HostResult<(u16, String)>
     }
     let port = managed.status.port.ok_or_else(sidecar_state_error)?;
     let bootstrap = managed.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
-    Ok((port, bootstrap.session_credential.expose()))
+    let stream = connect_loopback_until(port, Instant::now() + SIDECAR_HEALTH_CONNECT_TIMEOUT)?;
+    Ok(ActiveSidecarConnection {
+        stream,
+        session_token: bootstrap.session_credential.expose(),
+    })
 }
 
 fn readiness_hmac_domain(instance_id: &str, challenge: &str) -> String {
@@ -3796,6 +3935,7 @@ async fn select_project_source(
     state: tauri::State<'_, DesktopHostState>,
     kind: String,
     action_id: String,
+    project_id: Option<String>,
 ) -> HostResult<NativeProjectSourceV1> {
     if kind != "native_folder_snapshot" {
         return Err(workspace_selection_error());
@@ -3813,9 +3953,25 @@ async fn select_project_source(
     if !metadata.is_dir() {
         return Err(workspace_selection_error());
     }
-    let (port, session_token) = active_sidecar_session(&state)?;
+    let selected_device = metadata.dev();
+    let selected_inode = metadata.ino();
+    let ActiveSidecarConnection {
+        mut stream,
+        session_token,
+    } = active_sidecar_connection(&state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        register_native_workspace_source(port, &session_token, &kind, &action_id, &selected)
+        register_native_workspace_source(
+            &mut stream,
+            &session_token,
+            NativeWorkspaceSelection {
+                kind: &kind,
+                action_id: &action_id,
+                selected_path: &selected,
+                selected_device,
+                selected_inode,
+                project_id: project_id.as_deref(),
+            },
+        )
     })
     .await
     .map_err(|_| workspace_import_error())?
@@ -4760,6 +4916,111 @@ mod tests {
     }
 
     #[test]
+    fn loopback_http_uses_one_total_deadline_for_trickled_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let started = Instant::now();
+
+        let error = loopback_http_request(
+            port,
+            "GET",
+            "/health",
+            None,
+            None,
+            Duration::from_millis(60),
+            1024,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "sidecar_health_unavailable");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn native_workspace_request_stays_bound_to_the_pre_restart_listener() {
+        let state = DesktopHostState::default();
+        let (managed, _private_root, old_port) = managed_test_sidecar();
+        let old_listener = managed._listener.try_clone().unwrap();
+        *state.sidecar.lock().unwrap() = Some(managed);
+
+        let ActiveSidecarConnection {
+            mut stream,
+            session_token,
+        } = active_sidecar_connection(&state).unwrap();
+
+        let replacement = TcpListener::bind("127.0.0.1:0").unwrap();
+        let replacement_port = replacement.local_addr().unwrap().port();
+        let replacement_probe = replacement.try_clone().unwrap();
+        replacement_probe.set_nonblocking(true).unwrap();
+        {
+            let mut sidecar = state.sidecar.lock().unwrap();
+            let managed = sidecar.as_mut().unwrap();
+            managed.status.port = Some(replacement_port);
+            managed.status.url = Some(format!("http://127.0.0.1:{replacement_port}/openevo"));
+            managed._listener = replacement;
+        }
+        let old_server = thread::spawn(move || {
+            let (mut accepted, _) = old_listener.accept().unwrap();
+            let (headers, _) = read_http_request_with_body(&mut accepted);
+            assert!(headers.contains(NATIVE_WORKSPACE_IMPORT_ROUTE));
+            write_json_response(
+                &mut accepted,
+                201,
+                serde_json::json!({
+                    "kind": "native_folder_snapshot",
+                    "display_name": "study",
+                    "import_ref": {
+                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                        "content_sha256": "2b".repeat(32),
+                        "byte_size": 1024,
+                        "entry_count": 1,
+                        "extracted_byte_size": 4,
+                    }
+                }),
+            );
+        });
+
+        let source = register_native_workspace_source(
+            &mut stream,
+            &session_token,
+            NativeWorkspaceSelection {
+                kind: "native_folder_snapshot",
+                action_id: "native-source-action-pinned-0001",
+                selected_path: Path::new("/private/study"),
+                selected_device: 17,
+                selected_inode: 29,
+                project_id: None,
+            },
+        )
+        .unwrap();
+        old_server.join().unwrap();
+
+        assert_eq!(source.display_name, "study");
+        assert_eq!(old_port, stream.peer_addr().unwrap().port());
+        assert!(matches!(
+            replacement_probe.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        let mut managed = state.sidecar.lock().unwrap().take().unwrap();
+        if let Some(mut child) = managed.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    #[test]
     fn health_challenge_hmac_binds_readiness_to_the_instance_credential() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -4821,6 +5082,9 @@ mod tests {
                     "kind": "native_folder_snapshot",
                     "action_id": "native-source-action-0001",
                     "selected_path": expected_path.to_str().unwrap(),
+                    "selected_device": 17,
+                    "selected_inode": 29,
+                    "project_id": "project-existing-1",
                 })
             );
             write_json_response(
@@ -4840,12 +5104,18 @@ mod tests {
             );
         });
 
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let source = register_native_workspace_source(
-            port,
+            &mut stream,
             &session_token,
-            "native_folder_snapshot",
-            "native-source-action-0001",
-            &selected_path,
+            NativeWorkspaceSelection {
+                kind: "native_folder_snapshot",
+                action_id: "native-source-action-0001",
+                selected_path: &selected_path,
+                selected_device: 17,
+                selected_inode: 29,
+                project_id: Some("project-existing-1"),
+            },
         )
         .unwrap();
         server.join().unwrap();
@@ -4883,6 +5153,17 @@ mod tests {
                     "extracted_byte_size": 4,
                 }
             }),
+            serde_json::json!({
+                "kind": "native_folder_snapshot",
+                "display_name": "/Users/researcher/private/study",
+                "import_ref": {
+                    "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                    "content_sha256": "2b".repeat(32),
+                    "byte_size": 1024,
+                    "entry_count": 1,
+                    "extracted_byte_size": 4,
+                }
+            }),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -4892,12 +5173,18 @@ mod tests {
                 write_json_response(&mut stream, 201, body);
             });
 
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
             let error = register_native_workspace_source(
-                port,
+                &mut stream,
                 &"7c".repeat(SESSION_TOKEN_BYTES),
-                "native_folder_snapshot",
-                "native-source-action-0002",
-                Path::new("/private/study"),
+                NativeWorkspaceSelection {
+                    kind: "native_folder_snapshot",
+                    action_id: "native-source-action-0002",
+                    selected_path: Path::new("/private/study"),
+                    selected_device: 17,
+                    selected_inode: 29,
+                    project_id: None,
+                },
             )
             .unwrap_err();
             server.join().unwrap();
