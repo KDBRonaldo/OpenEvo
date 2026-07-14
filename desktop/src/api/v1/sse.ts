@@ -24,11 +24,18 @@ export interface CursorExpiredRecoverySignal {
   readonly error: ApiErrorV1;
 }
 
+const MAX_SSE_FRAME_BYTES = 1_048_576;
+
 const sseFramePayloadSchema = z
   .object({
     id: z.string().min(1).max(256),
     event: z.string().min(1).max(128),
-    data: z.string().min(1).max(1_048_576),
+    data: z
+      .string()
+      .min(1)
+      .refine((value) => utf8ByteLength(value) <= MAX_SSE_FRAME_BYTES, {
+        message: "Desktop event frame exceeds the payload limit",
+      }),
   })
   .strict();
 
@@ -90,7 +97,7 @@ export function parseEventStreamFailure(status: number, payload: unknown): Curso
 }
 
 function parseRawSseFrame(frame: string): SseFramePayload | null {
-  if (frame.length > 1_048_576) {
+  if (utf8ByteLength(frame) > MAX_SSE_FRAME_BYTES) {
     throw new DesktopContractError("Desktop event frame exceeds the payload limit");
   }
   const lines = frame.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
@@ -128,4 +135,8 @@ function parseRawSseFrame(frame: string): SseFramePayload | null {
 
   if (id === undefined && event === undefined && data.length === 0 && sawComment) return null;
   return sseFramePayloadSchema.parse({ id, event, data: data.join("\n") });
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }

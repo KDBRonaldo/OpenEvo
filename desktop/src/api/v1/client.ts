@@ -32,6 +32,7 @@ import {
   runV1Schema,
   servicePageV1Schema,
   serviceV1Schema,
+  sha256DigestSchema,
   timelinePageV1Schema,
   versionInfoV1Schema,
   type ApiErrorV1,
@@ -69,12 +70,13 @@ export const DESKTOP_SESSION_HEADER = "X-OpenEvo-Desktop-Session";
 
 export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 export type BootstrapContextProvider = () => Promise<unknown>;
+export type NonEmptyReadonlyArray<T> = readonly [T, ...T[]];
 
 export interface DesktopClientOptions {
   readonly fetch: FetchLike;
   readonly bootstrap: BootstrapContextProvider;
   readonly supportedMajors?: readonly number[];
-  readonly acceptedOpenApiDigests?: readonly string[];
+  readonly acceptedOpenApiDigests: NonEmptyReadonlyArray<string>;
   readonly allowedProviderKinds?: readonly DesktopBootstrapContextV1["negotiated_contract"]["provider_kind"][];
 }
 
@@ -118,6 +120,10 @@ const idempotencyKeySchema = z
   .max(256)
   .refine((value) => !/[\u0000-\u001f\u007f]/.test(value));
 const ifMatchSchema = etagSchema;
+const acceptedOpenApiDigestsSchema = z
+  .array(sha256DigestSchema)
+  .min(1)
+  .refine((digests) => new Set(digests).size === digests.length);
 
 export class DesktopApiError extends Error {
   readonly apiError: ApiErrorV1;
@@ -164,9 +170,10 @@ export interface NegotiatedVersion {
 
 export function negotiateVersion(
   serverInput: unknown,
-  clientSupportedMajors: readonly number[] = [1],
-  acceptedOpenApiDigests?: readonly string[],
+  clientSupportedMajors: readonly number[],
+  acceptedOpenApiDigests: NonEmptyReadonlyArray<string>,
 ): NegotiatedVersion {
+  const acceptedDigests = parseAcceptedOpenApiDigests(acceptedOpenApiDigests);
   const discovery = z
     .object({
       preferred_major: z.number().int().positive(),
@@ -182,7 +189,7 @@ export function negotiateVersion(
     throw new ContractVersionUnsupportedError(clientSupportedMajors, discovery.supported_majors);
   }
   const server = versionInfoV1Schema.parse(serverInput);
-  if (acceptedOpenApiDigests && !acceptedOpenApiDigests.includes(server.openapi_sha256)) {
+  if (!acceptedDigests.includes(server.openapi_sha256)) {
     throw new DesktopContractError("Desktop Local API reported an unknown OpenAPI digest");
   }
   return { major, openapiSha256: server.openapi_sha256, server };
@@ -241,6 +248,7 @@ export interface DesktopApiClientV1 {
 
 export function createDesktopApiClient(options: DesktopClientOptions): DesktopApiClientV1 {
   const supportedMajors = options.supportedMajors ?? [1];
+  const acceptedOpenApiDigests = parseAcceptedOpenApiDigests(options.acceptedOpenApiDigests);
   const allowedProviderKinds = options.allowedProviderKinds ?? ["desktop_sidecar"];
   let bootstrapPromise: Promise<DesktopBootstrapContextV1> | null = null;
 
@@ -253,10 +261,7 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
           if (!supportedMajors.includes(bootstrap.negotiated_contract.major)) {
             throw new ContractVersionUnsupportedError(supportedMajors, [bootstrap.negotiated_contract.major]);
           }
-          if (
-            options.acceptedOpenApiDigests &&
-            !options.acceptedOpenApiDigests.includes(bootstrap.negotiated_contract.openapi_sha256)
-          ) {
+          if (!acceptedOpenApiDigests.includes(bootstrap.negotiated_contract.openapi_sha256)) {
             throw new DesktopContractError("Tauri bootstrap reported an unknown OpenAPI digest");
           }
           if (!allowedProviderKinds.includes(bootstrap.negotiated_contract.provider_kind)) {
@@ -276,6 +281,7 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
     method: string,
     path: string,
     responseSchema: S,
+    expectedStatus: 200 | 201 | 202,
     requestOptions: {
       body?: unknown;
       bodySchema?: ZodType;
@@ -319,6 +325,12 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
       }
       throw new DesktopApiError(parsedError);
     }
+    if (response.status !== expectedStatus) {
+      throw new DesktopContractError(
+        `Desktop Local API returned HTTP ${response.status}; expected HTTP ${expectedStatus}`,
+        { status: response.status },
+      );
+    }
     const payload = await readJson(response);
     return parseResponse(responseSchema, payload, response.status, "success");
   }
@@ -356,27 +368,44 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
     responseSchema: z.ZodType<LocalOperationV1, z.ZodTypeDef, any>,
     actionOptions: ActionRequestOptions,
   ) =>
-      request("POST", path, responseSchema, {
+    request("POST", path, responseSchema, 202, {
       idempotencyKey: actionOptions.idempotencyKey,
       ifMatch: actionOptions.ifMatch,
     });
 
   return {
-    version: () => request("GET", "/version", versionInfoV1Schema, { authenticated: false }),
-    health: () => request("GET", "/health", healthV1Schema, { authenticated: false }),
-    state: () => request("GET", `${DESKTOP_API_V1_PREFIX}/state`, desktopStateV1Schema),
+    version: async () => {
+      const server = await request("GET", "/version", versionInfoV1Schema, 200, { authenticated: false });
+      const negotiated = negotiateVersion(server, supportedMajors, acceptedOpenApiDigests);
+      const bootstrap = await context();
+      if (negotiated.major !== bootstrap.negotiated_contract.major) {
+        throw new DesktopContractError("Tauri bootstrap and Desktop Local API version disagree on the major version");
+      }
+      if (negotiated.openapiSha256 !== bootstrap.negotiated_contract.openapi_sha256) {
+        throw new DesktopContractError("Tauri bootstrap and Desktop Local API version disagree on the OpenAPI digest");
+      }
+      if (server.provider_kind !== bootstrap.negotiated_contract.provider_kind) {
+        throw new DesktopContractError("Tauri bootstrap and Desktop Local API version disagree on the provider kind");
+      }
+      if (!sameFeatureFlags(server.feature_flags, bootstrap.negotiated_contract.feature_flags)) {
+        throw new DesktopContractError("Tauri bootstrap and Desktop Local API version disagree on feature flags");
+      }
+      return server;
+    },
+    health: () => request("GET", "/health", healthV1Schema, 200, { authenticated: false }),
+    state: () => request("GET", `${DESKTOP_API_V1_PREFIX}/state`, desktopStateV1Schema, 200),
     listProfiles: (listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/profiles`, listOptions), profilePageV1Schema),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/profiles`, listOptions), profilePageV1Schema, 200),
     createProfile: (input, createOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/profiles`, remoteProfileV1Schema, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/profiles`, remoteProfileV1Schema, 201, {
         body: input,
         bodySchema: profileCreateV1Schema,
         idempotencyKey: createOptions.idempotencyKey,
       }),
     getProfile: (profileId) =>
-      request("GET", `${DESKTOP_API_V1_PREFIX}/profiles/${segment(profileId)}`, remoteProfileV1Schema),
+      request("GET", `${DESKTOP_API_V1_PREFIX}/profiles/${segment(profileId)}`, remoteProfileV1Schema, 200),
     updateProfile: (profileId, input, actionOptions) =>
-      request("PATCH", `${DESKTOP_API_V1_PREFIX}/profiles/${segment(profileId)}`, remoteProfileV1Schema, {
+      request("PATCH", `${DESKTOP_API_V1_PREFIX}/profiles/${segment(profileId)}`, remoteProfileV1Schema, 200, {
         body: input,
         bodySchema: profilePatchV1Schema,
         ifMatch: actionOptions.ifMatch,
@@ -388,24 +417,24 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
     disconnectProfile: (profileId, actionOptions) =>
       action(`${DESKTOP_API_V1_PREFIX}/profiles/${segment(profileId)}/disconnect`, localOperationV1Schema, actionOptions),
     acceptProfileHostKey: (profileId, input, actionOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/profiles/${segment(profileId)}/host-key/accept`, localOperationV1Schema, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/profiles/${segment(profileId)}/host-key/accept`, localOperationV1Schema, 202, {
         body: input,
         bodySchema: hostKeyAcceptV1Schema,
         idempotencyKey: actionOptions.idempotencyKey,
         ifMatch: actionOptions.ifMatch,
       }),
     listProjects: (listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/projects`, listOptions), projectPageV1Schema),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/projects`, listOptions), projectPageV1Schema, 200),
     createProject: (input, createOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/projects`, projectV1Schema, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/projects`, projectV1Schema, 201, {
         body: input,
         bodySchema: projectCreateV1Schema,
         idempotencyKey: createOptions.idempotencyKey,
       }),
     getProject: (projectId) =>
-      request("GET", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}`, projectV1Schema),
+      request("GET", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}`, projectV1Schema, 200),
     updateProject: (projectId, input, actionOptions) =>
-      request("PATCH", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}`, projectV1Schema, {
+      request("PATCH", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}`, projectV1Schema, 200, {
         body: input,
         bodySchema: projectPatchV1Schema,
         ifMatch: actionOptions.ifMatch,
@@ -423,75 +452,75 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
     syncProjectWorkspace: (projectId, actionOptions) =>
       action(`${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}/workspace-sync`, localOperationV1Schema, actionOptions),
     projectCapabilities: (projectId) =>
-      request("GET", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}/capabilities`, projectCapabilitiesV1Schema),
+      request("GET", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}/capabilities`, projectCapabilitiesV1Schema, 200),
     validateProject: (projectId, input, actionOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}/validate`, projectValidationV1Schema, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/projects/${segment(projectId)}/validate`, projectValidationV1Schema, 200, {
         body: input,
         bodySchema: projectValidateRequestV1Schema,
         idempotencyKey: actionOptions.idempotencyKey,
         ifMatch: actionOptions.ifMatch,
       }),
     getOperation: (operationId) =>
-      request("GET", `${DESKTOP_API_V1_PREFIX}/operations/${segment(operationId)}`, localOperationV1Schema),
+      request("GET", `${DESKTOP_API_V1_PREFIX}/operations/${segment(operationId)}`, localOperationV1Schema, 200),
     operationLogs: (operationId, listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/operations/${segment(operationId)}/logs`, listOptions), logPageV1Schema),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/operations/${segment(operationId)}/logs`, listOptions), logPageV1Schema, 200),
     cancelOperation: (operationId, actionOptions) =>
       action(`${DESKTOP_API_V1_PREFIX}/operations/${segment(operationId)}/cancel`, localOperationV1Schema, actionOptions),
     listRuns: (listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/runs`, listOptions), runPageV1Schema),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/runs`, listOptions), runPageV1Schema, 200),
     createRun: (input, createOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/runs`, runV1Schema, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/runs`, runV1Schema, 202, {
         body: input,
         bodySchema: runCreateV1Schema,
         idempotencyKey: createOptions.idempotencyKey,
       }),
-    getRun: (runId) => request("GET", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}`, runV1Schema),
+    getRun: (runId) => request("GET", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}`, runV1Schema, 200),
     deleteRun: (runId, actionOptions) =>
       requestNoContent("DELETE", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}`, actionOptions),
     cancelRun: (runId, actionOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/cancel`, runV1Schema, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/cancel`, runV1Schema, 202, {
         idempotencyKey: actionOptions.idempotencyKey,
         ifMatch: actionOptions.ifMatch,
       }),
     retryRun: (runId, actionOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/retry`, runV1Schema, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/retry`, runV1Schema, 202, {
         idempotencyKey: actionOptions.idempotencyKey,
         ifMatch: actionOptions.ifMatch,
       }),
     runTimeline: (runId, listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/timeline`, listOptions), timelinePageV1Schema),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/timeline`, listOptions), timelinePageV1Schema, 200),
     runLogs: (runId, listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/logs`, listOptions), logPageV1Schema),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/logs`, listOptions), logPageV1Schema, 200),
     runContext: (runId) =>
-      request("GET", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/context`, runContextV1Schema),
+      request("GET", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/context`, runContextV1Schema, 200),
     runArtifacts: (runId, listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/artifacts`, listOptions), artifactPageV1Schema),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/artifacts`, listOptions), artifactPageV1Schema, 200),
     getArtifact: (artifactId) =>
-      request("GET", `${DESKTOP_API_V1_PREFIX}/artifacts/${segment(artifactId)}`, artifactV1Schema),
+      request("GET", `${DESKTOP_API_V1_PREFIX}/artifacts/${segment(artifactId)}`, artifactV1Schema, 200),
     artifactContent: (artifactId) =>
-      request("GET", `${DESKTOP_API_V1_PREFIX}/artifacts/${segment(artifactId)}/content`, artifactContentV1Schema),
+      request("GET", `${DESKTOP_API_V1_PREFIX}/artifacts/${segment(artifactId)}/content`, artifactContentV1Schema, 200),
     artifactDiff: (artifactId) =>
-      request("GET", `${DESKTOP_API_V1_PREFIX}/artifacts/${segment(artifactId)}/diff`, artifactDiffV1Schema),
+      request("GET", `${DESKTOP_API_V1_PREFIX}/artifacts/${segment(artifactId)}/diff`, artifactDiffV1Schema, 200),
     listServices: (listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/services`, listOptions), servicePageV1Schema),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/services`, listOptions), servicePageV1Schema, 200),
     restartService: (serviceId, actionOptions) =>
       action(`${DESKTOP_API_V1_PREFIX}/services/${segment(serviceId)}/restart`, localOperationV1Schema, actionOptions),
     stopService: (serviceId, actionOptions) =>
       action(`${DESKTOP_API_V1_PREFIX}/services/${segment(serviceId)}/stop`, localOperationV1Schema, actionOptions),
     serviceLogs: (serviceId, listOptions) =>
-      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/services/${segment(serviceId)}/logs`, listOptions), logPageV1Schema),
+      request("GET", withQuery(`${DESKTOP_API_V1_PREFIX}/services/${segment(serviceId)}/logs`, listOptions), logPageV1Schema, 200),
     createDiagnostic: (input, createOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/diagnostics`, localOperationV1Schema, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/diagnostics`, localOperationV1Schema, 202, {
         body: input,
         bodySchema: diagnosticCreateV1Schema,
         idempotencyKey: createOptions.idempotencyKey,
       }),
     getDiagnostic: (diagnosticId) =>
-      request("GET", `${DESKTOP_API_V1_PREFIX}/diagnostics/${segment(diagnosticId)}`, diagnosticReportV1Schema),
+      request("GET", `${DESKTOP_API_V1_PREFIX}/diagnostics/${segment(diagnosticId)}`, diagnosticReportV1Schema, 200),
     deleteDiagnostic: (diagnosticId, actionOptions) =>
       requestNoContent("DELETE", `${DESKTOP_API_V1_PREFIX}/diagnostics/${segment(diagnosticId)}`, actionOptions),
     cleanupMaintenanceCache: (createOptions) =>
-      request("POST", `${DESKTOP_API_V1_PREFIX}/maintenance/cache-cleanup`, localOperationV1Schema, {
+      request("POST", `${DESKTOP_API_V1_PREFIX}/maintenance/cache-cleanup`, localOperationV1Schema, 202, {
         idempotencyKey: createOptions.idempotencyKey,
       }),
     eventStreamRequest: async (lastEventId) => {
@@ -556,4 +585,21 @@ function withQuery(path: string, input?: ListRequestOptions): string {
   if (options.direction !== undefined) query.set("direction", options.direction);
   const serialized = query.toString();
   return serialized ? `${path}?${serialized}` : path;
+}
+
+function parseAcceptedOpenApiDigests(input: readonly string[]): NonEmptyReadonlyArray<string> {
+  const parsed = acceptedOpenApiDigestsSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new DesktopContractError("Accepted OpenAPI digest allowlist must contain at least one unique SHA-256 digest", {
+      cause: parsed.error,
+    });
+  }
+  return [parsed.data[0]!, ...parsed.data.slice(1)];
+}
+
+function sameFeatureFlags(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  return leftSet.size === left.length && rightSet.size === right.length && left.every((flag) => rightSet.has(flag));
 }

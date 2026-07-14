@@ -26,6 +26,26 @@ describe("Desktop Local API v1 SSE parser", () => {
     expect(parseSseFrame(": heartbeat\n\n")).toEqual({ kind: "heartbeat" });
   });
 
+  it("enforces the frame limit by UTF-8 bytes at a multibyte boundary", () => {
+    const exactLimit = `:${"a".repeat(1_048_576 - 5)}é\n\n`;
+    const overLimit = `:${"a".repeat(1_048_576 - 4)}é\n\n`;
+
+    expect(new TextEncoder().encode(exactLimit)).toHaveLength(1_048_576);
+    expect(parseSseFrame(exactLimit)).toEqual({ kind: "heartbeat" });
+    expect(new TextEncoder().encode(overLimit)).toHaveLength(1_048_577);
+    expect(() => parseSseFrame(overLimit)).toThrow(/exceeds the payload limit/i);
+  });
+
+  it("enforces the structured data limit by UTF-8 bytes", () => {
+    expect(() =>
+      parseSseFrame({
+        id: EVENT_FIXTURE_V1.event_id,
+        event: EVENT_FIXTURE_V1.event_name,
+        data: "é".repeat(524_289),
+      }),
+    ).toThrow(/exceeds the payload limit/i);
+  });
+
   it("rejects frame/envelope identity mismatches and extra payload fields", () => {
     expect(() =>
       parseSseFrame({ id: "different-event", event: EVENT_FIXTURE_V1.event_name, data: JSON.stringify(EVENT_FIXTURE_V1) }),
@@ -50,5 +70,11 @@ describe("Desktop Local API v1 SSE parser", () => {
 
   it("keeps non-expiry event errors typed", () => {
     expect(() => parseEventStreamFailure(409, CONTRACT_FIXTURE_V1.error)).toThrow(DesktopApiError);
+  });
+
+  it("rejects event error envelopes whose status does not match the response", () => {
+    expect(() => parseEventStreamFailure(410, CONTRACT_FIXTURE_V1.error)).toThrow(
+      /status does not match/i,
+    );
   });
 });
