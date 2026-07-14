@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 from hashlib import sha256
 import hmac
 import json
@@ -14,6 +15,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import threading
 from typing import Any, Literal, TypeVar, cast
 
 from pydantic import BaseModel, ValidationError
@@ -33,13 +35,24 @@ from desktop.sidecar.contracts.v1.models import (
 
 SCHEMA_VERSION = 1
 DATABASE_FILENAME = "provider.sqlite3"
+JOURNAL_FILENAME = f"{DATABASE_FILENAME}-journal"
+WAL_FILENAME = f"{DATABASE_FILENAME}-wal"
+SHM_FILENAME = f"{DATABASE_FILENAME}-shm"
+OWNER_LOCK_FILENAME = "provider.lock"
 CURSOR_KEY_FILENAME = "cursor-signing.key"
-MAX_REQUEST_BYTES = 1_048_576
-MAX_RESPONSE_BYTES = 2_097_152
+LOCAL_PRINCIPAL = "desktop-local-v1"
+MAX_DOCUMENT_BYTES = 136_314_880
+MAX_REQUEST_BYTES = MAX_DOCUMENT_BYTES
+MAX_RESPONSE_BYTES = MAX_DOCUMENT_BYTES
 MAX_CURSOR_BYTES = 2_048
 MAX_RENDERED_CURSOR_BYTES = 256
 MAX_IDEMPOTENCY_KEY_BYTES = 256
 MAX_IDENTITY_BYTES = 512
+MAX_DATABASE_BYTES = 536_870_912
+MAX_RECOVERY_ROWS = 100_000
+MAX_RECOVERY_BYTES = 402_653_184
+MAX_SCHEMA_OBJECTS = 32
+MAX_SCHEMA_BYTES = 65_536
 DEFAULT_IDEMPOTENCY_RECORD_LIMIT = 10_000
 DEFAULT_IDEMPOTENCY_RETENTION_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_CURSOR_TTL_SECONDS = 15 * 60
@@ -48,6 +61,11 @@ _RESOURCE_ID_BYTES = 32
 _CURSOR_KEY_BYTES = 32
 _ETAG_RE = re.compile(r'^"[0-9a-f]{64}"$')
 _B64_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+    r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{6}Z$"
+)
 
 
 class ProviderStoreError(Exception):
@@ -122,8 +140,8 @@ _Direction = Literal["asc", "desc"]
 _SCHEMA_V1 = (
     """
     CREATE TABLE schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL
+        version INTEGER PRIMARY KEY CHECK (version = 1),
+        applied_at TEXT NOT NULL CHECK (length(CAST(applied_at AS BLOB)) = 27)
     ) STRICT
     """,
     """
@@ -161,18 +179,20 @@ _SCHEMA_V1 = (
         resource_scope TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
         request_digest TEXT NOT NULL,
+        response_type TEXT NOT NULL,
         status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 599),
         response_bytes BLOB NOT NULL,
         created_at_epoch INTEGER NOT NULL,
         expires_at_epoch INTEGER NOT NULL,
         PRIMARY KEY (principal, method, route, resource_scope, idempotency_key),
-        CHECK (length(CAST(principal AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (principal = 'desktop-local-v1'),
         CHECK (length(CAST(method AS BLOB)) BETWEEN 1 AND 512),
         CHECK (length(CAST(route AS BLOB)) BETWEEN 1 AND 512),
         CHECK (length(CAST(resource_scope AS BLOB)) BETWEEN 1 AND 512),
         CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 16 AND 256),
         CHECK (length(request_digest) = 64),
-        CHECK (length(response_bytes) <= 2097152),
+        CHECK (response_type IN ('ProjectV1', 'RemoteProfileV1')),
+        CHECK (length(response_bytes) <= 136314880),
         CHECK (expires_at_epoch > created_at_epoch)
     ) STRICT
     """,
@@ -183,15 +203,47 @@ _SCHEMA_V1 = (
     "CREATE INDEX projects_created_idx ON projects(created_at, project_id)",
     "CREATE INDEX projects_name_idx ON projects(name, project_id)",
     "CREATE INDEX projects_profile_idx ON projects(profile_id, project_id)",
+    "CREATE UNIQUE INDEX projects_single_active_idx ON projects((1)) WHERE state = 'active'",
     "CREATE INDEX idempotency_expiry_idx ON idempotency_records(expires_at_epoch)",
 )
 
-_EXPECTED_TABLES = {
-    "schema_migrations",
-    "remote_profiles",
-    "projects",
-    "idempotency_records",
-}
+
+def _schema_rows(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
+    count, byte_count = connection.execute(
+        """
+        SELECT count(*), coalesce(sum(
+            length(CAST(type AS BLOB)) + length(CAST(name AS BLOB)) +
+            length(CAST(tbl_name AS BLOB)) + coalesce(length(CAST(sql AS BLOB)), 0)
+        ), 0)
+        FROM sqlite_schema
+        WHERE name NOT LIKE 'sqlite_%'
+        """
+    ).fetchone()
+    if count > MAX_SCHEMA_OBJECTS or byte_count > MAX_SCHEMA_BYTES:
+        raise ProviderSchemaError("provider schema exceeds its fingerprint bounds")
+    return tuple(
+        tuple(row)
+        for row in connection.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_schema
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type, name, tbl_name
+            """
+        )
+    )
+
+
+def _expected_schema() -> tuple[tuple[tuple[object, ...], ...], str]:
+    connection = sqlite3.connect(":memory:")
+    try:
+        for statement in _SCHEMA_V1:
+            connection.execute(statement)
+        rows = _schema_rows(connection)
+    finally:
+        connection.close()
+    digest = sha256(_canonical_json_bytes(rows)).hexdigest()
+    return rows, digest
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -205,6 +257,9 @@ def _canonical_json_bytes(value: Any) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ContractValidationError("value is not canonical JSON data") from exc
+
+
+_EXPECTED_SCHEMA_ROWS, _EXPECTED_SCHEMA_DIGEST = _expected_schema()
 
 
 def _decode_json_object(raw: bytes, *, label: str) -> dict[str, Any]:
@@ -235,19 +290,30 @@ def _validate_json_model(model_type: type[_ModelT], value: object) -> _ModelT:
         encoded = _canonical_json_bytes(value)
         return model_type.model_validate_json(encoded)
     except (ContractValidationError, ValidationError) as exc:
-        raise ProviderDataCorruptionError(
-            f"stored data violates {model_type.__name__}"
-        ) from exc
+        raise ProviderDataCorruptionError(f"stored data violates {model_type.__name__}") from exc
 
 
 class ProviderMutation:
     """Restricted state changes available inside an idempotent store transaction."""
 
-    __slots__ = ("_connection", "_store")
+    __slots__ = ("_connection", "_if_match", "_store")
 
-    def __init__(self, store: DesktopProviderStore, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        store: DesktopProviderStore,
+        connection: sqlite3.Connection,
+        *,
+        if_match: str | None = None,
+    ) -> None:
         self._store = store
         self._connection = connection
+        self._if_match = if_match
+
+    def _require_bound_if_match(self, if_match: str) -> None:
+        if self._if_match is not None and not hmac.compare_digest(self._if_match, if_match):
+            raise ContractValidationError(
+                "action mutation If-Match differs from its idempotency envelope"
+            )
 
     def set_project_state(
         self,
@@ -259,12 +325,23 @@ class ProviderMutation:
     ) -> ProjectV1:
         self._store._validate_resource_id(project_id)
         self._store._validate_if_match(if_match)
+        self._require_bound_if_match(if_match)
         if state not in {"draft", "active", "archived", "blocked"}:
             raise ContractValidationError("project state is not a Desktop v1 state")
         if current_revision_id is not None:
             self._store._validate_resource_id(current_revision_id)
         row = self._store._require_project_row(self._connection, project_id)
         self._store._require_etag("project", project_id, row, if_match)
+        if state == "active":
+            self._connection.execute(
+                """
+                UPDATE projects
+                SET state = 'draft', current_revision_id = NULL,
+                    resource_version = resource_version + 1, updated_at = ?
+                WHERE state = 'active' AND project_id != ?
+                """,
+                (self._store._timestamp(), project_id),
+            )
         self._connection.execute(
             """
             UPDATE projects
@@ -295,6 +372,7 @@ class ProviderMutation:
     ) -> RemoteProfileV1:
         self._store._validate_resource_id(profile_id)
         self._store._validate_if_match(if_match)
+        self._require_bound_if_match(if_match)
         if connection_state not in {
             "disconnected",
             "connecting",
@@ -302,9 +380,7 @@ class ProviderMutation:
             "connected",
             "failed",
         }:
-            raise ContractValidationError(
-                "profile connection state is not a Desktop v1 state"
-            )
+            raise ContractValidationError("profile connection state is not a Desktop v1 state")
         row = self._store._require_profile_row(self._connection, profile_id)
         self._store._require_etag("profile", profile_id, row, if_match)
         timestamp = self._store._timestamp()
@@ -399,6 +475,7 @@ class DesktopProviderStore:
         idempotency_retention_seconds: int = DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
         max_idempotency_records: int = DEFAULT_IDEMPOTENCY_RECORD_LIMIT,
     ) -> None:
+        self._require_secure_platform()
         if type(cursor_ttl_seconds) is not int or cursor_ttl_seconds < 1:
             raise ValueError("cursor_ttl_seconds must be a positive integer")
         if type(idempotency_retention_seconds) is not int or idempotency_retention_seconds < 1:
@@ -411,6 +488,7 @@ class DesktopProviderStore:
         self._idempotency_retention_seconds = idempotency_retention_seconds
         self._max_idempotency_records = max_idempotency_records
         self._closed = False
+        self._transaction_lock = threading.RLock()
 
         root = Path(os.path.abspath(os.fspath(Path(state_root).expanduser())))
         self._create_or_validate_root(root)
@@ -419,22 +497,35 @@ class DesktopProviderStore:
         try:
             self._root_fd = os.open(root, flags)
         except OSError as exc:
-            raise ProviderStateRootError("provider state root could not be securely opened") from exc
+            raise ProviderStateRootError(
+                "provider state root could not be securely opened"
+            ) from exc
         root_stat = os.fstat(self._root_fd)
         self._root_identity = (root_stat.st_dev, root_stat.st_ino)
 
         try:
+            self._ensure_empty_private_file(OWNER_LOCK_FILENAME)
+            self._acquire_owner_lock()
             self._ensure_empty_private_file(DATABASE_FILENAME)
+            self._ensure_empty_private_file(JOURNAL_FILENAME)
             self._cursor_key = self._load_or_create_cursor_key()
             self._managed_identities = {
                 name: self._file_identity(name)
-                for name in (DATABASE_FILENAME, CURSOR_KEY_FILENAME)
+                for name in (
+                    DATABASE_FILENAME,
+                    JOURNAL_FILENAME,
+                    OWNER_LOCK_FILENAME,
+                    CURSOR_KEY_FILENAME,
+                )
             }
+            self._verify_no_wal_side_files()
+            self._open_database_fd()
+            self._connection = self._open_bound_connection()
             self._migrate()
+            self._recover_and_validate()
             self._verify_managed_files()
         except BaseException:
-            os.close(self._root_fd)
-            self._closed = True
+            self._close_resources()
             raise
 
     @property
@@ -446,9 +537,34 @@ class DesktopProviderStore:
         return self._state_root
 
     def close(self) -> None:
-        if not self._closed and hasattr(self, "_root_fd"):
-            os.close(self._root_fd)
-            self._closed = True
+        if not self._closed:
+            self._close_resources()
+
+    def _close_resources(self) -> None:
+        connection = getattr(self, "_connection", None)
+        if connection is not None:
+            try:
+                connection.close()
+            finally:
+                del self._connection
+        database_fd = getattr(self, "_database_fd", None)
+        if database_fd is not None:
+            try:
+                os.close(database_fd)
+            finally:
+                del self._database_fd
+        owner_lock_fd = getattr(self, "_owner_lock_fd", None)
+        if owner_lock_fd is not None:
+            try:
+                fcntl.flock(owner_lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(owner_lock_fd)
+                del self._owner_lock_fd
+        root_fd = getattr(self, "_root_fd", None)
+        if root_fd is not None:
+            os.close(root_fd)
+            del self._root_fd
+        self._closed = True
 
     def __enter__(self) -> DesktopProviderStore:
         self._verify_root()
@@ -464,6 +580,19 @@ class DesktopProviderStore:
                 self.close()
             except OSError:
                 pass
+
+    @staticmethod
+    def _require_secure_platform() -> None:
+        if (
+            not hasattr(os, "O_NOFOLLOW")
+            or not hasattr(os, "O_DIRECTORY")
+            or os.open not in os.supports_dir_fd
+            or os.stat not in os.supports_dir_fd
+            or os.stat not in os.supports_follow_symlinks
+        ):
+            raise ProviderStateRootError(
+                "platform lacks no-follow descriptor-relative provider storage"
+            )
 
     @staticmethod
     def _create_or_validate_root(root: Path) -> None:
@@ -545,6 +674,88 @@ class DesktopProviderStore:
         file_stat = self._verify_private_file(name)
         return file_stat.st_dev, file_stat.st_ino
 
+    def _acquire_owner_lock(self) -> None:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        expected_stat = self._verify_private_file(OWNER_LOCK_FILENAME)
+        try:
+            descriptor = os.open(OWNER_LOCK_FILENAME, flags, dir_fd=self._root_fd)
+        except OSError as exc:
+            raise ProviderStateRootError("provider owner lock could not be opened") from exc
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise ProviderStateRootError(
+                "provider state root is already owned by another process"
+            ) from exc
+        except OSError:
+            os.close(descriptor)
+            raise
+        descriptor_stat = os.fstat(descriptor)
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (
+            expected_stat.st_dev,
+            expected_stat.st_ino,
+        ):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            raise ProviderStateRootError("provider owner lock identity changed")
+        self._owner_lock_fd = descriptor
+
+    def _open_database_fd(self) -> None:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(DATABASE_FILENAME, flags, dir_fd=self._root_fd)
+        except OSError as exc:
+            raise ProviderStateRootError("provider database could not be securely opened") from exc
+        descriptor_stat = os.fstat(descriptor)
+        expected = self._managed_identities[DATABASE_FILENAME]
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) != expected:
+            os.close(descriptor)
+            raise ProviderStateRootError("provider database descriptor identity changed")
+        self._database_fd = descriptor
+
+    def _open_bound_connection(self) -> sqlite3.Connection:
+        candidates = (
+            f"/dev/fd/{self._database_fd}",
+            f"/proc/self/fd/{self._database_fd}",
+        )
+        open_path = next(
+            (candidate for candidate in candidates if os.path.exists(candidate)), None
+        )
+        if open_path is None:
+            raise ProviderStateRootError(
+                "platform cannot bind SQLite to a securely opened database descriptor"
+            )
+        connection = sqlite3.connect(
+            open_path,
+            timeout=30,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            database_rows = connection.execute("PRAGMA database_list").fetchall()
+            if len(database_rows) != 1:
+                raise ProviderStateRootError("SQLite opened an unexpected database set")
+            opened_path = os.path.abspath(cast(str, database_rows[0][2]))
+            if opened_path != os.path.abspath(self.database_path):
+                raise ProviderStateRootError(
+                    "SQLite database descriptor no longer names the managed database"
+                )
+            self._sqlite_open_path = open_path
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 30000")
+            journal_mode = connection.execute("PRAGMA journal_mode = PERSIST").fetchone()[0]
+            if journal_mode != "persist":
+                raise ProviderStateRootError("SQLite persistent rollback journal is unavailable")
+            connection.execute("PRAGMA synchronous = FULL")
+            connection.execute("PRAGMA temp_store = MEMORY")
+            connection.execute("PRAGMA trusted_schema = OFF")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
     def _load_or_create_cursor_key(self) -> bytes:
         self._verify_root()
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -582,32 +793,36 @@ class DesktopProviderStore:
         return key
 
     def _verify_managed_files(self) -> None:
-        self._verify_private_file(DATABASE_FILENAME)
-        self._verify_private_file(CURSOR_KEY_FILENAME)
+        for name in (
+            DATABASE_FILENAME,
+            JOURNAL_FILENAME,
+            OWNER_LOCK_FILENAME,
+            CURSOR_KEY_FILENAME,
+        ):
+            self._verify_private_file(name)
+        self._verify_no_wal_side_files()
+        database_stat = os.fstat(self._database_fd)
+        if (database_stat.st_dev, database_stat.st_ino) != self._managed_identities[
+            DATABASE_FILENAME
+        ]:
+            raise ProviderStateRootError("provider database descriptor identity changed")
+        if database_stat.st_size > MAX_DATABASE_BYTES:
+            raise ProviderStateRootError("provider database exceeds its recovery byte bound")
 
-    def _connect(self) -> sqlite3.Connection:
-        self._verify_managed_files()
-        connection = sqlite3.connect(
-            self.database_path,
-            timeout=30,
-            isolation_level=None,
-            check_same_thread=True,
-        )
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA busy_timeout = 30000")
-            connection.execute("PRAGMA journal_mode = DELETE")
-            connection.execute("PRAGMA synchronous = FULL")
-            connection.execute("PRAGMA temp_store = MEMORY")
-            connection.execute("PRAGMA trusted_schema = OFF")
-        except BaseException:
-            connection.close()
-            raise
-        return connection
+    def _verify_no_wal_side_files(self) -> None:
+        for name in (WAL_FILENAME, SHM_FILENAME):
+            try:
+                os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ProviderStateRootError(
+                    f"unmanaged SQLite side file {name} could not be inspected"
+                ) from exc
+            raise ProviderStateRootError(f"unmanaged SQLite side file {name} is forbidden")
 
     def _migrate(self) -> None:
-        connection = self._connect()
+        connection = self._connection
         try:
             connection.execute("BEGIN EXCLUSIVE")
             version = cast(int, connection.execute("PRAGMA user_version").fetchone()[0])
@@ -631,43 +846,209 @@ class DesktopProviderStore:
                 raise ProviderSchemaError(f"unsupported provider schema version {version}")
             self._validate_schema(connection)
             connection.commit()
+        except ProviderStoreError:
+            connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            connection.rollback()
+            raise ProviderSchemaError("provider schema migration validation failed") from exc
         except BaseException:
             connection.rollback()
             raise
-        finally:
-            connection.close()
         self._verify_managed_files()
         os.fsync(self._root_fd)
 
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            )
-        }
-        if tables != _EXPECTED_TABLES:
-            raise ProviderSchemaError("provider database table set does not match schema v1")
-        migrations = connection.execute(
-            "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall()
-        if [row[0] for row in migrations] != [SCHEMA_VERSION]:
-            raise ProviderSchemaError("provider migration ledger does not match schema v1")
-
-    @contextmanager
-    def _transaction(self, *, write: bool) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            yield connection
+            actual_rows = _schema_rows(connection)
+        except sqlite3.DatabaseError as exc:
+            raise ProviderSchemaError("provider schema could not be read") from exc
+        actual_digest = sha256(_canonical_json_bytes(actual_rows)).hexdigest()
+        if actual_digest != _EXPECTED_SCHEMA_DIGEST or actual_rows != _EXPECTED_SCHEMA_ROWS:
+            raise ProviderSchemaError("provider schema fingerprint does not match canonical v1")
+
+    def _recover_and_validate(self) -> None:
+        connection = self._connection
+        try:
+            connection.execute("BEGIN EXCLUSIVE")
+            self._validate_schema(connection)
+            integrity = connection.execute("PRAGMA integrity_check(1)").fetchall()
+            if [tuple(row) for row in integrity] != [("ok",)]:
+                raise ProviderDataCorruptionError("provider SQLite integrity check failed")
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ProviderDataCorruptionError("provider foreign key check failed")
+            self._validate_recovery_budget(connection)
+            self._validate_migration_rows(connection)
+            for row in connection.execute("SELECT * FROM remote_profiles"):
+                self._validate_profile_recovery_row(cast(sqlite3.Row, row))
+            for row in connection.execute("SELECT * FROM projects"):
+                self._validate_project_recovery_row(cast(sqlite3.Row, row))
+            for row in connection.execute("SELECT * FROM idempotency_records"):
+                self._validate_idempotency_recovery_row(cast(sqlite3.Row, row))
+            timestamp = self._timestamp()
+            connection.execute(
+                """
+                UPDATE remote_profiles
+                SET connection_state = 'disconnected',
+                    resource_version = resource_version + 1, updated_at = ?
+                WHERE connection_state != 'disconnected'
+                """,
+                (timestamp,),
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET state = CASE WHEN state = 'active' THEN 'draft' ELSE state END,
+                    current_revision_id = NULL,
+                    resource_version = resource_version + 1, updated_at = ?
+                WHERE state = 'active' OR current_revision_id IS NOT NULL
+                """,
+                (timestamp,),
+            )
             connection.commit()
+        except ProviderStoreError:
+            connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            connection.rollback()
+            raise ProviderDataCorruptionError("provider SQLite recovery failed") from exc
         except BaseException:
             connection.rollback()
             raise
-        finally:
-            connection.close()
+
+    @staticmethod
+    def _validate_recovery_budget(connection: sqlite3.Connection) -> None:
+        total_rows = 0
+        total_bytes = 0
+        specifications = (
+            (
+                "remote_profiles",
+                "profile_id, name, document_json, connection_state, "
+                "credential_slots_json, host_key_fingerprint, created_at, updated_at",
+            ),
+            (
+                "projects",
+                "project_id, profile_id, name, document_json, state, "
+                "current_revision_id, created_at, updated_at",
+            ),
+            (
+                "idempotency_records",
+                "principal, method, route, resource_scope, idempotency_key, request_digest, "
+                "response_type, response_bytes",
+            ),
+            ("schema_migrations", "applied_at"),
+        )
+        for table, columns in specifications:
+            length_sum = " + ".join(
+                f"coalesce(length(CAST({column.strip()} AS BLOB)), 0)"
+                for column in columns.split(",")
+            )
+            row = connection.execute(
+                f"SELECT count(*), coalesce(sum({length_sum}), 0) FROM {table}"
+            ).fetchone()
+            total_rows += cast(int, row[0])
+            total_bytes += cast(int, row[1])
+            if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
+                raise ProviderDataCorruptionError("provider recovery budget exceeded")
+
+    def _validate_migration_rows(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["version"] != SCHEMA_VERSION:
+            raise ProviderSchemaError("provider migration ledger does not match schema v1")
+        self._validate_persisted_timestamp(cast(str, rows[0]["applied_at"]))
+
+    @staticmethod
+    def _validate_persisted_timestamp(value: str) -> datetime:
+        if type(value) is not str or _TIMESTAMP_RE.fullmatch(value) is None:
+            raise ProviderDataCorruptionError("provider timestamp is not canonical UTC")
+        try:
+            return datetime.fromisoformat(f"{value[:-1]}+00:00")
+        except ValueError as exc:
+            raise ProviderDataCorruptionError("provider timestamp is invalid") from exc
+
+    def _validate_common_resource_row(self, row: sqlite3.Row, id_column: str) -> None:
+        self._validate_resource_id(cast(str, row[id_column]))
+        if type(row["resource_version"]) is not int or row["resource_version"] < 1:
+            raise ProviderDataCorruptionError("provider resource version is invalid")
+        created_at = self._validate_persisted_timestamp(cast(str, row["created_at"]))
+        updated_at = self._validate_persisted_timestamp(cast(str, row["updated_at"]))
+        if updated_at < created_at:
+            raise ProviderDataCorruptionError("provider resource timestamps are reversed")
+
+    def _validate_profile_recovery_row(self, row: sqlite3.Row) -> None:
+        self._validate_common_resource_row(row, "profile_id")
+        document = _decode_json_object(bytes(row["document_json"]), label="profile")
+        if document.get("name") != row["name"]:
+            raise ProviderDataCorruptionError("profile name scalar differs from its document")
+        slots_raw = bytes(row["credential_slots_json"])
+        try:
+            slots = json.loads(slots_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProviderDataCorruptionError("stored credential slots are invalid") from exc
+        if _canonical_json_bytes(slots) != slots_raw:
+            raise ProviderDataCorruptionError("stored credential slots are not canonical")
+        self._profile_from_row(row)
+
+    def _validate_project_recovery_row(self, row: sqlite3.Row) -> None:
+        self._validate_common_resource_row(row, "project_id")
+        document = _decode_json_object(bytes(row["document_json"]), label="project")
+        if document.get("name") != row["name"] or document.get("profile_id") != row["profile_id"]:
+            raise ProviderDataCorruptionError(
+                "project indexed scalars differ from its canonical document"
+            )
+        self._project_from_row(row)
+
+    def _validate_idempotency_recovery_row(self, row: sqlite3.Row) -> None:
+        if row["principal"] != LOCAL_PRINCIPAL:
+            raise ProviderDataCorruptionError("idempotency principal is not local")
+        for label, column, maximum, minimum in (
+            ("method", "method", MAX_IDENTITY_BYTES, 1),
+            ("route", "route", MAX_IDENTITY_BYTES, 1),
+            ("resource scope", "resource_scope", MAX_IDENTITY_BYTES, 1),
+            (
+                "idempotency key",
+                "idempotency_key",
+                MAX_IDEMPOTENCY_KEY_BYTES,
+                16,
+            ),
+        ):
+            try:
+                self._bounded_identity(label, cast(str, row[column]), maximum, minimum=minimum)
+            except ContractValidationError as exc:
+                raise ProviderDataCorruptionError("idempotency identity is invalid") from exc
+        if _DIGEST_RE.fullmatch(cast(str, row["request_digest"])) is None:
+            raise ProviderDataCorruptionError("idempotency request digest is invalid")
+        if (
+            type(row["created_at_epoch"]) is not int
+            or type(row["expires_at_epoch"]) is not int
+            or row["expires_at_epoch"] <= row["created_at_epoch"]
+        ):
+            raise ProviderDataCorruptionError("idempotency retention timestamps are invalid")
+        response_model = self._response_model_for_name(cast(str, row["response_type"]))
+        response_bytes = bytes(row["response_bytes"])
+        response = self._model_from_response(response_model, response_bytes)
+        if _canonical_json_bytes(response.model_dump(mode="json")) != response_bytes:
+            raise ProviderDataCorruptionError("idempotency response is not canonical")
+
+    @contextmanager
+    def _transaction(self, *, write: bool) -> Iterator[sqlite3.Connection]:
+        with self._transaction_lock:
             self._verify_managed_files()
+            connection = self._connection
+            try:
+                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                yield connection
+                if write:
+                    self._validate_recovery_budget(connection)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                self._verify_managed_files()
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -700,7 +1081,6 @@ class DesktopProviderStore:
         self,
         request: RemoteProfileCreateV1 | Mapping[str, object],
         *,
-        principal: str,
         idempotency_key: str,
     ) -> RemoteProfileV1:
         validated = _validate_model(RemoteProfileCreateV1, request)
@@ -708,13 +1088,14 @@ class DesktopProviderStore:
         def mutation(transaction: ProviderMutation) -> tuple[int, BaseModel]:
             return 201, transaction._create_profile(validated)
 
-        result = self.execute_idempotent(
-            principal=principal,
+        result = self._execute_idempotent(
             method="POST",
             route="/desktop/v1/profiles",
             resource_scope="profiles",
             key=idempotency_key,
-            request=validated,
+            request_value=validated.model_dump(mode="json"),
+            response_model=RemoteProfileV1,
+            bound_if_match=None,
             mutation=mutation,
         )
         return self._model_from_response(RemoteProfileV1, result.response_bytes)
@@ -737,6 +1118,11 @@ class DesktopProviderStore:
         with self._transaction(write=True) as connection:
             row = self._require_profile_row(connection, profile_id)
             self._require_etag("profile", profile_id, row, if_match)
+            protected_connection_fields = {"host", "user", "authentication_kind"}
+            if row["connection_state"] != "disconnected" and (
+                validated_patch.model_fields_set & protected_connection_fields
+            ):
+                raise ResourceInUseError("profile", profile_id)
             current = _decode_json_object(bytes(row["document_json"]), label="profile")
             current.update(validated_patch.model_dump(mode="json", exclude_unset=True))
             validated = _validate_json_model(RemoteProfileCreateV1, current)
@@ -769,9 +1155,7 @@ class DesktopProviderStore:
             ).fetchone()
             if row["connection_state"] != "disconnected" or referenced is not None:
                 raise ResourceInUseError("profile", profile_id)
-            connection.execute(
-                "DELETE FROM remote_profiles WHERE profile_id = ?", (profile_id,)
-            )
+            connection.execute("DELETE FROM remote_profiles WHERE profile_id = ?", (profile_id,))
 
     def list_profiles(
         self,
@@ -803,7 +1187,6 @@ class DesktopProviderStore:
         self,
         request: ProjectCreateV1 | Mapping[str, object],
         *,
-        principal: str,
         idempotency_key: str,
     ) -> ProjectV1:
         validated = _validate_model(ProjectCreateV1, request)
@@ -811,13 +1194,14 @@ class DesktopProviderStore:
         def mutation(transaction: ProviderMutation) -> tuple[int, BaseModel]:
             return 201, transaction._create_project(validated)
 
-        result = self.execute_idempotent(
-            principal=principal,
+        result = self._execute_idempotent(
             method="POST",
             route="/desktop/v1/projects",
             resource_scope="projects",
             key=idempotency_key,
-            request=validated,
+            request_value=validated.model_dump(mode="json"),
+            response_model=ProjectV1,
+            bound_if_match=None,
             mutation=mutation,
         )
         return self._model_from_response(ProjectV1, result.response_bytes)
@@ -840,6 +1224,8 @@ class DesktopProviderStore:
         with self._transaction(write=True) as connection:
             row = self._require_project_row(connection, project_id)
             self._require_etag("project", project_id, row, if_match)
+            if row["state"] == "active" or row["current_revision_id"] is not None:
+                raise ResourceInUseError("project", project_id)
             current = _decode_json_object(bytes(row["document_json"]), label="project")
             current.update(validated_patch.model_dump(mode="json", exclude_unset=True))
             validated = _validate_json_model(ProjectCreateV1, current)
@@ -900,29 +1286,52 @@ class DesktopProviderStore:
             has_more=next_cursor is not None,
         )
 
-    def execute_idempotent(
+    def execute_idempotent_action(
         self,
         *,
-        principal: str,
+        route: str,
+        resource_scope: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+        semantic_headers: Mapping[str, str],
+        response_model: type[_ModelT],
+        mutation: Callable[[ProviderMutation], tuple[int, BaseModel]],
+    ) -> IdempotencyResult:
+        self._validate_if_match(if_match)
+        headers = self._normalize_semantic_headers(semantic_headers)
+        headers["if-match"] = if_match
+        body_value = body.model_dump(mode="json") if isinstance(body, BaseModel) else dict(body)
+        return self._execute_idempotent(
+            method="POST",
+            route=route,
+            resource_scope=resource_scope,
+            key=key,
+            request_value={"body": body_value, "headers": headers},
+            response_model=response_model,
+            bound_if_match=if_match,
+            mutation=mutation,
+        )
+
+    def _execute_idempotent(
+        self,
+        *,
         method: str,
         route: str,
         resource_scope: str,
         key: str,
-        request: BaseModel | Mapping[str, object],
+        request_value: object,
+        response_model: type[_ModelT],
+        bound_if_match: str | None,
         mutation: Callable[[ProviderMutation], tuple[int, BaseModel]],
     ) -> IdempotencyResult:
-        principal = self._bounded_identity("principal", principal, MAX_IDENTITY_BYTES)
+        response_type = self._response_type_name(response_model)
         method = self._bounded_identity("method", method, MAX_IDENTITY_BYTES)
         route = self._bounded_identity("route", route, MAX_IDENTITY_BYTES)
         resource_scope = self._bounded_identity(
             "resource_scope", resource_scope, MAX_IDENTITY_BYTES
         )
-        key = self._bounded_identity(
-            "idempotency key", key, MAX_IDEMPOTENCY_KEY_BYTES, minimum=16
-        )
-        request_value = (
-            request.model_dump(mode="json") if isinstance(request, BaseModel) else dict(request)
-        )
+        key = self._bounded_identity("idempotency key", key, MAX_IDEMPOTENCY_KEY_BYTES, minimum=16)
         request_bytes = _canonical_json_bytes(request_value)
         if len(request_bytes) > MAX_REQUEST_BYTES:
             raise ContractValidationError("canonical idempotency request exceeds the byte limit")
@@ -935,21 +1344,34 @@ class DesktopProviderStore:
             )
             existing = connection.execute(
                 """
-                SELECT request_digest, status_code, response_bytes
+                SELECT request_digest, response_type, status_code, response_bytes
                 FROM idempotency_records
                 WHERE principal = ? AND method = ? AND route = ?
                   AND resource_scope = ? AND idempotency_key = ?
                 """,
-                (principal, method, route, resource_scope, key),
+                (LOCAL_PRINCIPAL, method, route, resource_scope, key),
             ).fetchone()
             if existing is not None:
                 if existing["request_digest"] != request_digest:
                     raise IdempotencyConflictError(
                         "idempotency key is already bound to a different request"
                     )
+                if existing["response_type"] != response_type:
+                    raise ProviderDataCorruptionError(
+                        "idempotency replay response type differs from the typed route"
+                    )
+                response_bytes = bytes(existing["response_bytes"])
+                replay_response = self._model_from_response(response_model, response_bytes)
+                if (
+                    _canonical_json_bytes(replay_response.model_dump(mode="json"))
+                    != response_bytes
+                ):
+                    raise ProviderDataCorruptionError(
+                        "stored idempotency replay response is not canonical"
+                    )
                 return IdempotencyResult(
                     status_code=cast(int, existing["status_code"]),
-                    response_bytes=bytes(existing["response_bytes"]),
+                    response_bytes=response_bytes,
                     replayed=True,
                 )
 
@@ -959,11 +1381,13 @@ class DesktopProviderStore:
             if count >= self._max_idempotency_records:
                 raise IdempotencyCapacityError("live idempotency record capacity is exhausted")
 
-            status_code, response = mutation(ProviderMutation(self, connection))
+            status_code, response = mutation(
+                ProviderMutation(self, connection, if_match=bound_if_match)
+            )
             if type(status_code) is not int or not 100 <= status_code <= 599:
                 raise ProviderStoreError("idempotent mutation returned an invalid status code")
             if (
-                not isinstance(response, BaseModel)
+                type(response) is not response_model
                 or type(response).__module__ != "desktop.sidecar.contracts.v1.models"
                 or response.model_config.get("extra") != "forbid"
             ):
@@ -975,17 +1399,62 @@ class DesktopProviderStore:
                 raise ProviderStoreError("idempotent response exceeds the byte limit")
             self._insert_idempotency_record(
                 connection,
-                principal=principal,
+                principal=LOCAL_PRINCIPAL,
                 method=method,
                 route=route,
                 resource_scope=resource_scope,
                 key=key,
                 request_digest=request_digest,
+                response_type=response_type,
                 status_code=status_code,
                 response_bytes=response_bytes,
                 now_epoch=now_epoch,
             )
             return IdempotencyResult(status_code, response_bytes, False)
+
+    @staticmethod
+    def _normalize_semantic_headers(headers: Mapping[str, str]) -> dict[str, str]:
+        if not isinstance(headers, Mapping):
+            raise ContractValidationError("semantic headers must be a mapping")
+        normalized: dict[str, str] = {}
+        forbidden = {"authorization", "cookie", "idempotency-key", "if-match"}
+        for key, value in headers.items():
+            normalized_key = key.lower() if type(key) is str else ""
+            if (
+                type(key) is not str
+                or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", normalized_key) is None
+                or normalized_key in forbidden
+                or "session-token" in normalized_key
+                or normalized_key in normalized
+            ):
+                raise ContractValidationError(
+                    "semantic header name is invalid or credential-bearing"
+                )
+            normalized[normalized_key] = DesktopProviderStore._bounded_identity(
+                "semantic header value", value, MAX_IDENTITY_BYTES
+            )
+        return dict(sorted(normalized.items()))
+
+    @staticmethod
+    def _response_type_name(model_type: type[BaseModel]) -> str:
+        allowed = {RemoteProfileV1: "RemoteProfileV1", ProjectV1: "ProjectV1"}
+        try:
+            return allowed[model_type]
+        except KeyError as exc:
+            raise ContractValidationError(
+                "idempotent response model is not a persisted Desktop resource type"
+            ) from exc
+
+    @staticmethod
+    def _response_model_for_name(name: str) -> type[BaseModel]:
+        allowed: dict[str, type[BaseModel]] = {
+            "RemoteProfileV1": RemoteProfileV1,
+            "ProjectV1": ProjectV1,
+        }
+        try:
+            return allowed[name]
+        except KeyError as exc:
+            raise ProviderDataCorruptionError("idempotency response type is invalid") from exc
 
     def _insert_idempotency_record(
         self,
@@ -997,6 +1466,7 @@ class DesktopProviderStore:
         resource_scope: str,
         key: str,
         request_digest: str,
+        response_type: str,
         status_code: int,
         response_bytes: bytes,
         now_epoch: int,
@@ -1005,9 +1475,9 @@ class DesktopProviderStore:
             """
             INSERT INTO idempotency_records(
                 principal, method, route, resource_scope, idempotency_key,
-                request_digest, status_code, response_bytes,
+                request_digest, response_type, status_code, response_bytes,
                 created_at_epoch, expires_at_epoch
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 principal,
@@ -1016,6 +1486,7 @@ class DesktopProviderStore:
                 resource_scope,
                 key,
                 request_digest,
+                response_type,
                 status_code,
                 response_bytes,
                 now_epoch,
@@ -1025,7 +1496,11 @@ class DesktopProviderStore:
 
     @staticmethod
     def _bounded_identity(label: str, value: str, maximum: int, *, minimum: int = 1) -> str:
-        if type(value) is not str or value != value.strip() or any(ord(char) < 0x20 for char in value):
+        if (
+            type(value) is not str
+            or value != value.strip()
+            or any(ord(char) < 0x20 for char in value)
+        ):
             raise ContractValidationError(f"{label} must be trimmed text without controls")
         size = len(value.encode("utf-8"))
         if not minimum <= size <= maximum:
@@ -1046,9 +1521,7 @@ class DesktopProviderStore:
             ) from exc
 
     @staticmethod
-    def _require_profile_row(
-        connection: sqlite3.Connection, profile_id: str
-    ) -> sqlite3.Row:
+    def _require_profile_row(connection: sqlite3.Connection, profile_id: str) -> sqlite3.Row:
         row = connection.execute(
             "SELECT * FROM remote_profiles WHERE profile_id = ?", (profile_id,)
         ).fetchone()
@@ -1057,9 +1530,7 @@ class DesktopProviderStore:
         return cast(sqlite3.Row, row)
 
     @staticmethod
-    def _require_project_row(
-        connection: sqlite3.Connection, project_id: str
-    ) -> sqlite3.Row:
+    def _require_project_row(connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
         row = connection.execute(
             "SELECT * FROM projects WHERE project_id = ?", (project_id,)
         ).fetchone()
@@ -1130,9 +1601,9 @@ class DesktopProviderStore:
         if direction not in {"asc", "desc"}:
             raise ContractValidationError("pagination direction must be asc or desc")
         normalized_filters = self._normalize_filters(filters, filter_columns)
-        anchor_id = None
+        anchor: tuple[str, str] | None = None
         if after is not None:
-            anchor_id = self._decode_cursor(
+            anchor = self._decode_cursor(
                 after,
                 resource=resource,
                 filters=normalized_filters,
@@ -1148,14 +1619,8 @@ class DesktopProviderStore:
         sort_column = sort_columns[sort]
         sql_direction = "ASC" if direction == "asc" else "DESC"
         with self._transaction(write=False) as connection:
-            if anchor_id is not None:
-                anchor_row = connection.execute(
-                    f"SELECT {sort_column} FROM {table} WHERE {id_column} = ?",
-                    (anchor_id,),
-                ).fetchone()
-                if anchor_row is None:
-                    raise CursorInvalidError("provider cursor anchor no longer exists")
-                anchor_value = anchor_row[sort_column]
+            if anchor is not None:
+                anchor_value, anchor_id = anchor
                 operator = ">" if direction == "asc" else "<"
                 clauses.append(
                     f"({sort_column} {operator} ? OR "
@@ -1180,6 +1645,7 @@ class DesktopProviderStore:
                 sort=sort,
                 direction=direction,
                 anchor_id=last[id_column],
+                sort_value=last[sort_column],
             )
         return rows, next_cursor
 
@@ -1206,6 +1672,7 @@ class DesktopProviderStore:
         sort: str,
         direction: _Direction,
         anchor_id: str,
+        sort_value: str,
     ) -> str:
         query_digest = sha256(
             _canonical_json_bytes(
@@ -1216,13 +1683,14 @@ class DesktopProviderStore:
                     "sort": sort,
                 }
             )
-        ).digest()
+        ).digest()[:16]
         payload = _canonical_json_bytes(
             {
-                "a": anchor_id,
                 "e": int(self._now().timestamp()) + self._cursor_ttl_seconds,
+                "i": anchor_id,
                 "q": self._b64encode(query_digest),
-                "v": 1,
+                "s": {"t": "s", "v": sort_value},
+                "v": 2,
             }
         )
         encoded = self._b64encode(payload)
@@ -1240,7 +1708,7 @@ class DesktopProviderStore:
         filters: Mapping[str, str],
         sort: str,
         direction: _Direction,
-    ) -> str:
+    ) -> tuple[str, str]:
         if type(cursor) is not str or not 1 <= len(cursor.encode("utf-8")) <= MAX_CURSOR_BYTES:
             raise CursorInvalidError("provider cursor is outside its byte bounds")
         parts = cursor.split(".")
@@ -1258,7 +1726,7 @@ class DesktopProviderStore:
             payload = json.loads(payload_bytes)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CursorInvalidError("provider cursor payload is invalid") from exc
-        if type(payload) is not dict or set(payload) != {"a", "e", "q", "v"}:
+        if type(payload) is not dict or set(payload) != {"e", "i", "q", "s", "v"}:
             raise CursorInvalidError("provider cursor payload is not closed")
         if _canonical_json_bytes(payload) != payload_bytes:
             raise CursorInvalidError("provider cursor payload is not canonical")
@@ -1272,18 +1740,28 @@ class DesktopProviderStore:
                         "sort": sort,
                     }
                 )
-            ).digest()
+            ).digest()[:16]
         )
         if (
-            payload["v"] != 1
+            payload["v"] != 2
             or payload["q"] != query_digest
             or type(payload["e"]) is not int
-            or type(payload["a"]) is not str
+            or type(payload["i"]) is not str
+            or type(payload["s"]) is not dict
+            or set(payload["s"]) != {"t", "v"}
+            or payload["s"]["t"] != "s"
+            or type(payload["s"]["v"]) is not str
         ):
             raise CursorInvalidError("provider cursor is bound to another query")
+        try:
+            self._validate_resource_id(cast(str, payload["i"]))
+        except ContractValidationError as exc:
+            raise CursorInvalidError("provider cursor resource boundary is invalid") from exc
+        if len(payload["s"]["v"].encode("utf-8")) > 4096:
+            raise CursorInvalidError("provider cursor sort boundary exceeds its byte bound")
         if payload["e"] <= int(self._now().timestamp()):
             raise CursorExpiredError("provider cursor has expired")
-        return cast(str, payload["a"])
+        return cast(str, payload["s"]["v"]), cast(str, payload["i"])
 
     @staticmethod
     def _b64encode(value: bytes) -> str:

@@ -83,25 +83,60 @@ Every error uses `ApiErrorV1`:
 ```
 
 Create and action requests require `Idempotency-Key`. A provider persists the
-principal, route, resource scope, key, canonical request digest, response, and
-status. Replaying the same request returns the same result; reusing the key for
-a different request returns `409 idempotency_key_reused`. Mutable resources use
-ETag and `If-Match`.
+fixed `desktop-local-v1` principal, route, resource scope, key, canonical
+request digest, typed response, and status. Action digests cover the canonical
+body, `If-Match`, and every declared semantic header; callers cannot substitute
+an ETag copied into the body. Replaying the same request revalidates the stored
+response against the route's exact closed response model before returning it.
+Reusing the key for a different request returns `409 idempotency_key_reused`.
+Desktop session tokens and other credential-bearing headers are not accepted as
+principal or semantic idempotency data. Mutable resources use ETag and
+`If-Match`.
 
 The release sidecar stores Local API v1 profiles, project drafts, and bounded
 idempotency records in its versioned SQLite provider store. The private state
-root is a real owner-only `0700` directory; the database and cursor-signing
-side file are regular owner-only `0600` files. Resource and idempotency writes
-commit in one transaction. The store persists only closed Local API fields: it
-does not persist native credential references or secrets, host paths, commands,
-raw process output, Core URLs, or bearer/session tokens. Idempotency responses
-are retained for a bounded seven-day replay window and the live record count is
-bounded; exhaustion fails closed without evicting an unexpired replay.
+root is a real owner-only `0700` directory. A non-blocking process-lifetime
+owner lock permits exactly one provider owner. The database, persistent rollback
+journal, lock, and cursor-signing key are regular owner-only `0600` files with
+pinned identities. SQLite opens the main database through `/dev/fd` (or the
+equivalent `/proc/self/fd`) for a database descriptor opened relative to the
+pinned root with no-follow semantics. Startup fails closed on platforms without
+that descriptor path. The provider uses one lifetime connection and a pinned
+`PERSIST` rollback journal; it does not enable WAL or permit unmanaged WAL/SHM
+side files.
+
+Schema v1 has an exact canonical `sqlite_schema` fingerprint. Startup performs
+a database-size-bounded `integrity_check(1)`, `foreign_key_check`, bounded row
+and byte accounting, and complete validation of migration, resource, canonical
+JSON/blob, duplicated scalar, timestamp, version, and typed idempotency rows.
+Unknown views, triggers, indexes, or altered DDL are rejected. Startup also
+recovers process-owned transient state: remote profiles become disconnected and
+active project sessions return to draft with stale revision pins cleared.
+Resource and idempotency writes commit in one transaction. The store persists
+only closed Local API fields: it does not persist native credential references
+or secrets, host paths, commands, raw process output, Core URLs, or
+bearer/session tokens. Idempotency responses are retained for a bounded
+seven-day replay window and the live record count is bounded; exhaustion fails
+closed without evicting an unexpired replay.
+
+At most one project row may be active. Activation switches projects atomically.
+An active project cannot be patched in place, and a connected profile cannot
+change host, user, or authentication kind. This prevents persisted configuration
+from diverging from the process-owned session that was admitted from it.
+
+Project evolution config is accepted exactly to the aggregate range currently
+accepted by `ProjectCreateV1`/`ProjectPatchV1`; the store adds no per-project
+method-config aggregate limit. The Local contract work tracked separately must
+add any future aggregate budget to those authoritative models first, after
+which the store can consume the same exported bound rather than define one.
 
 List routes use `limit` (maximum 100), `after`, `sort`, and `direction`, and
 return `{items, next_cursor, has_more}`. A cursor is bound to the filters and
-sort order. `has_more` is true if and only if `next_cursor` is non-null. Invalid
-cursors return 400; expired cursors return 410.
+sort order. Its signed boundary contains the typed sort value and resource ID;
+continuation never re-reads a mutable anchor row, so deleting or editing that
+row does not change the next-page boundary. `has_more` is true if and only if
+`next_cursor` is non-null. Invalid cursors return 400; expired cursors return
+410.
 
 Core SSE uses closed `SseFrameV1` objects whose wire `id` and versioned `event`
 must exactly match `data.id` and `data.event` in the typed `EventEnvelopeV1`.
