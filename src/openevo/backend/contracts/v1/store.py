@@ -51,6 +51,10 @@ class StoreCorruptionError(CoreControlStoreError):
     pass
 
 
+class PostCommitStoreError(StoreCorruptionError):
+    """A committed transaction failed its final lifecycle verification."""
+
+
 class ResourceNotFoundError(CoreControlStoreError):
     def __init__(self, resource_type: str, resource_id: str) -> None:
         super().__init__(f"{resource_type} resource was not found")
@@ -180,15 +184,17 @@ class CoreControlStoreV1:
     ) -> None:
         if not 1 <= event_replay_limit <= 10_000:
             raise ValueError("event replay limit must be between 1 and 10000")
-        self.root = Path(state_root).expanduser().resolve() / "core-control-v1"
+        self._state_parent = Path(state_root).expanduser().resolve()
+        self.root = self._state_parent / "core-control-v1"
         self.upload_root = self.root / "workspace-uploads"
         self.workspace_root = self.root / "workspace-snapshots"
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._event_replay_limit = event_replay_limit
         self._mutex = threading.RLock()
         self._closed = False
-        self._prepare_root()
         try:
+            self._open_parent_anchor()
+            self._prepare_root()
             self._open_lifecycle_storage()
             self._connection = sqlite3.connect(
                 self.root / "provider.sqlite3",
@@ -495,8 +501,9 @@ class CoreControlStoreV1:
         with self._mutex:
             old_offset = 0
             file_fd: int | None = None
+            transaction = self._transaction()
             try:
-                with self._transaction():
+                with transaction:
                     replay = self._idempotency_replay(
                         "putCoreWorkspaceUploadChunkV1",
                         scope,
@@ -567,7 +574,7 @@ class CoreControlStoreV1:
                     )
                     return result
             except Exception:
-                if file_fd is not None:
+                if file_fd is not None and not transaction.committed:
                     os.ftruncate(file_fd, old_offset)
                     os.fsync(file_fd)
                 raise
@@ -1403,16 +1410,40 @@ class CoreControlStoreV1:
         finally:
             os.close(fd)
 
+    def _open_parent_anchor(self) -> None:
+        self._state_parent.mkdir(parents=True, exist_ok=True)
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            self._parent_fd = os.open(self._state_parent, directory_flags)
+            parent_identity = os.fstat(self._parent_fd)
+            _require_owner_directory_metadata(parent_identity, label="state parent")
+            _require_path_binding(self._state_parent, parent_identity)
+            self._parent_identity = parent_identity
+        except OSError as exc:
+            self._close_lifecycle_storage()
+            raise CoreControlStoreError("Core Control state parent is unavailable") from exc
+        try:
+            fcntl.flock(self._parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self._close_lifecycle_storage()
+            raise CoreControlStoreError("Core Control provider state is already owned") from exc
+
     def _open_lifecycle_storage(self) -> None:
         directory_flags = (
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
-            self._root_fd = os.open(self.root, directory_flags)
+            self._root_fd = os.open("core-control-v1", directory_flags, dir_fd=self._parent_fd)
             root_identity = os.fstat(self._root_fd)
             _require_private_directory_metadata(root_identity)
-            _require_path_binding(self.root, root_identity)
+            _require_entry_binding(self._parent_fd, "core-control-v1", root_identity)
             self._root_identity = root_identity
+        except OSError as exc:
+            self._close_lifecycle_storage()
+            raise CoreControlStoreError("Core Control provider root is unavailable") from exc
+        try:
             fcntl.flock(self._root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             self._close_lifecycle_storage()
@@ -1473,20 +1504,25 @@ class CoreControlStoreV1:
         if self._closed:
             raise StoreCorruptionError("Core Control store is closed")
         try:
+            parent_identity = os.fstat(self._parent_fd)
             root_identity = os.fstat(self._root_fd)
             lock_identity = os.fstat(self._lock_fd)
             upload_identity = os.fstat(self._upload_root_fd)
             workspace_identity = os.fstat(self._workspace_root_fd)
+            _require_owner_directory_metadata(parent_identity, label="state parent")
             _require_private_directory_metadata(root_identity)
             _require_private_regular_metadata(lock_identity)
             _require_private_directory_metadata(upload_identity)
             _require_private_directory_metadata(workspace_identity)
+            _require_same_identity(parent_identity, self._parent_identity, "state parent")
             _require_same_identity(root_identity, self._root_identity, "provider root")
             _require_same_identity(lock_identity, self._lock_identity, "provider lock")
             _require_same_identity(upload_identity, self._upload_root_identity, "upload root")
             _require_same_identity(
                 workspace_identity, self._workspace_root_identity, "workspace root"
             )
+            _require_path_binding(self._state_parent, self._parent_identity)
+            _require_entry_binding(self._parent_fd, "core-control-v1", self._root_identity)
             _require_path_binding(self.root, self._root_identity)
             _require_entry_binding(self._root_fd, "provider.lock", self._lock_identity)
             _require_entry_binding(self._root_fd, "workspace-uploads", self._upload_root_identity)
@@ -1516,6 +1552,13 @@ class CoreControlStoreV1:
             finally:
                 os.close(root_fd)
                 del self._root_fd
+        parent_fd = getattr(self, "_parent_fd", None)
+        if parent_fd is not None:
+            try:
+                fcntl.flock(parent_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(parent_fd)
+                del self._parent_fd
 
     def _prepare_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1582,6 +1625,7 @@ class _Transaction:
     ) -> None:
         self.connection = connection
         self.verify_storage = verify_storage
+        self.committed = False
 
     def __enter__(self):
         self.verify_storage()
@@ -1598,8 +1642,17 @@ class _Transaction:
             self.connection.execute("ROLLBACK")
             raise
         self.connection.execute("COMMIT")
-        self.verify_storage()
+        self.committed = True
+        try:
+            self._verify_after_commit()
+        except Exception as exc:
+            raise PostCommitStoreError(
+                "committed Core Control state failed lifecycle verification"
+            ) from exc
         return False
+
+    def _verify_after_commit(self) -> None:
+        self.verify_storage()
 
 
 def _new_id(prefix: str) -> str:
@@ -1779,6 +1832,11 @@ def _require_private_directory_metadata(metadata: os.stat_result) -> None:
         raise StoreCorruptionError("Core Control managed root is not privately owned")
 
 
+def _require_owner_directory_metadata(metadata: os.stat_result, *, label: str) -> None:
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise StoreCorruptionError(f"Core Control {label} is not owner-bound")
+
+
 def _require_path_binding(path: Path, expected: os.stat_result) -> None:
     try:
         current = path.stat(follow_symlinks=False)
@@ -1860,6 +1918,7 @@ __all__ = [
     "EventCursorInvalidError",
     "IdempotencyCapacityError",
     "IdempotencyConflictError",
+    "PostCommitStoreError",
     "ResourceConflictError",
     "ResourceNotFoundError",
     "StoreCorruptionError",

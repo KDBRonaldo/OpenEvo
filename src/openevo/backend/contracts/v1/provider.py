@@ -40,6 +40,7 @@ from .store import (
     EventCursorInvalidError,
     IdempotencyCapacityError,
     IdempotencyConflictError,
+    PostCommitStoreError,
     ResourceConflictError,
     ResourceNotFoundError,
     StoredResult,
@@ -86,6 +87,10 @@ _UNAVAILABLE_OPERATIONS = frozenset(
         "cleanupCoreCachesV1",
     }
 )
+
+
+class _PostCommitHTTPError(CoreControlHTTPError):
+    """Fail closed without overwriting a transaction's committed idempotency result."""
 
 
 class CoreControlProviderV1:
@@ -169,6 +174,8 @@ class CoreControlProviderV1:
             raise CoreControlHTTPError.from_error(previous_error)
         try:
             return self._invoke(operation_id, arguments)
+        except _PostCommitHTTPError:
+            raise
         except CoreControlHTTPError as exc:
             self.store.record_failed_idempotency(operation_id, arguments, exc.error)
             raise
@@ -271,6 +278,8 @@ class CoreControlProviderV1:
                 repair_action=m.RepairAction.USER_ACTION_REQUIRED,
                 next_action="Reconnect without the invalid cursor after reloading snapshots.",
             ) from exc
+        except PostCommitStoreError as exc:
+            raise _post_commit_error() from exc
         except CoreControlStoreError as exc:
             raise _error(
                 500,
@@ -681,6 +690,18 @@ def _idempotency_conflict_error() -> CoreControlHTTPError:
         retryable=False,
         repair_action=m.RepairAction.USER_ACTION_REQUIRED,
         next_action="Use the original request or issue a new idempotency key.",
+    )
+
+
+def _post_commit_error() -> _PostCommitHTTPError:
+    return _PostCommitHTTPError(
+        500,
+        code="core_control_store_failed",
+        message="Core Control durable state could not complete the request.",
+        category=m.ErrorCategory.INTERNAL,
+        retryable=True,
+        repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Inspect Core diagnostics before retrying.",
     )
 
 

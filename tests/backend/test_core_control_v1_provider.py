@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 from fastapi.testclient import TestClient
 import pytest
@@ -16,6 +18,7 @@ from openevo.backend.contracts.v1 import (
     openapi_sha256,
 )
 from openevo.backend.contracts.v1.models import SseFrameV1, WorkspaceArchiveDeclarationV1
+import openevo.backend.contracts.v1.store as store_module
 from openevo.backend.contracts.v1.store import (
     CoreControlStoreError,
     CoreControlStoreV1,
@@ -670,6 +673,82 @@ def test_workspace_chunk_partial_then_zero_write_rolls_back_to_zero_across_resta
         assert recovered.json()["accepted_offset"] == 0
 
 
+def test_workspace_chunk_post_commit_binding_failure_preserves_committed_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _workspace_archive()
+    app = _app(tmp_path)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        project, project_etag = _create_project(client, _project_create(archive=archive))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "begin-upload-post-commit-binding",
+                "If-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        snapshot_root = tmp_path / "core-control-v1" / "workspace-snapshots"
+        displaced_root = tmp_path / "core-control-v1" / "workspace-snapshots.displaced"
+        original_post_commit_verify = store_module._Transaction._verify_after_commit
+        replace_root = True
+
+        def replace_root_after_commit(transaction) -> None:
+            nonlocal replace_root
+            if replace_root:
+                replace_root = False
+                snapshot_root.rename(displaced_root)
+                snapshot_root.mkdir(mode=0o700)
+                try:
+                    original_post_commit_verify(transaction)
+                finally:
+                    snapshot_root.rmdir()
+                    displaced_root.rename(snapshot_root)
+                return
+            original_post_commit_verify(transaction)
+
+        monkeypatch.setattr(
+            store_module._Transaction,
+            "_verify_after_commit",
+            replace_root_after_commit,
+        )
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-post-commit-binding",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+
+        upload_path = (
+            tmp_path / "core-control-v1" / "workspace-uploads" / f"{upload.json()['id']}.part"
+        )
+        assert chunk.status_code == 500
+        assert chunk.json()["code"] == "core_control_store_failed"
+        assert upload_path.read_bytes() == archive
+
+        replay = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-post-commit-binding",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["accepted_offset"] == len(archive)
+        assert upload_path.read_bytes() == archive
+
+
 def test_workspace_finalize_rejects_same_inode_mutation_during_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -808,6 +887,55 @@ def test_provider_lock_unlink_fails_operations_and_second_owner(tmp_path: Path) 
         assert not lock_path.exists()
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("install_replacement", [False, True])
+def test_provider_root_replacement_cannot_admit_second_owner(
+    tmp_path: Path, install_replacement: bool
+) -> None:
+    store = CoreControlStoreV1(tmp_path)
+    provider_root = tmp_path / "core-control-v1"
+    displaced_root = tmp_path / "core-control-v1.displaced"
+    provider_root.rename(displaced_root)
+    if install_replacement:
+        provider_root.mkdir(mode=0o700)
+    try:
+        with pytest.raises(StoreCorruptionError, match="binding"):
+            store.list_projects(limit=1, after=None, sort="created_at", direction="asc")
+        second_owner = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "\n".join(
+                    (
+                        "import sys",
+                        "from openevo.backend.contracts.v1.store import "
+                        "CoreControlStoreError, CoreControlStoreV1",
+                        "try:",
+                        "    store = CoreControlStoreV1(sys.argv[1])",
+                        "except CoreControlStoreError as exc:",
+                        "    raise SystemExit(0 if 'already owned' in str(exc) else 2)",
+                        "else:",
+                        "    store.close()",
+                        "    raise SystemExit(3)",
+                    )
+                ),
+                os.fspath(tmp_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert second_owner.returncode == 0, second_owner.stderr
+        if install_replacement:
+            assert list(provider_root.iterdir()) == []
+        else:
+            assert not provider_root.exists()
+    finally:
+        store.close()
+        if provider_root.exists():
+            provider_root.rmdir()
+        displaced_root.rename(provider_root)
 
 
 @pytest.mark.parametrize("damage", ["corrupt", "missing"])

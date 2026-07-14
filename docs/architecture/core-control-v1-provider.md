@@ -67,12 +67,15 @@ metadata.
 Startup recovery runs while the provider holds its exclusive process lock. The
 store retains provider-root, owner-lock, upload-root, and snapshot-root FDs for
 its full lifetime. Every related operation revalidates each held inode against
-its pathname plus the required owner, mode, type, and link count. A provider-root
-flock prevents a removed owner-lock pathname or replaced workspace root from
-admitting a second owner. Recovery reuses the held owner-verified private root
-FDs, validates every project publication against its finalized upload and the
-exact published tree, and fails startup when a referenced archive or snapshot
-is missing, replaced, or corrupt. Unreferenced upload files, temporary
+its pathname plus the required owner, mode, type, and link count. Before it
+creates or opens the provider root, the store holds and exclusively locks the
+stable state-parent directory inode. The provider-root and owner-lock locks are
+additional bindings, but replacement of the complete canonical provider root
+cannot admit a second owner while the original parent-anchored owner is alive.
+Recovery reuses the held owner-verified private root FDs, validates every project
+publication against its finalized upload and the exact published tree, and fails
+startup when a referenced archive or snapshot is missing, replaced, or corrupt.
+Unreferenced upload files, temporary
 publications, and snapshots left by a crash after publish rename but before the
 SQLite commit are removed relative to those held FDs without following
 symlinks; cleanup never traverses outside the managed roots.
@@ -97,10 +100,12 @@ declaration, and optional base workspace snapshot. A chunk is accepted only at
 `accepted_offset`, is limited by the frozen 8 MiB chunk contract, and must match
 its decoded length and SHA-256. Core loops over short writes and treats a zero
 write as failure; the held upload FD is truncated back to the previous durable
-offset on any write, `fsync`, or database failure. SQLite advances the offset
-only after every byte is present and `fsync`ed. On startup, an uncommitted file
-tail is truncated to the durable offset; a file shorter than that offset fails
-closed.
+offset on any write, `fsync`, or pre-commit database failure. SQLite advances
+the offset only after every byte is present and `fsync`ed. A lifecycle failure
+after `COMMIT` still fails the request closed, but cannot truncate bytes or
+rewrite the offset/idempotency result that already committed. On startup, an
+uncommitted file tail is truncated to the durable offset; a file shorter than
+that offset fails closed.
 
 Finalize requires both upload `If-Match` and `If-Project-Match`. The latter must
 equal the upload's frozen project ETag and the current project ETag, and the
