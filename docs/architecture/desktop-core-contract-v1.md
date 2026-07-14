@@ -165,6 +165,30 @@ Project evolution config is accepted exactly to the aggregate range enforced
 by `ProjectCreateV1`/`ProjectPatchV1`; the store consumes that authoritative
 contract budget and adds no divergent per-project method-config limit.
 
+### Release Local provider phase one
+
+The first production provider slice is created by
+`desktop.sidecar.create_release_desktop_local_api_app`. It binds an implementation
+to the existing contract app by canonical `operation_id`; it does not register a
+second route table. Calling `create_contract_app()` without a provider retains
+the contract-only 501 behavior used for schema generation, and the release app's
+generated OpenAPI document must remain byte-for-byte canonical with that app.
+
+This phase owns the challenge-bound native health proof, Desktop session
+authentication, disconnected local state snapshot, and durable profile/project
+list/create/get/patch/delete routes. Resource responses carry the same ETag in
+the response header and closed response body. Store cursor, idempotency, ETag,
+recovery, and restart behavior is surfaced directly, while store failures are
+normalized to user-safe `ApiErrorV1` responses without filesystem or SQLite
+details.
+
+SSH, Core tunnel, capability validation, operation execution, run, artifact,
+service, diagnostic, maintenance, and event providers are not part of this
+phase. Their contract routes return typed HTTP 503 rather than fixture 501 or a
+synthetic ready/success response. Subsequent providers extend the same
+`DesktopLocalApiProviderV1` operation dispatch after they can satisfy the
+corresponding SSH/Core ownership and attestation requirements.
+
 List routes use `limit` (maximum 100), `after`, `sort`, and `direction`, and
 return `{items, next_cursor, has_more}`. A cursor is bound to the filters and
 sort order. Its server-side boundary contains the typed sort value and resource

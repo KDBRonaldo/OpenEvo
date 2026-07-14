@@ -1,4 +1,9 @@
-from .app import DESKTOP_SESSION_HEADER, contract_app, create_contract_app
+from .app import (
+    DESKTOP_SESSION_HEADER,
+    DesktopLocalApiProviderV1,
+    contract_app,
+    create_contract_app,
+)
 from . import models as _models
 from .canonical import (
     DESKTOP_EVENTS_SCHEMA_SHA256,
@@ -21,6 +26,7 @@ __all__ = _models.__all__ + (
     "DESKTOP_EVENTS_SCHEMA_SHA256",
     "DESKTOP_OPENAPI_SHA256",
     "DESKTOP_SESSION_HEADER",
+    "DesktopLocalApiProviderV1",
     "EVENTS_SCHEMA_SNAPSHOT_PATH",
     "OPENAPI_SNAPSHOT_PATH",
     "canonical_json_bytes",

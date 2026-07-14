@@ -33,6 +33,8 @@ from desktop.sidecar.config import (
     load_desktop_project_config,
     save_desktop_project_config,
 )
+from desktop.sidecar.release_app import create_release_desktop_local_api_app
+from desktop.sidecar.release_provider import DesktopReleaseProvider
 from openevo.deployment.profile import (
     ProxySettings,
     RemoteProfileConfig,
@@ -52,6 +54,7 @@ from openevo.deployment.workspace import (
 
 __all__ = [
     "DesktopExecutionStatus",
+    "DesktopReleaseProvider",
     "BackendClient",
     "BackendConnection",
     "DesktopBackendError",
@@ -79,6 +82,7 @@ __all__ = [
     "build_desktop_shell_status",
     "create_sidecar_app",
     "create_sidecar_app_for_project",
+    "create_release_desktop_local_api_app",
     "default_desktop_shell_status",
     "list_desktop_project_configs",
     "load_desktop_project_config",

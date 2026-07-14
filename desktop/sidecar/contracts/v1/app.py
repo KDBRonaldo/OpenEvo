@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal, NoReturn
+from collections.abc import Mapping
+from typing import Annotated, Literal, NoReturn, Protocol
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Path, Query, Security
+from fastapi.routing import APIRoute
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 
@@ -96,11 +98,30 @@ _ERROR_RESPONSES = {
 }
 
 
+class DesktopLocalApiProviderV1(Protocol):
+    """Execution provider bound to the canonical Desktop Local API routes."""
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object: ...
+
+
 def _contract_only() -> NoReturn:
     raise HTTPException(status_code=501, detail="Contract-only application")
 
 
-def create_contract_app() -> FastAPI:
+def _bind_provider(app: FastAPI, provider: DesktopLocalApiProviderV1) -> None:
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or route.operation_id is None:
+            continue
+        operation_id = route.operation_id
+
+        def invoke_provider(_operation_id: str = operation_id, **arguments: object) -> object:
+            return provider.invoke(_operation_id, arguments)
+
+        route.endpoint = invoke_provider
+        route.dependant.call = invoke_provider
+
+
+def create_contract_app(provider: DesktopLocalApiProviderV1 | None = None) -> FastAPI:
     app = FastAPI(
         title="OpenEvo Desktop Local API",
         summary="Strict renderer-to-sidecar product contract.",
@@ -632,6 +653,8 @@ def create_contract_app() -> FastAPI:
         _contract_only()
 
     app.include_router(router)
+    if provider is not None:
+        _bind_provider(app, provider)
     return app
 
 
