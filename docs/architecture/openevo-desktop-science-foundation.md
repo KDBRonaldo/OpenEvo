@@ -84,9 +84,15 @@ user does not need to log in again inside the managed runtime image.
 The legacy config value `codex_managed_local_inference` remains accepted as an
 input alias at Desktop and Science model boundaries, but configs normalize and
 emit `self-deployed`. The compiler sets the agent model to that Hugging Face
-model and injects `OPENEVO_MANAGED_HF_MODEL` into the runtime environment. The
-remote Desktop service lifecycle starts vLLM, the gateway, and the proxy path
-before a run can launch.
+model, explicitly sets `agent.settings.capture_mode="transcript"`, and injects
+`OPENEVO_MANAGED_HF_MODEL` into the runtime environment. The remote Desktop
+service lifecycle starts vLLM, the gateway, and the proxy path before a run can
+launch.
+
+The `text_memory`, `skill_bundle`, and `agent_system` targets use pure-text
+transcript trajectories in both execution modes. Their trajectories report
+`token_level_metrics_available=false`; proxy authentication in self-deployed
+mode does not opt these Science Project runs into token-level capture.
 
 Science Projects do not support an enabled
 `evolution.targets.parametric_memory` selection in this foundation slice,

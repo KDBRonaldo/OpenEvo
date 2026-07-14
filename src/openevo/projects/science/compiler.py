@@ -68,7 +68,10 @@ def _agent_payload(project: ScienceProjectConfig) -> dict[str, Any]:
         "model": project.execution.hf_model,
         "auth": "proxy",
         "provider": "codex_cli",
-        "settings": {"auth_mode": "proxy"},
+        "settings": {
+            "auth_mode": "proxy",
+            "capture_mode": "transcript",
+        },
     }
 
 

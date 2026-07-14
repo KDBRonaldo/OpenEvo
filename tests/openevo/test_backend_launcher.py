@@ -7,6 +7,50 @@ import pytest
 
 from openevo import experiments
 from openevo.backend import launcher
+from openevo.experiments.models import ExperimentConfig
+
+
+@pytest.mark.parametrize(
+    ("auth", "settings", "expected_execution_mode", "expected_runtime_capabilities"),
+    [
+        (
+            "subscription",
+            {"auth_mode": "subscription", "capture_mode": "transcript"},
+            "subscription",
+            (),
+        ),
+        (
+            "proxy",
+            {"auth_mode": "proxy", "capture_mode": "transcript"},
+            "self_deployed",
+            ("adapter_serving",),
+        ),
+    ],
+)
+def test_backend_launcher_builds_transcript_profile_for_science_execution_modes(
+    auth: str,
+    settings: dict[str, str],
+    expected_execution_mode: str,
+    expected_runtime_capabilities: tuple[str, ...],
+) -> None:
+    config = ExperimentConfig.model_validate(
+        {
+            "experiment": {"name": "science"},
+            "agent": {
+                "preset": "codex",
+                "model": "science-model",
+                "auth": auth,
+                "settings": settings,
+            },
+            "tasks": [{"id": "task", "instruction": "Run the task."}],
+        }
+    )
+
+    profile = launcher._execution_profile_for_config(config)
+
+    assert profile.execution_mode == expected_execution_mode
+    assert profile.capture_mode == "transcript"
+    assert profile.runtime_capabilities == expected_runtime_capabilities
 
 
 def test_backend_launcher_run_invokes_experiment_runner(

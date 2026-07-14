@@ -106,7 +106,7 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
     assert not hasattr(compiled, "artifacts")
 
 
-def test_local_inference_compiles_to_proxy_auth_and_hf_model_metadata_env() -> None:
+def test_local_inference_compiles_to_transcript_proxy_auth_and_hf_model_metadata_env() -> None:
     compiled = compile_science_project(
         _project(
             execution={
@@ -121,7 +121,10 @@ def test_local_inference_compiles_to_proxy_auth_and_hf_model_metadata_env() -> N
     assert compiled.agent.model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
     assert compiled.agent.auth == "proxy"
     assert compiled.agent.provider == "codex_cli"
-    assert compiled.agent.settings == {"auth_mode": "proxy"}
+    assert compiled.agent.settings == {
+        "auth_mode": "proxy",
+        "capture_mode": "transcript",
+    }
     assert compiled.runtime.env == {
         "SCIENCE_DATASET": "folding",
         "OPENEVO_MANAGED_HF_MODEL": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
