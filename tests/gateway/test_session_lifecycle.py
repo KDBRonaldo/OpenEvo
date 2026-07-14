@@ -661,3 +661,110 @@ async def test_ready_cancel_failure_still_enqueues_postrun_cleanup(tmp_path: Pat
     assert await dispatcher.cancel(managed.session_id) is True
     assert managed.stage == SessionStage.POSTRUN
     assert await dispatcher._postrun_queue.get() == managed.session_id
+
+
+class _DispatcherCancelBaseException(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_type",
+    [asyncio.CancelledError, _DispatcherCancelBaseException],
+)
+async def test_ready_cancel_base_exception_enqueues_postrun_before_propagation(
+    tmp_path: Path,
+    failure_type: type[BaseException],
+) -> None:
+    class CancellingRuntime:
+        async def cancel(self) -> None:
+            raise failure_type("runtime cancel interrupted")
+
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    dispatcher._started = True
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="ready-cancelled-error",
+            task_id="task",
+            instruction="work",
+            remaining_timeout_seconds=10,
+            runtime=RuntimeSpec(image="runtime:latest"),
+            agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+        ),
+        timer=StageTimer(),
+        session_dir=tmp_path / "ready-cancelled-error",
+        artifacts_dir=tmp_path / "ready-cancelled-error" / "artifacts",
+        runtime=CancellingRuntime(),  # type: ignore[arg-type]
+        stage=SessionStage.READY,
+    )
+    dispatcher._sessions[managed.session_id] = managed
+
+    with pytest.raises(failure_type, match="runtime cancel interrupted"):
+        await dispatcher.cancel(managed.session_id)
+
+    assert managed.stage == SessionStage.POSTRUN
+    assert await dispatcher._postrun_queue.get() == managed.session_id
+
+
+class _DispatcherPostrunBaseException(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_type",
+    [asyncio.CancelledError, _DispatcherPostrunBaseException],
+)
+async def test_postrun_base_exception_pops_session_without_killing_worker(
+    tmp_path: Path,
+    failure_type: type[BaseException],
+) -> None:
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    completed = asyncio.Event()
+    calls: list[str] = []
+
+    async def postrun(managed: ManagedSession) -> None:
+        calls.append(managed.session_id)
+        if managed.session_id == "postrun-failure":
+            raise failure_type("postrun callback interrupted")
+        completed.set()
+
+    def make_managed(session_id: str) -> ManagedSession:
+        return ManagedSession(
+            request=SessionDispatchRequest(
+                session_id=session_id,
+                task_id="task",
+                instruction="work",
+                remaining_timeout_seconds=10,
+                runtime=RuntimeSpec(image="runtime:latest"),
+                agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+            ),
+            timer=StageTimer(),
+            session_dir=tmp_path / session_id,
+            artifacts_dir=tmp_path / session_id / "artifacts",
+            stage=SessionStage.POSTRUN,
+        )
+
+    dispatcher.on_postrun = postrun
+    await dispatcher.start()
+    try:
+        for session_id in ("postrun-failure", "postrun-success"):
+            dispatcher._sessions[session_id] = make_managed(session_id)
+            await dispatcher._postrun_queue.put(session_id)
+
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert calls == ["postrun-failure", "postrun-success"]
+        assert dispatcher._sessions == {}
+        assert dispatcher._workers[-1].done() is False
+    finally:
+        await dispatcher.stop()

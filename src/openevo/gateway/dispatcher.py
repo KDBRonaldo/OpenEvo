@@ -91,6 +91,7 @@ class ManagedSession:
     execution_deadline: float | None = None
     finalization_deadline: float | None = None
     runtime_cleanup_blocked: bool = False
+    cleanup_journal_revision: int = 0
     stage: SessionStage = SessionStage.INIT
     inflight: bool = False
 
@@ -203,6 +204,7 @@ class SessionDispatcher:
         before_cancel: BeforeCancelCallback | None = None,
     ) -> bool:
         should_enqueue_postrun = False
+        preserved_failures: list[BaseException] = []
         async with self._lock:
             managed = self._sessions.get(session_id)
             if managed is None:
@@ -234,9 +236,16 @@ class SessionDispatcher:
                     exc,
                     level=logging.WARNING,
                 )
+            except BaseException as exc:
+                preserved_failures.append(exc)
         if should_enqueue_postrun:
-            self._notify_stage_change(managed)
-            await self._postrun_queue.put(session_id)
+            preserved_failures.extend(
+                await self._await_owned_cleanup(self._enqueue_postrun(managed))
+            )
+        self._raise_preserved_failures(
+            "runtime cancellation and post-run enqueue failed",
+            preserved_failures,
+        )
         return True
 
     async def active_count(self) -> int:
@@ -301,26 +310,88 @@ class SessionDispatcher:
             managed = await self._begin(session_id, SessionStage.POSTRUN)
             if managed is None:
                 continue
-            await self._safe_invoke(self.on_postrun, managed, SessionStage.POSTRUN)
-            async with self._lock:
-                self._sessions.pop(session_id, None)
+            interruptions = await self._await_owned_cleanup(
+                self._invoke_postrun_and_pop(managed)
+            )
+            self._raise_preserved_failures(
+                "post-run cleanup was interrupted",
+                interruptions,
+            )
 
     async def _safe_invoke(
-        self, callback: StageCallback | None, managed: ManagedSession, stage: SessionStage
+        self,
+        callback: StageCallback | None,
+        managed: ManagedSession,
+        stage: SessionStage,
+        *,
+        preserve_task_cancellation: bool = True,
     ) -> None:
         if callback is None:
             logger.error("Dispatcher stage %s has no callback", stage)
             return
         try:
             await callback(managed)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+        except BaseException as exc:
+            current = asyncio.current_task()
+            if (
+                preserve_task_cancellation
+                and isinstance(exc, asyncio.CancelledError)
+                and current is not None
+                and current.cancelling()
+            ):
+                raise
             self._log_session_exception(
                 managed,
                 f"Dispatcher stage {stage} failed",
                 exc,
             )
+
+    async def _enqueue_postrun(self, managed: ManagedSession) -> None:
+        self._notify_stage_change(managed)
+        await self._postrun_queue.put(managed.session_id)
+
+    async def _invoke_postrun_and_pop(self, managed: ManagedSession) -> None:
+        try:
+            await self._safe_invoke(
+                self.on_postrun,
+                managed,
+                SessionStage.POSTRUN,
+                preserve_task_cancellation=False,
+            )
+        finally:
+            async with self._lock:
+                self._sessions.pop(managed.session_id, None)
+
+    @staticmethod
+    async def _await_owned_cleanup(awaitable: Awaitable[None]) -> list[BaseException]:
+        """Finish one owned cleanup operation while retaining caller interruption."""
+
+        task = asyncio.ensure_future(awaitable)
+        failures: list[BaseException] = []
+        while True:
+            try:
+                await asyncio.shield(task)
+                return failures
+            except asyncio.CancelledError as exc:
+                failures.append(exc)
+                if not task.done():
+                    continue
+            except BaseException as exc:
+                failures.append(exc)
+                return failures
+            try:
+                task.result()
+            except BaseException as exc:
+                failures.append(exc)
+            return failures
+
+    @staticmethod
+    def _raise_preserved_failures(message: str, failures: list[BaseException]) -> None:
+        if not failures:
+            return
+        if len(failures) == 1:
+            raise failures[0]
+        raise BaseExceptionGroup(message, failures)
 
     async def _begin(
         self,
@@ -419,7 +490,7 @@ class SessionDispatcher:
             return
         try:
             callback(managed)
-        except Exception as exc:
+        except BaseException as exc:
             self._log_session_exception(
                 managed,
                 "Dispatcher stage-change callback failed",

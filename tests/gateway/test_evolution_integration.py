@@ -2120,7 +2120,7 @@ async def test_recovery_scrubs_journal_bound_auth_before_cleanup_budget_exhausti
 
     journal_path = next(journal_dir.glob("*.json"))
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert journal["version"] == 6
+    assert journal["version"] == 7
     assert journal["credential_root"]["auth_identity"] == list(auth_identity)
 
     real_remove = session_files.remove_credential_tree
@@ -2866,6 +2866,92 @@ def test_cleanup_journal_lock_serializes_replace_fsync_rollback_transition(
     assert list(journal_dir.glob("*.pending")) == []
 
 
+def test_cleanup_journal_stale_writer_cannot_regress_terminal_delivery(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    result = _session_result(session_id="journal-stale-terminal-writer")
+    managed = _managed_postrun_session(session_dir, result)
+    managed.request.callback_url = "http://rollout.test/callback"
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+
+    authoritative = _postrun_manager(calls=[])
+    authoritative._cleanup_journal_dir = journal_dir
+    authoritative._register_cleanup_retry(managed)
+    runtime_active = authoritative._cleanup_retries[managed.session_id]
+
+    stale_writer = _postrun_manager(calls=[])
+    stale_writer._cleanup_journal_dir = journal_dir
+    stale_entered = threading.Event()
+    release_stale = threading.Event()
+    original_acquire = stale_writer._acquire_cleanup_journal_lock
+
+    def delay_stale_lock(authority):
+        stale_entered.set()
+        assert release_stale.wait(timeout=2)
+        return original_acquire(authority)
+
+    stale_writer._acquire_cleanup_journal_lock = delay_stale_lock
+    stale_failures: list[BaseException] = []
+
+    def persist_stale_runtime_active() -> None:
+        try:
+            stale_writer._persist_cleanup_ownership(
+                replace(runtime_active, runtime_id="stale-runtime-active")
+            )
+        except BaseException as exc:
+            stale_failures.append(exc)
+
+    stale_thread = threading.Thread(target=persist_stale_runtime_active)
+    stale_thread.start()
+    assert stale_entered.wait(timeout=2)
+    try:
+        delivery = authoritative._prepare_terminal_delivery(managed, result)
+        delivery = authoritative._advance_terminal_delivery(
+            delivery,
+            callback_succeeded=True,
+        )
+    finally:
+        release_stale.set()
+        stale_thread.join(timeout=2)
+
+    assert not stale_thread.is_alive()
+    assert len(stale_failures) == 1
+    assert isinstance(stale_failures[0], RuntimeError)
+    assert "revision compare-and-swap failed" in str(stale_failures[0])
+
+    journal_path = next(journal_dir.glob("*.json"))
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 7
+    assert payload["revision"] == delivery.revision
+    assert payload["phase"] == "terminal_delivery"
+    assert payload["terminal_delivery"]["callback_succeeded"] is True
+    assert payload["runtime"]["runtime_id"] != "stale-runtime-active"
+
+    with pytest.raises(RuntimeError, match="phase cannot regress"):
+        authoritative._persist_cleanup_ownership(
+            replace(runtime_active, revision=delivery.revision)
+        )
+
+    assert delivery.delivery_state is not None
+    with pytest.raises(RuntimeError, match="callback proof cannot regress"):
+        authoritative._persist_cleanup_ownership(
+            replace(
+                delivery,
+                delivery_state=replace(
+                    delivery.delivery_state,
+                    callback_succeeded=False,
+                ),
+            )
+        )
+
+    persisted = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert persisted["phase"] == "terminal_delivery"
+    assert persisted["terminal_delivery"]["callback_succeeded"] is True
+
+
 def test_cleanup_journal_process_lock_is_bounded_and_released_after_holder_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3080,7 +3166,7 @@ def test_current_cleanup_journal_requires_explicit_recovery_phase(tmp_path: Path
     assert session_dir.exists()
 
 
-def test_v5_cleanup_journal_remains_readable_after_v6_upgrade(tmp_path: Path) -> None:
+def test_v5_cleanup_journal_remains_readable_after_v7_upgrade(tmp_path: Path) -> None:
     journal_dir = tmp_path / "journal"
     session_dir = tmp_path / "session"
     session_dir.mkdir(mode=0o700)
@@ -3093,6 +3179,7 @@ def test_v5_cleanup_journal_remains_readable_after_v6_upgrade(tmp_path: Path) ->
     journal_path = next(journal_dir.glob("*.json"))
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     journal["version"] = 5
+    journal.pop("revision")
     journal_path.write_text(json.dumps(journal), encoding="utf-8")
     journal_path.chmod(0o600)
 
@@ -3143,6 +3230,7 @@ def test_v5_credential_terminal_finalization_fails_closed_without_auth_authority
     journal_path = next(journal_dir.glob("*.json"))
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     journal["version"] = 5
+    journal.pop("revision")
     journal["credential_root"].pop("auth_identity")
     journal_path.write_text(json.dumps(journal), encoding="utf-8")
     journal_path.chmod(0o600)
@@ -3211,6 +3299,7 @@ async def test_legacy_journal_without_phase_stops_runtime_but_preserves_roots(
     journal_path = next(journal_dir.glob("*.json"))
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     journal["version"] = 4
+    journal.pop("revision")
     journal.pop("phase")
     journal["terminal_delivery"] = None
     journal_path.write_text(json.dumps(journal), encoding="utf-8")

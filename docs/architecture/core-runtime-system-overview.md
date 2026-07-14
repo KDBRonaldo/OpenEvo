@@ -206,7 +206,7 @@ output 或 artifact。scan 在任何写入前完成 per-file、aggregate byte、
 执行 deadline 耗尽后，transcript byte recovery/build 使用独立有界 finalization budget，保留
 timeout/cancel 前已经捕获的输出和原终态。结果发布前还会递归执行一次内存脱敏。失败时
 post-run 先做固定次数的 stop/absence retry，仍失败则释放 stage worker，由运行期周期
-reconciliation 继续。private v6 cleanup journal 除 runtime/container/session/log/credential
+reconciliation 继续。private v7 cleanup journal 除单调 revision、runtime/container/session/log/credential
 identities 和 exact staged auth identity 外，还保存显式 recovery phase、闭集且已脱敏的
 request/agent terminal/optional result/pending status/timer finalization authority，以及 canonical
 result digest 和单调的 export/callback success proof；agent terminal state 必须先 fsync 该
@@ -224,7 +224,9 @@ previous record、pending、candidate、final、rollback、unlink、replace 和 
 `0600`、link-count-one inode 上的有界跨进程 `flock` 串行化。成功返回前重新验证 lock
 owner/mode/link/device/inode 与 root binding，异常路径关闭 lock FD；过程中 root pathname 被
 rename/replacement 时，不得向 replacement 写入 journal bytes，并保留 displaced authority 与
-pending recovery marker 后 fail closed。
+pending recovery marker 后 fail closed。writer 持锁后重新读取权威记录，并以 exact revision CAS、
+phase 前进关系和 terminal delivery proof 单调性校验候选；stale writer 不得覆盖终态或丢失已提交
+proof。
 journal 的 private parent 另有 immutable root marker，绑定 normalized absolute path、从 `/`
 逐组件 no-follow 获得的 ancestor device/inode identity chain 和 journal root identity。重启遇到
 root rename/replacement 或 ancestor symlink 必须保留 displaced records 并 fail closed。Recovery

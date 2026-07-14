@@ -146,7 +146,7 @@ destroyed only when a final inspect proves that exact ID absent. Gateway does
 not remove either bind root until that proof succeeds; cleanup ownership remains
 in the private authority root and durable retry journal otherwise. Subscription
 post-run uses bounded immediate retries and then periodic reconciliation. Its
-private v6 journal also carries the exact staged auth identity, an explicit recovery phase, redacted
+private v7 journal also carries a monotonic revision, the exact staged auth identity, an explicit recovery phase, redacted
 finalization state, and a canonical result digest with monotonic export/callback
 success proofs. The terminal agent result is journaled before its in-memory
 terminal transition. Cancellation uses the same rule: its authority is fsynced
@@ -169,6 +169,9 @@ owner-only, link-count-one lock inode in that root. The lock inode and root
 binding are revalidated before a transition can return success. A root pathname rename or replacement therefore fails closed while
 retaining the displaced authority and never writes journal bytes into the
 replacement.
+Inside the lock, writers reread the durable record and require an exact revision
+compare-and-swap plus monotonic phase and terminal-delivery proof transitions;
+stale candidates fail without replacing the authority.
 An immutable marker in the journal's private parent binds its normalized path,
 no-follow ancestor identity chain, and root inode. Startup rejects a missing or
 replaced bound root and any symlinked ancestor. It also completes row, filename,

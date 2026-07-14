@@ -164,7 +164,7 @@ Docker always follows removal with an absence `inspect`, including after
 successful `rm -f`. Subscription teardown retries failed stop/absence checks a
 fixed number of times in the post-run worker. A still-unproven runtime is moved
 to periodic reconciliation instead of occupying that worker indefinitely.
-The private v6 cleanup journal contains runtime/container and pinned-root
+The private v7 cleanup journal contains a monotonic revision, runtime/container, and pinned-root
 ownership, the exact staged auth-file identity, an explicit recovery phase, and a redacted, closed finalization
 authority: request identity, agent terminal state, optional terminal result,
 pending status, and timer marks. A terminal agent result is fsynced into that
@@ -184,6 +184,9 @@ that root. Lock owner/mode/link/device/inode and root binding are verified befor
 successful return; exceptional exits always close the lock FD. A concurrent root
 rename or replacement therefore cannot receive journal bytes; pathname binding
 failure retains the displaced authority and its pending recovery marker.
+While holding that lock, each writer rereads and validates the authoritative
+record, performs a revision compare-and-swap, rejects recovery-phase regressions,
+and prevents durable terminal delivery proofs from being changed or discarded.
 Replace/fsync failures roll back the old authority and retain the pending marker,
 so restart cannot treat an uncertain transition as permission to delete storage
 or roots; live pending status/error likewise remain unchanged until persistence
@@ -216,7 +219,11 @@ publication-handoff records without an auth identity scrub every owned regular
 file in this dedicated root before deletion; this is cleanup authority only.
 Credential-bearing v5 terminal-finalization journals still fail closed rather
 than rebuilding a redactor from a replacement pathname. The
-live retry loop applies the same state machine between restarts.
+live retry loop applies the same state machine between restarts. Dispatcher
+cancellation completes any required POSTRUN enqueue before preserving
+`CancelledError` or another `BaseException`. POSTRUN callback execution and
+session removal are one shielded owned cleanup operation, so callback base
+exceptions do not strand the session or terminate the stage worker.
 
 ## What it captures
 

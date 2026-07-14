@@ -116,6 +116,11 @@ _RECOVERY_PHASES = {
     _RECOVERY_PHASE_TERMINAL_FINALIZATION,
     _RECOVERY_PHASE_TERMINAL_DELIVERY,
 }
+_RECOVERY_PHASE_ORDER = {
+    _RECOVERY_PHASE_RUNTIME_ACTIVE: 0,
+    _RECOVERY_PHASE_TERMINAL_FINALIZATION: 1,
+    _RECOVERY_PHASE_TERMINAL_DELIVERY: 2,
+}
 _UNSET = object()
 
 
@@ -186,6 +191,7 @@ class CleanupRetryOwnership:
     eval_container_id: str | None
     runtime: BaseRuntime | None
     phase: str | None
+    revision: int = 0
     eval_runtime: BaseRuntime | None = None
     managed: ManagedSession | None = None
     finalize_subscription: bool = False
@@ -2959,6 +2965,7 @@ class GatewayNodeManager:
                 if finalize_subscription
                 else _RECOVERY_PHASE_RUNTIME_ACTIVE
             ),
+            revision=managed.cleanup_journal_revision,
             eval_runtime=eval_runtime,
             managed=managed,
             finalize_subscription=finalize_subscription,
@@ -3338,17 +3345,13 @@ class GatewayNodeManager:
         name = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
         return f"{name}.json"
 
-    def _persist_cleanup_ownership(
-        self,
-        ownership: CleanupRetryOwnership,
-    ) -> CleanupRetryOwnership:
-        journal_dir = getattr(self, "_cleanup_journal_dir", None)
-        if journal_dir is None:
-            return ownership
+    @staticmethod
+    def _cleanup_ownership_payload(ownership: CleanupRetryOwnership) -> dict[str, Any]:
         state = ownership.finalization_state
         delivery = ownership.delivery_state
-        payload = {
-            "version": 6,
+        return {
+            "version": 7,
+            "revision": ownership.revision,
             "session_id": ownership.session_id,
             "phase": ownership.phase,
             "runtime": {
@@ -3427,14 +3430,131 @@ class GatewayNodeManager:
                 }
             ),
         }
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(encoded) > _CLEANUP_JOURNAL_MAX_BYTES:
-            raise RuntimeError("cleanup ownership journal exceeds the byte limit")
+
+    @staticmethod
+    def _merge_cleanup_journal_cancel_authority(
+        previous: CleanupRetryOwnership | None,
+        candidate: CleanupRetryOwnership,
+    ) -> CleanupRetryOwnership:
+        if (
+            previous is None
+            or previous.finalization_state is None
+            or not previous.finalization_state.cancel_requested
+            or candidate.finalization_state is None
+            or candidate.finalization_state.cancel_requested
+        ):
+            return candidate
+        return replace(
+            candidate,
+            finalization_state=replace(
+                candidate.finalization_state,
+                cancel_requested=True,
+            ),
+        )
+
+    @staticmethod
+    def _validate_cleanup_journal_transition(
+        previous: CleanupRetryOwnership | None,
+        candidate: CleanupRetryOwnership,
+    ) -> None:
+        expected_revision = 0 if previous is None else previous.revision
+        if candidate.revision != expected_revision:
+            raise RuntimeError(
+                "cleanup journal revision compare-and-swap failed: "
+                f"expected {expected_revision}, got {candidate.revision}"
+            )
+        if candidate.phase not in _RECOVERY_PHASE_ORDER:
+            raise RuntimeError("cleanup journal candidate phase is invalid")
+        if previous is None:
+            return
+        if previous.session_id != candidate.session_id:
+            raise RuntimeError("cleanup journal session identity changed")
+        if (
+            previous.session_dir != candidate.session_dir
+            or previous.session_root_identity != candidate.session_root_identity
+            or previous.log_authority_dir != candidate.log_authority_dir
+            or previous.log_authority_identity != candidate.log_authority_identity
+        ):
+            raise RuntimeError("cleanup journal root authority changed")
+        if previous.credential_dir is not None and (
+            previous.credential_dir != candidate.credential_dir
+            or previous.credential_root_identity != candidate.credential_root_identity
+        ):
+            raise RuntimeError("cleanup journal credential authority changed")
+        previous_phase = previous.phase
+        if previous_phase not in _RECOVERY_PHASE_ORDER:
+            raise RuntimeError("cleanup journal authoritative phase is invalid")
+        if _RECOVERY_PHASE_ORDER[candidate.phase] < _RECOVERY_PHASE_ORDER[previous_phase]:
+            raise RuntimeError("cleanup journal phase cannot regress")
+
+        previous_finalization = previous.finalization_state
+        candidate_finalization = candidate.finalization_state
+        candidate_delivery = candidate.delivery_state
+        if previous_finalization is not None:
+            if candidate_finalization is None:
+                raise RuntimeError("cleanup journal transition cannot discard finalization authority")
+            if previous_finalization.request != candidate_finalization.request:
+                raise RuntimeError("cleanup journal finalization request identity changed")
+            if previous_finalization.cancel_requested and not candidate_finalization.cancel_requested:
+                raise RuntimeError("cleanup journal transition cannot discard cancel authority")
+            for label, old, new in (
+                (
+                    "agent result",
+                    previous_finalization.agent_result,
+                    candidate_finalization.agent_result,
+                ),
+                (
+                    "final result",
+                    previous_finalization.final_result,
+                    candidate_finalization.final_result,
+                ),
+                (
+                    "pending status",
+                    previous_finalization.pending_status,
+                    candidate_finalization.pending_status,
+                ),
+                (
+                    "pending error",
+                    previous_finalization.pending_error,
+                    candidate_finalization.pending_error,
+                ),
+            ):
+                if old is not None and new != old:
+                    if (
+                        label == "final result"
+                        and candidate_delivery is not None
+                        and new == candidate_delivery.result
+                    ):
+                        continue
+                    raise RuntimeError(
+                        f"cleanup journal transition cannot discard or change {label}"
+                    )
+
+        previous_delivery = previous.delivery_state
+        if previous_delivery is not None:
+            if candidate_delivery is None:
+                raise RuntimeError("cleanup journal transition cannot discard terminal delivery")
+            if (
+                previous_delivery.result != candidate_delivery.result
+                or previous_delivery.result_digest != candidate_delivery.result_digest
+                or previous_delivery.callback_url != candidate_delivery.callback_url
+                or previous_delivery.export_required != candidate_delivery.export_required
+                or previous_delivery.export_authority != candidate_delivery.export_authority
+                or previous_delivery.callback_required != candidate_delivery.callback_required
+            ):
+                raise RuntimeError("cleanup journal terminal delivery identity changed")
+            if previous_delivery.export_succeeded and not candidate_delivery.export_succeeded:
+                raise RuntimeError("cleanup journal export proof cannot regress")
+            if previous_delivery.callback_succeeded and not candidate_delivery.callback_succeeded:
+                raise RuntimeError("cleanup journal callback proof cannot regress")
+
+    def _persist_cleanup_ownership(
+        self,
+        ownership: CleanupRetryOwnership,
+    ) -> CleanupRetryOwnership:
+        journal_dir = getattr(self, "_cleanup_journal_dir", None)
+        if journal_dir is None:
+            return ownership
         authority = self._open_cleanup_journal_authority(initialize=True)
         if authority is None:
             raise RuntimeError("cleanup journal root identity authority is unavailable")
@@ -3456,47 +3576,38 @@ class GatewayNodeManager:
                 max_bytes=_CLEANUP_JOURNAL_MAX_BYTES,
                 allow_missing=True,
             )
+            previous_ownership = None
             if previous is not None:
                 try:
                     previous_payload = json.loads(previous.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    previous_payload = None
-                previous_finalization = (
-                    previous_payload.get("subscription_finalization")
-                    if isinstance(previous_payload, dict)
-                    else None
-                )
-                previous_cancelled = (
-                    isinstance(previous_finalization, dict)
-                    and previous_finalization.get("cancel_requested") is True
-                )
-                if previous_cancelled:
-                    candidate_finalization = payload["subscription_finalization"]
-                    if not isinstance(candidate_finalization, dict):
-                        raise RuntimeError(
-                            "cleanup journal transition cannot discard cancel authority"
-                        )
-                    if candidate_finalization["cancel_requested"] is not True:
-                        candidate_finalization["cancel_requested"] = True
-                        if ownership.finalization_state is None:
-                            raise RuntimeError(
-                                "cleanup journal cancel authority is internally inconsistent"
-                            )
-                        ownership = replace(
-                            ownership,
-                            finalization_state=replace(
-                                ownership.finalization_state,
-                                cancel_requested=True,
-                            ),
-                        )
-                        encoded = json.dumps(
-                            payload,
-                            ensure_ascii=True,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                        if len(encoded) > _CLEANUP_JOURNAL_MAX_BYTES:
-                            raise RuntimeError("cleanup ownership journal exceeds the byte limit")
+                    previous_ownership = self._cleanup_ownership_from_payload(
+                        previous_payload,
+                        Path(destination),
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                    raise RuntimeError("cleanup ownership journal is invalid") from exc
+            ownership = self._merge_cleanup_journal_cancel_authority(
+                previous_ownership,
+                ownership,
+            )
+            self._validate_cleanup_journal_transition(previous_ownership, ownership)
+            ownership = replace(
+                ownership,
+                revision=(0 if previous_ownership is None else previous_ownership.revision) + 1,
+            )
+            payload = self._cleanup_ownership_payload(ownership)
+            try:
+                self._cleanup_ownership_from_payload(payload, Path(destination))
+            except ValueError as exc:
+                raise RuntimeError("cleanup ownership journal candidate is invalid") from exc
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(encoded) > _CLEANUP_JOURNAL_MAX_BYTES:
+                raise RuntimeError("cleanup ownership journal exceeds the byte limit")
         except BaseException:
             if lock_fd >= 0:
                 self._release_cleanup_journal_lock(lock_fd)
@@ -3535,6 +3646,8 @@ class GatewayNodeManager:
             self._fsync_cleanup_journal_directory(authority.root_fd)
             self._verify_cleanup_journal_authority(authority)
             self._verify_cleanup_journal_lock(authority, lock_fd)
+            if ownership.managed is not None:
+                ownership.managed.cleanup_journal_revision = ownership.revision
             return ownership
         except Exception:
             if descriptor >= 0:
@@ -3835,22 +3948,31 @@ class GatewayNodeManager:
             "session_root",
             "credential_root",
         }
-        if version in {2, 3, 4, 5, 6}:
+        if version in {2, 3, 4, 5, 6, 7}:
             expected_keys.add("log_root")
-        if version in {3, 4, 5, 6}:
+        if version in {3, 4, 5, 6, 7}:
             expected_keys.add("subscription_finalization")
-        if version in {4, 5, 6}:
+        if version in {4, 5, 6, 7}:
             expected_keys.add("terminal_delivery")
-        if version in {5, 6}:
+        if version in {5, 6, 7}:
             expected_keys.add("phase")
+        if version == 7:
+            expected_keys.add("revision")
         if set(payload) != expected_keys:
             raise ValueError("cleanup ownership payload is not closed")
-        if version not in {1, 2, 3, 4, 5, 6} or not isinstance(payload["session_id"], str):
+        if version not in {1, 2, 3, 4, 5, 6, 7} or not isinstance(
+            payload["session_id"], str
+        ):
             raise ValueError("cleanup ownership identity is invalid")
+        revision = payload.get("revision", 0)
+        if version == 7 and (
+            isinstance(revision, bool) or not isinstance(revision, int) or revision < 1
+        ):
+            raise ValueError("cleanup ownership revision is invalid")
         phase = payload.get("phase")
-        if version in {5, 6} and phase not in _RECOVERY_PHASES:
+        if version in {5, 6, 7} and phase not in _RECOVERY_PHASES:
             raise ValueError("cleanup recovery phase is invalid")
-        if version not in {5, 6}:
+        if version not in {5, 6, 7}:
             phase = None
         session_id = payload["session_id"]
         expected_name = f"{hashlib.sha256(session_id.encode('utf-8')).hexdigest()}.json"
@@ -3900,7 +4022,7 @@ class GatewayNodeManager:
             credential_identity = None
             credential_auth_identity = None
         else:
-            if version == 6:
+            if version in {6, 7}:
                 if not isinstance(credential_payload, dict) or set(credential_payload) != {
                     "path",
                     "identity",
@@ -4001,7 +4123,7 @@ class GatewayNodeManager:
                 "callback_required",
                 "callback_succeeded",
             }
-            if version in {5, 6}:
+            if version in {5, 6, 7}:
                 delivery_keys.add("export_authority")
             if (
                 not isinstance(delivery_payload, dict)
@@ -4074,7 +4196,7 @@ class GatewayNodeManager:
             callback_succeeded = delivery_payload["callback_succeeded"]
             if callback_required != (callback_url is not None):
                 raise ValueError("terminal delivery callback authority is invalid")
-            if version in {5, 6} and export_required != (export_authority is not None):
+            if version in {5, 6, 7} and export_required != (export_authority is not None):
                 raise ValueError("terminal delivery export authority is invalid")
             if (not export_required and not export_succeeded) or (
                 not callback_required and not callback_succeeded
@@ -4127,6 +4249,7 @@ class GatewayNodeManager:
             eval_container_id=eval_container_id,
             runtime=None,
             phase=phase,
+            revision=revision,
             eval_runtime=None,
             finalize_subscription=finalization_state is not None,
             finalization_state=finalization_state,
@@ -4250,6 +4373,7 @@ class GatewayNodeManager:
             pending_status=state.pending_status,
             pending_error=state.pending_error,
             cancel_requested=state.cancel_requested,
+            cleanup_journal_revision=ownership.revision,
             stage=SessionStage.POSTRUN,
         )
         if self.session_registry.get(managed.session_id) is None:
@@ -4297,7 +4421,7 @@ class GatewayNodeManager:
                     session_id,
                 )
                 return
-            self._record_cleanup_ownership_runtimes_absent(ownership)
+            ownership = self._record_cleanup_ownership_runtimes_absent(ownership)
             if ownership.phase == _RECOVERY_PHASE_TERMINAL_DELIVERY:
                 delivered = await self._resume_terminal_delivery(ownership)
                 if not delivered:

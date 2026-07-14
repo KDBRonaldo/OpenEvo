@@ -174,7 +174,7 @@ never publishes a subscription result until all credential-capable containers
 have been removed by pinned container ID and proven absent. Post-absence recovery
 uses a separate bounded finalization budget to preserve transcript bytes already
 captured before execution timeout/cancel, then defensively redacts the in-memory
-result before export. A private v6 cleanup journal drives independent
+result before export. A private v7 cleanup journal with monotonic revisions drives independent
 startup/shutdown retries. It binds the exact staged auth inode and persists a
 canonical result digest and monotonic
 evolution-export/callback success proofs; an unknown callback or failed export
