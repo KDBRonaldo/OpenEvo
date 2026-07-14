@@ -106,9 +106,13 @@ each command, rsync, or tunnel spawn, Core therefore copies the validated record
 to a random `0700` lease directory directly under the held secure ancestor. The
 lease file is `0600`, is independent of the mutable trust-store root, and is
 created while the shared store lock is held. Synchronous command/rsync leases
-remain present through subprocess completion; tunnel leases remain present
-until the tunnel closes. Replacing or renaming the trust-store root after
-validation cannot redirect that in-flight pathname to a different key.
+remain present until complete process-group cleanup and leader reap; tunnel
+leases remain present until the tunnel closes. Lease construction and
+synchronous runner exit handle every `BaseException`: partial lease directories
+and FDs are cleaned before propagation, or the exact lease is retained under
+bounded subprocess ownership for retry. Replacing or renaming the trust-store
+root after validation cannot redirect that in-flight pathname to a different
+key.
 
 A stored record contains both canonical metadata and an OpenSSH known-host line.
 The metadata binds all of:
@@ -321,25 +325,28 @@ reaps the process before the existing typed error translation runs. Every such
 subprocess first reserves one of 32 ownership slots, then starts a new session
 whose leader PID is the process-group ID. The slot enters an ownership envelope
 immediately after `Popen`; process-group validation, `waitid`, Darwin `kqueue`,
-portable waiter construction, capture setup, and thread start all execute inside
-that envelope. Error and cancellation cleanup keeps the direct child unreaped
-while that PID fixes the group identity, sends `SIGTERM` and then `SIGKILL` to
-the complete group, and only then waits/reaps the direct child. If any bounded
-terminate/reap step fails, the envelope and exact PID/PGID remain in a bounded
-process-local registry. Later command, tunnel, close, or recovery calls retry up
-to four retained entries synchronously. Full ownership capacity rejects a new
-command before `Popen`, so it cannot create an unrecorded process. Waits and
-portable waiter joins are always bounded.
+Linux `/proc/<pid>/stat` fallback setup, and capture all execute inside that
+envelope. There is no portable waiter thread that can call `wait()` early. If no
+non-reaping observer is available, closed capture pipes or the operation
+deadline initiate cleanup conservatively. Error and cancellation cleanup keeps
+the direct child unreaped while that PID fixes the group identity, sends
+`SIGTERM`, and performs two successful `SIGKILL` process-group sweeps before
+marking group cleanup confirmed. Only then may it wait/reap the direct child,
+remove the registry entry, release the subprocess slot, and close the known-host
+lease. Any group signal, confirmation, reap, or lease cleanup failure retains
+the complete authority in the bounded process-local registry. Later command,
+tunnel, close, or recovery calls retry up to four retained entries
+synchronously. Full ownership capacity rejects a new command before `Popen`, so
+it cannot create an unrecorded process. All waits remain bounded.
 
-Capture polls the unreaped leader at a bounded interval instead of treating pipe
-EOF as process completion. Once the leader exits, inherited descendant pipes
-receive a 100 ms drain grace; capture keeps bytes already delivered, kills the
-still-pinned process group, closes any remaining pipes, and returns the leader's
-actual exit code. This ordering avoids turning a successful or failed leader
-into a full-operation timeout, prevents PID/PGID reuse from redirecting cleanup,
-treats `ESRCH` as an already-empty group, never signals the Desktop process
-group, and keeps a descendant from writing after an error return or trust-lease
-release.
+Capture polls the unreaped leader at a bounded interval through `waitid`,
+`kqueue`, or Linux proc status instead of reaping it. Once the leader exits,
+inherited descendant pipes receive a 100 ms drain grace; capture keeps bytes
+already delivered, kills the still-pinned process group, closes any remaining
+pipes, and returns the leader's actual exit code. This ordering prevents
+PID/PGID reuse from redirecting cleanup, treats `ESRCH` as an already-empty
+group, never signals the Desktop process group, and keeps a descendant from
+writing after an error return or trust-lease release.
 
 `env` is injected into the remote command as POSIX assignments:
 
@@ -385,6 +392,10 @@ a unique owner-only `incoming-<bundle>-<transfer>` directory. Prepare, discard,
 and finalize validate that closed authority under the same publication lock;
 concurrent or exact retries never reuse an incoming pathname or inode. Staging
 admits at most 16 live incoming attempts and scans at most 32 staging entries.
+The transport independently reserves one of 16 local cleanup-authority slots
+before remote prepare. Full authority capacity fails before another incoming
+directory can be created; repeated malformed finalize receipts therefore retain
+recoverable exact authority but cannot grow local or remote work without bound.
 The transport retains every prepared exact transfer until publication or
 confirmed discard. Upload failure uses a separate bounded 10-second cleanup
 deadline instead of an exhausted staging deadline; failed cleanup remains
@@ -395,20 +406,26 @@ and validates its receipt. It discards only after that reconciliation completes
 with a definite non-publication result, so cleanup cannot remove an exact bundle
 that was published before the first response was lost.
 
-Timeout remnants stay private and bounded. In addition to retained exact
-authority, prepare recovers closed incoming directories whose inactivity exceeds
-600 seconds, twice the maximum staging operation lifetime. That age proof keeps
-active cross-process rsync transfers out of cleanup while allowing a later
-Desktop staging/startup to recover all 16 abandoned attempts after a caller
-crash. Locked reconciliation also cleans retired or private publish candidates.
+Timeout remnants stay private and bounded. Prepare creates a validated `0600`
+`.openevo-transfer.lock` in every incoming directory. The rsync server runs
+through a closed Python wrapper that holds a shared flock on that inode across
+`exec`; rsync deletion rules protect the marker. Prepare, discard, and finalize
+must acquire a nonblocking exclusive flock before retiring an incoming
+directory. Prepare considers only directories older than 600 seconds, twice the
+maximum staging operation lifetime, but age alone never authorizes deletion.
+Thus a continuously writing or orphaned cross-process rsync remains protected,
+while a later Desktop staging/startup can recover all 16 unlocked abandoned
+attempts after a caller crash. Locked reconciliation also cleans retired or
+private publish candidates.
 A candidate left sealed at `0500` by a pre-rename crash is rebound by inode,
 restored privately to `0700`, and then cleared; arbitrary or
 identity-mismatched entries still fail closed.
 
-Finalize verifies the exact two-file incoming inventory, then digest-verifies a
-streaming copy into a random private publish candidate that was never disclosed
-to rsync. Candidate members are created as `0400`; only the publisher's already
-open `O_WRONLY` FD can populate them, and it closes every such FD before rename.
+Finalize verifies the exact two-file payload plus the validated internal lease,
+then digest-verifies a streaming copy into a random private publish candidate
+that was never disclosed to rsync. Candidate members are created as `0400`;
+only the publisher's already open `O_WRONLY` FD can populate them, and it closes
+every such FD before rename.
 Finalize seals the directory to `0500`, verifies and fsyncs through the
 still-pinned candidate FD, and atomically renames that inode with no-replace. The same FD
 remains open through final pathname/inode verification and issues a receipt for

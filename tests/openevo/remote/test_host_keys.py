@@ -787,13 +787,17 @@ def test_concurrent_rotate_allows_only_one_first_writer(tmp_path: Path) -> None:
 
     def rotate(index: int) -> str:
         pending, candidate = pending_probes[index]
-        return stores[index].rotate_from_pending(
-            pending,
-            profile=profile,
-            algorithm=candidate.algorithm,
-            fingerprint=candidate.fingerprint,
-            expected_old_fingerprint=old.fingerprint,
-        ).fingerprint
+        return (
+            stores[index]
+            .rotate_from_pending(
+                pending,
+                profile=profile,
+                algorithm=candidate.algorithm,
+                fingerprint=candidate.fingerprint,
+                expected_old_fingerprint=old.fingerprint,
+            )
+            .fingerprint
+        )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(rotate, index) for index in range(2)]
@@ -835,6 +839,31 @@ def test_spawn_lease_holds_shared_lock_until_process_lifecycle_ends(
     finally:
         executor.shutdown(wait=True)
     assert not binding.known_hosts_file.exists()
+
+
+def test_spawn_lease_enter_cancellation_closes_fd_and_removes_private_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    original_write = host_keys_module._write_new_secure_file
+
+    def write_then_cancel(*args: object, **kwargs: object) -> None:
+        original_write(*args, **kwargs)
+        raise Cancelled
+
+    monkeypatch.setattr(host_keys_module, "_write_new_secure_file", write_then_cancel)
+
+    with pytest.raises(Cancelled):
+        binding.open_for_spawn(profile).__enter__()
+
+    assert not list(tmp_path.rglob(".openevo-ssh-lease-*"))
+    with binding._anchor.locked_root(create=False, exclusive=True):
+        pass
 
 
 def test_exclusive_lock_timeout_is_typed_and_shared_across_store_instances(

@@ -172,6 +172,29 @@ def build_core_asset_prepare_command(bundle_id: str) -> str:
     return f"python3 -I -c {shlex.quote(_REMOTE_PREPARE_SCRIPT)} {shlex.quote(bundle_id)}"
 
 
+def build_core_asset_rsync_path(
+    *,
+    service_root: str,
+    bundle_id: str,
+    transfer_id: str,
+) -> str:
+    _require_remote_path(service_root)
+    _require_bundle_id(bundle_id)
+    if not isinstance(transfer_id, str) or _TRANSFER_ID.fullmatch(transfer_id) is None:
+        raise ValueError("Core asset transfer identity is invalid")
+    arguments = (service_root, bundle_id, transfer_id)
+    return " ".join(
+        (
+            "python3",
+            "-I",
+            "-c",
+            shlex.quote(_REMOTE_RSYNC_LEASE_SCRIPT),
+            *(shlex.quote(value) for value in arguments),
+            "rsync",
+        )
+    )
+
+
 def parse_core_asset_prepare(
     payload: SecretStr,
     *,
@@ -591,6 +614,86 @@ def _require_bundle_id(bundle_id: str) -> None:
         raise ValueError("Core asset bundle identity is invalid")
 
 
+_REMOTE_RSYNC_LEASE_SCRIPT = r"""
+import fcntl, os, pwd, stat, sys
+
+service_root, bundle, transfer, executable, *arguments = sys.argv[1:]
+uid = os.geteuid()
+home = pwd.getpwuid(uid).pw_dir
+home_parts = home.split("/")[1:]
+allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._@%+=,-")
+if (not hasattr(os, "O_NOFOLLOW") or not home_parts
+        or any(not part or part in {".", ".."} or any(c not in allowed for c in part) for part in home_parts)
+        or home != "/" + "/".join(home_parts)
+        or service_root != home + "/.openevo/core"
+        or len(bundle) != 64 or any(c not in "0123456789abcdef" for c in bundle)
+        or len(transfer) != 32 or any(c not in "0123456789abcdef" for c in transfer)
+        or executable != "rsync" or not arguments):
+    raise SystemExit(70)
+
+dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+lock_flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+
+def open_absolute(path):
+    fd = os.open("/", dir_flags)
+    try:
+        for part in [item for item in path.split("/") if item]:
+            child = os.open(part, dir_flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def require_dir(fd, mode):
+    meta = os.fstat(fd)
+    if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid
+            or stat.S_IMODE(meta.st_mode) != mode):
+        raise SystemExit(71)
+
+core_fd = open_absolute(service_root)
+try:
+    require_dir(core_fd, 0o700)
+    staging_fd = os.open("asset-staging", dir_flags, dir_fd=core_fd)
+    try:
+        require_dir(staging_fd, 0o700)
+        incoming_name = "incoming-" + bundle + "-" + transfer
+        incoming_fd = os.open(incoming_name, dir_flags, dir_fd=staging_fd)
+        try:
+            require_dir(incoming_fd, 0o700)
+            current = os.stat(incoming_name, dir_fd=staging_fd, follow_symlinks=False)
+            opened = os.fstat(incoming_fd)
+            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                raise SystemExit(72)
+            lease_fd = os.open(".openevo-transfer.lock", lock_flags, dir_fd=incoming_fd)
+            lease = os.fstat(lease_fd)
+            current_lease = os.stat(
+                ".openevo-transfer.lock", dir_fd=incoming_fd, follow_symlinks=False
+            )
+            if (not stat.S_ISREG(lease.st_mode) or lease.st_uid != uid or lease.st_nlink != 1
+                    or stat.S_IMODE(lease.st_mode) != 0o600
+                    or (lease.st_dev, lease.st_ino)
+                        != (current_lease.st_dev, current_lease.st_ino)):
+                raise SystemExit(73)
+            fcntl.flock(lease_fd, fcntl.LOCK_SH)
+            current_lease = os.stat(
+                ".openevo-transfer.lock", dir_fd=incoming_fd, follow_symlinks=False
+            )
+            if (lease.st_dev, lease.st_ino) != (current_lease.st_dev, current_lease.st_ino):
+                raise SystemExit(73)
+            os.set_inheritable(lease_fd, True)
+        finally:
+            os.close(incoming_fd)
+    finally:
+        os.close(staging_fd)
+finally:
+    os.close(core_fd)
+
+os.execvp(executable, [executable, *arguments])
+""".strip()
+
+
 _REMOTE_PREPARE_SCRIPT = r"""
 import fcntl, json, os, pwd, secrets, stat, sys, time
 
@@ -659,13 +762,41 @@ def closed_attempt_name(name, prefix):
     return (len(parts) == 2 and len(parts[0]) == 64 and len(parts[1]) == 32
             and all(c in "0123456789abcdef" for part in parts for c in part))
 
-def clear_private_attempt(parent, attempt_name):
+def clear_private_attempt(parent, attempt_name, require_transfer_lease=False):
     fd = os.open(attempt_name, flags, dir_fd=parent)
+    lease_fd = None
     try:
         before = os.fstat(fd)
         if (not stat.S_ISDIR(before.st_mode) or before.st_uid != uid
                 or stat.S_IMODE(before.st_mode) not in {0o500, 0o700}):
             raise SystemExit(76)
+        if require_transfer_lease:
+            lease_fd = os.open(
+                ".openevo-transfer.lock",
+                os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=fd,
+            )
+            lease = os.fstat(lease_fd)
+            current_lease = os.stat(
+                ".openevo-transfer.lock", dir_fd=fd, follow_symlinks=False
+            )
+            if (not stat.S_ISREG(lease.st_mode) or lease.st_uid != uid
+                    or lease.st_nlink != 1 or stat.S_IMODE(lease.st_mode) != 0o600
+                    or (lease.st_dev, lease.st_ino)
+                        != (current_lease.st_dev, current_lease.st_ino)):
+                raise SystemExit(76)
+            try:
+                fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            current_lease = os.stat(
+                ".openevo-transfer.lock", dir_fd=fd, follow_symlinks=False
+            )
+            if (lease.st_dev, lease.st_ino) != (
+                current_lease.st_dev,
+                current_lease.st_ino,
+            ):
+                raise SystemExit(76)
         os.fchmod(fd, 0o700)
         names = bounded_names(fd, max_staging_entries)
         for child_name in names:
@@ -685,9 +816,12 @@ def clear_private_attempt(parent, attempt_name):
         if (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
             raise SystemExit(76)
     finally:
+        if lease_fd is not None:
+            os.close(lease_fd)
         os.close(fd)
     os.rmdir(attempt_name, dir_fd=parent)
     os.fsync(parent)
+    return True
 
 def reconcile_staging(fd):
     names = bounded_names(fd, max_staging_entries)
@@ -706,7 +840,7 @@ def reconcile_staging(fd):
             current = os.stat(name, dir_fd=fd, follow_symlinks=False)
             if current.st_mtime_ns > stale_before_ns:
                 continue
-            clear_private_attempt(fd, name)
+            clear_private_attempt(fd, name, require_transfer_lease=True)
         except FileNotFoundError:
             pass
     remaining = bounded_names(fd, max_staging_entries)
@@ -760,6 +894,22 @@ try:
                     incoming_fd = os.open(incoming, flags, dir_fd=staging_fd)
                     try:
                         require_dir(incoming_fd, 0o700)
+                        lease_fd = os.open(
+                            ".openevo-transfer.lock",
+                            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                            0o600,
+                            dir_fd=incoming_fd,
+                        )
+                        try:
+                            lease = os.fstat(lease_fd)
+                            if (not stat.S_ISREG(lease.st_mode) or lease.st_uid != uid
+                                    or lease.st_nlink != 1
+                                    or stat.S_IMODE(lease.st_mode) != 0o600):
+                                raise SystemExit(78)
+                            os.fsync(lease_fd)
+                            os.fsync(incoming_fd)
+                        finally:
+                            os.close(lease_fd)
                     finally:
                         os.close(incoming_fd)
                 finally:
@@ -910,11 +1060,34 @@ try:
             except FileNotFoundError:
                 incoming_fd = None
             if incoming_fd is not None:
+                lease_fd = None
                 try:
+                    lease_fd = os.open(
+                        ".openevo-transfer.lock",
+                        os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=incoming_fd,
+                    )
+                    lease = os.fstat(lease_fd)
+                    current_lease = os.stat(
+                        ".openevo-transfer.lock",
+                        dir_fd=incoming_fd,
+                        follow_symlinks=False,
+                    )
+                    if (not stat.S_ISREG(lease.st_mode) or lease.st_uid != uid
+                            or lease.st_nlink != 1 or stat.S_IMODE(lease.st_mode) != 0o600
+                            or (lease.st_dev, lease.st_ino)
+                                != (current_lease.st_dev, current_lease.st_ino)):
+                        raise SystemExit(75)
+                    try:
+                        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        raise SystemExit(75) from None
                     rename_noreplace(staging_fd, incoming_name, retired_name)
                     os.fsync(staging_fd)
                     clear_retired(staging_fd, retired_name, incoming_fd)
                 finally:
+                    if lease_fd is not None:
+                        os.close(lease_fd)
                     os.close(incoming_fd)
         finally:
             os.close(staging_fd)
@@ -978,6 +1151,40 @@ def open_child_dir(parent, name, mode=0o700):
     if (current.st_dev, current.st_ino) != (os.fstat(fd).st_dev, os.fstat(fd).st_ino):
         raise SystemExit(74)
     return fd
+
+def try_lock_transfer(fd):
+    lease_fd = os.open(
+        ".openevo-transfer.lock",
+        os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=fd,
+    )
+    try:
+        lease = os.fstat(lease_fd)
+        current_lease = os.stat(
+            ".openevo-transfer.lock", dir_fd=fd, follow_symlinks=False
+        )
+        if (not stat.S_ISREG(lease.st_mode) or lease.st_uid != uid or lease.st_nlink != 1
+                or stat.S_IMODE(lease.st_mode) != 0o600
+                or (lease.st_dev, lease.st_ino)
+                    != (current_lease.st_dev, current_lease.st_ino)):
+            raise SystemExit(79)
+        try:
+            fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lease_fd)
+            return None
+        current_lease = os.stat(
+            ".openevo-transfer.lock", dir_fd=fd, follow_symlinks=False
+        )
+        if (lease.st_dev, lease.st_ino) != (
+            current_lease.st_dev,
+            current_lease.st_ino,
+        ):
+            raise SystemExit(79)
+        return lease_fd
+    except BaseException:
+        os.close(lease_fd)
+        raise
 
 def verify_file(parent, name, size, digest, mode):
     fd = os.open(name, file_flags, dir_fd=parent)
@@ -1071,15 +1278,18 @@ def no_duplicates(pairs):
         result[key] = value
     return result
 
-def verify_bundle_fd(fd, directory_mode, file_mode):
+def verify_bundle_fd(fd, directory_mode, file_mode, require_transfer_lease=False):
     require_dir(fd, directory_mode)
     names = []
     with os.scandir(fd) as entries:
         for entry in entries:
-            if len(names) >= 2:
+            if len(names) >= (3 if require_transfer_lease else 2):
                 raise SystemExit(79)
             names.append(entry.name)
-    if set(names) != {wheel_name, "framework-lock.json"}:
+    expected_names = {wheel_name, "framework-lock.json"}
+    if require_transfer_lease:
+        expected_names.add(".openevo-transfer.lock")
+    if set(names) != expected_names:
         raise SystemExit(79)
     unused_wheel_bytes, wheel_meta = verify_file(
         fd, wheel_name, wheel_size, wheel_digest, file_mode
@@ -1107,10 +1317,15 @@ def verify_bundle_fd(fd, directory_mode, file_mode):
         "framework_lock_inode": lock_meta.st_ino,
     }
 
-def verify_bundle(parent, name, directory_mode, file_mode):
+def verify_bundle(parent, name, directory_mode, file_mode, require_transfer_lease=False):
     fd = open_child_dir(parent, name, directory_mode)
     try:
-        return fd, verify_bundle_fd(fd, directory_mode, file_mode)
+        return fd, verify_bundle_fd(
+            fd,
+            directory_mode,
+            file_mode,
+            require_transfer_lease=require_transfer_lease,
+        )
     except BaseException:
         os.close(fd)
         raise
@@ -1135,10 +1350,13 @@ def discard_private_bundle(parent, name, fd):
     names = []
     with os.scandir(fd) as entries:
         for entry in entries:
-            if len(names) >= 2:
+            if len(names) >= 3:
                 raise SystemExit(83)
             names.append(entry.name)
-    if set(names) != {wheel_name, "framework-lock.json"}:
+    if set(names) not in (
+        {wheel_name, "framework-lock.json"},
+        {wheel_name, "framework-lock.json", ".openevo-transfer.lock"},
+    ):
         raise SystemExit(83)
     for child_name in names:
         child_fd = os.open(child_name, file_flags, dir_fd=fd)
@@ -1232,6 +1450,7 @@ try:
         try:
             incoming_name = "incoming-" + bundle + "-" + transfer
             incoming_fd = None
+            transfer_lease_fd = None
             candidate_fd = None
             candidate_name = None
             published = False
@@ -1239,8 +1458,15 @@ try:
                 try:
                     final_fd, receipt = verify_bundle(assets_fd, bundle, 0o500, 0o400)
                 except FileNotFoundError:
-                    incoming_fd, unused_receipt = verify_bundle(
-                        staging_fd, incoming_name, 0o700, 0o600
+                    incoming_fd = open_child_dir(staging_fd, incoming_name)
+                    transfer_lease_fd = try_lock_transfer(incoming_fd)
+                    if transfer_lease_fd is None:
+                        raise SystemExit(79)
+                    unused_receipt = verify_bundle_fd(
+                        incoming_fd,
+                        0o700,
+                        0o600,
+                        require_transfer_lease=True,
                     )
                     candidate_name, candidate_fd = create_private_candidate(staging_fd)
                     copy_verified_file(incoming_fd, candidate_fd, wheel_name, wheel_size, wheel_digest)
@@ -1306,11 +1532,16 @@ try:
                         incoming_fd = open_child_dir(staging_fd, incoming_name)
                     except FileNotFoundError:
                         pass
-                if incoming_fd is not None:
-                    try:
+                if incoming_fd is not None and transfer_lease_fd is None:
+                    transfer_lease_fd = try_lock_transfer(incoming_fd)
+                try:
+                    if incoming_fd is not None and transfer_lease_fd is not None:
                         retire_incoming(staging_fd, incoming_name, incoming_fd)
-                    finally:
+                finally:
+                    if incoming_fd is not None:
                         os.close(incoming_fd)
+                    if transfer_lease_fd is not None:
+                        os.close(transfer_lease_fd)
         finally:
             os.close(assets_fd)
             os.close(staging_fd)
@@ -1535,6 +1766,7 @@ __all__ = (
     "build_core_asset_consumer_command",
     "build_core_asset_finalize_command",
     "build_core_asset_prepare_command",
+    "build_core_asset_rsync_path",
     "parse_core_asset_prepare",
     "parse_staged_core_assets",
     "snapshot_core_bootstrap_assets",

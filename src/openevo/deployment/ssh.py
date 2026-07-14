@@ -31,6 +31,7 @@ from openevo.deployment.core_assets import (
     build_core_asset_discard_command,
     build_core_asset_finalize_command,
     build_core_asset_prepare_command,
+    build_core_asset_rsync_path,
     parse_core_asset_prepare,
     parse_staged_core_assets,
     snapshot_core_bootstrap_assets,
@@ -58,11 +59,11 @@ _SUBPROCESS_CAPTURE_CHUNK_BYTES = 64 * 1024
 _SUBPROCESS_TERMINATE_GRACE_SECONDS = 1.0
 _SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS = 0.1
 _SUBPROCESS_STATUS_INTERVAL_SECONDS = 0.05
-_SUBPROCESS_OBSERVER_JOIN_SECONDS = 0.05
 _SUBPROCESS_OWNERSHIP_ACQUIRE_SECONDS = 0.1
 _MAX_OWNED_SUBPROCESSES = 32
 _MAX_SUBPROCESS_ORPHAN_RETRIES = 4
 _CORE_ASSET_CLEANUP_SECONDS = 10.0
+_MAX_CORE_ASSET_CLEANUP_AUTHORITIES = 16
 _ORPHANED_TUNNEL_GUARD = threading.Lock()
 _ORPHANED_TUNNELS: dict[int, "SshTunnel"] = {}
 _ORPHANED_CORE_TUNNELS: dict[int, "_CoreTunnelEndpoint"] = {}
@@ -650,6 +651,7 @@ class SshRemoteExecutorTransport:
         self._profile = profile
         self._trusted_host = trusted_host
         self._runner = runner or _run_subprocess
+        self._uses_default_runner = runner is None
         self._tunnel_starter = tunnel_starter or _start_tunnel_subprocess
         self._port_allocator = port_allocator or _allocate_local_port
         self._core_connection_starter = (
@@ -661,6 +663,42 @@ class SshRemoteExecutorTransport:
             tuple[str, str, str], _CoreAssetTransferAuthority
         ] = {}
         self._core_asset_active_transfers: set[tuple[str, str, str]] = set()
+        self._core_asset_pending_admissions = 0
+
+    def _run_trusted_subprocess(
+        self,
+        argv_factory: Callable[[Path], list[str]],
+        timeout_seconds: float,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        trust_lease = self._trusted_host.open_for_spawn(self._profile)
+        cleanup_required = True
+        try:
+            try:
+                known_hosts_file = trust_lease.__enter__()
+            except Exception:
+                _release_trust_lease(trust_lease)
+                cleanup_required = False
+                raise _KnownHostsSpawnFailure from None
+            argv = argv_factory(known_hosts_file)
+            if self._uses_default_runner:
+                cleanup_required = False
+                return (
+                    _run_subprocess(
+                        argv,
+                        timeout_seconds,
+                        trust_lease=trust_lease,
+                    ),
+                    known_hosts_file,
+                )
+            try:
+                return self._runner(argv, timeout_seconds), known_hosts_file
+            finally:
+                _release_trust_lease(trust_lease)
+                cleanup_required = False
+        except BaseException:
+            if cleanup_required:
+                _release_trust_lease(trust_lease)
+            raise
 
     def run(
         self,
@@ -685,14 +723,15 @@ class SshRemoteExecutorTransport:
         completed: subprocess.CompletedProcess[str] | None = None
         phase = "trust"
         try:
-            with self._trusted_host.open_for_spawn(self._profile) as known_hosts_file:
-                phase = "process"
-                completed = self._runner(
-                    self._ssh_argv(marked_command, known_hosts_file), timeout_seconds
-                )
-                phase = "trust"
+            phase = "process"
+            completed, known_hosts_file = self._run_trusted_subprocess(
+                lambda known_hosts_file: self._ssh_argv(marked_command, known_hosts_file),
+                timeout_seconds,
+            )
         except subprocess.TimeoutExpired:
             failure_code = SshTransportErrorCode.TIMEOUT
+        except _KnownHostsSpawnFailure:
+            failure_code = SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
         except Exception:
             failure_code = (
                 SshTransportErrorCode.START_FAILED
@@ -748,14 +787,15 @@ class SshRemoteExecutorTransport:
         completed: subprocess.CompletedProcess[str] | None = None
         phase = "trust"
         try:
-            with self._trusted_host.open_for_spawn(self._profile) as known_hosts_file:
-                phase = "process"
-                completed = self._runner(
-                    self._rsync_argv(local, remote_path, known_hosts_file), 300.0
-                )
-                phase = "trust"
+            phase = "process"
+            completed, _known_hosts_file = self._run_trusted_subprocess(
+                lambda known_hosts_file: self._rsync_argv(local, remote_path, known_hosts_file),
+                300.0,
+            )
         except subprocess.TimeoutExpired:
             failure_code = SshTransportErrorCode.TIMEOUT
+        except _KnownHostsSpawnFailure:
+            failure_code = SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
         except Exception:
             failure_code = (
                 SshTransportErrorCode.RSYNC_FAILED
@@ -806,15 +846,20 @@ class SshRemoteExecutorTransport:
                 self._retry_core_asset_transfer_cleanup(
                     deadline=time.monotonic() + _CORE_ASSET_CLEANUP_SECONDS
                 )
-                prepare_payload = self._run_secret_with_remote_failure(
-                    prepare_command,
-                    timeout_seconds=_stage_remaining(deadline),
-                    remote_failure_code=SshTransportErrorCode.CORE_ASSET_FAILED,
-                )
-                service_root, incoming_root, transfer_id = parse_core_asset_prepare(
-                    prepare_payload,
-                    bundle_id=bundle_id,
-                )
+                self._admit_core_asset_transfer()
+                try:
+                    prepare_payload = self._run_secret_with_remote_failure(
+                        prepare_command,
+                        timeout_seconds=_stage_remaining(deadline),
+                        remote_failure_code=SshTransportErrorCode.CORE_ASSET_FAILED,
+                    )
+                    service_root, incoming_root, transfer_id = parse_core_asset_prepare(
+                        prepare_payload,
+                        bundle_id=bundle_id,
+                    )
+                except BaseException:
+                    self._release_core_asset_admission()
+                    raise
                 authority = _CoreAssetTransferAuthority(
                     service_root=service_root,
                     bundle_id=bundle_id,
@@ -825,11 +870,16 @@ class SshRemoteExecutorTransport:
                     framework_lock_sha256=framework_lock_sha256,
                     framework_lock_size=framework_lock_size,
                 )
-                self._remember_core_asset_transfer(authority, active=True)
+                self._remember_core_asset_transfer(
+                    authority,
+                    active=True,
+                    consume_admission=True,
+                )
                 try:
                     self._upload_core_asset_snapshot(
                         snapshot.root,
                         incoming_root,
+                        authority=authority,
                         deadline=deadline,
                     )
                 except BaseException:
@@ -892,11 +942,33 @@ class SshRemoteExecutorTransport:
         authority: _CoreAssetTransferAuthority,
         *,
         active: bool = False,
+        consume_admission: bool = False,
     ) -> None:
         with self._core_asset_authority_lock:
+            if consume_admission:
+                if self._core_asset_pending_admissions <= 0:
+                    raise RuntimeError("Core asset admission ownership is missing")
+                self._core_asset_pending_admissions -= 1
+            existing = self._core_asset_cleanup_authorities.get(authority.key)
+            if existing is not None and (
+                consume_admission or authority not in (existing, existing.with_finalize_started())
+            ):
+                raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
             self._core_asset_cleanup_authorities[authority.key] = authority
             if active:
                 self._core_asset_active_transfers.add(authority.key)
+
+    def _admit_core_asset_transfer(self) -> None:
+        with self._core_asset_authority_lock:
+            owned = len(self._core_asset_cleanup_authorities) + self._core_asset_pending_admissions
+            if owned >= _MAX_CORE_ASSET_CLEANUP_AUTHORITIES:
+                raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
+            self._core_asset_pending_admissions += 1
+
+    def _release_core_asset_admission(self) -> None:
+        with self._core_asset_authority_lock:
+            if self._core_asset_pending_admissions > 0:
+                self._core_asset_pending_admissions -= 1
 
     def _mark_core_asset_transfer_inactive(
         self,
@@ -1012,25 +1084,27 @@ class SshRemoteExecutorTransport:
         local_root: Path,
         remote_root: str,
         *,
+        authority: _CoreAssetTransferAuthority,
         deadline: float,
     ) -> None:
         failure_code: SshTransportErrorCode | None = None
         completed: subprocess.CompletedProcess[str] | None = None
         phase = "trust"
         try:
-            with self._trusted_host.open_for_spawn(self._profile) as known_hosts_file:
-                phase = "process"
-                completed = self._runner(
-                    self._core_asset_rsync_argv(
-                        local_root,
-                        remote_root,
-                        known_hosts_file,
-                    ),
-                    _stage_remaining(deadline),
-                )
-                phase = "trust"
+            phase = "process"
+            completed, _known_hosts_file = self._run_trusted_subprocess(
+                lambda known_hosts_file: self._core_asset_rsync_argv(
+                    local_root,
+                    remote_root,
+                    known_hosts_file,
+                    authority=authority,
+                ),
+                _stage_remaining(deadline),
+            )
         except subprocess.TimeoutExpired:
             failure_code = SshTransportErrorCode.TIMEOUT
+        except _KnownHostsSpawnFailure:
+            failure_code = SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
         except SshTransportError:
             raise
         except Exception:
@@ -1357,6 +1431,8 @@ class SshRemoteExecutorTransport:
         local_root: Path,
         remote_root: str,
         known_hosts_file: Path,
+        *,
+        authority: _CoreAssetTransferAuthority,
     ) -> list[str]:
         _validate_remote_absolute_path(remote_root, "remote_root")
         ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
@@ -1364,9 +1440,16 @@ class SshRemoteExecutorTransport:
             "rsync",
             "--recursive",
             "--delete",
+            "--filter=protect /.openevo-transfer.lock",
             "--chmod=F600,D700",
             "--no-owner",
             "--no-group",
+            "--rsync-path",
+            build_core_asset_rsync_path(
+                service_root=authority.service_root,
+                bundle_id=authority.bundle_id,
+                transfer_id=authority.transfer_id,
+            ),
             "-e",
             ssh_command,
             _with_trailing_slash(str(local_root)),
@@ -1377,18 +1460,35 @@ class SshRemoteExecutorTransport:
 class _OwnedSubprocessAuthority:
     """Retain one spawned process group until bounded cleanup confirms reaping."""
 
-    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        trust_lease: AbstractContextManager[Path] | None,
+    ) -> None:
         self.process = process
         self.process_group_id = process.pid
         self.exit_observer: _SubprocessExitObserver | None = None
+        self._trust_lease = trust_lease
+        self._group_cleanup_confirmed = False
         self._slot_held = True
         self._retained = False
         self._cleanup_guard = threading.Lock()
 
     @classmethod
-    def spawn(cls, argv: list[str]) -> _OwnedSubprocessAuthority:
-        _retry_orphaned_subprocess_cleanup()
+    def spawn(
+        cls,
+        argv: list[str],
+        *,
+        trust_lease: AbstractContextManager[Path] | None,
+    ) -> _OwnedSubprocessAuthority:
+        try:
+            _retry_orphaned_subprocess_cleanup()
+        except BaseException:
+            _release_trust_lease(trust_lease)
+            raise
         if not _SUBPROCESS_OWNERSHIP_SLOTS.acquire(timeout=_SUBPROCESS_OWNERSHIP_ACQUIRE_SECONDS):
+            _release_trust_lease(trust_lease)
             raise RuntimeError("subprocess ownership capacity is exhausted")
         try:
             process = subprocess.Popen(
@@ -1401,8 +1501,9 @@ class _OwnedSubprocessAuthority:
             )
         except BaseException:
             _SUBPROCESS_OWNERSHIP_SLOTS.release()
+            _release_trust_lease(trust_lease)
             raise
-        return cls(process)
+        return cls(process, trust_lease=trust_lease)
 
     def initialize_observer(self) -> None:
         self.process_group_id = _owned_process_group_id(self.process)
@@ -1416,10 +1517,11 @@ class _OwnedSubprocessAuthority:
                     self.process,
                     process_group_id=self.process_group_id,
                     exit_observer=self.exit_observer,
+                    on_group_cleanup_confirmed=self.mark_group_cleanup_confirmed,
                 )
             except BaseException as exc:
                 failure = exc
-            if self._is_reaped():
+            if self._group_cleanup_confirmed and self._is_reaped():
                 self.release()
             else:
                 self.retain()
@@ -1439,21 +1541,32 @@ class _OwnedSubprocessAuthority:
             _ORPHANED_SUBPROCESSES[id(self)] = self
             self._retained = True
 
-    def release(self) -> None:
+    def mark_group_cleanup_confirmed(self) -> None:
+        self._group_cleanup_confirmed = True
+
+    def release(self) -> bool:
+        if not self._group_cleanup_confirmed or not self._is_reaped():
+            self.retain()
+            return False
+        trust_lease = self._trust_lease
+        if trust_lease is not None and not _release_trust_lease(trust_lease):
+            self.retain()
+            return False
         with _ORPHANED_SUBPROCESS_GUARD:
             if not self._slot_held:
-                return
+                return True
             _ORPHANED_SUBPROCESSES.pop(id(self), None)
             self._retained = False
             self._slot_held = False
+            self._trust_lease = None
         _SUBPROCESS_OWNERSHIP_SLOTS.release()
+        return True
 
     def release_if_reaped(self) -> bool:
-        if not self._is_reaped():
+        if not self._group_cleanup_confirmed or not self._is_reaped():
             self.retain()
             return False
-        self.release()
-        return True
+        return self.release()
 
     def _is_reaped(self) -> bool:
         if self.process.returncode is not None:
@@ -1464,8 +1577,13 @@ class _OwnedSubprocessAuthority:
             return False
 
 
-def _run_subprocess(argv: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
-    authority = _OwnedSubprocessAuthority.spawn(argv)
+def _run_subprocess(
+    argv: list[str],
+    timeout_seconds: float,
+    *,
+    trust_lease: AbstractContextManager[Path] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    authority = _OwnedSubprocessAuthority.spawn(argv, trust_lease=trust_lease)
     process = authority.process
     stdout = b""
     stderr = b""
@@ -1480,6 +1598,7 @@ def _run_subprocess(argv: list[str], timeout_seconds: float) -> subprocess.Compl
             timeout_seconds=timeout_seconds,
             process_group_id=authority.process_group_id,
             exit_observer=authority.exit_observer,
+            on_group_cleanup_confirmed=authority.mark_group_cleanup_confirmed,
         )
     except BaseException:
         try:
@@ -1515,6 +1634,10 @@ class _SubprocessCaptureLimitExceeded(RuntimeError):
     """Internal signal translated to an existing renderer-safe transport error."""
 
 
+class _KnownHostsSpawnFailure(RuntimeError):
+    """Internal trust setup failure without retaining the original exception."""
+
+
 def _capture_subprocess_output(
     process: subprocess.Popen[bytes],
     *,
@@ -1522,6 +1645,7 @@ def _capture_subprocess_output(
     timeout_seconds: float,
     process_group_id: int,
     exit_observer: _SubprocessExitObserver,
+    on_group_cleanup_confirmed: Callable[[], None],
 ) -> tuple[bytes, bytes]:
     assert process.stdout is not None
     assert process.stderr is not None
@@ -1584,14 +1708,21 @@ def _capture_subprocess_output(
                 if captured_bytes > _MAX_SUBPROCESS_CAPTURE_BYTES:
                     raise _SubprocessCaptureLimitExceeded
                 chunks[key.data].append(chunk)
-        if not leader_exited and not exit_observer.wait_until(deadline):
-            raise subprocess.TimeoutExpired(argv, timeout_seconds)
+        if not leader_exited and exit_observer.supports_nonreaping_observation:
+            if not exit_observer.wait_until(deadline):
+                raise subprocess.TimeoutExpired(argv, timeout_seconds)
         if not group_killed:
             _signal_owned_process_group(
                 process,
                 process_group_id=process_group_id,
                 signal_number=signal.SIGKILL,
             )
+        _signal_owned_process_group(
+            process,
+            process_group_id=process_group_id,
+            signal_number=signal.SIGKILL,
+        )
+        on_group_cleanup_confirmed()
         process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
     finally:
         selector.close()
@@ -1600,7 +1731,11 @@ def _capture_subprocess_output(
 
 def _owned_process_group_id(process: subprocess.Popen[bytes]) -> int:
     process_group_id = process.pid
-    if process_group_id <= 1 or process_group_id == os.getpgrp():
+    if (
+        process_group_id <= 1
+        or process_group_id == os.getpgrp()
+        or os.getpgid(process.pid) != process_group_id
+    ):
         raise RuntimeError("subprocess did not receive an independent process group")
     return process_group_id
 
@@ -1618,10 +1753,9 @@ class _SubprocessExitObserver:
             else None
         )
         self._kqueue: select.kqueue | None = None
+        proc_stat_path = f"/proc/{process.pid}/stat"
+        self._proc_stat_path = proc_stat_path if os.path.isfile(proc_stat_path) else None
         self._observed = False
-        self._waiter_done = threading.Event()
-        self._waiter_failure: BaseException | None = None
-        self._waiter: threading.Thread | None = None
         if callable(self._waitid):
             return
         if hasattr(select, "kqueue"):
@@ -1643,12 +1777,12 @@ class _SubprocessExitObserver:
             else:
                 self._kqueue = queue
                 return
-        self._waiter = threading.Thread(
-            target=self._wait_for_exit,
-            name="openevo-subprocess-exit-observer",
-            daemon=True,
+
+    @property
+    def supports_nonreaping_observation(self) -> bool:
+        return (
+            callable(self._waitid) or self._kqueue is not None or self._proc_stat_path is not None
         )
-        self._waiter.start()
 
     def exited(self) -> bool:
         if self._observed or self._process.returncode is not None:
@@ -1665,12 +1799,24 @@ class _SubprocessExitObserver:
         if self._kqueue is not None:
             self._observed = bool(self._kqueue.control(None, 1, 0))
             return self._observed
-        if not self._waiter_done.is_set():
-            return False
-        if self._waiter_failure is not None:
-            raise self._waiter_failure
-        self._observed = True
-        return True
+        if self._proc_stat_path is not None:
+            try:
+                with open(self._proc_stat_path, "rb") as stream:
+                    stat_line = stream.read(4097)
+            except FileNotFoundError:
+                self._observed = True
+                return True
+            if len(stat_line) > 4096:
+                raise RuntimeError("subprocess proc status exceeds the observation limit")
+            fields = stat_line.rsplit(b")", 1)
+            if len(fields) != 2:
+                raise RuntimeError("subprocess proc status is malformed")
+            status_fields = fields[1].split()
+            if not status_fields:
+                raise RuntimeError("subprocess proc status is malformed")
+            self._observed = status_fields[0] in {b"Z", b"X"}
+            return self._observed
+        return False
 
     def wait_until(self, deadline: float) -> bool:
         while True:
@@ -1679,25 +1825,12 @@ class _SubprocessExitObserver:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            if self._waiter is not None:
-                self._waiter_done.wait(min(0.01, remaining))
-            else:
-                time.sleep(min(0.01, remaining))
+            time.sleep(min(0.01, remaining))
 
     def close(self) -> None:
         if self._kqueue is not None:
             self._kqueue.close()
             self._kqueue = None
-        if self._waiter is not None and self._waiter_done.is_set():
-            self._waiter.join(timeout=_SUBPROCESS_OBSERVER_JOIN_SECONDS)
-
-    def _wait_for_exit(self) -> None:
-        try:
-            self._process.wait()
-        except BaseException as exc:
-            self._waiter_failure = exc
-        finally:
-            self._waiter_done.set()
 
 
 def _signal_owned_process_group(
@@ -1711,7 +1844,7 @@ def _signal_owned_process_group(
         or process_group_id <= 1
         or process_group_id == os.getpgrp()
     ):
-        return
+        raise RuntimeError("subprocess process-group ownership is invalid")
     try:
         os.killpg(process_group_id, signal_number)
     except ProcessLookupError:
@@ -1723,6 +1856,7 @@ def _terminate_and_reap_subprocess(
     *,
     process_group_id: int,
     exit_observer: _SubprocessExitObserver | None,
+    on_group_cleanup_confirmed: Callable[[], None],
 ) -> None:
     failure: BaseException | None = None
     try:
@@ -1741,26 +1875,24 @@ def _terminate_and_reap_subprocess(
     except BaseException as exc:
         if failure is None:
             failure = exc
-    finally:
-        try:
-            _signal_owned_process_group(
-                process,
-                process_group_id=process_group_id,
-                signal_number=signal.SIGKILL,
-            )
-        except BaseException as exc:
-            if failure is None:
-                failure = exc
-        try:
-            process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
+    try:
+        _signal_owned_process_group(
+            process,
+            process_group_id=process_group_id,
+            signal_number=signal.SIGKILL,
+        )
+        _signal_owned_process_group(
+            process,
+            process_group_id=process_group_id,
+            signal_number=signal.SIGKILL,
+        )
+    except BaseException as exc:
+        if failure is None:
+            failure = exc
     if failure is not None:
         raise failure
+    on_group_cleanup_confirmed()
+    process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
 
 
 def _start_tunnel_subprocess(argv: list[str]) -> subprocess.Popen[str]:
@@ -1915,18 +2047,20 @@ def _retry_orphaned_subprocess_cleanup() -> None:
                 raise
 
 
-def _release_trust_lease(trust_lease: AbstractContextManager[Path] | None) -> None:
+def _release_trust_lease(trust_lease: AbstractContextManager[Path] | None) -> bool:
     if trust_lease is None:
-        return
+        return True
     try:
         trust_lease.__exit__(None, None, None)
     except BaseException:
         with _ORPHANED_TUNNEL_GUARD:
             _ORPHANED_TRUST_LEASES[id(trust_lease)] = trust_lease
         _log_transport_failure(SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED)
+        return False
     else:
         with _ORPHANED_TUNNEL_GUARD:
             _ORPHANED_TRUST_LEASES.pop(id(trust_lease), None)
+        return True
 
 
 def _log_transport_failure(

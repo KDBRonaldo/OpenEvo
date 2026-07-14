@@ -92,9 +92,7 @@ class HostKeyStoreError(RuntimeError):
                 "before retrying."
             )
         else:
-            message = (
-                "SSH host-key trust is in use. Close the active tunnel and retry."
-            )
+            message = "SSH host-key trust is in use. Close the active tunnel and retry."
         super().__init__(message)
 
 
@@ -731,8 +729,11 @@ class _KnownHostsSpawnLease(AbstractContextManager[Path]):
             _write_new_secure_file(self._directory_fd, "known_hosts", content)
             os.fsync(self._directory_fd)
             return anchor.secure_ancestor / self._directory_name / "known_hosts"
-        except Exception:
-            self.__exit__(None, None, None)
+        except BaseException:
+            try:
+                self.__exit__(None, None, None)
+            except BaseException:
+                pass
             raise
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -1117,9 +1118,7 @@ def _open_secure_ancestor(path: Path) -> int:
     try:
         current_fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
-        raise ValueError(
-            "provider known-host secure ancestor could not be opened safely"
-        ) from exc
+        raise ValueError("provider known-host secure ancestor could not be opened safely") from exc
     try:
         for index, part in enumerate(parts[1:], start=1):
             try:
@@ -1143,9 +1142,7 @@ def _open_secure_ancestor(path: Path) -> int:
                     _validate_secure_path_component_stat(before)
                     _validate_secure_path_component_stat(opened)
                 if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
-                    raise ValueError(
-                        "provider known-host secure ancestor changed during open"
-                    )
+                    raise ValueError("provider known-host secure ancestor changed during open")
             except Exception:
                 os.close(next_fd)
                 raise
@@ -1164,9 +1161,7 @@ def _validate_secure_path_component_stat(result: os.stat_result) -> None:
         raise ValueError("provider known-host secure ancestor path is not owner-controlled")
     mode = stat.S_IMODE(result.st_mode)
     if mode & 0o022 and not (result.st_uid == 0 and mode & stat.S_ISVTX):
-        raise ValueError(
-            "provider known-host secure ancestor path contains a writable component"
-        )
+        raise ValueError("provider known-host secure ancestor path contains a writable component")
 
 
 def _validate_secure_ancestor_stat(result: os.stat_result) -> None:
@@ -1175,9 +1170,7 @@ def _validate_secure_ancestor_stat(result: os.stat_result) -> None:
     if result.st_uid != os.geteuid():
         raise ValueError("provider known-host secure ancestor must be owner-controlled")
     if stat.S_IMODE(result.st_mode) & 0o022:
-        raise ValueError(
-            "provider known-host secure ancestor must not be group/world writable"
-        )
+        raise ValueError("provider known-host secure ancestor must not be group/world writable")
 
 
 def _validate_root_stat(result: os.stat_result) -> None:

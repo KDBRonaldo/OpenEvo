@@ -12,13 +12,15 @@ document or add compatibility routes.
 The Desktop-side launcher and its local SSH/rsync subprocesses support both
 macOS and Linux hosts. Local leader-exit observation uses Linux
 `waitid(..., WNOWAIT)` when available and Darwin `kqueue` process-exit events
-otherwise; a waiter preserves the exact return code on platforms without either
-interface. All paths retain the 100 ms descendant-pipe drain, terminate the
-owned process group on leader exit, timeout, or cancellation, and reap the
-leader. Ownership capacity is reserved before `Popen`; observer construction,
-thread-start, capture, and cleanup `BaseException` paths cannot lose the PID or
-PGID. Unconfirmed cleanup remains in a bounded process-local registry for later
-command/tunnel/close recovery, and all waits and waiter joins remain bounded.
+otherwise, with non-reaping Linux proc status as the fallback. No portable
+waiter may reap the leader before group cleanup. All paths retain the 100 ms
+descendant-pipe drain, perform two successful kill sweeps over the owned process
+group on leader exit, timeout, or cancellation, and only then reap the leader.
+Ownership capacity is reserved before `Popen`; observer construction, capture,
+and cleanup `BaseException` paths cannot lose the PID or PGID. Unconfirmed
+cleanup retains its subprocess slot, registry entry, and known-host lease in a
+bounded process-local registry for later command/tunnel/close recovery. All
+waits remain bounded.
 This local portability does not extend the remote contract: the Core host must
 be Linux and the preflight rejects every other remote platform.
 
@@ -167,9 +169,11 @@ sizes, and digests. `openevo.deployment.core_assets` copies those files into a
 private no-follow local snapshot, while `SshRemoteExecutorTransport` prepares
 the canonical owner-only `~/.openevo/core` subdirectories and performs the
 rsync on the same authenticated transport. A remote standard-library verifier
-requires an exact two-file inventory, owner/mode/link identity, both digests,
-and the closed lock-to-wheel binding. Every transfer uses a unique random
-incoming authority. Finalize copies verified bytes into an owner-only private
+requires an exact two-file payload, owner/mode/link identity, both digests, the
+closed lock-to-wheel binding, and an internal transfer lease. Every transfer
+uses a unique random incoming authority. The local transport admits at most 16
+retained or active cleanup authorities and rejects new prepare work at capacity.
+Finalize copies verified bytes into an owner-only private
 candidate whose inode and pathname were never exposed to rsync. Members are
 created as `0400` and populated only through publisher-held writer FDs that are
 closed before rename; the directory is then sealed to `0500`. Finalize keeps the
@@ -189,8 +193,11 @@ replays the exact finalize transaction and validates its receipt; only a
 definitive non-publication result permits incoming discard. A later staging call
 retries retained authority before prepare. Under the same publication lock,
 prepare also reclaims closed incoming attempts inactive for more than 600
-seconds, so process restart can recover proven stale capacity without touching a
-live cross-process upload or an exact published bundle.
+seconds only after acquiring the exact transfer lease exclusively. The rsync
+server holds that lease across exec, so process restart can recover unlocked
+stale capacity without touching a continuously writing or orphaned
+cross-process upload or an exact published bundle. Directory mtime alone is
+never cleanup authority.
 Remote paths are outputs of this verifier, never Desktop configuration or
 user-preplaced `/srv` inputs.
 

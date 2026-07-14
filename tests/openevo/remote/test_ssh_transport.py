@@ -322,6 +322,50 @@ def test_run_revalidates_binding_before_spawning(tmp_path: Path) -> None:
     assert runner.calls == []
 
 
+@pytest.mark.parametrize("operation", ["run", "rsync"])
+def test_synchronous_spawn_cancellation_removes_known_hosts_lease(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    class CancellingRunner:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def __call__(
+            self,
+            argv: list[str],
+            _timeout_seconds: float,
+        ) -> subprocess.CompletedProcess[str]:
+            self.calls.append(argv)
+            if operation == "run" or len(self.calls) == 2:
+                raise Cancelled
+            marker = re.search(r"(__OPENEVO_REMOTE_COMPLETION_[0-9a-f]{32}__=)", argv[-1])
+            assert marker is not None
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="",
+                stderr=f"{marker.group(1)}0\n",
+            )
+
+    runner = CancellingRunner()
+    transport = _transport(tmp_path, runner=runner)
+    local = tmp_path / "workspace"
+    local.mkdir()
+
+    with pytest.raises(Cancelled):
+        if operation == "run":
+            transport.run("true")
+        else:
+            transport.upload_dir(str(local), "/remote/workspace")
+
+    assert not list(tmp_path.rglob(".openevo-ssh-lease-*"))
+    assert ssh_module._ORPHANED_TRUST_LEASES == {}
+
+
 def test_ipv6_rsync_and_tunnel_keep_exact_trust_binding(tmp_path: Path) -> None:
     profile = _profile(host="2001:db8::8")
     binding = _trusted_binding(tmp_path, profile)
@@ -2428,36 +2472,89 @@ def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
     _assert_processes_gone(leader_id, descendant_id)
 
 
-def test_default_runner_observer_start_cancellation_retains_spawn_ownership(
+def test_portable_observer_never_reaps_before_group_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class Cancelled(BaseException):
-        pass
+    original_isfile = os.path.isfile
+    original_signal_group = ssh_module._signal_owned_process_group
+    observed_returncodes: list[int | None] = []
 
-    started: list[subprocess.Popen[bytes]] = []
-    original_popen = subprocess.Popen
+    def fail_kqueue() -> object:
+        raise OSError("kqueue unavailable")
 
-    def recording_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
-        process = original_popen(*args, **kwargs)
-        started.append(process)
-        return process
-
-    def cancel_thread_start(_self: threading.Thread) -> None:
-        raise Cancelled
+    def record_signal_group(*args: object, **kwargs: object) -> None:
+        process = args[0]
+        assert isinstance(process, subprocess.Popen)
+        observed_returncodes.append(process.returncode)
+        original_signal_group(*args, **kwargs)
 
     monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
-    monkeypatch.setattr(ssh_module.subprocess, "Popen", recording_popen)
-    monkeypatch.setattr(threading.Thread, "start", cancel_thread_start)
+    monkeypatch.setattr(ssh_module.select, "kqueue", fail_kqueue, raising=False)
+    monkeypatch.setattr(
+        ssh_module.os.path,
+        "isfile",
+        lambda path: False if str(path).startswith("/proc/") else original_isfile(path),
+    )
+    monkeypatch.setattr(ssh_module, "_signal_owned_process_group", record_signal_group)
 
-    with pytest.raises(Cancelled):
-        ssh_module._run_subprocess(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            1,
+    completed = ssh_module._run_subprocess(
+        [sys.executable, "-c", "raise SystemExit(23)"],
+        1,
+    )
+
+    assert completed.returncode == 23
+    assert len(observed_returncodes) == 2
+    assert observed_returncodes == [None, None]
+
+
+def test_group_signal_failure_retains_slot_registry_and_trust_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Lease:
+        exits = 0
+
+        def __exit__(self, *_args: object) -> None:
+            self.exits += 1
+
+    lease = Lease()
+    authority = ssh_module._OwnedSubprocessAuthority.spawn(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        trust_lease=lease,
+    )
+    authority.initialize_observer()
+    original_signal_group = ssh_module._signal_owned_process_group
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(
+        ssh_module,
+        "_signal_owned_process_group",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("signal failed")),
+    )
+
+    try:
+        with pytest.raises(OSError, match="signal failed"):
+            authority.cleanup()
+
+        assert authority.process.returncode is None
+        assert id(authority) in ssh_module._ORPHANED_SUBPROCESSES
+        assert lease.exits == 0
+
+        monkeypatch.setattr(
+            ssh_module,
+            "_signal_owned_process_group",
+            original_signal_group,
         )
-
-    assert len(started) == 1
-    assert started[0].poll() is not None
-    assert ssh_module._ORPHANED_SUBPROCESSES == {}
+        authority.cleanup()
+        assert authority.process.returncode is not None
+        assert id(authority) not in ssh_module._ORPHANED_SUBPROCESSES
+        assert lease.exits == 1
+    finally:
+        monkeypatch.setattr(
+            ssh_module,
+            "_signal_owned_process_group",
+            original_signal_group,
+        )
+        if authority.process.returncode is None:
+            authority.cleanup()
 
 
 def test_default_runner_bounds_multiple_cleanup_orphans_and_reaps_on_retry(

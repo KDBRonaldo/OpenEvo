@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import pytest
 
 from openevo.deployment.host_keys import ProviderKnownHostStore
 from openevo.deployment import core_assets, core_runtime
+import openevo.deployment.ssh as ssh_module
 from openevo.deployment.profile import RemoteProfileConfig
 from openevo.deployment.ssh import (
     SshRemoteExecutorTransport,
@@ -836,6 +838,148 @@ def test_remote_asset_prepare_recovers_sixteen_proven_stale_incoming_authorities
     assert recovered not in incoming
 
 
+def test_stale_prepare_and_discard_preserve_cross_process_active_transfer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    incoming = Path(prepared["incoming_root"])
+    lease_path = incoming / ".openevo-transfer.lock"
+    ready_path = tmp_path / "lease-ready"
+    active_write_path = incoming / "partial-wheel"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl,os,sys,time;"
+                "fd=os.open(sys.argv[1],os.O_RDWR);"
+                "fcntl.flock(fd,fcntl.LOCK_SH);"
+                "data=os.open(sys.argv[3],os.O_WRONLY|os.O_CREAT,0o600);"
+                "open(sys.argv[2],'w').close();"
+                "[(os.lseek(data,0,0),os.write(data,b'active'),os.fsync(data),time.sleep(.01)) "
+                "for _ in range(3000)]"
+            ),
+            str(lease_path),
+            str(ready_path),
+            str(active_write_path),
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while not ready_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready_path.exists()
+        stale_time = time.time() - 601
+        os.utime(incoming, (stale_time, stale_time), follow_symlinks=False)
+
+        _execute_remote_script(
+            core_assets._REMOTE_PREPARE_SCRIPT,
+            [BUNDLE_ID],
+            home=home,
+            monkeypatch=monkeypatch,
+        )
+        capsys.readouterr()
+        assert incoming.is_dir()
+
+        with pytest.raises(SystemExit):
+            _execute_remote_script(
+                core_assets._REMOTE_DISCARD_SCRIPT,
+                [
+                    str(home / ".openevo" / "core"),
+                    BUNDLE_ID,
+                    prepared["transfer_id"],
+                ],
+                home=home,
+                monkeypatch=monkeypatch,
+            )
+        assert incoming.is_dir()
+    finally:
+        holder.terminate()
+        holder.wait(timeout=3)
+
+    stale_time = time.time() - 601
+    os.utime(incoming, (stale_time, stale_time), follow_symlinks=False)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    capsys.readouterr()
+    assert not incoming.exists()
+
+
+def test_remote_rsync_wrapper_holds_transfer_lease_through_exec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class ExecObserved(BaseException):
+        pass
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    lease_path = Path(prepared["incoming_root"]) / ".openevo-transfer.lock"
+    namespace: dict[str, object] = {"__name__": "__main__"}
+
+    def observe_exec(executable: str, arguments: list[str]) -> None:
+        assert executable == "rsync"
+        assert arguments == ["rsync", "--server"]
+        contender_fd = os.open(lease_path, os.O_RDWR | os.O_CLOEXEC)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(contender_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(contender_fd)
+        raise ExecObserved
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+        scoped.setattr(
+            sys,
+            "argv",
+            [
+                "remote-rsync-lease",
+                prepared["service_root"],
+                BUNDLE_ID,
+                prepared["transfer_id"],
+                "rsync",
+                "--server",
+            ],
+        )
+        scoped.setattr(os, "execvp", observe_exec)
+        with pytest.raises(ExecObserved):
+            exec(
+                compile(
+                    core_assets._REMOTE_RSYNC_LEASE_SCRIPT,
+                    "<core-asset-rsync-lease>",
+                    "exec",
+                ),
+                namespace,
+            )
+
+    lease_fd = namespace.get("lease_fd")
+    assert isinstance(lease_fd, int)
+    os.close(lease_fd)
+
+
 def stat_mode(path: Path) -> int:
     return os.stat(path, follow_symlinks=False).st_mode & 0o777
 
@@ -916,6 +1060,10 @@ def test_stage_core_assets_prepares_fresh_host_uploads_private_snapshot_and_fina
     argv, timeout = runner.calls[0]
     assert argv[0] == "rsync"
     assert "--chmod=F600,D700" in argv
+    assert "--filter=protect /.openevo-transfer.lock" in argv
+    rsync_path_index = argv.index("--rsync-path")
+    assert "python3 -I -c" in argv[rsync_path_index + 1]
+    assert "rsync" in argv[rsync_path_index + 1]
     assert "--no-perms" not in argv
     assert "--links" not in argv
     assert timeout <= 20
@@ -1316,6 +1464,54 @@ def test_stage_core_assets_retains_unknown_finalize_and_preserves_exact_publish(
     assert transport._core_asset_cleanup_authorities == {}
     assert len(calls) == 6
     assert all(shlex.quote(core_assets._REMOTE_DISCARD_SCRIPT) not in command for command in calls)
+
+
+def test_malformed_finalize_receipts_hit_cleanup_authority_backpressure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _assets(tmp_path)
+    transport = _transport(tmp_path, RecordingRunner())
+    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID)
+    prepare_calls = 0
+
+    def malformed_receipts(
+        command: str,
+        *,
+        timeout_seconds: float,
+        remote_failure_code: SshTransportErrorCode,
+    ) -> SecretStr:
+        nonlocal prepare_calls
+        del timeout_seconds, remote_failure_code
+        if command == prepare_command:
+            transfer_id = f"{prepare_calls + 1:032x}"
+            prepare_calls += 1
+            return _stage_responses(
+                assets[1],
+                assets[3],
+                transfer_id=transfer_id,
+            )[0]
+        return SecretStr("{}")
+
+    monkeypatch.setattr(ssh_module, "_MAX_CORE_ASSET_CLEANUP_AUTHORITIES", 2)
+    monkeypatch.setattr(
+        transport,
+        "_run_secret_with_remote_failure",
+        malformed_receipts,
+    )
+
+    for _index in range(2):
+        with pytest.raises(SshTransportError) as error:
+            _stage(transport, assets)
+        assert error.value.code is SshTransportErrorCode.CORE_ASSET_FAILED
+
+    with pytest.raises(SshTransportError) as backpressure:
+        _stage(transport, assets)
+
+    assert backpressure.value.code is SshTransportErrorCode.CORE_ASSET_FAILED
+    assert prepare_calls == 2
+    assert len(transport._core_asset_cleanup_authorities) == 2
+    assert transport._core_asset_pending_admissions == 0
 
 
 def test_stage_core_assets_rejects_tampered_finalize_without_leaking_paths(
