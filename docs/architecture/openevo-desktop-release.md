@@ -54,12 +54,15 @@ not complete the ordinary science E2E, create/redownload a draft GitHub Release,
 or authorize a public tag. The executable sidecar smoke proves
 its local health/static-asset path, discovery of the embedded Core wheel plus
 framework lock, and its token-protected capability proxy against a real backend.
-The native application smoke launches the bundle executable identified by
-`Info.plist`. The release renderer reports readiness only after Local API
-negotiation; Tauri accepts that report only while its managed sidecar is running
-with the same frozen OpenAPI digest. This proves that the mounted and copied
-application reaches the React renderer through Tauri IPC and its local sidecar.
-It does not prove remote bootstrap or completion of the science workflow.
+The native application smoke requires `Info.plist` to contain a top-level
+dictionary and launches the bundle executable named by `CFBundleExecutable`.
+The release renderer reports readiness only after Local API negotiation. Tauri
+performs a non-reaping leader check, reproves the private sidecar session, and
+then rechecks the same managed instance, lifecycle, contract, and leader under
+the manager lock before accepting that report. This proves that the mounted and
+copied application reaches the React renderer through Tauri IPC and its live
+local sidecar. It does not prove remote bootstrap or completion of the science
+workflow.
 
 The release workflow's outer smoke installs Core and exercises it through the
 Desktop harness imported from the source checkout. Its workflow and script names
@@ -259,9 +262,14 @@ real native lifecycle boundary and cannot adopt the failed attempt's credential.
 Before exposing the product shell, the renderer invokes the internal
 `renderer_ready` command with the checked-in Local API digest. The native host
 rejects the report unless the same digest belongs to the currently running
-managed sidecar, then emits a fixed, non-secret readiness marker for packaged
-application validation. This marker is diagnostic evidence only; it carries no
-endpoint, process identity, session credential, host path, or user data.
+managed sidecar, its unreaped leader is still live, and its retained credential
+still proves both authenticated acceptance and unauthenticated rejection. The
+session probe runs without the manager lock; before emitting the marker, native
+code reacquires the lock and requires the same random instance, endpoint,
+lifecycle, contract, and a second non-reaping leader check. It then emits a fixed,
+non-secret readiness marker for packaged application validation. This marker is
+diagnostic evidence only; it carries no endpoint, process identity, session
+credential, host path, or user data.
 
 Release policy does not read `OPENEVO_DESKTOP_SIDECAR_COMMAND`,
 `OPENEVO_DESKTOP_SIDECAR_PROGRAM`,

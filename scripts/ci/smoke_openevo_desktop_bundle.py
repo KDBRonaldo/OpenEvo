@@ -8,6 +8,7 @@ import hashlib
 import os
 from pathlib import Path
 import plistlib
+import signal
 import stat
 import subprocess
 import sys
@@ -29,6 +30,9 @@ DESKTOP_OPENAPI = REPO_ROOT / "desktop/sidecar/contracts/v1/openapi.json"
 DESKTOP_OPENAPI_SHA256 = hashlib.sha256(DESKTOP_OPENAPI.read_bytes()).hexdigest()
 RENDERER_READY_MARKER = f"{RENDERER_READY_PREFIX} {DESKTOP_OPENAPI_SHA256}"
 NATIVE_LOG_LIMIT = 64 * 1024
+NATIVE_LOG_READ_SIZE = 16 * 1024
+NATIVE_GROUP_TERM_TIMEOUT_SECONDS = 5.0
+NATIVE_GROUP_KILL_TIMEOUT_SECONDS = 5.0
 
 
 def _find_app_bundle(bundle_root: Path) -> Path:
@@ -75,6 +79,8 @@ def find_native_executable(bundle_root: Path) -> Path:
         info = plistlib.loads(info_path.read_bytes())
     except (OSError, plistlib.InvalidFileException, ValueError) as exc:
         raise SmokeFailure(f"OpenEvo Desktop has an invalid Info.plist: {info_path}") from exc
+    if not isinstance(info, dict):
+        raise SmokeFailure("OpenEvo Desktop Info.plist must contain a top-level dictionary")
     executable_name = info.get("CFBundleExecutable")
     if (
         not isinstance(executable_name, str)
@@ -94,26 +100,103 @@ def find_native_executable(bundle_root: Path) -> Path:
     return executable
 
 
-def _native_log_tail(log_path: Path) -> str:
+class _NativeLogReader:
+    def __init__(self, log_path: Path) -> None:
+        self._log_path = log_path
+        self._offset = 0
+        self._pending = bytearray()
+        self._discarding_oversized_line = False
+        self._tail = bytearray()
+
+    def _consume_part(self, part: bytes, *, complete: bool, lines: list[str]) -> None:
+        if self._discarding_oversized_line:
+            if complete:
+                self._discarding_oversized_line = False
+            return
+        self._pending.extend(part)
+        if len(self._pending) > NATIVE_LOG_LIMIT:
+            self._pending.clear()
+            self._discarding_oversized_line = not complete
+            return
+        if complete:
+            lines.append(self._pending.decode("utf-8", errors="replace"))
+            self._pending.clear()
+
+    def read_complete_lines(self) -> list[str]:
+        lines: list[str] = []
+        try:
+            with self._log_path.open("rb") as handle:
+                handle.seek(self._offset)
+                while chunk := handle.read(NATIVE_LOG_READ_SIZE):
+                    self._offset += len(chunk)
+                    self._tail.extend(chunk)
+                    if len(self._tail) > NATIVE_LOG_LIMIT:
+                        del self._tail[:-NATIVE_LOG_LIMIT]
+                    parts = chunk.split(b"\n")
+                    for part in parts[:-1]:
+                        self._consume_part(part, complete=True, lines=lines)
+                    self._consume_part(parts[-1], complete=False, lines=lines)
+        except OSError:
+            return lines
+        return lines
+
+    def tail_text(self) -> str:
+        return self._tail.decode("utf-8", errors="replace")
+
+
+def _native_process_group_exists(process_group: int) -> bool:
     try:
-        with log_path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - NATIVE_LOG_LIMIT))
-            return handle.read(NATIVE_LOG_LIMIT).decode("utf-8", errors="replace")
-    except OSError:
-        return ""
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        raise SmokeFailure("OpenEvo Desktop native process group could not be inspected") from exc
+    return True
+
+
+def _wait_for_native_process_group_exit(
+    process: subprocess.Popen[bytes],
+    process_group: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        process.poll()
+        if not _native_process_group_exists(process_group):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _signal_native_process_group(process_group: int, group_signal: signal.Signals) -> None:
+    try:
+        os.killpg(process_group, group_signal)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        raise SmokeFailure("OpenEvo Desktop native process group could not be stopped") from exc
 
 
 def _terminate_native_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
+    process_group = process.pid
+    if not _native_process_group_exists(process_group):
+        process.poll()
         return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
+    _signal_native_process_group(process_group, signal.SIGTERM)
+    if _wait_for_native_process_group_exit(
+        process,
+        process_group,
+        NATIVE_GROUP_TERM_TIMEOUT_SECONDS,
+    ):
+        return
+    _signal_native_process_group(process_group, signal.SIGKILL)
+    if not _wait_for_native_process_group_exit(
+        process,
+        process_group,
+        NATIVE_GROUP_KILL_TIMEOUT_SECONDS,
+    ):
+        raise SmokeFailure("OpenEvo Desktop native process group survived TERM/KILL cleanup")
 
 
 def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
@@ -135,11 +218,11 @@ def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
             raise SmokeFailure(
                 f"OpenEvo Desktop native executable could not start: {executable}"
             ) from exc
+        log_reader = _NativeLogReader(log_path)
         deadline = time.monotonic() + timeout_seconds
         try:
             while time.monotonic() < deadline:
-                output_text = _native_log_tail(log_path)
-                if RENDERER_READY_MARKER in output_text:
+                if RENDERER_READY_MARKER in log_reader.read_complete_lines():
                     time.sleep(0.25)
                     if process.poll() is not None:
                         raise SmokeFailure(
@@ -150,12 +233,12 @@ def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
                 if exit_code is not None:
                     raise SmokeFailure(
                         "OpenEvo Desktop exited before renderer readiness "
-                        f"(code {exit_code}): {output_text[-2048:]}"
+                        f"(code {exit_code}): {log_reader.tail_text()[-2048:]}"
                     )
                 time.sleep(0.1)
             raise SmokeFailure(
                 "OpenEvo Desktop did not report renderer readiness before timeout: "
-                f"{_native_log_tail(log_path)[-2048:]}"
+                f"{log_reader.tail_text()[-2048:]}"
             )
         finally:
             _terminate_native_process(process)

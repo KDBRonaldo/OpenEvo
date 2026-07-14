@@ -4413,21 +4413,66 @@ fn stop_sidecar_inner(state: &DesktopHostState) -> HostResult<HostStatus> {
 }
 
 fn renderer_ready_inner(state: &DesktopHostState, openapi_sha256: &str) -> HostResult<()> {
+    renderer_ready_inner_with(state, openapi_sha256, &OsProcessControl)
+}
+
+fn renderer_ready_inner_with<C: ProcessControl>(
+    state: &DesktopHostState,
+    openapi_sha256: &str,
+    control: &C,
+) -> HostResult<()> {
     if openapi_sha256 != DESKTOP_LOCAL_API_OPENAPI_SHA256 {
         return Err(sidecar_contract_incompatible_error());
     }
+    let (instance_id, port, session_token) = {
+        let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+        let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
+        if managed.lifecycle != ManagedLifecycle::Running {
+            return Err(sidecar_state_error());
+        }
+        let child = managed.child.as_ref().ok_or_else(sidecar_state_error)?;
+        if control
+            .leader_exited(child)
+            .map_err(|_| sidecar_inspection_error())?
+        {
+            return Err(sidecar_state_error());
+        }
+        let bootstrap = managed.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
+        if bootstrap.negotiated_contract.major != 1
+            || bootstrap.negotiated_contract.openapi_sha256 != openapi_sha256
+            || bootstrap.negotiated_contract.provider_kind != "desktop_sidecar"
+        {
+            return Err(sidecar_contract_incompatible_error());
+        }
+        (
+            managed.instance_id,
+            managed.status.port.ok_or_else(sidecar_state_error)?,
+            EncodedSecret::new(&bootstrap.session_credential.0),
+        )
+    };
+
+    check_sidecar_session_binding(port, session_token.expose())?;
+
     let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
     let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
+    if managed.instance_id != instance_id || managed.lifecycle != ManagedLifecycle::Running {
+        return Err(sidecar_state_error());
+    }
+    let child = managed.child.as_ref().ok_or_else(sidecar_state_error)?;
+    if control
+        .leader_exited(child)
+        .map_err(|_| sidecar_inspection_error())?
+    {
+        return Err(sidecar_state_error());
+    }
     let bootstrap = managed.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
-    if managed.lifecycle != ManagedLifecycle::Running
-        || managed.child.is_none()
+    if managed.status.port != Some(port)
         || bootstrap.negotiated_contract.major != 1
         || bootstrap.negotiated_contract.openapi_sha256 != openapi_sha256
         || bootstrap.negotiated_contract.provider_kind != "desktop_sidecar"
     {
         return Err(sidecar_contract_incompatible_error());
     }
-    drop(sidecar);
     eprintln!("{RENDERER_READY_MARKER} {openapi_sha256}");
     Ok(())
 }
@@ -4831,8 +4876,11 @@ mod tests {
 
         let state = DesktopHostState::default();
         let (managed, _, _) = managed_test_sidecar();
+        let session_listener = managed._listener.try_clone().unwrap();
+        let session_server = thread::spawn(move || serve_session_probe(&session_listener, false));
         *state.sidecar.lock().unwrap() = Some(managed);
         renderer_ready_inner(&state, DESKTOP_LOCAL_API_OPENAPI_SHA256).unwrap();
+        session_server.join().unwrap();
 
         assert_eq!(
             renderer_ready_inner(&state, &"0".repeat(64))
@@ -4840,6 +4888,54 @@ mod tests {
                 .code,
             "sidecar_contract_incompatible"
         );
+        stop_sidecar_inner(&state).unwrap();
+    }
+
+    #[test]
+    fn renderer_readiness_rejects_an_exited_unreaped_sidecar() {
+        let state = DesktopHostState::default();
+        let (managed, _, _) = managed_test_sidecar();
+        let process_group = managed.process_group;
+        *state.sidecar.lock().unwrap() = Some(managed);
+
+        assert_eq!(unsafe { libc::kill(process_group, libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let exited = {
+                let sidecar = state.sidecar.lock().unwrap();
+                OsProcessControl
+                    .leader_exited(sidecar.as_ref().unwrap().child.as_ref().unwrap())
+                    .unwrap()
+            };
+            if exited {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sidecar leader did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let error = renderer_ready_inner(&state, DESKTOP_LOCAL_API_OPENAPI_SHA256).unwrap_err();
+
+        assert_eq!(error.code, "sidecar_state_unavailable");
+        assert!(!error.message.contains(&process_group.to_string()));
+        stop_sidecar_inner(&state).unwrap();
+    }
+
+    #[test]
+    fn renderer_readiness_requires_the_private_sidecar_session() {
+        let state = DesktopHostState::default();
+        let (mut managed, _, _) = managed_test_sidecar();
+        let unreachable = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let unreachable_port = unreachable.local_addr().unwrap().port();
+        managed.status.port = Some(unreachable_port);
+        drop(unreachable);
+        *state.sidecar.lock().unwrap() = Some(managed);
+
+        let error = renderer_ready_inner(&state, DESKTOP_LOCAL_API_OPENAPI_SHA256).unwrap_err();
+
+        assert_eq!(error.code, "sidecar_session_unavailable");
+        assert!(!error.message.contains(&unreachable_port.to_string()));
+        assert!(!error.message.contains(&"7c".repeat(SESSION_TOKEN_BYTES)));
         stop_sidecar_inner(&state).unwrap();
     }
 

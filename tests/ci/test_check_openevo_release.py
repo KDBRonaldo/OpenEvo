@@ -4,8 +4,11 @@ import importlib.util
 import json
 import hashlib
 from io import BytesIO
+import os
 from pathlib import Path
 import plistlib
+import signal
+import time
 from zipfile import ZipFile
 
 import pytest
@@ -78,6 +81,20 @@ def _load_bundle_smoke_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _process_is_live(pid: int) -> bool:
+    if Path("/proc").is_dir():
+        try:
+            stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        except FileNotFoundError:
+            return False
+        return len(stat_fields) <= 2 or stat_fields[2] != "Z"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def test_desktop_wheel_smoke_exercises_config_backed_lifecycle(
@@ -193,6 +210,85 @@ def test_bundle_smoke_launches_the_native_app_until_renderer_is_ready(tmp_path: 
     assert launched == executable
 
 
+def test_bundle_smoke_requires_an_exact_complete_renderer_marker_line(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text(
+        f"#!/bin/sh\nprintf 'prefix%s-suffix\\n' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    with pytest.raises(smoke.SmokeFailure, match="renderer readiness"):
+        smoke.smoke_native_app(app, timeout_seconds=0.5)
+
+
+def test_bundle_smoke_rejects_an_unterminated_renderer_marker_line(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text(
+        f"#!/bin/sh\nprintf '%s' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    with pytest.raises(smoke.SmokeFailure, match="renderer readiness"):
+        smoke.smoke_native_app(app, timeout_seconds=0.5)
+
+
+def test_bundle_smoke_keeps_an_early_marker_beyond_the_log_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    class FakeProcess:
+        pid = 424242
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+    def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
+        output = kwargs["stdout"]
+        output.write((smoke.RENDERER_READY_MARKER + "\n").encode())
+        output.write(b"x" * (smoke.NATIVE_LOG_LIMIT + 1))
+        output.flush()
+        return FakeProcess()
+
+    monkeypatch.setattr(smoke.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(smoke, "_terminate_native_process", lambda process: None)
+    monkeypatch.setattr(smoke.time, "sleep", lambda seconds: None)
+
+    assert smoke.smoke_native_app(app, timeout_seconds=0.1) == executable
+
+
 def test_bundle_smoke_rejects_a_native_process_without_renderer_readiness(
     tmp_path: Path,
 ) -> None:
@@ -208,6 +304,61 @@ def test_bundle_smoke_rejects_a_native_process_without_renderer_readiness(
 
     with pytest.raises(smoke.SmokeFailure, match="renderer readiness"):
         smoke.smoke_native_app(app, timeout_seconds=1)
+
+
+def test_bundle_smoke_rejects_non_dictionary_info_plist(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    info = app / "Contents" / "Info.plist"
+    info.parent.mkdir(parents=True)
+    info.write_bytes(plistlib.dumps(["not", "a", "dictionary"]))
+
+    with pytest.raises(smoke.SmokeFailure, match="top-level dictionary"):
+        smoke.find_native_executable(app)
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "timeout"])
+def test_bundle_smoke_always_cleans_the_native_process_group(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    child_pid_path = tmp_path / f"{outcome}-child.pid"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    marker = smoke.RENDERER_READY_MARKER if outcome == "success" else "not-ready"
+    final_command = "exit 7" if outcome == "failure" else "wait"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "trap '' TERM\n"
+        "sh -c 'trap \"\" TERM; while :; do sleep 1; done' &\n"
+        f"echo $! > '{child_pid_path}'\n"
+        f"printf '%s\\n' '{marker}'\n"
+        f"{final_command}\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    if outcome == "success":
+        assert smoke.smoke_native_app(app, timeout_seconds=1) == executable
+    else:
+        with pytest.raises(smoke.SmokeFailure):
+            smoke.smoke_native_app(app, timeout_seconds=0.3)
+
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and _process_is_live(child_pid):
+        time.sleep(0.02)
+    if _process_is_live(child_pid):
+        try:
+            os.killpg(os.getpgid(child_pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        pytest.fail(f"native smoke left child process {child_pid} running after {outcome}")
 
 
 def test_accepts_valid_openevo_release_wheel(tmp_path: Path) -> None:

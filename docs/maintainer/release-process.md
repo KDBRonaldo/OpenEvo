@@ -19,7 +19,10 @@ bundle and the copied DMG, then requires the React renderer, Tauri IPC, and
 managed sidecar to agree on the frozen Local API digest. It is for exhibition
 and packaging rehearsal only; passing it does not satisfy the remote science
 E2E, benchmark, security/privacy, or draft-release gates and does not authorize
-publication.
+publication. The native smoke accepts only a complete log line equal to the
+frozen readiness marker, reads the log incrementally so later volume cannot
+discard earlier evidence, and always TERM/KILLs and verifies the dedicated
+native process group on success, failure, or timeout.
 
 PyPI is not part of the unsigned External Beta. The ordinary-user artifact is
 the macOS Desktop DMG; Desktop installs the descriptor-matched Core artifact on
