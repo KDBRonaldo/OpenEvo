@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+from enum import StrEnum
 import hashlib
 import json
+import queue
 import secrets
 import threading
 import time
-from typing import Any, BinaryIO, Protocol, TypeVar
+from typing import Any, BinaryIO, Literal, Protocol, TypeVar
 
 import httpx
 
@@ -28,11 +31,122 @@ from openevo.backend.contracts.v1 import models as core_v1
 DEFAULT_BRIDGE_TIMEOUT_SECONDS = 60.0
 MAX_BRIDGE_TIMEOUT_SECONDS = 300.0
 WORKSPACE_CHUNK_BYTES = core_v1.MAX_WORKSPACE_CHUNK_BYTES
+ADAPTER_WORKER_COUNT = 4
+MAX_ADAPTER_QUEUE_SIZE = 64
 
 _ResponseT = TypeVar("_ResponseT")
 
 
-@dataclass(frozen=True, slots=True)
+class _BoundedAdapterExecutor:
+    def __init__(self) -> None:
+        self._queue: queue.Queue[tuple[Future[Any], Callable[[], Any]]] = queue.Queue(
+            maxsize=MAX_ADAPTER_QUEUE_SIZE
+        )
+        for index in range(ADAPTER_WORKER_COUNT):
+            threading.Thread(
+                target=self._worker,
+                name=f"openevo-core-bridge-adapter-{index}",
+                daemon=True,
+            ).start()
+
+    def submit(self, action: Callable[[], _ResponseT]) -> Future[_ResponseT] | None:
+        future: Future[_ResponseT] = Future()
+        try:
+            self._queue.put_nowait((future, action))
+        except queue.Full:
+            return None
+        return future
+
+    def _worker(self) -> None:
+        while True:
+            future, action = self._queue.get()
+            try:
+                if future.set_running_or_notify_cancel():
+                    try:
+                        future.set_result(action())
+                    except BaseException as exc:
+                        future.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
+
+_ADAPTER_EXECUTOR = _BoundedAdapterExecutor()
+
+
+@dataclass(eq=False, repr=False, slots=True)
+class _ArchiveContextLease:
+    context: AbstractContextManager[BinaryIO]
+    lock: threading.Lock
+    stream: BinaryIO | None = None
+    entered: bool = False
+    closed: bool = False
+
+    def enter(self) -> BinaryIO:
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("archive context is closed")
+            if not self.entered:
+                self.stream = self.context.__enter__()
+                self.entered = True
+            assert self.stream is not None
+            return self.stream
+
+    def close(self) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            if not self.entered:
+                self.stream = self.context.__enter__()
+                self.entered = True
+            self.context.__exit__(None, None, None)
+            self.closed = True
+
+
+@dataclass(eq=False, repr=False, slots=True)
+class _GenerationToken:
+    generation: int
+    external_lock: threading.RLock
+    resource_lock: threading.Lock
+    cancelled: bool = False
+    retired: bool = False
+    clients: list[Any] | None = None
+    tunnels: list[CoreTunnelHandleV1] | None = None
+    archives: list[_ArchiveContextLease] | None = None
+    adapter_futures: set[Future[Any]] | None = None
+
+    def __post_init__(self) -> None:
+        self.clients = []
+        self.tunnels = []
+        self.archives = []
+        self.adapter_futures = set()
+
+    def add_client(self, client: Any) -> None:
+        with self.resource_lock:
+            assert self.clients is not None
+            self.clients.append(client)
+
+    def add_tunnel(self, tunnel: CoreTunnelHandleV1) -> None:
+        with self.resource_lock:
+            assert self.tunnels is not None
+            self.tunnels.append(tunnel)
+
+    def add_archive(self, archive: _ArchiveContextLease) -> None:
+        with self.resource_lock:
+            assert self.archives is not None
+            self.archives.append(archive)
+
+    def track_future(self, future: Future[Any]) -> None:
+        with self.resource_lock:
+            assert self.adapter_futures is not None
+            self.adapter_futures.add(future)
+
+    def untrack_future(self, future: Future[Any]) -> None:
+        with self.resource_lock:
+            assert self.adapter_futures is not None
+            self.adapter_futures.discard(future)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class CoreHostAttachmentV1:
     """Host-global Core authority returned without exposing a Core URL."""
 
@@ -44,6 +158,8 @@ class CoreHostAttachmentV1:
     def __post_init__(self) -> None:
         if not self.profile_id or not self.bearer_identity:
             raise ValueError("Core host attachment identities must not be empty")
+        if self.bearer_identity == self.bearer_token:
+            raise ValueError("Core host bearer identity must not be the bearer secret")
         if not 1 <= self.remote_port <= 65_535:
             raise ValueError("Core host attachment remote port is invalid")
         if len(self.bearer_token) < 43:
@@ -71,21 +187,80 @@ class CoreTunnelHandleV1:
         self._close_callback = close_callback
         self._lock = threading.Lock()
         self._closed = False
+        self._close_future: Future[None] | None = None
+        self._close_failure: Literal["deadline_exceeded", "callback_failed"] | None = None
+
+    def __repr__(self) -> str:
+        return "CoreTunnelHandleV1(<private>)"
 
     @property
     def closed(self) -> bool:
         with self._lock:
             return self._closed
 
-    def close(self) -> None:
+    @property
+    def close_failure(self) -> Literal["deadline_exceeded", "callback_failed"] | None:
+        with self._lock:
+            return self._close_failure
+
+    def close(self, *, deadline: float, token: _GenerationToken | None = None) -> None:
         with self._lock:
             if self._closed:
                 return
-            self._closed = True
+            future = self._close_future
+            if future is None:
+                future = _ADAPTER_EXECUTOR.submit(self._close_callback)
+                if future is None:
+                    self._close_failure = "deadline_exceeded"
+                    raise _bridge_error(
+                        "core_tunnel_close_unavailable",
+                        "The bounded tunnel close executor is full.",
+                        retryable=True,
+                    )
+                self._close_future = future
+                if token is not None:
+                    token.track_future(future)
         try:
-            self._close_callback()
-        except Exception:
-            pass
+            future.result(timeout=_remaining_seconds(deadline))
+        except FutureTimeoutError:
+            if future.done():
+                if token is not None:
+                    token.untrack_future(future)
+                with self._lock:
+                    if self._close_future is future:
+                        self._close_future = None
+                    self._close_failure = "callback_failed"
+                raise _bridge_error(
+                    "core_tunnel_close_failed",
+                    "The active Core tunnel close operation failed.",
+                    retryable=True,
+                ) from None
+            with self._lock:
+                self._close_failure = "deadline_exceeded"
+            raise _bridge_error(
+                "core_tunnel_close_deadline_exceeded",
+                "The active Core tunnel did not close before the deadline.",
+                retryable=True,
+            ) from None
+        except BaseException:
+            if token is not None:
+                token.untrack_future(future)
+            with self._lock:
+                if self._close_future is future:
+                    self._close_future = None
+                self._close_failure = "callback_failed"
+            raise _bridge_error(
+                "core_tunnel_close_failed",
+                "The active Core tunnel close operation failed.",
+                retryable=True,
+            ) from None
+        if token is not None:
+            token.untrack_future(future)
+        with self._lock:
+            if self._close_future is future:
+                self._close_future = None
+            self._close_failure = None
+            self._closed = True
 
 
 class CoreTunnelFactory(Protocol):
@@ -107,6 +282,12 @@ class WorkspaceArchiveSource(Protocol):
     ) -> AbstractContextManager[BinaryIO]: ...
 
 
+class CoreProjectCreateStateV1(StrEnum):
+    PRE_CREATE = "pre_create"
+    UNKNOWN = "unknown"
+    BOUND = "bound"
+
+
 @dataclass(frozen=True, slots=True)
 class CoreProjectCreateOperationV1:
     local_project_id: str
@@ -114,8 +295,16 @@ class CoreProjectCreateOperationV1:
     core_host_identity: str
     request_sha256: str
     idempotency_key: str
+    state: CoreProjectCreateStateV1 = CoreProjectCreateStateV1.PRE_CREATE
     core_project_id: str | None = None
     workspace_upload_id: str | None = None
+    workspace_upload_project_snapshot: core_v1.ImmutableSnapshotRefV1 | None = None
+
+    def __post_init__(self) -> None:
+        if (self.state is CoreProjectCreateStateV1.BOUND) != (self.core_project_id is not None):
+            raise ValueError("only a bound create operation has a Core project ID")
+        if (self.workspace_upload_id is None) != (self.workspace_upload_project_snapshot is None):
+            raise ValueError("workspace upload ID and project snapshot must be paired")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,27 +314,59 @@ class CoreProjectMappingV1:
     core_host_identity: str
     core_project_id: str
     request_sha256: str
+    project_create: core_v1.ProjectCreateV1
     project_snapshot: core_v1.ImmutableSnapshotRefV1
     task_snapshot: core_v1.ImmutableSnapshotRefV1
     workspace_snapshot: core_v1.ImmutableSnapshotRefV1
     registry_digest: str
+    project_etag: str
+    mapping_generation: int
+    predecessor_request_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if self.mapping_generation < 1:
+            raise ValueError("mapping generation must be positive")
+        if (self.mapping_generation == 1) != (self.predecessor_request_sha256 is None):
+            raise ValueError("only the first mapping has no predecessor")
 
 
 class DesktopCoreBridgePersistence(Protocol):
-    """Durable callback boundary; implementations must provide atomic exact replay."""
+    """Durable callback boundary with atomic create transitions and mapping CAS.
+
+    A pre-create reservation may be replaced by a later Local action. Unknown
+    outcomes require the exact request and key, while a bound Core project is
+    immutable. Mapping commits compare the complete previous mapping and the
+    adapter must retain an ordered audit history without lost updates.
+    """
 
     def load_mapping(self, local_project_id: str) -> CoreProjectMappingV1 | None: ...
+
+    def load_create(self, local_project_id: str) -> CoreProjectCreateOperationV1 | None: ...
 
     def reserve_create(
         self, operation: CoreProjectCreateOperationV1
     ) -> CoreProjectCreateOperationV1: ...
 
-    def update_create(self, operation: CoreProjectCreateOperationV1) -> None: ...
+    def mark_create_unknown(
+        self, operation: CoreProjectCreateOperationV1
+    ) -> CoreProjectCreateOperationV1: ...
+
+    def bind_created_project(
+        self,
+        operation: CoreProjectCreateOperationV1,
+        core_project_id: str,
+    ) -> CoreProjectCreateOperationV1: ...
+
+    def update_create(
+        self, operation: CoreProjectCreateOperationV1
+    ) -> CoreProjectCreateOperationV1: ...
 
     def commit_mapping(
         self,
         operation: CoreProjectCreateOperationV1,
         mapping: CoreProjectMappingV1,
+        *,
+        expected_previous: CoreProjectMappingV1 | None,
     ) -> None: ...
 
 
@@ -158,8 +379,9 @@ class CoreActivationV1:
     validation: core_v1.ProjectValidationResponseV1
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, repr=False)
 class DesktopCoreActiveSessionV1:
+    token: _GenerationToken
     generation: int
     local_project_id: str
     profile_id: str
@@ -169,12 +391,6 @@ class DesktopCoreActiveSessionV1:
     project: core_v1.ProjectV1
     capabilities: core_v1.CapabilitiesResponseV1
     revision_head: core_v1.RevisionHeadV1
-
-    def close(self) -> None:
-        try:
-            self.client.close()
-        finally:
-            self.tunnel.close()
 
 
 class DesktopCoreBridgeErrorV1(RuntimeError):
@@ -268,20 +484,29 @@ class DesktopCoreBridgeV1:
         self._transport_factory = transport_factory
         self._timeout = float(timeout)
         self._lock = threading.RLock()
+        self._transition_lock = threading.Lock()
         self._generation = 0
         self._closed = False
+        self._close_requested = False
         self._active: DesktopCoreActiveSessionV1 | None = None
+        self._candidate: _GenerationToken | None = None
 
     def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._generation += 1
-            active = self._active
-            self._active = None
-        if active is not None:
-            active.close()
+        deadline = time.monotonic() + self._timeout
+        self._acquire_transition(deadline)
+        try:
+            with self._lock:
+                if self._closed:
+                    return
+                self._close_requested = True
+                token = self._current_token_locked()
+            if token is not None:
+                self._retire_token(token, deadline=deadline)
+            with self._lock:
+                self._closed = True
+                self._generation += 1
+        finally:
+            self._transition_lock.release()
 
     def activate_project(
         self,
@@ -290,41 +515,55 @@ class DesktopCoreBridgeV1:
         idempotency_key: str,
     ) -> CoreActivationV1:
         deadline = time.monotonic() + self._timeout
-        generation, old_active = self._begin_activation()
-        if old_active is not None:
-            old_active.close()
-        candidate: DesktopCoreActiveSessionV1 | None = None
-        tunnel: CoreTunnelHandleV1 | None = None
-        client: CoreControlClientV1 | None = None
+        token = self._begin_activation(deadline)
+        generation = token.generation
         try:
-            attachment = self._host_service.ensure_core(project.profile_id, deadline=deadline)
-            self._remaining(deadline)
+            attachment = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._host_service.ensure_core(project.profile_id, deadline=deadline),
+                label="Core host attach",
+            )
             if attachment.profile_id != project.profile_id:
                 raise _bridge_error(
                     "core_host_identity_mismatch",
                     "The attached Core host belongs to another remote profile.",
                 )
             session_id = secrets.token_urlsafe(24)
-            tunnel = self._tunnel_factory.open_tunnel(
-                profile_id=attachment.profile_id,
-                remote_port=attachment.remote_port,
-                session_id=session_id,
-                deadline=deadline,
+            tunnel = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._tunnel_factory.open_tunnel(
+                    profile_id=attachment.profile_id,
+                    remote_port=attachment.remote_port,
+                    session_id=session_id,
+                    deadline=deadline,
+                ),
+                label="Core tunnel open",
+                adopt=token.add_tunnel,
             )
-            self._remaining(deadline)
             create_request = map_project_create_v1(project)
             request_sha256 = _model_digest(create_request)
-            mapping = self._persistence.load_mapping(project.project_id)
+            mapping = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.load_mapping(project.project_id),
+                label="project mapping read",
+            )
             operation: CoreProjectCreateOperationV1
             if mapping is None:
-                operation = self._persistence.reserve_create(
-                    CoreProjectCreateOperationV1(
-                        local_project_id=project.project_id,
-                        profile_id=project.profile_id,
-                        core_host_identity=attachment.bearer_identity,
-                        request_sha256=request_sha256,
-                        idempotency_key=idempotency_key,
-                    )
+                proposed_operation = CoreProjectCreateOperationV1(
+                    local_project_id=project.project_id,
+                    profile_id=project.profile_id,
+                    core_host_identity=attachment.bearer_identity,
+                    request_sha256=request_sha256,
+                    idempotency_key=idempotency_key,
+                )
+                operation = self._adapter_external(
+                    token,
+                    deadline,
+                    lambda: self._persistence.reserve_create(proposed_operation),
+                    label="project create reservation",
                 )
                 _ensure_create_operation(
                     operation,
@@ -334,7 +573,7 @@ class DesktopCoreBridgeV1:
                     core_host_identity=attachment.bearer_identity,
                 )
                 connection, operation = self._bootstrap_connection(
-                    project=project,
+                    token=token,
                     request=create_request,
                     operation=operation,
                     attachment=attachment,
@@ -342,20 +581,18 @@ class DesktopCoreBridgeV1:
                     deadline=deadline,
                 )
             else:
-                _ensure_mapping_request(
+                _ensure_mapping_authority(
                     mapping,
                     project,
-                    request_sha256,
                     core_host_identity=attachment.bearer_identity,
                 )
-                operation = CoreProjectCreateOperationV1(
-                    local_project_id=project.project_id,
-                    profile_id=project.profile_id,
-                    core_host_identity=attachment.bearer_identity,
-                    request_sha256=request_sha256,
-                    idempotency_key=idempotency_key,
-                    core_project_id=mapping.core_project_id,
+                loaded_operation = self._adapter_external(
+                    token,
+                    deadline,
+                    lambda: self._persistence.load_create(project.project_id),
+                    label="project create operation read",
                 )
+                operation = _ensure_bound_operation(loaded_operation, mapping)
                 connection = CoreTunnelConnectionV1(
                     endpoint=tunnel.endpoint,
                     bearer_token=attachment.bearer_token,
@@ -363,42 +600,58 @@ class DesktopCoreBridgeV1:
                     session_id=tunnel.session_id,
                 )
 
-            client = self._new_client(connection, deadline)
-            client.version()
-            self._remaining(deadline)
-            capabilities = client.capabilities(create_request.spec.execution_mode)
-            self._remaining(deadline)
-            core_project = client.get_project()
-            self._remaining(deadline)
-            _ensure_project_identity(core_project, create_request)
+            client = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._new_client(connection, deadline),
+                label="Core client construction",
+                adopt=token.add_client,
+            )
+            self._core_external(token, deadline, client.version)
+            capabilities = self._core_external(
+                token,
+                deadline,
+                lambda: client.capabilities(create_request.spec.execution_mode),
+            )
+            core_project = self._core_external(token, deadline, client.get_project)
             if mapping is not None:
-                _ensure_mapping_snapshots(mapping, core_project)
+                core_project = self._reconcile_mapped_project(
+                    token=token,
+                    deadline=deadline,
+                    client=client,
+                    mapping=mapping,
+                    current=core_project,
+                    requested=create_request,
+                    request_sha256=request_sha256,
+                )
+            else:
+                _ensure_project_identity(core_project, create_request)
             if isinstance(create_request.workspace, core_v1.ImportedWorkspaceSpecV1) and (
                 core_project.workspace_publication is None
             ):
                 core_project, operation = self._publish_imported_workspace(
+                    token=token,
                     client=client,
                     local_project=project,
                     core_project=core_project,
                     operation=operation,
                     deadline=deadline,
                 )
-                self._remaining(deadline)
             self._ensure_project_ready(core_project, capabilities)
-            revision_head = client.revision_head()
-            self._remaining(deadline)
+            revision_head = self._core_external(token, deadline, client.revision_head)
             if revision_head.active_revision != core_project.active_revision:
                 raise _bridge_error(
                     "core_project_revision_mismatch",
                     "Core project and revision head disagree.",
                 )
             validation = self._validate_current(
+                token,
+                deadline,
                 client,
                 core_project,
                 capabilities,
                 idempotency_key=_derived_key(idempotency_key, "validate"),
             )
-            self._remaining(deadline)
             if not validation.valid:
                 raise _bridge_error(
                     "core_project_validation_failed",
@@ -411,11 +664,21 @@ class DesktopCoreBridgeV1:
                 core_project,
                 capabilities,
                 core_host_identity=attachment.bearer_identity,
+                previous_mapping=mapping,
             )
-            if mapping is None:
-                self._persistence.commit_mapping(operation, completed_mapping)
-            self._remaining(deadline)
+            if mapping != completed_mapping:
+                self._adapter_external(
+                    token,
+                    deadline,
+                    lambda: self._persistence.commit_mapping(
+                        operation,
+                        completed_mapping,
+                        expected_previous=mapping,
+                    ),
+                    label="project mapping commit",
+                )
             candidate = DesktopCoreActiveSessionV1(
+                token=token,
                 generation=generation,
                 local_project_id=project.project_id,
                 profile_id=project.profile_id,
@@ -434,14 +697,11 @@ class DesktopCoreBridgeV1:
                 revision_head=revision_head,
                 validation=validation,
             )
-        except BaseException:
-            if candidate is not None:
-                candidate.close()
-            else:
-                if client is not None:
-                    client.close()
-                if tunnel is not None:
-                    tunnel.close()
+        except BaseException as exc:
+            try:
+                self._cleanup_failed_candidate(token, deadline=deadline)
+            except BaseException as cleanup_exc:
+                raise cleanup_exc from exc
             raise
 
     def capabilities(self, local_project_id: str) -> core_v1.CapabilitiesResponseV1:
@@ -454,8 +714,11 @@ class DesktopCoreBridgeV1:
         self, local_project_id: str, *, idempotency_key: str
     ) -> core_v1.ProjectValidationResponseV1:
         def call(session: DesktopCoreActiveSessionV1) -> core_v1.ProjectValidationResponseV1:
-            project, capabilities = self._refresh_authority(session)
+            deadline = time.monotonic() + self._timeout
+            project, capabilities = self._refresh_authority(session, deadline)
             return self._validate_current(
+                session.token,
+                deadline,
                 session.client,
                 project,
                 capabilities,
@@ -466,14 +729,17 @@ class DesktopCoreBridgeV1:
 
     def create_run(self, local_project_id: str, *, idempotency_key: str) -> core_v1.RunV1:
         def call(session: DesktopCoreActiveSessionV1) -> core_v1.RunV1:
-            project, capabilities = self._refresh_authority(session)
-            head = session.client.revision_head()
+            deadline = time.monotonic() + self._timeout
+            project, capabilities = self._refresh_authority(session, deadline)
+            head = self._core_external(session.token, deadline, session.client.revision_head)
             if head.active_revision != project.active_revision:
                 raise _bridge_error(
                     "core_project_revision_mismatch",
                     "Core project and revision head disagree.",
                 )
             validation = self._validate_current(
+                session.token,
+                deadline,
                 session.client,
                 project,
                 capabilities,
@@ -501,7 +767,14 @@ class DesktopCoreBridgeV1:
                 expected_registry_digest=capabilities.registry_digest,
                 required_revision=required_revision,
             )
-            return session.client.create_run(request, idempotency_key=idempotency_key)
+            return self._core_external(
+                session.token,
+                deadline,
+                lambda: session.client.create_run(
+                    request,
+                    idempotency_key=idempotency_key,
+                ),
+            )
 
         return self._invoke(local_project_id, call)
 
@@ -525,32 +798,50 @@ class DesktopCoreBridgeV1:
 
     def cancel_run(self, run_id: str, *, if_match: str, idempotency_key: str) -> core_v1.RunV1:
         def call(session: DesktopCoreActiveSessionV1) -> core_v1.RunV1:
-            session.client.get_run(run_id, project_id=session.project.id)
-            return session.client.cancel_run(
-                run_id,
-                core_v1.RunCancelRequestV1(reason=core_v1.RunCancelReason.USER_REQUESTED),
-                project_id=session.project.id,
-                if_match=if_match,
-                idempotency_key=idempotency_key,
+            deadline = time.monotonic() + self._timeout
+            self._core_external(
+                session.token,
+                deadline,
+                lambda: session.client.get_run(run_id, project_id=session.project.id),
+            )
+            return self._core_external(
+                session.token,
+                deadline,
+                lambda: session.client.cancel_run(
+                    run_id,
+                    core_v1.RunCancelRequestV1(reason=core_v1.RunCancelReason.USER_REQUESTED),
+                    project_id=session.project.id,
+                    if_match=if_match,
+                    idempotency_key=idempotency_key,
+                ),
             )
 
         return self._invoke_active(call)
 
     def retry_run(self, run_id: str, *, if_match: str, idempotency_key: str) -> core_v1.RunV1:
         def call(session: DesktopCoreActiveSessionV1) -> core_v1.RunV1:
-            run = session.client.get_run(run_id, project_id=session.project.id)
+            deadline = time.monotonic() + self._timeout
+            run = self._core_external(
+                session.token,
+                deadline,
+                lambda: session.client.get_run(run_id, project_id=session.project.id),
+            )
             if run.current_attempt_id is None:
                 raise _bridge_error(
                     "run_retry_not_ready",
                     "Core has no terminal run attempt to retry.",
                     status=409,
                 )
-            return session.client.retry_run(
-                run_id,
-                core_v1.RunRetryRequestV1(terminal_attempt_id=run.current_attempt_id),
-                project_id=session.project.id,
-                if_match=if_match,
-                idempotency_key=idempotency_key,
+            return self._core_external(
+                session.token,
+                deadline,
+                lambda: session.client.retry_run(
+                    run_id,
+                    core_v1.RunRetryRequestV1(terminal_attempt_id=run.current_attempt_id),
+                    project_id=session.project.id,
+                    if_match=if_match,
+                    idempotency_key=idempotency_key,
+                ),
             )
 
         return self._invoke_active(call)
@@ -688,33 +979,290 @@ class DesktopCoreBridgeV1:
         session, generation = self._session(None)
         return _BridgeEventContext(self, session, generation, last_event_id)
 
-    def _begin_activation(self) -> tuple[int, DesktopCoreActiveSessionV1 | None]:
-        with self._lock:
-            if self._closed:
-                raise _bridge_error(
-                    "desktop_core_bridge_closed",
-                    "The Desktop Core bridge is closed.",
+    def _begin_activation(self, deadline: float) -> _GenerationToken:
+        self._acquire_transition(deadline)
+        try:
+            with self._lock:
+                if self._closed or self._close_requested:
+                    raise _bridge_error(
+                        "desktop_core_bridge_closed",
+                        "The Desktop Core bridge is closed.",
+                    )
+                previous = self._current_token_locked()
+            if previous is not None:
+                self._retire_token(previous, deadline=deadline)
+            with self._lock:
+                if self._closed or self._close_requested:
+                    raise _bridge_error(
+                        "desktop_core_bridge_closed",
+                        "The Desktop Core bridge is closed.",
+                    )
+                self._generation += 1
+                token = _GenerationToken(
+                    generation=self._generation,
+                    external_lock=threading.RLock(),
+                    resource_lock=threading.Lock(),
                 )
-            self._generation += 1
-            generation = self._generation
-            old_active = self._active
-            self._active = None
-            return generation, old_active
+                self._candidate = token
+                return token
+        finally:
+            self._transition_lock.release()
 
     def _publish_activation(self, candidate: DesktopCoreActiveSessionV1) -> None:
         with self._lock:
-            if self._closed or candidate.generation != self._generation:
+            if (
+                self._closed
+                or self._close_requested
+                or candidate.token.cancelled
+                or self._candidate is not candidate.token
+                or candidate.generation != self._generation
+            ):
                 raise _bridge_error(
                     "active_project_session_superseded",
                     "A newer active project session superseded this result.",
                     retryable=True,
                 )
             self._active = candidate
+            self._candidate = None
+
+    def _current_token_locked(self) -> _GenerationToken | None:
+        if self._candidate is not None:
+            return self._candidate
+        if self._active is not None:
+            return self._active.token
+        return None
+
+    def _acquire_transition(self, deadline: float) -> None:
+        if not self._transition_lock.acquire(timeout=_remaining_seconds(deadline)):
+            raise _bridge_error(
+                "core_bridge_transition_deadline_exceeded",
+                "The active project transition did not finish before the deadline.",
+                retryable=True,
+            )
+
+    def _retire_token(self, token: _GenerationToken, *, deadline: float) -> None:
+        with self._lock:
+            if token.retired:
+                return
+            token.cancelled = True
+        with token.resource_lock:
+            clients = tuple(token.clients or ())
+        for client in clients:
+            self._run_adapter_cleanup(
+                token,
+                deadline,
+                client.close,
+                label="Core client close",
+            )
+        if not token.external_lock.acquire(timeout=_remaining_seconds(deadline)):
+            raise _bridge_error(
+                "core_bridge_retirement_deadline_exceeded",
+                "The previous Core session still owns an external call.",
+                retryable=True,
+            )
+        try:
+            self._wait_adapter_futures(token, deadline)
+            with token.resource_lock:
+                clients = tuple(token.clients or ())
+                tunnels = tuple(token.tunnels or ())
+                archives = tuple(token.archives or ())
+            # Client construction may have completed after the first close
+            # snapshot. Close the complete adopted set before other resources.
+            for client in clients:
+                self._run_adapter_cleanup(
+                    token,
+                    deadline,
+                    client.close,
+                    label="Core client close",
+                )
+            for archive in archives:
+                self._run_adapter_cleanup(
+                    token,
+                    deadline,
+                    archive.close,
+                    label="workspace archive close",
+                )
+            for tunnel in tunnels:
+                tunnel.close(deadline=deadline, token=token)
+            self._wait_adapter_futures(token, deadline)
+        finally:
+            token.external_lock.release()
+        with self._lock:
+            token.retired = True
+            if self._candidate is token:
+                self._candidate = None
+            if self._active is not None and self._active.token is token:
+                self._active = None
+
+    def _cleanup_failed_candidate(self, token: _GenerationToken, *, deadline: float) -> None:
+        cleanup_deadline = max(deadline, time.monotonic() + self._timeout)
+        self._acquire_transition(cleanup_deadline)
+        try:
+            self._retire_token(token, deadline=cleanup_deadline)
+        finally:
+            self._transition_lock.release()
+
+    def _gate_token(self, token: _GenerationToken, deadline: float) -> None:
+        self._remaining(deadline)
+        with self._lock:
+            current = self._current_token_locked()
+            if (
+                self._closed
+                or self._close_requested
+                or token.cancelled
+                or token.retired
+                or current is not token
+            ):
+                raise _bridge_error(
+                    "active_project_session_superseded",
+                    "A newer active project session superseded this result.",
+                    retryable=True,
+                )
+
+    def _external_call(
+        self,
+        token: _GenerationToken,
+        deadline: float,
+        action: Callable[[], _ResponseT],
+        *,
+        adapter_label: str | None = None,
+        adopt: Callable[[_ResponseT], None] | None = None,
+    ) -> _ResponseT:
+        if not token.external_lock.acquire(timeout=_remaining_seconds(deadline)):
+            raise _bridge_error(
+                "core_bridge_external_call_deadline_exceeded",
+                "The previous external bridge call did not finish before the deadline.",
+                retryable=True,
+            )
+        try:
+            self._gate_token(token, deadline)
+            if adapter_label is None:
+                result = action()
+            else:
+                result = self._run_adapter(
+                    token,
+                    deadline,
+                    action,
+                    label=adapter_label,
+                    adopt=adopt,
+                )
+                adopt = None
+            if adopt is not None:
+                adopt(result)
+            self._gate_token(token, deadline)
+            return result
+        finally:
+            token.external_lock.release()
+
+    def _core_external(
+        self,
+        token: _GenerationToken,
+        deadline: float,
+        action: Callable[[], _ResponseT],
+    ) -> _ResponseT:
+        return self._external_call(token, deadline, action)
+
+    def _adapter_external(
+        self,
+        token: _GenerationToken,
+        deadline: float,
+        action: Callable[[], _ResponseT],
+        *,
+        label: str,
+        adopt: Callable[[_ResponseT], None] | None = None,
+    ) -> _ResponseT:
+        return self._external_call(
+            token,
+            deadline,
+            action,
+            adapter_label=label,
+            adopt=adopt,
+        )
+
+    def _run_adapter(
+        self,
+        token: _GenerationToken,
+        deadline: float,
+        action: Callable[[], _ResponseT],
+        *,
+        label: str,
+        adopt: Callable[[_ResponseT], None] | None = None,
+    ) -> _ResponseT:
+        def run_and_adopt() -> _ResponseT:
+            result = action()
+            if adopt is not None:
+                adopt(result)
+            return result
+
+        future = _ADAPTER_EXECUTOR.submit(run_and_adopt)
+        if future is None:
+            raise _bridge_error(
+                "core_bridge_adapter_capacity_exhausted",
+                "The bounded bridge adapter executor is full.",
+                retryable=True,
+            )
+        token.track_future(future)
+        future.add_done_callback(lambda completed: token.untrack_future(completed))
+        try:
+            return future.result(timeout=_remaining_seconds(deadline))
+        except FutureTimeoutError:
+            if future.done():
+                raise _bridge_error(
+                    "core_bridge_adapter_failed",
+                    f"The {label} adapter failed.",
+                    retryable=True,
+                ) from None
+            future.cancel()
+            raise _bridge_error(
+                "core_bridge_adapter_deadline_exceeded",
+                f"The {label} adapter did not finish before the deadline.",
+                retryable=True,
+            ) from None
+        except DesktopCoreBridgeErrorV1:
+            raise
+        except BaseException:
+            raise _bridge_error(
+                "core_bridge_adapter_failed",
+                f"The {label} adapter failed.",
+                retryable=True,
+            ) from None
+
+    def _run_adapter_cleanup(
+        self,
+        token: _GenerationToken,
+        deadline: float,
+        action: Callable[[], None],
+        *,
+        label: str,
+    ) -> None:
+        self._run_adapter(token, deadline, action, label=label)
+
+    def _wait_adapter_futures(self, token: _GenerationToken, deadline: float) -> None:
+        while True:
+            with token.resource_lock:
+                pending = tuple(
+                    future for future in (token.adapter_futures or ()) if not future.done()
+                )
+            if not pending:
+                return
+            for future in pending:
+                try:
+                    future.result(timeout=_remaining_seconds(deadline))
+                except FutureTimeoutError:
+                    if future.done():
+                        continue
+                    raise _bridge_error(
+                        "core_bridge_retirement_deadline_exceeded",
+                        "A bridge adapter still owns external work.",
+                        retryable=True,
+                    ) from None
+                except BaseException:
+                    pass
 
     def _bootstrap_connection(
         self,
         *,
-        project: local_v1.ProjectV1,
+        token: _GenerationToken,
         request: core_v1.ProjectCreateV1,
         operation: CoreProjectCreateOperationV1,
         attachment: CoreHostAttachmentV1,
@@ -726,32 +1274,125 @@ class DesktopCoreBridgeV1:
             bearer_token=attachment.bearer_token,
             session_id=tunnel.session_id,
         )
-        if operation.core_project_id is not None:
+        if operation.state is CoreProjectCreateStateV1.BOUND:
+            assert operation.core_project_id is not None
             return bootstrap_connection.bind(operation.core_project_id), operation
-        bootstrap = CoreProjectBootstrapClientV1(
-            bootstrap_connection,
-            transport=self._new_transport(),
-            timeout=self._remaining(deadline),
+        bootstrap = self._adapter_external(
+            token,
+            deadline,
+            lambda: self._new_bootstrap_client(bootstrap_connection, deadline),
+            label="Core bootstrap client construction",
+            adopt=token.add_client,
         )
         try:
-            bootstrap.version()
-            self._remaining(deadline)
-            bootstrap.capabilities(request.spec.execution_mode)
-            self._remaining(deadline)
-            result = bootstrap.create_project(
-                request,
-                idempotency_key=operation.idempotency_key,
+            self._core_external(token, deadline, bootstrap.version)
+            self._core_external(
+                token,
+                deadline,
+                lambda: bootstrap.capabilities(request.spec.execution_mode),
             )
-            self._remaining(deadline)
-            operation = replace(operation, core_project_id=result.project.id)
-            self._persistence.update_create(operation)
+            if operation.state is CoreProjectCreateStateV1.PRE_CREATE:
+                expected_unknown = replace(
+                    operation,
+                    state=CoreProjectCreateStateV1.UNKNOWN,
+                )
+                stored_unknown = self._adapter_external(
+                    token,
+                    deadline,
+                    lambda: self._persistence.mark_create_unknown(operation),
+                    label="project create outcome transition",
+                )
+                operation = _ensure_create_transition(
+                    stored_unknown,
+                    expected_unknown,
+                    label="unknown-outcome",
+                )
+            result = self._core_external(
+                token,
+                deadline,
+                lambda: bootstrap.create_project(
+                    request,
+                    idempotency_key=operation.idempotency_key,
+                ),
+            )
+            expected_bound = replace(
+                operation,
+                state=CoreProjectCreateStateV1.BOUND,
+                core_project_id=result.project.id,
+            )
+            stored_bound = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.bind_created_project(
+                    operation,
+                    result.project.id,
+                ),
+                label="project create binding",
+            )
+            operation = _ensure_create_transition(
+                stored_bound,
+                expected_bound,
+                label="bound",
+            )
             return result.connection, operation
         finally:
-            bootstrap.close()
+            self._run_adapter_cleanup(
+                token,
+                max(deadline, time.monotonic() + self._timeout),
+                bootstrap.close,
+                label="bootstrap client close",
+            )
+
+    def _reconcile_mapped_project(
+        self,
+        *,
+        token: _GenerationToken,
+        deadline: float,
+        client: CoreControlClientV1,
+        mapping: CoreProjectMappingV1,
+        current: core_v1.ProjectV1,
+        requested: core_v1.ProjectCreateV1,
+        request_sha256: str,
+    ) -> core_v1.ProjectV1:
+        if mapping.request_sha256 == request_sha256:
+            _ensure_project_identity(current, requested)
+            _ensure_mapping_snapshots(mapping, current)
+            return current
+
+        if _project_identity_matches(current, requested):
+            _ensure_mapping_was_versioned(mapping, current, requested)
+            return current
+
+        _ensure_mapping_snapshots(mapping, current)
+        _ensure_project_identity(current, mapping.project_create)
+        patch = core_v1.ProjectPatchV1(
+            name=requested.name,
+            description=requested.description,
+            spec=requested.spec,
+            task=requested.task,
+            workspace=requested.workspace,
+        )
+        previous = current
+        patched = self._core_external(
+            token,
+            deadline,
+            lambda: client.patch_project(
+                patch,
+                if_match=previous.etag,
+                idempotency_key=_derived_key(
+                    mapping.local_project_id,
+                    f"project-patch-{mapping.request_sha256}-{request_sha256}",
+                ),
+            ),
+        )
+        _ensure_project_identity(patched, requested)
+        _ensure_patch_signed_new_snapshots(previous, patched, requested)
+        return patched
 
     def _publish_imported_workspace(
         self,
         *,
+        token: _GenerationToken,
         client: CoreControlClientV1,
         local_project: local_v1.ProjectV1,
         core_project: core_v1.ProjectV1,
@@ -767,34 +1408,107 @@ class DesktopCoreBridgeV1:
                 "The imported workspace does not have an adopted archive reference.",
                 status=422,
             )
-        if operation.workspace_upload_id is None:
-            upload = client.create_workspace_upload(
-                core_v1.WorkspaceUploadCreateV1(
-                    project_snapshot=core_project.current_project_snapshot,
-                    archive=core_project.workspace.archive,
-                    base_workspace_snapshot=core_project.current_workspace_snapshot,
-                ),
-                if_match=core_project.etag,
-                idempotency_key=_derived_key(operation.idempotency_key, "upload-create"),
+        if (
+            operation.workspace_upload_id is not None
+            and operation.workspace_upload_project_snapshot
+            != core_project.current_project_snapshot
+        ):
+            cleared_operation = replace(
+                operation,
+                workspace_upload_id=None,
+                workspace_upload_project_snapshot=None,
             )
-            self._remaining(deadline)
-            operation = replace(operation, workspace_upload_id=upload.id)
-            self._persistence.update_create(operation)
-        else:
-            upload = client.get_workspace_upload(operation.workspace_upload_id)
-            self._remaining(deadline)
+            stored_operation = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.update_create(cleared_operation),
+                label="stale workspace upload binding clear",
+            )
+            operation = _ensure_create_transition(
+                stored_operation,
+                cleared_operation,
+                label="workspace-upload-clear",
+            )
 
-        with self._archive_source.open_archive(import_ref) as stream:
+        upload_key_seed = _derived_key(
+            operation.idempotency_key,
+            f"workspace-upload-{_model_digest(core_project.current_project_snapshot)}",
+        )
+        if operation.workspace_upload_id is None:
+            upload_request = core_v1.WorkspaceUploadCreateV1(
+                project_snapshot=core_project.current_project_snapshot,
+                archive=core_project.workspace.archive,
+                base_workspace_snapshot=core_project.current_workspace_snapshot,
+            )
+            upload = self._core_external(
+                token,
+                deadline,
+                lambda: client.create_workspace_upload(
+                    upload_request,
+                    if_match=core_project.etag,
+                    idempotency_key=_derived_key(upload_key_seed, "create"),
+                ),
+            )
+            upload_operation = replace(
+                operation,
+                workspace_upload_id=upload.id,
+                workspace_upload_project_snapshot=upload.project_snapshot,
+            )
+            stored_operation = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.update_create(upload_operation),
+                label="workspace upload binding",
+            )
+            operation = _ensure_create_transition(
+                stored_operation,
+                upload_operation,
+                label="workspace-upload-bound",
+            )
+        else:
+            upload = self._core_external(
+                token,
+                deadline,
+                lambda: client.get_workspace_upload(operation.workspace_upload_id),
+            )
+        _ensure_workspace_upload_authority(upload, core_project)
+
+        lease_holder: list[_ArchiveContextLease] = []
+
+        def adopt_archive(context: AbstractContextManager[BinaryIO]) -> None:
+            lease = _ArchiveContextLease(context=context, lock=threading.Lock())
+            lease_holder.append(lease)
+            token.add_archive(lease)
+
+        self._adapter_external(
+            token,
+            deadline,
+            lambda: self._archive_source.open_archive(import_ref),
+            label="workspace archive open",
+            adopt=adopt_archive,
+        )
+        lease = lease_holder[0]
+        stream = self._adapter_external(
+            token,
+            deadline,
+            lease.enter,
+            label="workspace archive enter",
+        )
+        try:
             digest = hashlib.sha256()
             offset = 0
             upload_offset = upload.accepted_offset
             while offset < import_ref.byte_size:
-                self._remaining(deadline)
-                chunk = _read_archive_chunk(
-                    stream,
-                    min(WORKSPACE_CHUNK_BYTES, import_ref.byte_size - offset),
+                chunk_size = min(
+                    WORKSPACE_CHUNK_BYTES,
+                    import_ref.byte_size - offset,
                 )
-                self._remaining(deadline)
+                chunk = self._adapter_external(
+                    token,
+                    deadline,
+                    lambda: _read_archive_chunk(stream, chunk_size),
+                    label="workspace archive read",
+                )
                 if not chunk:
                     raise _bridge_error(
                         "workspace_archive_mismatch",
@@ -809,51 +1523,100 @@ class DesktopCoreBridgeV1:
                             "workspace_upload_offset_mismatch",
                             "Core accepted an offset that is not aligned to the archive stream.",
                         )
-                    upload = client.put_workspace_upload_chunk(
-                        upload.id,
-                        core_v1.WorkspaceUploadChunkV1(
-                            offset=offset,
-                            byte_length=len(chunk),
-                            content_base64=base64.b64encode(chunk).decode("ascii"),
-                            content_sha256=hashlib.sha256(chunk).hexdigest(),
-                        ),
-                        if_match=upload.etag,
-                        idempotency_key=_derived_key(
-                            operation.idempotency_key, f"upload-chunk-{offset}"
+                    chunk_request = core_v1.WorkspaceUploadChunkV1(
+                        offset=offset,
+                        byte_length=len(chunk),
+                        content_base64=base64.b64encode(chunk).decode("ascii"),
+                        content_sha256=hashlib.sha256(chunk).hexdigest(),
+                    )
+                    upload_id = upload.id
+                    upload_etag = upload.etag
+                    upload = self._core_external(
+                        token,
+                        deadline,
+                        lambda: client.put_workspace_upload_chunk(
+                            upload_id,
+                            chunk_request,
+                            if_match=upload_etag,
+                            idempotency_key=_derived_key(upload_key_seed, f"chunk-{offset}"),
                         ),
                     )
                     upload_offset = upload.accepted_offset
                 offset = next_offset
-            if stream.read(1):
+            trailing = self._adapter_external(
+                token,
+                deadline,
+                lambda: stream.read(1),
+                label="workspace archive trailing read",
+            )
+            if trailing:
                 raise _bridge_error(
                     "workspace_archive_mismatch",
                     "The adopted workspace archive exceeds its declared size.",
                     status=422,
                 )
+        finally:
+            self._run_adapter_cleanup(
+                token,
+                max(deadline, time.monotonic() + self._timeout),
+                lease.close,
+                label="workspace archive close",
+            )
         if digest.hexdigest() != import_ref.content_sha256:
             raise _bridge_error(
                 "workspace_archive_mismatch",
                 "The adopted workspace archive digest changed.",
                 status=422,
             )
-        finalized = client.finalize_workspace_upload(
-            upload.id,
-            core_v1.WorkspaceUploadFinalizeV1(content_sha256=import_ref.content_sha256),
-            if_match=upload.etag,
-            if_project_match=upload.project_etag,
-            idempotency_key=_derived_key(operation.idempotency_key, "upload-finalize"),
+        finalize_request = core_v1.WorkspaceUploadFinalizeV1(
+            content_sha256=import_ref.content_sha256
         )
-        self._remaining(deadline)
+        finalized = self._core_external(
+            token,
+            deadline,
+            lambda: client.finalize_workspace_upload(
+                upload.id,
+                finalize_request,
+                if_match=upload.etag,
+                if_project_match=upload.project_etag,
+                idempotency_key=_derived_key(upload_key_seed, "finalize"),
+            ),
+        )
         return finalized.project, operation
 
     def _new_client(
         self, connection: CoreTunnelConnectionV1, deadline: float
     ) -> CoreControlClientV1:
-        return CoreControlClientV1(
-            connection,
-            transport=self._new_transport(),
-            timeout=self._remaining(deadline),
-        )
+        timeout = self._remaining(deadline)
+        transport = self._new_transport()
+        try:
+            return CoreControlClientV1(
+                connection,
+                transport=transport,
+                timeout=timeout,
+            )
+        except BaseException:
+            if transport is not None:
+                transport.close()
+            raise
+
+    def _new_bootstrap_client(
+        self,
+        connection: CoreBootstrapTunnelConnectionV1,
+        deadline: float,
+    ) -> CoreProjectBootstrapClientV1:
+        timeout = self._remaining(deadline)
+        transport = self._new_transport()
+        try:
+            return CoreProjectBootstrapClientV1(
+                connection,
+                transport=transport,
+                timeout=timeout,
+            )
+        except BaseException:
+            if transport is not None:
+                transport.close()
+            raise
 
     def _new_transport(self) -> httpx.BaseTransport | None:
         if self._transport_factory is None:
@@ -861,15 +1624,27 @@ class DesktopCoreBridgeV1:
         return self._transport_factory()
 
     def _refresh_authority(
-        self, session: DesktopCoreActiveSessionV1
+        self,
+        session: DesktopCoreActiveSessionV1,
+        deadline: float,
     ) -> tuple[core_v1.ProjectV1, core_v1.CapabilitiesResponseV1]:
-        capabilities = session.client.capabilities(session.project.spec.execution_mode)
-        project = session.client.get_project()
+        capabilities = self._core_external(
+            session.token,
+            deadline,
+            lambda: session.client.capabilities(session.project.spec.execution_mode),
+        )
+        project = self._core_external(
+            session.token,
+            deadline,
+            session.client.get_project,
+        )
         self._ensure_project_ready(project, capabilities)
         return project, capabilities
 
-    @staticmethod
     def _validate_current(
+        self,
+        token: _GenerationToken,
+        deadline: float,
         client: CoreControlClientV1,
         project: core_v1.ProjectV1,
         capabilities: core_v1.CapabilitiesResponseV1,
@@ -882,13 +1657,18 @@ class DesktopCoreBridgeV1:
                 "core_project_not_ready",
                 "Core has not published the project workspace snapshot.",
             )
-        return client.validate_project(
-            core_v1.ProjectValidationRequestV1(
-                project_snapshot=project.current_project_snapshot,
-                workspace_snapshot=workspace_snapshot,
-                expected_registry_digest=capabilities.registry_digest,
+        request = core_v1.ProjectValidationRequestV1(
+            project_snapshot=project.current_project_snapshot,
+            workspace_snapshot=workspace_snapshot,
+            expected_registry_digest=capabilities.registry_digest,
+        )
+        return self._core_external(
+            token,
+            deadline,
+            lambda: client.validate_project(
+                request,
+                idempotency_key=idempotency_key,
             ),
-            idempotency_key=idempotency_key,
         )
 
     @staticmethod
@@ -911,7 +1691,7 @@ class DesktopCoreBridgeV1:
 
     def _session(self, local_project_id: str | None) -> tuple[DesktopCoreActiveSessionV1, int]:
         with self._lock:
-            if self._closed:
+            if self._closed or self._close_requested:
                 raise _bridge_error(
                     "desktop_core_bridge_closed",
                     "The Desktop Core bridge is closed.",
@@ -936,22 +1716,34 @@ class DesktopCoreBridgeV1:
         local_project_id: str,
         call: Callable[[DesktopCoreActiveSessionV1], _ResponseT],
     ) -> _ResponseT:
-        session, generation = self._session(local_project_id)
-        result = call(session)
-        self._ensure_generation(session, generation)
-        return result
+        session, _generation = self._session(local_project_id)
+        deadline = time.monotonic() + self._timeout
+        return self._external_call(
+            session.token,
+            deadline,
+            lambda: call(session),
+        )
 
     def _invoke_active(
         self, call: Callable[[DesktopCoreActiveSessionV1], _ResponseT]
     ) -> _ResponseT:
-        session, generation = self._session(None)
-        result = call(session)
-        self._ensure_generation(session, generation)
-        return result
+        session, _generation = self._session(None)
+        deadline = time.monotonic() + self._timeout
+        return self._external_call(
+            session.token,
+            deadline,
+            lambda: call(session),
+        )
 
     def _ensure_generation(self, session: DesktopCoreActiveSessionV1, generation: int) -> None:
         with self._lock:
-            if self._closed or self._generation != generation or self._active is not session:
+            if (
+                self._closed
+                or self._close_requested
+                or session.token.cancelled
+                or self._generation != generation
+                or self._active is not session
+            ):
                 raise _bridge_error(
                     "active_project_session_superseded",
                     "A newer active project session superseded this result.",
@@ -960,14 +1752,7 @@ class DesktopCoreBridgeV1:
 
     @staticmethod
     def _remaining(deadline: float) -> float:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise _bridge_error(
-                "desktop_core_bridge_deadline_exceeded",
-                "The Desktop Core bridge operation deadline expired.",
-                retryable=True,
-            )
-        return remaining
+        return _remaining_seconds(deadline)
 
 
 class _BridgeEventContext:
@@ -985,15 +1770,37 @@ class _BridgeEventContext:
         self._context = None
 
     def __enter__(self):
-        self._bridge._ensure_generation(self._session, self._generation)
-        self._context = self._session.client.events(last_event_id=self._last_event_id)
-        stream = self._context.__enter__()
-        self._bridge._ensure_generation(self._session, self._generation)
-        return stream
+        deadline = time.monotonic() + self._bridge._timeout
+
+        def enter():
+            self._bridge._ensure_generation(self._session, self._generation)
+            self._context = self._session.client.events(last_event_id=self._last_event_id)
+            return self._context.__enter__()
+
+        try:
+            return self._bridge._core_external(
+                self._session.token,
+                deadline,
+                enter,
+            )
+        except BaseException:
+            if self._context is not None:
+                self._bridge._run_adapter_cleanup(
+                    self._session.token,
+                    max(deadline, time.monotonic() + self._bridge._timeout),
+                    lambda: self._context.__exit__(None, None, None),
+                    label="Core event stream close",
+                )
+            raise
 
     def __exit__(self, *exc: object) -> None:
         if self._context is not None:
-            self._context.__exit__(*exc)
+            self._bridge._run_adapter_cleanup(
+                self._session.token,
+                time.monotonic() + self._bridge._timeout,
+                lambda: self._context.__exit__(*exc),
+                label="Core event stream close",
+            )
 
 
 def _workspace_archive_policy() -> core_v1.WorkspaceArchivePolicyV1:
@@ -1039,6 +1846,17 @@ def _derived_key(base: str, purpose: str) -> str:
     return f"desktop-core-{digest}"
 
 
+def _remaining_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _bridge_error(
+            "desktop_core_bridge_deadline_exceeded",
+            "The Desktop Core bridge operation deadline expired.",
+            retryable=True,
+        )
+    return remaining
+
+
 def _read_archive_chunk(stream: BinaryIO, byte_count: int) -> bytes:
     chunks: list[bytes] = []
     remaining = byte_count
@@ -1064,7 +1882,10 @@ def _ensure_create_operation(
         or operation.profile_id != project.profile_id
         or operation.core_host_identity != core_host_identity
         or operation.request_sha256 != request_sha256
-        or operation.idempotency_key != idempotency_key
+        or (
+            operation.state is not CoreProjectCreateStateV1.BOUND
+            and operation.idempotency_key != idempotency_key
+        )
     ):
         raise _bridge_error(
             "core_project_create_replay_mismatch",
@@ -1073,10 +1894,24 @@ def _ensure_create_operation(
         )
 
 
-def _ensure_mapping_request(
+def _ensure_create_transition(
+    actual: CoreProjectCreateOperationV1,
+    expected: CoreProjectCreateOperationV1,
+    *,
+    label: str,
+) -> CoreProjectCreateOperationV1:
+    if actual != expected:
+        raise _bridge_error(
+            "core_project_create_transition_mismatch",
+            f"The durable project create {label} transition was not atomic.",
+            status=409,
+        )
+    return actual
+
+
+def _ensure_mapping_authority(
     mapping: CoreProjectMappingV1,
     project: local_v1.ProjectV1,
-    request_sha256: str,
     *,
     core_host_identity: str,
 ) -> None:
@@ -1084,7 +1919,7 @@ def _ensure_mapping_request(
         mapping.local_project_id != project.project_id
         or mapping.profile_id != project.profile_id
         or mapping.core_host_identity != core_host_identity
-        or mapping.request_sha256 != request_sha256
+        or _model_digest(mapping.project_create) != mapping.request_sha256
     ):
         raise _bridge_error(
             "core_project_mapping_mismatch",
@@ -1093,8 +1928,31 @@ def _ensure_mapping_request(
         )
 
 
-def _ensure_project_identity(project: core_v1.ProjectV1, request: core_v1.ProjectCreateV1) -> None:
-    if any(
+def _ensure_bound_operation(
+    operation: CoreProjectCreateOperationV1 | None,
+    mapping: CoreProjectMappingV1,
+) -> CoreProjectCreateOperationV1:
+    if (
+        operation is None
+        or operation.state is not CoreProjectCreateStateV1.BOUND
+        or operation.local_project_id != mapping.local_project_id
+        or operation.profile_id != mapping.profile_id
+        or operation.core_host_identity != mapping.core_host_identity
+        or operation.core_project_id != mapping.core_project_id
+    ):
+        raise _bridge_error(
+            "core_project_create_binding_mismatch",
+            "The durable project create binding does not match the Core mapping.",
+            status=409,
+        )
+    return operation
+
+
+def _project_identity_matches(
+    project: core_v1.ProjectV1,
+    request: core_v1.ProjectCreateV1,
+) -> bool:
+    return not any(
         (
             project.name != request.name,
             project.description != request.description,
@@ -1104,11 +1962,79 @@ def _ensure_project_identity(project: core_v1.ProjectV1, request: core_v1.Projec
             project.execution_mode is not request.spec.execution_mode,
             project.workspace_kind.value != request.workspace.kind,
         )
-    ):
+    )
+
+
+def _ensure_project_identity(project: core_v1.ProjectV1, request: core_v1.ProjectCreateV1) -> None:
+    if not _project_identity_matches(project, request):
         raise _bridge_error(
             "core_project_identity_mismatch",
             "The Core project does not match the saved local project.",
             status=409,
+        )
+
+
+def _ensure_mapping_was_versioned(
+    mapping: CoreProjectMappingV1,
+    current: core_v1.ProjectV1,
+    requested: core_v1.ProjectCreateV1,
+) -> None:
+    if (
+        current.id != mapping.core_project_id
+        or (current.current_project_snapshot == mapping.project_snapshot)
+        or current.etag == mapping.project_etag
+    ):
+        raise _bridge_error(
+            "core_project_mapping_mismatch",
+            "Core reports changed project content without a new immutable snapshot.",
+            status=409,
+        )
+    if mapping.project_create.task != requested.task and (
+        current.current_task_snapshot == mapping.task_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_mapping_mismatch",
+            "Core reports changed task content without a new immutable snapshot.",
+            status=409,
+        )
+    if mapping.project_create.workspace != requested.workspace and (
+        current.current_workspace_snapshot == mapping.workspace_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_mapping_mismatch",
+            "Core reports changed workspace content without new snapshot state.",
+            status=409,
+        )
+
+
+def _ensure_patch_signed_new_snapshots(
+    previous: core_v1.ProjectV1,
+    patched: core_v1.ProjectV1,
+    requested: core_v1.ProjectCreateV1,
+) -> None:
+    if patched.current_project_snapshot == previous.current_project_snapshot:
+        raise _bridge_error(
+            "core_project_patch_not_versioned",
+            "Core patched the project without signing a new project snapshot.",
+        )
+    if patched.etag == previous.etag:
+        raise _bridge_error(
+            "core_project_patch_not_versioned",
+            "Core patched the project without issuing a new ETag.",
+        )
+    if previous.task != requested.task and (
+        patched.current_task_snapshot == previous.current_task_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_patch_not_versioned",
+            "Core patched the task without signing a new task snapshot.",
+        )
+    if previous.workspace != requested.workspace and (
+        patched.current_workspace_snapshot == previous.current_workspace_snapshot
+    ):
+        raise _bridge_error(
+            "core_project_patch_not_versioned",
+            "Core patched the workspace without changing its snapshot state.",
         )
 
 
@@ -1119,10 +2045,31 @@ def _ensure_mapping_snapshots(mapping: CoreProjectMappingV1, project: core_v1.Pr
         or mapping.task_snapshot != project.current_task_snapshot
         or mapping.workspace_snapshot != project.current_workspace_snapshot
         or mapping.registry_digest != project.registry_digest
+        or mapping.project_etag != project.etag
     ):
         raise _bridge_error(
             "core_project_mapping_mismatch",
             "The Core project identity or immutable snapshots changed outside Desktop authority.",
+            status=409,
+        )
+
+
+def _ensure_workspace_upload_authority(
+    upload: core_v1.WorkspaceUploadSessionV1,
+    project: core_v1.ProjectV1,
+) -> None:
+    if not isinstance(project.workspace, core_v1.ImportedWorkspaceSpecV1) or (
+        upload.status is not core_v1.WorkspaceUploadStatus.OPEN
+        or upload.project_id != project.id
+        or upload.project_snapshot != project.current_project_snapshot
+        or upload.project_etag != project.etag
+        or upload.archive != project.workspace.archive
+        or upload.base_workspace_snapshot != project.current_workspace_snapshot
+        or upload.publication is not None
+    ):
+        raise _bridge_error(
+            "workspace_upload_authority_mismatch",
+            "The persisted workspace upload does not belong to the current Core project version.",
             status=409,
         )
 
@@ -1134,6 +2081,7 @@ def _mapping_from_project(
     capabilities: core_v1.CapabilitiesResponseV1,
     *,
     core_host_identity: str,
+    previous_mapping: CoreProjectMappingV1 | None,
 ) -> CoreProjectMappingV1:
     workspace_snapshot = project.current_workspace_snapshot
     if workspace_snapshot is None:
@@ -1141,16 +2089,29 @@ def _mapping_from_project(
             "core_project_not_ready",
             "Core has not published the project workspace snapshot.",
         )
+    if previous_mapping is None:
+        mapping_generation = 1
+        predecessor_request_sha256 = None
+    elif previous_mapping.request_sha256 == request_sha256:
+        mapping_generation = previous_mapping.mapping_generation
+        predecessor_request_sha256 = previous_mapping.predecessor_request_sha256
+    else:
+        mapping_generation = previous_mapping.mapping_generation + 1
+        predecessor_request_sha256 = previous_mapping.request_sha256
     return CoreProjectMappingV1(
         local_project_id=local_project.project_id,
         profile_id=local_project.profile_id,
         core_host_identity=core_host_identity,
         core_project_id=project.id,
         request_sha256=request_sha256,
+        project_create=map_project_create_v1(local_project),
         project_snapshot=project.current_project_snapshot,
         task_snapshot=project.current_task_snapshot,
         workspace_snapshot=workspace_snapshot,
         registry_digest=capabilities.registry_digest,
+        project_etag=project.etag,
+        mapping_generation=mapping_generation,
+        predecessor_request_sha256=predecessor_request_sha256,
     )
 
 

@@ -5,6 +5,7 @@ import hashlib
 import io
 import secrets
 import threading
+import time
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.core_bridge_v1 import (
     CoreHostAttachmentV1,
     CoreProjectCreateOperationV1,
+    CoreProjectCreateStateV1,
     CoreProjectMappingV1,
     CoreTunnelHandleV1,
     DesktopCoreBridgeErrorV1,
@@ -128,9 +130,13 @@ def _project(
     *,
     ready: bool,
     imported_published: bool = False,
+    project_snapshot: core_v1.ImmutableSnapshotRefV1 | None = None,
+    task_snapshot: core_v1.ImmutableSnapshotRefV1 = TASK_SNAPSHOT,
+    workspace_snapshot: core_v1.ImmutableSnapshotRefV1 = WORKSPACE_SNAPSHOT,
+    etag: str | None = None,
 ) -> core_v1.ProjectV1:
     imported = isinstance(request.workspace, core_v1.ImportedWorkspaceSpecV1)
-    workspace_snapshot = WORKSPACE_SNAPSHOT if ready or not imported else None
+    current_workspace_snapshot = workspace_snapshot if ready or not imported else None
     publication = None
     if imported_published:
         assert isinstance(request.workspace, core_v1.ImportedWorkspaceSpecV1)
@@ -141,10 +147,10 @@ def _project(
                 sha256=request.workspace.archive.content_sha256,
                 byte_size=request.workspace.archive.byte_size,
             ),
-            workspace_snapshot=WORKSPACE_SNAPSHOT,
+            workspace_snapshot=workspace_snapshot,
             published_at=NOW,
         )
-        workspace_snapshot = WORKSPACE_SNAPSHOT
+        current_workspace_snapshot = workspace_snapshot
     return core_v1.ProjectV1(
         id=CORE_PROJECT_ID,
         name=request.name,
@@ -152,9 +158,11 @@ def _project(
         status=core_v1.ProjectStatus.READY if ready else core_v1.ProjectStatus.DRAFT,
         execution_mode=request.spec.execution_mode,
         workspace_kind=core_v1.WorkspaceSourceKind(request.workspace.kind),
-        current_project_snapshot=READY_PROJECT_SNAPSHOT if ready else PROJECT_SNAPSHOT,
-        current_task_snapshot=TASK_SNAPSHOT,
-        current_workspace_snapshot=workspace_snapshot,
+        current_project_snapshot=(
+            project_snapshot or (READY_PROJECT_SNAPSHOT if ready else PROJECT_SNAPSHOT)
+        ),
+        current_task_snapshot=task_snapshot,
+        current_workspace_snapshot=current_workspace_snapshot,
         workspace_publication=publication,
         active_revision=REVISION if ready else None,
         registry_digest=REGISTRY_DIGEST if ready or imported else None,
@@ -169,7 +177,7 @@ def _project(
         ),
         created_at=NOW,
         updated_at=NOW,
-        etag=ETAG_C if ready else ETAG_A,
+        etag=etag or (ETAG_C if ready else ETAG_A),
         spec=request.spec,
         task=request.task,
         workspace=request.workspace,
@@ -179,9 +187,15 @@ def _project(
 class FakeHostService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, float]] = []
+        self.block = False
+        self.entered = threading.Event()
+        self.release = threading.Event()
 
     def ensure_core(self, profile_id: str, *, deadline: float) -> CoreHostAttachmentV1:
         self.calls.append((profile_id, deadline))
+        if self.block:
+            self.entered.set()
+            assert self.release.wait(timeout=2)
         return CoreHostAttachmentV1(
             profile_id=profile_id,
             remote_port=43117,
@@ -193,6 +207,9 @@ class FakeHostService:
 class FakeTunnelFactory:
     def __init__(self) -> None:
         self.handles: list[CoreTunnelHandleV1] = []
+        self.block_open = False
+        self.open_entered = threading.Event()
+        self.open_release = threading.Event()
 
     def open_tunnel(
         self,
@@ -205,6 +222,9 @@ class FakeTunnelFactory:
         assert profile_id == PROFILE_ID
         assert remote_port == 43117
         del deadline
+        if self.block_open:
+            self.open_entered.set()
+            assert self.open_release.wait(timeout=2)
         handle = CoreTunnelHandleV1(
             endpoint=f"http://127.0.0.1:{48000 + len(self.handles)}",
             session_id=session_id,
@@ -218,11 +238,20 @@ class FakePersistence:
     def __init__(self) -> None:
         self.operation: CoreProjectCreateOperationV1 | None = None
         self.mapping: CoreProjectMappingV1 | None = None
+        self.mapping_history: list[CoreProjectMappingV1] = []
         self.events: list[str] = []
+        self.fail_commit_once = False
+        self.block_commit = False
+        self.commit_entered = threading.Event()
+        self.commit_release = threading.Event()
 
     def load_mapping(self, local_project_id: str) -> CoreProjectMappingV1 | None:
         assert local_project_id == LOCAL_PROJECT_ID
         return self.mapping
+
+    def load_create(self, local_project_id: str) -> CoreProjectCreateOperationV1 | None:
+        assert local_project_id == LOCAL_PROJECT_ID
+        return self.operation
 
     def reserve_create(
         self, operation: CoreProjectCreateOperationV1
@@ -230,28 +259,68 @@ class FakePersistence:
         self.events.append("reserve_create")
         if self.operation is None:
             self.operation = operation
-        elif self.operation.request_sha256 != operation.request_sha256:
+        elif (
+            self.operation.state is not CoreProjectCreateStateV1.BOUND
+            and self.operation.request_sha256 != operation.request_sha256
+        ):
             raise AssertionError("operation request changed")
+        elif self.operation.state is CoreProjectCreateStateV1.PRE_CREATE:
+            self.operation = operation
         return self.operation
 
-    def update_create(self, operation: CoreProjectCreateOperationV1) -> None:
+    def mark_create_unknown(
+        self, operation: CoreProjectCreateOperationV1
+    ) -> CoreProjectCreateOperationV1:
+        self.events.append("mark_create_unknown")
+        assert self.operation == operation
+        self.operation = replace(operation, state=CoreProjectCreateStateV1.UNKNOWN)
+        return self.operation
+
+    def bind_created_project(
+        self,
+        operation: CoreProjectCreateOperationV1,
+        core_project_id: str,
+    ) -> CoreProjectCreateOperationV1:
+        self.events.append("bind_created_project")
+        assert self.operation == operation
+        self.operation = replace(
+            operation,
+            state=CoreProjectCreateStateV1.BOUND,
+            core_project_id=core_project_id,
+        )
+        return self.operation
+
+    def update_create(
+        self, operation: CoreProjectCreateOperationV1
+    ) -> CoreProjectCreateOperationV1:
         self.events.append("update_create")
         self.operation = operation
+        return operation
 
     def commit_mapping(
         self,
         operation: CoreProjectCreateOperationV1,
         mapping: CoreProjectMappingV1,
+        *,
+        expected_previous: CoreProjectMappingV1 | None,
     ) -> None:
         self.events.append("commit_mapping")
+        if self.block_commit:
+            self.commit_entered.set()
+            assert self.commit_release.wait(timeout=2)
         assert self.operation == operation
+        assert self.mapping == expected_previous
+        if self.fail_commit_once:
+            self.fail_commit_once = False
+            raise RuntimeError("injected mapping commit failure")
         self.operation = operation
         self.mapping = mapping
+        self.mapping_history.append(mapping)
 
 
 class FakeArchiveSource:
-    def __init__(self) -> None:
-        self.archive = b"\0" * 1024
+    def __init__(self, archive: bytes | None = None) -> None:
+        self.archive = archive if archive is not None else b"\0" * 1024
         self.refs: list[local_v1.WorkspaceImportRefV1] = []
 
     def open_archive(self, ref: local_v1.WorkspaceImportRefV1) -> io.BytesIO:
@@ -266,6 +335,28 @@ class ShortReadArchive(io.BytesIO):
         return super().read(size)
 
 
+class BlockingReadArchive(io.BytesIO):
+    def __init__(self, value: bytes) -> None:
+        super().__init__(value)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def read(self, size: int = -1) -> bytes:
+        self.entered.set()
+        assert self.release.wait(timeout=2)
+        return super().read(size)
+
+
+class BlockingArchiveSource(FakeArchiveSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream = BlockingReadArchive(self.archive)
+
+    def open_archive(self, ref: local_v1.WorkspaceImportRefV1) -> io.BytesIO:
+        self.refs.append(ref)
+        return self.stream
+
+
 class FakeCore:
     def __init__(self, local_project: local_v1.ProjectV1) -> None:
         self.request = _core_create(local_project)
@@ -274,12 +365,29 @@ class FakeCore:
         self.run_requests: list[core_v1.RunCreateV1] = []
         self.fail_capabilities_with_503 = False
         self.lose_create_response_once = False
+        self.lose_patch_before_apply_once = False
+        self.lose_patch_after_apply_once = False
         self.upload: core_v1.WorkspaceUploadSessionV1 | None = None
         self.head = _head()
+        self.block_method: str | None = None
+        self.block_path: str | None = None
+        self.block_entered = threading.Event()
+        self.block_release = threading.Event()
+        self.block_once = True
+        self.patch_requests: list[tuple[core_v1.ProjectPatchV1, str, str]] = []
+        self.upload_count = 0
+        self.project_snapshot = READY_PROJECT_SNAPSHOT
+        self.task_snapshot = TASK_SNAPSHOT
+        self.workspace_snapshot = WORKSPACE_SNAPSHOT
+        self.project_etag = ETAG_C
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request)
         path = request.url.path
+        if self.block_once and request.method == self.block_method and path == self.block_path:
+            self.block_once = False
+            self.block_entered.set()
+            assert self.block_release.wait(timeout=2)
         if path == "/version":
             return httpx.Response(200, json=_version())
         if path == "/v1/capabilities":
@@ -297,6 +405,62 @@ class FakeCore:
                 json=_project(self.request, ready=False).model_dump(mode="json"),
             )
         if path == f"/v1/projects/{CORE_PROJECT_ID}":
+            if request.method == "PATCH":
+                patch = core_v1.ProjectPatchV1.model_validate_json(request.content, strict=True)
+                self.patch_requests.append(
+                    (
+                        patch,
+                        request.headers["If-Match"],
+                        request.headers["Idempotency-Key"],
+                    )
+                )
+                if self.lose_patch_before_apply_once:
+                    self.lose_patch_before_apply_once = False
+                    raise httpx.ReadError("patch response lost", request=request)
+                prior = self.request
+                self.request = core_v1.ProjectCreateV1(
+                    name=patch.name if patch.name is not None else prior.name,
+                    description=(
+                        patch.description
+                        if "description" in patch.model_fields_set
+                        else prior.description
+                    ),
+                    spec=patch.spec if patch.spec is not None else prior.spec,
+                    task=patch.task if patch.task is not None else prior.task,
+                    workspace=(
+                        patch.workspace if patch.workspace is not None else prior.workspace
+                    ),
+                )
+                self.project_snapshot = _snapshot(
+                    "project-snapshot-patched", core_v1.SnapshotKind.PROJECT, "8"
+                )
+                if self.request.task != prior.task:
+                    self.task_snapshot = _snapshot(
+                        "task-snapshot-patched", core_v1.SnapshotKind.TASK, "9"
+                    )
+                if self.request.workspace != prior.workspace:
+                    self.workspace_snapshot = _snapshot(
+                        "workspace-snapshot-patched", core_v1.SnapshotKind.WORKSPACE, "a"
+                    )
+                    self.upload = None
+                self.project_etag = '"' + "e" * 64 + '"'
+                imported_patch = isinstance(
+                    self.request.workspace, core_v1.ImportedWorkspaceSpecV1
+                )
+                if self.lose_patch_after_apply_once:
+                    self.lose_patch_after_apply_once = False
+                    raise httpx.ReadError("patch response lost", request=request)
+                return httpx.Response(
+                    200,
+                    json=_project(
+                        self.request,
+                        ready=not imported_patch,
+                        project_snapshot=self.project_snapshot,
+                        task_snapshot=self.task_snapshot,
+                        workspace_snapshot=self.workspace_snapshot,
+                        etag=self.project_etag,
+                    ).model_dump(mode="json"),
+                )
             imported = isinstance(self.request.workspace, core_v1.ImportedWorkspaceSpecV1)
             published = (
                 self.upload is not None
@@ -308,16 +472,28 @@ class FakeCore:
                     self.request,
                     ready=not imported or published,
                     imported_published=published,
+                    project_snapshot=self.project_snapshot,
+                    task_snapshot=self.task_snapshot,
+                    workspace_snapshot=self.workspace_snapshot,
+                    etag=self.project_etag,
                 ).model_dump(mode="json"),
             )
         if path.endswith("/workspace-uploads") and request.method == "POST":
-            self.upload = _upload(self.request)
+            self.upload_count += 1
+            self.upload = _upload(
+                self.request,
+                upload_id=f"upload-{self.upload_count}",
+                project_snapshot=self.project_snapshot,
+                project_etag=self.project_etag,
+            )
             return httpx.Response(201, json=self.upload.model_dump(mode="json"))
-        if path.endswith("/workspace-uploads/upload-1") and request.method == "GET":
+        if "/workspace-uploads/" in path and request.method == "GET":
             assert self.upload is not None
+            assert path.endswith(f"/workspace-uploads/{self.upload.id}")
             return httpx.Response(200, json=self.upload.model_dump(mode="json"))
-        if path.endswith("/workspace-uploads/upload-1/chunk"):
+        if path.endswith("/chunk") and "/workspace-uploads/" in path:
             assert self.upload is not None
+            assert path.endswith(f"/workspace-uploads/{self.upload.id}/chunk")
             chunk = core_v1.WorkspaceUploadChunkV1.model_validate_json(
                 request.content, strict=True
             )
@@ -329,9 +505,30 @@ class FakeCore:
                 }
             )
             return httpx.Response(200, json=self.upload.model_dump(mode="json"))
-        if path.endswith("/workspace-uploads/upload-1/finalize"):
+        if path.endswith("/finalize") and "/workspace-uploads/" in path:
             assert self.upload is not None
-            published = _project(self.request, ready=True, imported_published=True)
+            assert path.endswith(f"/workspace-uploads/{self.upload.id}/finalize")
+            if self.upload_count == 1:
+                self.project_snapshot = _snapshot(
+                    "project-snapshot-finalized", core_v1.SnapshotKind.PROJECT, "b"
+                )
+                self.project_etag = '"' + "f" * 64 + '"'
+            else:
+                self.project_snapshot = _snapshot(
+                    f"project-snapshot-finalized-{self.upload_count}",
+                    core_v1.SnapshotKind.PROJECT,
+                    "c",
+                )
+                self.project_etag = '"' + "0" * 64 + '"'
+            published = _project(
+                self.request,
+                ready=True,
+                imported_published=True,
+                project_snapshot=self.project_snapshot,
+                task_snapshot=self.task_snapshot,
+                workspace_snapshot=self.workspace_snapshot,
+                etag=self.project_etag,
+            )
             assert published.workspace_publication is not None
             finalized_upload = self.upload.model_copy(
                 update={
@@ -341,6 +538,7 @@ class FakeCore:
                     "etag": '"' + "d" * 64 + '"',
                 }
             )
+            self.upload = finalized_upload
             return httpx.Response(
                 201,
                 json=core_v1.WorkspaceUploadFinalizeResponseV1(
@@ -381,15 +579,21 @@ def _head() -> core_v1.RevisionHeadV1:
     )
 
 
-def _upload(request: core_v1.ProjectCreateV1) -> core_v1.WorkspaceUploadSessionV1:
+def _upload(
+    request: core_v1.ProjectCreateV1,
+    *,
+    upload_id: str = "upload-1",
+    project_snapshot: core_v1.ImmutableSnapshotRefV1 = PROJECT_SNAPSHOT,
+    project_etag: str = ETAG_A,
+) -> core_v1.WorkspaceUploadSessionV1:
     assert isinstance(request.workspace, core_v1.ImportedWorkspaceSpecV1)
     return core_v1.WorkspaceUploadSessionV1(
-        id="upload-1",
+        id=upload_id,
         project_id=CORE_PROJECT_ID,
         status=core_v1.WorkspaceUploadStatus.OPEN,
         accepted_offset=0,
-        project_snapshot=PROJECT_SNAPSHOT,
-        project_etag=ETAG_A,
+        project_snapshot=project_snapshot,
+        project_etag=project_etag,
         archive=request.workspace.archive,
         created_at=NOW,
         updated_at=NOW,
@@ -449,6 +653,8 @@ def _bridge(
     *,
     persistence: FakePersistence | None = None,
     fake_core: FakeCore | None = None,
+    archive_source: FakeArchiveSource | None = None,
+    timeout: float = 5.0,
 ) -> tuple[DesktopCoreBridgeV1, FakePersistence, FakeCore, FakeTunnelFactory]:
     persistence = persistence or FakePersistence()
     fake_core = fake_core or FakeCore(local_project)
@@ -457,9 +663,9 @@ def _bridge(
         host_service=FakeHostService(),
         tunnel_factory=tunnels,
         persistence=persistence,
-        archive_source=FakeArchiveSource(),
+        archive_source=archive_source or FakeArchiveSource(),
         transport_factory=lambda: httpx.MockTransport(fake_core),
-        timeout=5.0,
+        timeout=timeout,
     )
     return bridge, persistence, fake_core, tunnels
 
@@ -487,6 +693,24 @@ def test_project_mapping_is_deterministic_and_has_no_local_or_host_identity() ->
     assert PROFILE_ID not in encoded
     assert "import_id" not in encoded
     assert "/home/" not in encoded
+
+
+def test_subscription_mapping_preserves_model_and_forces_transcript_capture() -> None:
+    local_project = _local_project().model_copy(
+        update={
+            "execution": local_v1.ExecutionSettingsV1(
+                mode="codex_subscription_transcript",
+                codex_model="gpt-5-codex",
+            )
+        }
+    )
+
+    mapped = map_project_create_v1(local_project)
+
+    assert mapped.spec.execution_mode is core_v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+    assert mapped.spec.capture_mode is core_v1.CaptureMode.TRANSCRIPT
+    assert mapped.spec.harness_id == "codex"
+    assert mapped.spec.agent_model_ref == "gpt-5-codex"
 
 
 def test_activate_then_create_run_uses_real_strict_clients_and_core_authority() -> None:
@@ -713,6 +937,230 @@ def test_mapping_snapshot_drift_fails_closed() -> None:
     assert exc_info.value.error.code == "core_project_mapping_mismatch"
 
 
+def test_mapping_canonical_request_digest_corruption_fails_before_core_transport() -> None:
+    local_project = _local_project()
+    first, persistence, fake_core, _ = _bridge(local_project)
+    first.activate_project(local_project, idempotency_key="mapping-digest-base-0001")
+    first.close()
+    assert persistence.mapping is not None
+    persistence.mapping = replace(
+        persistence.mapping,
+        project_create=persistence.mapping.project_create.model_copy(
+            update={"name": "Corrupted persisted intent"}
+        ),
+    )
+    calls_before = len(fake_core.calls)
+    second, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        second.activate_project(
+            local_project,
+            idempotency_key="mapping-digest-reopen-0002",
+        )
+
+    assert exc_info.value.error.code == "core_project_mapping_mismatch"
+    assert len(fake_core.calls) == calls_before
+
+
+def test_mapped_project_edits_patch_core_and_commit_versioned_mapping() -> None:
+    original = _local_project()
+    first, persistence, fake_core, _ = _bridge(original)
+    first.activate_project(original, idempotency_key="activate-original-project-0001")
+    first.close()
+    original_mapping = persistence.mapping
+    assert original_mapping is not None
+    imported_source = _local_project(imported=True).source
+    modified = original.model_copy(
+        update={
+            "task": local_v1.ProjectTaskV1(
+                title="Redesigned task",
+                objective="Use the updated objective.",
+            ),
+            "execution": local_v1.ExecutionSettingsV1(
+                mode="self-deployed",
+                hf_model="openai/gpt-oss-120b",
+            ),
+            "evolution": local_v1.EvolutionConfigV1.model_validate(
+                {
+                    "targets": {
+                        "future_target": {
+                            "enabled": False,
+                            "method": "plugin.future.v2",
+                            "config": {"preserve": [1, True, "value"]},
+                        }
+                    }
+                },
+                strict=True,
+            ),
+            "source": imported_source,
+            "updated_at": "2026-07-14T12:01:00Z",
+        }
+    )
+    second, _, _, _ = _bridge(
+        modified,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    activation = second.activate_project(
+        modified,
+        idempotency_key="activate-modified-project-0002",
+    )
+
+    assert len(fake_core.patch_requests) == 1
+    patch, if_match, patch_key = fake_core.patch_requests[0]
+    assert patch.task == map_project_create_v1(modified).task
+    assert patch.spec == map_project_create_v1(modified).spec
+    assert patch.workspace == map_project_create_v1(modified).workspace
+    assert if_match == original_mapping.project_etag
+    assert patch_key.startswith("desktop-core-")
+    assert activation.core_project.current_project_snapshot != original_mapping.project_snapshot
+    assert activation.core_project.current_task_snapshot != original_mapping.task_snapshot
+    assert (
+        activation.core_project.current_workspace_snapshot != original_mapping.workspace_snapshot
+    )
+    assert persistence.mapping is not None
+    assert persistence.mapping.request_sha256 != original_mapping.request_sha256
+    assert persistence.mapping.mapping_generation == original_mapping.mapping_generation + 1
+    assert persistence.mapping.predecessor_request_sha256 == original_mapping.request_sha256
+    assert persistence.mapping.project_create == map_project_create_v1(modified)
+    assert persistence.mapping_history == [original_mapping, persistence.mapping]
+    assert (
+        len(
+            [
+                request
+                for request in fake_core.calls
+                if request.method == "POST" and request.url.path == "/v1/projects"
+            ]
+        )
+        == 1
+    )
+
+
+def test_imported_workspace_patch_uses_a_new_snapshot_bound_upload() -> None:
+    original = _local_project(imported=True)
+    first, persistence, fake_core, _ = _bridge(original)
+    first.activate_project(original, idempotency_key="activate-import-original-0001")
+    first.close()
+    assert persistence.operation is not None
+    original_upload_id = persistence.operation.workspace_upload_id
+    original_upload_snapshot = persistence.operation.workspace_upload_project_snapshot
+    original_mapping = persistence.mapping
+    assert original_upload_id == "upload-1"
+    assert original_upload_snapshot is not None
+    assert original_mapping is not None
+
+    archive = b"\1" * 1024
+    source = local_v1.ProjectSourceV1(
+        kind="native_folder_snapshot",
+        display_name="Updated workspace",
+        import_ref=local_v1.WorkspaceImportRefV1(
+            import_id="adopted-import-2",
+            content_sha256=hashlib.sha256(archive).hexdigest(),
+            byte_size=len(archive),
+            entry_count=0,
+            extracted_byte_size=0,
+        ),
+    )
+    modified = original.model_copy(update={"source": source, "updated_at": "2026-07-14T12:02:00Z"})
+    second, _, _, _ = _bridge(
+        modified,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    activation = second.activate_project(
+        modified,
+        idempotency_key="activate-import-updated-0002",
+    )
+
+    assert fake_core.upload_count == 2
+    assert persistence.operation is not None
+    assert persistence.operation.workspace_upload_id == "upload-2"
+    assert persistence.operation.workspace_upload_project_snapshot != original_upload_snapshot
+    assert activation.core_project.current_project_snapshot != original_mapping.project_snapshot
+    assert (
+        activation.core_project.current_workspace_snapshot != original_mapping.workspace_snapshot
+    )
+    assert persistence.mapping is not None
+    assert (
+        persistence.mapping.project_create.workspace == map_project_create_v1(modified).workspace
+    )
+
+
+def test_unknown_patch_outcome_replays_the_exact_versioned_request_key() -> None:
+    original = _local_project()
+    bridge, persistence, fake_core, _ = _bridge(original)
+    bridge.activate_project(original, idempotency_key="activate-patch-base-0001")
+    modified = original.model_copy(
+        update={
+            "task": local_v1.ProjectTaskV1(
+                title="Changed after transport loss",
+                objective="Retry the exact Core patch.",
+            ),
+            "updated_at": "2026-07-14T12:03:00Z",
+        }
+    )
+    fake_core.lose_patch_before_apply_once = True
+
+    with pytest.raises(CoreClientErrorV1):
+        bridge.activate_project(modified, idempotency_key="local-patch-action-0001")
+
+    original_mapping = persistence.mapping
+    assert original_mapping is not None
+    activation = bridge.activate_project(
+        modified,
+        idempotency_key="local-patch-action-0002",
+    )
+
+    assert len(fake_core.patch_requests) == 2
+    first_patch, first_etag, first_key = fake_core.patch_requests[0]
+    second_patch, second_etag, second_key = fake_core.patch_requests[1]
+    assert first_patch == second_patch
+    assert first_etag == second_etag == original_mapping.project_etag
+    assert first_key == second_key
+    assert activation.core_project.task == map_project_create_v1(modified).task
+    assert persistence.mapping is not None
+    assert persistence.mapping.request_sha256 != original_mapping.request_sha256
+
+
+def test_unknown_patch_outcome_already_applied_is_reconciled_without_duplicate_patch() -> None:
+    original = _local_project()
+    bridge, persistence, fake_core, _ = _bridge(original)
+    bridge.activate_project(original, idempotency_key="applied-patch-base-0001")
+    original_mapping = persistence.mapping
+    assert original_mapping is not None
+    modified = original.model_copy(
+        update={
+            "execution": local_v1.ExecutionSettingsV1(
+                mode="self-deployed",
+                hf_model="openai/gpt-oss-120b",
+            ),
+            "updated_at": "2026-07-14T12:04:00Z",
+        }
+    )
+    fake_core.lose_patch_after_apply_once = True
+
+    with pytest.raises(CoreClientErrorV1):
+        bridge.activate_project(modified, idempotency_key="applied-patch-action-0001")
+
+    activation = bridge.activate_project(
+        modified,
+        idempotency_key="applied-patch-action-0002",
+    )
+
+    assert len(fake_core.patch_requests) == 1
+    assert activation.core_project.spec == map_project_create_v1(modified).spec
+    assert persistence.mapping is not None
+    assert persistence.mapping.mapping_generation == 2
+    assert persistence.mapping.predecessor_request_sha256 == original_mapping.request_sha256
+
+
 def test_core_503_is_preserved_without_synthetic_capability_success() -> None:
     local_project = _local_project()
     bridge, _, fake_core, _ = _bridge(local_project)
@@ -752,14 +1200,64 @@ def test_switch_and_close_seal_old_client_before_new_delivery(
     worker = threading.Thread(target=read_runs)
     worker.start()
     assert started.wait(timeout=1)
-    bridge.close()
+    closer = threading.Thread(target=bridge.close)
+    closer.start()
+    time.sleep(0.05)
+    assert closer.is_alive()
     release.set()
     worker.join(timeout=2)
+    closer.join(timeout=2)
 
     assert len(tunnels.handles) == 1
     assert tunnels.handles[0].closed is True
     assert isinstance(result[0], DesktopCoreBridgeErrorV1)
     assert result[0].error.code == "active_project_session_superseded"
+
+
+def test_new_activation_retires_an_inflight_candidate_before_starting_core_work() -> None:
+    local_project = _local_project()
+    bridge, _, fake_core, tunnels = _bridge(local_project)
+    fake_core.block_method = "GET"
+    fake_core.block_path = "/v1/capabilities"
+    first_result: list[object] = []
+    second_result: list[object] = []
+
+    def activate(key: str, destination: list[object]) -> None:
+        try:
+            destination.append(bridge.activate_project(local_project, idempotency_key=key))
+        except BaseException as exc:
+            destination.append(exc)
+
+    first = threading.Thread(
+        target=activate,
+        args=("candidate-first-action-0001", first_result),
+    )
+    first.start()
+    assert fake_core.block_entered.wait(timeout=1)
+    second = threading.Thread(
+        target=activate,
+        args=("candidate-second-action-0002", second_result),
+    )
+    second.start()
+    time.sleep(0.05)
+    assert second.is_alive()
+    fake_core.block_release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert isinstance(first_result[0], DesktopCoreBridgeErrorV1 | CoreClientErrorV1)
+    assert isinstance(second_result[0], bridge_module.CoreActivationV1)
+    create_calls = [
+        request
+        for request in fake_core.calls
+        if request.method == "POST" and request.url.path == "/v1/projects"
+    ]
+    assert len(create_calls) == 1
+    assert create_calls[0].headers["Idempotency-Key"] == "candidate-second-action-0002"
+    assert len(tunnels.handles) == 2
+    assert tunnels.handles[0].closed is True
+    assert tunnels.handles[1].closed is False
+    bridge.close()
 
 
 def test_private_identity_is_rejected_before_proxy_transport() -> None:
@@ -858,6 +1356,502 @@ def test_close_rejects_new_calls_and_is_idempotent() -> None:
     with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
         bridge.capabilities(LOCAL_PROJECT_ID)
     assert exc_info.value.error.code == "desktop_core_bridge_closed"
+
+
+def test_bearer_never_appears_in_attachment_or_session_repr() -> None:
+    token = secrets.token_urlsafe(32)
+    attachment = CoreHostAttachmentV1(
+        profile_id=PROFILE_ID,
+        remote_port=43117,
+        bearer_token=token,
+        bearer_identity="core-host-key-1",
+    )
+
+    assert token not in repr(attachment)
+    assert token not in str(attachment)
+
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="repr-activation-0001")
+    assert bridge._active is not None
+    session_token = bridge._active.attachment.bearer_token
+    assert session_token not in repr(bridge._active)
+    assert session_token not in repr(bridge._active.tunnel)
+    bridge.close()
+
+
+def test_injected_adapter_exception_does_not_leak_path_or_error_detail() -> None:
+    local_project = _local_project()
+    tunnels = FakeTunnelFactory()
+    private_detail = "/home/private-user/.ssh/id_ed25519"
+
+    def leaky_transport_factory() -> httpx.BaseTransport:
+        raise TimeoutError(private_detail)
+
+    bridge = DesktopCoreBridgeV1(
+        host_service=FakeHostService(),
+        tunnel_factory=tunnels,
+        persistence=FakePersistence(),
+        archive_source=FakeArchiveSource(),
+        transport_factory=leaky_transport_factory,
+        timeout=1.0,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.activate_project(
+            local_project,
+            idempotency_key="leaky-adapter-activation-0001",
+        )
+
+    assert exc_info.value.error.code == "core_bridge_adapter_failed"
+    assert private_detail not in str(exc_info.value)
+    assert private_detail not in repr(exc_info.value)
+    assert private_detail not in exc_info.value.error.model_dump_json()
+    assert len(tunnels.handles) == 1
+    assert tunnels.handles[0].closed is True
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])
+def test_tunnel_close_failure_is_observable_and_retryable(
+    error_type: type[Exception],
+) -> None:
+    attempts = 0
+
+    def close_callback() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise error_type("injected close failure")
+
+    handle = CoreTunnelHandleV1(
+        endpoint="http://127.0.0.1:48765",
+        session_id="session-close-test",
+        close_callback=close_callback,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        handle.close(deadline=bridge_module.time.monotonic() + 1)
+
+    assert exc_info.value.error.code == "core_tunnel_close_failed"
+    assert handle.closed is False
+    assert handle.close_failure == "callback_failed"
+
+    handle.close(deadline=bridge_module.time.monotonic() + 1)
+    assert handle.closed is True
+    assert handle.close_failure is None
+    assert attempts == 2
+
+
+def test_bridge_close_is_bounded_and_not_announced_until_tunnel_closes() -> None:
+    local_project = _local_project()
+    bridge, _, _, tunnels = _bridge(local_project, timeout=0.1)
+    bridge.activate_project(local_project, idempotency_key="bounded-close-activate-0001")
+    release = threading.Event()
+    handle = tunnels.handles[0]
+    handle._close_callback = lambda: release.wait(timeout=2)
+
+    started = time.monotonic()
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.close()
+    elapsed = time.monotonic() - started
+
+    assert exc_info.value.error.code == "core_tunnel_close_deadline_exceeded"
+    assert elapsed < 0.75
+    assert bridge._closed is False
+    assert handle.closed is False
+    assert handle.close_failure == "deadline_exceeded"
+
+    release.set()
+    bridge.close()
+    assert bridge._closed is True
+    assert handle.closed is True
+
+
+def test_tunnel_returning_after_adapter_deadline_is_adopted_and_closed() -> None:
+    local_project = _local_project()
+    bridge, _, _, tunnels = _bridge(local_project, timeout=0.1)
+    tunnels.block_open = True
+    release_timer = threading.Timer(0.15, tunnels.open_release.set)
+    release_timer.start()
+    try:
+        with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+            bridge.activate_project(
+                local_project,
+                idempotency_key="late-tunnel-activate-0001",
+            )
+    finally:
+        release_timer.cancel()
+
+    assert exc_info.value.error.code == "core_bridge_adapter_deadline_exceeded"
+    assert tunnels.open_entered.is_set()
+    assert len(tunnels.handles) == 1
+    assert tunnels.handles[0].closed is True
+    assert bridge._active is None
+
+
+def test_client_returning_after_adapter_deadline_is_adopted_and_closed() -> None:
+    class TrackingTransport(httpx.BaseTransport):
+        def __init__(self) -> None:
+            self.closed = False
+
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            raise AssertionError(f"late client performed transport: {request.url.path}")
+
+        def close(self) -> None:
+            self.closed = True
+
+    local_project = _local_project()
+    tunnels = FakeTunnelFactory()
+    release = threading.Event()
+    transport = TrackingTransport()
+
+    def delayed_transport_factory() -> httpx.BaseTransport:
+        assert release.wait(timeout=2)
+        return transport
+
+    bridge = DesktopCoreBridgeV1(
+        host_service=FakeHostService(),
+        tunnel_factory=tunnels,
+        persistence=FakePersistence(),
+        archive_source=FakeArchiveSource(),
+        transport_factory=delayed_transport_factory,
+        timeout=0.1,
+    )
+    release_timer = threading.Timer(0.15, release.set)
+    release_timer.start()
+    try:
+        with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+            bridge.activate_project(
+                local_project,
+                idempotency_key="late-client-activate-0001",
+            )
+    finally:
+        release_timer.cancel()
+
+    assert exc_info.value.error.code == "core_bridge_adapter_deadline_exceeded"
+    assert transport.closed is True
+    assert len(tunnels.handles) == 1
+    assert tunnels.handles[0].closed is True
+    assert bridge._active is None
+
+
+def test_failed_tunnel_retirement_blocks_switch_until_a_retry_succeeds() -> None:
+    local_project = _local_project()
+    bridge, _, _, tunnels = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="switch-close-base-0001")
+    attempts = 0
+
+    def close_callback() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("injected switch close failure")
+
+    tunnels.handles[0]._close_callback = close_callback
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.activate_project(local_project, idempotency_key="switch-close-failed-0002")
+
+    assert exc_info.value.error.code == "core_tunnel_close_failed"
+    assert len(tunnels.handles) == 1
+    assert bridge._active is not None
+    assert bridge._active.token.cancelled is True
+
+    activation = bridge.activate_project(
+        local_project,
+        idempotency_key="switch-close-retry-0003",
+    )
+    assert activation.local_project_id == LOCAL_PROJECT_ID
+    assert attempts == 2
+    assert len(tunnels.handles) == 2
+    assert tunnels.handles[0].closed is True
+    bridge.close()
+
+
+@pytest.mark.parametrize(
+    ("imported", "method", "path", "forbidden_path"),
+    [
+        (False, "GET", "/v1/capabilities", "/v1/projects"),
+        (False, "POST", "/v1/projects", "/v1/projects/core-project-1"),
+        (
+            True,
+            "PUT",
+            "/v1/projects/core-project-1/workspace-uploads/upload-1/chunk",
+            "/v1/projects/core-project-1/workspace-uploads/upload-1/finalize",
+        ),
+        (
+            False,
+            "POST",
+            "/v1/projects/core-project-1/validate",
+            "/never-after-validation",
+        ),
+    ],
+)
+def test_close_seals_inflight_candidate_before_any_later_core_mutation(
+    imported: bool,
+    method: str,
+    path: str,
+    forbidden_path: str,
+) -> None:
+    local_project = _local_project(imported=imported)
+    bridge, persistence, fake_core, tunnels = _bridge(local_project)
+    fake_core.block_method = method
+    fake_core.block_path = path
+    activation_result: list[object] = []
+    close_result: list[object] = []
+
+    def activate() -> None:
+        try:
+            activation_result.append(
+                bridge.activate_project(
+                    local_project,
+                    idempotency_key="candidate-close-race-0001",
+                )
+            )
+        except BaseException as exc:
+            activation_result.append(exc)
+
+    def close() -> None:
+        try:
+            bridge.close()
+            close_result.append("closed")
+        except BaseException as exc:
+            close_result.append(exc)
+
+    activation_thread = threading.Thread(target=activate)
+    activation_thread.start()
+    assert fake_core.block_entered.wait(timeout=1)
+    close_thread = threading.Thread(target=close)
+    close_thread.start()
+    time.sleep(0.05)
+    assert close_thread.is_alive()
+    fake_core.block_release.set()
+    activation_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert close_result == ["closed"]
+    assert isinstance(activation_result[0], DesktopCoreBridgeErrorV1 | CoreClientErrorV1)
+    assert all(request.url.path != forbidden_path for request in fake_core.calls)
+    if path.endswith("/validate"):
+        assert persistence.mapping is None
+    assert all(handle.closed for handle in tunnels.handles)
+
+
+def test_close_waits_for_blocking_host_adapter_and_prevents_core_calls() -> None:
+    local_project = _local_project()
+    bridge, _, fake_core, _ = _bridge(local_project)
+    host = bridge._host_service
+    assert isinstance(host, FakeHostService)
+    host.block = True
+    activation_result: list[object] = []
+
+    def activate() -> None:
+        try:
+            activation_result.append(
+                bridge.activate_project(
+                    local_project,
+                    idempotency_key="blocked-host-activate-0001",
+                )
+            )
+        except BaseException as exc:
+            activation_result.append(exc)
+
+    activation_thread = threading.Thread(target=activate)
+    activation_thread.start()
+    assert host.entered.wait(timeout=1)
+    close_thread = threading.Thread(target=bridge.close)
+    close_thread.start()
+    time.sleep(0.05)
+    assert close_thread.is_alive()
+    host.release.set()
+    activation_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert fake_core.calls == []
+    assert isinstance(activation_result[0], DesktopCoreBridgeErrorV1)
+
+
+def test_close_waits_for_blocking_persistence_commit_before_returning() -> None:
+    local_project = _local_project()
+    persistence = FakePersistence()
+    persistence.block_commit = True
+    bridge, _, fake_core, tunnels = _bridge(
+        local_project,
+        persistence=persistence,
+    )
+    activation_result: list[object] = []
+    close_result: list[object] = []
+
+    def activate() -> None:
+        try:
+            activation_result.append(
+                bridge.activate_project(
+                    local_project,
+                    idempotency_key="blocked-persistence-activate-0001",
+                )
+            )
+        except BaseException as exc:
+            activation_result.append(exc)
+
+    def close() -> None:
+        try:
+            bridge.close()
+            close_result.append("closed")
+        except BaseException as exc:
+            close_result.append(exc)
+
+    activation_thread = threading.Thread(target=activate)
+    activation_thread.start()
+    assert persistence.commit_entered.wait(timeout=1)
+    close_thread = threading.Thread(target=close)
+    close_thread.start()
+    time.sleep(0.05)
+    assert close_thread.is_alive()
+    persistence.commit_release.set()
+    activation_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert close_result == ["closed"]
+    assert isinstance(activation_result[0], DesktopCoreBridgeErrorV1)
+    assert persistence.mapping is not None
+    events_after_close = tuple(persistence.events)
+    time.sleep(0.05)
+    assert tuple(persistence.events) == events_after_close
+    assert all(handle.closed for handle in tunnels.handles)
+    assert not any(request.url.path == "/v1/runs" for request in fake_core.calls)
+
+
+def test_blocking_persistence_adapter_has_a_bounded_activation_deadline() -> None:
+    local_project = _local_project()
+    persistence = FakePersistence()
+    persistence.block_commit = True
+    bridge, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        timeout=0.5,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.activate_project(
+            local_project,
+            idempotency_key="persistence-deadline-activate-0001",
+        )
+    elapsed = time.monotonic() - started
+
+    assert exc_info.value.error.code == "core_bridge_retirement_deadline_exceeded"
+    assert elapsed < 1.75
+    assert bridge._active is None
+    persistence.commit_release.set()
+    bridge.close()
+    assert bridge._closed is True
+
+
+def test_close_waits_for_blocking_archive_read_and_prevents_upload_mutation() -> None:
+    local_project = _local_project(imported=True)
+    archive_source = BlockingArchiveSource()
+    bridge, _, fake_core, tunnels = _bridge(
+        local_project,
+        archive_source=archive_source,
+    )
+    activation_result: list[object] = []
+
+    def activate() -> None:
+        try:
+            activation_result.append(
+                bridge.activate_project(
+                    local_project,
+                    idempotency_key="blocked-archive-activate-0001",
+                )
+            )
+        except BaseException as exc:
+            activation_result.append(exc)
+
+    activation_thread = threading.Thread(target=activate)
+    activation_thread.start()
+    assert archive_source.stream.entered.wait(timeout=1)
+    close_thread = threading.Thread(target=bridge.close)
+    close_thread.start()
+    time.sleep(0.05)
+    assert close_thread.is_alive()
+    archive_source.stream.release.set()
+    activation_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert isinstance(activation_result[0], DesktopCoreBridgeErrorV1)
+    assert archive_source.stream.closed is True
+    assert not any(request.url.path.endswith("/chunk") for request in fake_core.calls)
+    assert not any(request.url.path.endswith("/finalize") for request in fake_core.calls)
+    assert all(handle.closed for handle in tunnels.handles)
+
+
+def test_deterministic_precreate_failure_allows_a_new_local_retry_key() -> None:
+    local_project = _local_project()
+    persistence = FakePersistence()
+    fake_core = FakeCore(local_project)
+    fake_core.fail_capabilities_with_503 = True
+    first, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    with pytest.raises(CoreClientErrorV1):
+        first.activate_project(local_project, idempotency_key="precreate-failure-key-0001")
+
+    assert persistence.operation is not None
+    assert persistence.operation.state is CoreProjectCreateStateV1.PRE_CREATE
+    fake_core.fail_capabilities_with_503 = False
+    second, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    second.activate_project(local_project, idempotency_key="precreate-retry-key-00002")
+
+    create_calls = [
+        request
+        for request in fake_core.calls
+        if request.method == "POST" and request.url.path == "/v1/projects"
+    ]
+    assert len(create_calls) == 1
+    assert create_calls[0].headers["Idempotency-Key"] == "precreate-retry-key-00002"
+
+
+def test_bound_create_resumes_with_new_local_action_without_duplicate_create() -> None:
+    local_project = _local_project()
+    persistence = FakePersistence()
+    persistence.fail_commit_once = True
+    fake_core = FakeCore(local_project)
+    first, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        first.activate_project(local_project, idempotency_key="bound-create-key-00001")
+
+    assert exc_info.value.error.code == "core_bridge_adapter_failed"
+    assert "injected mapping commit failure" not in str(exc_info.value)
+    assert "/home/" not in repr(exc_info.value)
+    assert persistence.operation is not None
+    assert persistence.operation.state is CoreProjectCreateStateV1.BOUND
+    second, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    second.activate_project(local_project, idempotency_key="bound-resume-new-key-0002")
+
+    assert (
+        len(
+            [
+                request
+                for request in fake_core.calls
+                if request.method == "POST" and request.url.path == "/v1/projects"
+            ]
+        )
+        == 1
+    )
 
 
 def test_deadline_is_shared_with_host_and_rejects_expired_activation(

@@ -13,30 +13,64 @@ child services over SSH.
   identity and remote port. It does not receive the bearer.
 - `WorkspaceArchiveSource` resolves an already adopted
   `WorkspaceImportRefV1` to a read-only binary stream. Its contract has no path.
-- `DesktopCoreBridgePersistence` durably reserves exact create intent, records
-  upload progress identity, and atomically commits the local-to-Core mapping.
+- `DesktopCoreBridgePersistence` durably transitions project create ownership,
+  records snapshot-bound upload identity, and compare-and-swaps the
+  local-to-Core mapping while retaining adapter-owned history.
 
 The persisted create operation binds local project, profile, Core host
 identity, canonical Core `ProjectCreateV1` digest, idempotency key, returned
-Core project ID, and workspace upload ID. The completed mapping additionally
-binds the exact project/task/workspace snapshot refs and registry digest.
-Unknown create outcomes are retried with the same canonical request and key;
-changed intent fails before HTTP transport.
+Core project ID, and workspace upload ID plus its owning project snapshot. Its
+state is explicit:
+
+- `pre_create` proves no create request has been dispatched. A deterministic
+  failure in version/capability/bootstrap preparation leaves this state, so a
+  later Local retry action may atomically reserve a new key.
+- `unknown` is persisted immediately before project create transport. Only the
+  exact canonical request and original key may replay it.
+- `bound` records the Core-assigned project ID. Later Local activation keys
+  resume that binding and never issue another project create.
+
+The completed mapping also stores the canonical mapped request, exact
+project/task/workspace snapshots, project ETag, registry digest, monotonic
+mapping generation, and predecessor request digest. Mapping commit receives the
+complete expected prior mapping; a durable adapter must retain the ordered audit
+history and reject lost updates. Every load recomputes the canonical request
+digest before Core transport.
 
 ## Session Ownership
 
-One `DesktopCoreBridgeV1` owns at most one `DesktopCoreActiveSessionV1`. The
-session owns one tunnel and one project-bound `CoreControlClientV1`. Activation,
-switch, and close advance a bridge generation. Calls snapshot the active session
-and generation before invoking Core and check both again before returning. The
-strict client supplies the inner response/cache delivery barrier; sealing it
-prevents an old HTTP or SSE result from committing after a switch.
+One `DesktopCoreBridgeV1` owns at most one candidate or active generation. A
+generation token owns every client, tunnel, archive context, and unfinished
+blocking-adapter future created for that candidate. Every Core call and every
+host/tunnel/archive/persistence callback enters the token's external-call gate,
+checks generation and deadline before and after the call, and cannot overlap
+successful retirement. The strict client supplies the inner HTTP/SSE response
+and cache delivery barrier.
 
-An activation uses one finite wall-clock deadline across host attach, tunnel
-open, version negotiation, capabilities, project create/read, workspace
-publication, revision-head read, validation, persistence, and publication. A
-candidate that misses its generation or deadline is closed and never becomes
-active.
+Activation, switch, and close are serialized. A switch first cancels and fully
+retires the previous candidate or active token; no new host/Core work starts
+until its clients, adapter work, archive contexts, and tunnel are closed. A
+successful `close()` therefore proves that the old generation can perform no
+later capability, create, upload, validation, or persistence work. A failed or
+timed-out cleanup does not mark the bridge or tunnel closed and prevents a new
+session from publishing. Cleanup is observable through a typed retryable error
+and tunnel `close_failure`; calling close or activation again retries ownership
+of the same close operation.
+
+The forward activation path uses one finite wall-clock deadline across host
+attach, tunnel open, version negotiation, capabilities, project create/read,
+workspace publication, revision-head read, validation, persistence, and
+publication. Failed-candidate retirement receives a separate bounded cleanup
+window so resource ownership is not abandoned when the forward deadline
+expires.
+
+Potentially blocking Python adapters execute on a fixed-size, bounded daemon
+executor. Deadline expiry stops delivery immediately; unfinished work remains
+owned by the cancelled generation, and successful close/switch waits for it.
+Retirement itself is bounded and fails closed if that work does not finish, so
+the bridge never converts an unbounded callback into a false successful close.
+Resources returned after the original deadline are adopted before their future
+completes and are closed during retirement.
 
 ## Deterministic Project Mapping
 
@@ -54,9 +88,21 @@ Local project fields map as follows:
 The local project ID, profile ID, import ID, host path, command, credential
 reference, and bearer are not fields in Core `ProjectCreateV1`. Archive bytes
 are re-counted and re-hashed while streaming. Upload create, each fixed chunk,
-and finalize use deterministic sub-keys; a persisted upload ID permits recovery
-from an unknown chunk/finalize outcome through Core's authoritative upload and
-project state.
+and finalize use deterministic sub-keys bound to the Core project snapshot. A
+persisted upload ID is reused only for that exact snapshot, project ETag,
+archive declaration, and base workspace snapshot. A changed imported workspace
+therefore gets a new upload instead of reusing the prior version's session.
+
+For an existing mapping, Desktop first rereads the exact Core project. Unchanged
+intent must match the stored canonical request, snapshots, ETag, and registry.
+Changed name, task, model/execution, evolution config, or workspace is sent
+through frozen Core `patch_project` with the stored ETag and a deterministic key
+derived from old and new canonical request digests. Core must return a new
+project snapshot and ETag, plus a new task/workspace snapshot state when those
+inputs changed. Unknown patch outcomes are recovered by rereading Core; if the
+patch did not apply, retry uses the exact same key. Mapping CAS occurs only
+after workspace publication, readiness, revision-head agreement, and Core
+validation, preserving the prior mapping as traceable history until then.
 
 ## Run And Resource Proxy
 
