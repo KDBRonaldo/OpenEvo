@@ -11,6 +11,22 @@ It accepts a provider only after the Tauri bootstrap and `DesktopApiClientV1`
 agree on contract major, checked-in OpenAPI digest, provider kind, and required
 features. The contract simulator is test-only and is not a release fallback.
 
+For renderer visual QA, run the Vite development server and open
+`/product-preview.html?scenario=<name>`. The closed scenario set is `new-user`,
+`offline`, `online`, `completed`, and `degraded`. This secondary HTML entry is
+served only by Vite during development; the Tauri release build starts from
+`index.html`, and `preview.tsx` also rejects production execution. The preview
+therefore exercises the real product components against strict contract
+fixtures without becoming a release provider or fallback.
+
+The first-run renderer exposes one next action at a time. Until a remote profile
+exists, the Research workspace owns the `Add workspace` action and project
+creation is disabled. Once a profile is present, project creation becomes
+available. A project with no enabled evolution target remains runnable, but its
+Evolution view offers `Configure evolution`; that action opens the normal
+project drawer and still derives every target, method, schema, and default from
+the active remote capability payload.
+
 `LocalApiDesktopProductProvider` is the release adapter. It aggregates all
 bounded cursor pages, reloads exact run details, and marks artifacts complete
 only when every run artifact page succeeds. Capabilities and validation are

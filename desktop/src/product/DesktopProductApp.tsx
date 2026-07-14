@@ -281,7 +281,7 @@ export function DesktopProductApp({
               </select>
               <ChevronDown size={15} aria-hidden="true" />
             </div>
-            <IconButton label="Create project" onClick={() => { setCreatingProject(true); setSettingsOpen(true); }}><Plus size={17} /></IconButton>
+            <IconButton label="Create project" onClick={() => { setCreatingProject(true); setSettingsOpen(true); }} disabled={!profile}><Plus size={17} /></IconButton>
           </div>
           <div className="topbar-actions">
             <ConnectionBadge state={displayedConnectionState} profileName={profile?.name ?? "Remote workspace"} />
@@ -324,6 +324,7 @@ export function DesktopProductApp({
           {workspace === "research" ? (
             <ResearchWorkspace
               project={project}
+              hasProfile={profile !== null}
               runs={projectRuns}
               activeRun={activeRun}
               timelines={snapshot.timelines}
@@ -336,6 +337,7 @@ export function DesktopProductApp({
               onStart={() => project && void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), { kind: "readmit_run", projectId: project.project_id })}
               onCancel={() => activeRun && void act(() => provider.cancelRun(activeRun.id, resourceIntent(snapshot, activeRun.etag)))}
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
+              onOpenConnection={() => setConnectionSettingsOpen(true)}
               onOpenEvolution={() => setWorkspace("evolution")}
               onOpenSystem={() => setWorkspace("system")}
               onRefresh={() => void refresh()}
@@ -349,6 +351,7 @@ export function DesktopProductApp({
               artifactCollection={snapshot.artifactCollection}
               provider={provider}
               onRefresh={() => void refresh()}
+              onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
             />
           ) : null}
           {workspace === "system" ? (
@@ -581,13 +584,7 @@ function ConnectionGate({
     );
   }
   if (!profile) {
-    return (
-      <section className="connection-gate" aria-live="polite">
-        <div className="gate-icon"><PanelLeft size={21} /></div>
-        <div className="gate-copy"><h2>Add a remote workspace</h2><p>Enter the server details used for research sessions.</p></div>
-        <button className="primary-button" type="button" onClick={onSetup}><Plus size={16} /> Add workspace</button>
-      </section>
-    );
+    return null;
   }
   const credentialReason = missingCredentialReason(profile);
   return (
@@ -632,6 +629,7 @@ function ProjectActivationGate({
 
 function ResearchWorkspace({
   project,
+  hasProfile,
   runs,
   activeRun,
   timelines,
@@ -644,11 +642,13 @@ function ResearchWorkspace({
   onStart,
   onCancel,
   onOpenSettings,
+  onOpenConnection,
   onOpenEvolution,
   onOpenSystem,
   onRefresh,
 }: {
   project: ProjectV1 | null;
+  hasProfile: boolean;
   runs: readonly RunV1[];
   activeRun: RunV1 | null;
   timelines: DesktopProductSnapshot["timelines"];
@@ -661,12 +661,15 @@ function ResearchWorkspace({
   onStart: () => void;
   onCancel: () => void;
   onOpenSettings: () => void;
+  onOpenConnection: () => void;
   onOpenEvolution: () => void;
   onOpenSystem: () => void;
   onRefresh: () => void;
 }) {
   if (!project) {
-    return <EmptyState icon={FolderOpen} title="Create a research project" detail="Define a task and source to begin a session." action="Create project" onAction={onOpenSettings} />;
+    return hasProfile
+      ? <EmptyState icon={FolderOpen} title="Create a research project" detail="Define a task and source to begin a session." action="Create project" onAction={onOpenSettings} />
+      : <EmptyState icon={PanelLeft} title="Add a remote workspace" detail="Enter the server that will run research sessions." action="Add workspace" actionIcon={Plus} onAction={onOpenConnection} />;
   }
   const latestTerminal = runs.find((run) => isTerminal(run.status));
   const outputRun = activeRun ?? latestTerminal ?? null;
@@ -981,7 +984,7 @@ function RunOutcomeSummary({ run, onOpenEvolution, recovery }: { run: RunV1; onO
   );
 }
 
-function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, provider, onRefresh }: { project: ProjectV1 | null; runs: readonly RunV1[]; artifacts: readonly ArtifactV1[]; artifactCollection: ProductArtifactCollectionState; provider: DesktopProductProvider; onRefresh: () => void }) {
+function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, provider, onRefresh, onOpenSettings }: { project: ProjectV1 | null; runs: readonly RunV1[]; artifacts: readonly ArtifactV1[]; artifactCollection: ProductArtifactCollectionState; provider: DesktopProductProvider; onRefresh: () => void; onOpenSettings: () => void }) {
   const activeRevision = project ? authoritativeActiveRevision(project, runs) : null;
   const orderedArtifacts = activeRevision && artifactCollection.status === "complete"
     ? selectedArtifactsForRevision(artifacts, activeRevision)
@@ -1029,6 +1032,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
   if (!project) return <EmptyState icon={Sparkles} title="No evolution history" detail="Choose a project to inspect revisions and artifacts." />;
   const selected = orderedArtifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null;
   const activeGeneration = activeRevision?.generation ?? null;
+  const evolutionEnabled = Object.values(project.evolution.targets).some((target) => target.enabled);
   return (
     <div className="workspace-stack" data-testid="evolution-workspace">
       <div className="workspace-heading">
@@ -1042,7 +1046,9 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
       ) : artifactCollection.status !== "complete" ? (
         <EmptyState icon={RefreshCw} title="Artifact collection is incomplete" detail="Refetch all artifact pages before inspecting revision membership." action="Refetch artifacts" actionIcon={RefreshCw} onAction={onRefresh} />
       ) : orderedArtifacts.length === 0 ? (
-        <EmptyState icon={MemoryStick} title="No evolved artifacts yet" detail="Complete a session to create memory, skills, and agent guidance for the next revision." />
+        evolutionEnabled
+          ? <EmptyState icon={MemoryStick} title="No evolved artifacts yet" detail="Complete a session to create memory, skills, and agent guidance for the next revision." />
+          : <EmptyState icon={Settings} title="Evolution is not configured" detail="Choose evolution targets for future sessions." action="Configure evolution" actionIcon={Settings} onAction={onOpenSettings} />
       ) : (
         <div className="artifact-layout">
           <aside className="artifact-list" aria-label="Evolution artifacts">

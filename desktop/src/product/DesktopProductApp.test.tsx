@@ -181,6 +181,8 @@ describe("DesktopProductApp", () => {
     root = await renderProduct(provider);
 
     expect(screenText()).toContain("Add a remote workspace");
+    expect(optionalButton("Create project")).toBeNull();
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
     expect(screenText()).not.toContain("Start session");
     await clickButton("Add workspace");
     setInput("Workspace name", "Lab server");
@@ -201,6 +203,7 @@ describe("DesktopProductApp", () => {
     await advance(25);
     expect(screenText()).toContain("Online");
     expect(screenText()).toContain("Create a research project");
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(false);
 
     await clickButton("Create project");
     setInput("Project name", "Catalyst study");
@@ -218,6 +221,12 @@ describe("DesktopProductApp", () => {
       mode: "codex_subscription_transcript",
       codex_model: "gpt-5.5",
     });
+
+    await clickButton("Evolution");
+    expect(screenText()).toContain("Evolution is not configured");
+    await clickButton("Configure evolution");
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(screenText()).toContain("Evolution targets");
   });
 
   it("shows the authoritative retired state after editing an active project", async () => {
