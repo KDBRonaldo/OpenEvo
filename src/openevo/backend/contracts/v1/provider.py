@@ -200,12 +200,17 @@ class CoreControlProviderV1:
         with self._close_lock:
             if self._closed:
                 return
-            if self._run_control is not None:
-                self._run_control.close()
-                self._run_control = None
+            run_control = self._run_control
+            if run_control is not None:
+                request_stop = getattr(run_control, "request_stop", None)
+                if callable(request_stop):
+                    request_stop()
             if self._service_supervisor is not None:
                 self._service_supervisor.close()
                 self._service_supervisor = None
+            if self._run_control is not None:
+                self._run_control.close()
+                self._run_control = None
             future = self._executor.submit(self.store.close)
             future.result()
             self._closed = True

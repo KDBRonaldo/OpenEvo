@@ -221,6 +221,13 @@ class CoreScienceRunOwner:
             raise _admission_denied()
 
     def close(self) -> None:
+        self.request_stop()
+        self._worker.join(timeout=30.0)
+        if self._worker.is_alive():
+            raise RuntimeError("science run owner did not stop before shutdown")
+        self._ledger.close()
+
+    def request_stop(self) -> None:
         with self._condition:
             if self._closed:
                 return
@@ -228,9 +235,6 @@ class CoreScienceRunOwner:
             for event in self._cancel_events.values():
                 event.set()
             self._condition.notify_all()
-        self._worker.join(timeout=5.0)
-        if not self._worker.is_alive():
-            self._ledger.close()
 
     def _create_run(self, arguments: Mapping[str, object]) -> Response:
         request = cast(m.RunCreateV1, arguments["request"])

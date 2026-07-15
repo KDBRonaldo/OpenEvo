@@ -11,8 +11,8 @@ provider it returns the original HTTP 501 contract-only response on every
 route. `create_core_control_app(...)` creates `CoreControlStoreV1`, binds
 `CoreControlProviderV1` to the same routes by canonical `operation_id`, and
 constructs the release run owner through a factory that receives that exact
-store. Shutdown closes the run owner, managed service supervisor, and store in
-ownership order. It does not register a second
+store. Shutdown first asks the run owner to stop, closes managed services to
+release in-flight I/O, joins the owner, and finally closes the store. It does not register a second
 route table, call Desktop `/openevo-api` routes, or call model APIs.
 
 `GET /version` and `GET /health` are anonymous. Every path with a versioned
