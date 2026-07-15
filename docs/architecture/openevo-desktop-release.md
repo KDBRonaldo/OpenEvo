@@ -735,7 +735,7 @@ The replacement workflow must:
    required assets, download them into a clean directory, and revalidate names,
    versions, commits, checksums, title, tag name, target commit, body, draft
    state, prerelease state, ownership, and immutable numeric release ID at a
-   discrete API read;
+   discrete API read; persist cleanup authority once in an owner-only file;
 8. retain the point-in-time draft verification record as a run-attempt-qualified
    Actions artifact, prove no real Git tag was created, and leave the candidate
    as an unpublished review draft.

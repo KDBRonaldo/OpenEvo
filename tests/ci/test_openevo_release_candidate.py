@@ -180,6 +180,24 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         encoding="utf-8",
     )
     release_id = tmp_path / "release-id"
+    validation_arguments = [
+        "validate-draft",
+        str(metadata),
+        "--release-notes",
+        str(notes),
+        "--expected-tag",
+        "openevo-desktop-v0.1.0-exhibition.123.2",
+        "--expected-target",
+        "8e45af371eef49a86530a849041f7dcf047620ec",
+        "--expected-title",
+        "OpenEvo Desktop 0.1.0 unsigned candidate",
+        "--expected-repository",
+        "CompLifeLab-ZJU/OpenEvo",
+        "--expected-owner",
+        "d" * 32,
+        "--release-id-output",
+        str(release_id),
+    ]
 
     assert candidate.validate_draft_release_metadata(
         metadata,
@@ -190,29 +208,10 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         expected_repository="CompLifeLab-ZJU/OpenEvo",
         expected_owner="d" * 32,
     ) == []
-    assert (
-        candidate.main(
-            [
-                "validate-draft",
-                str(metadata),
-                "--release-notes",
-                str(notes),
-                "--expected-tag",
-                "openevo-desktop-v0.1.0-exhibition.123.2",
-                "--expected-target",
-                "8e45af371eef49a86530a849041f7dcf047620ec",
-                "--expected-title",
-                "OpenEvo Desktop 0.1.0 unsigned candidate",
-                "--expected-repository",
-                "CompLifeLab-ZJU/OpenEvo",
-                "--expected-owner",
-                "d" * 32,
-                "--release-id-output",
-                str(release_id),
-            ]
-        )
-        == 0
-    )
+    assert candidate.main(validation_arguments) == 0
+    assert release_id.read_text(encoding="ascii") == "354404740\n"
+    assert release_id.stat().st_mode & 0o777 == 0o600
+    assert candidate.main(validation_arguments) == 1
     assert release_id.read_text(encoding="ascii") == "354404740\n"
 
 

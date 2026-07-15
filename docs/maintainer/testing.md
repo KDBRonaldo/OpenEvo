@@ -157,8 +157,9 @@ flag. Its HTTPS review URL must belong to the expected repository; GitHub uses
 an opaque `untagged-*` URL slug for drafts, so the separately validated
 `tagName` remains the candidate tag-name authority. The repository-bound API
 URL must contain the immutable numeric release ID used for cleanup, preventing a
-same-tag replacement between validation and deletion from being deleted. The
-body must contain the canonical notes followed only by the 128-bit random
+same-tag replacement between validation and deletion from being deleted. The ID
+authority file must be created once with mode `0600` and must never be replaced.
+The body must contain the canonical notes followed only by the 128-bit random
 ownership marker generated for that workflow attempt. It stores that discrete,
 point-in-time record as a run-attempt-qualified immutable Actions artifact; this
 does not make an atomic claim about workflow completion. The

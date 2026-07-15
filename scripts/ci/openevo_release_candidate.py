@@ -7,6 +7,7 @@ import argparse
 from email.parser import Parser
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import stat
@@ -88,6 +89,19 @@ def _write_new(path: Path, payload: bytes) -> None:
             stream.write(payload)
     except FileExistsError as exc:
         raise CandidateError(f"Refusing to replace existing candidate file: {path.name}") from exc
+
+
+def _write_private_new(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise CandidateError(f"Refusing to replace existing candidate file: {path.name}") from exc
+    with os.fdopen(descriptor, "wb") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _load_json(path: Path) -> Any:
@@ -1000,7 +1014,10 @@ def main(argv: list[str] | None = None) -> int:
                 expected_owner=args.expected_owner,
             )
             if args.release_id_output is not None:
-                _write_new(args.release_id_output, f"{release_id}\n".encode("ascii"))
+                _write_private_new(
+                    args.release_id_output,
+                    f"{release_id}\n".encode("ascii"),
+                )
             print(f"OpenEvo draft release metadata validation passed: {args.metadata}")
             return 0
         errors = validate_candidate_manifest(

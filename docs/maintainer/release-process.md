@@ -144,7 +144,8 @@ outputs, downloads every asset into a clean directory, and verifies:
 - the GitHub draft title, tag, target commit, body, draft state, and prerelease
   state match the candidate at the discrete API read immediately after asset
   redownload. Its repository-bound API URL supplies the immutable numeric
-  release ID; this is not an atomic assertion about later workflow completion;
+  release ID; cleanup persists that authority once with mode `0600`. This is not
+  an atomic assertion about later workflow completion;
 - no unclassified development, secret, benchmark-private, or source-checkout
   files are present.
 
