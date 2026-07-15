@@ -55,8 +55,8 @@ Science environment profiles compile to runtime images:
 
 | Profile | Runtime image |
 |---|---|
-| `managed_science` | `openevo/science-runtime:0.1.0` |
-| `python_research` | `openevo/python-research-runtime:0.1.0` |
+| `managed_science` | release-locked `openevo/science-runtime@sha256:...` |
+| `python_research` | release-locked `openevo/python-research-runtime@sha256:...` |
 | `custom_image` | developer-supplied override |
 
 `custom_image` is an escape hatch for developers and advanced experiments. It is
@@ -66,6 +66,8 @@ returns an actionable error directing the user to a managed environment or
 self-deployed execution before compilation or runtime startup.
 
 For managed profiles, users do not upload or choose a runtime image in Desktop.
+The Science compiler serializes the release lock's immutable repository digest
+into `runtime.image`; the human-readable tag is only a local bootstrap alias.
 Every `managed_science` run, including `codex_subscription_transcript` and
 `self-deployed`, must reach Core as Docker + the exact canonical profile image +
 host-user execution. Runtime config, compiled `RuntimeSpec`, Core launcher, and

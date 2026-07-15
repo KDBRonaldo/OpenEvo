@@ -9,7 +9,7 @@ from openevo.evolution.framework.builtins import (
     build_builtin_registry,
 )
 from openevo.projects.science import PreparedWorkspace, ScienceProjectConfig, compile_science_project
-from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 
 _compile_experiment = experiments.compile_experiment
 _REGISTRY_SNAPSHOT = build_builtin_registry(
@@ -69,7 +69,10 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
     }
     assert compiled.agent.env == {}
     assert compiled.runtime.profile == "managed_science"
-    assert compiled.runtime.image == MANAGED_RUNTIME_IMAGES["managed_science"]
+    assert (
+        compiled.runtime.image
+        == MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference
+    )
     assert compiled.runtime.workdir == "/openevo/session/workspace"
     assert compiled.runtime.container_user == "host"
     assert compiled.runtime.env == {
@@ -350,7 +353,10 @@ def test_scratch_source_has_no_workspace_and_keeps_runtime_and_setup_commands() 
         )
     )
 
-    assert compiled.runtime.image == MANAGED_RUNTIME_IMAGES["python_research"]
+    assert (
+        compiled.runtime.image
+        == MANAGED_RUNTIME_RELEASES["python_research"].immutable_reference
+    )
     assert compiled.runtime.container_user == "host"
     assert compiled.tasks[0].workspace is None
     assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [

@@ -9,7 +9,8 @@ from openevo.projects.science.models import ScienceProjectConfig
 from openevo.runtime.managed import (
     MANAGED_HOME,
     MANAGED_PATH,
-    MANAGED_RUNTIME_IMAGES,
+    MANAGED_RUNTIME_IMAGES as MANAGED_RUNTIME_IMAGES,
+    MANAGED_RUNTIME_RELEASES,
 )
 
 
@@ -132,7 +133,9 @@ def _runtime_directory_prepare_command(project: ScienceProjectConfig) -> str:
 def _runtime_image(project: ScienceProjectConfig) -> str:
     if project.environment.profile == "custom_image":
         return str(project.environment.custom_image)
-    return MANAGED_RUNTIME_IMAGES[project.environment.profile]
+    return MANAGED_RUNTIME_RELEASES[
+        project.environment.profile
+    ].immutable_reference
 
 
 def _task_workspace(
