@@ -60,40 +60,31 @@ the remote server.
 8. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
    dependency checks.
 
-The exact Core wheel export parent and directory must be owned by the build user
-and must not be group/world writable. On macOS the held parent must not grant
-mutation through an extended ACL. A newly created directory is `0700` and may
-have an inherited ACL normalized once; any later ACL addition fails closed.
-The packaged `openevo/wheels` inventory must be exactly the Core wheel plus its
-canonical `framework-lock.json`, both verified through Core's lock loader. After
-an interrupted build, rerun the same builder with the same wheel inputs so its
-durable transaction recovery can complete. The builder takes a non-blocking
-exclusive lock on the held output-directory inode before inventory or recovery;
-an active same-output build therefore fails explicitly instead of being treated
-as crash residue. Recoverable cleanup uses one output-identity-bound sibling
-tombstone/purge state plus one durable receipt that binds its exact inode and
-inputs. Recovery never adopts the current same-name inode; a mismatch or renamed
-authorized inode is preserved and fails closed. A successful export and the
-candidate workflow must leave exactly the wheel/lock pair with no receipt or
-sibling cleanup state. Final macOS cleanup uses an `FSRef` prepared from the held
-object FD and `FSUnlinkObject`; the removal call does not resolve the quarantine,
-purge, or receipt name. A same-name replacement at that syscall boundary is
-therefore preserved and causes an explicit failure. If the platform or filesystem
-does not provide that identity-bound operation, the builder preserves the durable
-cleanup state and fails closed. Do not manually remove a preserved unknown path,
-hardlink, symlink, identity-mismatched replacement, or failed-cleanup tombstone
-without first investigating the release workspace.
+The exact Core wheel export runs only on a GitHub-hosted ephemeral runner or an
+equivalently controlled one-shot build account. Its requested output path must
+not exist. The builder verifies the generated wheel and canonical
+`framework-lock.json`, writes the exact pair into a private random sibling
+staging directory, fsyncs and revalidates both files, and atomically publishes
+the complete directory with no-replace semantics. It never adopts, overwrites,
+or automatically deletes stale output. A failed job publishes no manifest or
+artifact; a local maintainer must use a new output path and inspect any
+non-authoritative staging residue before removing it.
+
+The generated target-triple sidecar uses a separate same-directory atomic
+replacement. The builder verifies and fsyncs a random staging file before
+replacing the Tauri externalBin target. A failure before replacement keeps the
+previous target intact; any retained staging file is non-authoritative and must
+be inspected before removal.
 
 The pull-request release smoke keeps platform responsibilities separate. Its
 macOS packaging job builds the wheel/lock pair once, verifies a two-member
-SHA-256 manifest, runs the APFS held-FD/`FSRef`/`FSUnlinkObject` probe, and
-uploads the exact inputs under an artifact name bound to the source commit. The
-Linux Core job depends on that producer, verifies the downloaded manifest
-against the digest passed through the job output, rechecks both member digests,
-and only then installs the wheel and runs `openevo-core-service`. It must not
-rebuild the wheel or lock, and it rechecks those final candidate bytes after the
-service smoke. Conversely, the macOS packaging job must not run the Linux-only
-Core service lifecycle.
+SHA-256 manifest, and uploads the exact inputs under an artifact name bound to
+the source commit. The Linux Core job depends on that producer, verifies the
+downloaded manifest against the digest passed through the job output, rechecks
+both member digests, and only then installs the wheel and runs
+`openevo-core-service`. It must not rebuild the wheel or lock, and it rechecks
+those final candidate bytes after the service smoke. Conversely, the macOS
+packaging job must not run the Linux-only Core service lifecycle.
 
 The manual candidate uses the same producer/consumer rule for the complete
 release inventory. `release-candidate.json` and `core-install-artifact.json`
@@ -126,12 +117,6 @@ The portable app-smoke unit fixture uses an emitted evidence record because its
 executable is a test script, not Mach-O. It never substitutes for candidate
 evidence: macOS candidate runs always inspect and launch the real Tauri binary
 and packaged sidecar with `file`, `lipo`, native window, and FD checks.
-
-macOS release cleanup uses only supported FD-bound metadata APIs. ACL removal is
-applied through `filesec` and `fchmodx_np`; identity-bound deletion resolves a
-held FD with `F_GETPATH`, verifies its inode around `FSRef` creation, and lets
-`FSUnlinkObject` consume the opaque reference after the final race-test boundary.
-
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
 best stochastic result.

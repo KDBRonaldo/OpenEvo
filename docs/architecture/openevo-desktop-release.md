@@ -42,91 +42,26 @@ The repository currently provides:
   wheel and one lock, verifies raw CArchive TOC multiplicity before accepting
   PyInstaller's parsed inventory, verifies the wheel bytes, and reloads the
   embedded pair through the same lock contract. `--core-wheel-output-dir`
-  exports the same pair only to a current-user-owned path with no symbolic-link
-  component that is not group/world writable and is empty or contains one
-  recognized recoverable transaction/exact pair. Before creating that output,
-  the builder opens its immediate parent no-follow and rejects a different owner,
-  group/world write bits, or a macOS ACL that grants mutation to another
-  principal. Newly created output directories use `0700`. The
-  builder pins that directory by an open no-follow descriptor and revalidates
-  its inode, owner, private permissions, and ACL-free state through final return.
-  After those checks and before the first inventory or recovery, it takes a
-  non-blocking exclusive `flock` on the same held output-directory inode. A
-  contending builder fails closed, and the lock remains held through the complete
-  commit/rollback context and descriptor cleanup.
-  On macOS only a newly created output, transaction, marker, wheel, or lock may
-  normalize a valid inherited extended ACL with `acl_delete_fd_np`, followed by
-  readback through `acl_get_fd_np`. Every later open requires the ACL to remain
-  empty; malformed entries, unknown tags/permissions, failed removal, or an ACL
-  added after initialization fail closed and are never silently cleared. The held
-  immediate parent FD is also rechecked and rejects any mutating ALLOW entry,
-  because that ACL could otherwise replace the output root itself. Linux keeps
-  the same FD/inode/mode policy with an explicit no-op ACL layer.
-  Core wheel construction fixes `SOURCE_DATE_EPOCH` to the trusted source commit
-  time so a retry can reproduce and recognize a fully committed pair.
-  It stages the pair under a private `0700` transaction directory. Before any
-  member is created, its bounded canonical v2 marker durably records the output and
-  transaction identities plus a random per-member staging intent, name, size,
-  and SHA-256. Each new member inode is added monotonically to that marker before
-  its bytes are copied and fsynced. Publication uses FD-relative atomic
-  no-replace renames,
-  retains the source and destination descriptors, and commits only after the
-  temporary build tree has cleaned up and an exact root inventory revalidates
-  both regular, link-count-one, owner-only-written members against the source and
-  lock contract. A crash after the ready marker but before both names are
-  published leaves complete inode-bound recovery authority; the next build
-  quarantines only that exact transaction and retries. Preparing transactions at
-  every member create/copy/fsync boundary are also automatically and idempotently
-  recovered: a random intent authorizes only its private `0600` transaction path,
-  while a persisted inode receipt authorizes only that exact inode. Empty or
-  marker-only bootstrap transactions remain bounded recovery states. Any path
-  outside the durable intents, unknown root entry, symlink/hardlink fault, or
-  identity-mismatched replacement is preserved and fails closed. Marker updates
-  first move the exact previously held marker inode to an identity-named retired
-  entry with no-replace semantics, then publish the candidate marker with a
-  second no-replace rename. Recovery accepts a missing canonical marker only
-  when the durable candidate has one unique valid inode-bound retired
-  predecessor. A replacement introduced after an identity check is therefore
-  preserved or quarantined rather than deleted by a pathname-based replace. Root
-  and transaction inventories are read through bounded FD-based iterative scans;
-  each scan rejects on `limit + 1`, and changing consecutive snapshots fail
-  closed without first materializing or sorting an unbounded directory. An empty
-  marker-less transaction directory beside an exact complete pair is a bounded
-  bootstrap crash state. Cleanup never authorizes removal from a newly observed
-  pathname identity. Authorized root members move under deterministic
-  transaction quarantine names. Before the held transaction leaves the locked
-  output, a canonical cleanup-authority receipt binds the parent, output, exact
-  wheel/lock inputs, and transaction inode. Its candidate is file-fsynced and
-  output-directory-fsynced, then published no-replace under a filename that also
-  binds the receipt inode and directory-fsynced again. Only then may the held
-  transaction inode move with atomic no-replace rename to the deterministic
-  sibling tombstone or any tombstone marker be removed. Each
-  authorized tombstone member then moves no-replace to an inode-named quarantine;
-  member bytes are cleared through the held descriptor and markers are removed
-  last. The empty held directory moves no-replace to one deterministic purge name
-  and is rechecked against the durable receipt.
-  Final member, marker, directory, and receipt removal is not authorized by that
-  recheck. On macOS the builder first derives an opaque `FSRef` from the already
-  open object through `/dev/fd/<fd>`, then invokes `FSUnlinkObject` on that
-  reference. The final removal API receives no mutable cleanup pathname, so a
-  same-UID rename plus same-name replacement after reference creation can remove
-  only the already authorized object or fail; the replacement is checked,
-  preserved, and reported. If this identity-bound API is unavailable, rejects an
-  object or filesystem, or returns an error, cleanup retains its durable
-  receipt/quarantine and fails closed. A post-removal pathname or link-count check
-  is recovery evidence only and is never treated as authority for a name-based
-  delete.
-  A retry accepts at most one exact receipt and one tombstone/purge state. It never
-  derives cleanup authority from the current same-name inode. A mismatch preserves
-  the replacement and uses a no-follow, double-snapshot parent identity scan with
-  a fixed 4096-entry limit to detect a renamed authorized inode; either result
-  fails closed. If a crash follows the identity-bound directory removal, the same
-  bounded scan must prove that inode has no remaining sibling binding before the
-  receipt itself is quarantined and removed. Crashes at every boundary consume no
-  additional names or payload copies, while normal success and candidate builds
-  leave no cleanup receipt or sibling. A receipt interrupted before the transaction
-  leaves the output is first matched to that still marker-authorized transaction,
-  retired, and then recreated by ordinary transaction recovery;
+  publishes those same verified bytes as one atomic directory for release
+  workflows. The requested output path must not exist. The builder opens
+  the generated wheel and lock without following symlinks, revalidates their
+  identity and bytes, copies them as owner-only regular files into a private
+  random sibling directory, fsyncs both files and that directory, and verifies
+  the exact two-member inventory. It then publishes the complete directory with
+  an atomic no-replace rename and fsyncs the parent. A pre-publication failure
+  never creates the requested output; random staging residue is non-authoritative
+  and is not automatically adopted or deleted. A post-publication retry fails
+  because the output already exists. This contract is for a GitHub-hosted
+  ephemeral runner or an equivalently controlled one-shot build account. It does
+  not claim isolation from malicious code running under the same build UID and
+  provides no persistent-workspace recovery protocol. Core wheel construction
+  fixes `SOURCE_DATE_EPOCH` to the trusted source commit time, while the canonical
+  lock and SHA-256 checks bind the exported pair to the bytes embedded in the
+  sidecar. After all archive checks pass, the builder copies the externalBin to
+  a private random sibling file, fsyncs and verifies its exact bytes and mode,
+  then atomically replaces the Tauri target and fsyncs the binary directory. A
+  failure before replacement preserves the previous target and leaves only a
+  non-authoritative staging file for inspection.
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;
@@ -137,11 +72,8 @@ The repository currently provides:
   manifest under a source-commit-qualified Actions artifact name. The dependent
   Linux Core job downloads that exact artifact, verifies the transferred
   manifest against the producer's digest and then verifies both members before
-  install. It does not rebuild either release input. The macOS job separately
-  asserts that its temporary volume is APFS and runs a real held-descriptor to
-  `FSRef` to `FSUnlinkObject` probe through the release cleanup implementation;
-  the Linux job owns the actual `openevo-core-service` lifecycle and frozen
-  registry identity smoke;
+  install. It does not rebuild either release input. The Linux job owns the
+  actual `openevo-core-service` lifecycle and frozen registry identity smoke;
 - `.github/workflows/openevo-desktop-candidate.yml`, a stable-only manual
   candidate workflow. Its macOS job uses locked inputs, clean-installs the exact
   embedded Core wheel, runs renderer and release-mode Rust checks, and builds
@@ -687,14 +619,11 @@ downstream connection. Rsync names that held SSH FD in `-e` and inherits it
 through the nested exec. Relay buffers, accept lifetime, cleanup retries, and
 retained cleanup authorities are bounded; uncertain path cleanup never removes
 a replacement. Process-group birth and cleanup authority is retained across
-cancellation. These changes and Linux/macOS externalBin
-combination smokes do not prove code signing, notarization, mounted/copied macOS
-application launch, first-run
-remote bootstrap, or downloaded artifact identity, and do not make the DMG
-release-ready. ACL contract tests cover inherited/mutating entries, unknown
-tags/permissions, post-initialization mutation, and cleanup replacement windows.
-The macOS runner also creates a real writable inherited extended-ACL fixture and
-executes the FD-based clear/readback path before building the packaged sidecar.
+cancellation. Linux/macOS externalBin combination smokes cover this native
+launch boundary; candidate-only app/DMG launch and downloaded-asset roundtrip
+remain separate gates. ACL contract tests cover inherited/mutating entries,
+unknown tags/permissions, post-initialization mutation, and cleanup replacement
+windows.
 
 Before that outer lifecycle harness, the workflow installs the exact remote Core
 wheel in a clean Python environment and passes the exported build-generated
@@ -767,15 +696,16 @@ The repository does not carry a shell-script sidecar fallback; the generated
 target-triple binary is a required build input.
 
 The sidecar builder never removes repository-global `build/` or existing
-`src/openevo/wheels`. A caller-selected Core wheel output may be empty, contain
-the exact wheel/lock pair for the current inputs, or contain one recognized
-transaction or cleanup-authority recovery state. The builder removes only
-inode-bound entries authorized by that durable state; any unrelated prior file,
-partial pair, replacement, ambiguous recovery state, or path overlap is preserved
-and fails closed. The Core wheel is built in a private temporary tree and only the
-verified exact wheel/lock pair is transactionally exported. `--no-clean` only
-preserves the sidecar-owned `sidecar-dist` and `sidecar-build` paths, matching the
-existing clean/no-clean contract.
+`src/openevo/wheels`. A caller-selected Core wheel output must not exist. The
+Core wheel is built in a private temporary tree, and only the verified exact
+wheel/lock pair is published through a private sibling directory and atomic
+no-replace rename. Existing output, symlinks, and generated-path overlap fail
+before publication; stale random staging is non-authoritative and is never
+automatically recovered or removed. `--no-clean` only preserves the
+sidecar-owned `sidecar-dist` and `sidecar-build` paths, matching the existing
+clean/no-clean contract. The final target-triple externalBin is published from a
+verified sibling staging file with atomic replacement, so a failed replacement
+does not remove or partially overwrite the previously built target.
 
 ## Release Build Sequence
 

@@ -28,9 +28,11 @@ jobs:
       - name: Require a reviewed stable commit and safe label
         env:
           CANDIDATE_LABEL: ${{ inputs.candidate_label }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           test "$GITHUB_REF" = "refs/heads/stable"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$RUNNER_ENVIRONMENT" = "github-hosted"
           if [[ ! "$CANDIDATE_LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]; then
             echo "candidate_label must be a short filename-safe identifier" >&2
             exit 1
@@ -144,26 +146,26 @@ jobs:
       - name: Build packaged sidecar and final exact Core wheel
         working-directory: desktop
         run: |
-          mkdir "$GITHUB_WORKSPACE/.candidate-core"
           python packaging/build_sidecar.py \
-            --core-wheel-output-dir "$GITHUB_WORKSPACE/.candidate-core"
+            --core-wheel-output-dir "$RUNNER_TEMP/openevo-candidate-core"
+          echo "OPENEVO_CANDIDATE_CORE=$RUNNER_TEMP/openevo-candidate-core" >> "$GITHUB_ENV"
           sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-${OPENEVO_RUST_TARGET}"
           test -x "$sidecar"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
 
       - name: Clean-install and verify final Core wheel and framework lock
         run: |
-          test "$(find .candidate-core -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
-          test -f .candidate-core/framework-lock.json
+          test "$(find "$OPENEVO_CANDIDATE_CORE" -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          test -f "$OPENEVO_CANDIDATE_CORE/framework-lock.json"
           python -m venv "$RUNNER_TEMP/openevo-core-wheel-smoke"
           "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/python" -m pip install .candidate-core/openevo-*.whl
+          "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/python" -m pip install "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl
           PYTHONPATH= "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/openevo-backend" --help
           PYTHONPATH= "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/openevo-core-service" --help
           PYTHONPATH= "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/python" \
             scripts/ci/smoke_evolution_framework_wheel.py \
-            --wheel .candidate-core/openevo-*.whl \
-            --framework-lock .candidate-core/framework-lock.json \
+            --wheel "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl \
+            --framework-lock "$OPENEVO_CANDIDATE_CORE/framework-lock.json" \
             > "$RUNNER_TEMP/framework-smoke.json"
           registry_digest="$(uv run python -c \
             'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["registry_digest"])' \
@@ -197,8 +199,8 @@ jobs:
           dmg_source="$(find desktop/src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print)"
           cp "$dmg_source" \
             "candidate-artifacts/OpenEvo-Desktop-${OPENEVO_VERSION}-${OPENEVO_ARCHITECTURE}.dmg"
-          cp .candidate-core/openevo-*.whl candidate-artifacts/
-          cp .candidate-core/framework-lock.json candidate-artifacts/
+          cp "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl candidate-artifacts/
+          cp "$OPENEVO_CANDIDATE_CORE/framework-lock.json" candidate-artifacts/
 
       - name: Launch real app bundle and record native evidence
         run: |

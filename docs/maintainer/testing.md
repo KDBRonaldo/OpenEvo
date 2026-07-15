@@ -171,13 +171,9 @@ sidecar cannot execute on the Linux Core runner, Linux rebuilds a packaged Linux
 sidecar from the same checkout solely as the executable native-process fixture;
 it is not candidate artifact evidence and does not replace the macOS packaged or
 app-bundle smokes. The Linux remote smoke combines that fixture with the exact
-transferred wheel and lock. The macOS job owns candidate sidecar packaging and runs a direct probe
-on APFS through the held object FD, `FSPathMakeRef`/`FSRef`, and
-`FSUnlinkObject` implementation; it does not call the Linux-only Core service
-lifecycle. Linux focused tests exercise the unsupported-platform fail-closed
-behavior and their explicit conditional-removal testkit, but cannot establish
-that the Carbon/APFS primitive works. That final boundary remains pending until
-the `macos-14` job passes.
+transferred wheel and lock. The macOS job owns candidate sidecar packaging and
+exact-pair publication on its GitHub-hosted ephemeral runner; it does not call
+the Linux-only Core service lifecycle.
 
 The sidecar process smoke loads `desktop/release-contract.json`, validates the
 closed `VersionV1` and `DesktopStateV1` models, requires the frozen OpenAPI digest
@@ -185,113 +181,31 @@ and every renderer-required feature flag, and checks that state negotiation bind
 the same digest. The renderer imports that JSON directly; anti-drift tests bind
 the Rust native-host digest to it.
 
-The exact Core wheel/lock export keeps the output directory open for the whole
-sidecar build and verifies its pathname/inode binding before and after writes.
-Before creating the output, it holds and validates the immediate parent's owner,
-group/world write bits, and macOS ACL. A newly created child may clear a valid
-inherited ACL once; an ACL added to an existing output, transaction, marker, or
-member must be rejected without mutation.
-Darwin reports an absent extended ACL as `acl_get_fd_np` returning null with
-`ENOENT`; that exact result is normalized to an empty ACL inventory. Every other
-lookup error, and every unknown, unreadable, or mutating ACL entry, fails closed.
-Darwin ACL iteration accepts only `acl_get_entry` success `0` and treats only
-`-1/EINVAL` as the end of the held ACL; all other result/errno combinations fail
-closed before any artifact export or recovery.
-Apple's `acl_delete_fd_np` is not implemented. Inherited ACL normalization uses
-`filesec_set_property(FILESEC_ACL, _FILESEC_REMOVE_ACL)` followed by
-`fchmodx_np` on the held FD, then rereads the ACL and inode metadata.
-After opening and validating the child, but before its first inventory or any
-recovery, the builder takes a non-blocking exclusive `flock` on that same held
-output-directory descriptor. Contention fails closed with an explicit
-active-builder error. The lock remains held until the complete output context,
-including commit or rollback and all transaction/source descriptor cleanup, has
-exited. A paused real subprocess test proves a second builder cannot classify or
-recover the first builder's live transaction.
-It stages under a private transaction directory, publishes without replacement,
-keeps every source/export descriptor open, and exits the output context last so
-a `TemporaryDirectory` cleanup failure rolls the pair back. Before success, the
-test gate requires an exact wheel/lock root inventory and rechecks each pathname,
-inode/device, regular-file type, link count, owner/mode, byte size, and SHA-256
-against the source and canonical lock.
-The generated and embedded lock must load through Core's authoritative
-`FrameworkDistributionLock` loader, bind the exact wheel filename/version/digest,
-and be the only non-wheel member below PyInstaller's `openevo/wheels` directory.
-The wheel build fixes `SOURCE_DATE_EPOCH` to the trusted candidate commit time;
-reproducibility tests must build twice from the same source and compare exact
-wheel and generated lock bytes so a post-commit retry can recognize the pair.
+The exact Core wheel/lock export test contract is intentionally small. The
+requested output must not exist, and existing directories or symlinks are
+rejected without mutation. Tests verify that the builder opens stable private
+regular-file inputs, validates the canonical lock against the wheel filename and
+SHA-256, copies both files into a private random sibling directory, fsyncs and
+revalidates the exact two-member inventory, and publishes the directory with an
+atomic no-replace rename. An injected publish failure leaves the requested path
+absent and preserves only a clearly non-authoritative random staging directory.
+A successful publish contains exactly the verified wheel and lock; a second
+publish fails without changing them.
 
-Failure injection covers partial copy, second-member failure, output-path
-replacement, exported-member unlink/rename/same-name replacement, and extra
-members. A real child-process crash after the wheel name is published but before
-the lock name is published must leave a bounded marker-authorized state that the
-next run reconciles and replaces with one complete pair. Recovery and rollback
-move the canonical marker to a monotonic `cleaning` phase before removing any
-member. Its identity prefix records every cleanup-owned inode and its
-`cleanup_index` durably authorizes only an ordered prefix to have zero remaining
-links. Each progress update is file-fsynced, directory-fsynced, atomically
-installed through `transaction.ready`, and directory-fsynced again before the
-identity-bound removal. Restart may adopt that temporary marker only when both
-files are closed, canonical, identity-bound markers and they describe the exact
-next phase or cleanup index.
-Marker replacement tests also interrupt after the prior marker has moved to its
-inode-named retired entry and race the source pathname after identity validation.
-Both the checked inode and a same-name replacement must remain preserved; marker
-publication never uses an overwrite-capable rename.
+Sidecar target publication has a separate fault-injection contract. Tests prove
+that a verified staging file atomically replaces an existing externalBin with
+mode `0755`, and that a replacement failure preserves the old target byte for
+byte while leaving the new file only under a non-authoritative staging name.
 
-An unauthorized member must retain at least one canonical binding. An authorized
-member may be absent or may still have names after an interrupted removal, but
-every remaining name must resolve no-follow to the recorded inode and must still
-pass owner, mode, aggregate link-count, byte-size, and SHA-256 checks. Rollback
-may remove only an inode it recorded; its held descriptor is the only additional
-proof allowed to authorize an already-unlinked member or a bounded same-inode
-rename. If a pathname contains an identity-mismatched replacement or an owned
-inode has an unbound residual link, cleanup reports an unverifiable rollback,
-preserves the unknown entry and transaction marker, and subsequent retries remain
-fail closed until a maintainer resolves that output directory. Real subprocess
-tests interrupt initial publication, interrupt the following recovery after
-wheel or lock cleanup, and require a third process to finish; the same wheel/lock
-cleanup points are exercised through live rollback.
-The same preservation rule applies to a `preparing` transaction containing a
-staged entry whose inode has not yet reached the ready marker; only empty and
-marker-only bootstrap remnants are automatically reclaimed before readiness.
-
-After root members are quarantined, cleanup prepares to move the held transaction
-inode out of the output. Before that rename, the builder file-fsyncs a canonical
-receipt that binds the held parent/output, exact wheel/lock inputs, and cleanup
-inode; directory-fsyncs its candidate; publishes it no-replace under a name that
-also binds the receipt inode; and directory-fsyncs again. Only then does the held
-transaction inode move by atomic no-replace rename to one deterministic sibling
-tombstone bound to the output device/inode. Cleanup moves each authorized entry
-to an identity-named quarantine, clears member payloads through the held descriptor,
-and removes the transaction marker last. The empty held tombstone is then moved
-no-replace to one deterministic purge name and checked against the receipt.
-For final member, marker, directory, and receipt removal, macOS obtains the real
-path from the held FD with `F_GETPATH`, verifies that path against the held inode
-before and after preparing an opaque `FSRef`, then enters the syscall boundary
-and calls `FSUnlinkObject`; the final call does not receive the mutable cleanup
-name.
-Unsupported platforms and rejected filesystems preserve the object and fail
-closed. Linux unit and subprocess tests install a test-only conditional-removal
-model so portable transaction and crash cases remain executable; macOS CI uses
-the production primitive.
-
-Recovery accepts at most one receipt and one of those two exact sibling states; it
-must not adopt the inode currently found at a known name. Real `os._exit` tests at
-the empty-tombstone and purge windows rename the authorized directory, install a
-different empty inode at the expected name, and require restart to preserve both
-objects and fail explicitly. A double-snapshot no-follow parent identity scan is
-capped at 4096 entries and detects the renamed authorized inode; exceeding that
-budget also fails closed. Additional repeated crashes cover receipt candidate,
-publication while the transaction remains marker-authorized in the output,
-directory removal, and receipt quarantine. Twenty successful exports prove that
-normal and recovered operation leaves no receipt/sibling state or wheel/lock byte
-growth. Candidate builds have the same zero-residue requirement.
-Three syscall-boundary races run after the native removal token is prepared and
-immediately before execution: one replaces a tombstone regular member, one
-replaces the empty purge directory, and one replaces the cleanup receipt. Every
-replacement must remain present and the export must fail explicitly. On macOS
-these cases exercise the real `FSRef` operation; on a platform without it, the
-test-only conditional model refuses the mismatched binding before any delete.
+The workflow guard requires a GitHub-hosted ephemeral runner. The build UID and
+its processes are part of the release-build trust boundary; this publisher does
+not claim protection from malicious same-UID code or provide restart recovery
+for a persistent shared workspace. The Actions artifact manifest, candidate
+manifest, Linux clean install, embedded-archive checks, and final draft-asset
+roundtrip remain the durable cross-job identity evidence. Tests also retain the
+reproducible wheel build, authoritative `FrameworkDistributionLock` loader,
+raw PyInstaller TOC multiplicity, embedded byte equality, output-overlap, and
+failure-before-artifact gates.
 
 ## Release Identity
 

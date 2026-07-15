@@ -812,23 +812,15 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "tests/ci/test_build_sidecar.py" in macos_job
     assert "tests/ci/test_check_openevo_release.py" in macos_job
     assert "uv run python desktop/packaging/build_sidecar.py" in macos_job
-    assert "--core-wheel-output-dir .openevo-release-inputs" in macos_job
+    assert 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' in macos_job
+    assert 'test "$RUNNER_ENVIRONMENT" = "github-hosted"' in macos_job
+    assert '--core-wheel-output-dir "$RUNNER_TEMP/openevo-release-inputs"' in macos_job
     assert "scripts/ci/smoke_openevo_desktop_sidecar.py" in macos_job
-    assert text.count("desktop/packaging/build_sidecar.py") == 2
+    assert text.count("desktop/packaging/build_sidecar.py") == 1
     assert "uv run python packaging/build_sidecar.py" in linux_job
 
-    assert "name: Probe APFS held-FD to FSRef to FSUnlinkObject cleanup" in macos_job
-    assert 'diskutil info "$RUNNER_TEMP"' in macos_job
-    assert "File System Personality|Type \\(Bundle\\)" in macos_job
-    assert "_core_release_fd_removal_supported" in macos_job
-    assert "_remove_core_release_fd_bound_entry" in macos_job
-    assert "prepare_fsref = builder._prepare_core_release_fd_removal" in macos_job
-    assert "execute_fsunlink = builder._execute_core_release_fd_removal" in macos_job
-    assert 'native_calls.append("FSPathMakeRef")' in macos_job
-    assert 'native_calls.append("FSUnlinkObject")' in macos_job
-    assert "object_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)" in macos_job
-    assert 'subject="APFS held-FD FSRef probe"' in macos_job
-    assert "FSUnlinkObject did not unlink the held object" in macos_job
+    assert "FSPathMakeRef" not in macos_job
+    assert "FSUnlinkObject" not in macos_job
     assert "openevo-core-service ensure" not in macos_job
 
     artifact_name = "openevo-core-release-inputs-${{ github.sha }}"
@@ -840,9 +832,9 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert macos_job.count("-mindepth 1 -maxdepth 1") == 1
     assert "actions/upload-artifact@v4" in macos_job
     assert f"name: {artifact_name}" in macos_job
-    assert ".openevo-release-inputs/openevo-*.whl" in macos_job
-    assert ".openevo-release-inputs/framework-lock.json" in macos_job
-    assert ".openevo-release-inputs/SHA256SUMS" in macos_job
+    assert "${{ runner.temp }}/openevo-release-inputs/openevo-*.whl" in macos_job
+    assert "${{ runner.temp }}/openevo-release-inputs/framework-lock.json" in macos_job
+    assert "${{ runner.temp }}/openevo-release-inputs/SHA256SUMS" in macos_job
     assert "include-hidden-files: true" in macos_job
 
     assert "actions/download-artifact@v4" in linux_job
@@ -1181,6 +1173,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "runs-on: ubuntu-latest",
         "timeout-minutes:",
         'test "$GITHUB_REF" = "refs/heads/stable"',
+        'RUNNER_ENVIRONMENT: ${{ runner.environment }}',
+        'test "$RUNNER_ENVIRONMENT" = "github-hosted"',
         "uv sync --frozen --group dev",
         "tests/ci/test_build_sidecar.py",
         "tests/ci/test_openevo_release_candidate.py",
@@ -1253,7 +1247,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert "matrix:" not in text
     assert "Build distributable Core wheel" not in text
     assert "python -m build --wheel" not in text
-    assert "cp .candidate-core/openevo-*.whl candidate-artifacts/" in text
+    assert 'cp "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl candidate-artifacts/' in text
     assert 'pip install candidate-artifacts/openevo-*.whl' in text
     assert text.index("openevo_release_candidate.py validate") < text.index(
         'pip install candidate-artifacts/openevo-*.whl'
