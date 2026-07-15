@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 import openevo.deployment.ssh as ssh_module
+import openevo.deployment.system_executables as executable_module
 from openevo.deployment import RemoteCommandResult, RemoteExecutorTransport
 from openevo.deployment.host_keys import (
     HostKeyStoreError,
@@ -62,6 +63,10 @@ class _TestExecutableAuthority:
     @property
     def execution_path(self) -> str:
         return f"/dev/fd/{self.descriptor}"
+
+    @property
+    def identity(self):
+        return executable_module._executable_identity(os.fstat(self.descriptor))
 
     def verify_path_binding(self) -> None:
         os.fstat(self.descriptor)
@@ -2338,6 +2343,214 @@ def test_core_connection_authority_passes_birth_and_peer_fds_to_exact_ssh_child(
     assert authority.release() is True
 
 
+def test_owned_ssh_spawn_exposes_only_private_agent_proxy_and_cleans_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    upstream_path = tmp_path / "upstream-agent.sock"
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    upstream.bind(str(upstream_path))
+    upstream.listen(4)
+    upstream_path.chmod(0o600)
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(upstream_path))
+    source = executable_module.SshAgentSocketSource.from_environment("ssh_agent")
+    assert source is not None
+    original_popen = ssh_module._OWNED_SUBPROCESS_POPEN
+    observed: list[tuple[list[str], dict[str, object]]] = []
+
+    def recording_popen(
+        argv: list[str],
+        *args: object,
+        **kwargs: object,
+    ):
+        observed.append((list(argv), dict(kwargs)))
+        return original_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", recording_popen)
+    try:
+        completed = ssh_module._run_subprocess(
+            [ssh_module.SSH_EXECUTABLE, "-V"],
+            5,
+            env={},
+            agent_socket_source=source,
+        )
+    finally:
+        upstream.close()
+
+    assert completed.returncode == 0
+    assert len(observed) == 1
+    actual_argv, kwargs = observed[0]
+    child_environment = kwargs["env"]
+    assert isinstance(child_environment, dict)
+    assert set(child_environment) == {"SSH_AUTH_SOCK"}
+    proxy_path = child_environment["SSH_AUTH_SOCK"]
+    assert isinstance(proxy_path, str)
+    assert proxy_path != str(upstream_path)
+    assert str(upstream_path) not in repr(actual_argv)
+    assert str(upstream_path) not in repr(kwargs)
+    assert str(upstream_path) not in caplog.text
+    assert not Path(proxy_path).exists()
+    assert not Path(proxy_path).parent.exists()
+
+
+def test_upstream_agent_replacement_during_spawn_never_starts_forwarding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    upstream_path = tmp_path / "upstream-agent.sock"
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    upstream.bind(str(upstream_path))
+    upstream.listen(4)
+    upstream_path.chmod(0o600)
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(upstream_path))
+    source = executable_module.SshAgentSocketSource.from_environment("ssh_agent")
+    assert source is not None
+    original_popen = ssh_module._OWNED_SUBPROCESS_POPEN
+    proxy_paths: list[Path] = []
+
+    def replacing_popen(
+        argv: list[str],
+        *args: object,
+        **kwargs: object,
+    ):
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        proxy_paths.append(Path(environment["SSH_AUTH_SOCK"]))
+        process = original_popen(argv, *args, **kwargs)
+        upstream_path.unlink()
+        replacement.bind(str(upstream_path))
+        replacement.listen(4)
+        upstream_path.chmod(0o600)
+        return process
+
+    monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", replacing_popen)
+    try:
+        with pytest.raises(ValueError, match="binding changed") as exc_info:
+            ssh_module._run_subprocess(
+                [ssh_module.SSH_EXECUTABLE, "-V"],
+                5,
+                env={},
+                agent_socket_source=source,
+            )
+        assert str(upstream_path) not in str(exc_info.value)
+        assert str(upstream_path) not in caplog.text
+        assert len(proxy_paths) == 1
+        assert not proxy_paths[0].exists()
+        assert not proxy_paths[0].parent.exists()
+    finally:
+        replacement.close()
+        upstream.close()
+
+
+@pytest.mark.parametrize("failure", [OSError("spawn failed"), KeyboardInterrupt()])
+def test_agent_proxy_is_closed_when_spawn_fails_or_is_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    upstream_path = tmp_path / "upstream-agent.sock"
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    upstream.bind(str(upstream_path))
+    upstream.listen(4)
+    upstream_path.chmod(0o600)
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(upstream_path))
+    source = executable_module.SshAgentSocketSource.from_environment("ssh_agent")
+    assert source is not None
+    proxy_paths: list[Path] = []
+    original_open_proxy = executable_module.SshAgentSocketSource.open_proxy
+    original_orphans = set(ssh_module._ORPHANED_SUBPROCESSES)
+
+    def open_proxy(
+        socket_source: executable_module.SshAgentSocketSource,
+    ) -> executable_module.SshAgentProxy:
+        proxy = original_open_proxy(socket_source)
+        proxy_paths.append(Path(proxy.socket_path))
+        return proxy
+
+    def fail_spawn(*_args: object, **_kwargs: object):
+        raise failure
+
+    monkeypatch.setattr(executable_module.SshAgentSocketSource, "open_proxy", open_proxy)
+    monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", fail_spawn)
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_BIRTH_RECOVERY_SECONDS", 0)
+    try:
+        with pytest.raises(type(failure)) as exc_info:
+            ssh_module._OwnedSubprocessAuthority.spawn(
+                [ssh_module.SSH_EXECUTABLE, "-V"],
+                env={},
+                agent_socket_source=source,
+            )
+        if str(failure):
+            assert str(failure) in str(exc_info.value)
+        assert len(proxy_paths) == 1
+        assert not proxy_paths[0].exists()
+        assert not proxy_paths[0].parent.exists()
+        retained = [
+            authority
+            for key, authority in ssh_module._ORPHANED_SUBPROCESSES.items()
+            if key not in original_orphans
+        ]
+        assert len(retained) == 1
+        assert retained[0]._agent_proxy is None
+    finally:
+        upstream.close()
+        for key, authority in tuple(ssh_module._ORPHANED_SUBPROCESSES.items()):
+            if key in original_orphans:
+                continue
+            authority._spawn_outcome_unknown = False
+            authority.mark_group_cleanup_confirmed()
+            authority.release()
+
+
+def test_rsync_nested_ssh_executes_held_fd_and_inherits_pass_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "payload.txt"
+    source.write_text("payload", encoding="ascii")
+    original_popen = ssh_module._OWNED_SUBPROCESS_POPEN
+    observed: list[tuple[list[str], dict[str, object]]] = []
+
+    def recording_popen(
+        argv: list[str],
+        *args: object,
+        **kwargs: object,
+    ):
+        observed.append((list(argv), dict(kwargs)))
+        return original_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", recording_popen)
+    completed = ssh_module._run_subprocess(
+        [
+            ssh_module.RSYNC_EXECUTABLE,
+            "-e",
+            f"{ssh_module.SSH_EXECUTABLE} -V",
+            str(source),
+            "invalid.example:/tmp/openevo-rsync-held-fd-test",
+        ],
+        5,
+        env={},
+    )
+
+    assert completed.returncode != 0
+    assert "OpenSSH" in completed.stderr
+    assert len(observed) == 1
+    actual_argv, kwargs = observed[0]
+    marker_index = actual_argv.index(ssh_module.OWNED_SUBPROCESS_BIRTH_ARGUMENT)
+    spawned_argv = actual_argv[marker_index + 3 :]
+    assert spawned_argv[0] == ssh_module.RSYNC_EXECUTABLE
+    remote_shell = shlex.split(spawned_argv[spawned_argv.index("-e") + 1])
+    assert remote_shell[0].startswith("/dev/fd/")
+    nested_ssh_fd = int(remote_shell[0].removeprefix("/dev/fd/"))
+    pass_fds = kwargs["pass_fds"]
+    assert isinstance(pass_fds, tuple)
+    assert nested_ssh_fd in pass_fds
+    assert int(actual_argv[marker_index + 2]) in pass_fds
+
+
 def test_core_connection_subprocess_bridges_a_real_parent_owned_af_unix_stream() -> None:
     local_stream, child_stream = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     authority = ssh_module._OwnedSubprocessAuthority(trust_ownership=None)
@@ -2437,7 +2650,7 @@ def test_core_tunnel_close_quarantines_lease_cleanup_cancellation() -> None:
         connection_argv=["ssh"],
         trust_lease=lease,
         trusted_host=TrustedHost(),
-        process_environment={},
+        agent_socket_source=None,
     )
 
     with pytest.raises(Cancelled):

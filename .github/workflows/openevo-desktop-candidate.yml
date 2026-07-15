@@ -65,6 +65,14 @@ jobs:
             -q
           uv run python scripts/ci/audit_openevo_identity.py
 
+      - name: Exercise macOS SSH agent relay and fixed executable authority
+        run: |
+          uv run python -m pytest \
+            tests/openevo/remote/test_system_executables.py \
+            tests/openevo/remote/test_host_keys.py \
+            tests/openevo/remote/test_ssh_transport.py \
+            -q
+
       - name: Resolve exact product version and runner architecture
         run: |
           version="$(uv run python - <<'PY'

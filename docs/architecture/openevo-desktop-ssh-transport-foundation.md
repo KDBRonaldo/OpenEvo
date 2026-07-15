@@ -59,10 +59,15 @@ environment variables, `cwd`, and rsync-created remote paths.
 
 The local machine running OpenEvo Desktop must have:
 
-- `ssh` available on `PATH`;
-- `ssh-keyscan` available on `PATH` for the controlled host-key probe;
-- `rsync` available on `PATH` for local-folder workspace uploads;
+- the platform-fixed `/usr/bin/ssh` binary;
+- the platform-fixed `/usr/bin/ssh-keyscan` binary for the controlled host-key
+  probe;
+- the platform-fixed `/usr/bin/rsync` binary for local-folder workspace uploads;
 - network access from the local machine to the remote SSH server.
+
+Release execution never searches `PATH`. Each binary must be a root-owned,
+link-count-one regular executable with no group/world write bit and an unchanged
+held pathname/vnode identity.
 
 Remote `host` values support DNS names, IPv4 addresses, and IPv6 literals. IPv6
 rsync destinations use the required bracketed form. Host values that can be
@@ -277,8 +282,8 @@ SSH actions can proceed.
 
 Supported:
 
-- `ssh_agent`: uses OpenSSH agent/default identity lookup without loading user
-  SSH configuration.
+- `ssh_agent`: uses only the explicitly isolated OpenSSH agent path without
+  loading user SSH configuration or default identity files.
 - `private_key`: passes `-i <private_key_path>` as a subprocess argv element,
   clears default identities with `IdentityFile=none`, sets `IdentitiesOnly=yes`,
   and disables agent use with `IdentityAgent=none`.
@@ -293,9 +298,29 @@ release capability.
 Release process launches use fixed `/usr/bin/ssh`, `/usr/bin/ssh-keyscan`, and
 `/usr/bin/rsync` identities after root-owner, mode, type, ancestor, and pathname
 binding verification. The exact main executable is invoked through its held FD;
-the environment is empty except for an owner-validated `SSH_AUTH_SOCK` in agent
-mode. `PATH`, shell configuration, askpass variables, and ambient proxy values
-are not inherited.
+the ordinary environment is empty. In agent mode the original host
+`SSH_AUTH_SOCK` pathname never enters child env or argv. Before each command,
+rsync, or tunnel spawn, the parent holds every upstream directory identity,
+connects one upstream FD, and revalidates the socket pathname/inode after
+connect. It then creates a fresh owner-private one-shot relay and gives OpenSSH
+only that private relay path. `PATH`, shell configuration, askpass variables,
+and ambient proxy values are not inherited.
+
+The relay accepts only a peer whose kernel-reported PID belongs to the exact new
+session/process group owned for that spawn and whose executable vnode is the
+held `/usr/bin/ssh` identity. This rejects a same-UID connector that reaches the
+socket first. After the first authorized connection, the listener pathname is
+removed and bounded-buffer forwarding uses the already connected upstream FD.
+Timeout, cancellation, process exit, and spawn failure close both streams and
+the listener. Socket/root removal is relative to held directory FDs and exact
+inode identities; uncertain cleanup is retained in bounded retry ownership and
+never deletes a replacement pathname.
+
+For rsync, the remote-shell string names the verified SSH authority as
+`/dev/fd/<ssh-fd>`. That FD is included in `pass_fds`, remains inherited through
+the held rsync exec and its nested SSH exec, and both executable identities are
+verified immediately before and after rsync process birth. There is no
+`/usr/bin/ssh` pathname fallback in the nested command.
 
 ## Command Execution
 

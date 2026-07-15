@@ -51,9 +51,9 @@ from openevo.deployment.system_executables import (
     OWNED_SUBPROCESS_BIRTH_ARGUMENT,
     RSYNC_EXECUTABLE,
     SSH_EXECUTABLE,
-    VerifiedSshAgentSocket,
+    SshAgentProxy,
+    SshAgentSocketSource,
     VerifiedSystemExecutable,
-    closed_ssh_environment,
 )
 
 CompletedRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
@@ -107,7 +107,11 @@ try:
 finally:
     os.close(birth_fd)
 os.set_inheritable(executable_fd, False)
-os.execve(f"/dev/fd/{executable_fd}", argv, dict(os.environ))
+environment = {}
+agent_socket = os.environ.get("SSH_AUTH_SOCK")
+if agent_socket is not None:
+    environment["SSH_AUTH_SOCK"] = agent_socket
+os.execve(f"/dev/fd/{executable_fd}", argv, environment)
 """
 
 
@@ -235,11 +239,11 @@ class _CoreTunnelEndpoint:
         connection_argv: list[str],
         trust_lease: AbstractContextManager[Path],
         trusted_host: TrustedKnownHostsBinding,
-        process_environment: dict[str, str],
+        agent_socket_source: SshAgentSocketSource | None,
     ) -> None:
         self._connection_starter = connection_starter
         self._connection_argv = connection_argv
-        self._process_environment = process_environment
+        self._agent_socket_source = agent_socket_source
         self._trust_lease: AbstractContextManager[Path] | None = trust_lease
         self._guard = threading.RLock()
         self._close_guard = threading.Lock()
@@ -302,7 +306,7 @@ class _CoreTunnelEndpoint:
                     authority.spawn_tunnel(
                         list(self._connection_argv),
                         stream_fd=child_stream.fileno(),
-                        env=dict(self._process_environment),
+                        agent_socket_source=self._agent_socket_source,
                     )
                     child.process = authority.process
                 else:
@@ -787,7 +791,8 @@ class SshRemoteExecutorTransport:
         self._tunnel_starter = tunnel_starter
         self._port_allocator = port_allocator or _allocate_local_port
         self._core_connection_starter = core_connection_starter
-        self._subprocess_environment = closed_ssh_environment(profile.auth.method)
+        self._subprocess_environment: dict[str, str] = {}
+        self._agent_socket_source = SshAgentSocketSource.from_environment(profile.auth.method)
         self._closed = False
         self._core_asset_authority_lock = threading.Lock()
         self._core_asset_authorities: dict[
@@ -883,6 +888,7 @@ class SshRemoteExecutorTransport:
                     timeout_seconds,
                     trust_ownership=trust_ownership,
                     env=self._process_environment(),
+                    agent_socket_source=self._agent_socket_source,
                     on_start=self._register_subprocess,
                     on_finish=self._unregister_subprocess,
                 )
@@ -1572,6 +1578,7 @@ class SshRemoteExecutorTransport:
                 process_authority.spawn_tunnel(
                     argv,
                     env=self._process_environment(),
+                    agent_socket_source=self._agent_socket_source,
                 )
                 process = process_authority.process
                 if process is None:
@@ -1682,7 +1689,7 @@ class SshRemoteExecutorTransport:
                 connection_argv=connection_argv,
                 trust_lease=trust_lease,
                 trusted_host=self._trusted_host,
-                process_environment=self._process_environment(),
+                agent_socket_source=self._agent_socket_source,
             )
         except BaseException as exc:
             if isinstance(exc, Exception):
@@ -1942,7 +1949,7 @@ class _OwnedSubprocessAuthority:
         self.exit_observer: _SubprocessExitObserver | None = None
         self._trust_ownership = trust_ownership
         self._birth_record: BinaryIO | None = None
-        self._agent_socket_authority: VerifiedSshAgentSocket | None = None
+        self._agent_proxy: SshAgentProxy | None = None
         self._spawn_outcome_unknown = False
         self._group_cleanup_confirmed = False
         self._slot_held = False
@@ -1978,6 +1985,7 @@ class _OwnedSubprocessAuthority:
         trust_lease: AbstractContextManager[Path] | None = None,
         trust_ownership: _KnownHostsLeaseOwnership | None = None,
         env: dict[str, str] | None = None,
+        agent_socket_source: SshAgentSocketSource | None = None,
     ) -> _OwnedSubprocessAuthority:
         if trust_lease is not None and trust_ownership is not None:
             raise RuntimeError("known-host lease has multiple ownership sources")
@@ -1988,10 +1996,15 @@ class _OwnedSubprocessAuthority:
         authority = cls(trust_ownership=active_ownership)
         try:
             authority.acquire()
-            authority._spawn(argv, env=env)
+            authority._spawn(
+                argv,
+                env=env,
+                agent_socket_source=agent_socket_source,
+            )
             return authority
         except BaseException:
             try:
+                authority.close_agent_proxy()
                 authority.cleanup()
             except BaseException:
                 authority.retain()
@@ -2007,12 +2020,19 @@ class _OwnedSubprocessAuthority:
         *,
         stream_fd: int | None = None,
         env: dict[str, str] | None = None,
+        agent_socket_source: SshAgentSocketSource | None = None,
     ) -> None:
         try:
-            self._spawn_tunnel(argv, stream_fd=stream_fd, env=env)
+            self._spawn_tunnel(
+                argv,
+                stream_fd=stream_fd,
+                env=env,
+                agent_socket_source=agent_socket_source,
+            )
             self.initialize_observer()
         except BaseException:
             try:
+                self.close_agent_proxy()
                 if self.process is None and self._spawn_outcome_unknown:
                     self._recover_spawned_process(
                         deadline=time.monotonic() + _SUBPROCESS_BIRTH_RECOVERY_SECONDS
@@ -2033,15 +2053,34 @@ class _OwnedSubprocessAuthority:
             self._birth_record = birth_record
             os.fchmod(birth_record.fileno(), 0o600)
 
-    def _spawn(self, argv: list[str], *, env: dict[str, str] | None) -> None:
+    def _spawn(
+        self,
+        argv: list[str],
+        *,
+        env: dict[str, str] | None,
+        agent_socket_source: SshAgentSocketSource | None,
+    ) -> None:
         birth_record = self._birth_record
         if birth_record is None:
             raise RuntimeError("subprocess birth authority is unavailable")
         birth_record_fd = birth_record.fileno()
         executable, nested, spawn_argv = _prepare_verified_spawn(argv)
         try:
-            self._acquire_agent_socket_authority(env)
-            descriptors = (birth_record_fd, executable.descriptor)
+            child_environment = _require_closed_child_environment(env)
+            self._open_agent_proxy(agent_socket_source)
+            agent_proxy = self._agent_proxy
+            if agent_proxy is not None:
+                child_environment["SSH_AUTH_SOCK"] = agent_proxy.socket_path
+            descriptors = (
+                birth_record_fd,
+                executable.descriptor,
+                *(item.descriptor for item in nested),
+            )
+            executable.verify_path_binding()
+            for item in nested:
+                item.verify_path_binding()
+            if agent_proxy is not None:
+                agent_proxy.verify_upstream_binding()
             self._spawn_outcome_unknown = True
             process = _OWNED_SUBPROCESS_POPEN(
                 _subprocess_birth_argv(
@@ -2057,7 +2096,7 @@ class _OwnedSubprocessAuthority:
                 start_new_session=True,
                 close_fds=True,
                 pass_fds=descriptors,
-                env={} if env is None else env,
+                env=child_environment,
             )
             self.process_group_id = process.pid
             self.process = process
@@ -2065,7 +2104,14 @@ class _OwnedSubprocessAuthority:
             executable.verify_path_binding()
             for item in nested:
                 item.verify_path_binding()
-            self._verify_agent_socket_authority()
+            if agent_proxy is not None:
+                agent_proxy.verify_upstream_binding()
+                ssh_executable = nested[0] if nested else executable
+                agent_proxy.bind_child(
+                    session_id=process.pid,
+                    process_group_id=process.pid,
+                    executable_identity=ssh_executable.identity,
+                )
         finally:
             for item in reversed(nested):
                 item.close()
@@ -2077,6 +2123,7 @@ class _OwnedSubprocessAuthority:
         *,
         stream_fd: int | None,
         env: dict[str, str] | None,
+        agent_socket_source: SshAgentSocketSource | None,
     ) -> None:
         birth_record = self._birth_record
         if birth_record is None:
@@ -2084,10 +2131,23 @@ class _OwnedSubprocessAuthority:
         birth_record_fd = birth_record.fileno()
         executable, nested, spawn_argv = _prepare_verified_spawn(argv)
         try:
-            self._acquire_agent_socket_authority(env)
-            descriptors = [birth_record_fd, executable.descriptor]
+            child_environment = _require_closed_child_environment(env)
+            self._open_agent_proxy(agent_socket_source)
+            agent_proxy = self._agent_proxy
+            if agent_proxy is not None:
+                child_environment["SSH_AUTH_SOCK"] = agent_proxy.socket_path
+            descriptors = [
+                birth_record_fd,
+                executable.descriptor,
+                *(item.descriptor for item in nested),
+            ]
             if stream_fd is not None:
                 descriptors.append(stream_fd)
+            executable.verify_path_binding()
+            for item in nested:
+                item.verify_path_binding()
+            if agent_proxy is not None:
+                agent_proxy.verify_upstream_binding()
             self._spawn_outcome_unknown = True
             process = _TUNNEL_SUBPROCESS_POPEN(
                 _subprocess_birth_argv(
@@ -2103,7 +2163,7 @@ class _OwnedSubprocessAuthority:
                 text=False,
                 start_new_session=True,
                 pass_fds=tuple(descriptors),
-                env={} if env is None else env,
+                env=child_environment,
             )
             self.process_group_id = process.pid
             self.process = process
@@ -2111,7 +2171,14 @@ class _OwnedSubprocessAuthority:
             executable.verify_path_binding()
             for item in nested:
                 item.verify_path_binding()
-            self._verify_agent_socket_authority()
+            if agent_proxy is not None:
+                agent_proxy.verify_upstream_binding()
+                ssh_executable = nested[0] if nested else executable
+                agent_proxy.bind_child(
+                    session_id=process.pid,
+                    process_group_id=process.pid,
+                    executable_identity=ssh_executable.identity,
+                )
         finally:
             for item in reversed(nested):
                 item.close()
@@ -2138,20 +2205,18 @@ class _OwnedSubprocessAuthority:
                 return False
             time.sleep(min(0.01, remaining))
 
-    def _acquire_agent_socket_authority(self, env: dict[str, str] | None) -> None:
-        if self._agent_socket_authority is not None:
-            raise RuntimeError("SSH agent socket authority is already held")
-        environment = {} if env is None else env
-        if set(environment) - {"SSH_AUTH_SOCK"}:
-            raise RuntimeError("subprocess environment is not closed")
-        socket_path = environment.get("SSH_AUTH_SOCK")
-        if socket_path is not None:
-            self._agent_socket_authority = VerifiedSshAgentSocket.open(socket_path)
+    def _open_agent_proxy(self, source: SshAgentSocketSource | None) -> None:
+        if self._agent_proxy is not None:
+            raise RuntimeError("SSH agent proxy authority is already held")
+        if source is not None:
+            self._agent_proxy = source.open_proxy()
 
-    def _verify_agent_socket_authority(self) -> None:
-        authority = self._agent_socket_authority
-        if authority is not None:
-            authority.verify_path_binding()
+    def close_agent_proxy(self) -> None:
+        proxy = self._agent_proxy
+        if proxy is None:
+            return
+        proxy.close()
+        self._agent_proxy = None
 
     def initialize_observer(self) -> None:
         process = self.process
@@ -2260,10 +2325,13 @@ class _OwnedSubprocessAuthority:
             return False
         if self._birth_record is birth_record:
             self._birth_record = None
-        agent_socket_authority = self._agent_socket_authority
-        if agent_socket_authority is not None:
-            agent_socket_authority.close()
-            self._agent_socket_authority = None
+        agent_proxy = self._agent_proxy
+        if agent_proxy is not None:
+            try:
+                self.close_agent_proxy()
+            except BaseException:
+                self.retain()
+                return False
         trust_ownership = self._trust_ownership
         if trust_ownership is not None and not trust_ownership.release_for(self):
             self.retain()
@@ -2309,6 +2377,7 @@ def _prepare_verified_spawn(
                 raise RuntimeError("rsync SSH executable is not fixed")
             ssh = VerifiedSystemExecutable.open(SSH_EXECUTABLE)
             nested.append(ssh)
+            command[0] = ssh.execution_path
             spawn_argv[command_index] = " ".join(shlex.quote(part) for part in command)
         elif argv[0] != SSH_EXECUTABLE:
             raise RuntimeError("subprocess executable is not supported")
@@ -2391,6 +2460,7 @@ def _run_subprocess(
     trust_lease: AbstractContextManager[Path] | None = None,
     trust_ownership: _KnownHostsLeaseOwnership | None = None,
     env: dict[str, str] | None = None,
+    agent_socket_source: SshAgentSocketSource | None = None,
     on_start: Callable[[_OwnedSubprocessAuthority], None] | None = None,
     on_finish: Callable[[_OwnedSubprocessAuthority], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -2403,6 +2473,7 @@ def _run_subprocess(
             argv,
             trust_ownership=active_ownership,
             env=env,
+            agent_socket_source=agent_socket_source,
         )
         process = authority.process
         if process is None:
@@ -2459,6 +2530,13 @@ def _run_subprocess(
     finally:
         if caller_ownership is not None:
             caller_ownership.release_if_caller_owned()
+
+
+def _require_closed_child_environment(env: dict[str, str] | None) -> dict[str, str]:
+    environment = {} if env is None else dict(env)
+    if environment:
+        raise RuntimeError("subprocess environment is not closed")
+    return environment
 
 
 class _SubprocessCaptureLimitExceeded(RuntimeError):

@@ -677,10 +677,17 @@ remain supported.
 
 Release SSH, ssh-keyscan, and rsync calls use platform-fixed allowlisted absolute
 binaries. The launcher verifies root ownership, regular-file type, executable
-mode, non-group/world-writable ancestors and file metadata, holds the executable
-identity through process birth, and supplies a closed environment containing at
-most a validated `SSH_AUTH_SOCK`. Process-group birth and cleanup authority is
-retained across cancellation. These changes and Linux/macOS externalBin
+mode, link count one, non-group/world-writable ancestors and file metadata, and
+holds the executable identity through process birth. The original host
+`SSH_AUTH_SOCK` path is never supplied to OpenSSH. Every SSH/rsync/tunnel spawn
+first connects and revalidates the held upstream socket, then exposes only a
+fresh owner-private one-shot relay. Kernel peer PID, the owned child session and
+process group, and the held SSH executable vnode jointly authorize its sole
+downstream connection. Rsync names that held SSH FD in `-e` and inherits it
+through the nested exec. Relay buffers, accept lifetime, cleanup retries, and
+retained cleanup authorities are bounded; uncertain path cleanup never removes
+a replacement. Process-group birth and cleanup authority is retained across
+cancellation. These changes and Linux/macOS externalBin
 combination smokes do not prove code signing, notarization, mounted/copied macOS
 application launch, first-run
 remote bootstrap, or downloaded artifact identity, and do not make the DMG
