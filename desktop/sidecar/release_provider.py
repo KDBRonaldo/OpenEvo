@@ -24,6 +24,9 @@ from desktop.sidecar.contracts.v1.models import (
     ContractNegotiationV1,
     CoreConnectionStateV1,
     DesktopStateV1,
+    ExecutionModeCapabilitiesV1,
+    ExecutionModeCapabilityV1,
+    ExecutionModeV1,
     HealthV1,
     HostKeyAcceptV1,
     HostKeyReviewV1,
@@ -90,6 +93,15 @@ class ProviderCapabilityUnavailableError(Exception):
     def __init__(self, operation_id: str) -> None:
         super().__init__("required provider capability is unavailable")
         self.operation_id = operation_id
+
+
+class ExecutionModeReleaseUnavailableError(Exception):
+    """A valid project mode is not usable in the exact Desktop release composition."""
+
+    def __init__(self, operation_id: str, capability: ExecutionModeCapabilityV1) -> None:
+        super().__init__("execution mode is unavailable in this Desktop release")
+        self.operation_id = operation_id
+        self.capability = capability
 
 
 class InvalidNativeChallengeError(Exception):
@@ -211,6 +223,7 @@ class DesktopReleaseProvider:
         build_channel: str,
         instance_id: str,
         readiness_key: bytes,
+        execution_mode_capabilities: ExecutionModeCapabilitiesV1,
         remote_lifecycle: DesktopRemoteLifecycle,
         core_runtime: DesktopCoreRuntimeOwnerV1 | None = None,
         core_bridge: DesktopCoreBridgeV1 | None = None,
@@ -246,6 +259,10 @@ class DesktopReleaseProvider:
         self._instance_id = instance_id
         self._readiness_key = readiness_key
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._execution_mode_capabilities = execution_mode_capabilities
+        self._execution_modes = {
+            capability.mode: capability for capability in execution_mode_capabilities.modes
+        }
         self._reconcile_workspace_imports()
         feature_flags: tuple[local_v1.FeatureFlagV1, ...] = ("remote_profiles",)
         if self._core_bridge is not None and self._event_broker is not None:
@@ -424,6 +441,7 @@ class DesktopReleaseProvider:
                 ),
                 compatible=True,
             ),
+            execution_mode_capabilities=self._execution_mode_capabilities,
             core=core_state,
             active_project=active_project,
             pending_operation_ids=self._store.pending_operation_ids(),
@@ -971,6 +989,7 @@ class DesktopReleaseProvider:
 
     def _create_project(self, arguments: Mapping[str, object]) -> Response:
         request = cast(ProjectCreateV1, arguments["request"])
+        self._require_supported_execution_mode("createProject", request.execution.mode)
         with self._store.workspace_import_reference_guard():
             self._verify_project_source(request.source, project_id=None)
             project = self._store.create_project(
@@ -990,6 +1009,15 @@ class DesktopReleaseProvider:
         with self._project_session_lock:
             with self._store.workspace_import_reference_guard():
                 previous = self._store.get_project(project_id)
+                if not hmac.compare_digest(
+                    previous.etag,
+                    cast(str, arguments["if_match"]),
+                ):
+                    raise ETagConflictError("project", project_id, previous.etag)
+                self._require_supported_execution_mode(
+                    "updateProject",
+                    request.execution.mode if request.execution is not None else previous.execution.mode,
+                )
                 if request.source is not None:
                     self._verify_project_source(request.source, project_id=project_id)
                 project = self._store.patch_project(
@@ -1023,14 +1051,18 @@ class DesktopReleaseProvider:
         if_match = cast(str, arguments["if_match"])
         key = cast(str, arguments["idempotency_key"])
         route = f"/desktop/v1/projects/{project_id}/activate"
-        reservation = self._store.begin_project_runtime_action(
-            route=route,
-            operation_kind="project_activate",
-            project_id=project_id,
-            key=key,
-            body={},
-            if_match=if_match,
-        )
+        with self._project_session_lock:
+            reservation = self._store.begin_project_runtime_action(
+                route=route,
+                operation_kind="project_activate",
+                project_id=project_id,
+                key=key,
+                body={},
+                if_match=if_match,
+                admission_guard=lambda project: self._require_supported_execution_mode(
+                    "activateProject", project.execution.mode
+                ),
+            )
         if reservation.replayed:
             return self._project_operation_response(reservation.operation)
         work = _ProjectActivationWork(
@@ -1401,6 +1433,7 @@ class DesktopReleaseProvider:
                 request.project_id,
                 cast(str, arguments["if_match"]),
             )
+            self._require_supported_execution_mode("createRun", project.execution.mode)
             return self._require_bridge("createRun").create_run(
                 project,
                 idempotency_key=cast(str, arguments["idempotency_key"]),
@@ -1862,9 +1895,21 @@ class DesktopReleaseProvider:
     def _unavailable(operation_id: str) -> NoReturn:
         raise ProviderCapabilityUnavailableError(operation_id)
 
+    def _require_supported_execution_mode(
+        self,
+        operation_id: str,
+        mode: ExecutionModeV1,
+    ) -> None:
+        capability = self._execution_modes.get(mode)
+        if capability is None or capability.support_state != "supported":
+            if capability is None:
+                raise ProviderStoreError("release execution mode capability is missing")
+            raise ExecutionModeReleaseUnavailableError(operation_id, capability)
+
 
 __all__ = (
     "DesktopReleaseProvider",
+    "ExecutionModeReleaseUnavailableError",
     "InvalidNativeChallengeError",
     "NATIVE_SIDECAR_PROTOCOL",
     "ProviderCapabilityUnavailableError",

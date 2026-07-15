@@ -1323,6 +1323,12 @@ pre.json {
   box-shadow: 0 1px 2px rgb(30 40 34 / 12%);
 }
 
+.segmented-control button:disabled {
+  color: #8b928e;
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
 .artifact-body {
   min-height: 350px;
   margin-top: 13px;
@@ -1851,6 +1857,17 @@ pre.json {
 .form-help {
   margin: 9px 0 0;
   color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.mode-support-message {
+  margin: 9px 0 0;
+  padding: 8px 9px;
+  border: 1px solid #ead19e;
+  border-radius: 6px;
+  color: #744b13;
+  background: var(--warning-soft);
   font-size: 10px;
   line-height: 1.45;
 }

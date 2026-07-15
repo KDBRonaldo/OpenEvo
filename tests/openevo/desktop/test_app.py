@@ -420,7 +420,7 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
             "api_name": "openevo-desktop-local-api",
             "preferred_major": 1,
             "supported_majors": [1],
-            "openapi_sha256": "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36",
+            "openapi_sha256": "e3bc443ee213eb33de81b82c7f954fb617fab14b8a2c17e154f3d4b980ba441f",
             "build_version": "0.1.0",
             "source_commit": "89baeb26",
             "build_channel": "test",

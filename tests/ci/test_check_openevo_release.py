@@ -1281,6 +1281,21 @@ def test_desktop_tailwind_sources_are_explicit_and_exclude_packaged_web() -> Non
     assert "packaging/web" not in styles
 
 
+def test_release_execution_mode_authority_has_no_renderer_fixture_fallback() -> None:
+    release_provider = Path("desktop/src/product/releaseProvider.ts").read_text(encoding="utf-8")
+    local_provider = Path("desktop/src/product/localApiProvider.ts").read_text(encoding="utf-8")
+    product_app = Path("desktop/src/product/DesktopProductApp.tsx").read_text(encoding="utf-8")
+    release_capabilities = Path("desktop/sidecar/release_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "fixtureProvider" not in release_provider
+    assert "fixtureProvider" not in local_provider
+    assert "self_deployed_release_unavailable" not in product_app
+    assert "RELEASE_EXECUTION_MODE_CAPABILITIES" not in product_app
+    assert "self_deployed_release_unavailable" in release_capabilities
+
+
 def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     from desktop.sidecar.contracts.v1 import DESKTOP_OPENAPI_SHA256
 

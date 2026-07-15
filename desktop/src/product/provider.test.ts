@@ -37,7 +37,7 @@ describe("Desktop product provider boundary", () => {
     expect(contract.allowedProviderKinds).toEqual(["desktop_sidecar"]);
     expect(Object.isFrozen(contract.acceptedOpenApiDigests)).toBe(true);
     expect(DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests).toEqual([
-      "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36",
+      "e3bc443ee213eb33de81b82c7f954fb617fab14b8a2c17e154f3d4b980ba441f",
     ]);
   });
 

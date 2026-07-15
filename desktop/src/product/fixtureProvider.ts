@@ -1,4 +1,7 @@
-import { CONTRACT_FIXTURE_V1 } from "../api/v1/fixtures";
+import {
+  CONTRACT_FIXTURE_V1,
+  RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1,
+} from "../api/v1/fixtures";
 import { DesktopApiError } from "../api/v1/client";
 import {
   apiErrorV1Schema,
@@ -6,6 +9,7 @@ import {
   artifactDiffV1Schema,
   artifactV1Schema,
   desktopStateV1Schema,
+  executionModeCapabilitiesV1Schema,
   diagnosticReportV1Schema,
   localOperationV1Schema,
   logEntryV1Schema,
@@ -68,6 +72,7 @@ export interface FixtureProviderOptions {
   degraded?: boolean;
   stepDelayMs?: number;
   newUser?: boolean;
+  releaseExecutionModes?: boolean;
 }
 
 export class FixtureDesktopProductProvider implements DesktopProductProvider {
@@ -77,6 +82,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private readonly stepDelayMs: number;
   private readonly artifactTruncated: boolean;
   private state: DesktopStateV1;
+  private readonly executionModeCapabilities: DesktopStateV1["execution_mode_capabilities"];
   private profiles: RemoteProfileV1[];
   private projects: ProjectV1[];
   private runs: RunV1[] = [];
@@ -129,6 +135,20 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.artifactTruncated = options.artifactTruncated ?? false;
     const online = options.startOnline ?? false;
     const newUser = options.newUser ?? (!online && !options.seedCompletedRun);
+    const releaseExecutionModes = executionModeCapabilitiesV1Schema.parse(RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1);
+    this.executionModeCapabilities = options.releaseExecutionModes
+      ? releaseExecutionModes
+      : executionModeCapabilitiesV1Schema.parse({
+          ...releaseExecutionModes,
+          modes: releaseExecutionModes.modes.map((capability) => capability.mode === "self-deployed"
+            ? {
+                ...capability,
+                support_state: "supported",
+                reason_code: null,
+                message: "Available in the contract simulator.",
+              }
+            : capability),
+        });
     this.profiles = newUser ? [] : [this.makeProfile(online ? "connected" : "disconnected")];
     this.projects = newUser ? [] : [this.makeProjectFixture()];
     this.state = newUser ? this.makeNewUserState() : this.makeState(online ? "online" : "offline");
@@ -185,6 +205,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         : null;
     return structuredClone({
       state: this.state,
+      executionModeCapabilities: this.state.execution_mode_capabilities,
       profiles: this.profiles,
       projects: this.projects,
       runs: this.runs,
@@ -1157,6 +1178,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private makeState(connection: "offline" | "online"): DesktopStateV1 {
     return desktopStateV1Schema.parse({
       ...structuredClone(CONTRACT_FIXTURE_V1.state),
+      execution_mode_capabilities: this.executionModeCapabilities,
       core: connection === "online"
         ? structuredClone(CONTRACT_FIXTURE_V1.state.core)
         : {
@@ -1186,6 +1208,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       schema_version: "1",
       observed_at: NOW,
       contract: { selected_major: 1, desktop_openapi_sha256: A, core_openapi_sha256: null, compatible: false },
+      execution_mode_capabilities: this.executionModeCapabilities,
       core: {
         state: "disconnected",
         profile_id: null,

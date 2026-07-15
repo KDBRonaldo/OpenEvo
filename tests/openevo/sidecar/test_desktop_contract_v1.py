@@ -21,6 +21,7 @@ from desktop.sidecar.contracts.v1 import (
     DesktopStateV1,
     DiagnosticReportV1,
     EventEnvelopeV1,
+    ExecutionModeCapabilitiesV1,
     ExecutionSettingsV1,
     HealthV1,
     LocalOperationV1,
@@ -47,6 +48,7 @@ from desktop.sidecar.contracts.v1 import (
     desktop_openapi_document,
     verify_contract_snapshots,
 )
+from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
 
 
 _DIGEST = "a" * 64
@@ -176,6 +178,52 @@ def test_discovery_is_public_and_v1_uses_desktop_session_security() -> None:
     for method, path in _EXPECTED_OPERATIONS:
         if path.startswith("/desktop/v1"):
             assert schema["paths"][path][method]["security"] == [{"DesktopSession": []}]
+
+
+def test_execution_mode_capabilities_are_closed_complete_and_versioned() -> None:
+    capabilities = RELEASE_EXECUTION_MODE_CAPABILITIES_V1
+    assert capabilities.schema_version == "1"
+    assert [item.mode for item in capabilities.modes] == [
+        "codex_subscription_transcript",
+        "self-deployed",
+    ]
+    assert [item.support_state for item in capabilities.modes] == [
+        "supported",
+        "unavailable",
+    ]
+    assert capabilities.modes[1].reason_code == "self_deployed_release_unavailable"
+
+    payload = capabilities.model_dump(mode="json")
+    for invalid in (
+        {**payload, "modes": payload["modes"][:1]},
+        {**payload, "modes": [payload["modes"][0], payload["modes"][0]]},
+        {
+            **payload,
+            "modes": [
+                payload["modes"][0],
+                {**payload["modes"][1], "mode": "future-mode"},
+            ],
+        },
+        {
+            **payload,
+            "modes": [
+                payload["modes"][0],
+                {**payload["modes"][1], "reason_code": None},
+            ],
+        },
+        {
+            **payload,
+            "modes": [
+                payload["modes"][0],
+                {**payload["modes"][1], "reason_code": "future_reason"},
+            ],
+        },
+    ):
+        with pytest.raises(ValidationError):
+            ExecutionModeCapabilitiesV1.model_validate(invalid)
+
+    state_schema = desktop_openapi_document()["components"]["schemas"]["DesktopStateV1"]
+    assert "execution_mode_capabilities" in state_schema["required"]
 
 
 def test_only_sidecar_owned_actions_return_local_operations() -> None:
@@ -645,8 +693,8 @@ def test_snapshots_are_canonical_and_digests_are_stable() -> None:
     openapi_digest, events_digest = verify_contract_snapshots()
     assert openapi_digest == DESKTOP_OPENAPI_SHA256
     assert events_digest == DESKTOP_EVENTS_SCHEMA_SHA256
-    assert openapi_digest == "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36"
-    assert events_digest == "43ad2f8d2f8355a1d4227b7d26f8043cd2440cf9d35c5aa4f7a70d6717773543"
+    assert openapi_digest == "e3bc443ee213eb33de81b82c7f954fb617fab14b8a2c17e154f3d4b980ba441f"
+    assert events_digest == "39e485b6c61688832ec0445502d2f1f9e8bd9548e9b81a0a4740bc5997d90936"
     snapshot_root = Path(__file__).parents[3] / "desktop/sidecar/contracts/v1"
     assert (snapshot_root / "openapi.json").read_bytes() == canonical_json_bytes(
         desktop_openapi_document()

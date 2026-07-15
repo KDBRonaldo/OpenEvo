@@ -74,6 +74,7 @@ export type ProductArtifactCollectionState =
 
 export interface DesktopProductSnapshot {
   readonly state: DesktopStateV1;
+  readonly executionModeCapabilities: DesktopStateV1["execution_mode_capabilities"];
   readonly profiles: readonly RemoteProfileV1[];
   readonly projects: readonly ProjectV1[];
   readonly runs: readonly RunV1[];

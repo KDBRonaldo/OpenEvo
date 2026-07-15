@@ -19,6 +19,7 @@ from desktop.sidecar.event_broker_v1 import (
 from desktop.sidecar.provider_store import DesktopProviderStore, ETagConflictError
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import DesktopReleaseProvider
+from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
 from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
 from desktop.sidecar.workspace_imports import WorkspaceImportStore
 from openevo.backend.contracts.v1 import models as core_v1
@@ -83,6 +84,7 @@ def _provider(
         build_channel="test",
         instance_id="1" * 32,
         readiness_key=b"r" * 32,
+        execution_mode_capabilities=RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,  # type: ignore[arg-type]
         event_broker=event_broker,

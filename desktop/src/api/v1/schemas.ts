@@ -35,6 +35,42 @@ export const utcTimestampSchema = z.string().regex(UTC_RFC3339, "must be a UTC R
 export const sha256DigestSchema = z.string().regex(SHA256, "must be lowercase SHA-256 hex");
 export const etagSchema = z.string().regex(/^"[0-9a-f]{64}"$/);
 export const executionModeV1Schema = z.enum(["codex_subscription_transcript", "self-deployed"]);
+const executionModeReasonCodeV1Schema = z.enum([
+  "self_deployed_release_unavailable",
+  "execution_mode_release_unsupported",
+]);
+export const executionModeCapabilityV1Schema = z
+  .object({
+    mode: executionModeV1Schema,
+    display_name: shortTextSchema,
+    support_state: z.enum(["supported", "unavailable", "unsupported"]),
+    reason_code: executionModeReasonCodeV1Schema.nullable().default(null),
+    message: shortTextSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.support_state === "supported" && value.reason_code !== null) {
+      issue(context, ["reason_code"], "supported execution modes cannot include a reason code");
+    }
+    if (value.support_state !== "supported" && value.reason_code === null) {
+      issue(context, ["reason_code"], "unavailable and unsupported execution modes require a reason code");
+    }
+  });
+export const executionModeCapabilitiesV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    modes: z.array(executionModeCapabilityV1Schema).length(2),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const modes = value.modes.map((capability) => capability.mode);
+    if (new Set(modes).size !== modes.length) {
+      issue(context, ["modes"], "execution mode capabilities must not contain duplicates");
+    }
+    if (!["codex_subscription_transcript", "self-deployed"].every((mode) => modes.includes(mode as typeof modes[number]))) {
+      issue(context, ["modes"], "execution mode capabilities must contain every known mode exactly once");
+    }
+  });
 
 const coreOpaqueIdSchema = z
   .string()
@@ -221,6 +257,7 @@ export const desktopStateV1Schema = z
     schema_version: schemaVersionV1Schema,
     observed_at: utcTimestampSchema,
     contract: contractNegotiationV1Schema,
+    execution_mode_capabilities: executionModeCapabilitiesV1Schema,
     core: coreConnectionStateV1Schema,
     active_project: activeProjectStateV1Schema.nullable().default(null),
     pending_operation_ids: z.array(opaqueIdSchema).default([]),
@@ -1276,6 +1313,8 @@ export type DesktopBootstrapContextV1 = z.infer<typeof desktopBootstrapContextV1
 export type HealthV1 = z.infer<typeof healthV1Schema>;
 export type ApiErrorV1 = z.infer<typeof apiErrorV1Schema>;
 export type DesktopStateV1 = z.infer<typeof desktopStateV1Schema>;
+export type ExecutionModeCapabilityV1 = z.infer<typeof executionModeCapabilityV1Schema>;
+export type ExecutionModeCapabilitiesV1 = z.infer<typeof executionModeCapabilitiesV1Schema>;
 export type CoreConnectionStateV1 = z.infer<typeof coreConnectionStateV1Schema>;
 export type RemoteProfileV1 = z.infer<typeof remoteProfileV1Schema>;
 export type ProfileCreateV1 = z.input<typeof profileCreateV1Schema>;

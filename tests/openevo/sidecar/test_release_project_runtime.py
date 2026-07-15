@@ -18,6 +18,7 @@ from desktop.sidecar.core_bridge_v1 import (
 )
 from desktop.sidecar.provider_store import DesktopProviderStore
 from desktop.sidecar.release_provider import DesktopReleaseProvider
+from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
 from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
 from desktop.sidecar.remote_lifecycle import (
     RemoteConnectionFailedError,
@@ -98,6 +99,7 @@ def _provider(
         build_channel="test",
         instance_id="1" * 32,
         readiness_key=b"r" * 32,
+        execution_mode_capabilities=RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
         remote_lifecycle=lifecycle or _Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,  # type: ignore[arg-type]
         event_broker=event_broker,  # type: ignore[arg-type]

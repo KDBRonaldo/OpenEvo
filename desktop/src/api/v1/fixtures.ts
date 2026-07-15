@@ -4,7 +4,27 @@ const C = "c".repeat(64);
 const ETAG_A = `"${A}"`;
 const ETAG_B = `"${B}"`;
 const NOW = "2026-07-14T12:00:00Z";
-const OPENAPI_DIGEST = "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36";
+const OPENAPI_DIGEST = "e3bc443ee213eb33de81b82c7f954fb617fab14b8a2c17e154f3d4b980ba441f";
+
+export const RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1 = {
+  schema_version: "1",
+  modes: [
+    {
+      mode: "codex_subscription_transcript",
+      display_name: "Subscription",
+      support_state: "supported",
+      reason_code: null,
+      message: "Available in this OpenEvo Desktop release.",
+    },
+    {
+      mode: "self-deployed",
+      display_name: "Self-deployed",
+      support_state: "unavailable",
+      reason_code: "self_deployed_release_unavailable",
+      message: "Self-deployed execution is not available in this OpenEvo Desktop release. Choose Subscription to save or run this project.",
+    },
+  ],
+} as const;
 
 const supportedAxis = {
   state: "supported",
@@ -647,6 +667,7 @@ export const CONTRACT_FIXTURE_V1 = {
     schema_version: "1",
     observed_at: NOW,
     contract: { selected_major: 1, desktop_openapi_sha256: OPENAPI_DIGEST, core_openapi_sha256: B, compatible: true },
+    execution_mode_capabilities: RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1,
     core: {
       state: "online",
       profile_id: "profile-fixture-1",

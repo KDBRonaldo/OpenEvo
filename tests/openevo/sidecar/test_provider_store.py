@@ -3098,6 +3098,37 @@ def test_project_runtime_action_is_durable_idempotent_and_completes_atomically(
     assert store.begin_project_runtime_action(**action).operation == finished
 
 
+def test_project_runtime_action_admission_guard_is_atomic_and_skipped_for_replay(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-runtime-guard-create-01"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": project.project_id,
+        "key": "project-runtime-guard-activate-01",
+        "body": {},
+        "if_match": project.etag,
+    }
+
+    def reject(_project: ProjectV1) -> None:
+        raise RuntimeError("release capability rejected the project")
+
+    with pytest.raises(RuntimeError, match="release capability"):
+        store.begin_project_runtime_action(**action, admission_guard=reject)
+    assert store.pending_operation_ids() == ()
+
+    reservation = store.begin_project_runtime_action(**action)
+    replay = store.begin_project_runtime_action(**action, admission_guard=reject)
+    assert reservation.replayed is False
+    assert replay.replayed is True
+    assert replay.operation == reservation.operation
+
+
 @pytest.mark.parametrize("remote_kind", ["missing", "not_ready", "wrong_revision_project"])
 def test_project_activation_requires_a_matching_ready_remote_projection(
     tmp_path: Path, remote_kind: str

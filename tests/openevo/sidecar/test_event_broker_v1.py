@@ -29,6 +29,7 @@ from desktop.sidecar.event_broker_v1 import (
     DesktopEventReentrantPublishError,
     DesktopEventSubscriberLimitError,
 )
+from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
 
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
@@ -64,6 +65,7 @@ def _large_state(operation_count: int = 3_870) -> StateEventV1:
                 desktop_openapi_sha256="a" * 64,
                 compatible=False,
             ),
+            execution_mode_capabilities=RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
             core=CoreConnectionStateV1(
                 state="disconnected",
                 active_tunnel=False,

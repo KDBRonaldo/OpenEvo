@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 from threading import Event, Lock, Thread
 from typing import Any, cast
+from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
 import pytest
@@ -17,6 +18,8 @@ from desktop.sidecar.contracts.v1 import (
     contract_app,
     create_contract_app,
 )
+from desktop.sidecar.contracts.v1 import models as local_v1
+from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeV1
 import desktop.sidecar.provider_store as provider_store_module
 from desktop.sidecar.provider_store import (
     DesktopProviderStore,
@@ -162,6 +165,7 @@ def _app(
     *,
     clock: MutableClock | None = None,
     remote_lifecycle: FakeRemoteLifecycle | None = None,
+    core_bridge: DesktopCoreBridgeV1 | None = None,
 ):
     return create_release_desktop_local_api_app(
         state_root=state_root,
@@ -172,6 +176,7 @@ def _app(
         build_channel="test",
         clock=clock,
         remote_lifecycle=cast(DesktopRemoteLifecycle | None, remote_lifecycle),
+        core_bridge=core_bridge,
     )
 
 
@@ -303,6 +308,104 @@ def test_project_create_rejects_an_unregistered_native_workspace_reference(
         assert str(tmp_path) not in response.text
 
 
+def test_release_execution_mode_gate_rejects_create_update_activate_and_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    app = _app(tmp_path / "state", core_bridge=bridge)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Release mode server",
+            key="create-profile-release-mode-0001",
+        ).json()
+        request = _project(profile["profile_id"])
+        request["execution"] = {
+            "mode": "self-deployed",
+            "hf_model": "open-models/release-gated-model",
+        }
+        headers = {
+            **SESSION_HEADERS,
+            "Idempotency-Key": "create-project-release-mode-0001",
+        }
+
+        rejected_create = client.post("/desktop/v1/projects", headers=headers, json=request)
+        replayed_create = client.post("/desktop/v1/projects", headers=headers, json=request)
+        assert rejected_create.status_code == 409
+        assert replayed_create.json()["code"] == "self_deployed_release_unavailable"
+        assert replayed_create.json()["message"] == rejected_create.json()["message"]
+        assert client.get("/desktop/v1/projects", headers=SESSION_HEADERS).json()["items"] == []
+
+        supported_request = {
+            **request,
+            "name": "Supported release mode project",
+            "execution": {
+                "mode": "codex_subscription_transcript",
+                "codex_model": "gpt-5.5",
+            },
+        }
+        accepted_after_rejection = client.post(
+            "/desktop/v1/projects",
+            headers=headers,
+            json=supported_request,
+        )
+        assert accepted_after_rejection.status_code == 201
+
+        provider = app.state.desktop_release_provider
+        project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(request),
+            idempotency_key="seed-existing-release-mode-0001",
+        )
+        rejected_update = client.patch(
+            f"/desktop/v1/projects/{project.project_id}",
+            headers={**SESSION_HEADERS, "If-Match": project.etag},
+            json={"task": {"title": "Design", "objective": "Do not persist this edit."}},
+        )
+        assert rejected_update.status_code == 409
+        assert provider._store.get_project(project.project_id).etag == project.etag
+
+        rejected_activation = client.post(
+            f"/desktop/v1/projects/{project.project_id}/activate",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": project.etag,
+                "Idempotency-Key": "activate-project-release-mode-0001",
+            },
+        )
+        assert rejected_activation.status_code == 409
+        assert provider._store.pending_operation_ids() == ()
+
+        monkeypatch.setattr(provider, "_require_project_match", lambda *_args: project)
+        rejected_run = client.post(
+            "/desktop/v1/runs",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": project.etag,
+                "Idempotency-Key": "create-run-release-mode-0001",
+            },
+            json={"project_id": project.project_id},
+        )
+        assert rejected_run.status_code == 409
+        assert rejected_run.json()["category"] == "run"
+
+        switched = client.patch(
+            f"/desktop/v1/projects/{project.project_id}",
+            headers={**SESSION_HEADERS, "If-Match": project.etag},
+            json={
+                "execution": {
+                    "mode": "codex_subscription_transcript",
+                    "codex_model": "gpt-5.5",
+                }
+            },
+        )
+        assert switched.status_code == 200
+        assert switched.json()["execution"]["mode"] == "codex_subscription_transcript"
+
+        bridge.activate_project.assert_not_called()
+        bridge.create_run.assert_not_called()
+
+
 def test_release_discovery_health_and_desktop_session_auth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -341,6 +444,31 @@ def test_release_discovery_health_and_desktop_session_auth(
             == hmac.new(READINESS_KEY, domain, hashlib.sha256).hexdigest()
         )
         assert SESSION_TOKEN not in health.text
+
+        release_state = client.get("/desktop/v1/state", headers=SESSION_HEADERS)
+        assert release_state.status_code == 200
+        assert release_state.json()["execution_mode_capabilities"] == {
+            "schema_version": "1",
+            "modes": [
+                {
+                    "mode": "codex_subscription_transcript",
+                    "display_name": "Subscription",
+                    "support_state": "supported",
+                    "reason_code": None,
+                    "message": "Available in this OpenEvo Desktop release.",
+                },
+                {
+                    "mode": "self-deployed",
+                    "display_name": "Self-deployed",
+                    "support_state": "unavailable",
+                    "reason_code": "self_deployed_release_unavailable",
+                    "message": (
+                        "Self-deployed execution is not available in this OpenEvo Desktop "
+                        "release. Choose Subscription to save or run this project."
+                    ),
+                },
+            ],
+        }
 
         for response in (
             client.get("/desktop/v1/state"),

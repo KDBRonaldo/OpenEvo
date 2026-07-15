@@ -4,6 +4,23 @@ The sidecar owns Desktop-local security boundaries that must not be exposed to
 the React renderer. Local HTTP routes and the native host are separate adapters;
 they are not implemented in every private sidecar service module.
 
+## Release execution modes
+
+The exact sidecar release composition publishes the required
+`DesktopStateV1.execution_mode_capabilities` contract before any project or
+remote connection exists. The list is closed, versioned, bounded, ordered, and
+must contain each Local API v1 execution mode exactly once. It is release
+support, not remote-host readiness: model preparation, GPU/runtime checks, and
+credentials continue to come from Core/project diagnostics after connection.
+
+The current composition reports Subscription as `supported` and Self-deployed
+as `unavailable` with the stable `self_deployed_release_unavailable` reason.
+Create, update, activation, and run paths enforce the same object before any
+project persistence, activation reservation, SSH, or Core side effect. Existing
+Self-deployed projects remain readable and can be changed to Subscription.
+Changing the composition entry to `supported` after the self-deployed serving
+implementation ships enables the existing renderer without a React mode table.
+
 ## Workspace imports
 
 `WorkspaceImportStore` is the private persistence and verification layer for a

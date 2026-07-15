@@ -41,9 +41,11 @@ from desktop.sidecar.provider_store import (
 )
 from desktop.sidecar.release_provider import (
     DesktopReleaseProvider,
+    ExecutionModeReleaseUnavailableError,
     InvalidNativeChallengeError,
     ProviderCapabilityUnavailableError,
 )
+from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
 from desktop.sidecar.release_runtime import (
     DesktopReleaseCoreRuntimeV1,
     create_release_core_runtime,
@@ -318,6 +320,7 @@ def create_release_desktop_local_api_app(
             build_channel=build_channel,
             instance_id=instance_id,
             readiness_key=readiness_key,
+            execution_mode_capabilities=RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
             remote_lifecycle=lifecycle,
             core_runtime=core_runtime,
             core_bridge=core_bridge,
@@ -380,6 +383,21 @@ def create_release_desktop_local_api_app(
             message="This operation requires a provider capability that is not available yet.",
             category=_operation_category(exc.operation_id),
             repair_action="none",
+        )
+
+    @app.exception_handler(ExecutionModeReleaseUnavailableError)
+    async def handle_execution_mode_unavailable(
+        request: Request, exc: ExecutionModeReleaseUnavailableError
+    ) -> JSONResponse:
+        capability = exc.capability
+        return _error_response(
+            request,
+            status_code=409 if capability.support_state == "unavailable" else 422,
+            code=capability.reason_code or "execution_mode_release_unsupported",
+            message=capability.message,
+            category=_operation_category(exc.operation_id),
+            repair_action="user_input_required",
+            next_action="Choose a supported execution mode and save the project before continuing.",
         )
 
     @app.exception_handler(InvalidNativeChallengeError)

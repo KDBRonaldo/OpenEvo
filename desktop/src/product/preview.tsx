@@ -10,11 +10,11 @@ import {
 type PreviewScenario = "new-user" | "offline" | "online" | "completed" | "degraded";
 
 const scenarios: Record<PreviewScenario, FixtureProviderOptions> = {
-  "new-user": { newUser: true },
-  offline: { newUser: false },
-  online: { startOnline: true },
-  completed: { startOnline: true, seedCompletedRun: true },
-  degraded: { startOnline: true, degraded: true, seedCompletedRun: true },
+  "new-user": { newUser: true, releaseExecutionModes: true },
+  offline: { newUser: false, releaseExecutionModes: true },
+  online: { startOnline: true, releaseExecutionModes: true },
+  completed: { startOnline: true, seedCompletedRun: true, releaseExecutionModes: true },
+  degraded: { startOnline: true, degraded: true, seedCompletedRun: true, releaseExecutionModes: true },
 };
 
 function previewScenario(): PreviewScenario {

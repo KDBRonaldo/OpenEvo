@@ -14,6 +14,7 @@ import {
   diagnosticReportV1Schema,
   eventEnvelopeV1Schema,
   executionSettingsV1Schema,
+  executionModeCapabilitiesV1Schema,
   healthV1Schema,
   localLogEntryV1Schema,
   localOperationV1Schema,
@@ -85,6 +86,25 @@ describe("Desktop Local API v1 schemas", () => {
     expect(serviceV1Schema.parse(criticalFixture.service)).toEqual(criticalFixture.service);
     expect(artifactContentV1Schema.parse(criticalFixture.artifact_content).returned_utf8_bytes).toBe(29);
     expect(artifactDiffV1Schema.parse(criticalFixture.artifact_diff).document_changes[0]?.hunks[0]?.lines[0]?.text).toBe("");
+  });
+
+  it("rejects missing, duplicate, and unknown execution-mode capabilities", () => {
+    const capabilities = CONTRACT_FIXTURE_V1.state.execution_mode_capabilities;
+    expect(executionModeCapabilitiesV1Schema.parse(capabilities).modes.map((item) => item.support_state)).toEqual([
+      "supported",
+      "unavailable",
+    ]);
+    expect(() => desktopStateV1Schema.parse(({ ...CONTRACT_FIXTURE_V1.state, execution_mode_capabilities: undefined }))).toThrow();
+    expect(() => executionModeCapabilitiesV1Schema.parse({ ...capabilities, modes: capabilities.modes.slice(0, 1) })).toThrow();
+    expect(() => executionModeCapabilitiesV1Schema.parse({ ...capabilities, modes: [capabilities.modes[0], capabilities.modes[0]] })).toThrow(/duplicate/i);
+    expect(() => executionModeCapabilitiesV1Schema.parse({
+      ...capabilities,
+      modes: [capabilities.modes[0], { ...capabilities.modes[1], mode: "future-mode" }],
+    })).toThrow();
+    expect(() => executionModeCapabilitiesV1Schema.parse({
+      ...capabilities,
+      modes: [capabilities.modes[0], { ...capabilities.modes[1], reason_code: "future_reason" }],
+    })).toThrow();
   });
 
   it("mirrors Core admission, operation, diff, and pagination closure", () => {

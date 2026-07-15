@@ -489,6 +489,7 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
 
     return {
       state,
+      executionModeCapabilities: state.execution_mode_capabilities,
       profiles,
       projects,
       runs,

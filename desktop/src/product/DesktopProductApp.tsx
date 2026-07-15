@@ -38,6 +38,8 @@ import type {
   ArtifactDiffV1,
   ArtifactV1,
   DiagnosticReportV1,
+  ExecutionModeCapabilitiesV1,
+  ExecutionModeCapabilityV1,
   LogEntryV1,
   ProfileCreateV1,
   ProjectCapabilitiesV1,
@@ -393,6 +395,7 @@ export function DesktopProductApp({
               project={project}
               hasProfile={profile !== null}
               canCreateProject={canCreateProject}
+              executionModeLabel={project ? executionModeCapability(snapshot.executionModeCapabilities, project.execution.mode).display_name : null}
               runs={projectRuns}
               activeRun={activeRun}
               timelines={snapshot.timelines}
@@ -447,6 +450,7 @@ export function DesktopProductApp({
           key={settingsFormIdentity}
           project={settingsProject}
           profileId={profile?.profile_id ?? null}
+          executionModeCapabilities={snapshot.executionModeCapabilities}
           capability={settingsCapability}
           capabilities={readyCapabilities(settingsCapability, settingsProject)}
           busy={actionState === "working"}
@@ -965,6 +969,7 @@ function ResearchWorkspace({
   project,
   hasProfile,
   canCreateProject,
+  executionModeLabel,
   runs,
   activeRun,
   timelines,
@@ -985,6 +990,7 @@ function ResearchWorkspace({
   project: ProjectV1 | null;
   hasProfile: boolean;
   canCreateProject: boolean;
+  executionModeLabel: string | null;
   runs: readonly RunV1[];
   activeRun: RunV1 | null;
   timelines: DesktopProductSnapshot["timelines"];
@@ -1040,7 +1046,7 @@ function ResearchWorkspace({
           </div>
           <div className="brief-body">{project.task.objective}</div>
           <div className="brief-footer">
-            <div><span>Mode</span><strong>{project.execution.mode === "self-deployed" ? "Self-deployed" : "Subscription"}</strong></div>
+            <div><span>Mode</span><strong>{executionModeLabel}</strong></div>
             <div><span>Capture</span><strong>Session transcript</strong></div>
             <div><span>Evolution</span><strong>{Object.values(project.evolution.targets).filter((target) => target.enabled).length} targets</strong></div>
           </div>
@@ -1624,6 +1630,7 @@ function CredentialStatus({ slot }: { slot: RemoteProfileV1["credential_slots"][
 function SettingsDrawer({
   project,
   profileId,
+  executionModeCapabilities,
   capability,
   capabilities,
   busy,
@@ -1637,6 +1644,7 @@ function SettingsDrawer({
 }: {
   project: ProjectV1 | null;
   profileId: string | null;
+  executionModeCapabilities: ExecutionModeCapabilitiesV1;
   capability: DesktopProductSnapshot["capability"];
   capabilities: EvolutionCapabilitiesV1 | null;
   busy: boolean;
@@ -1658,7 +1666,10 @@ function SettingsDrawer({
   const [source, setSource] = useState<ProjectSourceV1>(project?.source ?? { kind: "scratch", display_name: "New workspace", import_ref: null });
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [selectingSource, setSelectingSource] = useState(false);
-  const [mode, setMode] = useState(project?.execution.mode ?? "codex_subscription_transcript");
+  const defaultMode = project?.execution.mode
+    ?? firstSupportedExecutionMode(executionModeCapabilities)?.mode
+    ?? executionModeCapabilities.modes[0].mode;
+  const [mode, setMode] = useState<ProjectV1["execution"]["mode"]>(defaultMode);
   const [hfModel, setHfModel] = useState(project?.execution.hf_model ?? DEFAULT_HF_MODEL);
   const [codexModel, setCodexModel] = useState(project?.execution.codex_model ?? DEFAULT_CODEX_MODEL);
   const [evolution, setEvolution] = useState<ProductEvolutionTargets>(project?.evolution.targets ?? {});
@@ -1704,6 +1715,10 @@ function SettingsDrawer({
   const dialogRef = useDialogFocus(requestClose);
   const saveActionId = useRef(newActionId());
   const activeModel = mode === "self-deployed" ? hfModel : codexModel;
+  const activeModeCapability = executionModeCapability(executionModeCapabilities, mode);
+  const focusMode = activeModeCapability.support_state === "supported"
+    ? mode
+    : firstSupportedExecutionMode(executionModeCapabilities)?.mode;
   const modeCapabilities = capabilities && capabilityExecutionMode(capabilities) === mode ? capabilities : null;
   const capabilityMatchesDraft = Boolean(project
     && capability
@@ -1719,7 +1734,7 @@ function SettingsDrawer({
     setTitle(project?.task.title ?? "Research task");
     setObjective(project?.task.objective ?? "");
     setSource(project?.source ?? { kind: "scratch", display_name: "New workspace", import_ref: null });
-    setMode(project?.execution.mode ?? "codex_subscription_transcript");
+    setMode(project?.execution.mode ?? firstSupportedExecutionMode(executionModeCapabilities)?.mode ?? executionModeCapabilities.modes[0].mode);
     setHfModel(project?.execution.hf_model ?? DEFAULT_HF_MODEL);
     setCodexModel(project?.execution.codex_model ?? DEFAULT_CODEX_MODEL);
     setEvolution(project?.evolution.targets ?? {});
@@ -1778,6 +1793,7 @@ function SettingsDrawer({
     && title.trim().length > 0
     && objective.trim().length > 0
     && activeModel.trim().length > 0
+    && activeModeCapability.support_state === "supported"
     && profileId !== null
     && (!modeCapabilities || rows.every((row) => !row.selection.enabled || row.valid));
   const retryCapabilities = async () => {
@@ -1818,8 +1834,22 @@ function SettingsDrawer({
           </section>
           <section className="form-section">
             <h3>Model mode</h3>
-            <div className="segmented-control wide" role="tablist" aria-label="Model mode" onKeyDown={handleTablistKeyDown}><button type="button" role="tab" aria-selected={mode === "self-deployed"} tabIndex={mode === "self-deployed" ? 0 : -1} className={mode === "self-deployed" ? "active" : ""} onClick={() => { setMode("self-deployed"); markDirty(); }}>Self-deployed</button><button type="button" role="tab" aria-selected={mode === "codex_subscription_transcript"} tabIndex={mode === "codex_subscription_transcript" ? 0 : -1} className={mode === "codex_subscription_transcript" ? "active" : ""} onClick={() => { setMode("codex_subscription_transcript"); markDirty(); }}>Subscription</button></div>
+            <div className="segmented-control wide" role="tablist" aria-label="Model mode" onKeyDown={handleTablistKeyDown}>{executionModeCapabilities.modes.map((capability) => (
+              <button
+                type="button"
+                role="tab"
+                key={capability.mode}
+                aria-selected={mode === capability.mode}
+                aria-describedby={capability.support_state === "supported" ? undefined : "execution-mode-support-message"}
+                tabIndex={focusMode === capability.mode ? 0 : -1}
+                className={mode === capability.mode ? "active" : ""}
+                disabled={capability.support_state !== "supported"}
+                title={capability.message}
+                onClick={() => { setMode(capability.mode); markDirty(); }}
+              >{capability.display_name}</button>
+            ))}</div>
             {mode === "self-deployed" ? <label>Hugging Face model<input value={hfModel} onChange={change(setHfModel)} placeholder="organization/model" /></label> : <label>Codex model<input value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>}
+            {activeModeCapability.support_state !== "supported" ? <p className="mode-support-message" id="execution-mode-support-message" role="status">{activeModeCapability.message}</p> : null}
             <p className="form-help">Sessions use transcript capture. Token-level metrics are unavailable in this mode.</p>
           </section>
           <section className="form-section">
@@ -1861,7 +1891,7 @@ function SettingsDrawer({
           </section>
         </div>
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
-        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={() => void reset()} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" disabled={!valid || busy || selectingSource || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); const pendingActionId = pendingSourceActionId.current; void onSave({
+        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={() => void reset()} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" disabled={!valid || busy || selectingSource || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : activeModeCapability.support_state !== "supported" ? activeModeCapability.message : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); const pendingActionId = pendingSourceActionId.current; void onSave({
           name: name.trim(),
           task: { title: title.trim(), objective: objective.trim() },
           source,
@@ -2214,6 +2244,8 @@ function getProjectActivationReason(
   if (!project) return null;
   if (actionState === "working") return "Wait for the current action to finish.";
   if (project.state === "archived") return "Archived projects cannot be activated.";
+  const modeCapability = executionModeCapability(snapshot.executionModeCapabilities, project.execution.mode);
+  if (modeCapability.support_state !== "supported") return modeCapability.message;
   if (!profile || profile.profile_id !== project.profile_id) return "Configure this project's remote workspace before activation.";
   if (profile.connection_state !== "connected") return "Connect this project's remote workspace before activation.";
   const core = snapshot.state.core;
@@ -2227,6 +2259,8 @@ function getProjectActivationReason(
 
 function getStartReason(snapshot: DesktopProductSnapshot, project: ProjectV1 | null, profile: RemoteProfileV1 | null, activeRun: RunV1 | null, actionState: AsyncState): string | null {
   if (!project) return "Create or select a project first.";
+  const modeCapability = executionModeCapability(snapshot.executionModeCapabilities, project.execution.mode);
+  if (modeCapability.support_state !== "supported") return modeCapability.message;
   if (snapshot.stream.status !== "fresh") return "Refresh this view before starting a session.";
   if (!profile || snapshot.state.core.state !== "online" || !snapshot.state.core.active_tunnel || snapshot.state.core.profile_id !== profile.profile_id) return "Connect this project's remote workspace before starting a session.";
   if (!project.remote) return "Activate this project on its assigned remote workspace before starting a session.";
@@ -2392,6 +2426,21 @@ function readyCapabilities(
 
 function capabilityExecutionMode(capabilities: EvolutionCapabilitiesV1): ProjectV1["execution"]["mode"] {
   return capabilities.evaluated_profile.execution_mode === "self_deployed" ? "self-deployed" : "codex_subscription_transcript";
+}
+
+function executionModeCapability(
+  capabilities: ExecutionModeCapabilitiesV1,
+  mode: ProjectV1["execution"]["mode"],
+): ExecutionModeCapabilityV1 {
+  const capability = capabilities.modes.find((item) => item.mode === mode);
+  if (!capability) throw new Error("Desktop execution mode capability is missing.");
+  return capability;
+}
+
+function firstSupportedExecutionMode(
+  capabilities: ExecutionModeCapabilitiesV1,
+): ExecutionModeCapabilityV1 | null {
+  return capabilities.modes.find((item) => item.support_state === "supported") ?? null;
 }
 
 function parseCapabilityJsonObject(value: string): OpenEvoJsonObject {

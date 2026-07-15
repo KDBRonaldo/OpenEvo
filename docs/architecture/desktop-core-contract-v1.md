@@ -149,6 +149,26 @@ Release builds reject providers that report `contract_simulator`, `scaffold`,
 connection outside the active project tunnel. Such providers may be used only
 by explicit development and test builds.
 
+`DesktopStateV1.execution_mode_capabilities` is the authenticated, versioned
+release-composition authority for project execution modes. It contains exactly
+one bounded entry for each closed Local API v1 mode, in release preference
+order, with a display name, `supported | unavailable | unsupported` state,
+stable reason code for non-supported entries, and ordinary-user message.
+Missing, duplicate, or unknown entries invalidate the complete state response.
+New projects select the first `supported` entry; saved projects retain their
+exact mode even when it is no longer supported so the user can review it and
+switch away. Create, patch, activation, and run admission reject a non-supported
+release mode before local mutation, activation reservation, SSH, or Core calls.
+
+This payload describes code shipped in the exact Desktop release composition.
+It is available before a project or Core tunnel exists and is not evidence that
+a particular remote host is operational. Core model preparation, credentials,
+GPU/runtime checks, and other host-specific readiness remain project diagnostics
+and Core service state. The current release marks
+`codex_subscription_transcript` supported and `self-deployed` unavailable; a
+future release enables the existing React path by changing only this validated
+release-composition payload after the vLLM/model-preparer implementation ships.
+
 The Desktop release Core client accepts only `provider_kind=openevo_core`,
 `build_channel=release`, and the frozen Core Control API v1 OpenAPI digest
 `006fbe0ad33497329912280d9836bd1dce44f49f26fb018a9d9ba6bdf33b62ed`.
@@ -481,8 +501,10 @@ Profile creation defaults an omitted port to `22`, authentication kind to
 `ssh_agent`, and proxy configuration to an empty proxy. Execution settings
 default omitted capture fields to `capture_mode="transcript"` and
 `token_level_metrics_available=false`. Subscription execution carries only
-`codex_model`; self-deployed execution carries only the bounded, trimmed
-user-provided Hugging Face `hf_model`. The sidecar maps `hf_model` to Core's
+`codex_model`; self-deployed execution remains a valid persisted v1 shape and
+carries only the bounded, trimmed user-provided Hugging Face `hf_model`. The
+current release capability marks that shape unavailable. The sidecar maps
+`hf_model` to Core's
 stable `agent_model_ref` boundary. `proxy.no_proxy` follows the common ordered
 collection rule: React sends a JSON array, the request boundary validates each
 bounded string and stores an immutable tuple, and responses serialize it back
@@ -658,7 +680,8 @@ The adapter between the two v1 contracts is deterministic and fail closed:
 | Run current project | Sidecar fetches the active head and any reachable successor, selects the exact Core-required revision, validates, and submits Core run creation. |
 | Core SSE change | Sidecar validates the complete Core event, updates its remote snapshot cache, and emits only an ETag/digest-bound Local invalidation. |
 
-Missing tunnel, contract mismatch, stale Local ETag, unavailable registry,
+Missing tunnel, contract mismatch, stale Local ETag, release-unavailable mode,
+unavailable registry,
 invalid project config, incomplete workspace upload, unprepared model, or a
 non-reachable revision produces a typed blocking error. None of these cases may
 fall back to an SSH run command, cached capability table, or renderer-generated

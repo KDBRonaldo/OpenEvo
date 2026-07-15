@@ -31,6 +31,16 @@ build before attaching the native bridge. The plain `npm run dev` command
 remains available for the separate shared observability pages; it is not the
 Desktop native development surface.
 
+The release adapter copies the authenticated
+`DesktopStateV1.execution_mode_capabilities` object into
+`DesktopProductSnapshot` without projection. Mode tabs, labels, new-project
+default selection, and Save/Activate/Start gates consume this single object.
+Missing, duplicate, or unknown mode entries fail state parsing; the renderer has
+no static support table or fixture fallback. The capability describes shipped
+release support and is deliberately separate from remote model/service
+diagnostics. Contract simulator scenarios may supply validated alternate states
+only in test and Vite preview builds.
+
 The first-run renderer exposes one next action at a time. Until a remote profile
 exists, the Research workspace owns the `Add workspace` action and project
 creation is disabled. Once a profile is present, project creation becomes
@@ -107,13 +117,14 @@ default native bridge rejects those calls without invoking a nonexistent Tauri
 command. They must not appear as usable release controls until the native broker
 is implemented and reviewed.
 
-New projects default to the Core-owned Codex subscription transcript profile and
-its release-tested `gpt-5.5` model default. They save an empty evolution target
+New projects default to the first release-supported mode, currently the
+Core-owned Codex subscription transcript profile and its release-tested
+`gpt-5.5` model default. They save an empty evolution target
 map until the created and activated project has remote capabilities for its own
 identity and execution mode; another project or mode can never provide defaults.
-`Self-deployed` is the explicit UI label for remote user-selected inference, and
-the renderer does not route a first-time user into that path before its remote
-service lifecycle is ready.
+`Self-deployed` remains visible with the exact release reason but is disabled in
+the current composition. A saved Self-deployed project is never rewritten: it
+remains visible, blocks Save/Activate/Start, and can be switched to Subscription.
 
 The project drawer is keyed by the explicit form identity (`create` or exact
 project ID). Changing that identity discards the previous component-local draft
@@ -130,7 +141,7 @@ leave an unowned sidecar or publish/reuse their session token. A bounded native
 cleanup failure remains visible as retryable startup failure.
 
 The Local API release digest is
-`3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36`.
+`e3bc443ee213eb33de81b82c7f954fb617fab14b8a2c17e154f3d4b980ba441f`.
 The checked-in TypeScript mirror and contract fixtures use that frozen digest.
 The product UI and simulator consume the final Local/Core v1 DTOs directly and
 construct simulator resources through the same strict Zod schemas as release

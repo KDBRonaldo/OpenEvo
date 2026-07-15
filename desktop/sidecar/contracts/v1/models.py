@@ -455,10 +455,49 @@ class ActiveProjectStateV1(StrictModel):
     connection_state: Literal["offline", "connecting", "ready", "blocked"]
 
 
+ExecutionModeV1 = Literal["codex_subscription_transcript", "self-deployed"]
+ExecutionModeSupportStateV1 = Literal["supported", "unavailable", "unsupported"]
+ExecutionModeReasonCodeV1 = Literal[
+    "self_deployed_release_unavailable",
+    "execution_mode_release_unsupported",
+]
+
+
+class ExecutionModeCapabilityV1(StrictModel):
+    mode: ExecutionModeV1
+    display_name: ShortText
+    support_state: ExecutionModeSupportStateV1
+    reason_code: ExecutionModeReasonCodeV1 | None = None
+    message: ShortText
+
+    @model_validator(mode="after")
+    def _reason_matches_support(self) -> ExecutionModeCapabilityV1:
+        if self.support_state == "supported" and self.reason_code is not None:
+            raise ValueError("supported execution modes cannot include a reason code")
+        if self.support_state != "supported" and self.reason_code is None:
+            raise ValueError("unavailable and unsupported execution modes require a reason code")
+        return self
+
+
+class ExecutionModeCapabilitiesV1(StrictModel):
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    modes: tuple[ExecutionModeCapabilityV1, ...] = Field(min_length=2, max_length=2)
+
+    @model_validator(mode="after")
+    def _exact_known_modes(self) -> ExecutionModeCapabilitiesV1:
+        mode_ids = tuple(capability.mode for capability in self.modes)
+        if len(mode_ids) != len(set(mode_ids)):
+            raise ValueError("execution mode capabilities must not contain duplicates")
+        if set(mode_ids) != {"codex_subscription_transcript", "self-deployed"}:
+            raise ValueError("execution mode capabilities must contain every known mode exactly once")
+        return self
+
+
 class DesktopStateV1(StrictModel):
     schema_version: Literal["1"] = SCHEMA_VERSION
     observed_at: UtcTimestamp
     contract: ContractNegotiationV1
+    execution_mode_capabilities: ExecutionModeCapabilitiesV1
     core: CoreConnectionStateV1
     active_project: ActiveProjectStateV1 | None = None
     pending_operation_ids: tuple[OpaqueId, ...] = ()
@@ -589,9 +628,6 @@ class ResourceRefV1(StrictModel):
         "maintenance",
     ]
     resource_id: OpaqueId
-
-
-ExecutionModeV1 = Literal["codex_subscription_transcript", "self-deployed"]
 
 
 class ExecutionSettingsV1(StrictModel):

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DesktopApiClientV1, FetchLike, ListRequestOptions } from "../api/v1/client";
 import { DesktopApiError } from "../api/v1/client";
-import { CONTRACT_FIXTURE_V1 } from "../api/v1/fixtures";
+import { CONTRACT_FIXTURE_V1, RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1 } from "../api/v1/fixtures";
 import {
   apiErrorV1Schema,
   artifactContentV1Schema,
@@ -67,6 +67,7 @@ describe("LocalApiDesktopProductProvider", () => {
     ]);
     expect(result.snapshot.artifactCollection).toEqual({ status: "complete" });
     expect(result.snapshot.services).toHaveLength(2);
+    expect(result.snapshot.executionModeCapabilities).toEqual(result.snapshot.state.execution_mode_capabilities);
     expect(result.snapshot.activeOperation?.operation_id).toBe("operation-a");
     expect(vi.mocked(client.getOperation).mock.calls.map(([operationId]) => operationId)).toEqual(["operation-a", "operation-z"]);
     expect(result.snapshot.capability?.status).toBe("ready");
@@ -569,6 +570,7 @@ function onlineState(pendingOperationIds: string[] = []) {
       core_openapi_sha256: B,
       compatible: true,
     },
+    execution_mode_capabilities: RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1,
     core: {
       state: "online",
       profile_id: "profile-fixture-1",
@@ -598,6 +600,7 @@ function disconnectedState() {
       core_openapi_sha256: null,
       compatible: true,
     },
+    execution_mode_capabilities: RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1,
     core: {
       state: "disconnected",
       profile_id: null,

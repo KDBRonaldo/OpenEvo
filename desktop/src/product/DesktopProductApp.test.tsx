@@ -416,6 +416,50 @@ describe("DesktopProductApp", () => {
     expect(created?.evolution.targets).toEqual({});
   });
 
+  it("uses release capabilities for new-project defaults and keeps unavailable modes visible", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, releaseExecutionModes: true });
+    root = await renderProduct(provider);
+
+    await clickAria("Create project");
+    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(button("Subscription").disabled).toBe(false);
+    expect(button("Self-deployed").disabled).toBe(true);
+    expect(button("Self-deployed").title).toContain("not available in this OpenEvo Desktop release");
+    expect(screenText()).not.toContain("Hugging Face model");
+  });
+
+  it("keeps a saved unavailable mode visible, blocks mutations, and lets the user switch away", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, releaseExecutionModes: true });
+    const startRun = vi.spyOn(provider, "startRun");
+    root = await renderProduct(provider);
+
+    expect(button("Start session").disabled).toBe(true);
+    expect(button("Start session").title).toContain("not available in this OpenEvo Desktop release");
+    await clickAria("Project settings");
+    expect(button("Self-deployed").getAttribute("aria-selected")).toBe("true");
+    expect(screenText()).toContain("Choose Subscription to save or run this project.");
+    expect(button("Save").disabled).toBe(true);
+
+    await clickButton("Subscription");
+    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(button("Save").disabled).toBe(false);
+    await clickButton("Save");
+    expect(startRun).not.toHaveBeenCalled();
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    expect(refreshed.snapshot.projects[0]?.execution.mode).toBe("codex_subscription_transcript");
+  });
+
+  it("blocks activation for a saved release-unavailable mode", async () => {
+    provider = createFixtureDesktopProductProvider({ newUser: false, releaseExecutionModes: true });
+    const activateProject = vi.spyOn(provider, "activateProject");
+    root = await renderProduct(provider);
+
+    expect(button("Activate project").disabled).toBe(true);
+    expect(button("Activate project").title).toContain("not available in this OpenEvo Desktop release");
+    expect(activateProject).not.toHaveBeenCalled();
+  });
+
   it("does not reuse another project's same-mode capabilities after a new-project mode switch", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     root = await renderProduct(provider);

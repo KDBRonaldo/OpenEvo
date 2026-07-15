@@ -3834,8 +3834,13 @@ class DesktopProviderStore:
         key: str,
         body: BaseModel | Mapping[str, object],
         if_match: str,
+        admission_guard: Callable[[ProjectV1], None] | None = None,
     ) -> ProjectRuntimeActionReservation:
-        """Atomically reserve one durable background action for a project."""
+        """Atomically admit and reserve one durable background action for a project.
+
+        The guard may only inspect the validated project and raise. Exact replays
+        return their frozen operation without invoking it.
+        """
 
         if operation_kind not in _PROJECT_OPERATION_KINDS:
             raise ContractValidationError("project runtime operation kind is invalid")
@@ -3865,6 +3870,8 @@ class DesktopProviderStore:
 
             transaction = ProviderMutation(self, connection, if_match=if_match)
             project = transaction.require_project_authority(project_id, if_match=if_match)
+            if admission_guard is not None:
+                admission_guard(project)
             self._require_project_not_busy(connection, project_id)
             result: LocalOperationResultV1 | None = None
             if operation_kind == "project_activate":

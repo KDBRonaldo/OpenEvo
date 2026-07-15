@@ -15,8 +15,9 @@
 6. Create and activate a research project. An existing project that loses its
    tunnel remains visible, but activation and runs stay disabled until its
    assigned workspace reconnects.
-7. Use the default Codex subscription transcript mode, or explicitly choose the
-   self-deployed reference mode when that remote runtime is available.
+7. Use the default Codex subscription transcript mode. Self-deployed remains
+   visible but unavailable in this release; Desktop explains the release reason
+   and lets an older saved project switch back to Subscription.
 8. Start the science run and monitor its timeline, logs, and artifacts.
 
 The System view distinguishes passing checks from completed checks that contain
