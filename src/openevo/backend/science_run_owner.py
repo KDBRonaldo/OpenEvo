@@ -52,9 +52,7 @@ from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
 from openevo.rollout.models import canonicalize_task_request
 
 
-_TERMINAL = frozenset(
-    {m.RunStatus.SUCCEEDED, m.RunStatus.FAILED, m.RunStatus.CANCELLED}
-)
+_TERMINAL = frozenset({m.RunStatus.SUCCEEDED, m.RunStatus.FAILED, m.RunStatus.CANCELLED})
 _ACTIVE_FOR_ADMISSION = frozenset(
     {m.RunStatus.PREPARING, m.RunStatus.RUNNING, m.RunStatus.CANCELLING}
 )
@@ -360,6 +358,7 @@ class CoreScienceRunOwner:
         run_id = cast(str, arguments["run_id"])
         key = cast(str, arguments["idempotency_key"])
         digest = _request_digest(None, cast(str, arguments["if_match"]))
+
         def delete(current: m.RunV1, _version: int) -> None:
             if current.status not in _TERMINAL:
                 raise ScienceRunConflict("only terminal runs can be deleted")
@@ -382,6 +381,7 @@ class CoreScienceRunOwner:
         request = cast(m.RunCancelRequestV1, arguments["request"])
         key = cast(str, arguments["idempotency_key"])
         digest = _request_digest(request, cast(str, arguments["if_match"]))
+
         def cancel(current: m.RunV1, version: int) -> m.RunV1:
             if current.status in _TERMINAL:
                 raise ScienceRunConflict("terminal run cannot be cancelled")
@@ -446,18 +446,21 @@ class CoreScienceRunOwner:
             expected_etag=cast(str, arguments["if_match"]),
             status_code=202,
             transform=retry,
+            timeline_builders=(
+                lambda accepted, sequence: self._timeline_entry(
+                    accepted,
+                    sequence,
+                    m.TimelinePhase.ADMISSION,
+                    m.TimelineEventStatus.PENDING,
+                    "Retry queued",
+                    "Core queued a new attempt against the same immutable request.",
+                ),
+            ),
         )
         assert updated is not None
         if replayed:
             return _response(updated, status_code=202)
         self._cancel_events[run_id] = threading.Event()
-        self._append_timeline(
-            updated,
-            m.TimelinePhase.ADMISSION,
-            m.TimelineEventStatus.PENDING,
-            "Retry queued",
-            "Core queued a new attempt against the same immutable request.",
-        )
         with self._condition:
             self._condition.notify_all()
         return _response(updated, status_code=202)
@@ -875,10 +878,7 @@ class CoreScienceRunOwner:
         image = MANAGED_RUNTIME_IMAGES["managed_science"]
         lease: ServiceRunLease | None = None
         try:
-            if (
-                project.spec.execution_mode
-                is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
-            ):
+            if project.spec.execution_mode is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
                 execution_mode = ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
                 arguments = {
                     "codex_model": project.spec.agent_model_ref,
@@ -953,7 +953,9 @@ class CoreScienceRunOwner:
             ) as authority:
                 yield authority
         except ResourceNotFoundError as exc:
-            raise _owner_error("run_project_not_found", "The saved project was not found.", 404, False) from exc
+            raise _owner_error(
+                "run_project_not_found", "The saved project was not found.", 404, False
+            ) from exc
 
     def _validate_create_authority(
         self,
@@ -963,7 +965,9 @@ class CoreScienceRunOwner:
         head: m.RevisionHeadV1,
     ) -> m.ProjectV1:
         if project.status is not m.ProjectStatus.READY:
-            raise _owner_error("run_project_not_ready", "The saved project is not ready.", 409, True)
+            raise _owner_error(
+                "run_project_not_ready", "The saved project is not ready.", 409, True
+            )
         if (
             request.project_snapshot != project.current_project_snapshot
             or request.task_snapshot != project.current_task_snapshot
@@ -1293,7 +1297,12 @@ def _transition_run(
     elif attempts:
         current = attempts[-1]
         started_at = current.started_at
-        if status in {m.RunStatus.RUNNING, m.RunStatus.CANCELLING, m.RunStatus.SUCCEEDED, m.RunStatus.FAILED}:
+        if status in {
+            m.RunStatus.RUNNING,
+            m.RunStatus.CANCELLING,
+            m.RunStatus.SUCCEEDED,
+            m.RunStatus.FAILED,
+        }:
             started_at = started_at or run.started_at or run.admitted_at or now
         attempts[-1] = current.model_copy(
             update={
@@ -1375,9 +1384,13 @@ def _retry_model(run: m.RunV1, *, version: int, now: str) -> m.RunV1:
 def _run_model(data: Mapping[str, object], *, version: int) -> m.RunV1:
     provisional = m.RunV1.model_validate({**data, "etag": '"' + "0" * 64 + '"'})
     payload = provisional.model_dump(mode="json", exclude={"etag"})
-    etag = '"' + hashlib.sha256(
-        _canonical_bytes({"resource_version": version, "run": payload})
-    ).hexdigest() + '"'
+    etag = (
+        '"'
+        + hashlib.sha256(
+            _canonical_bytes({"resource_version": version, "run": payload})
+        ).hexdigest()
+        + '"'
+    )
     return m.RunV1.model_validate_json(_canonical_bytes({**payload, "etag": etag}))
 
 
@@ -1512,9 +1525,7 @@ def _project_artifacts(
             )
             projected.append(m.TextMemoryArtifactSummaryV1.model_validate(common))
         elif artifact_type is m.ArtifactType.SKILL_BUNDLE:
-            common["metadata"] = m.SkillBundleArtifactMetadataV1(
-                document_count=file_count
-            )
+            common["metadata"] = m.SkillBundleArtifactMetadataV1(document_count=file_count)
             projected.append(m.SkillBundleArtifactSummaryV1.model_validate(common))
         elif artifact_type is m.ArtifactType.AGENT_SYSTEM:
             common["metadata"] = m.AgentSystemArtifactMetadataV1(
@@ -1562,12 +1573,18 @@ def _worker_output_records(result: Mapping[str, object]) -> dict[str, dict[str, 
                             raise ValueError("science result artifact ID is invalid")
                         artifact_ids.add(artifact_id)
                     for output in raw_outputs:
-                        artifact_id = output.get("artifact_id") if isinstance(output, dict) else None
+                        artifact_id = (
+                            output.get("artifact_id") if isinstance(output, dict) else None
+                        )
                         if not isinstance(artifact_id, str) or not artifact_id:
                             raise ValueError("science result artifact output is invalid")
                         existing = outputs.get(artifact_id)
-                        if existing is not None and _canonical_bytes(existing) != _canonical_bytes(output):
-                            raise ValueError("science result artifact output changed within the run")
+                        if existing is not None and _canonical_bytes(existing) != _canonical_bytes(
+                            output
+                        ):
+                            raise ValueError(
+                                "science result artifact output changed within the run"
+                            )
                         outputs[artifact_id] = output
     if set(outputs) != artifact_ids:
         raise ValueError("science result artifact output inventory is incomplete")
@@ -1626,9 +1643,7 @@ def _api_error(code: str, message: str, *, retryable: bool) -> m.ApiErrorV1:
         category=m.ErrorCategory.RUN,
         retryable=retryable,
         repair_action=(
-            m.RepairAction.OPENEVO_CAN_RETRY
-            if retryable
-            else m.RepairAction.USER_ACTION_REQUIRED
+            m.RepairAction.OPENEVO_CAN_RETRY if retryable else m.RepairAction.USER_ACTION_REQUIRED
         ),
         next_action="Retry the preserved run after checking remote service readiness.",
     )

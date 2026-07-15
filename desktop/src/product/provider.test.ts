@@ -136,7 +136,7 @@ describe("Desktop product provider boundary", () => {
     expect(native.readRunRetryRecovery).toHaveBeenCalledTimes(1);
   });
 
-  it("uses native compare-and-swap authority and reconciles a lost write response", async () => {
+  it("uses native compare-and-swap authority and fails closed after a lost write response", async () => {
     let durable: string | null = null;
     const writeRunRetryRecovery = vi.fn(async (next: string | null, expected: string | null) => {
       expect(durable).toBe(expected);
@@ -160,8 +160,10 @@ describe("Desktop product provider boundary", () => {
       durable = next;
       throw new Error("native response lost after commit");
     });
-    await expect(store.write("third")).resolves.toBeUndefined();
-    expect(store.read()).toBe("third");
+    await expect(store.write("third")).rejects.toThrow(/restart/i);
+    expect(() => store.read()).toThrow(/restart/i);
+    await expect(store.write("fourth")).rejects.toThrow(/restart/i);
+    expect(durable).toBe("third");
   });
 
   it("fails closed when another Desktop process wins the native retry journal", async () => {

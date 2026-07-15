@@ -109,11 +109,13 @@ identity-verified persistent lockfile, so separate Desktop processes cannot
 overwrite the journal. Every write is also a compare-and-swap against the exact
 previous journal value observed at startup or after the prior write. A second
 Desktop process with stale authority is rejected without changing the first
-process's record. If native persistence commits but its IPC response is lost,
-the renderer rereads the verified journal and accepts the write only when the
-exact requested value is present; a conflicting value poisons further writes
-until application restart. Invalid or unreadable journal or lock state fails
-startup closed and remains available for diagnosis. Bounded polling starts only
+process's record. If a native write returns an error, the renderer rereads the
+verified journal only to classify local state. Unchanged prior bytes preserve the
+deterministic local failure. Any changed value, including the exact requested
+value, poisons further reads and writes until application restart because
+visibility does not prove the directory fsync completed. Invalid or unreadable
+journal or lock state fails startup closed and remains available for diagnosis.
+Bounded polling starts only
 after the request becomes ambiguous. An aggregate that arrives while the retry
 transport is still in flight cannot reconcile or clear the journal. A later
 fresh snapshot reconciles the pending retry only when it preserves the canonical

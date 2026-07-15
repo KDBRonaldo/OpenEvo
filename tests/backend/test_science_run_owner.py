@@ -863,6 +863,75 @@ def test_retry_enforces_etag_attempt_binding_and_idempotent_replay(
         store.close()
 
 
+def test_retry_timeline_failure_rolls_back_run_and_idempotency(
+    tmp_path: Path,
+    registry: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+    retry_allowed = threading.Event()
+
+    def fail(**_kwargs: object) -> dict[str, Any]:
+        raise RuntimeError("injected runner failure")
+
+    def block_retry(**_kwargs: object) -> dict[str, Any]:
+        assert retry_allowed.wait(5)
+        return _completed_result()
+
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        _RunnerSequence(fail, block_retry),
+    )
+    try:
+        created = _invoke_create(owner, _run_request(project), "retry-atomic-create")
+        failed = _wait_for_status(owner, created.id, m.RunStatus.FAILED)
+        assert failed.current_attempt_id is not None
+        services.ensure_allowed.clear()
+        request = m.RunRetryRequestV1(terminal_attempt_id=failed.current_attempt_id)
+        arguments = {
+            "run_id": failed.id,
+            "request": request,
+            "if_match": failed.etag,
+            "idempotency_key": "retry-atomic-key",
+        }
+        original_timeline_entry = owner._timeline_entry
+
+        def fail_retry_timeline(*args: object, **kwargs: object) -> m.TimelineEntryV1:
+            if len(args) >= 5 and args[4] == "Retry queued":
+                raise ValueError("injected retry timeline failure")
+            return original_timeline_entry(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(owner, "_timeline_entry", fail_retry_timeline)
+        with pytest.raises(CoreRunControlError) as rejected:
+            owner.invoke("retryCoreRunV1", arguments)
+        assert rejected.value.code == "run_state_invalid"
+
+        unchanged = _get_run(owner, failed.id)
+        assert unchanged.status is m.RunStatus.FAILED
+        assert unchanged.attempt_count == failed.attempt_count
+        assert unchanged.current_attempt_id == failed.current_attempt_id
+        assert unchanged.etag == failed.etag
+
+        monkeypatch.setattr(owner, "_timeline_entry", original_timeline_entry)
+        accepted = _response_model(owner.invoke("retryCoreRunV1", arguments))
+        assert accepted.status is m.RunStatus.QUEUED
+        assert accepted.attempt_count == failed.attempt_count + 1
+        retry_entries = [
+            entry for entry in owner._ledger.timeline(failed.id) if entry.title == "Retry queued"
+        ]
+        assert len(retry_entries) == 1
+    finally:
+        retry_allowed.set()
+        services.ensure_allowed.set()
+        owner.close()
+        store.close()
+
+
 def test_restart_recovers_interrupted_preparing_attempt_as_failed(
     tmp_path: Path, registry: object
 ) -> None:
@@ -1026,13 +1095,13 @@ def test_admission_replays_only_exact_generation_payload_and_session(
         task_id = str(kwargs["task_ids"][0])
         admitted_task.append(task_id)
         assert (
-                kwargs["rollout_client"].submit_task(
-                    {
-                        "task_id": task_id,
-                        "instruction": "exact admitted payload",
-                        "agent": {"harness": "codex"},
-                    }
-                )
+            kwargs["rollout_client"].submit_task(
+                {
+                    "task_id": task_id,
+                    "instruction": "exact admitted payload",
+                    "agent": {"harness": "codex"},
+                }
+            )
             == task_id
         )
         submitted.set()

@@ -58,7 +58,9 @@ Only the Core worker can move a queued run into preparation and execution.
 Worker transitions compare the persisted source state inside the SQLite write
 transaction, so a concurrent cancellation cannot resurrect a cancelled run.
 Cancel, retry, and delete combine the state mutation and idempotency record in
-one transaction. Reusing an idempotency key with different request or ETag
+one transaction. Retry also writes its `Retry queued` timeline entry in that
+same transaction; timeline capacity or construction failure rolls back the run
+and replay record. Reusing an idempotency key with different request or ETag
 identity fails closed as canonical `idempotency_key_reused`; the provider does
 not persist that mismatch as a replayable operation failure.
 

@@ -974,10 +974,11 @@ fsyncs the file and directory, and no-follow rereads the published bytes before
 acknowledging the write. Every mutation carries the renderer's exact previously
 observed value and is a compare-and-swap under the same two locks. A stale second
 process therefore receives a conflict without replacing the first process's
-journal. If the native commit succeeds but the IPC response is lost, the
-renderer rereads through the same verified native path: exact requested bytes
-confirm success, unchanged prior bytes preserve a retryable local failure, and
-any third value poisons the renderer store until application restart.
+journal. If a native write returns an error, the renderer rereads through the
+same verified native path only to classify local state. Unchanged prior bytes
+preserve the deterministic local failure. Any changed value, including the exact
+requested bytes, poisons the renderer store until application restart because
+post-rename visibility alone cannot prove that the directory fsync completed.
 Schema-invalid, oversized, identity-inconsistent, unreadable, or unsafe persisted
 data remains in place and fails startup closed; it is never silently treated as
 an absent retry. This persistence lets a
@@ -1003,9 +1004,12 @@ cannot overwrite that authority. Bounded
 authoritative polling starts only after the mutation has become ambiguous. A
 snapshot received while the exact retry transport is still in flight cannot
 reconcile or clear the journal; transport settlement is an explicit prerequisite.
-Typed API rejection is deterministic: the provider clears recovery before the
-renderer performs any conflict refresh, so a concurrent append cannot turn that
-request into success or erase its error.
+Core commits the accepted retry run, its idempotency replay row, and the
+`Retry queued` timeline entry in one SQLite transaction. Capacity exhaustion,
+timeline construction failure, or any other pre-commit error rolls all three
+back. Typed API rejection is therefore deterministic: the provider clears
+recovery before the renderer performs any conflict refresh, so a concurrent
+append cannot turn that request into success or erase its error.
 
 For Core retry transport, failures before entering send remain deterministic
 local validation/availability errors, and a fully read, schema-valid Core

@@ -102,9 +102,7 @@ _MAX_ARTIFACT_ROWS = 100_000
 _MAX_ARTIFACTS_PER_RUN = 1_024
 _MAX_ADMISSION_ROWS = 100_000
 _MAX_ADMISSIONS_PER_RUN = 4_096
-_ACTIVE_STATUSES = frozenset(
-    {m.RunStatus.PREPARING, m.RunStatus.RUNNING, m.RunStatus.CANCELLING}
-)
+_ACTIVE_STATUSES = frozenset({m.RunStatus.PREPARING, m.RunStatus.RUNNING, m.RunStatus.CANCELLING})
 
 
 class ScienceRunStoreError(RuntimeError):
@@ -225,9 +223,7 @@ class ScienceRunStore:
                     )
                     if existing is not None:
                         return existing, True
-                    count = int(
-                        connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
-                    )
+                    count = int(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0])
                     if count >= _MAX_RUNS:
                         raise ScienceRunConflict("science run capacity is exhausted")
                     connection.execute(
@@ -384,9 +380,7 @@ class ScienceRunStore:
         run_id: str,
         transform: Callable[[m.RunV1, int], m.RunV1],
         *,
-        timeline_builders: Sequence[
-            Callable[[m.RunV1, int], m.TimelineEntryV1]
-        ] = (),
+        timeline_builders: Sequence[Callable[[m.RunV1, int], m.TimelineEntryV1]] = (),
         log_builders: Sequence[Callable[[m.RunV1, int], m.LogEntryV1]] = (),
     ) -> m.RunV1:
         with self._lock, self._transaction() as connection:
@@ -409,9 +403,7 @@ class ScienceRunStore:
             ).fetchone()
             timeline_count = int(timeline_row[0])
             log_count = int(log_row[0])
-            total_timeline = int(
-                connection.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
-            )
+            total_timeline = int(connection.execute("SELECT COUNT(*) FROM timeline").fetchone()[0])
             total_logs = int(connection.execute("SELECT COUNT(*) FROM logs").fetchone()[0])
             if (
                 timeline_count + len(timeline_builders) > _MAX_TIMELINE_PER_RUN
@@ -428,9 +420,7 @@ class ScienceRunStore:
                 sequence = next_timeline + offset
                 entry = build(updated, sequence)
                 if entry.run_id != run_id or entry.sequence != sequence:
-                    raise ScienceRunStoreError(
-                        "science run timeline builder changed its identity"
-                    )
+                    raise ScienceRunStoreError("science run timeline builder changed its identity")
                 connection.execute(
                     "INSERT INTO timeline(run_id, sequence, entry_json) VALUES (?, ?, ?)",
                     (run_id, sequence, _model_bytes(entry)),
@@ -462,6 +452,7 @@ class ScienceRunStore:
         status_code: int,
         transform: Callable[[m.RunV1, int], m.RunV1 | None],
         deleted: bool = False,
+        timeline_builders: Sequence[Callable[[m.RunV1, int], m.TimelineEntryV1]] = (),
     ) -> tuple[m.RunV1 | None, bool]:
         with self._lock, self._transaction() as connection:
             row = connection.execute(
@@ -471,15 +462,11 @@ class ScienceRunStore:
             ).fetchone()
             if row is not None:
                 if row["request_digest"] != request_digest:
-                    raise ScienceRunIdempotencyConflict(
-                        "run mutation idempotency key was reused"
-                    )
+                    raise ScienceRunIdempotencyConflict("run mutation idempotency key was reused")
                 if int(row["status_code"]) != status_code:
                     raise ScienceRunStoreError("persisted mutation status changed")
                 response = (
-                    None
-                    if row["response_json"] is None
-                    else _model(m.RunV1, row["response_json"])
+                    None if row["response_json"] is None else _model(m.RunV1, row["response_json"])
                 )
                 return response, True
             run_row = connection.execute(
@@ -493,6 +480,34 @@ class ScienceRunStore:
                 raise ScienceRunPreconditionFailed("science run ETag changed")
             version = int(run_row["resource_version"]) + 1
             response = transform(current, version)
+            if timeline_builders:
+                if response is None:
+                    raise ScienceRunStoreError("run mutation timeline requires a response")
+                timeline_row = connection.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(sequence), -1) FROM timeline WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                timeline_count = int(timeline_row[0])
+                total_timeline = int(
+                    connection.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
+                )
+                if (
+                    timeline_count + len(timeline_builders) > _MAX_TIMELINE_PER_RUN
+                    or total_timeline + len(timeline_builders) > _MAX_TIMELINE_ROWS
+                ):
+                    raise ScienceRunConflict("science run timeline capacity is exhausted")
+                next_sequence = int(timeline_row[1]) + 1
+                for offset, build in enumerate(timeline_builders):
+                    sequence = next_sequence + offset
+                    entry = build(response, sequence)
+                    if entry.run_id != run_id or entry.sequence != sequence:
+                        raise ScienceRunStoreError(
+                            "science run timeline builder changed its identity"
+                        )
+                    connection.execute(
+                        "INSERT INTO timeline(run_id, sequence, entry_json) VALUES (?, ?, ?)",
+                        (run_id, sequence, _model_bytes(entry)),
+                    )
             if response is not None:
                 connection.execute(
                     "UPDATE runs SET run_json = ?, resource_version = ? WHERE run_id = ?",
@@ -673,7 +688,10 @@ class ScienceRunStore:
                 (revision_id,),
             ).fetchone()
             if existing is not None:
-                if existing["project_id"] != project_id or bytes(existing["context_json"]) != payload:
+                if (
+                    existing["project_id"] != project_id
+                    or bytes(existing["context_json"]) != payload
+                ):
                     raise ScienceRunConflict("revision context identity was reused")
                 return
             connection.execute(
@@ -717,7 +735,9 @@ class ScienceRunStore:
             framework_lock_digest,
             payload_sha256,
         ):
-            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
                 raise ValueError("science run admission digest is invalid")
         normalized_session = session_id or ""
         with self._lock, self._transaction() as connection:
@@ -973,7 +993,9 @@ def _context_bytes(value: Mapping[str, Sequence[str]]) -> bytes:
         if (
             len(normalized_ids) > 256
             or len(set(normalized_ids)) != len(normalized_ids)
-            or any(not isinstance(item, str) or not 1 <= len(item) <= 256 for item in normalized_ids)
+            or any(
+                not isinstance(item, str) or not 1 <= len(item) <= 256 for item in normalized_ids
+            )
         ):
             raise ValueError("revision context artifact IDs are invalid")
         total += len(normalized_ids)

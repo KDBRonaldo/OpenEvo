@@ -157,12 +157,14 @@ export async function nativeRunRetryRecoveryStore(
             { cause: readError },
           );
         }
-        if (observed === next) {
-          value = next;
-          return;
-        }
         if (observed === expectedValue) throw writeError;
         poisoned = true;
+        if (observed === next) {
+          throw new DesktopContractError(
+            "Native Desktop run retry recovery write outcome requires an application restart",
+            { cause: writeError },
+          );
+        }
         throw new DesktopContractError(
           "Native Desktop run retry recovery changed in another process",
           { cause: writeError },
