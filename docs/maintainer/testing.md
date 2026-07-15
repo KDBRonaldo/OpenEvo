@@ -194,6 +194,9 @@ member must be rejected without mutation.
 Darwin reports an absent extended ACL as `acl_get_fd_np` returning null with
 `ENOENT`; that exact result is normalized to an empty ACL inventory. Every other
 lookup error, and every unknown, unreadable, or mutating ACL entry, fails closed.
+Darwin ACL iteration accepts only `acl_get_entry` success `0` and treats only
+`-1/EINVAL` as the end of the held ACL; all other result/errno combinations fail
+closed before any artifact export or recovery.
 After opening and validating the child, but before its first inventory or any
 recovery, the builder takes a non-blocking exclusive `flock` on that same held
 output-directory descriptor. Contention fails closed with an explicit

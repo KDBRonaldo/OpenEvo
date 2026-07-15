@@ -913,16 +913,20 @@ def _darwin_extended_acl_entries(file_fd: int) -> tuple[tuple[int, int], ...]:
         entry_id = _DARWIN_ACL_FIRST_ENTRY
         while True:
             entry = ctypes.c_void_p()
+            ctypes.set_errno(0)
             result = libc.acl_get_entry(acl, entry_id, ctypes.byref(entry))
-            if result == 0:
-                break
-            if result != 1 or not entry:
+            error = ctypes.get_errno()
+            if result == -1:
+                if error == errno.EINVAL:
+                    break
+                raise RuntimeError("macOS extended ACL contains an unreadable entry")
+            if result != 0 or not entry:
                 raise RuntimeError("macOS extended ACL contains an unreadable entry")
             tag = ctypes.c_int()
             permissions = ctypes.c_uint64()
             if (
-                libc.acl_get_tag_type(entry, ctypes.byref(tag)) == -1
-                or libc.acl_get_permset_mask_np(entry, ctypes.byref(permissions)) == -1
+                libc.acl_get_tag_type(entry, ctypes.byref(tag)) != 0
+                or libc.acl_get_permset_mask_np(entry, ctypes.byref(permissions)) != 0
             ):
                 raise RuntimeError("macOS extended ACL entry cannot be decoded")
             entries.append((tag.value, permissions.value))

@@ -1005,22 +1005,31 @@ def test_core_release_output_rejects_acl_added_after_initialization(
 
 
 class _FakeDarwinAclFunction:
-    def __init__(self, result: object) -> None:
-        self.result = result
+    def __init__(self, implementation: object) -> None:
+        self.implementation = implementation
         self.argtypes: object = None
         self.restype: object = None
 
-    def __call__(self, *_args: object) -> object:
-        return self.result
+    def __call__(self, *args: object) -> object:
+        if callable(self.implementation):
+            return self.implementation(*args)
+        return self.implementation
 
 
-def _fake_darwin_acl_libc() -> SimpleNamespace:
+def _fake_darwin_acl_libc(**overrides: object) -> SimpleNamespace:
+    implementations = {
+        "acl_get_fd_np": None,
+        "acl_get_entry": 0,
+        "acl_get_tag_type": 0,
+        "acl_get_permset_mask_np": 0,
+        "acl_free": 0,
+    }
+    implementations.update(overrides)
     return SimpleNamespace(
-        acl_get_fd_np=_FakeDarwinAclFunction(None),
-        acl_get_entry=_FakeDarwinAclFunction(0),
-        acl_get_tag_type=_FakeDarwinAclFunction(0),
-        acl_get_permset_mask_np=_FakeDarwinAclFunction(0),
-        acl_free=_FakeDarwinAclFunction(0),
+        **{
+            name: _FakeDarwinAclFunction(implementation)
+            for name, implementation in implementations.items()
+        }
     )
 
 
@@ -1028,9 +1037,19 @@ def test_macos_fd_acl_treats_enoent_as_no_extended_acl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     builder = _load_builder()
+
+    def missing_acl(*_args: object) -> None:
+        assert builder.ctypes.get_errno() == 0
+        builder.ctypes.set_errno(errno.ENOENT)
+        return None
+
     monkeypatch.setattr(builder.sys, "platform", "darwin")
-    monkeypatch.setattr(builder.ctypes, "CDLL", lambda *_args, **_kwargs: _fake_darwin_acl_libc())
-    monkeypatch.setattr(builder.ctypes, "get_errno", lambda: errno.ENOENT)
+    monkeypatch.setattr(
+        builder.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: _fake_darwin_acl_libc(acl_get_fd_np=missing_acl),
+    )
+    builder.ctypes.set_errno(errno.EIO)
 
     assert builder._darwin_extended_acl_entries(41) == ()
 
@@ -1041,11 +1060,119 @@ def test_macos_fd_acl_rejects_non_enoent_lookup_failure(
     error: int,
 ) -> None:
     builder = _load_builder()
+
+    def failed_acl_lookup(*_args: object) -> None:
+        assert builder.ctypes.get_errno() == 0
+        builder.ctypes.set_errno(error)
+        return None
+
     monkeypatch.setattr(builder.sys, "platform", "darwin")
-    monkeypatch.setattr(builder.ctypes, "CDLL", lambda *_args, **_kwargs: _fake_darwin_acl_libc())
-    monkeypatch.setattr(builder.ctypes, "get_errno", lambda: error)
+    monkeypatch.setattr(
+        builder.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: _fake_darwin_acl_libc(
+            acl_get_fd_np=failed_acl_lookup
+        ),
+    )
+    builder.ctypes.set_errno(errno.ENOENT)
 
     with pytest.raises(RuntimeError, match=rf"errno {error}$"):
+        builder._darwin_extended_acl_entries(41)
+
+
+def test_macos_fd_acl_uses_darwin_entry_iteration_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    entry_calls: list[int] = []
+    freed: list[int] = []
+
+    def get_entry(_acl: object, entry_id: int, entry_out: object) -> int:
+        assert builder.ctypes.get_errno() == 0
+        entry_calls.append(entry_id)
+        if len(entry_calls) == 1:
+            entry_out._obj.value = 0x2000
+            return 0
+        builder.ctypes.set_errno(errno.EINVAL)
+        return -1
+
+    def get_tag(_entry: object, tag_out: object) -> int:
+        tag_out._obj.value = builder._DARWIN_ACL_EXTENDED_ALLOW
+        return 0
+
+    def get_permissions(_entry: object, permissions_out: object) -> int:
+        permissions_out._obj.value = 1 << 6
+        return 0
+
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        builder.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: _fake_darwin_acl_libc(
+            acl_get_fd_np=0x1000,
+            acl_get_entry=get_entry,
+            acl_get_tag_type=get_tag,
+            acl_get_permset_mask_np=get_permissions,
+            acl_free=lambda acl: freed.append(acl) or 0,
+        ),
+    )
+
+    assert builder._darwin_extended_acl_entries(41) == (
+        (builder._DARWIN_ACL_EXTENDED_ALLOW, 1 << 6),
+    )
+    assert entry_calls == [
+        builder._DARWIN_ACL_FIRST_ENTRY,
+        builder._DARWIN_ACL_NEXT_ENTRY,
+    ]
+    assert freed == [0x1000]
+
+
+def test_macos_fd_acl_accepts_einval_as_empty_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+
+    def no_entry(_acl: object, _entry_id: int, _entry_out: object) -> int:
+        assert builder.ctypes.get_errno() == 0
+        builder.ctypes.set_errno(errno.EINVAL)
+        return -1
+
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        builder.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: _fake_darwin_acl_libc(
+            acl_get_fd_np=0x1000,
+            acl_get_entry=no_entry,
+        ),
+    )
+
+    assert builder._darwin_extended_acl_entries(41) == ()
+
+
+@pytest.mark.parametrize(("result", "error"), [(-1, errno.EIO), (1, 0)])
+def test_macos_fd_acl_rejects_invalid_entry_iteration_result(
+    monkeypatch: pytest.MonkeyPatch,
+    result: int,
+    error: int,
+) -> None:
+    builder = _load_builder()
+
+    def invalid_iteration(_acl: object, _entry_id: int, _entry_out: object) -> int:
+        builder.ctypes.set_errno(error)
+        return result
+
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        builder.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: _fake_darwin_acl_libc(
+            acl_get_fd_np=0x1000,
+            acl_get_entry=invalid_iteration,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="unreadable entry"):
         builder._darwin_extended_acl_entries(41)
 
 
