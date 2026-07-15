@@ -357,6 +357,16 @@ adapter name；如果旧 artifact 没有这个字段，则回退到 artifact nam
   没有任何 DB artifact row 引用的 managed orphan，因此 DB delete 与文件 unlink 之间崩溃可在
   下次启动重复回收。扫描只接受 artifact root 内、目录/type/artifact ID 与 manifest 一致的普通
   文件，不跟随指向外部的 symlink；删除会去重并尽量移除空 artifact 目录。
+- Core managed science run owner 通过 private authenticated
+  `GET /v1/internal/jobs/{job_id}` 观察 job terminal state；该接口不是公开 Evolution API。
+  Store 在同一个 SQLite read snapshot 中读取 job row 和按 `created_at, artifact_id` 排序的全部
+  active output rows。非 `succeeded` 状态固定返回空 artifact IDs、sanitized error code，省略
+  outputs 且不触碰 payload。`succeeded` 状态最多投影 128 个 outputs，完整 serialized result
+  最多 4 MiB；同一个 request-scoped `ArtifactPayloadService` no-follow 扫描全部 `file://`
+  payload，并共享不可退回的累计 node/file/byte attempt budget。Projection 只返回 typed artifact
+  metadata 与 trusted payload manifest digest/byte size/file count，不返回 URI、host path、scanner
+  handle、raw worker error 或额外字段；missing、non-file、root escape、symlink、hardlink、identity
+  drift 和容量超限都会使整个 private observation fail closed。
 - Identity mapping 是 loopback 上 trusted Core worker 的版本匹配，不是同一 OS user 下任意
   进程的密码学 attestation；Core API auth/process isolation 由 backend lifecycle workstream 提供。
 - Human/LLM promotion gate 应让 worker 先注册 `promoted=false` artifact；backend 会强制

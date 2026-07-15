@@ -39,12 +39,26 @@ pre-release runtime identity。新 producers 和新文档必须使用 OpenEvo id
 - `/v1/jobs/{job_id}/fail`
 - `/v1/contexts/resolve`
 
-Core's generation-bound run owner also uses the private authenticated
-`GET /v1/internal/jobs/{job_id}` observation. The store reads the job row and
-its output artifacts in one explicit SQLite read transaction, so concurrent job
-completion cannot combine an older state with newer outputs. Artifact IDs are
-returned only for a `succeeded` job snapshot, and worker error text is reduced
-to the bounded `evolution_job_failed` code.
+Core's managed science run owner, and no public client, consumes the private
+authenticated `GET /v1/internal/jobs/{job_id}` observation. The store reads the
+job row and all active output artifact rows in one explicit SQLite read
+transaction, so concurrent job completion cannot combine an older state with
+newer outputs. Non-succeeded snapshots always return an empty `artifact_ids`,
+never scan payloads, omit `outputs`, and reduce worker error text to the bounded
+`evolution_job_failed` code.
+
+For a succeeded snapshot, outputs are ordered by `(created_at, artifact_id)` and
+limited to 128 rows and 4 MiB of serialized result data. A single
+request-scoped `ArtifactPayloadService` scans every output `file://` payload
+under the managed artifact root, so its no-follow node/file/byte attempt budgets
+are cumulative and cannot be reset between outputs. Each closed output contains
+only `artifact_id`, `type`, `name`, `manifest`, `lineage`, `compatibility`,
+`scores`, `promoted`, `created_at`, and the scanner-issued
+`payload_manifest_digest`, `payload_byte_size`, and `payload_file_count`.
+Artifact URI, host path, opaque payload handle, raw worker error, and arbitrary
+extra fields are never projected. Missing, non-file, outside-root, symlinked,
+hardlinked, drifting, or over-budget payloads fail the whole private result
+closed.
 
 `artifact_payloads.py` 是 handler runtime 的 Core-owned 本地 payload 安全边界。它只扫描
 Evolution Backend 配置的 artifact root 内 normalized `file://` regular

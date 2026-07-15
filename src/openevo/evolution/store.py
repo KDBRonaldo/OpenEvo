@@ -11,10 +11,11 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, NotRequired, TypedDict
 from urllib.parse import urlparse, urlunparse
 
 from openevo.evolution.agent_system import normalize_agent_system_target_path
+from openevo.evolution.artifact_payloads import ArtifactPayloadService
 from openevo.evolution.context import (
     artifact_manifest,
     artifact_matches,
@@ -125,6 +126,7 @@ from openevo.evolution.revisions import (
 from openevo.evolution.time import utc_now_iso
 from openevo.evolution.framework.contracts import (
     MAX_CONTRACT_JSON_BYTES,
+    MAX_HANDLER_ARTIFACTS,
     canonical_digest,
     canonical_json,
 )
@@ -406,6 +408,33 @@ WHERE query_decision_id IS NOT NULL;
 """
 
 MAX_ARTIFACT_ID_ATTEMPTS = 10
+MAX_INTERNAL_JOB_OUTPUTS = MAX_HANDLER_ARTIFACTS
+MAX_INTERNAL_JOB_RESULT_BYTES = 4 * 1024 * 1024
+
+
+class _InternalJobOutput(TypedDict):
+    artifact_id: str
+    type: str
+    name: str
+    manifest: dict[str, object]
+    lineage: dict[str, object]
+    compatibility: dict[str, object]
+    scores: dict[str, object]
+    promoted: bool
+    created_at: str
+    payload_manifest_digest: str
+    payload_byte_size: int
+    payload_file_count: int
+
+
+class _InternalJobResult(TypedDict):
+    artifact_ids: list[str]
+    error: str | None
+    job_id: str
+    state: str
+    outputs: NotRequired[list[_InternalJobOutput]]
+
+
 MAX_DATASET_ID_ATTEMPTS = 10
 MAX_CONTEXT_ID_ATTEMPTS = 10
 MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS = 16_384
@@ -6828,7 +6857,7 @@ class EvolutionStore:
             "artifact_ids": registered_artifact_ids,
         }
 
-    def get_internal_job_result(self, job_id: str) -> dict[str, object]:
+    def get_internal_job_result(self, job_id: str) -> _InternalJobResult:
         """Return the closed terminal observation used by Core's managed run owner."""
 
         with self.connect() as conn:
@@ -6844,7 +6873,9 @@ class EvolutionStore:
                 if row["state"] == str(JobState.SUCCEEDED):
                     artifacts = conn.execute(
                         """
-                        SELECT artifact_id
+                        SELECT artifact_id, type, name, created_at, uri,
+                               manifest_json, lineage_json, compatibility_json,
+                               scores_json, promoted
                         FROM artifacts
                         WHERE state = ?
                           AND json_extract(
@@ -6852,9 +6883,13 @@ class EvolutionStore:
                                 '$.openevo_execution.job_id'
                               ) = ?
                         ORDER BY created_at ASC, artifact_id ASC
-                        LIMIT 1025
+                        LIMIT ?
                         """,
-                        (str(ArtifactState.ACTIVE), job_id),
+                        (
+                            str(ArtifactState.ACTIVE),
+                            job_id,
+                            MAX_INTERNAL_JOB_OUTPUTS + 1,
+                        ),
                     ).fetchall()
                 conn.commit()
             except BaseException:
@@ -6863,14 +6898,64 @@ class EvolutionStore:
                 except sqlite3.Error:
                     pass
                 raise
-        if len(artifacts) > 1024:
+        if len(artifacts) > MAX_INTERNAL_JOB_OUTPUTS:
             raise ValueError("job output artifact count exceeds the internal bound")
-        return {
-            "artifact_ids": [str(item["artifact_id"]) for item in artifacts],
+        result: _InternalJobResult = {
+            "artifact_ids": [],
             "error": "evolution_job_failed" if row["error"] is not None else None,
             "job_id": str(row["job_id"]),
             "state": str(row["state"]),
         }
+        if row["state"] != str(JobState.SUCCEEDED):
+            return result
+
+        outputs: list[_InternalJobOutput] = []
+        with ArtifactPayloadService(self.files.root) as payloads:
+            for rank_index, artifact in enumerate(artifacts):
+                manifest = _internal_job_output_object(artifact, "manifest_json", "manifest")
+                lineage = _internal_job_output_object(artifact, "lineage_json", "lineage")
+                compatibility = _internal_job_output_object(
+                    artifact,
+                    "compatibility_json",
+                    "compatibility",
+                )
+                scores = _internal_job_output_object(artifact, "scores_json", "scores")
+                promoted = artifact["promoted"]
+                if type(promoted) is not int or promoted not in (0, 1):
+                    raise ValueError("job output promoted value is invalid")
+                snapshot = payloads.issue_snapshot(
+                    artifact_id=str(artifact["artifact_id"]),
+                    artifact_type=str(artifact["type"]),
+                    name=str(artifact["name"]),
+                    uri=str(artifact["uri"]),
+                    manifest=manifest,
+                    scores=scores,
+                    rank_index=rank_index,
+                )
+                outputs.append(
+                    {
+                        "artifact_id": snapshot.artifact_id,
+                        "type": snapshot.artifact_type,
+                        "name": snapshot.name,
+                        "manifest": manifest,
+                        "lineage": lineage,
+                        "compatibility": compatibility,
+                        "scores": scores,
+                        "promoted": bool(promoted),
+                        "created_at": str(artifact["created_at"]),
+                        "payload_manifest_digest": snapshot.payload_manifest_digest,
+                        "payload_byte_size": sum(
+                            entry.size_bytes for entry in snapshot.payload_entries
+                        ),
+                        "payload_file_count": len(snapshot.payload_entries),
+                    }
+                )
+
+        result["artifact_ids"] = [output["artifact_id"] for output in outputs]
+        result["outputs"] = outputs
+        if len(_json_dumps(result).encode("utf-8")) > MAX_INTERNAL_JOB_RESULT_BYTES:
+            raise ValueError("job result exceeds the internal serialized byte bound")
+        return result
 
     def _materialize_feedback_applications_for_artifact(
         self,
@@ -7376,6 +7461,20 @@ def _artifact_id_allowed(
         return True
     artifact_id = row.get("artifact_id")
     return isinstance(artifact_id, str) and artifact_id in requested_artifact_ids
+
+
+def _internal_job_output_object(
+    row: sqlite3.Row,
+    column: str,
+    label: str,
+) -> dict[str, object]:
+    try:
+        value = json.loads(str(row[column]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"job output {label} is invalid") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"job output {label} must be an object")
+    return value
 
 
 def _artifact_response_from_row(row: sqlite3.Row) -> ArtifactResponse:

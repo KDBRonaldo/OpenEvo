@@ -2,17 +2,22 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import sqlite3
 
 import pytest
 
+import openevo.evolution.artifact_payloads as artifact_payloads_module
 import openevo.evolution.store as store_module
 from openevo.evolution.framework import (
     EvolutionExecutionProfile,
     EvolutionTargetSelection,
+    PayloadManifestEntry,
+    payload_tree_digest,
 )
 from openevo.evolution.framework.builtins import (
     ImplementationDistributionIdentity,
@@ -1457,6 +1462,9 @@ def test_plan_bound_job_rejects_each_mismatched_existing_plan_identity_field(tmp
 def test_job_claim_heartbeat_and_complete(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
+    adapter = store.files.root / "worker-output" / "adapter.bin"
+    adapter.parent.mkdir()
+    adapter.write_bytes(b"adapter")
     dataset = store.register_artifact(
         ArtifactRegisterRequest(
             type=ArtifactType.DATASET,
@@ -1498,10 +1506,15 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
                 ArtifactRegisterRequest(
                     type=ArtifactType.PARAMETRIC_MEMORY,
                     name="pmem_calc",
-                    uri="file:///tmp/adapter",
-                    manifest={"base_model": "Qwen/Qwen3.6-27B", "adapter_format": "lora"},
+                    uri=adapter.as_uri(),
+                    manifest={
+                        "adapter_format": "lora",
+                        "base_model": "Qwen/Qwen3.6-27B",
+                        "content_path": "adapter.bin",
+                    },
                     lineage={"openevo_execution": {"job_id": job.job_id}},
                     compatibility={"base_model": "Qwen/Qwen3.6-27B"},
+                    scores={"quality": 0.75},
                     promoted=True,
                 )
             ],
@@ -1510,12 +1523,61 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
 
     assert complete["state"] == "succeeded"
     assert complete["artifact_ids"][0].startswith("art_")
-    assert store.get_internal_job_result(job.job_id) == {
+    result = store.get_internal_job_result(job.job_id)
+    assert result == {
         "artifact_ids": complete["artifact_ids"],
         "error": None,
         "job_id": job.job_id,
+        "outputs": [
+            {
+                "artifact_id": complete["artifact_ids"][0],
+                "compatibility": {"base_model": "Qwen/Qwen3.6-27B"},
+                "created_at": result["outputs"][0]["created_at"],
+                "lineage": {"openevo_execution": {"job_id": job.job_id}},
+                "manifest": {
+                    "adapter_format": "lora",
+                    "base_model": "Qwen/Qwen3.6-27B",
+                    "content_path": "adapter.bin",
+                },
+                "name": "pmem_calc",
+                "payload_byte_size": 7,
+                "payload_file_count": 1,
+                "payload_manifest_digest": payload_tree_digest(
+                    (
+                        PayloadManifestEntry(
+                            relative_path="adapter.bin",
+                            media_type="application/octet-stream",
+                            size_bytes=7,
+                            sha256=hashlib.sha256(b"adapter").hexdigest(),
+                        ),
+                    )
+                ),
+                "promoted": True,
+                "scores": {"quality": 0.75},
+                "type": "parametric_memory",
+            }
+        ],
         "state": "succeeded",
     }
+    assert set(result["outputs"][0]) == {
+        "artifact_id",
+        "type",
+        "name",
+        "manifest",
+        "lineage",
+        "compatibility",
+        "scores",
+        "promoted",
+        "created_at",
+        "payload_manifest_digest",
+        "payload_byte_size",
+        "payload_file_count",
+    }
+    serialized = json.dumps(result, sort_keys=True)
+    assert str(store.files.root) not in serialized
+    assert adapter.as_uri() not in serialized
+    assert "uri" not in result["outputs"][0]
+    assert "payload_handle" not in result["outputs"][0]
     with store.connect() as conn:
         row = conn.execute(
             "SELECT state, error FROM jobs WHERE job_id = ?",
@@ -1537,7 +1599,10 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
     ] == [(dataset.artifact_id, complete["artifact_ids"][0], "job_input")]
 
 
-def test_internal_job_result_does_not_expose_worker_error_text(tmp_path):
+def test_internal_job_result_does_not_expose_worker_error_text_or_scan_payloads(
+    tmp_path,
+    monkeypatch,
+):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
     job = store.create_job(
@@ -1564,12 +1629,210 @@ def test_internal_job_result_does_not_expose_worker_error_text(tmp_path):
         ),
     )
 
+    def unexpected_payload_service(*args, **kwargs):
+        raise AssertionError("non-succeeded jobs must not scan artifact payloads")
+
+    monkeypatch.setattr(store_module, "ArtifactPayloadService", unexpected_payload_service)
+
     assert store.get_internal_job_result(job.job_id) == {
         "artifact_ids": [],
         "error": "evolution_job_failed",
         "job_id": job.job_id,
         "state": "failed",
     }
+
+
+def test_internal_job_result_projects_ordered_file_and_directory_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    memory_path = store.files.root / "outputs" / "memory.md"
+    skill_dir = store.files.root / "outputs" / "skill"
+    inactive_path = store.files.root / "outputs" / "inactive.txt"
+    memory_path.parent.mkdir()
+    memory_path.write_text("remember", encoding="utf-8")
+    inactive_path.write_text("inactive", encoding="utf-8")
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    (skill_dir / "helpers").mkdir()
+    (skill_dir / "helpers" / "run.txt").write_text("run", encoding="utf-8")
+    job = store.create_job(
+        JobCreateRequest(method="output_projection", job_type="projection_test")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["projection_test"],
+            lease_seconds=60,
+        )
+    )
+    assert claim.job is not None
+    completed = store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.TEXT_MEMORY,
+                    name="memory",
+                    uri=memory_path.as_uri(),
+                    manifest={"content_path": "memory.md"},
+                    lineage={"openevo_execution": {"job_id": job.job_id}},
+                ),
+                ArtifactRegisterRequest(
+                    type=ArtifactType.SKILL_BUNDLE,
+                    name="skill",
+                    uri=skill_dir.as_uri(),
+                    lineage={"openevo_execution": {"job_id": job.job_id}},
+                    compatibility={"agent_harness": "codex"},
+                    promoted=True,
+                ),
+                ArtifactRegisterRequest(
+                    type=ArtifactType.REPORT,
+                    name="inactive",
+                    uri=inactive_path.as_uri(),
+                    manifest={"content_path": "inactive.txt"},
+                    lineage={"openevo_execution": {"job_id": job.job_id}},
+                ),
+            ],
+        ),
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?",
+            ("2026-07-15T00:00:02Z", completed["artifact_ids"][0]),
+        )
+        conn.execute(
+            "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?",
+            ("2026-07-15T00:00:01Z", completed["artifact_ids"][1]),
+        )
+        conn.execute(
+            "UPDATE artifacts SET state = ? WHERE artifact_id = ?",
+            (str(ArtifactState.DEPRECATED), completed["artifact_ids"][2]),
+        )
+        conn.commit()
+    inactive_path.unlink()
+    payload_services = []
+
+    def recording_payload_service(root):
+        service = artifact_payloads_module.ArtifactPayloadService(root)
+        payload_services.append(service)
+        return service
+
+    monkeypatch.setattr(store_module, "ArtifactPayloadService", recording_payload_service)
+
+    result = store.get_internal_job_result(job.job_id)
+
+    assert result["artifact_ids"] == list(reversed(completed["artifact_ids"][:2]))
+    assert len(payload_services) == 1
+    assert [output["name"] for output in result["outputs"]] == ["skill", "memory"]
+    assert result["outputs"][0]["payload_byte_size"] == len(b"# Skill\nrun")
+    assert result["outputs"][0]["payload_file_count"] == 2
+    assert result["outputs"][1]["payload_byte_size"] == len(b"remember")
+    assert result["outputs"][1]["payload_file_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "payload_kind",
+    ["outside", "missing", "symlink", "hardlink", "scheme"],
+)
+def test_internal_job_result_rejects_untrusted_payloads(tmp_path, payload_kind):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    managed = store.files.root / "outputs"
+    managed.mkdir()
+    external = tmp_path / "external.txt"
+    external.write_text("secret", encoding="utf-8")
+    payload = managed / "payload.txt"
+    if payload_kind == "outside":
+        payload = external
+    elif payload_kind == "missing":
+        pass
+    elif payload_kind == "symlink":
+        payload.symlink_to(external)
+    elif payload_kind == "hardlink":
+        os.link(external, payload)
+    uri = "https://example.invalid/output" if payload_kind == "scheme" else payload.as_uri()
+    job = store.create_job(
+        JobCreateRequest(method="output_projection", job_type="projection_test")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["projection_test"],
+            lease_seconds=60,
+        )
+    )
+    assert claim.job is not None
+    store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.REPORT,
+                    name="untrusted",
+                    uri=uri,
+                    manifest={"content_path": "payload.txt"},
+                    lineage={"openevo_execution": {"job_id": job.job_id}},
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        store.get_internal_job_result(job.job_id)
+
+
+def test_internal_job_result_rejects_payload_identity_drift(tmp_path, monkeypatch):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    payload = store.files.root / "outputs" / "payload.txt"
+    payload.parent.mkdir()
+    payload.write_text("original", encoding="utf-8")
+    job = store.create_job(
+        JobCreateRequest(method="output_projection", job_type="projection_test")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["projection_test"],
+            lease_seconds=60,
+        )
+    )
+    assert claim.job is not None
+    store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.REPORT,
+                    name="drifting",
+                    uri=payload.as_uri(),
+                    manifest={"content_path": "payload.txt"},
+                    lineage={"openevo_execution": {"job_id": job.job_id}},
+                )
+            ],
+        ),
+    )
+    original_stream = artifact_payloads_module._stream_fd_chunks
+    mutated = False
+
+    def replace_during_hash(fd):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            payload.rename(payload.with_suffix(".old"))
+            payload.write_text("replacement", encoding="utf-8")
+        yield from original_stream(fd)
+
+    monkeypatch.setattr(artifact_payloads_module, "_stream_fd_chunks", replace_during_hash)
+
+    with pytest.raises(ValueError, match="drift|changed|mutated|safely"):
+        store.get_internal_job_result(job.job_id)
 
 
 def test_internal_job_result_reads_job_and_outputs_from_one_sqlite_snapshot(
@@ -1579,6 +1842,9 @@ def test_internal_job_result_reads_job_and_outputs_from_one_sqlite_snapshot(
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
     writer = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    raced_payload = store.files.root / "outputs" / "raced-adapter.bin"
+    raced_payload.parent.mkdir()
+    raced_payload.write_bytes(b"raced")
     job = store.create_job(
         JobCreateRequest(
             method="mock_lora",
@@ -1612,10 +1878,11 @@ def test_internal_job_result_reads_job_and_outputs_from_one_sqlite_snapshot(
                         ArtifactRegisterRequest(
                             type=ArtifactType.PARAMETRIC_MEMORY,
                             name="raced-output",
-                            uri="file:///tmp/raced-adapter",
+                            uri=raced_payload.as_uri(),
                             manifest={
                                 "base_model": "Qwen/Qwen3.6-27B",
                                 "adapter_format": "lora",
+                                "content_path": "raced-adapter.bin",
                             },
                             lineage={"openevo_execution": {"job_id": job.job_id}},
                             compatibility={"base_model": "Qwen/Qwen3.6-27B"},
@@ -1647,7 +1914,8 @@ def test_internal_job_result_reads_job_and_outputs_from_one_sqlite_snapshot(
 
     monkeypatch.setattr(store, "connect", raced_connect)
 
-    assert store.get_internal_job_result(job.job_id) == {
+    raced_result = store.get_internal_job_result(job.job_id)
+    assert raced_result == {
         "artifact_ids": [],
         "error": None,
         "job_id": job.job_id,
@@ -1655,12 +1923,131 @@ def test_internal_job_result_reads_job_and_outputs_from_one_sqlite_snapshot(
     }
     assert statements[0] == "BEGIN"
     monkeypatch.setattr(store, "connect", original_connect)
-    assert store.get_internal_job_result(job.job_id) == {
+    completed_result = store.get_internal_job_result(job.job_id)
+    assert completed_result == {
         "artifact_ids": completed_artifact_ids,
         "error": None,
         "job_id": job.job_id,
+        "outputs": [
+            {
+                "artifact_id": completed_artifact_ids[0],
+                "compatibility": {"base_model": "Qwen/Qwen3.6-27B"},
+                "created_at": completed_result["outputs"][0]["created_at"],
+                "lineage": {"openevo_execution": {"job_id": job.job_id}},
+                "manifest": {
+                    "adapter_format": "lora",
+                    "base_model": "Qwen/Qwen3.6-27B",
+                    "content_path": "raced-adapter.bin",
+                },
+                "name": "raced-output",
+                "payload_byte_size": 5,
+                "payload_file_count": 1,
+                "payload_manifest_digest": payload_tree_digest(
+                    (
+                        PayloadManifestEntry(
+                            relative_path="raced-adapter.bin",
+                            media_type="application/octet-stream",
+                            size_bytes=5,
+                            sha256=hashlib.sha256(b"raced").hexdigest(),
+                        ),
+                    )
+                ),
+                "promoted": False,
+                "scores": {},
+                "type": "parametric_memory",
+            }
+        ],
         "state": "succeeded",
     }
+
+
+def test_internal_job_result_enforces_output_count_before_payload_scanning(
+    tmp_path,
+    monkeypatch,
+):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    outputs = store.files.root / "outputs"
+    outputs.mkdir()
+    payloads = []
+    for index in range(2):
+        payload = outputs / f"{index}.txt"
+        payload.write_text(str(index), encoding="utf-8")
+        payloads.append(payload)
+    job = store.create_job(
+        JobCreateRequest(method="output_projection", job_type="projection_test")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["projection_test"],
+            lease_seconds=60,
+        )
+    )
+    assert claim.job is not None
+    store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.REPORT,
+                    name=f"output-{index}",
+                    uri=payload.as_uri(),
+                    manifest={"content_path": payload.name},
+                    lineage={"openevo_execution": {"job_id": job.job_id}},
+                )
+                for index, payload in enumerate(payloads)
+            ],
+        ),
+    )
+    monkeypatch.setattr(store_module, "MAX_INTERNAL_JOB_OUTPUTS", 1)
+
+    def unexpected_payload_service(*args, **kwargs):
+        raise AssertionError("over-count results must fail before scanning")
+
+    monkeypatch.setattr(store_module, "ArtifactPayloadService", unexpected_payload_service)
+
+    with pytest.raises(ValueError, match="count exceeds"):
+        store.get_internal_job_result(job.job_id)
+
+
+def test_internal_job_result_enforces_serialized_byte_bound(tmp_path, monkeypatch):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    payload = store.files.root / "outputs" / "result.txt"
+    payload.parent.mkdir()
+    payload.write_text("result", encoding="utf-8")
+    job = store.create_job(
+        JobCreateRequest(method="output_projection", job_type="projection_test")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["projection_test"],
+            lease_seconds=60,
+        )
+    )
+    assert claim.job is not None
+    store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.REPORT,
+                    name="large-metadata",
+                    uri=payload.as_uri(),
+                    manifest={"content_path": "result.txt", "summary": "x" * 512},
+                    lineage={"openevo_execution": {"job_id": job.job_id}},
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(store_module, "MAX_INTERNAL_JOB_RESULT_BYTES", 256)
+
+    with pytest.raises(ValueError, match="serialized byte bound"):
+        store.get_internal_job_result(job.job_id)
 
 
 def test_complete_job_honors_unpromoted_job_config(tmp_path):
