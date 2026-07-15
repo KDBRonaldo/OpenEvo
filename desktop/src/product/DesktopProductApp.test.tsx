@@ -998,6 +998,64 @@ describe("DesktopProductApp", () => {
     expect(startRun).not.toHaveBeenCalled();
   });
 
+  it("clears an unknown retry error when refresh proves the same run advanced", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const failedRun = before.snapshot.runs.find((run) => run.id === "run-failed-model");
+    if (!failedRun?.current_attempt) throw new Error("Expected the failed fixture run.");
+    const queuedRun: RunV1 = {
+      ...failedRun,
+      status: "queued",
+      queued_reason: {
+        code: "admission_pending",
+        summary: "The retry was admitted.",
+        retry_after_seconds: null,
+      },
+      current_attempt_id: "attempt-run-failed-model-retry",
+      current_attempt: {
+        ...failedRun.current_attempt,
+        id: "attempt-run-failed-model-retry",
+        status: "queued",
+        queued_reason: {
+          code: "admission_pending",
+          summary: "The retry was admitted.",
+          retry_after_seconds: null,
+        },
+        error: null,
+        started_at: null,
+        finished_at: null,
+      },
+      current_error: null,
+      started_at: null,
+      finished_at: null,
+      etag: `"${"e".repeat(64)}"`,
+    };
+    const retryRun = vi.fn(async () => {
+      throw new DesktopProductUserError("The retry response was lost.");
+    });
+    Object.assign(provider, { retryRun });
+    root = await renderProduct(provider);
+
+    await clickButton("Cancel session");
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: {
+        ...before.snapshot,
+        runs: before.snapshot.runs.map((run) => run.id === queuedRun.id ? queuedRun : run),
+      },
+    });
+
+    await clickButton("Retry session");
+    await flush();
+
+    expect(retryRun).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("The retry was admitted.");
+    expect(screenText()).not.toContain("Action could not be completed");
+    expect(screenText()).not.toContain("The retry response was lost.");
+  });
+
   it("shows every selected revision member, including multiple artifacts for one target, in stable order", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useAuthoritativeArtifactOrderingScenario();

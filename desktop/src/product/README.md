@@ -207,8 +207,9 @@ from visible choices.
 
 Run outcomes are rendered from `RunV1.status`, `current_attempt`,
 `current_error`, exact revision refs, and `revision_transition`. Queued reasons
-and failed run errors remain visible, and recovery creates a fresh admission
-instead of rewriting a terminal attempt. Service rows consume `ServiceV1.id`,
+and failed run errors remain visible, and recovery appends a new attempt to the
+same durable run instead of replacing its identity or rewriting a terminal
+attempt. Service rows consume `ServiceV1.id`,
 `status`, and `status_message`. The renderer exposes those rows and the Research
 model-service projection only when the selected `ProjectV1` exactly matches the
 active project's project ID, profile ID, and ETag and that connection is ready.

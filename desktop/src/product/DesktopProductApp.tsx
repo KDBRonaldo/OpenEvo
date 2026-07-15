@@ -375,6 +375,7 @@ export function DesktopProductApp({
         || (result.refreshedSnapshot?.stream.status === "fresh" && !refreshedRun)
         || (refreshedRun && (refreshedRun.etag !== run.etag || refreshedRun.status !== "failed"))) {
         pendingRunRetry.current = null;
+        setActionError(null);
       }
     });
   };
