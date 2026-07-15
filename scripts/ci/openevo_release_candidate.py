@@ -19,11 +19,14 @@ MANIFEST_NAME = "release-candidate.json"
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 MINIMUM_MACOS_VERSION = "12.0"
+CORE_PYTHON_REQUIRES = ">=3.11"
+CORE_SUPPORTED_PLATFORMS = ("linux-x86_64",)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARCHITECTURE_TARGETS = {
     "aarch64": "aarch64-apple-darwin",
     "x64": "x86_64-apple-darwin",
 }
+ARCHITECTURE_SLICES = {"aarch64": "arm64", "x64": "x86_64"}
 SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 REQUIRED_INPUT_ROLES = (
@@ -34,6 +37,7 @@ REQUIRED_INPUT_ROLES = (
     ("dependency_inventory", "dependency-inventory.json"),
     ("license_inventory", "license-inventory.json"),
     ("security_audit", "security-audit.json"),
+    ("python_requirements", "python-requirements.txt"),
     ("app_bundle_smoke", "app-bundle-smoke.json"),
     ("dmg_copy_smoke", "dmg-copy-smoke.json"),
 )
@@ -122,6 +126,8 @@ def _validate_wheel(wheel: Path, *, version: str) -> None:
         raise CandidateError("Core wheel is unreadable") from exc
     if metadata.get("Name") != "openevo" or metadata.get("Version") != version:
         raise CandidateError("Core wheel name/version does not match the candidate")
+    if metadata.get("Requires-Python") != CORE_PYTHON_REQUIRES:
+        raise CandidateError("Core wheel Python compatibility does not match the release contract")
     required = (
         "openevo-backend = openevo.backend.launcher:main",
         "openevo-core-service = openevo.backend.service:main",
@@ -152,7 +158,30 @@ def _validate_framework_lock(lock_path: Path, wheel: Path, *, version: str) -> d
     return lock
 
 
-def _validate_evidence(root: Path) -> None:
+def _validate_mach_o_observation(payload: object, *, subject: str) -> list[str]:
+    if type(payload) is not dict or set(payload) != {"file_output", "slices"}:
+        raise CandidateError(f"{subject} Mach-O evidence does not use the closed schema")
+    file_output = payload.get("file_output")
+    slices = payload.get("slices")
+    if (
+        type(file_output) is not str
+        or not file_output
+        or len(file_output) > 512
+        or "Mach-O" not in file_output
+        or any(ord(character) < 32 or ord(character) == 127 for character in file_output)
+    ):
+        raise CandidateError(f"{subject} file evidence is not Mach-O")
+    if (
+        type(slices) is not list
+        or not slices
+        or any(type(value) is not str or value not in ARCHITECTURE_SLICES.values() for value in slices)
+        or slices != sorted(set(slices))
+    ):
+        raise CandidateError(f"{subject} Mach-O slices are invalid")
+    return slices
+
+
+def _validate_evidence(root: Path, *, architecture: str) -> dict[str, list[str]]:
     dependency = _load_json(root / "dependency-inventory.json")
     license_inventory = _load_json(root / "license-inventory.json")
     security = _load_json(root / "security-audit.json")
@@ -160,7 +189,7 @@ def _validate_evidence(root: Path) -> None:
     if type(dependency) is not dict or set(dependency) != {"schema_version", "ecosystems"}:
         raise CandidateError("dependency inventory does not use the closed evidence schema")
     dependency_ecosystems = dependency.get("ecosystems")
-    if dependency.get("schema_version") != 1 or type(dependency_ecosystems) is not dict:
+    if dependency.get("schema_version") != 2 or type(dependency_ecosystems) is not dict:
         raise CandidateError("dependency inventory schema version is invalid")
     if set(dependency_ecosystems) != ecosystems:
         raise CandidateError("dependency inventory must cover Python, npm, and Cargo")
@@ -209,15 +238,27 @@ def _validate_evidence(root: Path) -> None:
     if type(security) is not dict or set(security) != {"schema_version", "audits"}:
         raise CandidateError("security evidence does not use the closed evidence schema")
     audits = security.get("audits")
-    if security.get("schema_version") != 1 or type(audits) is not dict:
+    if security.get("schema_version") != 2 or type(audits) is not dict:
         raise CandidateError("security evidence schema version is invalid")
     if set(audits) != expected_audits:
         raise CandidateError("security evidence must cover npm, Python, and Cargo")
     for audit, entry in audits.items():
-        if type(entry) is not dict or set(entry) != {"status", "vulnerabilities"}:
+        expected_keys = {"status", "vulnerabilities"}
+        if audit == "pip-audit":
+            expected_keys |= {"audited_packages", "requirements_sha256"}
+        if type(entry) is not dict or set(entry) != expected_keys:
             raise CandidateError(f"security evidence is invalid for {audit}")
         if entry.get("status") != "passed" or entry.get("vulnerabilities") != 0:
             raise CandidateError(f"security evidence did not pass for {audit}")
+    requirements_path = root / "python-requirements.txt"
+    pip_evidence = audits["pip-audit"]
+    _require_digest(pip_evidence.get("requirements_sha256"), "Python requirements digest")
+    if (
+        not _is_regular_file(requirements_path)
+        or pip_evidence.get("requirements_sha256") != _sha256(requirements_path)
+        or pip_evidence.get("audited_packages") != dependency_ecosystems["python"]["packages"]
+    ):
+        raise CandidateError("pip-audit evidence does not bind the exported Python requirements")
 
     smoke_keys = {
         "schema_version",
@@ -229,20 +270,66 @@ def _validate_evidence(root: Path) -> None:
         "native_listener_fd_handoff",
         "native_executable_fd_handoff",
         "process_group_cleanup",
+        "mach_o",
     }
+    smoke_payloads: list[dict[str, object]] = []
     for filename in ("app-bundle-smoke.json", "dmg-copy-smoke.json"):
         smoke = _load_json(root / filename)
         if type(smoke) is not dict or set(smoke) != smoke_keys:
             raise CandidateError(f"{filename} does not use the closed smoke evidence schema")
-        if smoke.get("schema_version") != 1:
+        if smoke.get("schema_version") != 2:
             raise CandidateError(f"{filename} schema version is invalid")
         if smoke.get("native_executable") != "OpenEvo Desktop":
             raise CandidateError(f"{filename} did not launch the Tauri executable")
         if smoke.get("bundled_external_bin") != "openevo-desktop-sidecar":
             raise CandidateError(f"{filename} did not resolve the packaged externalBin")
-        boolean_keys = smoke_keys - {"schema_version", "native_executable", "bundled_external_bin"}
+        boolean_keys = smoke_keys - {
+            "schema_version",
+            "native_executable",
+            "bundled_external_bin",
+            "mach_o",
+        }
         if any(smoke.get(key) is not True for key in boolean_keys):
             raise CandidateError(f"{filename} contains failing native evidence")
+        mach_o = smoke.get("mach_o")
+        if type(mach_o) is not dict or set(mach_o) != {
+            "native_executable",
+            "bundled_external_bin",
+        }:
+            raise CandidateError(f"{filename} Mach-O evidence does not use the closed schema")
+        for binary in ("native_executable", "bundled_external_bin"):
+            _validate_mach_o_observation(mach_o[binary], subject=f"{filename} {binary}")
+        smoke_payloads.append(smoke)
+    if smoke_payloads[0]["mach_o"] != smoke_payloads[1]["mach_o"]:
+        raise CandidateError("Raw app and DMG-copy Mach-O evidence do not match")
+    expected_slice = ARCHITECTURE_SLICES[architecture]
+    mach_o = smoke_payloads[0]["mach_o"]
+    assert isinstance(mach_o, dict)
+    native_architectures: dict[str, list[str]] = {}
+    for binary in ("native_executable", "bundled_external_bin"):
+        observation = mach_o[binary]
+        assert isinstance(observation, dict)
+        slices = observation["slices"]
+        assert isinstance(slices, list)
+        if slices != [expected_slice]:
+            raise CandidateError("Packaged Mach-O slices do not match the candidate architecture")
+        native_architectures[binary] = slices
+    return native_architectures
+
+
+def _validate_core_compatibility(
+    payload: object,
+    *,
+    expected_platform: str | None = None,
+) -> None:
+    if type(payload) is not dict or set(payload) != {"python_requires", "supported_platforms"}:
+        raise CandidateError("Core install compatibility does not use the closed release schema")
+    if payload.get("python_requires") != CORE_PYTHON_REQUIRES or payload.get(
+        "supported_platforms"
+    ) != list(CORE_SUPPORTED_PLATFORMS):
+        raise CandidateError("Core install compatibility is unsupported")
+    if expected_platform is not None and expected_platform not in CORE_SUPPORTED_PLATFORMS:
+        raise CandidateError("Expected Core platform is not supported by the candidate")
 
 
 def _validate_release_notes(
@@ -319,7 +406,7 @@ def create_candidate_manifest(
     wheel = paths["core_wheel"]
     _validate_wheel(wheel, version=version)
     _validate_framework_lock(paths["framework_lock"], wheel, version=version)
-    _validate_evidence(root)
+    native_architectures = _validate_evidence(root, architecture=architecture)
     _validate_release_notes(
         paths["release_notes"],
         source_commit=source_commit,
@@ -329,9 +416,13 @@ def create_candidate_manifest(
 
     descriptor = {
         "artifact": _file_entry("core_wheel", wheel),
+        "compatibility": {
+            "python_requires": CORE_PYTHON_REQUIRES,
+            "supported_platforms": list(CORE_SUPPORTED_PLATFORMS),
+        },
         "framework_lock": _file_entry("framework_lock", paths["framework_lock"]),
         "registry_digest": registry_digest,
-        "schema_version": 1,
+        "schema_version": 2,
         "source_commit": source_commit,
         "version": version,
     }
@@ -356,6 +447,7 @@ def create_candidate_manifest(
         "macos": {
             "architecture": architecture,
             "minimum_system_version": MINIMUM_MACOS_VERSION,
+            "native_architectures": native_architectures,
             "rust_target": rust_target,
         },
         "release": {
@@ -363,7 +455,7 @@ def create_candidate_manifest(
             "notarized": False,
             "signed": False,
         },
-        "schema_version": 1,
+        "schema_version": 2,
         "source_commit": source_commit,
         "version": version,
     }
@@ -379,6 +471,7 @@ def _validate_candidate_manifest(
     manifest_path: Path,
     *,
     expected_source_commit: str | None,
+    expected_core_platform: str | None,
 ) -> None:
     if not _is_regular_file(manifest_path):
         raise CandidateError("candidate manifest must be a regular non-symlink file")
@@ -401,7 +494,7 @@ def _validate_candidate_manifest(
     macos = manifest.get("macos")
     core = manifest.get("core")
     files = manifest.get("files")
-    if manifest.get("schema_version") != 1:
+    if manifest.get("schema_version") != 2:
         raise CandidateError("candidate manifest schema version is invalid")
     if type(source_commit) is not str or SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise CandidateError("candidate source commit is invalid")
@@ -414,6 +507,7 @@ def _validate_candidate_manifest(
     if type(macos) is not dict or set(macos) != {
         "architecture",
         "minimum_system_version",
+        "native_architectures",
         "rust_target",
     }:
         raise CandidateError("candidate macOS identity is invalid")
@@ -425,6 +519,13 @@ def _validate_candidate_manifest(
         or macos.get("minimum_system_version") != MINIMUM_MACOS_VERSION
     ):
         raise CandidateError("candidate macOS target identity is inconsistent")
+    native_architectures = macos.get("native_architectures")
+    expected_slice = ARCHITECTURE_SLICES[architecture]
+    if native_architectures != {
+        "native_executable": [expected_slice],
+        "bundled_external_bin": [expected_slice],
+    }:
+        raise CandidateError("candidate manifest does not bind the packaged Mach-O slices")
     if type(files) is not list or len(files) != len(FINAL_ROLES):
         raise CandidateError("candidate file inventory is incomplete")
     by_role: dict[str, dict[str, object]] = {}
@@ -480,12 +581,13 @@ def _validate_candidate_manifest(
         "source_commit",
         "version",
         "registry_digest",
+        "compatibility",
         "artifact",
         "framework_lock",
     }:
         raise CandidateError("Core install descriptor does not use the closed release schema")
     if (
-        descriptor.get("schema_version") != 1
+        descriptor.get("schema_version") != 2
         or descriptor.get("source_commit") != source_commit
         or descriptor.get("version") != version
         or descriptor.get("registry_digest") != core.get("registry_digest")
@@ -493,12 +595,18 @@ def _validate_candidate_manifest(
         or descriptor.get("framework_lock") != by_role["framework_lock"]
     ):
         raise CandidateError("Core install descriptor does not bind the candidate wheel and lock")
+    _validate_core_compatibility(
+        descriptor.get("compatibility"),
+        expected_platform=expected_core_platform,
+    )
 
     wheel_path = root / str(by_role["core_wheel"]["filename"])
     lock_path = root / str(by_role["framework_lock"]["filename"])
     _validate_wheel(wheel_path, version=version)
     _validate_framework_lock(lock_path, wheel_path, version=version)
-    _validate_evidence(root)
+    observed_native_architectures = _validate_evidence(root, architecture=architecture)
+    if observed_native_architectures != native_architectures:
+        raise CandidateError("candidate manifest Mach-O slices do not match native evidence")
     _validate_release_notes(
         root / str(by_role["release_notes"]["filename"]),
         source_commit=source_commit,
@@ -524,11 +632,13 @@ def validate_candidate_manifest(
     manifest_path: Path,
     *,
     expected_source_commit: str | None = None,
+    expected_core_platform: str | None = None,
 ) -> list[str]:
     try:
         _validate_candidate_manifest(
             manifest_path,
             expected_source_commit=expected_source_commit,
+            expected_core_platform=expected_core_platform,
         )
     except CandidateError as exc:
         return [str(exc)]
@@ -548,6 +658,7 @@ def main(argv: list[str] | None = None) -> int:
     validate = subparsers.add_parser("validate")
     validate.add_argument("manifest", type=Path)
     validate.add_argument("--expected-source-commit")
+    validate.add_argument("--expected-core-platform")
     args = parser.parse_args(argv)
     try:
         if args.command == "create":
@@ -564,6 +675,7 @@ def main(argv: list[str] | None = None) -> int:
         errors = validate_candidate_manifest(
             args.manifest,
             expected_source_commit=args.expected_source_commit,
+            expected_core_platform=args.expected_core_platform,
         )
         if errors:
             raise CandidateError("; ".join(errors))

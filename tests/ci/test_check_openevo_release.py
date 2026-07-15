@@ -7,6 +7,7 @@ from io import BytesIO
 from pathlib import Path
 import plistlib
 import subprocess
+import tomllib
 from zipfile import ZipFile
 
 import pytest
@@ -187,7 +188,68 @@ def test_bundle_smoke_launches_tauri_main_and_requires_native_evidence(tmp_path:
     assert evidence["native_listener_fd_handoff"] is True
     assert evidence["native_executable_fd_handoff"] is True
     assert evidence["process_group_cleanup"] is True
+    assert evidence["mach_o"] == {
+        "bundled_external_bin": {
+            "file_output": "Mach-O 64-bit executable arm64",
+            "slices": ["arm64"],
+        },
+        "native_executable": {
+            "file_output": "Mach-O 64-bit executable arm64",
+            "slices": ["arm64"],
+        },
+    }
     assert json.loads(evidence_path.read_text(encoding="utf-8")) == evidence
+
+
+def test_bundle_smoke_inspects_mach_o_with_file_and_lipo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    binary = tmp_path / "binary"
+    binary.write_bytes(b"mach-o")
+    calls: list[list[str]] = []
+
+    def fake_run(arguments, **_kwargs):
+        calls.append(arguments)
+        if arguments[0] == "file":
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                "Mach-O 64-bit executable arm64\n",
+                "",
+            )
+        return subprocess.CompletedProcess(arguments, 0, "arm64\n", "")
+
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+
+    assert smoke.inspect_mach_o(binary) == {
+        "file_output": "Mach-O 64-bit executable arm64",
+        "slices": ["arm64"],
+    }
+    assert calls == [["file", "-b", str(binary)], ["lipo", "-archs", str(binary)]]
+
+
+def test_bundle_smoke_rejects_non_mach_o_file_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    binary = tmp_path / "binary"
+    binary.write_bytes(b"script")
+    monkeypatch.setattr(
+        smoke.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments,
+            0,
+            "POSIX shell script\n" if arguments[0] == "file" else "arm64\n",
+            "",
+        ),
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="not a Mach-O"):
+        smoke.inspect_mach_o(binary)
 
 
 def test_bundle_smoke_requires_openevo_desktop_app_bundle(tmp_path: Path) -> None:
@@ -926,7 +988,11 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "npm ci",
         "npm audit --audit-level=high",
         "pip-audit==2.9.0",
-        "cargo-audit --locked --version 0.21.2",
+        "--no-emit-project",
+        "--pip-requirements",
+        "cargo-audit --locked --version 0.22.2",
+        "file --version",
+        "lipo -version",
         "collect_openevo_release_evidence.py",
         "Retain failed supply-chain summaries",
         "npm test -- --run",
@@ -975,6 +1041,9 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert text.index("gh release upload") < text.index("gh release download")
     assert text.count("contents: write") == 1
     assert "softprops/action-gh-release" not in text
+    assert "cargo audit --ignore" not in text
+    assert "--ignore-vuln" not in text
+    assert "--suppress" not in text
     assert "tags:" not in text
     assert "universal" not in text
     assert "matrix:" not in text
@@ -988,6 +1057,15 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
 
     desktop_checks = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     assert '".github/workflows/openevo-desktop-candidate.yml"' in desktop_checks
+
+
+def test_python_runtime_dependencies_pin_security_fixed_minimums() -> None:
+    with Path("pyproject.toml").open("rb") as stream:
+        dependencies = tomllib.load(stream)["project"]["dependencies"]
+
+    assert "click>=8.3.3" in dependencies
+    assert "idna>=3.15" in dependencies
+    assert "starlette>=1.3.1" in dependencies
 
 
 def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> None:
@@ -1275,7 +1353,7 @@ def _write_fake_tauri_release_smoke(path: Path) -> None:
                 "",
                 "subprocess.Popen(['/bin/sh', '-c', 'sleep 60'])",
                 "evidence = {",
-                "    'schema_version': 1,",
+                "    'schema_version': 2,",
                 "    'nonce': os.environ['OPENEVO_RELEASE_SMOKE_NONCE'],",
                 "    'native_executable': 'OpenEvo Desktop',",
                 "    'bundled_external_bin': 'openevo-desktop-sidecar',",
@@ -1285,6 +1363,16 @@ def _write_fake_tauri_release_smoke(path: Path) -> None:
                 "    'native_listener_fd_handoff': True,",
                 "    'native_executable_fd_handoff': True,",
                 "    'process_group_cleanup': True,",
+                "    'mach_o': {",
+                "        'native_executable': {",
+                "            'file_output': 'Mach-O 64-bit executable arm64',",
+                "            'slices': ['arm64'],",
+                "        },",
+                "        'bundled_external_bin': {",
+                "            'file_output': 'Mach-O 64-bit executable arm64',",
+                "            'slices': ['arm64'],",
+                "        },",
+                "    },",
                 "}",
                 "Path(os.environ['OPENEVO_RELEASE_SMOKE_EVIDENCE_PATH']).write_text(",
                 "    json.dumps(evidence, sort_keys=True) + '\\n', encoding='utf-8'",

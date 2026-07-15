@@ -693,11 +693,17 @@ commit:
   by Desktop;
 - `release-candidate.json` and canonical `SHA256SUMS` binding the DMG, Core
   wheel, framework lock, Core descriptor, source commit, actual architecture,
-  native app smokes, and supply-chain evidence;
+  raw/DMG-copy Mach-O evidence, native app smokes, and supply-chain evidence;
+- `python-requirements.txt`, exported without the OpenEvo project itself and
+  digest-bound to the exact third-party `pip-audit` report summary;
 - release notes and the dependency/security evidence required by the canonical
   spec.
 
 PyPI is not part of the External Beta release.
+
+The changed closed contracts use version 2 for dependency/security summaries,
+native smoke evidence, the Core descriptor, and the release candidate manifest.
+The unchanged license inventory and framework lock keep their existing versions.
 
 ## Build Inputs
 
@@ -745,7 +751,9 @@ The replacement workflow must:
 4. build the sidecar, Vite assets, Tauri app bundle, and DMG on a supported
    macOS runner;
 5. mount the DMG, copy the app into a clean location, and launch that copied
-   application with a clean user profile;
+   application with a clean user profile; before each launch, inspect the Tauri
+   executable and sidecar with `file -b` and `lipo -archs`, then require the raw
+   and copied observations to match the declared candidate architecture;
 6. exercise first-run through a descriptor-matched remote Core health check;
 7. create a draft GitHub prerelease, upload all required assets, download them into
    a clean directory, and revalidate names, versions, commits, and checksums;
@@ -776,12 +784,19 @@ signing, or notarization gates.
 Release evidence must cover:
 
 - supported architecture and minimum macOS version;
+- exact Mach-O slices for both the Tauri executable and sidecar in the raw app
+  and the app copied from the mounted DMG;
+- Core Python/platform compatibility and a Linux verifier selected from the
+  descriptor's closed supported-platform list;
 - sidecar start, crash recovery, tunnel loss, quit, and relaunch;
 - first-run bootstrap against the exact Core descriptor;
 - the ordinary science flow without CLI use;
 - no-default-telemetry and secret-canary checks;
 - mounted/copy launch and supported window-size/accessibility checks;
-- artifact inventory, SHA256, source commit, and release-note consistency.
+- artifact inventory, SHA256, source commit, and release-note consistency;
+- third-party-only Python export/report equality and vulnerability audits with
+  no ignored advisories; the Rust audit tool must parse the current RustSec
+  database or the evidence collector fails closed.
 
 Local source checks remain useful during implementation:
 

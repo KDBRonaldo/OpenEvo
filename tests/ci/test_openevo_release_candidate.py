@@ -35,6 +35,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
     ) == []
     payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
     assert payload["release"] == {
         "channel": "unsigned-draft-prerelease",
         "notarized": False,
@@ -43,6 +44,10 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
     assert payload["macos"] == {
         "architecture": "aarch64",
         "minimum_system_version": "12.0",
+        "native_architectures": {
+            "bundled_external_bin": ["arm64"],
+            "native_executable": ["arm64"],
+        },
         "rust_target": "aarch64-apple-darwin",
     }
     by_role = {entry["role"]: entry for entry in payload["files"]}
@@ -62,6 +67,11 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
     assert descriptor["artifact"] == by_role["core_wheel"]
     assert descriptor["framework_lock"] == by_role["framework_lock"]
     assert descriptor["source_commit"] == payload["source_commit"]
+    assert descriptor["schema_version"] == 2
+    assert descriptor["compatibility"] == {
+        "python_requires": ">=3.11",
+        "supported_platforms": ["linux-x86_64"],
+    }
 
 
 def test_candidate_manifest_rejects_post_manifest_asset_mutation(tmp_path: Path) -> None:
@@ -139,6 +149,77 @@ def test_candidate_manifest_requires_passing_security_evidence(tmp_path: Path) -
         raise AssertionError("failing security evidence must fail closed")
 
 
+def test_candidate_manifest_rejects_mismatched_dmg_mach_o_slices(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path, dmg_slices=["x86_64"])
+
+    try:
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="f" * 64,
+        )
+    except candidate.CandidateError as exc:
+        assert "Mach-O" in str(exc)
+    else:
+        raise AssertionError("mismatched DMG-copy Mach-O slices must fail closed")
+
+
+def test_candidate_manifest_rejects_open_core_compatibility_schema(tmp_path: Path) -> None:
+    candidate = _load_module()
+
+    try:
+        candidate._validate_core_compatibility(
+            {
+                "python_requires": ">=3.11",
+                "supported_platforms": ["linux-x86_64"],
+                "extra": True,
+            }
+        )
+    except candidate.CandidateError as exc:
+        assert "closed release schema" in str(exc)
+    else:
+        raise AssertionError("open Core compatibility schema must fail closed")
+
+
+def test_candidate_manifest_rejects_unsupported_core_compatibility() -> None:
+    candidate = _load_module()
+
+    for compatibility in (
+        {"python_requires": ">=3.12", "supported_platforms": ["linux-x86_64"]},
+        {"python_requires": ">=3.11", "supported_platforms": ["linux-aarch64"]},
+    ):
+        try:
+            candidate._validate_core_compatibility(compatibility)
+        except candidate.CandidateError as exc:
+            assert "unsupported" in str(exc)
+        else:
+            raise AssertionError("unsupported Core compatibility must fail closed")
+
+
+def test_candidate_manifest_requires_expected_core_platform(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    manifest = candidate.create_candidate_manifest(
+        tmp_path,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
+        rust_target="aarch64-apple-darwin",
+        registry_digest="a" * 64,
+    )
+
+    errors = candidate.validate_candidate_manifest(
+        manifest,
+        expected_core_platform="linux-aarch64",
+    )
+
+    assert any("Core platform" in error for error in errors)
+
+
 def test_candidate_manifest_rejects_unclassified_directory(tmp_path: Path) -> None:
     candidate = _load_module()
     _write_candidate_inputs(tmp_path)
@@ -162,12 +243,16 @@ def _write_candidate_inputs(
     *,
     locked_digest: str | None = None,
     npm_vulnerabilities: int = 0,
+    dmg_slices: list[str] | None = None,
 ) -> dict[str, Path]:
     wheel = root / "openevo-0.1.0-py3-none-any.whl"
     with ZipFile(wheel, "w") as archive:
         archive.writestr(
             "openevo-0.1.0.dist-info/METADATA",
-            "Metadata-Version: 2.4\nName: openevo\nVersion: 0.1.0\n\n",
+            "Metadata-Version: 2.4\n"
+            "Name: openevo\n"
+            "Version: 0.1.0\n"
+            "Requires-Python: >=3.11\n\n",
         )
         archive.writestr(
             "openevo-0.1.0.dist-info/entry_points.txt",
@@ -201,10 +286,12 @@ def _write_candidate_inputs(
         "Architecture: aarch64\n\nUNSIGNED AND NOT NOTARIZED.\n",
         encoding="utf-8",
     )
+    requirements = root / "python-requirements.txt"
+    requirements.write_text("fastapi==1.0\n", encoding="utf-8")
     _write_json(
         root / "dependency-inventory.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "ecosystems": {
                 "python": {
                     "lockfile_sha256": _sha256(Path("uv.lock")),
@@ -235,19 +322,24 @@ def _write_candidate_inputs(
     _write_json(
         root / "security-audit.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "audits": {
                 "npm-audit-high": {
                     "status": "passed" if npm_vulnerabilities == 0 else "failed",
                     "vulnerabilities": npm_vulnerabilities,
                 },
-                "pip-audit": {"status": "passed", "vulnerabilities": 0},
+                "pip-audit": {
+                    "audited_packages": 1,
+                    "requirements_sha256": _sha256(requirements),
+                    "status": "passed",
+                    "vulnerabilities": 0,
+                },
                 "cargo-audit": {"status": "passed", "vulnerabilities": 0},
             },
         },
     )
-    smoke_evidence = {
-        "schema_version": 1,
+    raw_smoke_evidence = {
+        "schema_version": 2,
         "native_executable": "OpenEvo Desktop",
         "bundled_external_bin": "openevo-desktop-sidecar",
         "renderer_ready": True,
@@ -256,9 +348,22 @@ def _write_candidate_inputs(
         "native_listener_fd_handoff": True,
         "native_executable_fd_handoff": True,
         "process_group_cleanup": True,
+        "mach_o": {
+            "native_executable": {
+                "file_output": "Mach-O 64-bit executable arm64",
+                "slices": ["arm64"],
+            },
+            "bundled_external_bin": {
+                "file_output": "Mach-O 64-bit executable arm64",
+                "slices": ["arm64"],
+            },
+        },
     }
-    _write_json(root / "app-bundle-smoke.json", smoke_evidence)
-    _write_json(root / "dmg-copy-smoke.json", smoke_evidence)
+    copied_smoke_evidence = json.loads(json.dumps(raw_smoke_evidence))
+    for binary in ("native_executable", "bundled_external_bin"):
+        copied_smoke_evidence["mach_o"][binary]["slices"] = dmg_slices or ["arm64"]
+    _write_json(root / "app-bundle-smoke.json", raw_smoke_evidence)
+    _write_json(root / "dmg-copy-smoke.json", copied_smoke_evidence)
     return {"wheel": wheel, "framework_lock": framework_lock, "dmg": dmg}
 
 

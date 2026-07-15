@@ -13,6 +13,9 @@ import sys
 import tomllib
 from typing import Any
 
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+
 
 class EvidenceError(RuntimeError):
     pass
@@ -48,31 +51,96 @@ def _npm_vulnerabilities(report: Any) -> int:
     return high + critical
 
 
-def _pip_vulnerabilities(report: Any) -> int:
-    dependencies = report.get("dependencies") if type(report) is dict else report
+def _exported_requirements(payload: str) -> dict[str, str]:
+    requirements: dict[str, str] = {}
+    for raw_line in payload.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement as exc:
+            raise EvidenceError("exported Python requirement is invalid") from exc
+        name = canonicalize_name(requirement.name)
+        if name == "openevo":
+            raise EvidenceError("exported Python requirements must exclude the OpenEvo project")
+        if requirement.marker is not None and not requirement.marker.evaluate():
+            continue
+        specifiers = list(requirement.specifier)
+        if requirement.url is not None or requirement.extras or len(specifiers) != 1:
+            raise EvidenceError("exported Python requirement must be one exact third-party pin")
+        specifier = specifiers[0]
+        if specifier.operator != "==" or specifier.version.endswith(".*"):
+            raise EvidenceError("exported Python requirement must use one exact version")
+        if name in requirements:
+            raise EvidenceError("exported Python requirements contain a duplicate package")
+        requirements[name] = specifier.version
+    if not requirements:
+        raise EvidenceError("exported Python requirements contain no third-party packages")
+    return requirements
+
+
+def _pip_vulnerabilities(report: Any, requirements_payload: str) -> tuple[int, int]:
+    if type(report) is not dict or set(report) != {"dependencies", "fixes"}:
+        raise EvidenceError("pip-audit report does not use the expected JSON schema")
+    if report.get("fixes") != []:
+        raise EvidenceError("pip-audit report unexpectedly contains fix mutations")
+    dependencies = report.get("dependencies")
     if type(dependencies) is not list:
         raise EvidenceError("pip-audit report does not contain a dependency list")
+    expected = _exported_requirements(requirements_payload)
+    observed: dict[str, str] = {}
     count = 0
     for dependency in dependencies:
-        if type(dependency) is not dict or type(dependency.get("vulns")) is not list:
+        if type(dependency) is not dict or set(dependency) != {"name", "version", "vulns"}:
             raise EvidenceError("pip-audit dependency entry is invalid")
-        count += len(dependency["vulns"])
-    return count
+        name = dependency.get("name")
+        version = dependency.get("version")
+        vulnerabilities = dependency.get("vulns")
+        if type(name) is not str or type(version) is not str or type(vulnerabilities) is not list:
+            raise EvidenceError("pip-audit dependency entry is invalid")
+        canonical_name = canonicalize_name(name)
+        if canonical_name == "openevo" or canonical_name in observed:
+            raise EvidenceError("pip-audit report is not a unique third-party dependency report")
+        if any(type(vulnerability) is not dict for vulnerability in vulnerabilities):
+            raise EvidenceError("pip-audit vulnerability entry is invalid")
+        observed[canonical_name] = version
+        count += len(vulnerabilities)
+    if observed != expected:
+        raise EvidenceError("pip-audit report does not cover the exact exported dependency set")
+    return count, len(observed)
 
 
 def _cargo_vulnerabilities(report: Any) -> int:
     try:
+        advisory_count = report["database"]["advisory-count"]
+        dependency_count = report["lockfile"]["dependency-count"]
+        ignored = report["settings"]["ignore"]
         found = report["vulnerabilities"]["found"]
+        count = report["vulnerabilities"]["count"]
+        vulnerabilities = report["vulnerabilities"]["list"]
     except (KeyError, TypeError) as exc:
-        raise EvidenceError("cargo-audit report does not contain vulnerability totals") from exc
-    if type(found) is not bool:
+        raise EvidenceError("cargo-audit report does not contain authoritative totals") from exc
+    if (
+        type(advisory_count) is not int
+        or advisory_count < 1
+        or type(dependency_count) is not int
+        or dependency_count < 1
+    ):
+        raise EvidenceError("cargo-audit database or lockfile inventory is invalid")
+    if ignored != []:
+        raise EvidenceError("cargo-audit report contains ignored advisories")
+    if (
+        type(found) is not bool
+        or type(count) is not int
+        or count < 0
+        or type(vulnerabilities) is not list
+        or any(type(vulnerability) is not dict for vulnerability in vulnerabilities)
+        or count != len(vulnerabilities)
+        or found is not (count > 0)
+    ):
         raise EvidenceError("cargo-audit vulnerability status is invalid")
-    if not found:
-        return 0
-    vulnerabilities = report["vulnerabilities"].get("list")
-    if type(vulnerabilities) is not list:
-        raise EvidenceError("cargo-audit vulnerability list is invalid")
-    return len(vulnerabilities)
+    return count
 
 
 def _python_license_inventory() -> tuple[int, int]:
@@ -162,6 +230,7 @@ def collect_evidence(
     *,
     npm_audit: Path,
     pip_audit: Path,
+    pip_requirements: Path,
     cargo_audit: Path,
 ) -> None:
     repo = repo.resolve()
@@ -182,8 +251,16 @@ def collect_evidence(
     if type(npm_packages) is not dict:
         raise EvidenceError("package-lock.json does not contain packages")
     cargo_packages = _cargo_metadata(repo)
+    try:
+        requirements_payload = pip_requirements.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise EvidenceError("exported Python requirements are unreadable") from exc
+    pip_vulnerabilities, pip_packages = _pip_vulnerabilities(
+        _load_json(pip_audit),
+        requirements_payload,
+    )
     dependency_counts = {
-        "python": len(python_packages),
+        "python": pip_packages,
         "npm": sum(1 for path in npm_packages if path),
         "cargo": len(cargo_packages),
     }
@@ -195,7 +272,7 @@ def collect_evidence(
             }
             for ecosystem in ("python", "npm", "cargo")
         },
-        "schema_version": 1,
+        "schema_version": 2,
     }
 
     python_licenses = _python_license_inventory()
@@ -216,7 +293,7 @@ def collect_evidence(
 
     vulnerability_counts = {
         "npm-audit-high": _npm_vulnerabilities(_load_json(npm_audit)),
-        "pip-audit": _pip_vulnerabilities(_load_json(pip_audit)),
+        "pip-audit": pip_vulnerabilities,
         "cargo-audit": _cargo_vulnerabilities(_load_json(cargo_audit)),
     }
     security_audit = {
@@ -227,8 +304,14 @@ def collect_evidence(
             }
             for audit, count in vulnerability_counts.items()
         },
-        "schema_version": 1,
+        "schema_version": 2,
     }
+    security_audit["audits"]["pip-audit"].update(
+        {
+            "audited_packages": pip_packages,
+            "requirements_sha256": _sha256(pip_requirements),
+        }
+    )
     _write_json(output_dir / "dependency-inventory.json", dependency_inventory)
     _write_json(output_dir / "license-inventory.json", license_inventory)
     _write_json(output_dir / "security-audit.json", security_audit)
@@ -244,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--npm-audit", type=Path, required=True)
     parser.add_argument("--pip-audit", type=Path, required=True)
+    parser.add_argument("--pip-requirements", type=Path, required=True)
     parser.add_argument("--cargo-audit", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
@@ -252,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir,
             npm_audit=args.npm_audit,
             pip_audit=args.pip_audit,
+            pip_requirements=args.pip_requirements,
             cargo_audit=args.cargo_audit,
         )
     except (EvidenceError, OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:

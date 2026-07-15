@@ -108,27 +108,29 @@ jobs:
 
       - name: Audit shipped Python dependencies
         run: |
+          mkdir candidate-artifacts
           uv export --frozen --no-dev --format requirements-txt --no-hashes \
-            > "$RUNNER_TEMP/openevo-requirements.txt"
+            --no-annotate --no-header --no-emit-project \
+            > candidate-artifacts/python-requirements.txt
           uvx --from pip-audit==2.9.0 pip-audit \
-            --requirement "$RUNNER_TEMP/openevo-requirements.txt" \
+            --requirement candidate-artifacts/python-requirements.txt \
             --format json > "$RUNNER_TEMP/pip-audit.json" || true
 
       - name: Audit shipped Rust dependencies
         run: |
-          cargo install cargo-audit --locked --version 0.21.2
+          cargo install cargo-audit --locked --version 0.22.2
           cargo audit \
             --file desktop/src-tauri/Cargo.lock \
             --json > "$RUNNER_TEMP/cargo-audit.json" || true
 
       - name: Collect dependency, license, and security evidence
         run: |
-          mkdir candidate-artifacts
           uv run python scripts/ci/collect_openevo_release_evidence.py \
             --repo "$GITHUB_WORKSPACE" \
             --output-dir candidate-artifacts \
             --npm-audit "$RUNNER_TEMP/npm-audit.json" \
             --pip-audit "$RUNNER_TEMP/pip-audit.json" \
+            --pip-requirements candidate-artifacts/python-requirements.txt \
             --cargo-audit "$RUNNER_TEMP/cargo-audit.json"
 
       - name: Build packaged sidecar and final exact Core wheel
@@ -174,6 +176,11 @@ jobs:
       - name: Build unsigned Desktop DMG for the runner architecture
         working-directory: desktop
         run: npm run tauri:build -- --ci
+
+      - name: Require native binary inspection tools
+        run: |
+          file --version
+          lipo -version
 
       - name: Copy exact candidate bytes
         run: |
@@ -235,7 +242,8 @@ jobs:
             --registry-digest "$OPENEVO_REGISTRY_DIGEST"
           uv run python scripts/ci/openevo_release_candidate.py validate \
             candidate-artifacts/release-candidate.json \
-            --expected-source-commit "$GITHUB_SHA"
+            --expected-source-commit "$GITHUB_SHA" \
+            --expected-core-platform linux-x86_64
           test -f candidate-artifacts/core-install-artifact.json
           test -f candidate-artifacts/SHA256SUMS
           manifest_sha256="$(shasum -a 256 candidate-artifacts/release-candidate.json | awk '{print $1}')"
@@ -305,7 +313,8 @@ jobs:
             | sha256sum --check -
           uv run python scripts/ci/openevo_release_candidate.py validate \
             candidate-artifacts/release-candidate.json \
-            --expected-source-commit "$GITHUB_SHA"
+            --expected-source-commit "$GITHUB_SHA" \
+            --expected-core-platform linux-x86_64
 
       - name: Install and verify the exact candidate Core wheel
         run: |

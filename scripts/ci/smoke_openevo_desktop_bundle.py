@@ -24,7 +24,7 @@ from smoke_openevo_desktop_sidecar import SmokeFailure  # noqa: E402
 
 SIDECAR_NAME = "openevo-desktop-sidecar"
 APP_BUNDLE_NAME = "OpenEvo Desktop.app"
-EVIDENCE_SCHEMA_VERSION = 1
+EVIDENCE_SCHEMA_VERSION = 2
 REQUIRED_BOOLEAN_EVIDENCE = (
     "renderer_ready",
     "sidecar_ready",
@@ -32,6 +32,7 @@ REQUIRED_BOOLEAN_EVIDENCE = (
     "native_listener_fd_handoff",
     "native_executable_fd_handoff",
 )
+MACH_O_ARCHITECTURES = {"arm64", "x86_64"}
 
 
 def _app_bundle(bundle_root: Path) -> Path:
@@ -90,6 +91,68 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_mach_o_observation(payload: object) -> dict[str, object]:
+    if type(payload) is not dict or set(payload) != {"file_output", "slices"}:
+        raise SmokeFailure("Mach-O evidence does not use the closed schema")
+    file_output = payload.get("file_output")
+    slices = payload.get("slices")
+    if (
+        type(file_output) is not str
+        or not file_output
+        or len(file_output) > 512
+        or "Mach-O" not in file_output
+        or any(ord(character) < 32 or ord(character) == 127 for character in file_output)
+    ):
+        raise SmokeFailure("Binary is not a Mach-O executable according to file")
+    if (
+        type(slices) is not list
+        or not slices
+        or any(type(value) is not str or value not in MACH_O_ARCHITECTURES for value in slices)
+        or slices != sorted(set(slices))
+    ):
+        raise SmokeFailure("Mach-O architecture slices are invalid")
+    return {"file_output": file_output, "slices": slices}
+
+
+def inspect_mach_o(path: Path) -> dict[str, object]:
+    file_result = subprocess.run(
+        ["file", "-b", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if file_result.returncode != 0:
+        raise SmokeFailure(f"file could not inspect packaged binary: {path.name}")
+    lipo_result = subprocess.run(
+        ["lipo", "-archs", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if lipo_result.returncode != 0:
+        raise SmokeFailure(f"lipo could not inspect packaged binary: {path.name}")
+    return _validate_mach_o_observation(
+        {
+            "file_output": file_result.stdout.strip(),
+            "slices": sorted(lipo_result.stdout.split()),
+        }
+    )
+
+
+def _validate_mach_o_evidence(payload: object) -> dict[str, object]:
+    if type(payload) is not dict or set(payload) != {
+        "native_executable",
+        "bundled_external_bin",
+    }:
+        raise SmokeFailure("App smoke Mach-O evidence does not use the closed schema")
+    return {
+        name: _validate_mach_o_observation(payload[name])
+        for name in ("native_executable", "bundled_external_bin")
+    }
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -219,6 +282,7 @@ def _macos_native_evidence(
     app_pid: int,
     executable: Path,
     sidecar: Path,
+    mach_o: dict[str, object],
 ) -> tuple[dict[str, object] | None, set[int]]:
     sidecar_digest = _sha256(sidecar)
     sidecar_rows = [row for row in _descendants(app_pid) if SIDECAR_NAME in row[3]]
@@ -249,6 +313,7 @@ def _macos_native_evidence(
                 "bundled_external_bin_resolved": True,
                 "native_listener_fd_handoff": True,
                 "native_executable_fd_handoff": True,
+                "mach_o": mach_o,
             },
             process_groups,
         )
@@ -278,6 +343,7 @@ def _read_emitted_evidence(
         raise SmokeFailure("App release smoke evidence names the wrong externalBin")
     if any(payload.get(field) is not True for field in REQUIRED_BOOLEAN_EVIDENCE):
         raise SmokeFailure("App release smoke evidence is incomplete")
+    payload["mach_o"] = _validate_mach_o_evidence(payload.get("mach_o"))
     return payload
 
 
@@ -299,6 +365,14 @@ def smoke_bundle(
         raise SmokeFailure("Bundle smoke timeout must be positive")
     executable = find_app_executable(bundle_root)
     sidecar = find_bundled_sidecar(bundle_root)
+    mach_o = (
+        {
+            "native_executable": inspect_mach_o(executable),
+            "bundled_external_bin": inspect_mach_o(sidecar),
+        }
+        if sys.platform == "darwin"
+        else None
+    )
     app = _app_bundle(bundle_root)
     nonce = os.urandom(32).hex()
     with tempfile.TemporaryDirectory(prefix="openevo-desktop-app-smoke-") as temporary:
@@ -334,6 +408,7 @@ def smoke_bundle(
                             process.pid,
                             executable,
                             sidecar,
+                            mach_o,
                         )
                         process_groups.update(observed_groups)
                         if evidence is not None and evidence["renderer_ready"] is True:

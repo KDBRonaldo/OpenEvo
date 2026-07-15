@@ -1,16 +1,17 @@
 # Core Install Artifact
 
-> Target contract: no External Beta Core descriptor/artifact pair has been
-> published yet. Workstream B2 implements and tests this format before Desktop
-> or release docs may rely on it.
+> Release-candidate contract: no External Beta Core descriptor/artifact pair
+> has been published yet. The unsigned candidate workflow implements the
+> bounded descriptor below. Final B2 publication URL, bundled-resource, remote
+> bootstrap, and installed-origin attestation remain release blockers.
 
 The A2.3 evolution runtime consumes a bounded `framework-lock.json` containing
 the distribution name/version, sibling wheel basename, and SHA-256. Desktop
 currently writes that lock from its packaged exact wheel and uploads both files;
 Core verifies the installed inventory and entry points before startup. This is
 an internal bridge, not this full B2 descriptor: it has no release URL, source
-commit, size, platform matrix, or publication evidence and therefore does not
-make the release artifact contract complete.
+commit or compatibility evidence and therefore does not make the release
+artifact contract complete by itself.
 
 The Core install artifact is the exact OpenEvo Core Backend package that
 OpenEvo Desktop installs on the remote server. Desktop is the ordinary-user
@@ -19,38 +20,52 @@ jobs, artifacts, context resolution, runtime injection, and typed service APIs.
 
 ## Descriptor Contract
 
-Every External Beta release publishes one small `core-install-artifact.json`
-descriptor. Its implementation must add a typed model or JSON schema and
-negative tests in the same PR; this document does not claim that validator
-already exists.
+Every unsigned candidate publishes one small `core-install-artifact.json`
+descriptor. The candidate creator and validator enforce an exact top-level
+key set and exact nested compatibility/file-entry key sets:
 
 ```json
 {
-  "core_install_artifact": {
-    "type": "wheel",
-    "version": "<version>",
+  "artifact": {
+    "byte_size": 123,
     "filename": "openevo-<version>-py3-none-any.whl",
-    "release_asset_url": "github-release://<owner>/<repo>/releases/tags/<tag>/assets/openevo-<version>-py3-none-any.whl",
-    "resource_relative_path": "core/openevo-<version>-py3-none-any.whl",
-    "sha256": "...",
-    "size_bytes": 123,
-    "source_commit": "...",
-    "python_requires": ">=3.11,<3.13",
+    "role": "core_wheel",
+    "sha256": "..."
+  },
+  "compatibility": {
+    "python_requires": ">=3.11",
     "supported_platforms": ["linux-x86_64"]
-  }
+  },
+  "framework_lock": {
+    "byte_size": 123,
+    "filename": "framework-lock.json",
+    "role": "framework_lock",
+    "sha256": "..."
+  },
+  "registry_digest": "...",
+  "schema_version": 2,
+  "source_commit": "...",
+  "version": "<version>"
 }
 ```
 
-The descriptor is the release identity for Core. Validators must compare the
-descriptor file, bundled app resource, GitHub Release asset, remote upload, and
-installed backend import origin against this same object.
+The wheel metadata must declare the same `Requires-Python: >=3.11`. Candidate
+validation rejects extra compatibility fields, another Python requirement,
+another platform list, a wheel/lock digest mismatch, or a Linux verifier that
+requests a platform absent from the descriptor. The current workflow proves
+only `linux-x86_64`; support must not be widened without a matching clean
+install job, negative tests, and descriptor update.
+
+The descriptor is the candidate release identity for Core. Final B2 validators
+must additionally compare the bundled app resource, GitHub Release asset,
+remote upload, and installed backend import origin against this same object.
 
 ## Artifact Type
 
-`type` may be `wheel` or `remote_bundle`. External Beta normally uses a Python
-wheel. If a `remote_bundle` is used, it must still provide package inventory,
-entrypoint, source commit, SHA256, and clean-install evidence equivalent to the
-wheel path.
+The implemented candidate schema accepts one Python wheel. A future
+`remote_bundle` contract must use a new reviewed schema and still provide
+package inventory, entrypoint, source commit, SHA256, compatibility, and
+clean-install evidence equivalent to the wheel path.
 
 Desktop must not install Core from a source checkout, editable install, stale
 cache, package-relative fallback, or locally rebuilt artifact when release mode
@@ -72,8 +87,8 @@ installed release artifact and not from the repository checkout.
 
 ## Clean Install
 
-The clean install smoke creates a fresh Python environment, installs only the
-declared artifact, starts `openevo-backend serve`, and verifies:
+The final B2 clean install smoke must create a fresh Python environment, install
+only the declared artifact, start `openevo-backend serve`, and verify:
 
 - `/version`;
 - `/health`;
@@ -86,22 +101,24 @@ declared artifact, starts `openevo-backend serve`, and verifies:
 
 ## Bootstrap Use
 
-OpenEvo Desktop bundles `core-install-artifact.json` and the exact install
-artifact bytes under:
+Final B2 packaging must bundle `core-install-artifact.json` and the exact
+install artifact bytes under:
 
 ```text
 OpenEvo Desktop.app/Contents/Resources/core/
 ```
 
-Remote bootstrap uploads or verifies those bytes, creates a user-level remote
+The current unsigned candidate publishes the descriptor and wheel as sibling
+release assets; it does not prove the resource placement above. Final remote
+bootstrap uploads or verifies those bytes, creates a user-level remote
 environment, installs Core, writes the backend API token, starts the backend,
 and opens the localhost SSH tunnel. After Core is healthy, Desktop forwards run
 and service operations through Core APIs.
 
 ## Cache Use
 
-Desktop may reuse a local or remote cached Core artifact only when the cached
-bytes match `core_install_artifact.sha256`. The bootstrap report must record
+Final B2 Desktop may reuse a local or remote cached Core artifact only when the
+cached bytes match `artifact.sha256`. The bootstrap report must record
 whether the source was `bundled`, `local_cache`, or `verified_redownload`.
 Unverified cache reuse is release-blocking.
 

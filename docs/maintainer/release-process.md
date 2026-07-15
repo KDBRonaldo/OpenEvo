@@ -14,7 +14,9 @@ from the disabled placeholder workflows.
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
 architecture, launches the real Tauri app before and after DMG copy, verifies
-the same final Core wheel on Linux, and creates an unsigned draft prerelease.
+the Tauri executable and sidecar Mach-O slices in both copies with `file` and
+`lipo`, verifies the same final Core wheel on Linux, and creates an unsigned
+draft prerelease.
 It uploads all assets, downloads them into a clean directory, and validates the
 exact closed manifest before leaving the draft for review. Passing this
 packaging rehearsal does not satisfy the science E2E, benchmark,
@@ -31,13 +33,15 @@ the remote server.
 - DMG SHA256 checksum;
 - exact Core install artifact and SHA256 checksum;
 - Core descriptor containing version, compatibility, source commit, artifact
-  name, and checksum;
+  name, and checksum; the current closed compatibility is Python `>=3.11` on
+  `linux-x86_64`;
 - candidate manifest and canonical checksum inventory binding the DMG, exact
   Core wheel, framework lock, Core descriptor, source commit, architecture,
   native smoke evidence, and supply-chain reports;
 - release notes;
 - dependency lock, practical vulnerability, and license results for shipped
-  Python, npm, and Rust dependencies;
+  Python, npm, and Rust dependencies, including the exact third-party-only
+  Python requirements input audited by `pip-audit`;
 - benchmark summaries for textual memory, trajectory-to-skill, and
   agent-system gates.
 
@@ -96,9 +100,27 @@ release inventory. `release-candidate.json` and `core-install-artifact.json`
 bind the exact Core wheel and framework lock; the former also binds the DMG,
 `SHA256SUMS`, commit, runner architecture, app/DMG native evidence, and Python,
 npm, and Cargo dependency/license/security summaries. Those summaries are
-checked against the candidate checkout's four lock/license files. The final
-draft job alone receives `contents: write`; build and Linux verification retain
-read-only permissions.
+checked against the candidate checkout's four lock/license files. The Python
+export uses `uv export --no-emit-project`; the collector requires the
+`pip-audit` package/version set to equal every applicable exact requirement,
+rejects OpenEvo itself, and records the requirements digest and audited package
+count. `cargo-audit` is pinned to `0.22.2` so the current RustSec CVSS 4.0 data
+is parseable; malformed or incomplete JSON still fails in the collector and no
+advisory is ignored. The final draft job alone receives `contents: write`;
+build and Linux verification retain read-only permissions.
+
+The dependency and security summaries, native smoke evidence, Core descriptor,
+and release candidate manifest use schema version 2 for these closed contracts.
+The unchanged license inventory remains version 1; `framework-lock.json`
+retains its independent string-valued version 1 contract.
+
+Each native smoke records closed `mach_o` evidence for the Tauri executable and
+packaged sidecar: bounded `file -b` output plus the sorted `lipo -archs` slice
+list. Candidate creation requires raw-app and DMG-copy observations to match
+and requires both binaries to contain exactly the slice represented by the
+runner architecture. `release-candidate.json` repeats those normalized slice
+lists under `macos.native_architectures`, while the file inventory binds both
+complete smoke reports by size and SHA256.
 
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
