@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -54,6 +55,7 @@ from .store import (
     ResourceNotFoundError,
     StoreCorruptionError,
     StoredResult,
+    _failed_idempotency_identity,
 )
 
 
@@ -65,6 +67,16 @@ _FEATURES = [
     m.FeatureFlag.NON_PARAMETRIC_EVOLUTION,
     m.FeatureFlag.SSE_REPLAY,
 ]
+
+_RUN_MUTATION_OPERATION_IDS = frozenset(
+    {
+        "cancelCoreRunV1",
+        "createCoreRunV1",
+        "deleteCoreRunV1",
+        "retryCoreRunV1",
+    }
+)
+_RUN_MUTATION_SINGLEFLIGHT_CAPACITY = 256
 
 _UNAVAILABLE_OPERATIONS = frozenset(
     {
@@ -120,6 +132,92 @@ def _run_control_http_error(exc: CoreRunControlError) -> _RunControlHTTPError:
     )
 
 
+class _RunMutationSingleFlight:
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("run mutation single-flight capacity must be positive")
+        self._capacity = capacity
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[
+            tuple[str, str, str], tuple[str, Future[object]]
+        ] = OrderedDict()
+        self._closing = False
+
+    def invoke(
+        self,
+        identity: tuple[str, str, str],
+        request_digest: str,
+        call: Callable[[], object],
+    ) -> object:
+        with self._lock:
+            if self._closing:
+                raise _run_mutation_closing_error()
+            entry = self._entries.get(identity)
+            if entry is not None:
+                retained_digest, future = entry
+                if not hmac.compare_digest(retained_digest, request_digest):
+                    raise _idempotency_conflict_error()
+                self._entries.move_to_end(identity)
+                owner = False
+            else:
+                self._evict_completed_locked()
+                if len(self._entries) >= self._capacity:
+                    raise _run_mutation_capacity_error()
+                future = Future()
+                self._entries[identity] = (request_digest, future)
+                owner = True
+
+        if not owner:
+            try:
+                return future.result()
+            except CoreControlHTTPError as exc:
+                replay = CoreControlHTTPError.from_error(exc.error)
+                replay.headers = dict(exc.headers)
+                raise replay from exc
+
+        try:
+            result = call()
+        except BaseException as exc:
+            with self._lock:
+                retained = self._entries.get(identity)
+                if retained is not None and retained[1] is future:
+                    del self._entries[identity]
+                future.set_exception(exc)
+            raise
+        with self._lock:
+            if self._closing:
+                retained = self._entries.get(identity)
+                if retained is not None and retained[1] is future:
+                    del self._entries[identity]
+            else:
+                self._entries.move_to_end(identity)
+            future.set_result(result)
+        return result
+
+    def close(self) -> tuple[Future[object], ...]:
+        with self._lock:
+            self._closing = True
+            active = tuple(
+                future for _, future in self._entries.values() if not future.done()
+            )
+            self._entries.clear()
+            return active
+
+    def _evict_completed_locked(self) -> None:
+        while len(self._entries) >= self._capacity:
+            completed_identity = next(
+                (
+                    identity
+                    for identity, (_, future) in self._entries.items()
+                    if future.done()
+                ),
+                None,
+            )
+            if completed_identity is None:
+                return
+            del self._entries[completed_identity]
+
+
 class _PostCommitHTTPError(CoreControlHTTPError):
     """Fail closed without overwriting a transaction's committed idempotency result."""
 
@@ -154,6 +252,9 @@ class CoreControlProviderV1:
         )
         self._close_lock = threading.Lock()
         self._closed = False
+        self._run_mutations = _RunMutationSingleFlight(
+            _RUN_MUTATION_SINGLEFLIGHT_CAPACITY
+        )
         self._authorization = b"Bearer " + token_bytes
         self._registry = evolution_registry
         self._service_supervisor = service_supervisor
@@ -200,11 +301,15 @@ class CoreControlProviderV1:
         with self._close_lock:
             if self._closed:
                 return
-            run_control = self._run_control
-            if run_control is not None:
-                request_stop = getattr(run_control, "request_stop", None)
-                if callable(request_stop):
-                    request_stop()
+            active_run_mutations = self._run_mutations.close()
+            if self._run_control is not None:
+                self._run_control.close()
+                self._run_control = None
+            for mutation in active_run_mutations:
+                try:
+                    mutation.result()
+                except BaseException:
+                    pass
             if self._service_supervisor is not None:
                 self._service_supervisor.close()
                 self._service_supervisor = None
@@ -230,6 +335,20 @@ class CoreControlProviderV1:
         )
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        if operation_id in _RUN_MUTATION_OPERATION_IDS:
+            identity = _failed_idempotency_identity(operation_id, arguments)
+            if identity is not None:
+                scope, key, digest = identity
+                return self._run_mutations.invoke(
+                    (operation_id, scope, key),
+                    digest,
+                    lambda: self._invoke_with_failed_idempotency(operation_id, arguments),
+                )
+        return self._invoke_with_failed_idempotency(operation_id, arguments)
+
+    def _invoke_with_failed_idempotency(
+        self, operation_id: str, arguments: Mapping[str, object]
+    ) -> object:
         try:
             previous_error = self.store.replay_failed_idempotency(
                 operation_id,
@@ -848,6 +967,28 @@ def _idempotency_conflict_error() -> CoreControlHTTPError:
         retryable=False,
         repair_action=m.RepairAction.USER_ACTION_REQUIRED,
         next_action="Use the original request or issue a new idempotency key.",
+    )
+
+
+def _run_mutation_capacity_error() -> CoreControlHTTPError:
+    return _run_control_http_error(
+        CoreRunControlError(
+            "run_mutation_capacity_exhausted",
+            "Core cannot accept another idempotent run mutation right now.",
+            http_status=503,
+            retryable=True,
+        )
+    )
+
+
+def _run_mutation_closing_error() -> CoreControlHTTPError:
+    return _run_control_http_error(
+        CoreRunControlError(
+            "run_owner_unavailable",
+            "The managed run owner is shutting down.",
+            http_status=503,
+            retryable=True,
+        )
     )
 
 

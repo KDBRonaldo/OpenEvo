@@ -1668,6 +1668,8 @@ class CoreControlStoreV1:
             ).fetchone()
             if row is None:
                 return None
+            if not hmac.compare_digest(row["request_digest"], digest):
+                raise IdempotencyConflictError("idempotency key was reused")
             if clear_retryable:
                 error = _validate_bytes(m.ApiErrorV1, row["error_json"])
                 if error.retryable:
@@ -1689,8 +1691,6 @@ class CoreControlStoreV1:
                                 "failed idempotency cleanup lost its authority"
                             )
                     return None
-            if not hmac.compare_digest(row["request_digest"], digest):
-                raise IdempotencyConflictError("idempotency key was reused")
             if clear_retryable:
                 return error
             return _validate_bytes(m.ApiErrorV1, row["error_json"])

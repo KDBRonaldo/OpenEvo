@@ -4717,17 +4717,6 @@ class _SuccessfulMutationRunControl(_RecordingRunControl):
         return "owner-retried"
 
 
-class _ConcurrentSuccessfulRunControl(_RecordingRunControl):
-    def __init__(self) -> None:
-        super().__init__()
-        self._barrier = threading.Barrier(2)
-
-    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
-        self.invocations.append((operation_id, arguments))
-        self._barrier.wait(timeout=5)
-        return "owner-retried"
-
-
 class _BlockingSuccessfulRunControl(_RecordingRunControl):
     def __init__(self) -> None:
         super().__init__()
@@ -4739,6 +4728,50 @@ class _BlockingSuccessfulRunControl(_RecordingRunControl):
         self.entered.set()
         assert self.release.wait(timeout=5)
         return "owner-retried"
+
+
+class _BlockingRetryableThenSuccessfulRunControl(_RecordingRunControl):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self.invocations.append((operation_id, arguments))
+        if len(self.invocations) == 1:
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            raise CoreRunControlError(
+                "run_owner_temporarily_unavailable",
+                "The managed run owner rejected the operation.",
+                http_status=503,
+                retryable=True,
+            )
+        return "owner-retried"
+
+
+class _BlockingNonRetryableRunControl(_RecordingRunControl):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self.invocations.append((operation_id, arguments))
+        self.entered.set()
+        assert self.release.wait(timeout=5)
+        raise CoreRunControlError(
+            "run_request_rejected",
+            "The managed run owner rejected the operation.",
+            http_status=409,
+            retryable=False,
+        )
+
+
+class _CloseReleasesRunControl(_BlockingSuccessfulRunControl):
+    def close(self) -> None:
+        self.close_calls += 1
+        self.release.set()
 
 
 def _run_failure_error(*, retryable: bool) -> ApiErrorV1:
@@ -4996,6 +5029,44 @@ def test_legacy_retryable_run_failure_is_cleared_before_owner_retry(
     assert [invocation[0] for invocation in run_control.invocations] == [operation_id]
 
 
+def test_legacy_retryable_run_failure_conflict_does_not_delete_original_row(
+    tmp_path: Path,
+) -> None:
+    original_arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "legacy-retryable-conflict-key",
+    }
+    persisted = _persist_legacy_failure(
+        tmp_path,
+        "cancelCoreRunV1",
+        original_arguments,
+        retryable=True,
+    )
+    conflicting_arguments = {
+        **original_arguments,
+        "request": {"reason": "superseded"},
+    }
+    run_control = _SuccessfulMutationRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with TestClient(app):
+        with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+            provider.invoke("cancelCoreRunV1", conflicting_arguments)
+        assert raised.value.status_code == 409
+        assert raised.value.error.code == "idempotency_key_reused"
+        assert (
+            provider.store.replay_failed_idempotency(
+                "cancelCoreRunV1", original_arguments
+            )
+            == persisted
+        )
+
+    assert run_control.invocations == []
+
+
 def test_legacy_non_retryable_run_failure_keeps_exact_replay_after_restart(
     tmp_path: Path,
 ) -> None:
@@ -5127,7 +5198,7 @@ def test_legacy_retryable_run_cleanup_survives_post_commit_failure_without_cross
     assert [invocation[0] for invocation in run_control.invocations] == ["cancelCoreRunV1"]
 
 
-def test_concurrent_retries_both_reach_owner_after_legacy_retryable_cleanup(
+def test_concurrent_exact_retries_are_coalesced_after_legacy_retryable_cleanup(
     tmp_path: Path,
 ) -> None:
     arguments = {
@@ -5142,24 +5213,204 @@ def test_concurrent_retries_both_reach_owner_after_legacy_retryable_cleanup(
         arguments,
         retryable=True,
     )
-    run_control = _ConcurrentSuccessfulRunControl()
+    run_control = _BlockingSuccessfulRunControl()
     app = _app(tmp_path, run_control=run_control)
     provider = app.state.core_control_provider
 
     with TestClient(app), ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [
-            executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
-            for _ in range(2)
-        ]
+        first = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        assert run_control.entered.wait(timeout=5)
+        second = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        time.sleep(0.05)
+        run_control.release.set()
+        futures = [first, second]
         assert [future.result(timeout=10) for future in futures] == [
             "owner-retried",
             "owner-retried",
         ]
 
+    assert [invocation[0] for invocation in run_control.invocations] == ["cancelCoreRunV1"]
+
+
+def test_concurrent_retryable_run_failure_is_coalesced_but_not_cached(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "retryable-concurrent-key",
+    }
+    run_control = _BlockingRetryableThenSuccessfulRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with TestClient(app), ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        assert run_control.entered.wait(timeout=5)
+        second = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        time.sleep(0.05)
+        run_control.release.set()
+        errors = []
+        for future in (first, second):
+            with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+                future.result(timeout=10)
+            errors.append(raised.value.error)
+        assert errors[0] == errors[1]
+        assert provider.invoke("cancelCoreRunV1", arguments) == "owner-retried"
+
     assert [invocation[0] for invocation in run_control.invocations] == [
         "cancelCoreRunV1",
         "cancelCoreRunV1",
     ]
+
+
+def test_concurrent_non_retryable_run_failure_is_coalesced_and_durable(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "non-retryable-concurrent-key",
+    }
+    run_control = _BlockingNonRetryableRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with TestClient(app), ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        assert run_control.entered.wait(timeout=5)
+        second = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        time.sleep(0.05)
+        run_control.release.set()
+        errors = []
+        for future in (first, second):
+            with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+                future.result(timeout=10)
+            errors.append(raised.value.error)
+        assert errors[0] == errors[1]
+        with pytest.raises(provider_module.CoreControlHTTPError) as replayed:
+            provider.invoke("cancelCoreRunV1", arguments)
+        assert replayed.value.error == errors[0]
+
+    assert [invocation[0] for invocation in run_control.invocations] == ["cancelCoreRunV1"]
+
+
+def test_concurrent_run_mutation_same_key_with_different_payload_conflicts(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "concurrent-conflict-key",
+    }
+    conflicting_arguments = {**arguments, "request": {"reason": "superseded"}}
+    run_control = _BlockingSuccessfulRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with TestClient(app), ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        assert run_control.entered.wait(timeout=5)
+        with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+            provider.invoke("cancelCoreRunV1", conflicting_arguments)
+        assert raised.value.status_code == 409
+        assert raised.value.error.code == "idempotency_key_reused"
+        run_control.release.set()
+        assert first.result(timeout=10) == "owner-retried"
+
+    assert [invocation[0] for invocation in run_control.invocations] == ["cancelCoreRunV1"]
+
+
+def test_run_mutation_success_replay_is_bounded_and_lru_evicted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_RUN_MUTATION_SINGLEFLIGHT_CAPACITY", 2)
+    run_control = _SuccessfulMutationRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    def arguments(key: str) -> dict[str, object]:
+        return {
+            "run_id": f"run-{key}",
+            "if_match": '"' + "a" * 64 + '"',
+            "idempotency_key": key,
+        }
+
+    with TestClient(app):
+        assert provider.invoke("deleteCoreRunV1", arguments("a")) == "owner-retried"
+        assert provider.invoke("deleteCoreRunV1", arguments("b")) == "owner-retried"
+        assert provider.invoke("deleteCoreRunV1", arguments("a")) == "owner-retried"
+        assert provider.invoke("deleteCoreRunV1", arguments("c")) == "owner-retried"
+        assert provider.invoke("deleteCoreRunV1", arguments("a")) == "owner-retried"
+        assert provider.invoke("deleteCoreRunV1", arguments("b")) == "owner-retried"
+
+    assert [invocation[1]["run_id"] for invocation in run_control.invocations] == [
+        "run-a",
+        "run-b",
+        "run-c",
+        "run-b",
+    ]
+
+
+def test_run_mutation_singleflight_capacity_fails_closed_when_all_entries_are_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_RUN_MUTATION_SINGLEFLIGHT_CAPACITY", 1)
+    run_control = _BlockingSuccessfulRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+    first_arguments = {
+        "run_id": "run-1",
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "capacity-a",
+    }
+    second_arguments = {
+        "run_id": "run-2",
+        "if_match": '"' + "b" * 64 + '"',
+        "idempotency_key": "capacity-b",
+    }
+
+    with TestClient(app), ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(provider.invoke, "deleteCoreRunV1", first_arguments)
+        assert run_control.entered.wait(timeout=5)
+        with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+            provider.invoke("deleteCoreRunV1", second_arguments)
+        assert raised.value.status_code == 503
+        assert raised.value.error.code == "run_mutation_capacity_exhausted"
+        assert raised.value.error.retryable is True
+        run_control.release.set()
+        assert first.result(timeout=10) == "owner-retried"
+
+
+def test_run_mutation_singleflight_shutdown_does_not_deadlock_waiters(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "run_id": "run-1",
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "shutdown-key",
+    }
+    run_control = _CloseReleasesRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        first = executor.submit(provider.invoke, "deleteCoreRunV1", arguments)
+        assert run_control.entered.wait(timeout=5)
+        second = executor.submit(provider.invoke, "deleteCoreRunV1", arguments)
+        time.sleep(0.05)
+        closed = executor.submit(provider.close)
+        closed.result(timeout=10)
+        assert first.result(timeout=10) == "owner-retried"
+        assert second.result(timeout=10) == "owner-retried"
+
+    assert run_control.close_calls == 1
+    assert [invocation[0] for invocation in run_control.invocations] == ["deleteCoreRunV1"]
 
 
 def test_legacy_retryable_cleanup_does_not_delete_concurrent_non_retryable_replacement(

@@ -383,14 +383,31 @@ An anti-drift test derives every `/v1/runs*` operation ID from the frozen route
 table and requires exact equality with `RUN_OPERATION_IDS`; the run artifact
 route is therefore owned as `listCoreRunArtifactsV1`, its canonical operation
 ID. A retryable `CoreRunControlError` remains a transient observation and is not
-written to the provider failed-idempotency table. Repeating create, cancel,
-retry, or delete with the same request and idempotency key calls the owner again.
-For state upgraded from an older provider, replay validates a retained run error
-inside an immediate transaction and conditionally deletes the exact row when it
-is retryable before invoking the owner. A failed cleanup transaction or unknown
-post-commit lifecycle verification never invokes the owner; a committed cleanup
-allows the next retry to proceed. Non-retryable run errors retain exact
-deterministic replay, and non-run failed-idempotency behavior is unchanged.
+written to the provider failed-idempotency table. For state upgraded from an
+older provider, replay compares a retained run error's request digest in
+constant time before parsing or cleanup. A conflicting request therefore
+returns `idempotency_key_reused` without deleting the original row. An exact
+replay validates the retained error inside an immediate transaction and
+conditionally deletes the exact row when it is retryable before invoking the
+owner. A failed cleanup transaction or unknown post-commit lifecycle
+verification never invokes the owner; a committed cleanup allows the next
+retry to proceed.
+
+The provider applies a thread-safe, 256-entry single-flight table only to keyed
+create, cancel, retry, and delete run mutations. Concurrent requests with the
+same operation, scope, key, and digest share one owner call and receive the same
+success or error payload. A concurrent request that reuses the identity with a
+different digest conflicts before owner invocation. Successful results remain
+in a bounded process-local LRU replay cache; completed errors leave the table
+after their current waiters are released. Retryable owner errors can therefore
+be retried immediately, while non-retryable errors continue to replay from
+durable provider storage. Eviction, process crash, and restart fall back to the
+run owner's durable idempotency authority. When all entries are active, a new
+identity fails with a typed retryable capacity error. Shutdown stops admission
+to the table before closing the run owner, then waits for active mutation
+leaders before closing the store. It does not hold the single-flight lock while
+waiting for leaders or the bounded provider executor. Non-run operations and run
+reads are unchanged.
 
 The run owner's science execution projection preserves the exact project
 `capture_mode` in both experiment agent settings and the evolution execution

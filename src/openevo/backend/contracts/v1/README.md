@@ -54,9 +54,14 @@ frozen `/v1/runs*` routes, including `listCoreRunArtifactsV1`. Retryable errors
 from that owner are not persisted as failed idempotency results, so an exact
 same-key mutation retry calls the owner again; non-retryable failures retain the
 existing replay policy. A retry of a retryable run error persisted by an older
-Core version transactionally removes that exact failed row before calling the
-owner. The cleanup does not apply to non-run operations, and a post-commit
-verification failure stops before owner invocation so a later retry can recover.
+Core version first compares the request digest in constant time, then
+transactionally removes that exact failed row before calling the owner. The
+provider coalesces concurrent exact keyed run mutations through a bounded
+process-local table, retains only successful bounded replay entries, and relies
+on owner durability after eviction or restart. Conflicting concurrent payloads
+fail before owner invocation. The cleanup and coalescing do not apply to non-run
+operations or run reads, and a post-commit verification failure stops before
+owner invocation so a later retry can recover.
 
 `SseFrameV1` freezes matching wire `id`, `event`, and typed `data`; every
 non-heartbeat envelope binds its change resource identity, ETag or digest, and
