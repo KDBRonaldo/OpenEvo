@@ -12,13 +12,13 @@ from openevo import experiments
 from openevo.backend import launcher
 from openevo.backend.runtime_identity import CoreReleaseIdentity
 from openevo.experiments.models import ExperimentConfig
-from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 
 
 _MANAGED_SCIENCE_RUNTIME = {
     "kind": "docker",
     "profile": "managed_science",
-    "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+    "image": MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
     "container_user": "host",
 }
 
@@ -77,7 +77,10 @@ def test_backend_launcher_builds_transcript_profile_for_science_execution_modes(
     if auth == "subscription":
         assert config.runtime.kind == "docker"
         assert config.runtime.profile == "managed_science"
-        assert config.runtime.image == MANAGED_RUNTIME_IMAGES["managed_science"]
+        assert (
+            config.runtime.image
+            == MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference
+        )
         assert config.runtime.container_user == "host"
 
 
