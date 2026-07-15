@@ -240,8 +240,52 @@ jobs:
 
           This candidate is unsigned and not notarized. macOS users must manually
           allow OpenEvo Desktop in Privacy & Security after the first launch.
-          Only the architecture above was built and validated by this run.
-          This draft is not a published release and PyPI is not used.
+
+          ## Supported Workflows
+
+          Codex subscription transcript mode: runs subscription-authenticated Codex
+          on the remote server with transcript capture and non-parametric evolution.
+          Self-Deployed Reference mode: runs the reference remote model-serving path
+          with the same non-parametric evolution targets.
+          Both modes use the remote OpenEvo Core Backend; Desktop does not call a
+          model API directly.
+
+          ## Known Limitations
+
+          Parameter evolution is not included in this candidate.
+          PyPI is not used for this release.
+          Only the declared architecture was built.
+          This packaging-only draft does not satisfy the science E2E, benchmark,
+          secret-canary/privacy, signing, notarization, or final-publication gates.
+
+          ## Validation Results
+
+          Benchmark gates completed by this packaging candidate: 0 of 3.
+          Textual-memory pass@1 rescue count: pending.
+          Trajectory-to-skill pass@1 rescue count: pending.
+          Agent-system pass@1 rescue count: pending.
+          No benchmark performance claim is made by this draft.
+          The exact Core wheel, app bundle, copied DMG app, dependency evidence, and
+          downloaded draft assets are validated by this workflow.
+
+          ## Security And Privacy
+
+          No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.
+          Release assets contain no credentials.
+          Diagnostics sharing is explicit. Science data can be sent to the remote
+          server and harness or model provider selected by the user. The full
+          secret-canary/privacy release gate remains pending.
+
+          ## Install, Upgrade, And Uninstall
+
+          Install: open the DMG, copy OpenEvo Desktop to Applications, and manually
+          allow the unsigned app in Privacy & Security on first launch.
+          Upgrade: this draft has no automatic updater; quit the app and replace it
+          with a newer reviewed DMG. Remote Core upgrade compatibility is not proven
+          by this packaging-only candidate.
+          Uninstall: quit OpenEvo Desktop and remove it from Applications. Removing
+          the app does not automatically delete remote Core state, task data, model
+          downloads, or runtime caches.
           EOF
           uv run python scripts/ci/openevo_release_candidate.py create \
             candidate-artifacts \

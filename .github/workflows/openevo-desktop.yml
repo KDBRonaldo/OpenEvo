@@ -155,7 +155,7 @@ jobs:
             tests/openevo/remote/test_ssh_transport.py \
             -q
 
-      - name: Exercise macOS Core release ACL and cleanup policy
+      - name: Exercise macOS Core release publication contract
         run: |
           uv run python -m pytest \
             tests/ci/test_build_sidecar.py \

@@ -1218,6 +1218,25 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "actions/download-artifact@v4",
         "retention-days: 14",
         "unsigned and not notarized",
+        "## Supported Workflows",
+        "Codex subscription transcript mode",
+        "Self-Deployed Reference mode",
+        "## Known Limitations",
+        "Parameter evolution is not included in this candidate.",
+        "PyPI is not used for this release.",
+        "Only the declared architecture was built.",
+        "## Validation Results",
+        "Benchmark gates completed by this packaging candidate: 0 of 3.",
+        "Textual-memory pass@1 rescue count: pending.",
+        "Trajectory-to-skill pass@1 rescue count: pending.",
+        "Agent-system pass@1 rescue count: pending.",
+        "## Security And Privacy",
+        "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
+        "Release assets contain no credentials.",
+        "## Install, Upgrade, And Uninstall",
+        "Install:",
+        "Upgrade:",
+        "Uninstall:",
         "permissions:\n      contents: write",
         "gh release create",
         "--draft",
@@ -1257,6 +1276,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
 
     desktop_checks = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     assert '".github/workflows/openevo-desktop-candidate.yml"' in desktop_checks
+    assert "Exercise macOS Core release publication contract" in desktop_checks
+    assert "Core release ACL and cleanup policy" not in desktop_checks
 
 
 def test_python_runtime_dependencies_pin_security_fixed_minimums() -> None:

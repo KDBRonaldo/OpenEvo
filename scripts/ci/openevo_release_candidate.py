@@ -45,6 +45,29 @@ FINAL_ROLES = tuple(role for role, _name in REQUIRED_INPUT_ROLES) + (
     "core_descriptor",
     "checksums",
 )
+RELEASE_NOTES_REQUIRED_LINES = (
+    "## Supported Workflows",
+    "## Known Limitations",
+    "Parameter evolution is not included in this candidate.",
+    "PyPI is not used for this release.",
+    "Only the declared architecture was built.",
+    "## Validation Results",
+    "Benchmark gates completed by this packaging candidate: 0 of 3.",
+    "Textual-memory pass@1 rescue count: pending.",
+    "Trajectory-to-skill pass@1 rescue count: pending.",
+    "Agent-system pass@1 rescue count: pending.",
+    "## Security And Privacy",
+    "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
+    "Release assets contain no credentials.",
+    "## Install, Upgrade, And Uninstall",
+)
+RELEASE_NOTES_REQUIRED_PREFIXES = (
+    "Codex subscription transcript mode:",
+    "Self-Deployed Reference mode:",
+    "Install:",
+    "Upgrade:",
+    "Uninstall:",
+)
 
 
 class CandidateError(RuntimeError):
@@ -343,9 +366,22 @@ def _validate_release_notes(
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise CandidateError("Release notes are unreadable") from exc
-    required = (source_commit, version, architecture, "unsigned", "not notarized")
-    if any(value.lower() not in text.lower() for value in required):
+    required_identity = (source_commit, version, architecture, "unsigned", "not notarized")
+    lowered = text.lower()
+    if any(value.lower() not in lowered for value in required_identity):
         raise CandidateError("Release notes do not bind commit, version, architecture, and signing status")
+    lines = tuple(line.strip().casefold() for line in text.splitlines() if line.strip())
+    missing_lines = [
+        value for value in RELEASE_NOTES_REQUIRED_LINES if value.casefold() not in lines
+    ]
+    missing_prefixes = [
+        value
+        for value in RELEASE_NOTES_REQUIRED_PREFIXES
+        if not any(line.startswith(value.casefold()) for line in lines)
+    ]
+    if missing_lines or missing_prefixes:
+        missing = ", ".join((*missing_lines, *missing_prefixes))
+        raise CandidateError(f"Release notes are missing required release content: {missing}")
 
 
 def _file_entry(role: str, path: Path) -> dict[str, object]:

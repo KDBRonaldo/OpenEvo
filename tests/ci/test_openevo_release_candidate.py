@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from zipfile import ZipFile
 
+import pytest
+
 
 def _load_module():
     path = Path(__file__).resolve().parents[2] / "scripts/ci/openevo_release_candidate.py"
@@ -15,6 +17,34 @@ def _load_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _release_notes_text() -> str:
+    return (
+        "# OpenEvo 0.1.0 unsigned candidate\n\n"
+        "Source commit: 8e45af371eef49a86530a849041f7dcf047620ec\n"
+        "Architecture: aarch64\n\n"
+        "UNSIGNED AND NOT NOTARIZED.\n\n"
+        "## Supported Workflows\n\n"
+        "Codex subscription transcript mode: remote subscription harness.\n"
+        "Self-Deployed Reference mode: remote reference model serving.\n\n"
+        "## Known Limitations\n\n"
+        "Parameter evolution is not included in this candidate.\n"
+        "PyPI is not used for this release.\n"
+        "Only the declared architecture was built.\n\n"
+        "## Validation Results\n\n"
+        "Benchmark gates completed by this packaging candidate: 0 of 3.\n"
+        "Textual-memory pass@1 rescue count: pending.\n"
+        "Trajectory-to-skill pass@1 rescue count: pending.\n"
+        "Agent-system pass@1 rescue count: pending.\n\n"
+        "## Security And Privacy\n\n"
+        "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.\n"
+        "Release assets contain no credentials.\n\n"
+        "## Install, Upgrade, And Uninstall\n\n"
+        "Install: open the DMG and copy OpenEvo Desktop to Applications.\n"
+        "Upgrade: quit the app and replace it with a newer reviewed DMG.\n"
+        "Uninstall: quit the app and remove it from Applications.\n"
+    )
 
 
 def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> None:
@@ -72,6 +102,53 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         "python_requires": ">=3.11",
         "supported_platforms": ["linux-x86_64"],
     }
+
+
+@pytest.mark.parametrize(
+    "required_marker",
+    [
+        "## Supported Workflows",
+        "Codex subscription transcript mode",
+        "Self-Deployed Reference mode",
+        "## Known Limitations",
+        "Parameter evolution is not included in this candidate.",
+        "PyPI is not used for this release.",
+        "Only the declared architecture was built.",
+        "## Validation Results",
+        "Benchmark gates completed by this packaging candidate: 0 of 3.",
+        "Textual-memory pass@1 rescue count: pending.",
+        "Trajectory-to-skill pass@1 rescue count: pending.",
+        "Agent-system pass@1 rescue count: pending.",
+        "## Security And Privacy",
+        "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
+        "Release assets contain no credentials.",
+        "## Install, Upgrade, And Uninstall",
+        "Install:",
+        "Upgrade:",
+        "Uninstall:",
+    ],
+)
+def test_candidate_manifest_rejects_incomplete_release_notes(
+    tmp_path: Path,
+    required_marker: str,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    notes = tmp_path / "release-notes.md"
+    notes.write_text(
+        notes.read_text(encoding="utf-8").replace(required_marker, "omitted", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(candidate.CandidateError, match="Release notes"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="a" * 64,
+        )
 
 
 def test_candidate_manifest_rejects_post_manifest_asset_mutation(tmp_path: Path) -> None:
@@ -280,12 +357,7 @@ def _write_candidate_inputs(
     )
     dmg = root / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
     dmg.write_bytes(b"dmg")
-    (root / "release-notes.md").write_text(
-        "# OpenEvo 0.1.0 unsigned candidate\n\n"
-        "Source commit: 8e45af371eef49a86530a849041f7dcf047620ec\n"
-        "Architecture: aarch64\n\nUNSIGNED AND NOT NOTARIZED.\n",
-        encoding="utf-8",
-    )
+    (root / "release-notes.md").write_text(_release_notes_text(), encoding="utf-8")
     requirements = root / "python-requirements.txt"
     requirements.write_text("fastapi==1.0\n", encoding="utf-8")
     _write_json(

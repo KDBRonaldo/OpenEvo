@@ -136,6 +136,13 @@ redownloaded draft run the same validator before using any Core bytes. A valid
 packaging manifest is not evidence for the still-separate science, benchmark,
 privacy, signing, or notarization gates.
 
+Release-note validation requires closed sections for supported workflows, known
+limitations, validation results, security/privacy, and
+install/upgrade/uninstall. The packaging-only draft must explicitly report zero
+of three benchmark gates complete and all textual-memory,
+trajectory-to-skill, and agent-system rescue counts as pending; it cannot imply
+that packaging smoke is algorithm-performance evidence.
+
 Remote capability discovery has an additional artifact-level gate. In a clean
 environment containing the exact Core wheel, run
 `scripts/ci/smoke_openevo_remote_capabilities.py --wheel <exact-core-wheel>

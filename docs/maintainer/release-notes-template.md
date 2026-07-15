@@ -3,6 +3,10 @@
 Replace every placeholder and remove sections that do not apply before
 publishing a GitHub Release.
 
+An automated packaging-only draft keeps every section and reports unrun
+benchmark gates as `0 of 3` with each rescue count `pending`. Those placeholders
+must be replaced by validated results before final publication.
+
 ## Release
 
 - Version:

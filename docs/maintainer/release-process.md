@@ -132,8 +132,10 @@ downloads every asset into a clean directory, and verifies:
 - the Core descriptor references the uploaded Core artifact;
 - the DMG version and bundled/fetched descriptor match the candidate commit;
 - release notes state unsigned/not-notarized status, supported modes, known
-  limitations, benchmark counts, privacy/security behavior, and
-  install/upgrade/uninstall steps;
+  limitations, benchmark gate status and rescue counts, privacy/security
+  behavior, and install/upgrade/uninstall steps. A packaging-only draft must
+  state `0 of 3` completed benchmark gates and mark all three rescue counts
+  `pending`; final publication must replace those values with validated results;
 - no unclassified development, secret, benchmark-private, or source-checkout
   files are present.
 
