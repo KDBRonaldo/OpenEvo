@@ -5456,6 +5456,222 @@ def test_artifact_content_uses_declared_503_when_authority_is_unavailable(
     assert response.json()["code"] == "artifact_authority_invalid"
 
 
+@pytest.mark.parametrize("suffix", ["", "/content", "/diff"])
+def test_artifact_routes_translate_missing_authoritative_run_to_retryable_503(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    artifact_id = "missing-authoritative-run"
+    record, digest, byte_size, _primary = _artifact_payload(
+        artifact_root,
+        artifact_id=artifact_id,
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="durably reachable\n",
+    )
+    run_control = _ArtifactRunControl()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader={artifact_id: record}.__getitem__,
+    )
+    project = _ready_provider_project(app, registry)
+    _project, summary = _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id="run-missing-authority",
+        record=record,
+        content_sha256=digest,
+        byte_size=byte_size,
+    )
+    run_control.artifacts.clear()
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/v1/projects/{project.id}/artifacts/{summary.id}{suffix}", headers=AUTH
+        )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "artifact_authority_invalid"
+    assert response.json()["retryable"] is True
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["wrong_response_type", "empty", "duplicate", "identity_mismatch", "run_corruption"],
+)
+def test_artifact_lookup_translates_invalid_run_authority_to_retryable_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    artifact_id = f"invalid-run-authority-{failure}"
+    record, digest, byte_size, _primary = _artifact_payload(
+        artifact_root,
+        artifact_id=artifact_id,
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="durably reachable\n",
+    )
+    run_control = _ArtifactRunControl()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader={artifact_id: record}.__getitem__,
+    )
+    project = _ready_provider_project(app, registry)
+    _project, summary = _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id=f"run-invalid-authority-{failure}",
+        record=record,
+        content_sha256=digest,
+        byte_size=byte_size,
+    )
+    assert summary.run_id is not None
+
+    if failure == "wrong_response_type":
+        monkeypatch.setattr(
+            run_control,
+            "invoke",
+            lambda _operation_id, _arguments: m.RunPageV1(
+                items=[], next_cursor=None, has_more=False
+            ),
+        )
+    elif failure == "empty":
+        run_control.artifacts[summary.run_id] = []
+    elif failure == "duplicate":
+        run_control.artifacts[summary.run_id] = [summary, summary]
+    elif failure == "identity_mismatch":
+        run_control.artifacts[summary.run_id] = [
+            summary.model_copy(update={"run_id": "run-authority-mismatch"})
+        ]
+    else:
+
+        def fail_with_run_corruption(
+            _operation_id: str, _arguments: Mapping[str, object]
+        ) -> object:
+            raise CoreRunControlError(
+                "run_store_corrupt",
+                "The run authority store is corrupt.",
+                http_status=500,
+                retryable=False,
+            )
+
+        monkeypatch.setattr(run_control, "invoke", fail_with_run_corruption)
+
+    with TestClient(app) as client:
+        response = client.get(f"/v1/projects/{project.id}/artifacts/{summary.id}", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "artifact_authority_invalid"
+    assert response.json()["retryable"] is True
+
+
+def test_artifact_lookup_translates_durable_authority_store_corruption_to_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    artifact_id = "corrupt-durable-artifact-authority"
+    record, digest, byte_size, _primary = _artifact_payload(
+        artifact_root,
+        artifact_id=artifact_id,
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="durably reachable\n",
+    )
+    run_control = _ArtifactRunControl()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader={artifact_id: record}.__getitem__,
+    )
+    project = _ready_provider_project(app, registry)
+    _project, summary = _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id="run-corrupt-durable-authority",
+        record=record,
+        content_sha256=digest,
+        byte_size=byte_size,
+    )
+
+    def fail_reachability(*_args: object, **_kwargs: object) -> object:
+        raise StoreCorruptionError("durable artifact authority is corrupt")
+
+    monkeypatch.setattr(
+        app.state.core_control_provider.store,
+        "artifact_reachability",
+        fail_reachability,
+    )
+
+    with TestClient(app) as client:
+        response = client.get(f"/v1/projects/{project.id}/artifacts/{summary.id}", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "artifact_authority_invalid"
+    assert response.json()["retryable"] is True
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+def test_artifact_lookup_does_not_translate_unrelated_run_owner_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    artifact_id = f"internal-failure-{failure_type.__name__.lower()}"
+    record, digest, byte_size, _primary = _artifact_payload(
+        artifact_root,
+        artifact_id=artifact_id,
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="durably reachable\n",
+    )
+    run_control = _ArtifactRunControl()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader={artifact_id: record}.__getitem__,
+    )
+    project = _ready_provider_project(app, registry)
+    _project, summary = _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id=f"run-internal-failure-{failure_type.__name__.lower()}",
+        record=record,
+        content_sha256=digest,
+        byte_size=byte_size,
+    )
+    failure = failure_type("not an authority-domain error")
+
+    def fail_internally(_operation_id: str, _arguments: Mapping[str, object]) -> object:
+        raise failure
+
+    monkeypatch.setattr(run_control, "invoke", fail_internally)
+
+    with pytest.raises(failure_type, match="not an authority-domain error"):
+        app.state.core_control_provider.invoke(
+            "getCoreArtifactV1",
+            {"project_id": project.id, "artifact_id": summary.id},
+        )
+
+
 def test_artifact_lookup_is_scoped_to_the_requested_active_project(tmp_path: Path) -> None:
     registry = verified_builtin_registry(tmp_path / "registry")
     artifact_root = tmp_path / "managed-artifacts"
@@ -5499,6 +5715,7 @@ def test_artifact_lookup_is_scoped_to_the_requested_active_project(tmp_path: Pat
 
     assert response.status_code == 404
     assert response.json()["code"] == "artifact_not_found"
+    assert response.json()["retryable"] is False
     assert loader_calls == []
 
 

@@ -150,8 +150,14 @@ reads; rejected data is never decoded into Python first.
 Content inspection uses a separate small no-follow scanner budget before
 hashing, verifies digest, size, complete inventory, and UTF-8 for every returned
 document, and never returns artifact URI, scanner handle, or host path. Diff
-applies line and comparison budgets before its bounded matcher. Unavailable
-managed authority uses the declared retryable HTTP 503 error contract. The
+applies line and comparison budgets before its bounded matcher. Once durable
+revision reachability exists, a missing run, unavailable run owner, store or
+run-authority corruption, malformed page, empty result, duplicate result, or
+summary identity mismatch all use the same retryable
+`503 artifact_authority_invalid` contract. An artifact absent from the durable
+revision authority remains a non-retryable `404 artifact_not_found`; unrelated
+provider exceptions and process cancellation are not translated as authority
+failures. The
 2 MiB returned UTF-8 budget can expand sixfold under legal JSON control-character
 escaping, so Desktop reserves a separate 32 MiB artifact-response envelope for
 content and diff rather than applying its ordinary 4 MiB JSON response limit.

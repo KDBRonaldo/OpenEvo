@@ -792,11 +792,14 @@ class CoreControlProviderV1:
         *,
         require_current: bool,
     ) -> m.ArtifactSummaryV1:
-        reachability = self.store.artifact_reachability(
-            project_id,
-            artifact_id,
-            require_current=require_current,
-        )
+        try:
+            reachability = self.store.artifact_reachability(
+                project_id,
+                artifact_id,
+                require_current=require_current,
+            )
+        except StoreCorruptionError as exc:
+            raise _artifact_authority_error() from exc
         if not reachability:
             raise ResourceNotFoundError("artifact", artifact_id)
         if self._run_control is None:
@@ -807,41 +810,47 @@ class CoreControlProviderV1:
             after: str | None = None
             seen_cursors: set[str] = set()
             for _page_number in range(_MAX_ARTIFACT_PAGES_PER_RUN):
-                page = self._run_control.invoke(
-                    "listCoreRunArtifactsV1",
-                    {
-                        "run_id": reachable.run_id,
-                        "limit": _ARTIFACT_PAGE_LIMIT,
-                        "after": after,
-                        "sort": "created_at",
-                        "direction": "asc",
-                        "artifact_type": reachable.artifact_type,
-                    },
-                )
+                try:
+                    page = self._run_control.invoke(
+                        "listCoreRunArtifactsV1",
+                        {
+                            "run_id": reachable.run_id,
+                            "limit": _ARTIFACT_PAGE_LIMIT,
+                            "after": after,
+                            "sort": "created_at",
+                            "direction": "asc",
+                            "artifact_type": reachable.artifact_type,
+                        },
+                    )
+                except CoreRunControlError as exc:
+                    raise _artifact_authority_error() from exc
                 if not isinstance(page, m.ArtifactPageV1):
-                    raise StoreCorruptionError("run artifact authority returned the wrong type")
+                    _raise_artifact_authority_error(
+                        "run artifact authority returned the wrong type"
+                    )
                 for item in page.items:
                     if item.id != artifact_id:
                         continue
                     if not _summary_matches_reachability(item, reachable):
-                        raise StoreCorruptionError(
+                        _raise_artifact_authority_error(
                             "run artifact summary does not match revision reachability"
                         )
                     matches.append(item)
                 if not page.has_more:
                     break
                 if page.next_cursor is None or page.next_cursor in seen_cursors:
-                    raise StoreCorruptionError("run artifact pagination did not advance")
+                    _raise_artifact_authority_error("run artifact pagination did not advance")
                 seen_cursors.add(page.next_cursor)
                 after = page.next_cursor
             else:
-                raise StoreCorruptionError("run artifact pagination exceeded its closed bound")
-        unique = {item.model_dump_json(): item for item in matches}
-        if len(unique) != 1:
-            raise StoreCorruptionError(
+                _raise_artifact_authority_error(
+                    "run artifact pagination exceeded its closed bound"
+                )
+        if len(matches) != 1:
+            _raise_artifact_authority_error(
                 "artifact does not have exactly one authoritative run output"
             )
-        return cast(m.ArtifactSummaryV1, next(iter(unique.values())))
+        return cast(m.ArtifactSummaryV1, matches[0])
 
     def _previous_artifact_summary(
         self,
@@ -1331,6 +1340,10 @@ def _artifact_authority_error() -> CoreControlHTTPError:
         repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
         next_action="Retry after the managed evolution service is healthy.",
     )
+
+
+def _raise_artifact_authority_error(message: str) -> NoReturn:
+    raise _artifact_authority_error() from StoreCorruptionError(message)
 
 
 def _diff_document_identity(
