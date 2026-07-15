@@ -53,7 +53,10 @@ When a `CoreRunControl` is injected, its operation-ID set must exactly equal all
 frozen `/v1/runs*` routes, including `listCoreRunArtifactsV1`. Retryable errors
 from that owner are not persisted as failed idempotency results, so an exact
 same-key mutation retry calls the owner again; non-retryable failures retain the
-existing replay policy.
+existing replay policy. A retry of a retryable run error persisted by an older
+Core version transactionally removes that exact failed row before calling the
+owner. The cleanup does not apply to non-run operations, and a post-commit
+verification failure stops before owner invocation so a later retry can recover.
 
 `SseFrameV1` freezes matching wire `id`, `event`, and typed `data`; every
 non-heartbeat envelope binds its change resource identity, ETag or digest, and

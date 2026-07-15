@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import asyncio
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -4708,6 +4709,62 @@ class _MutationFailingRunControl(_RecordingRunControl):
         )
 
 
+class _SuccessfulMutationRunControl(_RecordingRunControl):
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self.invocations.append((operation_id, arguments))
+        return "owner-retried"
+
+
+class _ConcurrentSuccessfulRunControl(_RecordingRunControl):
+    def __init__(self) -> None:
+        super().__init__()
+        self._barrier = threading.Barrier(2)
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self.invocations.append((operation_id, arguments))
+        self._barrier.wait(timeout=5)
+        return "owner-retried"
+
+
+class _BlockingSuccessfulRunControl(_RecordingRunControl):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self.invocations.append((operation_id, arguments))
+        self.entered.set()
+        assert self.release.wait(timeout=5)
+        return "owner-retried"
+
+
+def _run_failure_error(*, retryable: bool) -> ApiErrorV1:
+    error = CoreRunControlError(
+        "run_owner_temporarily_unavailable" if retryable else "run_request_rejected",
+        "The managed run owner rejected the operation.",
+        http_status=503 if retryable else 409,
+        retryable=retryable,
+    )
+    return provider_module._run_control_http_error(error).error
+
+
+def _persist_legacy_failure(
+    state_root: Path,
+    operation_id: str,
+    arguments: Mapping[str, object],
+    *,
+    retryable: bool,
+) -> ApiErrorV1:
+    error = _run_failure_error(retryable=retryable)
+    store = CoreControlStoreV1(state_root)
+    try:
+        store.record_failed_idempotency(operation_id, arguments, error)
+    finally:
+        store.close()
+    return error
+
+
 def test_injected_service_supervisor_is_projected_and_closed(tmp_path: Path) -> None:
     supervisor = _RecordingServiceSupervisor()
     app = _app(tmp_path, service_supervisor=supervisor)
@@ -4847,6 +4904,270 @@ def test_non_retryable_run_mutation_failure_keeps_failure_idempotency_replay(
             assert raised.value.error.retryable is False
 
     assert [invocation[0] for invocation in run_control.invocations] == ["cancelCoreRunV1"]
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "arguments"),
+    [
+        (
+            "createCoreRunV1",
+            {
+                "request": {"project_id": "project-1"},
+                "idempotency_key": "legacy-retryable-create-key",
+            },
+        ),
+        (
+            "cancelCoreRunV1",
+            {
+                "run_id": "run-1",
+                "request": {"reason": "user_requested"},
+                "if_match": '"' + "a" * 64 + '"',
+                "idempotency_key": "legacy-retryable-cancel-key",
+            },
+        ),
+        (
+            "retryCoreRunV1",
+            {
+                "run_id": "run-1",
+                "request": {"terminal_attempt_id": "attempt-1"},
+                "if_match": '"' + "a" * 64 + '"',
+                "idempotency_key": "legacy-retryable-retry-key",
+            },
+        ),
+        (
+            "deleteCoreRunV1",
+            {
+                "run_id": "run-1",
+                "if_match": '"' + "a" * 64 + '"',
+                "idempotency_key": "legacy-retryable-delete-key",
+            },
+        ),
+    ],
+)
+def test_legacy_retryable_run_failure_is_cleared_before_owner_retry(
+    tmp_path: Path,
+    operation_id: str,
+    arguments: Mapping[str, object],
+) -> None:
+    _persist_legacy_failure(
+        tmp_path,
+        operation_id,
+        arguments,
+        retryable=True,
+    )
+    run_control = _SuccessfulMutationRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with TestClient(app):
+        assert provider.invoke(operation_id, arguments) == "owner-retried"
+        assert provider.store.replay_failed_idempotency(operation_id, arguments) is None
+
+    assert [invocation[0] for invocation in run_control.invocations] == [operation_id]
+
+
+def test_legacy_non_retryable_run_failure_keeps_exact_replay_after_restart(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "legacy-non-retryable-run-key",
+    }
+    persisted = _persist_legacy_failure(
+        tmp_path,
+        "cancelCoreRunV1",
+        arguments,
+        retryable=False,
+    )
+    run_control = _SuccessfulMutationRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with TestClient(app):
+        for _ in range(2):
+            with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+                provider.invoke("cancelCoreRunV1", arguments)
+            assert raised.value.error == persisted
+
+    assert run_control.invocations == []
+
+
+def test_legacy_retryable_non_run_failure_keeps_existing_replay_policy(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "project_id": "project-1",
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "legacy-retryable-project-key",
+    }
+    persisted = _persist_legacy_failure(
+        tmp_path,
+        "deleteCoreProjectV1",
+        arguments,
+        retryable=True,
+    )
+    app = _app(tmp_path)
+    provider = app.state.core_control_provider
+
+    with TestClient(app):
+        with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+            provider.invoke("deleteCoreProjectV1", arguments)
+        assert raised.value.error == persisted
+        assert (
+            provider.store.replay_failed_idempotency("deleteCoreProjectV1", arguments)
+            == persisted
+        )
+
+
+def test_legacy_retryable_run_cleanup_survives_post_commit_failure_without_cross_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_control = _SuccessfulMutationRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+    retryable_arguments = {
+        "run_id": "run-retryable",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "legacy-retryable-crash-key",
+    }
+    non_retryable_arguments = {
+        "run_id": "run-non-retryable",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "b" * 64 + '"',
+        "idempotency_key": "legacy-non-retryable-peer-key",
+    }
+
+    with TestClient(app) as client:
+        project_payload = _project_create()
+        project, _ = _create_project(
+            client,
+            project_payload,
+            idempotency_key="successful-project-peer-key",
+        )
+        provider.store.record_failed_idempotency(
+            "cancelCoreRunV1",
+            retryable_arguments,
+            _run_failure_error(retryable=True),
+        )
+        non_retryable_error = _run_failure_error(retryable=False)
+        provider.store.record_failed_idempotency(
+            "cancelCoreRunV1",
+            non_retryable_arguments,
+            non_retryable_error,
+        )
+
+        original_post_commit_verify = store_module._Transaction._verify_after_commit
+        fail_once = True
+
+        def fail_after_cleanup_commit(transaction) -> None:
+            nonlocal fail_once
+            original_post_commit_verify(transaction)
+            if fail_once:
+                fail_once = False
+                raise OSError("injected failure after legacy retryable cleanup commit")
+
+        monkeypatch.setattr(
+            store_module._Transaction,
+            "_verify_after_commit",
+            fail_after_cleanup_commit,
+        )
+        with pytest.raises(store_module.PostCommitStoreError):
+            provider.invoke("cancelCoreRunV1", retryable_arguments)
+        monkeypatch.setattr(
+            store_module._Transaction,
+            "_verify_after_commit",
+            original_post_commit_verify,
+        )
+
+        replayed_project, _ = _create_project(
+            client,
+            project_payload,
+            idempotency_key="successful-project-peer-key",
+        )
+        assert replayed_project == project
+        with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+            provider.invoke("cancelCoreRunV1", non_retryable_arguments)
+        assert raised.value.error == non_retryable_error
+        assert provider.invoke("cancelCoreRunV1", retryable_arguments) == "owner-retried"
+
+    assert [invocation[0] for invocation in run_control.invocations] == ["cancelCoreRunV1"]
+
+
+def test_concurrent_retries_both_reach_owner_after_legacy_retryable_cleanup(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "legacy-retryable-concurrent-key",
+    }
+    _persist_legacy_failure(
+        tmp_path,
+        "cancelCoreRunV1",
+        arguments,
+        retryable=True,
+    )
+    run_control = _ConcurrentSuccessfulRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with TestClient(app), ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+            for _ in range(2)
+        ]
+        assert [future.result(timeout=10) for future in futures] == [
+            "owner-retried",
+            "owner-retried",
+        ]
+
+    assert [invocation[0] for invocation in run_control.invocations] == [
+        "cancelCoreRunV1",
+        "cancelCoreRunV1",
+    ]
+
+
+def test_legacy_retryable_cleanup_does_not_delete_concurrent_non_retryable_replacement(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "legacy-retryable-replacement-key",
+    }
+    _persist_legacy_failure(
+        tmp_path,
+        "cancelCoreRunV1",
+        arguments,
+        retryable=True,
+    )
+    run_control = _BlockingSuccessfulRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with TestClient(app), ThreadPoolExecutor(max_workers=1) as executor:
+        retried = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        assert run_control.entered.wait(timeout=5)
+        replacement = _run_failure_error(retryable=False)
+        try:
+            provider.store.record_failed_idempotency(
+                "cancelCoreRunV1",
+                arguments,
+                replacement,
+            )
+        finally:
+            run_control.release.set()
+        assert retried.result(timeout=10) == "owner-retried"
+        assert (
+            provider.store.replay_failed_idempotency("cancelCoreRunV1", arguments)
+            == replacement
+        )
 
 
 def test_run_control_failures_use_the_frozen_typed_error_contract(tmp_path: Path) -> None:

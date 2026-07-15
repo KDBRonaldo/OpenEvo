@@ -1649,7 +1649,11 @@ class CoreControlStoreV1:
             return result
 
     def replay_failed_idempotency(
-        self, operation_id: str, arguments: Mapping[str, object]
+        self,
+        operation_id: str,
+        arguments: Mapping[str, object],
+        *,
+        clear_retryable: bool = False,
     ) -> m.ApiErrorV1 | None:
         identity = _failed_idempotency_identity(operation_id, arguments)
         if identity is None:
@@ -1664,8 +1668,31 @@ class CoreControlStoreV1:
             ).fetchone()
             if row is None:
                 return None
+            if clear_retryable:
+                error = _validate_bytes(m.ApiErrorV1, row["error_json"])
+                if error.retryable:
+                    with self._transaction():
+                        deleted = self._connection.execute(
+                            "DELETE FROM failed_idempotency_records WHERE operation_id = ? "
+                            "AND resource_scope = ? AND idempotency_key = ? "
+                            "AND request_digest = ? AND error_json = ?",
+                            (
+                                operation_id,
+                                scope,
+                                key,
+                                row["request_digest"],
+                                row["error_json"],
+                            ),
+                        )
+                        if deleted.rowcount != 1:
+                            raise StoreCorruptionError(
+                                "failed idempotency cleanup lost its authority"
+                            )
+                    return None
             if not hmac.compare_digest(row["request_digest"], digest):
                 raise IdempotencyConflictError("idempotency key was reused")
+            if clear_retryable:
+                return error
             return _validate_bytes(m.ApiErrorV1, row["error_json"])
 
     def record_failed_idempotency(

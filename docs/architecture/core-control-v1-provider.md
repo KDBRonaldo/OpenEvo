@@ -378,7 +378,12 @@ route is therefore owned as `listCoreRunArtifactsV1`, its canonical operation
 ID. A retryable `CoreRunControlError` remains a transient observation and is not
 written to the provider failed-idempotency table. Repeating create, cancel,
 retry, or delete with the same request and idempotency key calls the owner again.
-Non-retryable owner errors retain the existing deterministic failure replay.
+For state upgraded from an older provider, replay validates a retained run error
+inside an immediate transaction and conditionally deletes the exact row when it
+is retryable before invoking the owner. A failed cleanup transaction or unknown
+post-commit lifecycle verification never invokes the owner; a committed cleanup
+allows the next retry to proceed. Non-retryable run errors retain exact
+deterministic replay, and non-run failed-idempotency behavior is unchanged.
 
 The run owner's science execution projection preserves the exact project
 `capture_mode` in both experiment agent settings and the evolution execution

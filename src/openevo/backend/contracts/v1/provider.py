@@ -226,7 +226,11 @@ class CoreControlProviderV1:
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         try:
-            previous_error = self.store.replay_failed_idempotency(operation_id, arguments)
+            previous_error = self.store.replay_failed_idempotency(
+                operation_id,
+                arguments,
+                clear_retryable=operation_id in RUN_OPERATION_IDS,
+            )
         except IdempotencyConflictError as exc:
             raise _idempotency_conflict_error() from exc
         if previous_error is not None:
