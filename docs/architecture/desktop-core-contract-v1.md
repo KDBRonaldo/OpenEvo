@@ -963,9 +963,13 @@ Retry creates a new attempt; it never rewrites a terminal attempt.
 Before transport, the release provider persists a bounded recovery record with
 the complete original `RunV1`, Core project ID, idempotency key, observed stream
 epoch, and ETag. The record is non-secret, limited to 1 MiB of UTF-8 JSON, and
-stored under one versioned Desktop WebView key. Schema-invalid, oversized, or
-identity-inconsistent persisted data is deleted and fails that startup attempt;
-the user can then retry startup from a clean provider. This persistence lets a
+stored as one versioned file under the native Tauri application-data directory.
+The native host serializes access, uses a private owner-verified directory,
+atomically renames a mode-0600 temporary file, fsyncs the file and directory, and
+no-follow rereads the published bytes before acknowledging the write.
+Schema-invalid, oversized, identity-inconsistent, unreadable, or unsafe persisted
+data remains in place and fails startup closed; it is never silently treated as
+an absent retry. This persistence lets a
 renderer remount or application restart recover the exact intent instead of
 minting another retry action.
 
@@ -974,15 +978,22 @@ complete mutation intent. ETag or status
 churn without advancement cannot replace that intent; an explicit retry replays
 it exactly, even if later refreshes have advanced the renderer epoch. This is a
 single-run exact-replay exception in the release provider; a new intent or an
-intent for another run must satisfy the current snapshot preconditions. Bounded
+intent for another run is rejected while any unresolved retry journal exists and
+cannot overwrite that authority. Bounded
 authoritative polling starts only after the mutation has become ambiguous. A
+snapshot received while the exact retry transport is still in flight cannot
+reconcile or clear the journal; transport settlement is an explicit prerequisite.
 typed API rejection is deterministic: the provider clears recovery before the
 renderer performs any conflict refresh, so a concurrent append cannot turn that
 request into success or erase its error.
 
 The release provider validates every 2xx retry response before returning it. The
 same run and project must preserve the canonical complete original attempt prefix
-and contain exactly one appended current attempt. A missing run, a rewritten
+and contain exactly one appended current attempt. The direct response must be the
+Core retry admission reset: queued with `admission_pending`, null pin/admission/
+start/finish timestamps, and no current or attempt error. Once that response is
+persisted, an exact replay must return the same accepted object and appended
+attempt identity. A missing run, a rewritten
 terminal attempt, another project, a different appended attempt after response
 acceptance, multiple appended attempts, or ETag/status churn without that one
 append is not success and cannot clear recovery. A validated response is written

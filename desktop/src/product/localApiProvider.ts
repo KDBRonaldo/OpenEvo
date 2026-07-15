@@ -39,7 +39,6 @@ import {
   type ReleaseDesktopProductProvider,
 } from "./provider";
 import {
-  browserRunRetryRecoveryStore,
   createRunRetryRecovery,
   overlayAcceptedRetryRun,
   parseRunRetryRecovery,
@@ -113,16 +112,15 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
   private waitingForRefresh = false;
   private readonly retryRecoveryStore: ProductRunRetryRecoveryStore | null;
   private retryReplay: ProductRunRetryRecovery | null;
+  private retryRequestInFlight: ProductRunRetryRecovery | null = null;
 
   constructor(options: LocalApiDesktopProductProviderOptions) {
     this.client = options.client;
     this.native = options.native;
     this.fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.reconnectDelaysMs = options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS;
-    const retryRecoveryStore = options.retryRecoveryStore === undefined
-      ? browserRunRetryRecoveryStore()
-      : options.retryRecoveryStore;
-    if (options.retryRecoveryStore === undefined && retryRecoveryStore === null) {
+    const retryRecoveryStore = options.retryRecoveryStore;
+    if (!retryRecoveryStore) {
       throw new DesktopContractError("Persistent Desktop run retry recovery is unavailable");
     }
     this.retryRecoveryStore = retryRecoveryStore;
@@ -140,8 +138,10 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
       const recovery = this.retryReplay;
       if (recovery) {
         const run = snapshot.runs.find((item) => item.id === recovery.runId);
-        if (run && retryRunProvesSingleAppend(run, recovery)) {
-          this.setRunRetryRecovery(null);
+        if (this.retryRequestInFlight !== recovery
+          && run
+          && retryRunProvesSingleAppend(run, recovery)) {
+          await this.setRunRetryRecovery(null);
         } else if (recovery.acceptedRun && snapshot.projects.some(
           (project) => project.remote?.core_project_id === recovery.projectId,
         )) {
@@ -339,14 +339,27 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
   async retryRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1> {
     const exactReplay = this.retryReplay?.runId === runId
       && sameRunRetryIntent(this.retryReplay.intent, intent);
+    if (this.retryReplay && !exactReplay) {
+      throw new DesktopProductUserError(
+        "OpenEvo is still reconciling an earlier session retry. Wait for it to finish before retrying another session.",
+      );
+    }
+    if (this.retryRequestInFlight) {
+      throw new DesktopProductUserError("OpenEvo is already sending this session retry.");
+    }
     if (!exactReplay) {
       this.assertIntent(intent);
       const original = this.snapshot?.runs.find((run) => run.id === runId);
       if (!original || original.etag !== intent.etag) {
         throw new DesktopProductUserError("This session changed remotely. Refresh before retrying it.");
       }
-      this.setRunRetryRecovery(createRunRetryRecovery(original, intent));
+      await this.setRunRetryRecovery(createRunRetryRecovery(original, intent));
     }
+    const requestAuthority = this.retryReplay;
+    if (!requestAuthority) {
+      throw new DesktopContractError("Run retry request has no durable recovery authority");
+    }
+    this.retryRequestInFlight = requestAuthority;
     try {
       const run = await this.client.retryRun(runId, actionOptions(intent));
       this.assertKnownRunResponse(run, runId, "Run retry returned the wrong run");
@@ -355,7 +368,7 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
         throw new DesktopContractError("Run retry response lost its exact recovery authority");
       }
       const accepted = withAcceptedRetryRun(recovery, run);
-      this.setRunRetryRecovery(accepted);
+      await this.setRunRetryRecovery(accepted);
       if (this.snapshot) {
         this.snapshot = { ...this.snapshot, runs: overlayAcceptedRetryRun(this.snapshot.runs, accepted) };
       }
@@ -364,13 +377,15 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
     } catch (error) {
       if (error instanceof DesktopApiError) {
         if (this.retryReplay?.runId === runId && sameRunRetryIntent(this.retryReplay.intent, intent)) {
-          this.setRunRetryRecovery(null);
+          await this.setRunRetryRecovery(null);
         }
         throw error;
       }
       throw error instanceof DesktopProductAmbiguousMutationError
         ? error
         : new DesktopProductAmbiguousMutationError(undefined, error);
+    } finally {
+      if (this.retryRequestInFlight === requestAuthority) this.retryRequestInFlight = null;
     }
   }
 
@@ -655,18 +670,13 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
     try {
       return parseRunRetryRecovery(value);
     } catch (error) {
-      try {
-        this.retryRecoveryStore?.write(null);
-      } catch {
-        // The original contract error remains the useful startup failure.
-      }
-      throw new DesktopContractError("Saved run retry recovery state is invalid and was discarded", { cause: error });
+      throw new DesktopContractError("Saved run retry recovery state is invalid", { cause: error });
     }
   }
 
-  private setRunRetryRecovery(recovery: ProductRunRetryRecovery | null): void {
+  private async setRunRetryRecovery(recovery: ProductRunRetryRecovery | null): Promise<void> {
     try {
-      this.retryRecoveryStore?.write(recovery === null ? null : serializeRunRetryRecovery(recovery));
+      await this.retryRecoveryStore?.write(recovery === null ? null : serializeRunRetryRecovery(recovery));
     } catch {
       throw new DesktopProductUserError("OpenEvo could not save local retry recovery state. Restart Desktop and try again.");
     }

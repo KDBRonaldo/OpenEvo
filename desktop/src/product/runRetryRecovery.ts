@@ -2,12 +2,11 @@ import { runV1Schema, type RunV1 } from "../api/v1/schemas";
 import { DesktopContractError } from "../api/v1/client";
 import type { ProductResourceMutationIntent, ProductRunRetryRecovery } from "./provider";
 
-export const RUN_RETRY_RECOVERY_STORAGE_KEY = "openevo.desktop.run-retry-recovery.v1";
 export const MAX_RUN_RETRY_RECOVERY_BYTES = 1_048_576;
 
 export interface ProductRunRetryRecoveryStore {
   read(): string | null;
-  write(value: string | null): void;
+  write(value: string | null): void | Promise<void>;
 }
 
 export function createRunRetryRecovery(
@@ -28,7 +27,10 @@ export function withAcceptedRetryRun(
   recovery: ProductRunRetryRecovery,
   run: RunV1,
 ): ProductRunRetryRecovery {
-  if (!retryRunProvesSingleAppend(run, recovery, false)) {
+  if (!retryRunProvesSingleAppend(run, recovery)
+    || !retryResponseProvesAdmissionReset(run, recovery.originalRun)
+    || (recovery.acceptedRun !== null
+      && canonicalJsonSnapshot(run) !== canonicalJsonSnapshot(recovery.acceptedRun))) {
     throw new DesktopContractError("Run retry response does not prove one canonical appended attempt");
   }
   return { ...recovery, acceptedRun: runV1Schema.parse(run) };
@@ -103,14 +105,14 @@ export function serializeRunRetryRecovery(recovery: ProductRunRetryRecovery): st
     accepted_run: recovery.acceptedRun,
   });
   if (new TextEncoder().encode(value).byteLength > MAX_RUN_RETRY_RECOVERY_BYTES) {
-    throw new DesktopContractError("Run retry recovery state exceeds its local storage budget");
+    throw new DesktopContractError("Run retry recovery state exceeds its native journal budget");
   }
   return value;
 }
 
 export function parseRunRetryRecovery(value: string): ProductRunRetryRecovery {
   if (new TextEncoder().encode(value).byteLength > MAX_RUN_RETRY_RECOVERY_BYTES) {
-    throw new DesktopContractError("Run retry recovery state exceeds its local storage budget");
+    throw new DesktopContractError("Run retry recovery state exceeds its native journal budget");
   }
   let parsed: unknown;
   try {
@@ -136,7 +138,7 @@ export function parseRunRetryRecovery(value: string): ProductRunRetryRecovery {
   }
   const originalRun = runV1Schema.parse(parsed.original_run);
   const acceptedRun = parsed.accepted_run === null ? null : runV1Schema.parse(parsed.accepted_run);
-  const recovery: ProductRunRetryRecovery = {
+  const recoveryWithoutAccepted: ProductRunRetryRecovery = {
     schemaVersion: 1,
     runId: parsed.run_id,
     projectId: parsed.project_id,
@@ -146,31 +148,17 @@ export function parseRunRetryRecovery(value: string): ProductRunRetryRecovery {
       etag: parsed.intent.etag,
     },
     originalRun,
-    acceptedRun,
+    acceptedRun: null,
   };
-  if (originalRun.id !== recovery.runId
-    || originalRun.project_id !== recovery.projectId
-    || originalRun.etag !== recovery.intent.etag
-    || (acceptedRun !== null && !retryRunProvesSingleAppend(acceptedRun, recovery, false))) {
+  if (originalRun.id !== recoveryWithoutAccepted.runId
+    || originalRun.project_id !== recoveryWithoutAccepted.projectId
+    || originalRun.etag !== recoveryWithoutAccepted.intent.etag
+    || (acceptedRun !== null
+      && (!retryRunProvesSingleAppend(acceptedRun, recoveryWithoutAccepted)
+        || !retryResponseProvesAdmissionReset(acceptedRun, originalRun)))) {
     throw new DesktopContractError("Run retry recovery state does not match its run authority");
   }
-  return recovery;
-}
-
-export function browserRunRetryRecoveryStore(): ProductRunRetryRecoveryStore | null {
-  try {
-    const storage = globalThis.localStorage;
-    if (!storage) return null;
-    return {
-      read: () => storage.getItem(RUN_RETRY_RECOVERY_STORAGE_KEY),
-      write: (value) => {
-        if (value === null) storage.removeItem(RUN_RETRY_RECOVERY_STORAGE_KEY);
-        else storage.setItem(RUN_RETRY_RECOVERY_STORAGE_KEY, value);
-      },
-    };
-  } catch {
-    return null;
-  }
+  return { ...recoveryWithoutAccepted, acceptedRun };
 }
 
 export function sameRunRetryIntent(
@@ -204,6 +192,26 @@ function immutableRunIdentity(run: RunV1): unknown {
     ...identity
   } = run;
   return identity;
+}
+
+function retryResponseProvesAdmissionReset(run: RunV1, original: RunV1): boolean {
+  const appended = run.attempts[original.attempt_count];
+  return appended !== undefined
+    && run.status === "queued"
+    && run.queued_reason?.code === "admission_pending"
+    && run.current_error === null
+    && run.pinned_revision === null
+    && run.admitted_at === null
+    && run.started_at === null
+    && run.finished_at === null
+    && appended.run_id === run.id
+    && appended.number === original.attempt_count + 1
+    && appended.status === "queued"
+    && appended.queued_reason?.code === "admission_pending"
+    && appended.error === null
+    && appended.started_at === null
+    && appended.finished_at === null
+    && canonicalJsonSnapshot(run.queued_reason) === canonicalJsonSnapshot(appended.queued_reason);
 }
 
 function sortCanonicalJsonValue(value: unknown): unknown {

@@ -1460,6 +1460,50 @@ describe("DesktopProductApp", () => {
     expect(screenText()).not.toContain("The retry was admitted on the same session.");
   });
 
+  it("retains a deterministic retry rejection after an earlier refresh reconciles the pending view", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    root = await renderProduct(provider);
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const retryRequest = deferred<RunV1>();
+    Object.assign(provider, { retryRun: vi.fn(() => retryRequest.promise) });
+    vi.spyOn(provider, "refresh").mockResolvedValue({
+      status: "fresh",
+      snapshot: withAdvancedRetry(failed.snapshot),
+    });
+
+    await act(async () => {
+      button("Retry session").click();
+      await Promise.resolve();
+      provider?.emitAuthoritativeRefresh();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await flush();
+    await act(async () => {
+      retryRequest.reject(new DesktopApiError(apiErrorV1Schema.parse({
+        schema_version: "1",
+        request_id: "request-retry-after-refresh-1",
+        http_status: 409,
+        code: "run_retry_rejected_after_refresh",
+        message: "The exact retry was rejected after reconciliation started.",
+        severity: "warning",
+        category: "run",
+        retryable: false,
+        repair_action: "user_action_required",
+        next_action: "Review the remote session before retrying.",
+        details: {},
+      })));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await flush();
+
+    expect(screenText()).toContain("The exact retry was rejected after reconciliation started.");
+  });
+
   it("restores an exact ambiguous retry after the product renderer remounts", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();

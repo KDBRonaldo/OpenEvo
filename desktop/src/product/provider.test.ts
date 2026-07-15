@@ -113,6 +113,52 @@ describe("Desktop product provider boundary", () => {
     expect(provider.providerKind).toBe("desktop_sidecar");
   });
 
+  it("requires and restores the native retry journal for the release provider", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
+    const native = {
+      bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+      stop: vi.fn().mockResolvedValue(undefined),
+      readRunRetryRecovery: vi.fn().mockResolvedValue(null),
+      writeRunRetryRecovery: vi.fn().mockResolvedValue(undefined),
+      selectProjectSource: vi.fn(),
+      cancelProjectSource: vi.fn(),
+      settleProjectSource: vi.fn(),
+    };
+
+    const provider = await createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native,
+    });
+
+    expect(provider.providerKind).toBe("desktop_sidecar");
+    expect(native.readRunRetryRecovery).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails release startup when the native retry journal is unavailable or malformed", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
+    const baseNative = {
+      bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+      stop: vi.fn().mockResolvedValue(undefined),
+      selectProjectSource: vi.fn(),
+      cancelProjectSource: vi.fn(),
+      settleProjectSource: vi.fn(),
+    };
+    const fetch = () => vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags)));
+
+    await expect(createReleaseDesktopProductProvider({ fetch: fetch(), native: baseNative }))
+      .rejects.toThrow(/native.*retry recovery.*unavailable/i);
+    await expect(createReleaseDesktopProductProvider({
+      fetch: fetch(),
+      native: {
+        ...baseNative,
+        readRunRetryRecovery: vi.fn().mockResolvedValue({ corrupted: true }),
+        writeRunRetryRecovery: vi.fn(),
+      },
+    })).rejects.toThrow(/invalid record/i);
+  });
+
   it("passes an existing project ID to the Tauri picker and omits it for a new project", async () => {
     const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
     const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];

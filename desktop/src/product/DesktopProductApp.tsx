@@ -101,6 +101,7 @@ type PendingRunRetry = {
   readonly errorOwner: number;
   readonly originalRun: RunV1;
   acceptedRun: RunV1 | null;
+  transportSettled: boolean;
   reconciled: boolean;
 };
 type SaveAttemptResult = {
@@ -241,7 +242,7 @@ export function DesktopProductApp({
         setPendingRetryPoll(pendingRetry);
       }
     }
-    if (pendingRetry && retryAdvancedInSnapshot(next, pendingRetry)) {
+    if (pendingRetry?.transportSettled && retryAdvancedInSnapshot(next, pendingRetry)) {
       clearPendingRetry(pendingRetry);
     } else if (pendingRetry?.acceptedRun) {
       next = mergeAuthoritativeRetryRun(next, pendingRetry.acceptedRun, pendingRetry);
@@ -474,6 +475,7 @@ export function DesktopProductApp({
       errorOwner,
       originalRun: sameUnprovenRetry ? existing.originalRun : run,
       acceptedRun: null,
+      transportSettled: false,
       reconciled: false,
     };
     pendingRunRetry.current = pending;
@@ -483,8 +485,10 @@ export function DesktopProductApp({
       async () => {
         try {
           retryResponse = await retryRun.call(provider, run.id, pending.intent);
+          pending.transportSettled = true;
           return retryResponse;
         } catch (error) {
+          pending.transportSettled = true;
           if (!isAmbiguousRetryOutcome(error)) abandonPendingRetry(pending);
           throw error;
         }
@@ -494,7 +498,10 @@ export function DesktopProductApp({
       errorOwner,
     ).then((result) => {
       if (pendingRunRetry.current !== pending) {
-        if (pending.reconciled) clearActionError(errorOwner);
+        if (pending.reconciled
+          && (result.error === null || isAmbiguousRetryOutcome(result.error))) {
+          clearActionError(errorOwner);
+        }
         return;
       }
       const acceptedRetryResponse = retryResponse;
@@ -2660,6 +2667,7 @@ function pendingRetryFromRecovery(
     errorOwner,
     originalRun: recovery.originalRun,
     acceptedRun: recovery.acceptedRun,
+    transportSettled: true,
     reconciled: false,
   };
 }

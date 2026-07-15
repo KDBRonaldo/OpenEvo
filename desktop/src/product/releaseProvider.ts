@@ -18,6 +18,8 @@ import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 export interface ReleaseNativeBridge {
   bootstrap(): Promise<unknown>;
   stop(): Promise<unknown>;
+  readRunRetryRecovery?(): Promise<unknown>;
+  writeRunRetryRecovery?(value: string | null): Promise<unknown>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
   cancelProjectSource(actionId: string): Promise<unknown>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
@@ -42,6 +44,8 @@ export interface ReleaseProviderFactoryDependencies {
 const tauriNativeBridge: ReleaseNativeBridge = {
   bootstrap: () => invoke<DesktopBootstrapContextV1>("start_sidecar"),
   stop: () => invoke("stop_sidecar"),
+  readRunRetryRecovery: () => invoke("read_run_retry_recovery"),
+  writeRunRetryRecovery: (value) => invoke("write_run_retry_recovery", { value }),
   selectProjectSource: (intent) => invoke("select_project_source", {
     kind: intent.kind,
     actionId: intent.actionId,
@@ -107,10 +111,31 @@ export async function createReleaseDesktopProductProvider(
         client,
         native: context.native,
         fetch: dependencies.fetch,
-        retryRecoveryStore: dependencies.retryRecoveryStore,
+        retryRecoveryStore: dependencies.retryRecoveryStore
+          ?? await nativeRunRetryRecoveryStore(native),
       });
   assertReleaseProvider(provider);
   return provider;
+}
+
+async function nativeRunRetryRecoveryStore(
+  native: ReleaseNativeBridge,
+): Promise<ProductRunRetryRecoveryStore> {
+  if (!native.readRunRetryRecovery || !native.writeRunRetryRecovery) {
+    throw new DesktopContractError("Native Desktop run retry recovery is unavailable");
+  }
+  const saved = await native.readRunRetryRecovery();
+  if (saved !== null && typeof saved !== "string") {
+    throw new DesktopContractError("Native Desktop run retry recovery returned an invalid record");
+  }
+  let value = saved;
+  return {
+    read: () => value,
+    write: async (next) => {
+      await native.writeRunRetryRecovery!(next);
+      value = next;
+    },
+  };
 }
 
 function assertReleaseProvider(

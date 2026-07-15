@@ -288,6 +288,10 @@ function productionHarness(options: { readonly includeSecondProject?: boolean } 
     },
     fetch,
     reconnectDelaysMs: [],
+    retryRecoveryStore: {
+      read: () => null,
+      write: () => undefined,
+    },
   });
   const subscribe = vi.spyOn(provider, "subscribe");
   const originalRefresh = provider.refresh.bind(provider);

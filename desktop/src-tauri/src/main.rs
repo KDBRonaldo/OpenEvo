@@ -65,6 +65,9 @@ const NATIVE_WORKSPACE_CANCEL_GRACE: Duration = Duration::from_secs(3);
 const NATIVE_WORKSPACE_IO_POLL: Duration = Duration::from_millis(50);
 const MAX_PENDING_WORKSPACE_IMPORTS: usize = 64;
 const MAX_CANCELLED_PICKER_ACTIONS: usize = 64;
+const RUN_RETRY_RECOVERY_MAX_BYTES: usize = 1024 * 1024;
+const RUN_RETRY_RECOVERY_FILE_NAME: &str = ".7f3d8b24c1a94762";
+const RUN_RETRY_RECOVERY_TEMP_PREFIX: &str = ".7f3d8b24c1a94762.tmp.";
 const SIDECAR_TERM_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -838,6 +841,7 @@ impl ManagedSidecar {
 
 struct DesktopHostStateInner {
     sidecar: Mutex<Option<ManagedSidecar>>,
+    run_retry_recovery: Mutex<()>,
     spawn_handoff: Mutex<Option<Arc<SpawnHandoff>>>,
     parent_liveness: Mutex<Option<File>>,
     startup_in_progress: AtomicBool,
@@ -864,6 +868,7 @@ impl Default for DesktopHostState {
     fn default() -> Self {
         Self(Arc::new(DesktopHostStateInner {
             sidecar: Mutex::new(None),
+            run_retry_recovery: Mutex::new(()),
             spawn_handoff: Mutex::new(None),
             parent_liveness: Mutex::new(None),
             startup_in_progress: AtomicBool::new(false),
@@ -4638,9 +4643,506 @@ fn stop_sidecar_inner_with<C: ProcessControl>(
     Ok(stopped_host_status())
 }
 
+struct RunRetryRecoveryRoot {
+    path: PathBuf,
+    directory: File,
+    device: u64,
+    inode: u64,
+}
+
+impl RunRetryRecoveryRoot {
+    fn validate(&self) -> HostResult<()> {
+        let reopened = open_run_retry_recovery_root(&self.path, false)?
+            .ok_or_else(run_retry_recovery_error)?;
+        let held = file_identity(&self.directory).map_err(|_| run_retry_recovery_error())?;
+        let current = file_identity(&reopened.directory).map_err(|_| run_retry_recovery_error())?;
+        if held.device != self.device
+            || held.inode != self.inode
+            || current.device != self.device
+            || current.inode != self.inode
+        {
+            return Err(run_retry_recovery_error());
+        }
+        validate_run_retry_recovery_root_identity(&held)
+    }
+}
+
+struct RunRetryRecoveryTemp<'a> {
+    directory: &'a File,
+    name: CString,
+    file: File,
+    published: bool,
+}
+
+impl Drop for RunRetryRecoveryTemp<'_> {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        let Ok(open_identity) = file_identity(&self.file) else {
+            return;
+        };
+        let Ok(Some(path_identity)) =
+            run_retry_recovery_identity_at_optional(self.directory, &self.name)
+        else {
+            return;
+        };
+        if open_identity == path_identity
+            && open_identity.mode & FILE_TYPE_MASK == REGULAR_FILE_TYPE
+            && open_identity.owner == unsafe { libc::geteuid() }
+            && open_identity.links == 1
+        {
+            let removed =
+                unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
+            if removed == 0 {
+                let _ = self.directory.sync_all();
+            }
+        }
+    }
+}
+
+fn run_retry_recovery_root_path(app: &tauri::AppHandle) -> HostResult<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .map_err(|_| run_retry_recovery_error())
+}
+
+fn with_run_retry_recovery_lock<T>(
+    state: &DesktopHostState,
+    operation: impl FnOnce() -> HostResult<T>,
+) -> HostResult<T> {
+    let _guard = state
+        .run_retry_recovery
+        .lock()
+        .map_err(|_| run_retry_recovery_error())?;
+    operation()
+}
+
+fn open_run_retry_recovery_root(
+    path: &Path,
+    create: bool,
+) -> HostResult<Option<RunRetryRecoveryRoot>> {
+    if !path.is_absolute() {
+        return Err(run_retry_recovery_error());
+    }
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => names.push(name),
+            _ => return Err(run_retry_recovery_error()),
+        }
+    }
+    if names.is_empty() {
+        return Err(run_retry_recovery_error());
+    }
+
+    let mut current = open_directory(Path::new("/")).map_err(|_| run_retry_recovery_error())?;
+    validate_run_retry_recovery_parent(&current)?;
+    for (index, name) in names.iter().enumerate() {
+        let name = CString::new(name.as_bytes()).map_err(|_| run_retry_recovery_error())?;
+        let is_root = index + 1 == names.len();
+        let next = match openat_file(
+            current.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => {
+                return Ok(None);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let created = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) };
+                if created == -1 {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(run_retry_recovery_error());
+                    }
+                } else {
+                    current.sync_all().map_err(|_| run_retry_recovery_error())?;
+                }
+                openat_file(
+                    current.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                )
+                .map_err(|_| run_retry_recovery_error())?
+            }
+            Err(_) => return Err(run_retry_recovery_error()),
+        };
+        if is_root {
+            validate_run_retry_recovery_root_identity(
+                &file_identity(&next).map_err(|_| run_retry_recovery_error())?,
+            )?;
+        } else {
+            validate_run_retry_recovery_parent(&next)?;
+        }
+        validate_anchored_extended_acl(&next).map_err(|_| run_retry_recovery_error())?;
+        current = next;
+    }
+    let identity = file_identity(&current).map_err(|_| run_retry_recovery_error())?;
+    Ok(Some(RunRetryRecoveryRoot {
+        path: path.to_path_buf(),
+        directory: current,
+        device: identity.device,
+        inode: identity.inode,
+    }))
+}
+
+fn validate_run_retry_recovery_parent(directory: &File) -> HostResult<()> {
+    let identity = file_identity(directory).map_err(|_| run_retry_recovery_error())?;
+    let effective_user = unsafe { libc::geteuid() };
+    let root_sticky_boundary = identity.owner == 0 && identity.mode & libc::S_ISVTX != 0;
+    if identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
+        || (identity.owner != 0 && identity.owner != effective_user)
+        || (identity.mode & 0o022 != 0 && !root_sticky_boundary)
+    {
+        return Err(run_retry_recovery_error());
+    }
+    validate_anchored_extended_acl(directory).map_err(|_| run_retry_recovery_error())
+}
+
+fn validate_run_retry_recovery_root_identity(identity: &FileIdentity) -> HostResult<()> {
+    if identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
+        || identity.owner != unsafe { libc::geteuid() }
+        || identity.mode & 0o777 != 0o700
+    {
+        return Err(run_retry_recovery_error());
+    }
+    Ok(())
+}
+
+fn run_retry_recovery_identity_at_optional(
+    directory: &File,
+    name: &CString,
+) -> HostResult<Option<FileIdentity>> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(Some(file_identity_from_stat(unsafe {
+            &stat.assume_init()
+        })));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(run_retry_recovery_error())
+    }
+}
+
+fn validate_run_retry_recovery_file_identity(identity: &FileIdentity) -> HostResult<()> {
+    if identity.mode & FILE_TYPE_MASK != REGULAR_FILE_TYPE
+        || identity.owner != unsafe { libc::geteuid() }
+        || identity.mode & 0o777 != 0o600
+        || identity.links != 1
+    {
+        return Err(run_retry_recovery_error());
+    }
+    Ok(())
+}
+
+fn validate_run_retry_recovery_read_identity(identity: &FileIdentity) -> HostResult<()> {
+    validate_run_retry_recovery_file_identity(identity)?;
+    if identity.size > RUN_RETRY_RECOVERY_MAX_BYTES as u64 {
+        return Err(run_retry_recovery_error());
+    }
+    Ok(())
+}
+
+fn run_retry_recovery_name() -> CString {
+    CString::new(RUN_RETRY_RECOVERY_FILE_NAME).expect("recovery file name has no NUL")
+}
+
+fn read_run_retry_recovery_from_root(
+    root: &RunRetryRecoveryRoot,
+    expected_identity: Option<&FileIdentity>,
+) -> HostResult<Option<String>> {
+    root.validate()?;
+    let name = run_retry_recovery_name();
+    let Some(path_identity) = run_retry_recovery_identity_at_optional(&root.directory, &name)?
+    else {
+        return if expected_identity.is_none() {
+            Ok(None)
+        } else {
+            Err(run_retry_recovery_error())
+        };
+    };
+    validate_run_retry_recovery_read_identity(&path_identity)?;
+    if expected_identity.is_some_and(|expected| expected != &path_identity) {
+        return Err(run_retry_recovery_error());
+    }
+    let mut file = openat_file(
+        root.directory.as_raw_fd(),
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|_| run_retry_recovery_error())?;
+    let opened_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
+    if opened_identity != path_identity {
+        return Err(run_retry_recovery_error());
+    }
+    validate_run_retry_recovery_read_identity(&opened_identity)?;
+    validate_anchored_extended_acl(&file).map_err(|_| run_retry_recovery_error())?;
+
+    let capacity = usize::try_from(opened_identity.size).map_err(|_| run_retry_recovery_error())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take((RUN_RETRY_RECOVERY_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| run_retry_recovery_error())?;
+    if bytes.len() != capacity || bytes.len() > RUN_RETRY_RECOVERY_MAX_BYTES {
+        return Err(run_retry_recovery_error());
+    }
+    let final_open_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
+    let final_path_identity = run_retry_recovery_identity_at_optional(&root.directory, &name)?
+        .ok_or_else(run_retry_recovery_error)?;
+    if final_open_identity != opened_identity || final_path_identity != opened_identity {
+        return Err(run_retry_recovery_error());
+    }
+    root.validate()?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| run_retry_recovery_error())
+}
+
+fn read_run_retry_recovery_at(path: &Path) -> HostResult<Option<String>> {
+    let Some(root) = open_run_retry_recovery_root(path, false)? else {
+        return Ok(None);
+    };
+    read_run_retry_recovery_from_root(&root, None)
+}
+
+fn create_run_retry_recovery_temp(
+    root: &RunRetryRecoveryRoot,
+) -> HostResult<RunRetryRecoveryTemp<'_>> {
+    for _ in 0..64 {
+        let mut random = [0_u8; 16];
+        OsRng
+            .try_fill_bytes(&mut random)
+            .map_err(|_| run_retry_recovery_error())?;
+        let name = CString::new(format!(
+            "{RUN_RETRY_RECOVERY_TEMP_PREFIX}{}",
+            encode_hex(&random)
+        ))
+        .expect("recovery temp name has no NUL");
+        let file = match openat_file(
+            root.directory.as_raw_fd(),
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(run_retry_recovery_error()),
+        };
+        let temp = RunRetryRecoveryTemp {
+            directory: &root.directory,
+            name,
+            file,
+            published: false,
+        };
+        temp.file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| run_retry_recovery_error())?;
+        let identity = file_identity(&temp.file).map_err(|_| run_retry_recovery_error())?;
+        validate_run_retry_recovery_file_identity(&identity)?;
+        if run_retry_recovery_identity_at_optional(&root.directory, &temp.name)?.as_ref()
+            != Some(&identity)
+        {
+            return Err(run_retry_recovery_error());
+        }
+        return Ok(temp);
+    }
+    Err(run_retry_recovery_error())
+}
+
+fn write_some_run_retry_recovery_at_with<F>(
+    path: &Path,
+    value: &str,
+    after_directory_sync: F,
+) -> HostResult<()>
+where
+    F: FnOnce(&mut File) -> HostResult<()>,
+{
+    if value.len() > RUN_RETRY_RECOVERY_MAX_BYTES {
+        return Err(run_retry_recovery_too_large_error());
+    }
+    let root = open_run_retry_recovery_root(path, true)?.ok_or_else(run_retry_recovery_error)?;
+    root.validate()?;
+    let target_name = run_retry_recovery_name();
+    let previous_identity = run_retry_recovery_identity_at_optional(&root.directory, &target_name)?;
+    if let Some(identity) = previous_identity.as_ref() {
+        validate_run_retry_recovery_file_identity(identity)?;
+        read_run_retry_recovery_from_root(&root, Some(identity))?;
+    }
+
+    let mut temp = create_run_retry_recovery_temp(&root)?;
+    temp.file
+        .write_all(value.as_bytes())
+        .map_err(|_| run_retry_recovery_error())?;
+    temp.file.flush().map_err(|_| run_retry_recovery_error())?;
+    temp.file
+        .sync_all()
+        .map_err(|_| run_retry_recovery_error())?;
+    let temp_identity = file_identity(&temp.file).map_err(|_| run_retry_recovery_error())?;
+    validate_run_retry_recovery_file_identity(&temp_identity)?;
+    if temp_identity.size != value.len() as u64
+        || run_retry_recovery_identity_at_optional(&root.directory, &temp.name)?.as_ref()
+            != Some(&temp_identity)
+        || run_retry_recovery_identity_at_optional(&root.directory, &target_name)?
+            != previous_identity
+    {
+        return Err(run_retry_recovery_error());
+    }
+    root.validate()?;
+    let renamed = unsafe {
+        libc::renameat(
+            root.directory.as_raw_fd(),
+            temp.name.as_ptr(),
+            root.directory.as_raw_fd(),
+            target_name.as_ptr(),
+        )
+    };
+    if renamed == -1 {
+        return Err(run_retry_recovery_error());
+    }
+    temp.published = true;
+    root.directory
+        .sync_all()
+        .map_err(|_| run_retry_recovery_error())?;
+    after_directory_sync(&mut temp.file)?;
+
+    let published_identity = file_identity(&temp.file).map_err(|_| run_retry_recovery_error())?;
+    validate_run_retry_recovery_file_identity(&published_identity)?;
+    if read_run_retry_recovery_from_root(&root, Some(&published_identity))?.as_deref()
+        != Some(value)
+    {
+        return Err(run_retry_recovery_error());
+    }
+    Ok(())
+}
+
+fn write_some_run_retry_recovery_at(path: &Path, value: &str) -> HostResult<()> {
+    write_some_run_retry_recovery_at_with(path, value, |_| Ok(()))
+}
+
+fn same_run_retry_recovery_identity_after_unlink(
+    actual: &FileIdentity,
+    expected: &FileIdentity,
+) -> bool {
+    if expected.links != 1 || actual.links != 0 {
+        return false;
+    }
+    let mut normalized = actual.clone();
+    normalized.links = expected.links;
+    normalized.changed_seconds = expected.changed_seconds;
+    normalized.changed_nanoseconds = expected.changed_nanoseconds;
+    &normalized == expected
+}
+
+fn clear_run_retry_recovery_at(path: &Path) -> HostResult<()> {
+    let Some(root) = open_run_retry_recovery_root(path, false)? else {
+        return Ok(());
+    };
+    root.validate()?;
+    let name = run_retry_recovery_name();
+    let Some(path_identity) = run_retry_recovery_identity_at_optional(&root.directory, &name)?
+    else {
+        return Ok(());
+    };
+    validate_run_retry_recovery_file_identity(&path_identity)?;
+    let file = openat_file(
+        root.directory.as_raw_fd(),
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|_| run_retry_recovery_error())?;
+    let opened_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
+    if opened_identity != path_identity {
+        return Err(run_retry_recovery_error());
+    }
+    validate_run_retry_recovery_file_identity(&opened_identity)?;
+    validate_anchored_extended_acl(&file).map_err(|_| run_retry_recovery_error())?;
+    root.validate()?;
+    if run_retry_recovery_identity_at_optional(&root.directory, &name)?.as_ref()
+        != Some(&opened_identity)
+    {
+        return Err(run_retry_recovery_error());
+    }
+    if unsafe { libc::unlinkat(root.directory.as_raw_fd(), name.as_ptr(), 0) } == -1 {
+        return Err(run_retry_recovery_error());
+    }
+    root.directory
+        .sync_all()
+        .map_err(|_| run_retry_recovery_error())?;
+    let unlinked_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
+    if !same_run_retry_recovery_identity_after_unlink(&unlinked_identity, &opened_identity)
+        || run_retry_recovery_identity_at_optional(&root.directory, &name)?.is_some()
+    {
+        return Err(run_retry_recovery_error());
+    }
+    root.validate()
+}
+
+fn write_run_retry_recovery_at(path: &Path, value: Option<&str>) -> HostResult<()> {
+    match value {
+        Some(value) => write_some_run_retry_recovery_at(path, value),
+        None => clear_run_retry_recovery_at(path),
+    }
+}
+
+fn run_retry_recovery_error() -> NativeHostError {
+    NativeHostError::new(
+        "run_retry_recovery_unavailable",
+        "OpenEvo Desktop could not securely access saved run retry recovery state.",
+    )
+}
+
+fn run_retry_recovery_too_large_error() -> NativeHostError {
+    NativeHostError::new(
+        "run_retry_recovery_too_large",
+        "OpenEvo Desktop could not save run retry recovery because it is too large.",
+    )
+}
+
 #[tauri::command]
 fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStatus> {
     host_status_inner(&state)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn read_run_retry_recovery(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopHostState>,
+) -> HostResult<Option<String>> {
+    with_run_retry_recovery_lock(&state, || {
+        let root = run_retry_recovery_root_path(&app)?;
+        read_run_retry_recovery_at(&root)
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn write_run_retry_recovery(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopHostState>,
+    value: Option<String>,
+) -> HostResult<()> {
+    with_run_retry_recovery_lock(&state, || {
+        let root = run_retry_recovery_root_path(&app)?;
+        write_run_retry_recovery_at(&root, value.as_deref())
+    })
 }
 
 #[tauri::command]
@@ -4846,6 +5348,8 @@ fn main() {
         .manage(DesktopHostState::default())
         .invoke_handler(tauri::generate_handler![
             host_status,
+            read_run_retry_recovery,
+            write_run_retry_recovery,
             start_sidecar,
             stop_sidecar,
             renderer_ready,
@@ -4899,6 +5403,179 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_run_retry_recovery_root(temp: &TempDir) -> PathBuf {
+        temp.path().join("app-data")
+    }
+
+    fn run_retry_recovery_target(root: &Path) -> PathBuf {
+        root.join(RUN_RETRY_RECOVERY_FILE_NAME)
+    }
+
+    #[test]
+    fn run_retry_recovery_roundtrips_and_clears_private_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let value = r#"{"schema_version":"1","run_id":"run-1"}"#;
+
+        assert_eq!(read_run_retry_recovery_at(&root).unwrap(), None);
+        write_run_retry_recovery_at(&root, Some(value)).unwrap();
+        assert_eq!(
+            read_run_retry_recovery_at(&root).unwrap().as_deref(),
+            Some(value)
+        );
+
+        let root_metadata = fs::symlink_metadata(&root).unwrap();
+        let target_metadata = fs::symlink_metadata(run_retry_recovery_target(&root)).unwrap();
+        assert_eq!(root_metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(root_metadata.uid(), unsafe { libc::geteuid() });
+        assert!(target_metadata.file_type().is_file());
+        assert_eq!(target_metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(target_metadata.nlink(), 1);
+        assert_eq!(target_metadata.uid(), unsafe { libc::geteuid() });
+
+        write_run_retry_recovery_at(&root, None).unwrap();
+        assert_eq!(read_run_retry_recovery_at(&root).unwrap(), None);
+        assert!(!run_retry_recovery_target(&root).exists());
+    }
+
+    #[test]
+    fn run_retry_recovery_fails_when_post_sync_verification_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+
+        let error = write_some_run_retry_recovery_at_with(&root, "durable", |file| {
+            file.set_len(0).map_err(|_| run_retry_recovery_error())?;
+            file.sync_all().map_err(|_| run_retry_recovery_error())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, "run_retry_recovery_unavailable");
+        assert_eq!(
+            read_run_retry_recovery_at(&root).unwrap().as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn run_retry_recovery_rejects_oversize_write_and_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let oversized = "x".repeat(RUN_RETRY_RECOVERY_MAX_BYTES + 1);
+
+        let error = write_run_retry_recovery_at(&root, Some(&oversized)).unwrap_err();
+        assert_eq!(error.code, "run_retry_recovery_too_large");
+
+        open_run_retry_recovery_root(&root, true).unwrap().unwrap();
+        let target = run_retry_recovery_target(&root);
+        fs::write(&target, oversized.as_bytes()).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_run_retry_recovery_at(&root).unwrap_err().code,
+            "run_retry_recovery_unavailable"
+        );
+        write_run_retry_recovery_at(&root, None).unwrap();
+        assert!(!target.exists());
+
+        fs::write(&target, [0xff]).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_run_retry_recovery_at(&root).unwrap_err().code,
+            "run_retry_recovery_unavailable"
+        );
+        write_run_retry_recovery_at(&root, None).unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn run_retry_recovery_rejects_symlink_and_hardlink_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        open_run_retry_recovery_root(&root, true).unwrap().unwrap();
+        let target = run_retry_recovery_target(&root);
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "outside").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+
+        symlink(&outside, &target).unwrap();
+        assert!(read_run_retry_recovery_at(&root).is_err());
+        assert!(write_run_retry_recovery_at(&root, None).is_err());
+        assert!(write_run_retry_recovery_at(&root, Some("replacement")).is_err());
+        fs::remove_file(&target).unwrap();
+
+        fs::write(&target, "linked").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = root.join("alias");
+        hard_link(&target, &alias).unwrap();
+        assert!(read_run_retry_recovery_at(&root).is_err());
+        assert!(write_run_retry_recovery_at(&root, None).is_err());
+        assert!(write_run_retry_recovery_at(&root, Some("replacement")).is_err());
+    }
+
+    #[test]
+    fn run_retry_recovery_rejects_symlinked_or_non_private_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let actual = temp.path().join("actual");
+        fs::create_dir(&actual).unwrap();
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).unwrap();
+        let linked = temp.path().join("linked");
+        symlink(&actual, &linked).unwrap();
+        assert!(read_run_retry_recovery_at(&linked).is_err());
+
+        let non_private = temp.path().join("non-private");
+        fs::create_dir(&non_private).unwrap();
+        fs::set_permissions(&non_private, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(read_run_retry_recovery_at(&non_private).is_err());
+        assert!(write_run_retry_recovery_at(&non_private, Some("value")).is_err());
+    }
+
+    #[test]
+    fn run_retry_recovery_lock_serializes_without_sidecar_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let state = DesktopHostState::default();
+
+        let sidecar_guard = state.sidecar.lock().unwrap();
+        let (sidecar_tx, sidecar_rx) = mpsc::channel();
+        let sidecar_state = state.clone();
+        let sidecar_root = root.clone();
+        let sidecar_writer = thread::spawn(move || {
+            let result = with_run_retry_recovery_lock(&sidecar_state, || {
+                write_run_retry_recovery_at(&sidecar_root, Some("first"))
+            });
+            sidecar_tx.send(result).unwrap();
+        });
+        sidecar_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recovery write waited for the sidecar lifecycle lock")
+            .unwrap();
+        drop(sidecar_guard);
+        sidecar_writer.join().unwrap();
+
+        let recovery_guard = state.run_retry_recovery.lock().unwrap();
+        let (recovery_tx, recovery_rx) = mpsc::channel();
+        let recovery_state = state.clone();
+        let recovery_root = root.clone();
+        let recovery_writer = thread::spawn(move || {
+            let result = with_run_retry_recovery_lock(&recovery_state, || {
+                write_run_retry_recovery_at(&recovery_root, Some("second"))
+            });
+            recovery_tx.send(result).unwrap();
+        });
+        assert!(recovery_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(recovery_guard);
+        recovery_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recovery write did not resume after its dedicated lock")
+            .unwrap();
+        recovery_writer.join().unwrap();
+        assert_eq!(
+            read_run_retry_recovery_at(&root).unwrap().as_deref(),
+            Some("second")
+        );
+    }
 
     #[test]
     fn allocated_listener_keeps_the_selected_port_reserved() {

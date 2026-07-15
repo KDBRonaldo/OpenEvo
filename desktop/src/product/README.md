@@ -95,11 +95,20 @@ immediately following aggregate snapshot omits or lags that run. A rejected or
 unknown request remains visibly failed, presents the typed error, and retains
 the complete original action ID, stream epoch, and ETag for exact replay while
 the same run has not proved advancement; ETag churn alone does not replace that
-intent. Bounded polling starts only after the request becomes ambiguous. A later
+intent. The release provider admits only one unresolved retry intent at a time;
+a retry for another run or with another action ID cannot overwrite it. Before
+transport, the intent is atomically written and fsynced by the Tauri native host,
+not WebView storage. Invalid or unreadable native journal state fails startup
+closed and remains available for diagnosis. Bounded polling starts only after
+the request becomes ambiguous. An aggregate that arrives while the retry
+transport is still in flight cannot reconcile or clear the journal. A later
 fresh snapshot reconciles the pending retry only when it preserves the canonical
 complete original attempt prefix and contains exactly one appended current
 attempt. That reconciliation clears only the error owned by the retry; errors
-from newer or concurrent actions remain owned by those actions.
+from newer or concurrent actions remain owned by those actions. A direct 2xx
+must also prove the exact Core retry admission reset: the new attempt is queued,
+the prior admission pin and timestamps are cleared, and no error remains. Once a
+2xx has been journaled, every exact replay is bound to that same appended attempt.
 The Research view renders at most the latest 200
 matching records and separates agent, evolution, and system streams; SSE
 snapshot epochs trigger an authoritative output refresh while a session runs.
