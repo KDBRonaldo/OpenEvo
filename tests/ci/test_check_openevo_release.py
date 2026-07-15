@@ -7,10 +7,20 @@ from io import BytesIO
 from pathlib import Path
 import plistlib
 import subprocess
+from types import SimpleNamespace
 import tomllib
 from zipfile import ZipFile
 
 import pytest
+
+
+RELEASE_CONTRACT = json.loads(
+    (Path(__file__).resolve().parents[2] / "desktop/release-contract.json").read_text(
+        encoding="utf-8"
+    )
+)
+RELEASE_OPENAPI_SHA256 = RELEASE_CONTRACT["accepted_openapi_digests"][0]
+RELEASE_FEATURE_FLAGS = RELEASE_CONTRACT["required_feature_flags"]
 
 
 GOOD_METADATA = "\n".join(
@@ -162,6 +172,31 @@ def test_sidecar_smoke_launches_process_and_checks_assets(tmp_path: Path) -> Non
     _write_fake_sidecar(sidecar)
 
     smoke.smoke_sidecar(sidecar, timeout_seconds=5)
+
+
+def test_sidecar_smoke_rejects_unreviewed_openapi_digest() -> None:
+    smoke = _load_sidecar_smoke_module()
+    payload = _release_version_payload()
+    payload["openapi_sha256"] = "b" * 64
+
+    with pytest.raises(smoke.SmokeFailure, match="unreviewed OpenAPI digest"):
+        smoke._assert_release_version(payload)
+
+
+def test_sidecar_smoke_rejects_missing_required_feature() -> None:
+    smoke = _load_sidecar_smoke_module()
+    payload = _release_version_payload()
+    payload["feature_flags"] = RELEASE_FEATURE_FLAGS[:-1]
+
+    with pytest.raises(smoke.SmokeFailure, match="omitted required release features"):
+        smoke._assert_release_version(payload)
+
+
+def test_sidecar_smoke_rejects_invalid_desktop_state() -> None:
+    smoke = _load_sidecar_smoke_module()
+
+    with pytest.raises(smoke.SmokeFailure, match="invalid Desktop state"):
+        smoke._assert_desktop_state({"schema_version": "1"})
 
 
 def test_bundle_smoke_launches_tauri_main_and_requires_native_evidence(tmp_path: Path) -> None:
@@ -772,7 +807,7 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "--core-wheel-output-dir .openevo-release-inputs" in macos_job
     assert "scripts/ci/smoke_openevo_desktop_sidecar.py" in macos_job
     assert text.count("desktop/packaging/build_sidecar.py") == 2
-    assert "desktop/packaging/build_sidecar.py" not in linux_job
+    assert "uv run python packaging/build_sidecar.py" in linux_job
 
     assert "name: Probe APFS held-FD to FSRef to FSUnlinkObject cleanup" in macos_job
     assert 'diskutil info "$RUNNER_TEMP"' in macos_job
@@ -820,18 +855,19 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
         "pip install .openevo-release-inputs/openevo-*.whl"
     )
 
-    assert "openevo-core-service ensure" in linux_job
-    assert "openevo-core-service consume-attachment" in linux_job
-    assert "openevo-core-service stop" in linux_job
-    assert '--framework-lock "$GITHUB_WORKSPACE/.openevo-release-inputs/framework-lock.json"' in (
-        linux_job
-    )
+    assert 'node-version: "22"' in linux_job
+    assert "dtolnay/rust-toolchain@stable" in linux_job
+    assert "npm ci" in linux_job
+    assert "openevo-core-service ensure" not in linux_job
+    assert "openevo-core-service consume-attachment" not in linux_job
+    assert "openevo-core-service stop" not in linux_job
     assert '--source-commit "$GITHUB_SHA"' in linux_job
     assert "scripts/ci/smoke_evolution_framework_wheel.py" in linux_job
+    assert "scripts/ci/smoke_openevo_remote_capabilities.py" in linux_job
     assert "--wheel .openevo-release-inputs/openevo-*.whl" in linux_job
     assert "--framework-lock .openevo-release-inputs/framework-lock.json" in linux_job
-    assert "codex_subscription_transcript" in linux_job
-    assert '"self-deployed"' in linux_job
+    assert '--sidecar "$OPENEVO_LINUX_PACKAGED_SIDECAR"' in linux_job
+    assert "openevo-remote-smoke-home" not in linux_job
 
     assert "name: Reverify final Core candidate bytes after service smoke" in linux_job
     assert "python -m build --wheel --outdir .openevo-release-inputs" not in text
@@ -839,7 +875,7 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "python -m build" not in linux_job
     assert "dist/*.whl" not in linux_job
     assert "ensure_core_service" in capability_smoke_text
-    assert "stop_core_service" in capability_smoke_text
+    assert "stop_core_service_if_generation" in capability_smoke_text
     assert 'parser.add_argument("--framework-lock"' in capability_smoke_text
     assert "load_framework_distribution_lock" in capability_smoke_text
     assert "TemporaryDirectory" not in capability_smoke_text
@@ -847,6 +883,8 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     smoke_body = capability_smoke_text.split("def smoke(", 1)[1].split("def main(", 1)[0]
     assert "attachment = ensure_core_service(" in smoke_body
     assert "if not attachment.attached:" in smoke_body
+    assert "expected_generation=attachment.generation" in smoke_body
+    assert "expected_release_identity=attachment.release_identity" in smoke_body
     assert "sidecar_smoke.smoke_sidecar" in capability_smoke_text
     assert "TestClient" not in capability_smoke_text
     assert "create_sidecar_app" not in capability_smoke_text
@@ -881,7 +919,9 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     )
     assert macos_job.index("npm test -- --run") < macos_job.index("npm run build:openevo")
     assert macos_job.index("npm run typecheck") < macos_job.index("npm run build:openevo")
-    assert linux_job.index("name: Smoke Linux Core service lifecycle") < linux_job.index(
+    assert linux_job.index(
+        "name: Smoke exact transferred Core release through Linux packaged sidecar gate"
+    ) < linux_job.index(
         "name: Reverify final Core candidate bytes after service smoke"
     )
 
@@ -918,7 +958,7 @@ def test_remote_capability_smoke_does_not_stop_without_attachment_authority(
     def ensure_core_service(**_kwargs):
         raise RuntimeError("injected ensure failure")
 
-    def stop_core_service(*, service_root, **_kwargs):
+    def stop_core_service_if_generation(*, service_root, **_kwargs):
         stop_calls.append(Path(service_root))
 
     monkeypatch.setattr(smoke.openevo, "__file__", str(imported))
@@ -932,7 +972,11 @@ def test_remote_capability_smoke_does_not_stop_without_attachment_authority(
     monkeypatch.setattr(smoke, "_load_sidecar_smoke", lambda: SidecarSmoke())
     monkeypatch.setattr(smoke, "default_core_service_root", lambda: tmp_path / "core")
     monkeypatch.setattr(smoke, "ensure_core_service", ensure_core_service)
-    monkeypatch.setattr(smoke, "stop_core_service", stop_core_service)
+    monkeypatch.setattr(
+        smoke,
+        "stop_core_service_if_generation",
+        stop_core_service_if_generation,
+    )
 
     with pytest.raises(RuntimeError, match="injected ensure failure"):
         smoke.smoke(
@@ -944,6 +988,160 @@ def test_remote_capability_smoke_does_not_stop_without_attachment_authority(
         )
 
     assert stop_calls == []
+
+
+def test_remote_capability_smoke_cleanup_is_bound_to_attachment_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_remote_capability_smoke_module()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    framework_lock = tmp_path / "framework-lock.json"
+    sidecar = tmp_path / "openevo-desktop-sidecar"
+    for path in (wheel, framework_lock, sidecar):
+        path.write_bytes(path.name.encode("ascii"))
+    imported = tmp_path / "installed/openevo/__init__.py"
+    imported.parent.mkdir(parents=True)
+    imported.write_text("", encoding="utf-8")
+    digest = "a" * 64
+    attachment = SimpleNamespace(
+        attached=False,
+        bearer_token="secret",
+        generation="b" * 32,
+        port=43117,
+        release_identity="c" * 64,
+    )
+    stop_calls: list[dict[str, object]] = []
+
+    class SidecarSmoke:
+        @staticmethod
+        def smoke_sidecar(_path: Path, *, timeout_seconds: float) -> None:
+            assert timeout_seconds == 1.0
+
+        @staticmethod
+        def _read_json(_url: str, *, headers: dict[str, str]) -> dict[str, str]:
+            assert headers == {"Authorization": "Bearer secret"}
+            return {"registry_digest": "d" * 64}
+
+        @staticmethod
+        def _assert_capabilities(
+            _payload: dict[str, str],
+            *,
+            execution_mode: str,
+            expected_core_version: str,
+        ) -> None:
+            assert execution_mode in {"codex_subscription_transcript", "self-deployed"}
+            assert expected_core_version == "0.1.0"
+
+    monkeypatch.setattr(smoke.openevo, "__file__", str(imported))
+    monkeypatch.setattr(smoke.metadata, "version", lambda _: "0.1.0")
+    monkeypatch.setattr(smoke, "_sha256", lambda _: digest)
+    monkeypatch.setattr(smoke, "_verify_framework_lock_binding", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(smoke, "_load_sidecar_smoke", lambda: SidecarSmoke())
+    monkeypatch.setattr(smoke, "default_core_service_root", lambda: tmp_path / "core")
+    monkeypatch.setattr(smoke, "ensure_core_service", lambda **_kwargs: attachment)
+    monkeypatch.setattr(
+        smoke,
+        "stop_core_service_if_generation",
+        lambda **kwargs: stop_calls.append(kwargs) or False,
+    )
+
+    smoke.smoke(
+        wheel,
+        framework_lock,
+        sidecar,
+        source_commit="e" * 40,
+        timeout_seconds=1.0,
+    )
+
+    assert stop_calls == [
+        {
+            "service_root": tmp_path / "core",
+            "expected_generation": attachment.generation,
+            "expected_release_identity": attachment.release_identity,
+            "deadline_seconds": 1.0,
+        }
+    ]
+
+
+def _write_framework_lock(
+    path: Path,
+    *,
+    wheel_filename: str,
+    version: str,
+    digest: str,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "distribution": "openevo",
+                "distribution_version": version,
+                "distribution_digest": digest,
+                "wheel_filename": wheel_filename,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_remote_capability_smoke_rejects_lock_for_wrong_wheel_path(tmp_path: Path) -> None:
+    smoke = _load_remote_capability_smoke_module()
+    digest = hashlib.sha256(b"wheel").hexdigest()
+    candidate = tmp_path / "candidate/openevo-0.1.0-py3-none-any.whl"
+    locked = tmp_path / "locked/openevo-0.1.0-py3-none-any.whl"
+    candidate.parent.mkdir()
+    locked.parent.mkdir()
+    candidate.write_bytes(b"wheel")
+    locked.write_bytes(b"wheel")
+    lock = locked.parent / "framework-lock.json"
+    _write_framework_lock(lock, wheel_filename=locked.name, version="0.1.0", digest=digest)
+
+    with pytest.raises(RuntimeError, match="does not bind the exact Core wheel"):
+        smoke._verify_framework_lock_binding(
+            candidate.resolve(),
+            lock.resolve(),
+            version="0.1.0",
+            digest=digest,
+        )
+
+
+@pytest.mark.parametrize(
+    ("locked_version", "locked_digest", "locked_filename"),
+    [
+        ("0.2.0", "a" * 64, "openevo-0.2.0-py3-none-any.whl"),
+        ("0.1.0", "b" * 64, "openevo-0.1.0-py3-none-any.whl"),
+        ("0.1.0", "a" * 64, "openevo-0.1.0-1-py3-none-any.whl"),
+    ],
+    ids=("wrong-version", "wrong-digest", "wrong-wheel"),
+)
+def test_remote_capability_smoke_rejects_mismatched_lock_identity(
+    tmp_path: Path,
+    locked_version: str,
+    locked_digest: str,
+    locked_filename: str,
+) -> None:
+    smoke = _load_remote_capability_smoke_module()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    locked_wheel = tmp_path / locked_filename
+    if locked_wheel != wheel:
+        locked_wheel.write_bytes(b"wheel")
+    lock = tmp_path / "framework-lock.json"
+    _write_framework_lock(
+        lock,
+        wheel_filename=locked_filename,
+        version=locked_version,
+        digest=locked_digest,
+    )
+
+    with pytest.raises(RuntimeError, match="does not bind the exact Core wheel"):
+        smoke._verify_framework_lock_binding(
+            wheel.resolve(),
+            lock.resolve(),
+            version="0.1.0",
+            digest="a" * 64,
+        )
 
 
 def test_pre_external_beta_release_artifact_workflow_is_disabled() -> None:
@@ -1084,12 +1282,15 @@ def test_desktop_tailwind_sources_are_explicit_and_exclude_packaged_web() -> Non
 
 
 def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
+    from desktop.sidecar.contracts.v1 import DESKTOP_OPENAPI_SHA256
+
     config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
     cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
     main = Path("desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
     workflow = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     sidecar_builder = Path("desktop/packaging/build_sidecar.py")
     sidecar_entry = Path("desktop/packaging/sidecar_entry.py")
+    release_contract = json.loads(Path("desktop/release-contract.json").read_text(encoding="utf-8"))
     gitignore = Path(".gitignore").read_text(encoding="utf-8")
 
     assert config["productName"] == "OpenEvo Desktop"
@@ -1130,7 +1331,10 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "libc::WNOWAIT" in main
     assert "GroupSignalAuthority::Finalizing" in main
     assert main.count("const DESKTOP_LOCAL_API_OPENAPI_SHA256") == 1
-    assert "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36" in main
+    assert release_contract == RELEASE_CONTRACT
+    assert release_contract["allowed_provider_kinds"] == ["desktop_sidecar"]
+    assert RELEASE_OPENAPI_SHA256 == DESKTOP_OPENAPI_SHA256
+    assert f'    "{RELEASE_OPENAPI_SHA256}";' in main
     assert "fn macos_proc_listpgrppids_call(" in main
     assert "fn sanitize_pyinstaller_launch_environment(" in main
     assert 'command.env(PYINSTALLER_RESET_ENVIRONMENT, "1")' in main
@@ -1394,6 +1598,46 @@ def _write_fake_tauri_release_smoke(path: Path) -> None:
     )
     path.chmod(0o755)
 
+
+def _release_version_payload() -> dict[str, object]:
+    return {
+        "schema_version": "1",
+        "api_name": "openevo-desktop-local-api",
+        "preferred_major": 1,
+        "supported_majors": [1],
+        "provider_kind": "desktop_sidecar",
+        "build_channel": "release",
+        "openapi_sha256": RELEASE_OPENAPI_SHA256,
+        "build_version": "0.1.0",
+        "source_commit": "89baeb26",
+        "feature_flags": RELEASE_FEATURE_FLAGS,
+    }
+
+
+def _desktop_state_payload() -> dict[str, object]:
+    return {
+        "schema_version": "1",
+        "observed_at": "2026-07-15T00:00:00Z",
+        "contract": {
+            "selected_major": 1,
+            "desktop_openapi_sha256": RELEASE_OPENAPI_SHA256,
+            "core_openapi_sha256": None,
+            "compatible": True,
+        },
+        "core": {
+            "state": "disconnected",
+            "profile_id": None,
+            "active_tunnel": False,
+            "operation_id": None,
+            "host_key_review": None,
+            "core": None,
+            "failure": None,
+        },
+        "active_project": None,
+        "pending_operation_ids": [],
+    }
+
+
 def _write_fake_sidecar(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -1439,18 +1683,7 @@ def _write_fake_sidecar(path: Path) -> None:
                 "            self.wfile.write(body)",
                 "            return",
                 "        if self.path == '/version':",
-                "            body = json.dumps({",
-                "                'schema_version': '1',",
-                "                'api_name': 'openevo-desktop-local-api',",
-                "                'preferred_major': 1,",
-                "                'supported_majors': [1],",
-                "                'provider_kind': 'desktop_sidecar',",
-                "                'build_channel': 'release',",
-                "                'openapi_sha256': 'a' * 64,",
-                "                'build_version': '0.1.0',",
-                "                'source_commit': '89baeb26',",
-                "                'feature_flags': [],",
-                "            }).encode()",
+                f"            body = json.dumps({_release_version_payload()!r}).encode()",
                 "            self.send_response(200)",
                 "            self.send_header('Content-Type', 'application/json')",
                 "            self.send_header('Content-Length', str(len(body)))",
@@ -1462,7 +1695,7 @@ def _write_fake_sidecar(path: Path) -> None:
                 "                self.send_response(401)",
                 "                self.end_headers()",
                 "                return",
-                "            body = json.dumps({'schema_version': '1'}).encode()",
+                f"            body = json.dumps({_desktop_state_payload()!r}).encode()",
                 "            self.send_response(200)",
                 "            self.send_header('Content-Type', 'application/json')",
                 "            self.send_header('Content-Length', str(len(body)))",

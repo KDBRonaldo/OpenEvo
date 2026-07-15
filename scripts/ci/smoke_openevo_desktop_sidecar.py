@@ -27,6 +27,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import build_opener, ProxyHandler, Request
 
+from pydantic import ValidationError
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from desktop.sidecar.contracts.v1 import DesktopStateV1, VersionV1  # noqa: E402
+
 
 EXPECTED_DESKTOP_METHOD_IDS = frozenset(
     {
@@ -54,6 +63,41 @@ NATIVE_ARCHIVE_FD = 4
 NATIVE_GUARD_MIN_FD = 64
 NATIVE_SIDECAR_BASENAME = "openevo-desktop-sidecar"
 _LOCAL_HTTP_OPENER = build_opener(ProxyHandler({}))
+
+
+def _load_release_contract() -> tuple[str, frozenset[str]]:
+    path = REPOSITORY_ROOT / "desktop" / "release-contract.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Desktop release contract is unavailable") from exc
+    if type(payload) is not dict or set(payload) != {
+        "accepted_openapi_digests",
+        "allowed_provider_kinds",
+        "required_feature_flags",
+        "schema_version",
+    }:
+        raise RuntimeError("Desktop release contract does not use the closed schema")
+    digests = payload.get("accepted_openapi_digests")
+    provider_kinds = payload.get("allowed_provider_kinds")
+    features = payload.get("required_feature_flags")
+    if (
+        payload.get("schema_version") != "1"
+        or type(digests) is not list
+        or len(digests) != 1
+        or type(digests[0]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", digests[0]) is None
+        or provider_kinds != ["desktop_sidecar"]
+        or type(features) is not list
+        or not features
+        or any(type(feature) is not str for feature in features)
+        or len(features) != len(set(features))
+    ):
+        raise RuntimeError("Desktop release contract is invalid")
+    return digests[0], frozenset(features)
+
+
+EXPECTED_DESKTOP_OPENAPI_SHA256, REQUIRED_DESKTOP_FEATURE_FLAGS = _load_release_contract()
 
 
 class SmokeFailure(RuntimeError):
@@ -407,6 +451,47 @@ def _assert_project_method_contract(method: dict[str, Any]) -> None:
         )
 
 
+def _assert_release_version(payload: dict[str, Any]) -> None:
+    try:
+        version = VersionV1.model_validate_json(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        )
+    except ValidationError as exc:
+        raise SmokeFailure("packaged sidecar returned an invalid release contract") from exc
+    if version.openapi_sha256 != EXPECTED_DESKTOP_OPENAPI_SHA256:
+        raise SmokeFailure("packaged sidecar returned an unreviewed OpenAPI digest")
+    missing_features = REQUIRED_DESKTOP_FEATURE_FLAGS.difference(version.feature_flags)
+    if missing_features:
+        raise SmokeFailure(
+            "packaged sidecar omitted required release features: "
+            + ", ".join(sorted(missing_features))
+        )
+    if (
+        version.schema_version != "1"
+        or version.api_name != "openevo-desktop-local-api"
+        or version.provider_kind != "desktop_sidecar"
+        or version.build_channel != "release"
+        or version.preferred_major != 1
+        or version.supported_majors != (1,)
+    ):
+        raise SmokeFailure("packaged sidecar returned an invalid release contract")
+
+
+def _assert_desktop_state(payload: dict[str, Any]) -> None:
+    try:
+        state = DesktopStateV1.model_validate_json(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        )
+    except ValidationError as exc:
+        raise SmokeFailure("packaged sidecar returned an invalid Desktop state") from exc
+    if (
+        state.contract.selected_major != 1
+        or not state.contract.compatible
+        or state.contract.desktop_openapi_sha256 != EXPECTED_DESKTOP_OPENAPI_SHA256
+    ):
+        raise SmokeFailure("packaged sidecar state does not bind the release contract")
+
+
 def _terminate(process: subprocess.Popen[Any]) -> None:
     if process.poll() is not None:
         return
@@ -481,26 +566,15 @@ def smoke_sidecar(
                         f"sidecar did not become healthy within {timeout_seconds}s"
                     )
 
-                version = _read_json(f"{base_url}/version")
-                if (
-                    version.get("schema_version") != "1"
-                    or version.get("api_name") != "openevo-desktop-local-api"
-                    or version.get("provider_kind") != "desktop_sidecar"
-                    or version.get("build_channel") != "release"
-                    or version.get("preferred_major") != 1
-                    or version.get("supported_majors") != [1]
-                    or re.fullmatch(r"[0-9a-f]{64}", version.get("openapi_sha256", ""))
-                    is None
-                ):
-                    raise SmokeFailure("packaged sidecar returned an invalid release contract")
+                _assert_release_version(_read_json(f"{base_url}/version"))
 
                 session_headers = {DESKTOP_SESSION_HEADER: credentials.session_token}
-                state = _read_json(
-                    f"{base_url}/desktop/v1/state",
-                    headers=session_headers,
+                _assert_desktop_state(
+                    _read_json(
+                        f"{base_url}/desktop/v1/state",
+                        headers=session_headers,
+                    )
                 )
-                if state.get("schema_version") != "1":
-                    raise SmokeFailure("packaged sidecar returned an invalid Desktop state")
                 _read_url(
                     f"{base_url}/desktop/v1/state",
                     expected_status=401,

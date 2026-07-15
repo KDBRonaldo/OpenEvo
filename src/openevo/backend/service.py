@@ -503,6 +503,66 @@ def stop_core_service(
             os.close(bootstrap_lock_fd)
 
 
+def stop_core_service_if_generation(
+    *,
+    service_root: str | Path,
+    expected_generation: str,
+    expected_release_identity: str,
+    deadline_seconds: float = 15.0,
+    process_controller: LinuxProcessController | None = None,
+) -> bool:
+    """Stop only the exact service generation named by a prior attachment."""
+
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", expected_generation) is None
+        or re.fullmatch(r"[0-9a-f]{64}", expected_release_identity) is None
+        or not 0 < deadline_seconds <= 300
+    ):
+        raise CoreServiceError(
+            CoreServiceErrorCode.START_FAILED,
+            "Core service conditional stop settings are invalid.",
+            retryable=False,
+        )
+    deadline = time.monotonic() + deadline_seconds
+    try:
+        require_host_global_service_root(service_root)
+        root = HostServiceRoot(service_root, create=False)
+    except (OSError, RuntimeIdentityError) as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.INVALID_ROOT,
+            "Core service root failed private ownership validation.",
+            retryable=False,
+        ) from exc
+    with root:
+        controller = process_controller or LinuxProcessController()
+        bootstrap_lock_fd = root.open_lock("bootstrap.lock")
+        try:
+            _flock_until(bootstrap_lock_fd, deadline)
+            lifecycle_lock_fd = root.open_lock("lifecycle.lock")
+            try:
+                _flock_until(lifecycle_lock_fd, deadline)
+                value = root.read_optional_json(_LEDGER_NAME)
+                if value is None:
+                    return False
+                ledger = _require_ledger(value)
+                if (
+                    ledger["generation"] != expected_generation
+                    or ledger["release_identity"] != expected_release_identity
+                ):
+                    return False
+                identity = _process_from_ledger(ledger)
+                if controller.is_alive(identity):
+                    controller.terminate(identity, deadline=deadline)
+                root.unlink_regular(_LEDGER_NAME)
+                root.unlink_regular(_READY_NAME)
+                root.unlink_regular(_PENDING_NAME)
+                return True
+            finally:
+                os.close(lifecycle_lock_fd)
+        finally:
+            os.close(bootstrap_lock_fd)
+
+
 def bootstrap_core_service(
     *,
     service_root: str | Path,
@@ -1810,4 +1870,5 @@ __all__ = [
     "ensure_core_service",
     "inspect_core_service",
     "stop_core_service",
+    "stop_core_service_if_generation",
 ]

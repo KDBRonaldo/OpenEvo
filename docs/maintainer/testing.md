@@ -144,11 +144,15 @@ The lock must be the exact sibling artifact emitted by the sidecar build, not a
 runtime-generated substitute. The smoke must start Core with that external lock
 through the installed Core supervisor API, exercise the packaged sidecar through its native
 inherited-listener/credential-frame launch contract, and use a full 40-character
-`--source-commit` matching the release checkout. This CI-only smoke may replace
-or attach to the current user's canonical Core service, so run it only on a
-disposable release worker. It stops Core only when the returned attachment proves
-that this smoke started the process; a failed ensure has no authority to stop a
-possibly pre-existing service. It
+`--source-commit` matching the release checkout. This gate runs only on its
+dedicated GitHub-hosted Linux worker because the supervisor derives its required
+canonical host-global root from the OS account database, not from `HOME` or a
+caller-selected path.
+The smoke stops a process only through `stop_core_service_if_generation`, which
+rechecks the attachment generation and release identity under the supervisor
+locks before signalling or removing publication state. A failed ensure, an
+attachment to an existing process, or a replaced generation has no cleanup
+authority. It
 validates the two packaged process boundaries;
 the separate remote-profile/SSH/active-project gate validates their production
 forwarding composition. A source `TestClient` or local fake capability catalog
@@ -162,13 +166,24 @@ under a source-commit-qualified artifact name. `linux-core-smoke` has an
 explicit dependency on that job, downloads the same artifact, verifies the
 manifest digest and both payload digests before installation, then owns the
 actual Core service ensure/attachment/capability/stop smoke. It never rebuilds
-the release inputs or constructs a later outer wheel. The macOS job owns sidecar packaging and runs a direct probe
+the release inputs or constructs a later outer wheel. Because a macOS Mach-O
+sidecar cannot execute on the Linux Core runner, Linux rebuilds a packaged Linux
+sidecar from the same checkout solely as the executable native-process fixture;
+it is not candidate artifact evidence and does not replace the macOS packaged or
+app-bundle smokes. The Linux remote smoke combines that fixture with the exact
+transferred wheel and lock. The macOS job owns candidate sidecar packaging and runs a direct probe
 on APFS through the held object FD, `FSPathMakeRef`/`FSRef`, and
 `FSUnlinkObject` implementation; it does not call the Linux-only Core service
 lifecycle. Linux focused tests exercise the unsupported-platform fail-closed
 behavior and their explicit conditional-removal testkit, but cannot establish
 that the Carbon/APFS primitive works. That final boundary remains pending until
 the `macos-14` job passes.
+
+The sidecar process smoke loads `desktop/release-contract.json`, validates the
+closed `VersionV1` and `DesktopStateV1` models, requires the frozen OpenAPI digest
+and every renderer-required feature flag, and checks that state negotiation binds
+the same digest. The renderer imports that JSON directly; anti-drift tests bind
+the Rust native-host digest to it.
 
 The exact Core wheel/lock export keeps the output directory open for the whole
 sidecar build and verifies its pathname/inode binding before and after writes.

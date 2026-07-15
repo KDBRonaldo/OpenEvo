@@ -186,7 +186,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
       - uses: astral-sh/setup-uv@v6
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux release smoke dependencies
         run: uv sync --frozen --group dev
@@ -225,65 +233,26 @@ jobs:
             --wheel .openevo-release-inputs/openevo-*.whl \
             --framework-lock .openevo-release-inputs/framework-lock.json
 
-      - name: Smoke Linux Core service lifecycle
+      - name: Build executable Linux packaged sidecar fixture
+        run: |
+          cd desktop
+          npm ci
+          uv run python packaging/build_sidecar.py
+          sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
+          test -x "$sidecar"
+          echo "OPENEVO_LINUX_PACKAGED_SIDECAR=$sidecar" >> "$GITHUB_ENV"
+
+      - name: Smoke exact transferred Core release through Linux packaged sidecar gate
         run: |
           set -euo pipefail
-          service_root="$RUNNER_TEMP/openevo-core-service-smoke"
-          attachment_name="release-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
-          service_json="$RUNNER_TEMP/openevo-core-service.json"
-          attachment_json="$RUNNER_TEMP/openevo-core-attachment.json"
-          cleanup() {
-            PYTHONPATH= .openevo-core-smoke/bin/openevo-core-service stop \
-              --service-root "$service_root" \
-              --deadline-seconds 15 >/dev/null 2>&1 || true
-            rm -f "$service_json" "$attachment_json"
-          }
-          trap cleanup EXIT
-          umask 077
-          PYTHONPATH= .openevo-core-smoke/bin/openevo-core-service ensure \
-            --service-root "$service_root" \
-            --framework-lock "$GITHUB_WORKSPACE/.openevo-release-inputs/framework-lock.json" \
+          test -x "$OPENEVO_LINUX_PACKAGED_SIDECAR"
+          PYTHONPATH= .openevo-core-smoke/bin/python \
+            scripts/ci/smoke_openevo_remote_capabilities.py \
+            --wheel .openevo-release-inputs/openevo-*.whl \
+            --framework-lock .openevo-release-inputs/framework-lock.json \
+            --sidecar "$OPENEVO_LINUX_PACKAGED_SIDECAR" \
             --source-commit "$GITHUB_SHA" \
-            --port 0 \
-            --deadline-seconds 60 \
-            --replace-mismatched \
-            --attachment-name "$attachment_name" > "$service_json"
-          PYTHONPATH= .openevo-core-smoke/bin/openevo-core-service consume-attachment \
-            --service-root "$service_root" \
-            --attachment-name "$attachment_name" > "$attachment_json"
-          PYTHONPATH= .openevo-core-smoke/bin/python - \
-            "$service_json" "$attachment_json" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-          from urllib.parse import urlencode
-          from urllib.request import ProxyHandler, Request, build_opener
-
-          service = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          attachment = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-          port = service.get("port")
-          token = attachment.get("bearer_token")
-          if type(port) is not int or not 0 < port <= 65535:
-              raise SystemExit("Core service returned an invalid port")
-          if type(token) is not str or len(token) < 43:
-              raise SystemExit("Core service returned an invalid attachment token")
-          opener = build_opener(ProxyHandler({}))
-          digests = set()
-          for mode in ("codex_subscription_transcript", "self-deployed"):
-              query = urlencode({"execution_mode": mode})
-              request = Request(
-                  f"http://127.0.0.1:{port}/v1/capabilities?{query}",
-                  headers={"Authorization": f"Bearer {token}"},
-              )
-              with opener.open(request, timeout=10) as response:
-                  payload = json.load(response)
-              digest = payload.get("registry_digest")
-              if type(digest) is not str or len(digest) != 64:
-                  raise SystemExit("Core capability response omitted registry identity")
-              digests.add(digest)
-          if len(digests) != 1:
-              raise SystemExit("release modes resolved different registry identities")
-          PY
+            --timeout-seconds 60
 
       - name: Reverify final Core candidate bytes after service smoke
         run: |

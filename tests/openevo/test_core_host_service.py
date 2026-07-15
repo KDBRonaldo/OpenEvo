@@ -1126,6 +1126,102 @@ def test_stop_terminates_exact_service_and_clears_publication(
     assert not (root / "ready.json").exists()
 
 
+def test_conditional_stop_preserves_replacement_generation(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    original = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+    )
+    service.stop_core_service(service_root=root, process_controller=controller)
+    replacement = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+    )
+
+    stopped = service.stop_core_service_if_generation(
+        service_root=root,
+        expected_generation=original.generation,
+        expected_release_identity=original.release_identity,
+        process_controller=controller,
+    )
+
+    assert stopped is False
+    assert replacement.generation != original.generation
+    assert len(controller.terminated) == 1
+    with HostServiceRoot(root) as pinned:
+        ledger = pinned.read_json("service.json")
+    assert ledger["generation"] == replacement.generation
+    assert ledger["release_identity"] == replacement.release_identity
+
+
+def test_conditional_stop_terminates_matching_generation(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    attachment = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+    )
+
+    stopped = service.stop_core_service_if_generation(
+        service_root=root,
+        expected_generation=attachment.generation,
+        expected_release_identity=attachment.release_identity,
+        process_controller=controller,
+    )
+
+    assert stopped is True
+    assert len(controller.terminated) == 1
+    assert not (root / "service.json").exists()
+    assert not (root / "ready.json").exists()
+
+
+def test_conditional_stop_preserves_generation_on_release_identity_mismatch(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    attachment = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+    )
+
+    stopped = service.stop_core_service_if_generation(
+        service_root=root,
+        expected_generation=attachment.generation,
+        expected_release_identity=RELEASE_B.digest,
+        process_controller=controller,
+    )
+
+    assert stopped is False
+    assert controller.terminated == []
+    with HostServiceRoot(root) as pinned:
+        ledger = pinned.read_json("service.json")
+    assert ledger["generation"] == attachment.generation
+    assert ledger["release_identity"] == attachment.release_identity
+
+
 def test_pidfd_esrch_is_already_stopped_and_stop_cleans_publication(
     tmp_path: Path,
     service_fakes: tuple[FakeController, list[FakeChild]],

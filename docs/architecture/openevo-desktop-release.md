@@ -267,13 +267,14 @@ The native host binds the loopback listener before spawn and transfers that
 already-bound socket on inherited FD 3, removing the release-and-rebind port
 window. Native code sends exactly one UTF-8 JSON frame of at most 512 bytes over
 the child's stdin and then closes the pipe. Its exact keys are `protocol`,
-`instance_id`, `readiness_key`, and `session_token`; protocol is
-`openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and both credentials
-are independently generated 256-bit values. Duplicate, missing, unknown,
+`instance_id`, `readiness_key`, `session_token`, and `handoff_token`; protocol is
+`openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and all three
+credentials are independently generated 256-bit values. Duplicate, missing, unknown,
 malformed, or trailing input is rejected by the strict sidecar integration.
 The packaged Python launcher applies the same 512-byte bound, requires the
-closed four-key object and lowercase fixed-width hex values, and passes all
-three native values directly to `create_release_desktop_local_api_app`. It
+closed five-key object and lowercase fixed-width hex values, and passes the
+readiness/session values to `create_release_desktop_local_api_app` while retaining
+the handoff credential only for hidden native workspace routes. It
 mounts only that release Local API and the audited product web. It does not
 construct the legacy sidecar app, expose `/openevo-api/*`, translate the Desktop
 session header into a legacy mutation token, or accept a backend base URL. Its
@@ -667,18 +668,23 @@ Before that outer lifecycle harness, the workflow installs the exact remote Core
 wheel in a clean Python environment and passes the exported build-generated
 framework lock, rather than synthesizing a new lock at smoke time, to both
 framework and remote-capability smokes. The latter starts the real
-`openevo-core-service` supervisor with that lock and checks bearer protection,
+Core supervisor API with that lock and checks bearer protection,
 both release profiles, registry identity, and target-rooted methods over HTTP.
-It separately starts the packaged sidecar through the same inherited-listener
+It separately starts a Linux packaged sidecar fixture built from the same commit
+through the same inherited-listener
 and one-shot native credential frame used by the Rust host, verifies the native
-readiness proof, Desktop session protection, and packaged assets, and rejects
+readiness proof, frozen release digest and features, strict Desktop state,
+Desktop session protection, and packaged assets, and rejects
 the removed legacy `/openevo-api/desktop/capabilities` route. End-to-end remote
 profile, SSH tunnel, and active-project capability forwarding remain a distinct
 release-composition gate; these two process smokes do not claim to replace it.
 The supervised Core process smoke runs only in the Linux release-smoke job,
 because the remote Core service intentionally depends on Linux pidfd semantics;
 the macOS candidate job validates the exact wheel/lock pair and launchers but
-does not pretend to host the remote Core locally.
+does not pretend to host the remote Core locally. The Linux fixture is not a
+macOS candidate artifact. Remote-smoke cleanup is conditional on the exact
+attachment generation and release identity still matching under the Core
+supervisor locks, so a replacement service cannot be stopped by stale cleanup.
 
 ## External Beta Artifacts
 

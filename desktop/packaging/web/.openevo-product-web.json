@@ -1,20 +1,20 @@
 {
   "schema_version": "1",
-  "build_digest": "de1dd19622abf7e7d028ce29067938f3a785e69adddf338921c7c6a66534d293",
+  "build_digest": "df8f52bbf956e494e362d02ef072e820b313aa5b0223edf77b217fe2e8c90cd7",
   "files": [
+    {
+      "path": "assets/index--dbJixsU.js",
+      "sha256": "6eefc6a643f1769cf2e8ef5f223d03c76ba817dd625d4759aee9f6dbac20bd54",
+      "byte_size": 466972
+    },
     {
       "path": "assets/index-BmEvlBjt.css",
       "sha256": "99b948e78b879501513b323851153dab0e1d3f0621988de81e6a1330c6f5170b",
       "byte_size": 52333
     },
     {
-      "path": "assets/index-X2DJDE-w.js",
-      "sha256": "7c2a0286b216b6364791338eaa937840ceb43c08020cda55c4a7f45eb10c4b2d",
-      "byte_size": 466797
-    },
-    {
       "path": "index.html",
-      "sha256": "7302acb03ad65d3b1d5c50f0572d0e6c12276a63d0f30a3cb9f827c67e0ec039",
+      "sha256": "95fda420edeca13e32320da4909dae2f901d6edabb04795574c966bc393d7444",
       "byte_size": 435
     }
   ]

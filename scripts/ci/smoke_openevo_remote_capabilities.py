@@ -13,7 +13,7 @@ from types import ModuleType
 
 import openevo
 from openevo.backend.runtime_identity import default_core_service_root
-from openevo.backend.service import ensure_core_service, stop_core_service
+from openevo.backend.service import ensure_core_service, stop_core_service_if_generation
 from openevo.evolution.framework import load_framework_distribution_lock
 
 
@@ -45,6 +45,24 @@ def _load_sidecar_smoke() -> ModuleType:
     return module
 
 
+def _verify_framework_lock_binding(
+    wheel: Path,
+    framework_lock: Path,
+    *,
+    version: str,
+    digest: str,
+) -> None:
+    locked_identity, locked_wheel = load_framework_distribution_lock(framework_lock)
+    if (
+        locked_identity.distribution != "openevo"
+        or locked_identity.distribution_version != version
+        or locked_identity.distribution_digest != digest
+        or locked_identity.wheel_filename != wheel.name
+        or locked_wheel.resolve(strict=True) != wheel
+    ):
+        raise RuntimeError("packaged framework lock does not bind the exact Core wheel")
+
+
 def smoke(
     wheel_path: Path,
     framework_lock_path: Path,
@@ -64,15 +82,12 @@ def smoke(
 
     version = metadata.version("openevo")
     digest = _sha256(wheel)
-    locked_identity, locked_wheel = load_framework_distribution_lock(framework_lock)
-    if (
-        locked_identity.distribution != "openevo"
-        or locked_identity.distribution_version != version
-        or locked_identity.distribution_digest != digest
-        or locked_identity.wheel_filename != wheel.name
-        or locked_wheel.resolve(strict=True) != wheel
-    ):
-        raise RuntimeError("packaged framework lock does not bind the exact Core wheel")
+    _verify_framework_lock_binding(
+        wheel,
+        framework_lock,
+        version=version,
+        digest=digest,
+    )
 
     sidecar_smoke = _load_sidecar_smoke()
     service_root = default_core_service_root()
@@ -109,8 +124,10 @@ def smoke(
         registry_digest = next(iter(registry_digests))
     finally:
         if not attachment.attached:
-            stop_core_service(
+            stop_core_service_if_generation(
                 service_root=service_root,
+                expected_generation=attachment.generation,
+                expected_release_identity=attachment.release_identity,
                 deadline_seconds=min(timeout_seconds, 60.0),
             )
 

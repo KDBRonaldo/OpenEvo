@@ -35,6 +35,13 @@ This is launcher/maintenance automation, not an ordinary-user CLI surface.
 readiness descriptors; it cannot choose a public bind address or per-run state
 root.
 
+Maintenance `stop` remains an explicit unconditional operation. Callers that
+own only one returned attachment must instead use the internal
+`stop_core_service_if_generation` API with that attachment's generation and
+release identity. It acquires the bootstrap and lifecycle locks, validates the
+current ledger, and stops or removes state only on an exact match; a missing or
+replacement generation returns without mutation.
+
 The external framework lock names the exact installed Core wheel and pins its
 version and SHA-256. Startup fails before serving capabilities when the lock,
 wheel, installed inventory, or entry points do not match.

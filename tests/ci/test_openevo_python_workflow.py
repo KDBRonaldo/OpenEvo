@@ -123,6 +123,8 @@ def test_release_smoke_path_filter_and_platform_separation_guard() -> None:
     assert "openevo-core-service ensure" not in macos_job
     assert "runs-on: ubuntu-latest" in linux_job
     assert "needs: macos-packaging-smoke" in linux_job
-    assert "openevo-core-service ensure" in linux_job
+    assert "scripts/ci/smoke_openevo_remote_capabilities.py" in linux_job
+    assert "uv run python packaging/build_sidecar.py" in linux_job
+    assert "openevo-core-service ensure" not in linux_job
     assert "sidecar_smoke.smoke_sidecar" in remote_smoke_text
     assert "TestClient" not in remote_smoke_text
