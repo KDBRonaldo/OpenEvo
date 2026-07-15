@@ -1539,6 +1539,8 @@ def _rollout_runtime_context_receipt(
     if evolution.get("context_injected") is not True:
         raise ValueError("science rollout context was not injected exactly")
     receipt = _validate_runtime_context_receipt(value)
+    if evolution.get("context_id") != receipt["context_id"]:
+        raise ValueError("science rollout receipt context differs from runtime metadata")
     if tuple(item["artifact_id"] for item in receipt["artifacts"]) != tuple(
         sorted(context_artifact_ids)
     ):

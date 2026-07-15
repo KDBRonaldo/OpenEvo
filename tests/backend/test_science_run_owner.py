@@ -88,6 +88,7 @@ def test_rollout_runtime_context_receipt_is_closed_and_canonical() -> None:
                     "metadata": {
                         "evolution": {
                             "context_injected": True,
+                            "context_id": "context-verified",
                             "context_artifact_ids": ["skill-1", "memory-1", "agent-1"],
                             "runtime_injection_receipt": expected,
                         }
@@ -165,6 +166,38 @@ def test_runtime_context_receipt_rejects_wrong_revision_content_and_membership()
                     "content_sha256": "5" * 64,
                 },
             },
+        )
+
+
+def test_rollout_runtime_context_receipt_rejects_context_identity_mismatch() -> None:
+    receipt = _runtime_receipt(
+        revision_id="revision-1",
+        artifacts=[
+            {
+                "artifact_id": "memory-1",
+                "artifact_type": "text_memory",
+                "content_sha256": "3" * 64,
+                "staged_sha256": "4" * 64,
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="receipt context"):
+        owner_module._rollout_runtime_context_receipt(
+            {
+                "results": [
+                    {
+                        "metadata": {
+                            "evolution": {
+                                "context_injected": True,
+                                "context_id": "context-other",
+                                "context_artifact_ids": ["memory-1"],
+                                "runtime_injection_receipt": receipt,
+                            }
+                        }
+                    }
+                ]
+            }
         )
 
 
@@ -273,6 +306,7 @@ class _ReceiptRolloutClient(_FakeRolloutClient):
                     "metadata": {
                         "evolution": {
                             "context_injected": True,
+                            "context_id": "context-verified",
                             "context_artifact_ids": artifact_ids,
                             "runtime_injection_receipt": receipt,
                         }
