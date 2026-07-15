@@ -373,7 +373,11 @@ def test_capability_selection_enables_all_three_remote_supported_methods() -> No
                                 if target_id == "agent_system"
                                 else {
                                     "target_id": target_id,
-                                    "effective_default_method_id": f"remote-{target_id}",
+                                    "effective_default_method_id": (
+                                        "unsupported-skill_bundle"
+                                        if target_id == "skill_bundle"
+                                        else f"remote-{target_id}"
+                                    ),
                                     "methods": [
                                         {
                                             "method_id": f"remote-{target_id}",
@@ -390,6 +394,13 @@ def test_capability_selection_enables_all_three_remote_supported_methods() -> No
                                             "support": {"overall": "supported"},
                                             "implementation_identity_digest": "c" * 64,
                                             "default_config_json": "{}",
+                                        },
+                                        {
+                                            "method_id": f"unsupported-{target_id}",
+                                            "maturity": "experimental",
+                                            "support": {"overall": "unsupported"},
+                                            "implementation_identity_digest": "d" * 64,
+                                            "default_config_json": '{"must_not_select":true}',
                                         },
                                     ],
                                 }
