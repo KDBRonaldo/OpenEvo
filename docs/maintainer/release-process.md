@@ -143,7 +143,8 @@ outputs, downloads every asset into a clean directory, and verifies:
   for `org.openevo.desktop`, and remote data;
 - the GitHub draft title, tag, target commit, body, draft state, and prerelease
   state match the candidate at the discrete API read immediately after asset
-  redownload; this is not an atomic assertion about later workflow completion;
+  redownload. Its repository-bound API URL supplies the immutable numeric
+  release ID; this is not an atomic assertion about later workflow completion;
 - no unclassified development, secret, benchmark-private, or source-checkout
   files are present.
 
@@ -153,7 +154,8 @@ are included when requiring both a same-name release and remote Git tag to be
 absent. If creation, upload, redownload, metadata validation, or
 verification-record upload fails or is cancelled, an `always()` cleanup deletes
 only a draft whose complete metadata and random ownership marker still match
-this workflow attempt. It does
+this workflow attempt. Cleanup deletes the validated immutable release ID, not a
+second lookup by mutable tag name. It does
 not delete Git tags, and it fails unless both the owned draft and any same-name
 remote Git tag are absent afterward. A successful run leaves the draft for
 review but proves that no real Git tag exists; the draft's `tagName` is release

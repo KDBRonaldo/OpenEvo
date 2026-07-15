@@ -48,6 +48,7 @@ FINAL_ROLES = tuple(role for role, _name in REQUIRED_INPUT_ROLES) + (
     "checksums",
 )
 DRAFT_RELEASE_METADATA_KEYS = {
+    "apiUrl",
     "body",
     "isDraft",
     "isPrerelease",
@@ -500,7 +501,7 @@ def _validate_draft_release_metadata(
     expected_title: str,
     expected_repository: str,
     expected_owner: str,
-) -> None:
+) -> int:
     metadata = _load_json(metadata_path)
     if type(metadata) is not dict or set(metadata) != DRAFT_RELEASE_METADATA_KEYS:
         raise CandidateError("Draft release metadata does not use the closed review schema")
@@ -538,6 +539,23 @@ def _validate_draft_release_metadata(
         )
     ):
         raise CandidateError("Expected GitHub repository is invalid")
+    api_url = metadata.get("apiUrl")
+    if type(api_url) is not str:
+        raise CandidateError("Draft release API URL is invalid")
+    parsed_api_url = urlsplit(api_url)
+    expected_api_prefix = f"/repos/{expected_repository}/releases/"
+    release_id_text = parsed_api_url.path[len(expected_api_prefix) :]
+    if (
+        parsed_api_url.scheme != "https"
+        or parsed_api_url.netloc.casefold() != "api.github.com"
+        or not parsed_api_url.path.startswith(expected_api_prefix)
+        or not release_id_text.isascii()
+        or not release_id_text.isdigit()
+        or release_id_text.startswith("0")
+        or parsed_api_url.query
+        or parsed_api_url.fragment
+    ):
+        raise CandidateError("Draft release API URL does not bind an immutable release ID")
     if type(url) is not str:
         raise CandidateError("Draft release URL is invalid")
     parsed_url = urlsplit(url)
@@ -553,6 +571,28 @@ def _validate_draft_release_metadata(
         or parsed_url.fragment
     ):
         raise CandidateError("Draft release URL does not belong to the expected repository")
+    return int(release_id_text)
+
+
+def validated_draft_release_id(
+    metadata_path: Path,
+    *,
+    release_notes: Path,
+    expected_tag: str,
+    expected_target: str,
+    expected_title: str,
+    expected_repository: str,
+    expected_owner: str,
+) -> int:
+    return _validate_draft_release_metadata(
+        metadata_path,
+        release_notes=release_notes,
+        expected_tag=expected_tag,
+        expected_target=expected_target,
+        expected_title=expected_title,
+        expected_repository=expected_repository,
+        expected_owner=expected_owner,
+    )
 
 
 def validate_draft_release_metadata(
@@ -566,7 +606,7 @@ def validate_draft_release_metadata(
     expected_owner: str,
 ) -> list[str]:
     try:
-        _validate_draft_release_metadata(
+        validated_draft_release_id(
             metadata_path,
             release_notes=release_notes,
             expected_tag=expected_tag,
@@ -911,6 +951,7 @@ def main(argv: list[str] | None = None) -> int:
     validate_draft.add_argument("--expected-title", required=True)
     validate_draft.add_argument("--expected-repository", required=True)
     validate_draft.add_argument("--expected-owner", required=True)
+    validate_draft.add_argument("--release-id-output", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "write-notes":
@@ -949,7 +990,7 @@ def main(argv: list[str] | None = None) -> int:
             print(path)
             return 0
         if args.command == "validate-draft":
-            errors = validate_draft_release_metadata(
+            release_id = validated_draft_release_id(
                 args.metadata,
                 release_notes=args.release_notes,
                 expected_tag=args.expected_tag,
@@ -958,8 +999,8 @@ def main(argv: list[str] | None = None) -> int:
                 expected_repository=args.expected_repository,
                 expected_owner=args.expected_owner,
             )
-            if errors:
-                raise CandidateError("; ".join(errors))
+            if args.release_id_output is not None:
+                _write_new(args.release_id_output, f"{release_id}\n".encode("ascii"))
             print(f"OpenEvo draft release metadata validation passed: {args.metadata}")
             return 0
         errors = validate_candidate_manifest(

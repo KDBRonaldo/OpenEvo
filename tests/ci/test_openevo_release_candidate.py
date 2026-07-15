@@ -147,6 +147,9 @@ def test_candidate_manifest_rejects_extra_or_contradictory_release_claims(
 
 def _draft_release_metadata(*, body: str) -> dict[str, object]:
     return {
+        "apiUrl": (
+            "https://api.github.com/repos/CompLifeLab-ZJU/OpenEvo/releases/354404740"
+        ),
         "body": body,
         "isDraft": True,
         "isPrerelease": True,
@@ -176,6 +179,7 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         json.dumps(_draft_release_metadata(body=_owned_draft_body(candidate, notes))),
         encoding="utf-8",
     )
+    release_id = tmp_path / "release-id"
 
     assert candidate.validate_draft_release_metadata(
         metadata,
@@ -203,10 +207,13 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
                 "CompLifeLab-ZJU/OpenEvo",
                 "--expected-owner",
                 "d" * 32,
+                "--release-id-output",
+                str(release_id),
             ]
         )
         == 0
     )
+    assert release_id.read_text(encoding="ascii") == "354404740\n"
 
 
 @pytest.mark.parametrize(
@@ -218,6 +225,14 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         ("name", "edited title"),
         ("tagName", "edited-tag"),
         ("targetCommitish", "f" * 40),
+        (
+            "apiUrl",
+            "https://api.github.com/repos/attacker/unrelated/releases/354404740",
+        ),
+        (
+            "apiUrl",
+            "https://api.github.com/repos/CompLifeLab-ZJU/OpenEvo/releases/not-an-id",
+        ),
         ("url", "https://github.com/attacker/unrelated/releases/tag/forged"),
         (
             "url",

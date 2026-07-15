@@ -499,7 +499,7 @@ jobs:
           diff -qr candidate-artifacts downloaded-draft
 
           gh release view "$RELEASE_TAG" \
-            --json body,isDraft,isPrerelease,name,tagName,targetCommitish,url \
+            --json apiUrl,body,isDraft,isPrerelease,name,tagName,targetCommitish,url \
             > "$RUNNER_TEMP/draft-release.json"
           python scripts/ci/openevo_release_candidate.py validate-draft \
             "$RUNNER_TEMP/draft-release.json" \
@@ -546,7 +546,7 @@ jobs:
           release_found=false
           for attempt in 1 2 3; do
             if gh release view "$RELEASE_TAG" \
-              --json body,isDraft,isPrerelease,name,tagName,targetCommitish,url \
+              --json apiUrl,body,isDraft,isPrerelease,name,tagName,targetCommitish,url \
               > "$RUNNER_TEMP/cleanup-draft-release.json"; then
               release_found=true
               break
@@ -561,12 +561,15 @@ jobs:
               --expected-target "$GITHUB_SHA" \
               --expected-title "$RELEASE_TITLE" \
               --expected-repository "$GITHUB_REPOSITORY" \
-              --expected-owner "$RELEASE_OWNER"; then
+              --expected-owner "$RELEASE_OWNER" \
+              --release-id-output "$RUNNER_TEMP/cleanup-release-id"; then
               echo "Refusing to delete a draft not owned by this workflow attempt" >&2
               exit 1
             fi
+            IFS= read -r release_id < "$RUNNER_TEMP/cleanup-release-id"
             for attempt in 1 2 3; do
-              if gh release delete "$RELEASE_TAG" --yes; then
+              if gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/${release_id}"; then
                 break
               fi
               sleep "$attempt"

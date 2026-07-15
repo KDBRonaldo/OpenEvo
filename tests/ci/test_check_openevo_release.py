@@ -1245,6 +1245,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "validate-draft",
         "--expected-owner",
         "--expected-repository",
+        "--release-id-output",
+        "apiUrl",
         "gh release view",
         "gh api --paginate",
         ".tag_name | @json",
@@ -1254,7 +1256,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "if: ${{ always()",
         "git ls-remote --exit-code --tags origin",
         "Refusing to delete a draft not owned by this workflow attempt",
-        "gh release delete",
+        "gh api --method DELETE",
     ):
         assert marker in text
 
@@ -1299,8 +1301,12 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     cleanup = text.split(
         "      - name: Delete an owned unverified draft", maxsplit=1
     )[1]
-    assert cleanup.index("validate-draft") < cleanup.index("gh release delete")
+    assert cleanup.index("validate-draft") < cleanup.index("gh api --method DELETE")
     assert "--cleanup-tag" not in cleanup
+    assert "gh release delete" not in cleanup
+    assert cleanup.index("--release-id-output") < cleanup.index(
+        '"repos/${GITHUB_REPOSITORY}/releases/${release_id}"'
+    )
     assert "/releases/tags/" not in text
     assert text.count("assert-release-absent") >= 2
     assert text.count("git ls-remote --exit-code --tags origin") >= 3
@@ -1329,11 +1335,29 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert text.index("openevo_release_candidate.py validate") < text.index(
         'pip install candidate-artifacts/openevo-*.whl'
     )
-
     desktop_checks = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     assert '".github/workflows/openevo-desktop-candidate.yml"' in desktop_checks
     assert "Exercise macOS Core release publication contract" in desktop_checks
     assert "Core release ACL and cleanup policy" not in desktop_checks
+
+
+def test_candidate_cleanup_deletes_only_the_validated_immutable_release_id() -> None:
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+    cleanup = workflow.split(
+        "      - name: Delete an owned unverified draft", maxsplit=1
+    )[1]
+
+    assert "--json apiUrl,body," in cleanup
+    assert cleanup.index("validate-draft") < cleanup.index("--release-id-output")
+    assert cleanup.index("--release-id-output") < cleanup.index(
+        "IFS= read -r release_id"
+    )
+    assert cleanup.index("IFS= read -r release_id") < cleanup.index(
+        '"repos/${GITHUB_REPOSITORY}/releases/${release_id}"'
+    )
+    assert 'gh release delete "$RELEASE_TAG"' not in cleanup
 
 
 def test_python_runtime_dependencies_pin_security_fixed_minimums() -> None:

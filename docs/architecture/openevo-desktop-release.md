@@ -734,7 +734,8 @@ The replacement workflow must:
    draft GitHub prerelease with a per-attempt random ownership marker; upload all
    required assets, download them into a clean directory, and revalidate names,
    versions, commits, checksums, title, tag name, target commit, body, draft
-   state, prerelease state, and ownership at a discrete API read;
+   state, prerelease state, ownership, and immutable numeric release ID at a
+   discrete API read;
 8. retain the point-in-time draft verification record as a run-attempt-qualified
    Actions artifact, prove no real Git tag was created, and leave the candidate
    as an unpublished review draft.
@@ -742,7 +743,8 @@ The replacement workflow must:
 Final publication remains disabled. The manual candidate workflow implements
 the packaging-level draft roundtrip. If the job fails or is cancelled before
 its final verification marker, cleanup first verifies the exact draft metadata
-and random ownership marker, then retries deletion of that owned draft. Cleanup
+and random ownership marker, then retries deletion by that draft's immutable
+numeric release ID rather than resolving the mutable tag again. Cleanup
 never deletes a Git tag and fails unless a same-name tag is absent. It
 deliberately leaves
 a successful candidate as an unsigned draft prerelease; a maintainer cannot use
