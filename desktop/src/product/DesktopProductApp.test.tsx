@@ -12,6 +12,7 @@ import {
   DesktopProductUserError,
   type DesktopProductSnapshot,
   type ProductResourceMutationIntent,
+  type ProductRunRetryRecovery,
 } from "./provider";
 import { sameSessionOutputIdentity } from "./sessionOutputIdentity";
 
@@ -1143,6 +1144,56 @@ describe("DesktopProductApp", () => {
     await flush();
     expect(screenText()).toContain("The retry was admitted.");
     expect(optionalButton("Retry session")).toBeNull();
+
+    vi.mocked(provider.refresh).mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: withTwoAdvancedRetries(failed.snapshot),
+    });
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+    expect(screenText()).toContain("The retry was admitted.");
+    expect(screenText()).not.toContain("A later retry was admitted.");
+    expect(optionalButton("Retry session")).toBeNull();
+  });
+
+  it("does not reconcile an accepted retry from a different appended attempt or project", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    root = await renderProduct(provider);
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const acceptedSnapshot = withAdvancedRetry(failed.snapshot);
+    const accepted = acceptedSnapshot.runs.find((run) => run.id === "run-failed-model");
+    if (!accepted?.current_attempt) throw new Error("Expected an accepted retry.");
+    const retryRun = vi.fn(async () => accepted);
+    Object.assign(provider, { retryRun });
+    const refresh = vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: failed.snapshot,
+    });
+
+    await clickButton("Retry session");
+    const otherAttemptId = "attempt-run-failed-model-other-retry";
+    const otherAttempt = { ...accepted.current_attempt, id: otherAttemptId };
+    refresh.mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: {
+        ...acceptedSnapshot,
+        runs: acceptedSnapshot.runs.map((run) => run.id === accepted.id ? {
+          ...run,
+          current_attempt_id: otherAttemptId,
+          current_attempt: otherAttempt,
+          attempts: [...run.attempts.slice(0, -1), otherAttempt],
+        } : run),
+      },
+    });
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+
+    expect(screenText()).toContain("The retry was admitted.");
+    expect(screenText()).not.toContain(otherAttemptId);
+    expect(optionalButton("Retry session")).toBeNull();
   });
 
   it("polls after an unknown retry until a later authoritative refresh proves advancement", async () => {
@@ -1372,6 +1423,76 @@ describe("DesktopProductApp", () => {
 
     expect(refresh).toHaveBeenCalledTimes(refreshesAfterSettledWork);
     expect(screenText()).toContain("The failed session cannot be retried yet.");
+  });
+
+  it("does not let a concurrent aggregate erase a deterministic retry rejection", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    root = await renderProduct(provider);
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const retryRun = vi.fn(async () => {
+      throw new DesktopApiError(apiErrorV1Schema.parse({
+        schema_version: "1",
+        request_id: "request-retry-concurrent-1",
+        http_status: 409,
+        code: "run_retry_rejected",
+        message: "This exact retry request was rejected.",
+        severity: "warning",
+        category: "run",
+        retryable: true,
+        repair_action: "openevo_can_retry",
+        next_action: "Review the new remote attempt before retrying.",
+        details: {},
+      }));
+    });
+    Object.assign(provider, { retryRun });
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: withAdvancedRetry(failed.snapshot),
+    });
+
+    await clickButton("Retry session");
+    await flush();
+
+    expect(screenText()).toContain("This exact retry request was rejected.");
+    expect(screenText()).not.toContain("The retry was admitted on the same session.");
+  });
+
+  it("restores an exact ambiguous retry after the product renderer remounts", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    root = await renderProduct(provider);
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh failed fixture.");
+    const failedRun = failed.snapshot.runs.find((run) => run.id === "run-failed-model");
+    if (!failedRun) throw new Error("Expected a failed run.");
+    const intent = {
+      actionId: "renderer-action-retry-remount-0001",
+      streamEpoch: failed.snapshot.stream.epoch,
+      etag: failedRun.etag,
+    };
+    const recovery: ProductRunRetryRecovery = {
+      schemaVersion: 1,
+      runId: failedRun.id,
+      projectId: failedRun.project_id,
+      intent,
+      originalRun: failedRun,
+      acceptedRun: null,
+    };
+    const retryRun = vi.fn(async () => {
+      throw new DesktopProductAmbiguousMutationError("Still reconciling the original retry.");
+    });
+    Object.assign(provider, { retryRun, getRunRetryRecovery: () => recovery });
+    await act(async () => root?.unmount());
+    root = null;
+
+    root = await renderProduct(provider);
+    await clickButton("Retry session");
+
+    expect(retryRun).toHaveBeenCalledWith(failedRun.id, intent);
   });
 
   it("does not let retry completion clear a newer operation error", async () => {

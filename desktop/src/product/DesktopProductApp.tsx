@@ -60,8 +60,10 @@ import {
   type ProductResourceMutationIntent,
   type ProductRefreshResult,
   unavailableDesktopProductProvider,
+  type ProductRunRetryRecovery,
 } from "./provider";
 import { MethodConfigEditor, methodConfigErrors } from "./MethodConfigEditor";
+import { retryRunProvesSingleAppend } from "./runRetryRecovery";
 import {
   sameSessionOutputIdentity,
   sessionOutputIdentity,
@@ -94,12 +96,10 @@ type PendingProjectActivation = {
 };
 type PendingRunRetry = {
   readonly runId: string;
+  readonly projectId: string;
   readonly intent: ProductResourceMutationIntent;
   readonly errorOwner: number;
-  readonly originalAttemptCount: number;
-  readonly originalAttemptIds: readonly string[];
-  readonly originalAttemptSnapshots: readonly string[];
-  readonly originalCurrentAttemptId: string | null;
+  readonly originalRun: RunV1;
   acceptedRun: RunV1 | null;
   reconciled: boolean;
 };
@@ -225,7 +225,22 @@ export function DesktopProductApp({
       return;
     }
     let next = result.snapshot;
-    const pendingRetry = pendingRunRetry.current;
+    let pendingRetry = pendingRunRetry.current;
+    const recoveredRetry = provider.getRunRetryRecovery?.() ?? null;
+    if (!pendingRetry && recoveredRetry) {
+      const errorOwner = actionErrorGeneration.current + 1;
+      actionErrorGeneration.current = errorOwner;
+      pendingRetry = pendingRetryFromRecovery(recoveredRetry, errorOwner);
+      pendingRunRetry.current = pendingRetry;
+      setActionRecovery(null);
+      if (!pendingRetry.acceptedRun) {
+        setActionError({
+          owner: errorOwner,
+          message: "The retry outcome is not yet confirmed. OpenEvo will keep checking the remote session.",
+        });
+        setPendingRetryPoll(pendingRetry);
+      }
+    }
     if (pendingRetry && retryAdvancedInSnapshot(next, pendingRetry)) {
       clearPendingRetry(pendingRetry);
     } else if (pendingRetry?.acceptedRun) {
@@ -237,7 +252,7 @@ export function DesktopProductApp({
       if (current && next.projects.some((project) => project.project_id === current)) return current;
       return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
     });
-  }, [clearPendingRetry]);
+  }, [clearPendingRetry, provider]);
 
   useLayoutEffect(() => {
     const coordinator = refreshCoordinator.current!;
@@ -454,14 +469,10 @@ export function DesktopProductApp({
       : resourceIntent(snapshot, run.etag);
     const pending: PendingRunRetry = {
       runId: run.id,
+      projectId: sameUnprovenRetry ? existing.projectId : run.project_id,
       intent,
       errorOwner,
-      originalAttemptCount: sameUnprovenRetry ? existing.originalAttemptCount : run.attempt_count,
-      originalAttemptIds: sameUnprovenRetry ? existing.originalAttemptIds : run.attempts.map((attempt) => attempt.id),
-      originalAttemptSnapshots: sameUnprovenRetry
-        ? existing.originalAttemptSnapshots
-        : run.attempts.map(canonicalJsonSnapshot),
-      originalCurrentAttemptId: sameUnprovenRetry ? existing.originalCurrentAttemptId : run.current_attempt_id,
+      originalRun: sameUnprovenRetry ? existing.originalRun : run,
       acceptedRun: null,
       reconciled: false,
     };
@@ -470,8 +481,13 @@ export function DesktopProductApp({
     let retryResponse: RunV1 | null = null;
     void act(
       async () => {
-        retryResponse = await retryRun.call(provider, run.id, pending.intent);
-        return retryResponse;
+        try {
+          retryResponse = await retryRun.call(provider, run.id, pending.intent);
+          return retryResponse;
+        } catch (error) {
+          if (!isAmbiguousRetryOutcome(error)) abandonPendingRetry(pending);
+          throw error;
+        }
       },
       null,
       true,
@@ -2609,20 +2625,14 @@ function retryAdvancedInSnapshot(
 }
 
 function retryAdvancedRun(run: RunV1, pending: PendingRunRetry): boolean {
-  if (run.id !== pending.runId
-    || pending.originalAttemptIds.length !== pending.originalAttemptCount
-    || pending.originalAttemptSnapshots.length !== pending.originalAttemptCount
-    || run.attempt_count !== pending.originalAttemptCount + 1
-    || run.current_attempt_id === null
-    || run.current_attempt?.id !== run.current_attempt_id
-    || run.attempts[pending.originalAttemptCount]?.id !== run.current_attempt_id
-    || run.current_attempt_id === pending.originalCurrentAttemptId
-    || pending.originalAttemptIds.includes(run.current_attempt_id)
-    || run.attempts.length !== run.attempt_count) return false;
-  return pending.originalAttemptSnapshots.every((attemptSnapshot, index) =>
-    run.attempts[index]?.id === pending.originalAttemptIds[index]
-    && canonicalJsonSnapshot(run.attempts[index]) === attemptSnapshot
-  );
+  return retryRunProvesSingleAppend(run, {
+    schemaVersion: 1,
+    runId: pending.runId,
+    projectId: pending.projectId,
+    intent: pending.intent,
+    originalRun: pending.originalRun,
+    acceptedRun: pending.acceptedRun,
+  });
 }
 
 function mergeAuthoritativeRetryRun(
@@ -2633,24 +2643,25 @@ function mergeAuthoritativeRetryRun(
   const index = snapshot.runs.findIndex((run) => run.id === pending.runId);
   if (index < 0) return { ...snapshot, runs: [response, ...snapshot.runs] };
   const current = snapshot.runs[index];
-  if (!current || retryAdvancedRun(current, pending) || current.attempt_count > response.attempt_count) return snapshot;
+  if (!current || retryAdvancedRun(current, pending)) return snapshot;
   const runs = [...snapshot.runs];
   runs[index] = response;
   return { ...snapshot, runs };
 }
 
-function canonicalJsonSnapshot(value: unknown): string {
-  return JSON.stringify(sortCanonicalJsonValue(value));
-}
-
-function sortCanonicalJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortCanonicalJsonValue);
-  if (value === null || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => [key, sortCanonicalJsonValue(child)]),
-  );
+function pendingRetryFromRecovery(
+  recovery: ProductRunRetryRecovery,
+  errorOwner: number,
+): PendingRunRetry {
+  return {
+    runId: recovery.runId,
+    projectId: recovery.projectId,
+    intent: recovery.intent,
+    errorOwner,
+    originalRun: recovery.originalRun,
+    acceptedRun: recovery.acceptedRun,
+    reconciled: false,
+  };
 }
 
 function canReadmitRun(

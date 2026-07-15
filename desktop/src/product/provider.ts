@@ -111,6 +111,15 @@ export interface ProductRunIntent extends ProductResourceMutationIntent {
   readonly projectId: string;
 }
 
+export interface ProductRunRetryRecovery {
+  readonly schemaVersion: 1;
+  readonly runId: string;
+  readonly projectId: string;
+  readonly intent: ProductResourceMutationIntent;
+  readonly originalRun: RunV1;
+  readonly acceptedRun: RunV1 | null;
+}
+
 export class ProductRefreshOrder {
   private sequence = 0;
 
@@ -145,6 +154,7 @@ export interface DesktopProductProvider {
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
   startRun(intent: ProductRunIntent): Promise<RunV1>;
   retryRun?(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
+  getRunRetryRecovery?(): ProductRunRetryRecovery | null;
   cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
   cancelOperation(operationId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   getRunLogs(runId: string): Promise<readonly LogEntryV1[]>;
@@ -154,6 +164,7 @@ export interface DesktopProductProvider {
 
 export interface ReleaseDesktopProductProvider extends DesktopProductProvider {
   retryRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
+  getRunRetryRecovery(): ProductRunRetryRecovery | null;
 }
 
 export class DesktopProductProviderUnavailableError extends Error {
@@ -205,6 +216,7 @@ export const unavailableDesktopProductProvider: DesktopProductProvider = {
   settleProjectSource: unavailable,
   startRun: unavailable,
   retryRun: unavailable,
+  getRunRetryRecovery: () => null,
   cancelRun: unavailable,
   cancelOperation: unavailable,
   getRunLogs: unavailable,

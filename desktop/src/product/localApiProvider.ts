@@ -29,6 +29,7 @@ import {
   type ProductMutationIntent,
   type ProductRefreshResult,
   type ProductResourceMutationIntent,
+  type ProductRunRetryRecovery,
   type ProductRunIntent,
   type ProductStreamState,
   type ProductSubscriptionSignal,
@@ -37,6 +38,17 @@ import {
   type ProjectValidationState,
   type ReleaseDesktopProductProvider,
 } from "./provider";
+import {
+  browserRunRetryRecoveryStore,
+  createRunRetryRecovery,
+  overlayAcceptedRetryRun,
+  parseRunRetryRecovery,
+  retryRunProvesSingleAppend,
+  sameRunRetryIntent,
+  serializeRunRetryRecovery,
+  withAcceptedRetryRun,
+  type ProductRunRetryRecoveryStore,
+} from "./runRetryRecovery";
 
 const PAGE_LIMIT = 100;
 const MAX_REFRESH_PAGES = 512;
@@ -57,6 +69,7 @@ export interface LocalApiDesktopProductProviderOptions {
   readonly native: LocalApiNativeBridge;
   readonly fetch?: FetchLike;
   readonly reconnectDelaysMs?: readonly number[];
+  readonly retryRecoveryStore?: ProductRunRetryRecoveryStore | null;
 }
 
 class RefreshBudget {
@@ -98,23 +111,43 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
   private streamAbort: AbortController | null = null;
   private streamPromise: Promise<void> | null = null;
   private waitingForRefresh = false;
-  private retryReplay: { readonly runId: string; readonly intent: ProductResourceMutationIntent } | null = null;
+  private readonly retryRecoveryStore: ProductRunRetryRecoveryStore | null;
+  private retryReplay: ProductRunRetryRecovery | null;
 
   constructor(options: LocalApiDesktopProductProviderOptions) {
     this.client = options.client;
     this.native = options.native;
     this.fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.reconnectDelaysMs = options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS;
+    const retryRecoveryStore = options.retryRecoveryStore === undefined
+      ? browserRunRetryRecoveryStore()
+      : options.retryRecoveryStore;
+    if (options.retryRecoveryStore === undefined && retryRecoveryStore === null) {
+      throw new DesktopContractError("Persistent Desktop run retry recovery is unavailable");
+    }
+    this.retryRecoveryStore = retryRecoveryStore;
+    this.retryReplay = this.restoreRunRetryRecovery();
   }
 
   async refresh(): Promise<ProductRefreshResult> {
     const refreshSequence = this.refreshOrder.begin();
     try {
-      const snapshot = await this.loadSnapshot();
+      let snapshot = await this.loadSnapshot();
       if (!this.refreshOrder.isCurrent(refreshSequence)) {
         return { status: "stale", stream: { status: "stale", epoch: this.epoch, reason: "refresh_pending" } };
       }
       this.epoch += 1;
+      const recovery = this.retryReplay;
+      if (recovery) {
+        const run = snapshot.runs.find((item) => item.id === recovery.runId);
+        if (run && retryRunProvesSingleAppend(run, recovery)) {
+          this.setRunRetryRecovery(null);
+        } else if (recovery.acceptedRun && snapshot.projects.some(
+          (project) => project.remote?.core_project_id === recovery.projectId,
+        )) {
+          snapshot = { ...snapshot, runs: overlayAcceptedRetryRun(snapshot.runs, recovery) };
+        }
+      }
       const freshSnapshot: DesktopProductSnapshot = {
         ...snapshot,
         stream: { status: "fresh", epoch: this.epoch, lastEventId: this.lastEventId },
@@ -305,23 +338,33 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
 
   async retryRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1> {
     const exactReplay = this.retryReplay?.runId === runId
-      && sameResourceIntent(this.retryReplay.intent, intent);
+      && sameRunRetryIntent(this.retryReplay.intent, intent);
     if (!exactReplay) {
       this.assertIntent(intent);
-      this.retryReplay = { runId, intent: { ...intent } };
+      const original = this.snapshot?.runs.find((run) => run.id === runId);
+      if (!original || original.etag !== intent.etag) {
+        throw new DesktopProductUserError("This session changed remotely. Refresh before retrying it.");
+      }
+      this.setRunRetryRecovery(createRunRetryRecovery(original, intent));
     }
     try {
       const run = await this.client.retryRun(runId, actionOptions(intent));
       this.assertKnownRunResponse(run, runId, "Run retry returned the wrong run");
-      if (this.retryReplay?.runId === runId && sameResourceIntent(this.retryReplay.intent, intent)) {
-        this.retryReplay = null;
+      const recovery = this.retryReplay;
+      if (!recovery || recovery.runId !== runId || !sameRunRetryIntent(recovery.intent, intent)) {
+        throw new DesktopContractError("Run retry response lost its exact recovery authority");
+      }
+      const accepted = withAcceptedRetryRun(recovery, run);
+      this.setRunRetryRecovery(accepted);
+      if (this.snapshot) {
+        this.snapshot = { ...this.snapshot, runs: overlayAcceptedRetryRun(this.snapshot.runs, accepted) };
       }
       this.invalidate();
       return run;
     } catch (error) {
       if (error instanceof DesktopApiError) {
-        if (this.retryReplay?.runId === runId && sameResourceIntent(this.retryReplay.intent, intent)) {
-          this.retryReplay = null;
+        if (this.retryReplay?.runId === runId && sameRunRetryIntent(this.retryReplay.intent, intent)) {
+          this.setRunRetryRecovery(null);
         }
         throw error;
       }
@@ -329,6 +372,10 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
         ? error
         : new DesktopProductAmbiguousMutationError(undefined, error);
     }
+  }
+
+  getRunRetryRecovery(): ProductRunRetryRecovery | null {
+    return this.retryReplay === null ? null : structuredClone(this.retryReplay);
   }
 
   async getArtifactContent(artifactId: string): Promise<ArtifactContentV1> {
@@ -597,6 +644,35 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
     }
   }
 
+  private restoreRunRetryRecovery(): ProductRunRetryRecovery | null {
+    let value: string | null;
+    try {
+      value = this.retryRecoveryStore?.read() ?? null;
+    } catch (error) {
+      throw new DesktopContractError("Saved run retry recovery state could not be read", { cause: error });
+    }
+    if (value === null) return null;
+    try {
+      return parseRunRetryRecovery(value);
+    } catch (error) {
+      try {
+        this.retryRecoveryStore?.write(null);
+      } catch {
+        // The original contract error remains the useful startup failure.
+      }
+      throw new DesktopContractError("Saved run retry recovery state is invalid and was discarded", { cause: error });
+    }
+  }
+
+  private setRunRetryRecovery(recovery: ProductRunRetryRecovery | null): void {
+    try {
+      this.retryRecoveryStore?.write(recovery === null ? null : serializeRunRetryRecovery(recovery));
+    } catch {
+      throw new DesktopProductUserError("OpenEvo could not save local retry recovery state. Restart Desktop and try again.");
+    }
+    this.retryReplay = recovery;
+  }
+
   private invalidate(): void {
     this.setSnapshotStream({ status: "stale", epoch: this.epoch, reason: "refresh_pending" });
     this.emit({ kind: "snapshot_changed" });
@@ -803,15 +879,6 @@ async function mapLimited<T, R>(
 
 function actionOptions(intent: ProductResourceMutationIntent) {
   return { idempotencyKey: intent.actionId, ifMatch: intent.etag };
-}
-
-function sameResourceIntent(
-  left: ProductResourceMutationIntent,
-  right: ProductResourceMutationIntent,
-): boolean {
-  return left.actionId === right.actionId
-    && left.streamEpoch === right.streamEpoch
-    && left.etag === right.etag;
 }
 
 function validationIdempotencyKey(project: ProjectV1): string {

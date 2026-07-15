@@ -101,6 +101,7 @@ describe("Desktop product provider boundary", () => {
     const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
     const provider = await createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      retryRecoveryStore: memoryRetryRecoveryStore(),
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
         stop: vi.fn().mockResolvedValue(undefined),
@@ -224,6 +225,18 @@ describe("Desktop product provider boundary", () => {
       },
       adapterFactory: () => ({ ...unavailableDesktopProductProvider, retryRun: undefined }),
     })).rejects.toThrow(/run retry contract/i);
+
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native: {
+        bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
+        selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
+        settleProjectSource: vi.fn(),
+      },
+      adapterFactory: () => ({ ...unavailableDesktopProductProvider, getRunRetryRecovery: undefined }),
+    })).rejects.toThrow(/durable run retry recovery/i);
   });
 
   it("rejects native source responses outside ProjectSourceV1 or cross-wired to another source kind", async () => {
@@ -346,6 +359,14 @@ function releaseBootstrap(openapiSha256: string, featureFlags: string[]) {
       feature_flags: featureFlags,
     },
   } as const;
+}
+
+function memoryRetryRecoveryStore() {
+  let value: string | null = null;
+  return {
+    read: () => value,
+    write: (next: string | null) => { value = next; },
+  };
 }
 
 function jsonResponse(payload: unknown, status = 200): Response {

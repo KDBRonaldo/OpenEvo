@@ -25,6 +25,7 @@ import {
 } from "../api/v1/schemas";
 import { LocalApiDesktopProductProvider } from "./localApiProvider";
 import { DesktopProductAmbiguousMutationError } from "./provider";
+import type { ProductRunRetryRecoveryStore } from "./runRetryRecovery";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -33,6 +34,33 @@ const ETAG_B = `"${B}"`;
 const NOW = "2026-07-14T12:00:00Z";
 
 describe("LocalApiDesktopProductProvider", () => {
+  it("fails closed without persistent retry recovery and discards an invalid saved record", () => {
+    const client = mockClient();
+    const native = {
+      selectProjectSource: vi.fn(),
+      cancelProjectSource: vi.fn(),
+      settleProjectSource: vi.fn(),
+    };
+    expect(() => new LocalApiDesktopProductProvider({
+      client,
+      native,
+      fetch: vi.fn<FetchLike>(),
+    })).toThrow(/persistent.*retry recovery.*unavailable/i);
+
+    let value: string | null = "{not-json";
+    const store: ProductRunRetryRecoveryStore = {
+      read: () => value,
+      write: (next) => { value = next; },
+    };
+    expect(() => new LocalApiDesktopProductProvider({
+      client,
+      native,
+      fetch: vi.fn<FetchLike>(),
+      retryRecoveryStore: store,
+    })).toThrow(/invalid.*discarded/i);
+    expect(value).toBeNull();
+  });
+
   it("loads every page, exact run details, deterministic operations, and active project authority", async () => {
     const client = mockClient();
     const secondService = serviceV1Schema.parse({
@@ -246,6 +274,10 @@ describe("LocalApiDesktopProductProvider", () => {
 
   it("maps epochs, ETags, idempotency keys, request bodies, and Core operations exactly", async () => {
     const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    client.retryRun = vi.fn().mockResolvedValue(advancedRetryRun(retrySource));
     const provider = createProvider(client);
     const refreshed = await provider.refresh();
     if (refreshed.status !== "fresh") throw new Error("expected a fresh fixture");
@@ -301,7 +333,10 @@ describe("LocalApiDesktopProductProvider", () => {
 
   it("replays an ambiguous run retry with its exact stale renderer intent", async () => {
     const client = mockClient();
-    const accepted = runV1Schema.parse(CONTRACT_FIXTURE_V1.run);
+    const retrySource = failedRetrySourceRun();
+    const accepted = advancedRetryRun(retrySource);
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
     client.retryRun = vi.fn()
       .mockRejectedValueOnce(new TypeError("retry response was lost"))
       .mockResolvedValueOnce(accepted);
@@ -329,6 +364,163 @@ describe("LocalApiDesktopProductProvider", () => {
       idempotencyKey: intent.actionId,
       ifMatch: intent.etag,
     });
+  });
+
+  it("retains exact replay authority when a 2xx retry rewrites the original prefix", async () => {
+    const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    const accepted = advancedRetryRun(retrySource);
+    const rewritten = runV1Schema.parse({
+      ...accepted,
+      attempts: accepted.attempts.map((attempt, index) => index === 0
+        ? { ...attempt, updated_at: "2026-07-15T00:00:00Z" }
+        : attempt),
+    });
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    client.retryRun = vi.fn()
+      .mockResolvedValueOnce(rewritten)
+      .mockResolvedValueOnce(accepted);
+    const provider = createProvider(client);
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    const intent = {
+      actionId: "renderer-action-retry-prefix-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    };
+
+    await expect(provider.retryRun(retrySource.id, intent))
+      .rejects.toBeInstanceOf(DesktopProductAmbiguousMutationError);
+    expect(provider.getRunRetryRecovery()?.intent).toEqual(intent);
+    await provider.refresh();
+    await expect(provider.retryRun(retrySource.id, intent)).resolves.toEqual(accepted);
+    expect(client.retryRun).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not accept a 2xx retry response with two appended attempts", async () => {
+    const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    client.retryRun = vi.fn().mockResolvedValue(twoAdvancedRetryRuns(retrySource));
+    const provider = createProvider(client);
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+
+    await expect(provider.retryRun(retrySource.id, {
+      actionId: "renderer-action-retry-multiple-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    })).rejects.toBeInstanceOf(DesktopProductAmbiguousMutationError);
+    expect(provider.getRunRetryRecovery()?.acceptedRun).toBeNull();
+  });
+
+  it("overlays an accepted retry across missing aggregates and keeps provider operations coherent", async () => {
+    const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    const accepted = advancedRetryRun(retrySource);
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    client.retryRun = vi.fn().mockResolvedValue(accepted);
+    const provider = createProvider(client);
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    await provider.retryRun(retrySource.id, {
+      actionId: "renderer-action-retry-overlay-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    });
+    client.listRuns = pagedMock([[]]);
+
+    const lagging = await provider.refresh();
+    if (lagging.status !== "fresh") throw new Error("expected a fresh lagging fixture");
+    expect(lagging.snapshot.runs).toEqual([accepted]);
+    expect(provider.getRunRetryRecovery()?.acceptedRun).toEqual(accepted);
+
+    const otherAppend = advancedRetryRun(retrySource, "attempt-fixture-other-retry-2");
+    client.listRuns = pagedMock([[runSummary(otherAppend)]]);
+    client.getRun = vi.fn().mockResolvedValue(otherAppend);
+    const otherAppendRefresh = await provider.refresh();
+    if (otherAppendRefresh.status !== "fresh") throw new Error("expected a fresh cross-wired fixture");
+    expect(otherAppendRefresh.snapshot.runs).toEqual([accepted]);
+    expect(provider.getRunRetryRecovery()?.acceptedRun).toEqual(accepted);
+
+    const conflicting = twoAdvancedRetryRuns(retrySource);
+    client.listRuns = pagedMock([[runSummary(conflicting)]]);
+    client.getRun = vi.fn().mockResolvedValue(conflicting);
+    const conflictingRefresh = await provider.refresh();
+    if (conflictingRefresh.status !== "fresh") throw new Error("expected a fresh conflicting fixture");
+    expect(conflictingRefresh.snapshot.runs).toEqual([accepted]);
+    expect(provider.getRunRetryRecovery()?.acceptedRun).toEqual(accepted);
+
+    client.cancelRun = vi.fn().mockResolvedValue(accepted);
+    await expect(provider.cancelRun(accepted.id, {
+      actionId: "renderer-action-cancel-overlay-0001",
+      streamEpoch: conflictingRefresh.snapshot.stream.epoch,
+      etag: accepted.etag,
+    })).resolves.toEqual(accepted);
+
+    client.listRuns = pagedMock([[runSummary(accepted)]]);
+    client.getRun = vi.fn().mockResolvedValue(accepted);
+    const converged = await provider.refresh();
+    expect(converged.status).toBe("fresh");
+    expect(provider.getRunRetryRecovery()).toBeNull();
+  });
+
+  it("restores an ambiguous exact retry after provider recreation", async () => {
+    const retrySource = failedRetrySourceRun();
+    const accepted = advancedRetryRun(retrySource);
+    const store = memoryRetryRecoveryStore();
+    const firstClient = mockClient();
+    firstClient.listRuns = pagedMock([[runSummary(retrySource)]]);
+    firstClient.getRun = vi.fn().mockResolvedValue(retrySource);
+    firstClient.retryRun = vi.fn().mockRejectedValue(new TypeError("response lost"));
+    const first = createProvider(firstClient, undefined, store);
+    const before = await first.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    const intent = {
+      actionId: "renderer-action-retry-restart-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    };
+    await expect(first.retryRun(retrySource.id, intent))
+      .rejects.toBeInstanceOf(DesktopProductAmbiguousMutationError);
+
+    const secondClient = mockClient();
+    secondClient.listRuns = pagedMock([[runSummary(retrySource)]]);
+    secondClient.getRun = vi.fn().mockResolvedValue(retrySource);
+    secondClient.retryRun = vi.fn().mockResolvedValue(accepted);
+    const second = createProvider(secondClient, undefined, store);
+    const afterRestart = await second.refresh();
+    if (afterRestart.status !== "fresh") throw new Error("expected a fresh restarted fixture");
+
+    expect(second.getRunRetryRecovery()?.intent).toEqual(intent);
+    await expect(second.retryRun(retrySource.id, intent)).resolves.toEqual(accepted);
+    expect(secondClient.retryRun).toHaveBeenCalledWith(retrySource.id, {
+      idempotencyKey: intent.actionId,
+      ifMatch: intent.etag,
+    });
+  });
+
+  it("does not send a retry when durable recovery cannot be written", async () => {
+    const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    const provider = createProvider(client, undefined, {
+      read: () => null,
+      write: () => { throw new Error("quota exhausted"); },
+    });
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+
+    await expect(provider.retryRun(retrySource.id, {
+      actionId: "renderer-action-retry-storage-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    })).rejects.toThrow(/could not save local retry recovery/i);
+    expect(client.retryRun).not.toHaveBeenCalled();
   });
 
   it("does not retain exact replay authority after a deterministic retry rejection", async () => {
@@ -430,7 +622,12 @@ describe("LocalApiDesktopProductProvider", () => {
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
     };
-    const provider = new LocalApiDesktopProductProvider({ client, native, fetch: vi.fn<FetchLike>() });
+    const provider = new LocalApiDesktopProductProvider({
+      client,
+      native,
+      fetch: vi.fn<FetchLike>(),
+      retryRecoveryStore: memoryRetryRecoveryStore(),
+    });
     const refreshed = await provider.refresh();
     if (refreshed.status !== "fresh") throw new Error("expected a fresh fixture");
     const epoch = refreshed.snapshot.stream.epoch;
@@ -590,7 +787,11 @@ function mockClient(): DesktopApiClientV1 & Record<string, ReturnType<typeof vi.
   } as unknown as DesktopApiClientV1 & Record<string, ReturnType<typeof vi.fn>>;
 }
 
-function createProvider(client: DesktopApiClientV1, fetch: FetchLike = vi.fn<FetchLike>()) {
+function createProvider(
+  client: DesktopApiClientV1,
+  fetch: FetchLike = vi.fn<FetchLike>(),
+  retryRecoveryStore: ProductRunRetryRecoveryStore | null = memoryRetryRecoveryStore(),
+) {
   return new LocalApiDesktopProductProvider({
     client,
     native: {
@@ -600,7 +801,16 @@ function createProvider(client: DesktopApiClientV1, fetch: FetchLike = vi.fn<Fet
     },
     fetch,
     reconnectDelaysMs: [],
+    retryRecoveryStore,
   });
+}
+
+function memoryRetryRecoveryStore(): ProductRunRetryRecoveryStore {
+  let value: string | null = null;
+  return {
+    read: () => value,
+    write: (next) => { value = next; },
+  };
 }
 
 function onlineState(pendingOperationIds: string[] = []) {
@@ -693,6 +903,115 @@ function projectInput() {
 
 function run(overrides: Record<string, unknown> = {}) {
   return runV1Schema.parse({ ...CONTRACT_FIXTURE_V1.run, ...overrides });
+}
+
+function advancedRetryRun(source = run(), attemptId = "attempt-fixture-retry-2") {
+  const current = source.current_attempt ?? source.attempts.at(-1);
+  if (!current) throw new Error("A retry fixture requires an original attempt.");
+  const queuedReason = {
+    code: "admission_pending" as const,
+    summary: "The retry was admitted.",
+    retry_after_seconds: null,
+  };
+  const appended = {
+    ...current,
+    id: attemptId,
+    number: source.attempt_count + 1,
+    status: "queued" as const,
+    queued_reason: queuedReason,
+    error: null,
+    started_at: null,
+    finished_at: null,
+  };
+  return runV1Schema.parse({
+    ...source,
+    status: "queued",
+    queued_reason: queuedReason,
+    current_attempt_id: appended.id,
+    current_attempt: appended,
+    current_error: null,
+    attempt_count: source.attempt_count + 1,
+    attempts: [...source.attempts, appended],
+    started_at: null,
+    finished_at: null,
+    etag: `"${"e".repeat(64)}"`,
+  });
+}
+
+function failedRetrySourceRun() {
+  const source = run();
+  const current = source.current_attempt ?? source.attempts.at(-1);
+  if (!current) throw new Error("A failed retry fixture requires an attempt.");
+  const error = apiErrorV1Schema.parse({
+    ...CONTRACT_FIXTURE_V1.error,
+    code: "session_execution_failed",
+    message: "The session failed.",
+    category: "run",
+  });
+  const failed = {
+    ...current,
+    status: "failed" as const,
+    queued_reason: null,
+    error,
+    started_at: current.started_at ?? NOW,
+    finished_at: NOW,
+  };
+  return runV1Schema.parse({
+    ...source,
+    status: "failed",
+    queued_reason: null,
+    current_attempt_id: failed.id,
+    current_attempt: failed,
+    current_error: error,
+    attempts: [failed],
+    finished_at: NOW,
+  });
+}
+
+function twoAdvancedRetryRuns(source: ReturnType<typeof failedRetrySourceRun>) {
+  const once = advancedRetryRun(source);
+  const firstRetry = once.current_attempt;
+  if (!firstRetry) throw new Error("A two-retry fixture requires its first retry.");
+  const failedError = apiErrorV1Schema.parse({
+    ...CONTRACT_FIXTURE_V1.error,
+    code: "session_execution_failed",
+    message: "The first retry failed.",
+    category: "run",
+  });
+  const failedFirstRetry = {
+    ...firstRetry,
+    status: "failed" as const,
+    queued_reason: null,
+    error: failedError,
+    started_at: NOW,
+    finished_at: NOW,
+  };
+  const queuedReason = {
+    code: "admission_pending" as const,
+    summary: "Another retry was admitted.",
+    retry_after_seconds: null,
+  };
+  const secondRetry = {
+    ...firstRetry,
+    id: "attempt-fixture-retry-3",
+    number: once.attempt_count + 1,
+    status: "queued" as const,
+    queued_reason: queuedReason,
+    error: null,
+    started_at: null,
+    finished_at: null,
+  };
+  return runV1Schema.parse({
+    ...once,
+    status: "queued",
+    queued_reason: queuedReason,
+    current_attempt_id: secondRetry.id,
+    current_attempt: secondRetry,
+    current_error: null,
+    attempt_count: once.attempt_count + 1,
+    attempts: [...once.attempts.slice(0, -1), failedFirstRetry, secondRetry],
+    etag: `"${"d".repeat(64)}"`,
+  });
 }
 
 function runWithId(id: string) {

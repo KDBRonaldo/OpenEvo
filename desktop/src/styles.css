@@ -33,6 +33,8 @@ pre.json {
 .product-shell,
 .product-boot {
   --focus-ring: #7abca5;
+  --accent: #176b5a;
+  --accent-hover: #125647;
 }
 
 .product-shell,
@@ -2226,6 +2228,16 @@ pre.json {
   color: #202622;
   background: #f3f5f3;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.product-boot .primary-button {
+  border-color: #176b5a;
+  background: #176b5a;
+}
+
+.product-boot .primary-button:hover:not(:disabled) {
+  border-color: #125647;
+  background: #125647;
 }
 
 .product-loading-row {

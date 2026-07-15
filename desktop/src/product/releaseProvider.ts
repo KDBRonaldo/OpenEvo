@@ -7,6 +7,7 @@ import {
   type ProjectSourceV1,
 } from "../api/v1/schemas";
 import { createLocalApiDesktopProductProvider } from "./localApiProvider";
+import type { ProductRunRetryRecoveryStore } from "./runRetryRecovery";
 import {
   type DesktopProductProvider,
   type ProjectSourceSelectionIntent,
@@ -35,6 +36,7 @@ export interface ReleaseProviderFactoryDependencies {
   readonly fetch?: FetchLike;
   readonly native?: ReleaseNativeBridge;
   readonly adapterFactory?: (context: ReleaseProviderAdapterContext) => Promise<DesktopProductProvider> | DesktopProductProvider;
+  readonly retryRecoveryStore?: ProductRunRetryRecoveryStore;
 }
 
 const tauriNativeBridge: ReleaseNativeBridge = {
@@ -101,7 +103,12 @@ export async function createReleaseDesktopProductProvider(
   };
   const provider = dependencies.adapterFactory
     ? await dependencies.adapterFactory(context)
-    : createLocalApiDesktopProductProvider({ client, native: context.native, fetch: dependencies.fetch });
+    : createLocalApiDesktopProductProvider({
+        client,
+        native: context.native,
+        fetch: dependencies.fetch,
+        retryRecoveryStore: dependencies.retryRecoveryStore,
+      });
   assertReleaseProvider(provider);
   return provider;
 }
@@ -114,5 +121,8 @@ function assertReleaseProvider(
   }
   if (typeof provider.retryRun !== "function") {
     throw new DesktopContractError("Release provider adapter is missing the run retry contract");
+  }
+  if (typeof provider.getRunRetryRecovery !== "function") {
+    throw new DesktopContractError("Release provider adapter is missing durable run retry recovery");
   }
 }

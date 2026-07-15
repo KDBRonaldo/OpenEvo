@@ -960,23 +960,37 @@ those identities, current attempt/error, `updated_at`, and strong ETag. A run
 has at most 100 attempts; detail embeds all of them in contiguous number order,
 and current attempt ID, number, status, error, and run ID must match the run.
 Retry creates a new attempt; it never rewrites a terminal attempt.
-After an ambiguous retry response, the renderer retains the complete original
-mutation intent: idempotency key, observed stream epoch, and ETag. ETag or status
+Before transport, the release provider persists a bounded recovery record with
+the complete original `RunV1`, Core project ID, idempotency key, observed stream
+epoch, and ETag. The record is non-secret, limited to 1 MiB of UTF-8 JSON, and
+stored under one versioned Desktop WebView key. Schema-invalid, oversized, or
+identity-inconsistent persisted data is deleted and fails that startup attempt;
+the user can then retry startup from a clean provider. This persistence lets a
+renderer remount or application restart recover the exact intent instead of
+minting another retry action.
+
+After an ambiguous retry response, the provider and renderer retain that
+complete mutation intent. ETag or status
 churn without advancement cannot replace that intent; an explicit retry replays
 it exactly, even if later refreshes have advanced the renderer epoch. This is a
 single-run exact-replay exception in the release provider; a new intent or an
 intent for another run must satisfy the current snapshot preconditions. Bounded
 authoritative polling starts only after the mutation has become ambiguous. A
-typed API rejection is deterministic, clears the exact-replay authority, and
-does not start that polling. Reconciliation succeeds only when the same run
-preserves the canonical complete original attempt prefix and contains exactly
-one appended current attempt. A missing run, a rewritten terminal attempt,
-multiple appended attempts, or ETag/status churn without that one append is not
-success and cannot clear the retry error. A validated retry response carrying
-the same proof is authoritative for the run. The renderer overlays that response
-over every lagging or omitting aggregate snapshot until a fresh Core aggregate
-independently proves the same append; one later stale aggregate cannot erase the
-accepted retry or expose a duplicate action.
+typed API rejection is deterministic: the provider clears recovery before the
+renderer performs any conflict refresh, so a concurrent append cannot turn that
+request into success or erase its error.
+
+The release provider validates every 2xx retry response before returning it. The
+same run and project must preserve the canonical complete original attempt prefix
+and contain exactly one appended current attempt. A missing run, a rewritten
+terminal attempt, another project, a different appended attempt after response
+acceptance, multiple appended attempts, or ETag/status churn without that one
+append is not success and cannot clear recovery. A validated response is written
+back to the recovery record and overlaid into the provider's own snapshot as well
+as the renderer. All subsequent reads and mutations therefore use the same run.
+Every lagging, omitting, or otherwise non-proving aggregate remains behind that
+overlay, regardless of its attempt count, until a fresh Core aggregate
+independently proves the same appended attempt ID and prefix.
 
 Evolution is cross-session. A successful task seals its dataset, runs every
 enabled target, validates and materializes all outputs, and then atomically

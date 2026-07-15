@@ -174,9 +174,13 @@ transport or response-validation outcome. The release provider may replay that
 same run ID, idempotency key, ETag, and observed renderer epoch after later
 refreshes advance the view; a new or cross-wired intent must pass the current
 snapshot checks. A typed API rejection ends this replay authority immediately
-and does not start reconciliation polling. When a validated retry response
-proves one appended attempt, Desktop keeps that run visible until a fresh Core
-aggregate independently contains the same canonical attempt prefix and append.
+and does not start reconciliation polling. Before transport, the provider saves
+a bounded, non-secret copy of the original run and intent in Desktop's persistent
+WebView storage so a renderer or application restart cannot mint a second action.
+A 2xx response is accepted only when it preserves the complete canonical prefix,
+same project, and exactly one new current attempt. The provider then overlays the
+validated run into both its own cache and the renderer until a fresh Core
+aggregate independently proves that same appended attempt.
 
 Current release smoke checks are pre-External-Beta maintainer checks. They
 validate Core Backend wheel identity and Desktop asset packaging, but they do
