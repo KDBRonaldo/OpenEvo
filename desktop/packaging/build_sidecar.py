@@ -21,8 +21,14 @@ import tomllib
 from urllib.request import urlopen
 from zipfile import BadZipFile, ZipFile
 
+from openevo.evolution.framework.runtime import (
+    FrameworkDistributionLock,
+    load_framework_distribution_lock,
+)
+
 SIDECAR_NAME = "openevo-desktop-sidecar"
 CORE_WHEEL_ARCHIVE_ROOT = Path("openevo/wheels")
+CORE_FRAMEWORK_LOCK_BASENAME = "framework-lock.json"
 FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
     {
         "openevo/evolution/terminal_bench_bridge.py",
@@ -426,6 +432,74 @@ def _validate_core_wheel(wheel: Path, *, name: str, version: str) -> None:
         )
 
 
+def _core_framework_lock_bytes(wheel: Path, *, version: str) -> bytes:
+    try:
+        wheel_payload = wheel.read_bytes()
+        lock = FrameworkDistributionLock(
+            distribution_version=version,
+            distribution_digest=_sha256_bytes(wheel_payload),
+            wheel_filename=wheel.name,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Core wheel cannot produce a valid framework lock identity") from exc
+    return (
+        json.dumps(lock.model_dump(mode="json"), separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def _validated_framework_lock(payload: bytes) -> FrameworkDistributionLock:
+    try:
+        lock = FrameworkDistributionLock.model_validate_json(payload)
+    except ValueError as exc:
+        raise RuntimeError("Core framework lock is invalid") from exc
+    canonical = (
+        json.dumps(lock.model_dump(mode="json"), separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if payload != canonical:
+        raise RuntimeError("Core framework lock is not canonical")
+    return lock
+
+
+def _load_exact_framework_lock(
+    framework_lock: Path,
+    wheel: Path,
+    *,
+    version: str,
+) -> FrameworkDistributionLock:
+    try:
+        lock, locked_wheel = load_framework_distribution_lock(framework_lock)
+        payload = framework_lock.read_bytes()
+        resolved_wheel = wheel.resolve(strict=True)
+        resolved_locked_wheel = locked_wheel.resolve(strict=True)
+        wheel_digest = _sha256_bytes(resolved_wheel.read_bytes())
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("Core framework lock cannot be loaded") from exc
+    canonical_lock = _validated_framework_lock(payload)
+    if lock != canonical_lock:
+        raise RuntimeError("Core framework lock loader returned a different identity")
+    if (
+        resolved_locked_wheel != resolved_wheel
+        or lock.distribution != "openevo"
+        or lock.distribution_version != version
+        or lock.distribution_digest != wheel_digest
+        or lock.wheel_filename != wheel.name
+    ):
+        raise RuntimeError("Core framework lock does not bind the exact built wheel")
+    return lock
+
+
+def _write_core_framework_lock(wheel: Path, *, version: str) -> Path:
+    framework_lock = wheel.parent / CORE_FRAMEWORK_LOCK_BASENAME
+    payload = _core_framework_lock_bytes(wheel, version=version)
+    try:
+        with framework_lock.open("xb") as stream:
+            stream.write(payload)
+    except FileExistsError as exc:
+        raise RuntimeError("refusing to replace an existing Core framework lock") from exc
+    _load_exact_framework_lock(framework_lock, wheel, version=version)
+    return framework_lock
+
+
 def _copy_core_build_source(repo: Path, destination: Path) -> None:
     destination.mkdir()
     for filename in ("pyproject.toml", "README.md", "LICENSE"):
@@ -780,6 +854,53 @@ def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
     return source_digest
 
 
+def _validate_embedded_core_framework_lock(
+    executable: Path,
+    wheel: Path,
+    framework_lock: Path,
+    *,
+    version: str,
+) -> str:
+    expected_wheel = (CORE_WHEEL_ARCHIVE_ROOT / wheel.name).as_posix()
+    expected_lock = (CORE_WHEEL_ARCHIVE_ROOT / CORE_FRAMEWORK_LOCK_BASENAME).as_posix()
+    archive_root = CORE_WHEEL_ARCHIVE_ROOT.as_posix()
+    embedded_release_inputs = sorted(
+        name
+        for name in _archive_member_names(executable)
+        if name == archive_root or name.startswith(f"{archive_root}/")
+    )
+    expected_release_inputs = sorted((expected_wheel, expected_lock))
+    if embedded_release_inputs != expected_release_inputs:
+        raise RuntimeError(
+            "sidecar archive does not contain the exact Core release inputs: "
+            f"expected {expected_release_inputs}, found {embedded_release_inputs}"
+        )
+
+    expected_payload = _core_framework_lock_bytes(wheel, version=version)
+    try:
+        source_payload = framework_lock.read_bytes()
+    except OSError as exc:
+        raise RuntimeError("Core framework lock is unavailable") from exc
+    if source_payload != expected_payload:
+        raise RuntimeError("staged Core framework lock differs from the exact built wheel")
+    _load_exact_framework_lock(framework_lock, wheel, version=version)
+
+    embedded_payload = _archive_member_bytes(executable, expected_lock)
+    if embedded_payload != source_payload:
+        raise RuntimeError("sidecar embedded Core framework lock differs from the staged lock")
+    with TemporaryDirectory(prefix="openevo-embedded-core-lock-") as temporary_dir:
+        embedded_root = Path(temporary_dir)
+        embedded_wheel = embedded_root / wheel.name
+        embedded_lock = embedded_root / CORE_FRAMEWORK_LOCK_BASENAME
+        embedded_wheel.write_bytes(_archive_member_bytes(executable, expected_wheel))
+        embedded_lock.write_bytes(embedded_payload)
+        try:
+            _load_exact_framework_lock(embedded_lock, embedded_wheel, version=version)
+        except RuntimeError as exc:
+            raise RuntimeError("sidecar embedded Core framework lock identity is invalid") from exc
+    return _sha256_bytes(source_payload)
+
+
 def _validate_embedded_product_web(
     executable: Path,
     desktop_root: Path,
@@ -852,6 +973,11 @@ def build_sidecar(
     with TemporaryDirectory(prefix="openevo-sidecar-build-") as temporary_dir:
         temporary_root = Path(temporary_dir)
         core_wheel = _build_core_wheel(repo, temporary_root / "core")
+        _, core_version = _project_identity(repo)
+        core_framework_lock = _write_core_framework_lock(
+            core_wheel,
+            version=core_version,
+        )
         product_web_digest = _build_product_web(desktop_root)
         pyinstaller_root = _prepare_fd_bound_pyinstaller(
             repo,
@@ -888,6 +1014,8 @@ def build_sidecar(
             "openevo",
             "--add-data",
             f"{core_wheel}{os.pathsep}{CORE_WHEEL_ARCHIVE_ROOT.as_posix()}",
+            "--add-data",
+            f"{core_framework_lock}{os.pathsep}{CORE_WHEEL_ARCHIVE_ROOT.as_posix()}",
             "--add-data",
             f"{static_root}{os.pathsep}desktop/packaging/web",
             "--add-data",
@@ -927,10 +1055,20 @@ def build_sidecar(
             raise RuntimeError(f"PyInstaller did not produce expected sidecar: {built}")
         _validate_fd_bound_bootloader(built)
         _validate_embedded_core_wheel(built, core_wheel)
+        _validate_embedded_core_framework_lock(
+            built,
+            core_wheel,
+            core_framework_lock,
+            version=core_version,
+        )
         _validate_embedded_product_web(built, desktop_root, product_web_digest)
 
         if core_wheel_output_dir is not None:
             _copy_exclusive(core_wheel, core_wheel_output_dir / core_wheel.name)
+            _copy_exclusive(
+                core_framework_lock,
+                core_wheel_output_dir / CORE_FRAMEWORK_LOCK_BASENAME,
+            )
 
         shutil.copy2(built, target)
         target.chmod(0o755)
@@ -947,7 +1085,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--core-wheel-output-dir",
         type=Path,
-        help="Preserve the exact embedded Core wheel in this generated output directory.",
+        help="Preserve the exact embedded Core wheel and framework lock in this output directory.",
     )
     args = parser.parse_args(argv)
     target = build_sidecar(

@@ -106,6 +106,34 @@ def test_validate_core_wheel_rejects_project_identity_mismatch(tmp_path: Path) -
         builder._validate_core_wheel(wheel, name="openevo", version="0.1.0")
 
 
+def test_core_framework_lock_is_canonical_and_bound_to_exact_wheel(tmp_path: Path) -> None:
+    builder = _load_builder()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+
+    framework_lock = builder._write_core_framework_lock(wheel, version="0.1.0")
+
+    expected = {
+        "schema_version": "1",
+        "distribution": "openevo",
+        "distribution_version": "0.1.0",
+        "distribution_digest": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        "wheel_filename": wheel.name,
+    }
+    assert framework_lock == tmp_path / "framework-lock.json"
+    assert framework_lock.read_bytes() == (
+        json.dumps(expected, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("utf-8")
+    assert (
+        builder._load_exact_framework_lock(
+            framework_lock,
+            wheel,
+            version="0.1.0",
+        ).model_dump(mode="json")
+        == expected
+    )
+
+
 def test_validate_core_wheel_rejects_nested_wheel(tmp_path: Path) -> None:
     builder = _load_builder()
     wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
@@ -291,11 +319,13 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     commands: list[str] = []
     embedded_wheel: Path | None = None
     embedded_bytes: bytes | None = None
+    embedded_lock: Path | None = None
+    embedded_lock_bytes: bytes | None = None
 
     pyinstaller_root = repo / "fd-bound-pyinstaller"
 
     def fake_run(command, *, check, cwd, **kwargs):
-        nonlocal embedded_bytes, embedded_wheel
+        nonlocal embedded_bytes, embedded_lock, embedded_lock_bytes, embedded_wheel
         assert check is True
         if command[:3] == ["npm", "run", "build:openevo"]:
             assert not kwargs
@@ -324,13 +354,28 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
             commands.append("PyInstaller")
             assert Path(cwd) == repo
             assert ("--clean" in command) is clean
-            add_data = command[command.index("--add-data") + 1]
-            source_value, destination = add_data.rsplit(os.pathsep, 1)
-            embedded_wheel = Path(source_value)
+            add_data = [
+                command[index + 1]
+                for index, value in enumerate(command[:-1])
+                if value == "--add-data"
+            ]
+            core_data = {
+                Path(source_value).name: (Path(source_value), destination)
+                for source_value, destination in (
+                    value.rsplit(os.pathsep, 1) for value in add_data
+                )
+                if destination == "openevo/wheels"
+            }
+            embedded_wheel, wheel_destination = core_data[
+                "openevo-0.1.0-py3-none-any.whl"
+            ]
+            embedded_lock, lock_destination = core_data["framework-lock.json"]
             assert embedded_wheel.name == "openevo-0.1.0-py3-none-any.whl"
             assert embedded_wheel.is_file()
             embedded_bytes = embedded_wheel.read_bytes()
-            assert destination == "openevo/wheels"
+            assert embedded_lock.is_file()
+            embedded_lock_bytes = embedded_lock.read_bytes()
+            assert wheel_destination == lock_destination == "openevo/wheels"
             assert not any(
                 command[index : index + 2] == ["--collect-data", "openevo"]
                 for index in range(len(command) - 1)
@@ -356,6 +401,7 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         "_archive_member_names",
         lambda _: (
             "openevo/wheels/openevo-0.1.0-py3-none-any.whl",
+            "openevo/wheels/framework-lock.json",
             *(
                 f"desktop/packaging/web/{path.relative_to(repo / 'desktop/packaging/web').as_posix()}"
                 for path in sorted((repo / "desktop/packaging/web").rglob("*"))
@@ -372,7 +418,11 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         builder,
         "_archive_member_bytes",
         lambda _, member: (
-            embedded_bytes if member.startswith("openevo/wheels/") else web_payloads[member]
+            embedded_bytes
+            if member.endswith(".whl")
+            else embedded_lock_bytes
+            if member == "openevo/wheels/framework-lock.json"
+            else web_payloads[member]
         ),
     )
 
@@ -391,10 +441,13 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         "openevo-0.1.0-py3-none-any.whl"
     ]
     assert next(wheel_output.glob("*.whl")).read_bytes() == embedded_bytes
+    assert (wheel_output / "framework-lock.json").read_bytes() == embedded_lock_bytes
     assert (stale_stage / "stale.whl").read_text(encoding="utf-8") == "stale"
     assert (generic_build / "user-output.txt").read_text(encoding="utf-8") == "keep"
     assert embedded_wheel is not None
     assert not embedded_wheel.exists()
+    assert embedded_lock is not None
+    assert not embedded_lock.exists()
 
 
 def test_fd_bound_bootloader_patch_is_exact_and_cross_platform(
@@ -670,3 +723,109 @@ def test_sidecar_archive_rejects_embedded_core_wheel_digest_mismatch(
 
     with pytest.raises(RuntimeError, match="digest does not match"):
         builder._validate_embedded_core_wheel(executable, wheel)
+
+
+def test_sidecar_archive_requires_exact_wheel_bound_framework_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"sidecar")
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    framework_lock = builder._write_core_framework_lock(wheel, version="0.1.0")
+    wheel_member = "openevo/wheels/openevo-0.1.0-py3-none-any.whl"
+    lock_member = "openevo/wheels/framework-lock.json"
+    payloads = {
+        wheel_member: wheel.read_bytes(),
+        lock_member: framework_lock.read_bytes(),
+    }
+    monkeypatch.setattr(builder, "_archive_member_names", lambda _: tuple(payloads))
+    monkeypatch.setattr(builder, "_archive_member_bytes", lambda _, name: payloads[name])
+
+    builder._validate_embedded_core_framework_lock(
+        executable,
+        wheel,
+        framework_lock,
+        version="0.1.0",
+    )
+
+    payloads[lock_member] = payloads[lock_member].replace(b'"0.1.0"', b'"9.9.9"')
+    with pytest.raises(RuntimeError, match="framework lock differs"):
+        builder._validate_embedded_core_framework_lock(
+            executable,
+            wheel,
+            framework_lock,
+            version="0.1.0",
+        )
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        ("openevo/wheels/openevo-0.1.0-py3-none-any.whl",),
+        (
+            "openevo/wheels/openevo-0.1.0-py3-none-any.whl",
+            "openevo/wheels/framework-lock.json",
+            "openevo/wheels/stale.json",
+        ),
+        (
+            "openevo/wheels/openevo-0.1.0-py3-none-any.whl",
+            "openevo/wheels/framework-lock.json",
+            "openevo/wheels/../escaped.json",
+        ),
+    ],
+)
+def test_sidecar_archive_rejects_non_closed_core_release_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    members: tuple[str, ...],
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"sidecar")
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    framework_lock = builder._write_core_framework_lock(wheel, version="0.1.0")
+    monkeypatch.setattr(builder, "_archive_member_names", lambda _: members)
+
+    with pytest.raises(RuntimeError, match="exact Core release inputs"):
+        builder._validate_embedded_core_framework_lock(
+            executable,
+            wheel,
+            framework_lock,
+            version="0.1.0",
+        )
+
+
+def test_sidecar_archive_rejects_framework_lock_for_another_wheel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"sidecar")
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    other_wheel = tmp_path / "other" / wheel.name
+    _write_core_wheel(wheel)
+    _write_core_wheel(other_wheel)
+    with ZipFile(other_wheel, "a") as archive:
+        archive.writestr("openevo/other.py", b"different")
+    framework_lock = builder._write_core_framework_lock(other_wheel, version="0.1.0")
+    wheel_member = "openevo/wheels/openevo-0.1.0-py3-none-any.whl"
+    lock_member = "openevo/wheels/framework-lock.json"
+    payloads = {
+        wheel_member: wheel.read_bytes(),
+        lock_member: framework_lock.read_bytes(),
+    }
+    monkeypatch.setattr(builder, "_archive_member_names", lambda _: tuple(payloads))
+    monkeypatch.setattr(builder, "_archive_member_bytes", lambda _, name: payloads[name])
+
+    with pytest.raises(RuntimeError, match="exact built wheel|identity is invalid"):
+        builder._validate_embedded_core_framework_lock(
+            executable,
+            wheel,
+            framework_lock,
+            version="0.1.0",
+        )

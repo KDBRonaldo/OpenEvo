@@ -97,6 +97,9 @@ jobs:
           mkdir "$GITHUB_WORKSPACE/.candidate-remote-wheel"
           python packaging/build_sidecar.py \
             --core-wheel-output-dir "$GITHUB_WORKSPACE/.candidate-remote-wheel"
+          test "$(find "$GITHUB_WORKSPACE/.candidate-remote-wheel" -maxdepth 1 -type f -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          test -f "$GITHUB_WORKSPACE/.candidate-remote-wheel/framework-lock.json"
+          test "$(find "$GITHUB_WORKSPACE/.candidate-remote-wheel" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = 2
           sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
           test -x "$sidecar"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"

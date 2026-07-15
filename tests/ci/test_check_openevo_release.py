@@ -1175,6 +1175,11 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert "name: Build and smoke packaged Desktop sidecar" in text
     assert "uv run python desktop/packaging/build_sidecar.py" in text
     assert "--core-wheel-output-dir .openevo-remote-wheel" in text
+    assert "test -f .openevo-remote-wheel/framework-lock.json" in text
+    assert (
+        "find .openevo-remote-wheel -mindepth 1 -maxdepth 1 -type f | wc -l"
+        in text
+    )
     assert "scripts/ci/smoke_openevo_desktop_sidecar.py" in text
     assert "name: Build outer smoke wheel from isolated source" in text
     assert "python -m build --wheel --outdir .openevo-remote-wheel" not in text
@@ -1287,6 +1292,7 @@ def test_desktop_candidate_workflow_builds_and_smokes_unsigned_dmg_without_publi
         "npm run typecheck",
         "packaging/build_sidecar.py",
         "--core-wheel-output-dir",
+        "framework-lock.json",
         "smoke_openevo_remote_capabilities.py",
         "cargo fmt --check",
         "cargo clippy --locked --release --all-targets -- -D warnings",
@@ -1362,6 +1368,8 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "PyInstaller" in sidecar_builder_text
     assert "_build_core_wheel" in sidecar_builder_text
     assert "_validate_embedded_core_wheel" in sidecar_builder_text
+    assert "_write_core_framework_lock" in sidecar_builder_text
+    assert "_validate_embedded_core_framework_lock" in sidecar_builder_text
     assert "--add-data" in sidecar_builder_text
     assert "desktop/packaging/web" in sidecar_builder_text
     assert "sidecar-build-metadata.json" in sidecar_builder_text

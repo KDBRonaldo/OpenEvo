@@ -70,6 +70,9 @@ jobs:
         run: |
           uv run python desktop/packaging/build_sidecar.py \
             --core-wheel-output-dir .openevo-remote-wheel
+          test "$(find .openevo-remote-wheel -maxdepth 1 -type f -name 'openevo-*.whl' | wc -l)" -eq 1
+          test -f .openevo-remote-wheel/framework-lock.json
+          test "$(find .openevo-remote-wheel -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
           uv run python scripts/ci/smoke_openevo_desktop_sidecar.py \
             "desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)" \
             --timeout-seconds 60

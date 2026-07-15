@@ -34,9 +34,15 @@ The repository currently provides:
   and `src/` into an exclusive temporary directory, excluding wheel, egg-info,
   and cache content. It builds the exact Core wheel there with the locked
   `setuptools` and `wheel` using `python -m build --no-isolation`, verifies its
-  name/version metadata, and passes that exact file to PyInstaller with
-  `--add-data` at `openevo/wheels`. Archive inspection requires one matching
-  member whose byte SHA-256 equals the built and optionally exported wheel;
+  name/version metadata, and creates a canonical `framework-lock.json` through
+  Core's closed `FrameworkDistributionLock` model. The Core lock loader must
+  resolve that lock back to the exact wheel filename, version, and SHA-256 before
+  either file becomes a release input. PyInstaller receives that same verified
+  wheel/lock pair with `--add-data` at `openevo/wheels`; optional release-input
+  export preserves the same two bytes. Archive inspection requires the resource
+  root to be the closed set of exactly one wheel and one lock, rejects additional
+  and path-escaping members, rechecks both source digests, and reloads the
+  extracted pair through the Core lock loader;
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;
@@ -563,8 +569,8 @@ an all-zero placeholder. Development and test apps must inject their source
 commit and non-release channel explicitly. There is no direct-backend fallback.
 
 Packaged release startup resolves `openevo/wheels` only beneath the absolute
-PyInstaller extraction root. The sidecar requires that directory to contain
-exactly one Core wheel and one canonical `framework-lock.json`; it verifies
+PyInstaller extraction root. The builder and sidecar both require that directory
+to contain exactly one Core wheel and one canonical `framework-lock.json`; they verify
 owner/mode/link identity, bounded byte size, SHA-256, directory binding, and the
 exact lock-to-wheel relationship through no-follow descriptors. The release
 source commit used for remote bootstrap must be the full 40-character commit
