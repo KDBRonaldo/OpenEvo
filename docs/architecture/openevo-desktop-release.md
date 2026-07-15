@@ -1,9 +1,9 @@
 # OpenEvo Desktop Release Packaging
 
-> Pre-release status: the current repository contains Tauri packaging
-> scaffolding, but the External Beta release workflow is intentionally disabled.
-> The manual Desktop candidate workflow builds and smokes an unsigned DMG as a
-> short-lived Actions artifact; it does not upload or publish a GitHub Release.
+> Pre-release status: final External Beta publication remains disabled. The
+> stable-only manual workflow builds and validates an unsigned candidate, leaves
+> it as a draft GitHub prerelease after upload/download verification, and never
+> signs, notarizes, or publishes that draft.
 
 The canonical release requirements live in
 `docs/maintainer/productization/spec.md`. This document defines the packaging
@@ -142,57 +142,27 @@ The repository currently provides:
   `FSRef` to `FSUnlinkObject` probe through the release cleanup implementation;
   the Linux job owns the actual `openevo-core-service` lifecycle and frozen
   registry identity smoke;
-- `.github/workflows/openevo-desktop-candidate.yml`, a manual macOS candidate
-  job that uses locked inputs, clean-installs the exact embedded Core wheel,
-  runs renderer and release-mode Rust checks, builds the unsigned DMG, mounts
-  and copies its app bundle, smokes the copied sidecar and native application,
-  validates canonical names/checksums, and retains the candidate for 14 days as
-  an Actions artifact;
+- `.github/workflows/openevo-desktop-candidate.yml`, a stable-only manual
+  candidate workflow. Its macOS job uses locked inputs, clean-installs the exact
+  embedded Core wheel, runs renderer and release-mode Rust checks, and builds
+  only the architecture reported by `rustc --print host-tuple`. Both the raw app
+  bundle and the app copied from the mounted DMG launch the real
+  `Contents/MacOS` Tauri executable. The smoke records a visible renderer
+  window, packaged sidecar readiness, inherited listener FD 3, executable FD 4
+  matching the bundled externalBin bytes, and bounded process-group cleanup.
+  The dependent Linux job downloads the complete candidate manifest and
+  installs, framework-verifies, and service-smokes the same final Core wheel
+  bytes. Only after both jobs pass does a write-scoped job create an unsigned
+  draft prerelease, upload every manifest member, download every asset into an
+  empty directory, revalidate the closed inventory, and compare all bytes;
 - a disabled `.github/workflows/openevo-release-artifact.yml` placeholder that
   publishes nothing.
 
-The candidate workflow is packaging feedback, not DMG release evidence: it does
-not complete the ordinary science E2E, create/redownload a draft GitHub Release,
-or authorize a public tag. The executable sidecar smoke proves
-its local health/static-asset path, discovery of the embedded Core wheel plus
-framework lock, and its token-protected capability proxy against a real backend.
-The native application smoke uses component-relative no-follow descriptors for
-the bundle path, `Contents`, `Info.plist`, `MacOS`, and the executable named by
-`CFBundleExecutable`. On Darwin it first canonicalizes only the bundle parent so
-the root-owned `/var` to `/private/var` system alias does not become a fake
-directory component; it never resolves the `.app` itself. It then starts at the
-filesystem root and opens every canonical parent component. Every directory, the regular link-count-one `Info.plist`, and
-the regular executable must be owned by root or the current effective UID and
-must reject group/other write; the executable must additionally be
-link-count-one and executable. Root execution consequently accepts only
-root-owned components. The smoke records descriptor and pathname identity and
-rechecks the complete chain before `Popen`, in the child immediately before
-exec, and after the spawn handshake. Detected symlink, ownership, mode, hardlink,
-directory, or leaf replacement fails closed.
-
-Linux regression tests continue to execute the held executable through
-`/proc/self/fd`. Darwin launches the original
-`Contents/MacOS/CFBundleExecutable` pathname because Mach-O execution through
-`/dev/fd` returns `EACCES` and would also break normal bundle-relative resource
-discovery. The final pathname check and `execve` cannot be made one atomic
-operation on Darwin. A process running as the same effective UID can therefore
-race that final gap; same-UID mutation is explicitly inside this smoke trust
-boundary. Only the macOS candidate job proves that the real copied Mach-O app
-launches and resolves its bundle resources under this policy. Linux tests prove
-the no-follow chain and replacement checks but are not macOS launch evidence.
-The release renderer reports readiness only after
-Local API negotiation. Tauri performs a non-reaping leader check, reproves the
-private sidecar session, and then rechecks the same managed instance, lifecycle,
-contract, and leader under the manager lock before accepting that report. This
-proves that the mounted and copied application reaches the React renderer
-through Tauri IPC and its live local sidecar. It does not prove remote bootstrap
-or completion of the science workflow.
-
-The release workflow's outer smoke installs Core and exercises it through the
-Desktop harness imported from the source checkout. Its workflow and script names
-must not be interpreted as packaged Desktop evidence. The outer smoke wheel is
-assembled from a separate temporary source tree, so staging its embedded Core
-wheel does not alter `src/openevo/wheels` in the checkout.
+The candidate workflow proves the native packaging, exact-byte transfer, Core
+service, minimal dependency/license/security, and draft-asset roundtrip named
+above. It does not complete the ordinary science E2E, benchmark gates,
+secret-canary/privacy suite, code signing, notarization, or final publication,
+and its candidate tag is not a public release authorization.
 
 ### Native host trust boundary, phase one
 
@@ -249,25 +219,19 @@ same-UID process. Its owner retains a directory FD and performs only an
 identity-checked, non-recursive `rmdir`, so pathname replacement cannot cause
 recursive deletion.
 
-The native launch protocol reserves inherited FD 3 for the already-listening
-loopback socket and inherited FD 4 for the verified onefile archive. It sets
-`OPENEVO_NATIVE_LISTENER_FD=3` and `OPENEVO_NATIVE_EXECUTABLE_FD=4`; either
-marker without the other, any other descriptor number, a non-listening FD 3,
-or a non-regular FD 4 fails closed. Linux execution and archive reads use FD 4
-through `/proc/self/fd/4`.
+Linux execution and archive reads use inherited FD 4 through `/proc/self/fd/4`.
 On macOS, archive reads still use verified FD 4 through `/dev/fd/4`, but the
 PyInstaller onefile parent cannot use that device path for its later child
 `execvp`. The native host therefore supplies a second non-secret, closed
 environment field, `OPENEVO_NATIVE_EXECUTABLE_PATH`, containing only the private
 `.../openevo-desktop-sidecar` pathname whose final inode was matched to FD 4 in
-the Rust `pre_exec` hook. All three names must be removed from the inherited
-environment before the native host sets its own values; Linux must leave the
-pathname field absent.
+the Rust `pre_exec` hook. `OPENEVO_NATIVE_EXECUTABLE_FD` remains exactly `4`.
+Both names must be removed from the inherited environment allowlist before the
+native host sets its own values; Linux must leave the pathname field absent.
 
-The custom bootloader treats the listener marker, archive marker, and optional
-macOS path as one closed protocol. A path without both FD markers, a macOS FD
-launch without the path, or a Linux FD launch with the path fails closed. On
-macOS it requires an absolute
+The custom bootloader treats the two values as one protocol. A path without the
+FD marker, an FD value other than `4`, a macOS FD launch without the path, or a
+Linux FD launch with the path fails closed. On macOS it requires an absolute
 path with the fixed basename and no control or dot-segment components, then
 compares both the original and resolved pathname `lstat` identities with
 `fstat(4)`, requires a link-count-one regular file, rejects group/world write,
@@ -275,19 +239,9 @@ and accepts only root or effective-user ownership. It resolves parent-component
 aliases such as macOS `/var` to `/private/var` within those checks.
 `pyi_ctx->executable_filename`
 receives that resolved private path solely for onefile child execution;
-before onefile extraction can reuse the low descriptor numbers, the bootloader
-validates FD 3 with `SO_ACCEPTCONN`, validates FD 4 as a regular file, and
-duplicates both to dynamically allocated guard descriptors at or above 64.
-Every bootloader restart and onefile child `execvp` restores FD 3 and FD 4 with
-`dup2`, clears `FD_CLOEXEC`, and repeats the type/listener checks. The child
-closes the guard duplicates before entering Python, while retaining FD 3 for
-Uvicorn and FD 4 for the full process lifetime. PyInstaller continues to verify
-its archive path against FD 4 after Python entry, so closing or repurposing that
-descriptor is a fatal protocol violation. This avoids collisions with archive
-extraction opens without exposing an additional fixed inherited descriptor.
 `_pyi_main_resolve_pkg_archive` independently opens
 `/dev/fd/4`, so parent and child archive bytes remain FD-bound. The packaged
-Python entry point removes all protocol fields before launcher `main` runs.
+Python entry point removes both protocol fields before launcher `main` runs.
 
 The sidecar builder downloads only the exact size/SHA-256 PyInstaller sdist
 recorded in `uv.lock`, applies exact-source resolver and archive patches, and
@@ -313,16 +267,13 @@ The native host binds the loopback listener before spawn and transfers that
 already-bound socket on inherited FD 3, removing the release-and-rebind port
 window. Native code sends exactly one UTF-8 JSON frame of at most 512 bytes over
 the child's stdin and then closes the pipe. Its exact keys are `protocol`,
-`instance_id`, `readiness_key`, `session_token`, and `handoff_token`; protocol
-is `openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and all three
-credentials are independently generated 256-bit values encoded as 64 lowercase
-hexadecimal characters. Duplicate, missing, unknown,
+`instance_id`, `readiness_key`, and `session_token`; protocol is
+`openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and both credentials
+are independently generated 256-bit values. Duplicate, missing, unknown,
 malformed, or trailing input is rejected by the strict sidecar integration.
 The packaged Python launcher applies the same 512-byte bound, requires the
-closed five-key object and lowercase fixed-width hex values. It passes the
-instance ID, readiness key, and session token directly to
-`create_release_desktop_local_api_app`, and retains the handoff token only for
-the hidden native workspace-import routes. It
+closed four-key object and lowercase fixed-width hex values, and passes all
+three native values directly to `create_release_desktop_local_api_app`. It
 mounts only that release Local API and the audited product web. It does not
 construct the legacy sidecar app, expose `/openevo-api/*`, translate the Desktop
 session header into a legacy mutation token, or accept a backend base URL. Its
@@ -402,37 +353,6 @@ for both the superseded bootstrap and native stop to settle before invoking
 in-flight start, allowing the native cancellation epoch and bounded join path to
 reclaim a not-yet-published child. Therefore a release startup retry crosses a
 real native lifecycle boundary and cannot adopt the failed attempt's credential.
-Immediately after `Command::spawn` returns, the native host reads the sidecar
-leader's kernel birth identity (`/proc/<pid>/stat` start ticks on Linux or
-`PROC_PIDTBSDINFO` start time on macOS) and its kernel PGID and SID. It requires
-`PID == PGID == SID`, stores all four process identity dimensions in the
-manager-owned slot, and emits the internal sidecar-process marker immediately.
-The marker contains only the non-secret instance ID, PID, PGID, SID, and
-platform-tagged birth identity; it is native-smoke evidence, not an HTTP or
-renderer contract. This evidence publication is independent of renderer
-connection and readiness.
-
-Before exposing the product shell, the renderer invokes the internal
-`renderer_ready` command with the checked-in Local API digest. The native host
-rejects the report unless the same digest belongs to the currently running
-managed sidecar, its unreaped leader is still live, and its retained credential
-still proves both authenticated acceptance and unauthenticated rejection. The
-session probe runs without the manager lock; before emitting the fixed
-renderer-ready marker, native code reacquires the lock and requires the same
-random instance, endpoint, lifecycle, contract, and a second non-reaping leader
-check. It rereads PID, PGID, SID, and birth identity and requires an exact match
-with the spawn-time identity. `renderer_ready` does not re-emit sidecar process
-evidence.
-
-The Python smoke captures native output from process start and validates the
-sidecar marker's PID, PGID, SID, and birth identity against the live process
-before accepting renderer readiness. It drains complete evidence again at
-normal, timeout, error, and pre-readiness-exit boundaries before terminating the
-app's separate session. It then waits a bounded interval for the Rust
-parent-liveness watchdog to remove the exact sidecar group and requires the
-group to disappear. A surviving identity-bound group receives TERM and then
-bounded KILL escalation, and still makes the smoke red, so a passing or failing
-smoke cannot leave its observed sidecar group behind.
 
 Release policy does not read `OPENEVO_DESKTOP_SIDECAR_COMMAND`,
 `OPENEVO_DESKTOP_SIDECAR_PROGRAM`,
@@ -444,9 +364,8 @@ in addition to this fixed product override list. It has no `sh -c`,
 source-checkout Python, or
 direct-backend fallback. Debug builds retain a development launcher behind
 `cfg(debug_assertions)`: an optional program plus JSON string-array argv is
-passed directly to `Command` without shell parsing; the inherited listener and
-instance channel remain native-host owned, and no sidecar launch path receives
-`--host` or `--port`.
+passed directly to `Command` without shell parsing, and the local host and port
+arguments, inherited listener, and instance channel remain native-host owned.
 Linux executes the verified anonymous file through `/proc/self/fd`. macOS keeps
 the same digest-verified inode linked inside an owner-only `0700` launch
 directory for the complete PyInstaller onefile parent/child process lifecycle,
@@ -614,8 +533,7 @@ Immediately before every TERM or KILL, cleanup repeats that non-reaping child
 check; an inspection error authorizes no numeric-PGID signal. While the manager
 is `Anchored`, the retained child identity prevents PID/PGID reuse and authorizes
 TERM/KILL to the group. Linux enumerates `/proc`; a visible PID's denied or
-malformed `stat` data fails closed, while `NotFound` and raw `ESRCH` from a member
-exiting during `stat` inspection are treated as that member having disappeared.
+malformed `stat` data fails closed, while only a real `NotFound` race is skipped.
 macOS treats both return values from `proc_listpgrppids` as PID counts. Only the
 buffer call receives byte capacity. A full buffer causes bounded growth and
 retry. Native code clears `errno` immediately before every count and buffer call;
@@ -686,32 +604,6 @@ does not infer it from environment variables or Git, and release startup rejects
 an all-zero placeholder. Development and test apps must inject their source
 commit and non-release channel explicitly. There is no direct-backend fallback.
 
-Packaged release startup resolves `openevo/wheels` only beneath the absolute
-PyInstaller extraction root. The builder and sidecar both require that directory
-to contain exactly one Core wheel and one canonical `framework-lock.json`; they verify
-owner/mode/link identity, bounded byte size, SHA-256, directory binding, and the
-exact lock-to-wheel relationship through no-follow descriptors. The release
-source commit used for remote bootstrap must be the full 40-character commit
-identity. Any failure aborts sidecar startup rather than advertising a reduced
-provider.
-
-After verification, the sidecar constructs one owned release runtime containing
-the production SSH adapter, dynamic durable workspace source, bridge store,
-project-bound Core bridge, bounded Desktop event broker, and Core SSE relay. It
-therefore exposes the full frozen Desktop feature inventory required by the
-renderer. All Core resource routes are bound to the exact active Local project;
-project edits wait for in-flight route delivery and then retire that bridge
-generation. Successful retirement clears the process-local project binding and
-publishes `active_tunnel=false` in one provider lock transition; a failed
-retirement preserves the generation-bound binding with a typed offline failure
-for diagnosis. The relay converts non-heartbeat Core activity only into a
-Desktop state invalidation, after which the renderer reloads authoritative
-Core-owned resources. Its `Last-Event-ID` advances only after that Desktop
-publication succeeds and the Core event sequence remains contiguous, so
-publication failure or a sequence gap reconnects from the prior committed
-cursor and replays the frame. It never copies algorithm state or interprets evolution
-method events in the Desktop process.
-
 The release sidecar now owns the initial SSH lifecycle behind the frozen Local
 API profile routes. A connect action atomically validates its idempotency
 envelope and profile ETag, reserves live idempotency capacity plus fixed-size
@@ -728,13 +620,6 @@ runs a bounded SSH connectivity check. Success, failure, and crash cancellation
 update the reserved profile, operation, and idempotency response in one
 transaction, so concurrent capacity consumption and the request's now-stale
 ETag cannot break finalization.
-Profile lifecycle admission and project activation admission share one
-process-local session generation. Each admission is ordered with project
-retirement before external work; terminal publication must still own that exact
-generation. A late connect/disconnect success or failure may finalize only its
-durable operation after replacement and cannot downgrade a newer online Core
-state, run failed-operation transport cleanup against the replacement, or
-advance the replacement binding.
 Disconnect reservations are non-displacing and do not publish `connecting`; the
 sidecar checks the process lifecycle owner before invoking disconnect, so a
 request for profile B cannot rewrite profile A or close A's transport. A
@@ -771,47 +656,44 @@ the Local API models, idempotency envelope, error response, or renderer state.
 The native command surface exposes no placeholder Keychain operation. These
 native-host changes and Linux/macOS externalBin combination smokes do not prove
 code signing, notarization, closure of the same-UID pathname TOCTOU described
-above, first-run remote bootstrap, a real science task, or downloaded artifact
-identity, and do not make the DMG release-ready. The manual candidate workflow
-separately proves mounted/copied macOS application startup through the renderer
-readiness handshake, but not first-run remote bootstrap, a real science task,
-or downloaded artifact identity, and does not make the DMG release-ready. ACL
-contract tests cover inherited/mutating entries, unknown
+above, mounted/copied macOS application launch, first-run
+remote bootstrap, or downloaded artifact identity, and do not make the DMG
+release-ready. ACL contract tests cover inherited/mutating entries, unknown
 tags/permissions, post-initialization mutation, and cleanup replacement windows.
 The macOS runner also creates a real writable inherited extended-ACL fixture and
 executes the FD-based clear/readback path before building the packaged sidecar.
 
 Before that outer lifecycle harness, the workflow installs the exact remote Core
-wheel in a clean Python environment and runs
-`scripts/ci/smoke_openevo_remote_capabilities.py` with the PyInstaller sidecar
-path on Linux. That smoke calls the installed `ensure_core_service`, which owns
-the Core listener, readiness pipe, spawn lock, generation, and release identity,
-then starts the packaged sidecar through the FD 3/FD 4 native protocol. It uses
-the supervisor-issued bearer against `/v1/capabilities` and checks both release
-profiles, registry identity, and target-rooted methods over HTTP. It stops only
-a Core instance that the smoke created. A source `TestClient`, direct
-`openevo-backend serve --host/--port`, or local capability fixture is not
-release evidence. The macOS candidate job validates the exact wheel inventory
-and native packaged sidecar but leaves Linux remote-Core supervision to this
-Ubuntu release smoke.
-
-Outer-wheel validation requires the exact internal script set declared by the
-Core package: `openevo-backend = openevo.backend.launcher:main` and
-`openevo-core-service = openevo.backend.service:main`. The first is the backend
-launcher and the second is Desktop's maintenance supervisor entry point; neither
-is presented as a standalone user CLI. A missing entry, a changed target, or any
-additional console script fails release validation.
+wheel in a clean Python environment and passes the exported build-generated
+framework lock, rather than synthesizing a new lock at smoke time, to both
+framework and remote-capability smokes. The latter starts the real
+`openevo-core-service` supervisor with that lock and checks bearer protection,
+both release profiles, registry identity, and target-rooted methods over HTTP.
+It separately starts the packaged sidecar through the same inherited-listener
+and one-shot native credential frame used by the Rust host, verifies the native
+readiness proof, Desktop session protection, and packaged assets, and rejects
+the removed legacy `/openevo-api/desktop/capabilities` route. End-to-end remote
+profile, SSH tunnel, and active-project capability forwarding remain a distinct
+release-composition gate; these two process smokes do not claim to replace it.
+The supervised Core process smoke runs only in the Linux release-smoke job,
+because the remote Core service intentionally depends on Linux pidfd semantics;
+the macOS candidate job validates the exact wheel/lock pair and launchers but
+does not pretend to host the remote Core locally.
 
 ## External Beta Artifacts
 
 The implemented release workflow must produce, from one reviewed `stable`
 commit:
 
-- `OpenEvo-Desktop-<version>-<aarch64|x64|universal>.dmg`;
+- `OpenEvo-Desktop-<version>-<aarch64|x64>.dmg` for the architecture actually
+  built by the current runner; no universal claim is made;
 - the DMG SHA256 checksum;
 - the exact Core install artifact and checksum;
 - `core-install-artifact.json` matching the Core bytes bundled with or fetched
   by Desktop;
+- `release-candidate.json` and canonical `SHA256SUMS` binding the DMG, Core
+  wheel, framework lock, Core descriptor, source commit, actual architecture,
+  native app smokes, and supply-chain evidence;
 - release notes and the dependency/security evidence required by the canonical
   spec.
 
@@ -837,13 +719,6 @@ The release build must use locked and reviewed inputs:
 Developer fallbacks such as source-checkout Python launchers, custom sidecar
 commands, backend URL overrides, and dry-run transports must be rejected by a
 release build.
-The product Vite mode aliases the general provider-kind parser to a release-only
-module that accepts only `desktop_sidecar`. Development and test builds retain
-the simulator/scaffold/dry-run schema and fixtures. Rollup therefore removes
-those modules and provider strings from the production dependency graph, while
-the product web policy independently rejects all three strings in generated or
-packaged assets. Benchmark and legacy observability modules remain outside the
-product graph as before.
 The repository does not carry a shell-script sidecar fallback; the generated
 target-triple binary is a required build input.
 
@@ -872,14 +747,16 @@ The replacement workflow must:
 5. mount the DMG, copy the app into a clean location, and launch that copied
    application with a clean user profile;
 6. exercise first-run through a descriptor-matched remote Core health check;
-7. create a draft GitHub Release, upload all required assets, download them into
+7. create a draft GitHub prerelease, upload all required assets, download them into
    a clean directory, and revalidate names, versions, commits, and checksums;
 8. publish the already-validated draft without rebuilding any bytes.
 
-The publishing workflow remains disabled until these steps and their failure
-paths are implemented. The candidate workflow deliberately stops after the
-mounted/copied native renderer/sidecar smoke and Actions upload; it does not run
-steps 6-8.
+Final publication remains disabled. The manual candidate workflow implements
+the packaging-level draft roundtrip and deletes a newly created draft and its
+candidate tag if upload or redownload validation fails. It deliberately leaves
+a successful candidate as an unsigned draft prerelease; a maintainer cannot use
+that result to bypass the still-pending science, benchmark, privacy, review,
+signing, or notarization gates.
 
 ## Packaged Runtime Rules
 

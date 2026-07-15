@@ -7,22 +7,18 @@ weaken the canonical release gates.
 
 ## Current Status
 
-Automated publishing is disabled while productization work tracked by #131 is
-in progress. Do not publish a GitHub Release, PyPI package, or `v*` tag from the
-current placeholder workflows.
+Final publication is disabled while productization work tracked by #131/#163 is
+in progress. Do not publish a draft, create a final `v*` tag, or upload to PyPI
+from the disabled placeholder workflows.
 
-Maintainers can manually dispatch `OpenEvo Desktop unsigned candidate` to get a
-14-day Actions artifact from a macOS runner. That workflow builds, mounts,
-copies, smokes, checksums, and validates the candidate DMG and exact nested Core
-wheel. Its packaged-app gate launches the native executable from both the build
-bundle and the copied DMG, then requires the React renderer, Tauri IPC, and
-managed sidecar to agree on the frozen Local API digest. It is for exhibition
-and packaging rehearsal only; passing it does not satisfy the remote science
-E2E, benchmark, security/privacy, or draft-release gates and does not authorize
-publication. The native smoke accepts only a complete log line equal to the
-frozen readiness marker, reads the log incrementally so later volume cannot
-discard earlier evidence, and always TERM/KILLs and verifies the dedicated
-native process group on success, failure, or timeout.
+Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
+from one reviewed `stable` commit. The workflow builds only its macOS runner
+architecture, launches the real Tauri app before and after DMG copy, verifies
+the same final Core wheel on Linux, and creates an unsigned draft prerelease.
+It uploads all assets, downloads them into a clean directory, and validates the
+exact closed manifest before leaving the draft for review. Passing this
+packaging rehearsal does not satisfy the science E2E, benchmark,
+secret-canary/privacy, signing, notarization, or final publication gates.
 
 PyPI is not part of the unsigned External Beta. The ordinary-user artifact is
 the macOS Desktop DMG; Desktop installs the descriptor-matched Core artifact on
@@ -30,12 +26,15 @@ the remote server.
 
 ## Required Outputs
 
-- OpenEvo Desktop DMG for each declared macOS architecture, or one universal
-  DMG;
+- one OpenEvo Desktop DMG for the architecture actually built and declared by
+  the runner; the current workflow does not claim a universal build;
 - DMG SHA256 checksum;
 - exact Core install artifact and SHA256 checksum;
 - Core descriptor containing version, compatibility, source commit, artifact
   name, and checksum;
+- candidate manifest and canonical checksum inventory binding the DMG, exact
+  Core wheel, framework lock, Core descriptor, source commit, architecture,
+  native smoke evidence, and supply-chain reports;
 - release notes;
 - dependency lock, practical vulnerability, and license results for shipped
   Python, npm, and Rust dependencies;
@@ -51,13 +50,10 @@ the remote server.
 4. Build and clean-install the Core artifact.
 5. Run Core integration tests for Codex subscription transcript and the
    self-deployed reference profile.
-6. Dispatch `OpenEvo Core Backend checks` for the exact candidate with
-   `require_real_docker=true`; the required Docker ownership job must pass
-   without skips after pulling `python:3.12-slim-bookworm`.
-7. Build the Desktop app and run source-level tests before packaging.
-8. Build the DMG and rerun the packaged-app lifecycle and science workflow
+6. Build the Desktop app and run source-level tests before packaging.
+7. Build the DMG and rerun the packaged-app lifecycle and science workflow
    smoke against the exact Core descriptor/artifact.
-9. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
+8. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
    dependency checks.
 
 The exact Core wheel export parent and directory must be owned by the build user
@@ -91,8 +87,18 @@ uploads the exact inputs under an artifact name bound to the source commit. The
 Linux Core job depends on that producer, verifies the downloaded manifest
 against the digest passed through the job output, rechecks both member digests,
 and only then installs the wheel and runs `openevo-core-service`. It must not
-rebuild the wheel or lock. Conversely, the macOS packaging job must not run the
-Linux-only Core service lifecycle.
+rebuild the wheel or lock, and it rechecks those final candidate bytes after the
+service smoke. Conversely, the macOS packaging job must not run the Linux-only
+Core service lifecycle.
+
+The manual candidate uses the same producer/consumer rule for the complete
+release inventory. `release-candidate.json` and `core-install-artifact.json`
+bind the exact Core wheel and framework lock; the former also binds the DMG,
+`SHA256SUMS`, commit, runner architecture, app/DMG native evidence, and Python,
+npm, and Cargo dependency/license/security summaries. Those summaries are
+checked against the candidate checkout's four lock/license files. The final
+draft job alone receives `contents: write`; build and Linux verification retain
+read-only permissions.
 
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
@@ -100,9 +106,9 @@ best stochastic result.
 
 ## Draft Release Validation
 
-Create a GitHub draft release only after the candidate preparation succeeds.
-Upload the required outputs, download every asset into a clean directory, and
-verify:
+The manual workflow creates a uniquely tagged GitHub draft prerelease only after
+its macOS and Linux candidate jobs succeed. It uploads the required outputs,
+downloads every asset into a clean directory, and verifies:
 
 - asset names and architectures are expected;
 - SHA256 files match downloaded bytes;
@@ -113,6 +119,10 @@ verify:
   install/upgrade/uninstall steps;
 - no unclassified development, secret, benchmark-private, or source-checkout
   files are present.
+
+If upload or redownload validation fails after draft creation, the workflow
+deletes that draft and its candidate tag. A successful run leaves the draft and
+candidate tag for review; it does not publish the release.
 
 Two fresh-context `gpt-5.6-sol` high-effort reviews must approve product/spec
 compliance and release risk before publication.

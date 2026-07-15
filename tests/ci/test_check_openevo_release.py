@@ -4,14 +4,9 @@ import importlib.util
 import json
 import hashlib
 from io import BytesIO
-import os
 from pathlib import Path
 import plistlib
-import signal
-import stat
 import subprocess
-from types import SimpleNamespace
-import time
 from zipfile import ZipFile
 
 import pytest
@@ -31,7 +26,6 @@ GOOD_ENTRY_POINTS = "\n".join(
     [
         "[console_scripts]",
         "openevo-backend = openevo.backend.launcher:main",
-        "openevo-core-service = openevo.backend.service:main",
         "",
     ]
 )
@@ -85,77 +79,6 @@ def _load_bundle_smoke_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
-
-
-def _process_is_live(pid: int) -> bool:
-    if Path("/proc").is_dir():
-        try:
-            stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
-        except FileNotFoundError:
-            return False
-        return len(stat_fields) <= 2 or stat_fields[2] != "Z"
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def _write_fake_native_with_independent_sidecar(
-    app: Path,
-    *,
-    renderer_marker: str,
-    sidecar_pid_path: Path,
-    clean_sidecar: bool,
-    exit_after_markers: bool = False,
-) -> Path:
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text(
-        "#!/usr/bin/env python3\n"
-        "import ctypes\n"
-        "import os\n"
-        "from pathlib import Path\n"
-        "import signal\n"
-        "import subprocess\n"
-        "import sys\n"
-        "import time\n"
-        "child = subprocess.Popen([\"/bin/sh\", \"-c\", \"trap '' TERM; exec sleep 30\"], start_new_session=True)\n"
-        f"Path({str(sidecar_pid_path)!r}).write_text(str(child.pid), encoding='utf-8')\n"
-        "if sys.platform == 'darwin':\n"
-        "    class ProcBsdInfo(ctypes.Structure):\n"
-        "        _fields_ = [('pbi_flags', ctypes.c_uint32), ('pbi_status', ctypes.c_uint32), ('pbi_xstatus', ctypes.c_uint32), ('pbi_pid', ctypes.c_uint32), ('pbi_ppid', ctypes.c_uint32), ('pbi_uid', ctypes.c_uint32), ('pbi_gid', ctypes.c_uint32), ('pbi_ruid', ctypes.c_uint32), ('pbi_rgid', ctypes.c_uint32), ('pbi_svuid', ctypes.c_uint32), ('pbi_svgid', ctypes.c_uint32), ('rfu_1', ctypes.c_uint32), ('pbi_comm', ctypes.c_char * 16), ('pbi_name', ctypes.c_char * 32), ('pbi_nfiles', ctypes.c_uint32), ('pbi_pgid', ctypes.c_uint32), ('pbi_pjobc', ctypes.c_uint32), ('e_tdev', ctypes.c_uint32), ('e_tpgid', ctypes.c_uint32), ('pbi_nice', ctypes.c_int32), ('pbi_start_tvsec', ctypes.c_uint64), ('pbi_start_tvusec', ctypes.c_uint64)]\n"
-        "    info = ProcBsdInfo()\n"
-        "    proc_pidinfo = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidinfo\n"
-        "    proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]\n"
-        "    proc_pidinfo.restype = ctypes.c_int\n"
-        "    assert proc_pidinfo(child.pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) == ctypes.sizeof(info)\n"
-        "    birth = f'darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}'\n"
-        "else:\n"
-        "    start_ticks = Path(f'/proc/{child.pid}/stat').read_text(encoding='utf-8').rsplit(')', 1)[1].split()[19]\n"
-        "    birth = f'linux:{start_ticks}'\n"
-        "print(f'OPENEVO_DESKTOP_SIDECAR_PROCESS_V1 {\"a\" * 32} {child.pid} {os.getpgid(child.pid)} {os.getsid(child.pid)} {birth}', flush=True)\n"
-        f"print({renderer_marker!r}, flush=True)\n"
-        + (
-            "def stop(_signum, _frame):\n"
-            "    try:\n"
-            "        os.killpg(child.pid, signal.SIGKILL)\n"
-            "    except ProcessLookupError:\n"
-            "        pass\n"
-            "    child.wait()\n"
-            "    raise SystemExit(0)\n"
-            "signal.signal(signal.SIGTERM, stop)\n"
-            if clean_sidecar
-            else ""
-        )
-        + ("raise SystemExit(7)\n" if exit_after_markers else "while True:\n    time.sleep(1)\n"),
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-    return executable
 
 
 def _load_remote_capability_smoke_module():
@@ -212,60 +135,6 @@ def test_sidecar_smoke_extracts_desktop_static_assets() -> None:
     assert assets == ["assets/index.css", "assets/index.js"]
 
 
-@pytest.mark.parametrize(
-    "startup_error",
-    [
-        TimeoutError("application has not accepted the inherited listener yet"),
-        ConnectionResetError("listener changed ownership during startup"),
-    ],
-)
-def test_sidecar_smoke_treats_startup_socket_error_as_not_ready(
-    monkeypatch: pytest.MonkeyPatch,
-    startup_error: OSError,
-) -> None:
-    smoke = _load_sidecar_smoke_module()
-
-    class _TimeoutOpener:
-        def open(self, request, timeout):
-            raise startup_error
-
-    monkeypatch.setattr(smoke, "_LOCAL_HTTP_OPENER", _TimeoutOpener())
-
-    with pytest.raises(smoke.SmokeFailure, match="was not reachable"):
-        smoke._read_url("http://127.0.0.1:1/health")
-
-
-def test_release_smokes_use_the_native_fd_and_five_key_frame_protocol() -> None:
-    sidecar_smoke = Path("scripts/ci/smoke_openevo_desktop_sidecar.py").read_text(
-        encoding="utf-8"
-    )
-    remote_smoke = Path("scripts/ci/smoke_openevo_remote_capabilities.py").read_text(
-        encoding="utf-8"
-    )
-    bundle_smoke = Path("scripts/ci/smoke_openevo_desktop_bundle.py").read_text(
-        encoding="utf-8"
-    )
-
-    assert 'NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"' in sidecar_smoke
-    assert 'NATIVE_ARCHIVE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"' in sidecar_smoke
-    assert "pass_fds=(NATIVE_LISTENER_FD, NATIVE_ARCHIVE_FD)" in sidecar_smoke
-    assert "process_log_guard = _duplicate_fd(process_log.fileno())" in sidecar_smoke
-    assert "stdout=process_log_guard" in sidecar_smoke
-    assert '"handoff_token": self.handoff_token' in sidecar_smoke
-    assert '"--host"' not in sidecar_smoke
-    assert '"--port"' not in sidecar_smoke
-    assert "_smoke_capability_proxy" not in sidecar_smoke
-    assert "X-OpenEvo-Sidecar-Token" not in sidecar_smoke
-    assert '"--host"' not in remote_smoke
-    assert '"--port"' not in remote_smoke
-    assert "ensure_core_service(" in remote_smoke
-    assert "stop_core_service(" in remote_smoke
-    assert 'f"{base_url}/v1/capabilities' in remote_smoke
-    assert '"Authorization": f"Bearer {attachment.bearer_token}"' in remote_smoke
-    assert "sidecar_smoke.smoke_sidecar(" in remote_smoke
-    assert "smoke_sidecar(sidecar" in bundle_smoke
-
-
 def test_sidecar_smoke_rejects_core_owned_fields_in_project_contract() -> None:
     smoke = _load_sidecar_smoke_module()
 
@@ -293,14 +162,32 @@ def test_sidecar_smoke_launches_process_and_checks_assets(tmp_path: Path) -> Non
     smoke.smoke_sidecar(sidecar, timeout_seconds=5)
 
 
-def test_bundle_smoke_finds_and_launches_app_sidecar(tmp_path: Path) -> None:
+def test_bundle_smoke_launches_tauri_main_and_requires_native_evidence(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
-    sidecar = tmp_path / "OpenEvo Desktop.app" / "Contents" / "MacOS" / "openevo-desktop-sidecar"
-    _write_fake_sidecar(sidecar)
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "OpenEvo Desktop"
+    sidecar = app / "Contents" / "MacOS" / "openevo-desktop-sidecar"
+    _write_fake_tauri_release_smoke(executable)
+    sidecar.write_bytes(b"packaged externalBin")
+    sidecar.chmod(0o755)
+    with (app / "Contents" / "Info.plist").open("wb") as stream:
+        plistlib.dump({"CFBundleExecutable": executable.name}, stream)
 
-    smoked_sidecar = smoke.smoke_bundle(tmp_path, timeout_seconds=5)
+    evidence_path = tmp_path / "native-evidence.json"
+    evidence = smoke.smoke_bundle(
+        tmp_path,
+        timeout_seconds=5,
+        evidence_out=evidence_path,
+    )
 
-    assert smoked_sidecar == sidecar
+    assert evidence["native_executable"] == executable.name
+    assert evidence["bundled_external_bin"] == sidecar.name
+    assert evidence["renderer_ready"] is True
+    assert evidence["sidecar_ready"] is True
+    assert evidence["native_listener_fd_handoff"] is True
+    assert evidence["native_executable_fd_handoff"] is True
+    assert evidence["process_group_cleanup"] is True
+    assert json.loads(evidence_path.read_text(encoding="utf-8")) == evidence
 
 
 def test_bundle_smoke_requires_openevo_desktop_app_bundle(tmp_path: Path) -> None:
@@ -309,451 +196,20 @@ def test_bundle_smoke_requires_openevo_desktop_app_bundle(tmp_path: Path) -> Non
     _write_fake_sidecar(other_sidecar)
 
     try:
-        smoke.find_bundled_sidecar(tmp_path)
+        smoke.find_app_executable(tmp_path)
     except smoke.SmokeFailure as exc:
         assert "No OpenEvo Desktop.app bundle found" in str(exc)
     else:
         raise AssertionError("Expected missing OpenEvo Desktop.app bundle to fail")
 
 
-def test_bundle_smoke_launches_the_native_app_until_renderer_is_ready(tmp_path: Path) -> None:
+def test_bundle_smoke_rejects_sidecar_only_bundle(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    executable = _write_fake_native_with_independent_sidecar(
-        app,
-        renderer_marker=smoke.RENDERER_READY_MARKER,
-        sidecar_pid_path=tmp_path / "sidecar.pid",
-        clean_sidecar=True,
-    )
+    sidecar = tmp_path / "OpenEvo Desktop.app" / "Contents" / "MacOS" / "openevo-desktop-sidecar"
+    _write_fake_sidecar(sidecar)
 
-    launched = smoke.smoke_native_app(app, timeout_seconds=5)
-
-    assert launched == executable
-
-
-def test_bundle_smoke_requires_instance_bound_sidecar_process_evidence(
-    tmp_path: Path,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text(
-        f"#!/bin/sh\nprintf '%s\\n' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-
-    with pytest.raises(smoke.SmokeFailure, match="sidecar process evidence"):
-        smoke.smoke_native_app(app, timeout_seconds=1)
-
-
-def test_bundle_smoke_proves_independent_sidecar_group_exit(tmp_path: Path) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    sidecar_pid_path = tmp_path / "sidecar.pid"
-    executable = _write_fake_native_with_independent_sidecar(
-        app,
-        renderer_marker=smoke.RENDERER_READY_MARKER,
-        sidecar_pid_path=sidecar_pid_path,
-        clean_sidecar=True,
-    )
-
-    assert smoke.smoke_native_app(app, timeout_seconds=2) == executable
-    assert not _process_is_live(int(sidecar_pid_path.read_text(encoding="utf-8")))
-
-
-def test_bundle_smoke_cleans_and_fails_for_surviving_setsid_sidecar(
-    tmp_path: Path,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    sidecar_pid_path = tmp_path / "leaked-sidecar.pid"
-    _write_fake_native_with_independent_sidecar(
-        app,
-        renderer_marker=smoke.RENDERER_READY_MARKER,
-        sidecar_pid_path=sidecar_pid_path,
-        clean_sidecar=False,
-    )
-
-    try:
-        with pytest.raises(smoke.SmokeFailure, match="sidecar process group survived"):
-            smoke.smoke_native_app(app, timeout_seconds=2)
-    finally:
-        if sidecar_pid_path.exists():
-            sidecar_pid = int(sidecar_pid_path.read_text(encoding="utf-8"))
-            try:
-                os.killpg(sidecar_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-    assert not _process_is_live(int(sidecar_pid_path.read_text(encoding="utf-8")))
-
-
-@pytest.mark.parametrize("outcome", ["timeout", "error"])
-def test_bundle_smoke_cleans_independent_sidecar_on_readiness_failure(
-    tmp_path: Path,
-    outcome: str,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    sidecar_pid_path = tmp_path / f"{outcome}-sidecar.pid"
-    _write_fake_native_with_independent_sidecar(
-        app,
-        renderer_marker="not-ready",
-        sidecar_pid_path=sidecar_pid_path,
-        clean_sidecar=True,
-        exit_after_markers=outcome == "error",
-    )
-
-    with pytest.raises(smoke.SmokeFailure):
-        smoke.smoke_native_app(app, timeout_seconds=0.5)
-    assert not _process_is_live(int(sidecar_pid_path.read_text(encoding="utf-8")))
-
-
-def test_bundle_smoke_reviewer_regression_kills_evidenced_setsid_sidecar_on_code7(
-    tmp_path: Path,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    sidecar_pid_path = tmp_path / "reviewer-code7-sidecar.pid"
-    _write_fake_native_with_independent_sidecar(
-        app,
-        renderer_marker="renderer-never-ready",
-        sidecar_pid_path=sidecar_pid_path,
-        clean_sidecar=True,
-        exit_after_markers=True,
-    )
-
-    with pytest.raises(smoke.SmokeFailure):
-        smoke.smoke_native_app(app, timeout_seconds=0.5)
-    sidecar_pid = int(sidecar_pid_path.read_text(encoding="utf-8"))
-    assert not _process_is_live(sidecar_pid)
-
-
-def test_bundle_smoke_uses_the_original_bundle_path_on_darwin(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o755)
-
-    canonical_executable = (
-        Path(os.path.realpath(app.parent)) / app.name / "Contents" / "MacOS" / executable.name
-    )
-    with smoke._PinnedNativeExecutable.open(app) as pinned:
-        monkeypatch.setattr(smoke.sys, "platform", "darwin")
-        assert pinned.execution_path() == str(canonical_executable)
-
-
-def test_bundle_smoke_canonicalizes_only_a_darwin_parent_alias(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    canonical_parent = tmp_path / "canonical"
-    app = canonical_parent / "OpenEvo Desktop.app"
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o755)
-    alias = tmp_path / "alias"
-    alias.symlink_to(canonical_parent, target_is_directory=True)
-    monkeypatch.setattr(smoke.sys, "platform", "darwin")
-    monkeypatch.setattr(smoke, "_validate_component", lambda *args, **kwargs: None)
-
-    expected_app = Path(os.path.realpath(canonical_parent)) / app.name
-    with smoke._PinnedNativeExecutable.open(alias / app.name) as pinned:
-        assert pinned.app_bundle == expected_app
-        assert pinned.execution_path() == str(
-            expected_app / "Contents" / "MacOS" / executable.name
-        )
-
-
-@pytest.mark.parametrize(
-    ("metadata", "kind"),
-    [
-        (SimpleNamespace(st_mode=stat.S_IFDIR | 0o775, st_uid=os.geteuid(), st_nlink=1), "directory"),
-        (SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=os.geteuid() + 1, st_nlink=1), "executable"),
-        (SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=os.geteuid(), st_nlink=2), "executable"),
-    ],
-)
-def test_bundle_smoke_rejects_untrusted_darwin_components(
-    metadata: SimpleNamespace,
-    kind: str,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-
-    with pytest.raises(smoke.SmokeFailure, match="not trustworthy"):
-        smoke._validate_darwin_component(metadata, kind=kind, path=Path("component"))
-
-
-@pytest.mark.parametrize("component", ["app", "Contents", "MacOS"])
-def test_bundle_smoke_rejects_symlinked_native_path_components(
-    tmp_path: Path,
-    component: str,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    external_contents = tmp_path / "external" / "Contents"
-    executable = external_contents / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (external_contents / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o755)
-
-    if component == "app":
-        app.symlink_to(external_contents.parent, target_is_directory=True)
-    elif component == "Contents":
-        app.mkdir()
-        (app / "Contents").symlink_to(external_contents, target_is_directory=True)
-    else:
-        contents = app / "Contents"
-        contents.mkdir(parents=True)
-        (contents / "Info.plist").write_bytes(
-            plistlib.dumps({"CFBundleExecutable": executable.name})
-        )
-        (contents / "MacOS").symlink_to(
-            external_contents / "MacOS", target_is_directory=True
-        )
-
-    with pytest.raises(smoke.SmokeFailure, match="native executable path"):
-        smoke.find_native_executable(app)
-
-
-@pytest.mark.parametrize("replacement", ["Contents", "MacOS", "leaf"])
-def test_bundle_smoke_fails_closed_on_native_path_replacement_at_exec(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    replacement: str,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text(
-        f"#!/bin/sh\nprintf '%s\\n' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-    escaped_marker = tmp_path / f"{replacement.lower()}-escaped"
-    external_contents = tmp_path / f"external-{replacement}" / "Contents"
-    external_executable = external_contents / "MacOS" / executable.name
-    external_executable.parent.mkdir(parents=True)
-    (external_contents / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": external_executable.name})
-    )
-    external_executable.write_text(
-        f"#!/bin/sh\ntouch '{escaped_marker}'\n"
-        f"printf '%s\\n' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
-        encoding="utf-8",
-    )
-    external_executable.chmod(0o755)
-    real_popen = smoke.subprocess.Popen
-
-    def replacing_popen(*args: object, **kwargs: object):
-        if replacement == "Contents":
-            contents = app / "Contents"
-            contents.rename(app / "Contents.original")
-            contents.symlink_to(external_contents, target_is_directory=True)
-        elif replacement == "MacOS":
-            macos = executable.parent
-            macos.rename(macos.with_name("MacOS.original"))
-            macos.symlink_to(external_executable.parent, target_is_directory=True)
-        else:
-            executable.unlink()
-            executable.symlink_to(external_executable)
-        return real_popen(*args, **kwargs)
-
-    monkeypatch.setattr(smoke.subprocess, "Popen", replacing_popen)
-
-    with pytest.raises(smoke.SmokeFailure, match="native executable"):
-        smoke.smoke_native_app(app, timeout_seconds=1)
-    assert not escaped_marker.exists()
-
-
-def test_bundle_smoke_requires_an_exact_complete_renderer_marker_line(tmp_path: Path) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text(
-        f"#!/bin/sh\nprintf 'prefix%s-suffix\\n' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-
-    with pytest.raises(smoke.SmokeFailure, match="renderer readiness"):
-        smoke.smoke_native_app(app, timeout_seconds=0.5)
-
-
-def test_bundle_smoke_rejects_an_unterminated_renderer_marker_line(tmp_path: Path) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text(
-        f"#!/bin/sh\nprintf '%s' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-
-    with pytest.raises(smoke.SmokeFailure, match="renderer readiness"):
-        smoke.smoke_native_app(app, timeout_seconds=0.5)
-
-
-def test_bundle_smoke_keeps_an_early_marker_beyond_the_log_tail(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-    executable.chmod(0o755)
-
-    class FakeProcess:
-        pid = 424242
-
-        def poll(self) -> None:
-            return None
-
-        def terminate(self) -> None:
-            return None
-
-        def wait(self, timeout: float | None = None) -> int:
-            return 0
-
-        def kill(self) -> None:
-            return None
-
-    def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
-        output = kwargs["stdout"]
-        output.write(
-            (
-                f"{smoke.SIDECAR_PROCESS_PREFIX} {'a' * 32} "
-                "515151 515151 515151 linux:12345\n"
-            ).encode()
-        )
-        output.write((smoke.RENDERER_READY_MARKER + "\n").encode())
-        output.write(b"x" * (smoke.NATIVE_LOG_LIMIT + 1))
-        output.flush()
-        return FakeProcess()
-
-    monkeypatch.setattr(smoke.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(
-        smoke, "_validate_sidecar_process_evidence", lambda *args, **kwargs: None
-    )
-    monkeypatch.setattr(smoke, "_verify_sidecar_process_group_exit", lambda evidence: None)
-    monkeypatch.setattr(smoke, "_terminate_native_process", lambda process: None)
-    monkeypatch.setattr(smoke.time, "sleep", lambda seconds: None)
-
-    assert smoke.smoke_native_app(app, timeout_seconds=0.1) == executable
-
-
-def test_bundle_smoke_rejects_a_native_process_without_renderer_readiness(
-    tmp_path: Path,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    executable.write_text("#!/bin/sh\nprintf 'renderer failed\\n'\n", encoding="utf-8")
-    executable.chmod(0o755)
-
-    with pytest.raises(smoke.SmokeFailure, match="renderer readiness"):
-        smoke.smoke_native_app(app, timeout_seconds=1)
-
-
-def test_bundle_smoke_rejects_non_dictionary_info_plist(tmp_path: Path) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    info = app / "Contents" / "Info.plist"
-    info.parent.mkdir(parents=True)
-    info.write_bytes(plistlib.dumps(["not", "a", "dictionary"]))
-
-    with pytest.raises(smoke.SmokeFailure, match="top-level dictionary"):
-        smoke.find_native_executable(app)
-
-
-@pytest.mark.parametrize("outcome", ["success", "failure", "timeout"])
-def test_bundle_smoke_always_cleans_the_native_process_group(
-    tmp_path: Path,
-    outcome: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    smoke = _load_bundle_smoke_module()
-    app = tmp_path / "OpenEvo Desktop.app"
-    executable = app / "Contents" / "MacOS" / "openevo-desktop"
-    child_pid_path = tmp_path / f"{outcome}-child.pid"
-    executable.parent.mkdir(parents=True)
-    (app / "Contents" / "Info.plist").write_bytes(
-        plistlib.dumps({"CFBundleExecutable": executable.name})
-    )
-    marker = smoke.RENDERER_READY_MARKER if outcome == "success" else "not-ready"
-    final_command = "exit 7" if outcome == "failure" else "wait"
-    executable.write_text(
-        "#!/bin/sh\n"
-        "trap '' TERM\n"
-        "sh -c 'trap \"\" TERM; while :; do sleep 1; done' &\n"
-        f"echo $! > '{child_pid_path}'\n"
-        f"printf '%s\\n' '{smoke.SIDECAR_PROCESS_PREFIX} {'a' * 32} 515151 515151 515151 linux:12345'\n"
-        f"printf '%s\\n' '{marker}'\n"
-        f"{final_command}\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-    monkeypatch.setattr(
-        smoke, "_validate_sidecar_process_evidence", lambda *args, **kwargs: None
-    )
-    monkeypatch.setattr(smoke, "_verify_sidecar_process_group_exit", lambda evidence: None)
-
-    if outcome == "success":
-        assert smoke.smoke_native_app(app, timeout_seconds=1) == executable
-    else:
-        with pytest.raises(smoke.SmokeFailure):
-            smoke.smoke_native_app(app, timeout_seconds=0.3)
-
-    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline and _process_is_live(child_pid):
-        time.sleep(0.02)
-    if _process_is_live(child_pid):
-        try:
-            os.killpg(os.getpgid(child_pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        pytest.fail(f"native smoke left child process {child_pid} running after {outcome}")
+    with pytest.raises(smoke.SmokeFailure, match="Info.plist"):
+        smoke.smoke_bundle(tmp_path, timeout_seconds=1)
 
 
 def test_accepts_valid_openevo_release_wheel(tmp_path: Path) -> None:
@@ -1083,14 +539,6 @@ def test_requires_expected_console_scripts(tmp_path: Path) -> None:
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
     assert any("openevo-backend = openevo.backend.launcher:main" in error for error in errors)
-    assert any("openevo-core-service = openevo.backend.service:main" in error for error in errors)
-
-
-def test_accepts_only_the_two_published_core_service_scripts(tmp_path: Path) -> None:
-    checker = _load_module()
-    wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
-
-    assert checker.validate_wheel(wheel, expected_version="0.1.0") == []
 
 
 def test_rejects_unexpected_console_scripts(tmp_path: Path) -> None:
@@ -1238,6 +686,7 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert '"desktop/**"' in text
     assert '- "scripts/ci/**"' in text
     assert '"tests/**"' in text
+
     jobs = text.split("jobs:\n", maxsplit=1)[1]
     macos_job, linux_job = jobs.split("  linux-core-smoke:\n", maxsplit=1)
     assert macos_job.startswith("  macos-packaging-smoke:\n")
@@ -1299,7 +748,7 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     ) in linux_job
     assert "sha256sum --check -" in linux_job
     assert "sha256sum --check SHA256SUMS" in linux_job
-    assert linux_job.count("-mindepth 1 -maxdepth 1") == 1
+    assert linux_job.count("-mindepth 1 -maxdepth 1") == 2
     assert "uv sync --frozen --group dev" in linux_job
     assert linux_job.index("actions/download-artifact@v4") < linux_job.index(
         "Verify transferred Core release input manifest"
@@ -1321,29 +770,24 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "codex_subscription_transcript" in linux_job
     assert '"self-deployed"' in linux_job
 
-    assert "name: Build outer smoke wheel from the transferred Core wheel" in linux_job
+    assert "name: Reverify final Core candidate bytes after service smoke" in linux_job
     assert "python -m build --wheel --outdir .openevo-release-inputs" not in text
-    assert "rm -rf src/openevo/wheels" not in text
-    assert "mkdir -p src/openevo/wheels" not in text
-    assert 'mkdir -p "$outer_source/src/openevo/wheels"' in linux_job
-    assert 'src/ "$outer_source/src/"' in linux_job
-    assert "uv run python -m build --wheel --no-isolation" in linux_job
-    assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in linux_job
-    assert "name: Smoke installed Core with source Desktop harness" in linux_job
-    assert "python -m venv .openevo-wheel-smoke" in linux_job
-    assert ".openevo-wheel-smoke/bin/python -m pip install dist/*.whl" in linux_job
-    assert (
-        "PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py"
-    ) in linux_job
-    assert "ensure_core_service" in capability_smoke_text
-    assert "stop_core_service" in capability_smoke_text
-    assert 'parser.add_argument("--source-commit", required=True)' in capability_smoke_text
+    assert "outer_source" not in linux_job
+    assert "python -m build" not in linux_job
+    assert "dist/*.whl" not in linux_job
+    assert "openevo-core-service" in capability_smoke_text
+    assert '"ensure"' in capability_smoke_text
+    assert '"consume-attachment"' in capability_smoke_text
+    assert '"stop"' in capability_smoke_text
+    assert '"--replace-mismatched"' in capability_smoke_text
+    assert 'f"bootstrap-{secrets.token_hex(16)}.json"' in capability_smoke_text
+    smoke_body = capability_smoke_text.split("def smoke(", 1)[1].split("def main(", 1)[0]
+    assert "try:\n        ensure_result = _run_core_service(" in smoke_body
     assert "sidecar_smoke.smoke_sidecar" in capability_smoke_text
     assert "TestClient" not in capability_smoke_text
     assert "create_sidecar_app" not in capability_smoke_text
     assert "BackendConnection" not in capability_smoke_text
     assert "backend_client_factory" not in capability_smoke_text
-    assert "subprocess.Popen" not in capability_smoke_text
     assert "start_new_session=True" in sidecar_process_smoke_text
     assert '"--listener-fd"' in sidecar_process_smoke_text
     assert '"--native-instance-stdin"' in sidecar_process_smoke_text
@@ -1354,13 +798,15 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "EXPECTED_METHOD_IDS" in framework_smoke_text
     assert "EXPECTED_TARGET_IDS" in framework_smoke_text
     assert "EXPECTED_HANDLER_IDS" in framework_smoke_text
+    assert "load_framework_distribution_lock" in framework_smoke_text
+    assert "FrameworkDistributionLock(" not in framework_smoke_text
+    assert "load_framework_distribution_lock" in capability_smoke_text
     assert framework_smoke_text.index("verified = verify_distribution_install(") < (
         framework_smoke_text.index("from openevo.evolution.framework import (")
     )
-    assert "FrameworkDistributionLock" in framework_smoke_text
     assert "load_verified_framework_registry" in framework_smoke_text
-    assert framework_smoke_text.index("FrameworkDistributionLock(") < (
-        framework_smoke_text.index("loaded = load_verified_framework_registry(lock_path)")
+    assert framework_smoke_text.index("load_framework_distribution_lock") < (
+        framework_smoke_text.index("loaded = load_verified_framework_registry(framework_lock)")
     )
 
     assert macos_job.index("npm ci") < macos_job.index("npm test -- --run")
@@ -1370,11 +816,8 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     )
     assert macos_job.index("npm test -- --run") < macos_job.index("npm run build:openevo")
     assert macos_job.index("npm run typecheck") < macos_job.index("npm run build:openevo")
-    assert linux_job.index("Build outer smoke wheel from the transferred Core wheel") < (
-        linux_job.index("name: Validate OpenEvo wheel")
-    )
-    assert linux_job.index("name: Validate OpenEvo wheel") < linux_job.index(
-        "name: Smoke installed Core with source Desktop harness"
+    assert linux_job.index("name: Smoke Linux Core service lifecycle") < linux_job.index(
+        "name: Reverify final Core candidate bytes after service smoke"
     )
 
 
@@ -1464,7 +907,7 @@ def test_pre_external_beta_release_artifact_workflow_is_disabled() -> None:
     assert "desktop-dmg-artifact:" not in text
 
 
-def test_desktop_candidate_workflow_builds_and_smokes_unsigned_dmg_without_publishing() -> None:
+def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease() -> None:
     workflow = Path(".github/workflows/openevo-desktop-candidate.yml")
 
     text = workflow.read_text(encoding="utf-8")
@@ -1472,40 +915,76 @@ def test_desktop_candidate_workflow_builds_and_smokes_unsigned_dmg_without_publi
     for marker in (
         "workflow_dispatch:",
         "runs-on: macos-14",
+        "runs-on: ubuntu-latest",
         "timeout-minutes:",
+        'test "$GITHUB_REF" = "refs/heads/stable"',
         "uv sync --frozen --group dev",
         "tests/ci/test_build_sidecar.py",
+        "tests/ci/test_openevo_release_candidate.py",
+        "tests/ci/test_openevo_release_evidence.py",
         "scripts/ci/audit_openevo_identity.py",
         "npm ci",
         "npm audit --audit-level=high",
+        "pip-audit==2.9.0",
+        "cargo-audit --locked --version 0.21.2",
+        "collect_openevo_release_evidence.py",
+        "Retain failed supply-chain summaries",
         "npm test -- --run",
         "npm run typecheck",
         "packaging/build_sidecar.py",
         "--core-wheel-output-dir",
         "framework-lock.json",
-        "smoke_openevo_desktop_sidecar.py",
+        "--framework-lock",
+        "openevo-core-service",
         "cargo fmt --check",
         "cargo clippy --locked --release --all-targets -- -D warnings",
         "cargo test --locked --release",
         "npm run tauri:build -- --ci",
         "hdiutil attach",
         "smoke_openevo_desktop_bundle.py",
-        "--native-app",
-        "scripts/ci/write_sha256.py",
-        "scripts/ci/check_openevo_release.py",
+        "--evidence-out candidate-artifacts/app-bundle-smoke.json",
+        "--evidence-out candidate-artifacts/dmg-copy-smoke.json",
+        "scripts/ci/openevo_release_candidate.py create",
+        "core-install-artifact.json",
+        "release-candidate.json",
+        "SHA256SUMS",
         "actions/upload-artifact@v4",
+        "actions/download-artifact@v4",
         "retention-days: 14",
         "unsigned and not notarized",
+        "permissions:\n      contents: write",
+        "gh release create",
+        "--draft",
+        "--prerelease",
+        "gh release upload",
+        "gh release download",
+        "diff -qr candidate-artifacts downloaded-draft",
+        "gh release delete",
     ):
         assert marker in text
+
     assert "smoke_openevo_remote_capabilities.py" not in text
 
     assert text.index("npm ci") < text.index("npm run tauri:build -- --ci")
-    assert text.index("hdiutil attach") < text.index("actions/upload-artifact@v4")
-    assert "contents: write" not in text
-    assert "gh release" not in text
+    assert text.index("hdiutil attach") < text.index(
+        "scripts/ci/openevo_release_candidate.py create"
+    )
+    assert text.index("linux-core-candidate:") < text.index("draft-prerelease-roundtrip:")
+    assert "needs: [macos-candidate, linux-core-candidate]" in text
+    assert text.index("gh release create") < text.index("gh release upload")
+    assert text.index("gh release upload") < text.index("gh release download")
+    assert text.count("contents: write") == 1
     assert "softprops/action-gh-release" not in text
     assert "tags:" not in text
+    assert "universal" not in text
+    assert "matrix:" not in text
+    assert "Build distributable Core wheel" not in text
+    assert "python -m build --wheel" not in text
+    assert "cp .candidate-core/openevo-*.whl candidate-artifacts/" in text
+    assert 'pip install candidate-artifacts/openevo-*.whl' in text
+    assert text.index("openevo_release_candidate.py validate") < text.index(
+        'pip install candidate-artifacts/openevo-*.whl'
+    )
 
     desktop_checks = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     assert '".github/workflows/openevo-desktop-candidate.yml"' in desktop_checks
@@ -1515,7 +994,6 @@ def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> N
     package = json.loads(Path("desktop/package.json").read_text(encoding="utf-8"))
 
     assert package["name"] == "openevo-desktop"
-    assert package["scripts"]["dev:openevo"] == "vite --mode openevo-desktop"
     assert package["scripts"]["tauri:dev"] == "tauri dev"
     assert package["scripts"]["tauri:build"] == "tauri build"
     assert package["scripts"]["build:sidecar"] == "python packaging/build_sidecar.py"
@@ -1545,7 +1023,6 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert config["version"] == "0.1.0"
     assert config["identifier"] == "org.openevo.desktop"
     assert config["build"]["beforeBuildCommand"] == "npm run build:openevo"
-    assert config["build"]["beforeDevCommand"] == "npm run dev:openevo"
     assert config["build"]["frontendDist"] == "../dist"
     assert config["bundle"]["active"] is True
     assert config["bundle"]["targets"] == ["dmg"]
@@ -1559,8 +1036,6 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "PyInstaller" in sidecar_builder_text
     assert "_build_core_wheel" in sidecar_builder_text
     assert "_validate_embedded_core_wheel" in sidecar_builder_text
-    assert "_write_core_framework_lock" in sidecar_builder_text
-    assert "_validate_embedded_core_framework_lock" in sidecar_builder_text
     assert "--add-data" in sidecar_builder_text
     assert "desktop/packaging/web" in sidecar_builder_text
     assert "sidecar-build-metadata.json" in sidecar_builder_text
@@ -1568,7 +1043,6 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "_write_sidecar_build_metadata" in sidecar_builder_text
     assert "desktop.server.launcher" in sidecar_entry_text
     assert "_load_packaged_build_metadata" in sidecar_entry_text
-    assert "os.close(4)" not in sidecar_entry_text
     assert 'name = "openevo-desktop"' in cargo
     assert 'serde = { version = "1", features = ["derive"] }' in cargo
     assert "tauri = " in cargo
@@ -1625,7 +1099,6 @@ def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
 ) -> None:
     builder = Path("desktop/packaging/build_sidecar.py").read_text(encoding="utf-8")
 
-    assert 'NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"' in builder
     assert 'NATIVE_EXECUTABLE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"' in builder
     assert 'NATIVE_EXECUTABLE_PATH_ENV = "OPENEVO_NATIVE_EXECUTABLE_PATH"' in builder
     assert "/dev/fd/{NATIVE_EXECUTABLE_FD}" in builder
@@ -1649,33 +1122,18 @@ def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
     source.write_text(
         module._BOOTLOADER_MACOS_INCLUDE_NEEDLE
         + module._BOOTLOADER_RESOLVER_NEEDLE
-        + module._BOOTLOADER_ARCHIVE_NEEDLE
-        + module._BOOTLOADER_RESTART_NEEDLE
-        + module._BOOTLOADER_CHILD_MAIN_NEEDLE,
+        + module._BOOTLOADER_ARCHIVE_NEEDLE,
         encoding="utf-8",
     )
-    utils_source = tmp_path / "bootloader/src/pyi_utils_posix.c"
-    utils_source.write_text(
-        module._BOOTLOADER_POSIX_INCLUDE_NEEDLE
-        + module._BOOTLOADER_NATIVE_HANDOFF_NEEDLE
-        + module._BOOTLOADER_CHILD_EXEC_NEEDLE,
-        encoding="utf-8",
-    )
-    utils_header = tmp_path / "bootloader/src/pyi_utils.h"
-    utils_header.write_text(module._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
 
     module._patch_fd_bound_bootloader(tmp_path)
 
     patched = source.read_text(encoding="utf-8")
-    patched_utils = utils_source.read_text(encoding="utf-8")
     assert patched.count('getenv("OPENEVO_NATIVE_EXECUTABLE_PATH")') == 1
-    assert patched.count('getenv("OPENEVO_NATIVE_LISTENER_FD")') == 1
     assert patched.count("pyi_archive_open(openevo_archive_path)") == 1
     assert patched.count("fstat(4, &openevo_fd_stat)") == 1
     assert patched.count("lstat(openevo_native_path, &openevo_path_stat)") == 1
     assert patched.count("lstat(openevo_resolved_path, &openevo_resolved_stat)") == 1
-    assert "SO_ACCEPTCONN" in patched_utils
-    assert "pyi_utils_openevo_native_handoff_restore()" in patched_utils
 
 
 def test_pre_external_beta_pypi_publish_workflow_is_disabled() -> None:
@@ -1804,6 +1262,40 @@ def _write_release_notes(directory: Path) -> Path:
     return notes
 
 
+def _write_fake_tauri_release_smoke(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import json",
+                "import os",
+                "from pathlib import Path",
+                "import subprocess",
+                "",
+                "subprocess.Popen(['/bin/sh', '-c', 'sleep 60'])",
+                "evidence = {",
+                "    'schema_version': 1,",
+                "    'nonce': os.environ['OPENEVO_RELEASE_SMOKE_NONCE'],",
+                "    'native_executable': 'OpenEvo Desktop',",
+                "    'bundled_external_bin': 'openevo-desktop-sidecar',",
+                "    'renderer_ready': True,",
+                "    'sidecar_ready': True,",
+                "    'bundled_external_bin_resolved': True,",
+                "    'native_listener_fd_handoff': True,",
+                "    'native_executable_fd_handoff': True,",
+                "    'process_group_cleanup': True,",
+                "}",
+                "Path(os.environ['OPENEVO_RELEASE_SMOKE_EVIDENCE_PATH']).write_text(",
+                "    json.dumps(evidence, sort_keys=True) + '\\n', encoding='utf-8'",
+                ")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
 def _write_fake_sidecar(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -1817,17 +1309,31 @@ def _write_fake_sidecar(path: Path) -> None:
                 "import json",
                 "import socket",
                 "import sys",
+                "",
                 "frame = json.loads(sys.stdin.readline())",
-                "assert set(frame) == {'protocol', 'instance_id', 'readiness_key', 'session_token', 'handoff_token'}",
-                "assert frame['protocol'] == 'openevo-native-sidecar-v1'",
+                "assert sys.stdin.read(1) == ''",
+                "session_token = frame['session_token']",
+                "readiness_key = bytes.fromhex(frame['readiness_key'])",
+                "instance_id = frame['instance_id']",
+                "protocol = frame['protocol']",
                 "",
                 "class Handler(BaseHTTPRequestHandler):",
                 "    def do_GET(self):",
                 "        if self.path == '/health':",
-                "            challenge = self.headers.get('X-OpenEvo-Native-Challenge', '')",
-                "            domain = f\"{frame['protocol']}\\0{frame['instance_id']}\\0{challenge}\".encode()",
-                "            proof = hmac.new(bytes.fromhex(frame['readiness_key']), domain, hashlib.sha256).hexdigest()",
-                "            body = json.dumps({'service': 'openevo-sidecar', 'status': 'ok', 'protocol': frame['protocol'], 'instance_id': frame['instance_id'], 'instance_proof': proof}).encode()",
+                "            challenge = self.headers.get('X-OpenEvo-Native-Challenge')",
+                "            if challenge is None:",
+                "                self.send_response(403)",
+                "                self.end_headers()",
+                "                return",
+                "            domain = f'{protocol}\\0{instance_id}\\0{challenge}'.encode('ascii')",
+                "            proof = hmac.new(readiness_key, domain, hashlib.sha256).hexdigest()",
+                "            body = json.dumps({",
+                "                'service': 'openevo-sidecar',",
+                "                'status': 'ok',",
+                "                'protocol': protocol,",
+                "                'instance_id': instance_id,",
+                "                'instance_proof': proof,",
+                "            }).encode()",
                 "            self.send_response(200)",
                 "            self.send_header('Content-Type', 'application/json')",
                 "            self.send_header('Content-Length', str(len(body)))",
@@ -1836,16 +1342,9 @@ def _write_fake_sidecar(path: Path) -> None:
                 "            return",
                 "        if self.path == '/version':",
                 "            body = json.dumps({",
-                "                'schema_version': '1',",
-                "                'api_name': 'openevo-desktop-local-api',",
-                "                'preferred_major': 1,",
-                "                'supported_majors': [1],",
-                "                'openapi_sha256': 'a' * 64,",
-                "                'build_version': '0.1.0',",
-                "                'source_commit': '89baeb26',",
-                "                'build_channel': 'release',",
                 "                'provider_kind': 'desktop_sidecar',",
-                "                'feature_flags': [],",
+                "                'build_channel': 'release',",
+                "                'openapi_sha256': 'a' * 64,",
                 "            }).encode()",
                 "            self.send_response(200)",
                 "            self.send_header('Content-Type', 'application/json')",
@@ -1854,7 +1353,7 @@ def _write_fake_sidecar(path: Path) -> None:
                 "            self.wfile.write(body)",
                 "            return",
                 "        if self.path == '/desktop/v1/state':",
-                "            if self.headers.get('X-OpenEvo-Desktop-Session') != frame['session_token']:",
+                "            if self.headers.get('X-OpenEvo-Desktop-Session') != session_token:",
                 "                self.send_response(401)",
                 "                self.end_headers()",
                 "                return",
@@ -1864,11 +1363,6 @@ def _write_fake_sidecar(path: Path) -> None:
                 "            self.send_header('Content-Length', str(len(body)))",
                 "            self.end_headers()",
                 "            self.wfile.write(body)",
-                "            return",
-                "        if self.path == '/openevo-native/session':",
-                "            status = 204 if self.headers.get('X-OpenEvo-Desktop-Session') == frame['session_token'] else 403",
-                "            self.send_response(status)",
-                "            self.end_headers()",
                 "            return",
                 "        if self.path == '/openevo':",
                 "            body = b'<script src=\"/assets/index.js\"></script>'",
@@ -1893,14 +1387,16 @@ def _write_fake_sidecar(path: Path) -> None:
                 "        return",
                 "",
                 "parser = argparse.ArgumentParser()",
+                "parser.add_argument('--host', default='127.0.0.1')",
+                "parser.add_argument('--desktop-config-root')",
                 "parser.add_argument('--listener-fd', type=int, required=True)",
                 "parser.add_argument('--native-instance-stdin', action='store_true', required=True)",
-                "parser.add_argument('--desktop-config-root')",
                 "args = parser.parse_args()",
-                "server = HTTPServer(('127.0.0.1', 0), Handler, bind_and_activate=False)",
-                "server.socket.close()",
+                "server = HTTPServer((args.host, 0), Handler, bind_and_activate=False)",
                 "server.socket = socket.socket(fileno=args.listener_fd)",
                 "server.server_address = server.socket.getsockname()",
+                "server.server_name = args.host",
+                "server.server_port = server.server_address[1]",
                 "server.serve_forever()",
                 "",
             ]

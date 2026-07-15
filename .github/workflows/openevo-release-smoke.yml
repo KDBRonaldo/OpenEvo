@@ -285,30 +285,10 @@ jobs:
               raise SystemExit("release modes resolved different registry identities")
           PY
 
-      - name: Build outer smoke wheel from the transferred Core wheel
+      - name: Reverify final Core candidate bytes after service smoke
         run: |
-          rm -rf dist
-          outer_source="$(mktemp -d)"
-          trap 'rm -rf "$outer_source"' EXIT
-          cp pyproject.toml README.md LICENSE "$outer_source/"
-          mkdir -p "$outer_source/src"
-          rsync -a \
-            --exclude 'wheels/' \
-            --exclude '*.egg-info/' \
-            --exclude '__pycache__/' \
-            src/ "$outer_source/src/"
-          mkdir -p "$outer_source/src/openevo/wheels"
-          cp .openevo-release-inputs/openevo-*.whl "$outer_source/src/openevo/wheels/"
-          uv run python -m build --wheel --no-isolation \
-            --outdir "$GITHUB_WORKSPACE/dist" "$outer_source"
-
-      - name: Validate OpenEvo wheel
-        run: |
-          uv run python scripts/ci/check_openevo_release.py --wheel dist/*.whl
-
-      - name: Smoke installed Core with source Desktop harness
-        run: |
-          python -m venv .openevo-wheel-smoke
-          .openevo-wheel-smoke/bin/python -m pip install --upgrade pip
-          .openevo-wheel-smoke/bin/python -m pip install dist/*.whl
-          PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py
+          (
+            cd .openevo-release-inputs
+            sha256sum --check SHA256SUMS
+          )
+          test "$(find .openevo-release-inputs -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 3

@@ -117,6 +117,25 @@ state migration. Fake transports may be used in CI only when the evidence is
 clearly marked as a non-release substitute; the release candidate needs real
 canary evidence for the supported release modes.
 
+The packaging-level native smoke is
+`scripts/ci/smoke_openevo_desktop_bundle.py`. It reads
+`CFBundleExecutable` from `Info.plist` and launches that exact
+`Contents/MacOS` process; directly executing the bundled sidecar is not app
+evidence. On macOS it requires a renderer window, the packaged sidecar listener
+on inherited FD 3, executable FD 4 whose bytes match the bundled externalBin,
+and disappearance of the captured app/sidecar process groups after main-app
+termination. Candidate runs retain separate `app-bundle-smoke.json` and
+`dmg-copy-smoke.json` outputs.
+
+`scripts/ci/openevo_release_candidate.py` creates and validates the closed
+candidate inventory. Validation includes the source commit, actual runner
+architecture, final Core wheel/framework lock/registry identity, DMG,
+`core-install-artifact.json`, canonical `SHA256SUMS`, release notes, both native
+smokes, and dependency/license/security evidence. The Linux job and the
+redownloaded draft run the same validator before using any Core bytes. A valid
+packaging manifest is not evidence for the still-separate science, benchmark,
+privacy, signing, or notarization gates.
+
 Remote capability discovery has an additional artifact-level gate. In a clean
 environment containing the exact Core wheel, run
 `scripts/ci/smoke_openevo_remote_capabilities.py --wheel <exact-core-wheel>
@@ -142,7 +161,7 @@ under a source-commit-qualified artifact name. `linux-core-smoke` has an
 explicit dependency on that job, downloads the same artifact, verifies the
 manifest digest and both payload digests before installation, then owns the
 actual Core service ensure/attachment/capability/stop smoke. It never rebuilds
-the release inputs. The macOS job owns sidecar packaging and runs a direct probe
+the release inputs or constructs a later outer wheel. The macOS job owns sidecar packaging and runs a direct probe
 on APFS through the held object FD, `FSPathMakeRef`/`FSRef`, and
 `FSUnlinkObject` implementation; it does not call the Linux-only Core service
 lifecycle. Linux focused tests exercise the unsupported-platform fail-closed

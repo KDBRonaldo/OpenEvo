@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+from zipfile import ZipFile
+
+
+def _load_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/openevo_release_candidate.py"
+    spec = importlib.util.spec_from_file_location("openevo_release_candidate", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> None:
+    candidate = _load_module()
+    paths = _write_candidate_inputs(tmp_path)
+
+    manifest = candidate.create_candidate_manifest(
+        tmp_path,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
+        rust_target="aarch64-apple-darwin",
+        registry_digest="a" * 64,
+    )
+
+    assert candidate.validate_candidate_manifest(
+        manifest,
+        expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+    ) == []
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["release"] == {
+        "channel": "unsigned-draft-prerelease",
+        "notarized": False,
+        "signed": False,
+    }
+    assert payload["macos"] == {
+        "architecture": "aarch64",
+        "minimum_system_version": "12.0",
+        "rust_target": "aarch64-apple-darwin",
+    }
+    by_role = {entry["role"]: entry for entry in payload["files"]}
+    assert by_role["desktop_dmg"]["filename"] == paths["dmg"].name
+    assert by_role["core_wheel"]["sha256"] == hashlib.sha256(
+        paths["wheel"].read_bytes()
+    ).hexdigest()
+    assert by_role["framework_lock"]["filename"] == "framework-lock.json"
+    assert by_role["core_descriptor"]["filename"] == "core-install-artifact.json"
+    assert by_role["checksums"]["filename"] == "SHA256SUMS"
+    assert by_role["app_bundle_smoke"]["filename"] == "app-bundle-smoke.json"
+    assert by_role["dmg_copy_smoke"]["filename"] == "dmg-copy-smoke.json"
+    assert payload["core"]["registry_digest"] == "a" * 64
+    descriptor = json.loads(
+        (tmp_path / "core-install-artifact.json").read_text(encoding="utf-8")
+    )
+    assert descriptor["artifact"] == by_role["core_wheel"]
+    assert descriptor["framework_lock"] == by_role["framework_lock"]
+    assert descriptor["source_commit"] == payload["source_commit"]
+
+
+def test_candidate_manifest_rejects_post_manifest_asset_mutation(tmp_path: Path) -> None:
+    candidate = _load_module()
+    paths = _write_candidate_inputs(tmp_path)
+    manifest = candidate.create_candidate_manifest(
+        tmp_path,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
+        rust_target="aarch64-apple-darwin",
+        registry_digest="b" * 64,
+    )
+
+    paths["wheel"].write_bytes(paths["wheel"].read_bytes() + b"tampered")
+
+    errors = candidate.validate_candidate_manifest(manifest)
+    assert any("digest mismatch" in error and paths["wheel"].name in error for error in errors)
+
+
+def test_candidate_manifest_rejects_false_universal_architecture(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+
+    try:
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="universal",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="c" * 64,
+        )
+    except candidate.CandidateError as exc:
+        assert "actual host architecture" in str(exc)
+    else:
+        raise AssertionError("universal candidate architecture must fail closed")
+
+
+def test_candidate_manifest_rejects_framework_lock_for_other_wheel(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path, locked_digest="d" * 64)
+
+    try:
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="e" * 64,
+        )
+    except candidate.CandidateError as exc:
+        assert "exact Core wheel" in str(exc)
+    else:
+        raise AssertionError("mismatched framework lock must fail closed")
+
+
+def test_candidate_manifest_requires_passing_security_evidence(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path, npm_vulnerabilities=1)
+
+    try:
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="f" * 64,
+        )
+    except candidate.CandidateError as exc:
+        assert "security evidence" in str(exc)
+    else:
+        raise AssertionError("failing security evidence must fail closed")
+
+
+def test_candidate_manifest_rejects_unclassified_directory(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    manifest = candidate.create_candidate_manifest(
+        tmp_path,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
+        rust_target="aarch64-apple-darwin",
+        registry_digest="a" * 64,
+    )
+    (tmp_path / "unclassified").mkdir()
+
+    errors = candidate.validate_candidate_manifest(manifest)
+
+    assert any("non-regular" in error for error in errors)
+
+
+def _write_candidate_inputs(
+    root: Path,
+    *,
+    locked_digest: str | None = None,
+    npm_vulnerabilities: int = 0,
+) -> dict[str, Path]:
+    wheel = root / "openevo-0.1.0-py3-none-any.whl"
+    with ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "openevo-0.1.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\nName: openevo\nVersion: 0.1.0\n\n",
+        )
+        archive.writestr(
+            "openevo-0.1.0.dist-info/entry_points.txt",
+            "[console_scripts]\n"
+            "openevo-backend = openevo.backend.launcher:main\n"
+            "openevo-core-service = openevo.backend.service:main\n",
+        )
+        archive.writestr("openevo/__init__.py", "__version__ = '0.1.0'\n")
+    wheel_digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    framework_lock = root / "framework-lock.json"
+    framework_lock.write_text(
+        json.dumps(
+            {
+                "distribution": "openevo",
+                "distribution_digest": locked_digest or wheel_digest,
+                "distribution_version": "0.1.0",
+                "schema_version": "1",
+                "wheel_filename": wheel.name,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dmg = root / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
+    dmg.write_bytes(b"dmg")
+    (root / "release-notes.md").write_text(
+        "# OpenEvo 0.1.0 unsigned candidate\n\n"
+        "Source commit: 8e45af371eef49a86530a849041f7dcf047620ec\n"
+        "Architecture: aarch64\n\nUNSIGNED AND NOT NOTARIZED.\n",
+        encoding="utf-8",
+    )
+    _write_json(
+        root / "dependency-inventory.json",
+        {
+            "schema_version": 1,
+            "ecosystems": {
+                "python": {
+                    "lockfile_sha256": _sha256(Path("uv.lock")),
+                    "packages": 1,
+                },
+                "npm": {
+                    "lockfile_sha256": _sha256(Path("desktop/package-lock.json")),
+                    "packages": 1,
+                },
+                "cargo": {
+                    "lockfile_sha256": _sha256(Path("desktop/src-tauri/Cargo.lock")),
+                    "packages": 1,
+                },
+            },
+        },
+    )
+    _write_json(
+        root / "license-inventory.json",
+        {
+            "schema_version": 1,
+            "project_license_sha256": _sha256(Path("LICENSE")),
+            "ecosystems": {
+                ecosystem: {"packages": 1, "unresolved": 0}
+                for ecosystem in ("python", "npm", "cargo")
+            },
+        },
+    )
+    _write_json(
+        root / "security-audit.json",
+        {
+            "schema_version": 1,
+            "audits": {
+                "npm-audit-high": {
+                    "status": "passed" if npm_vulnerabilities == 0 else "failed",
+                    "vulnerabilities": npm_vulnerabilities,
+                },
+                "pip-audit": {"status": "passed", "vulnerabilities": 0},
+                "cargo-audit": {"status": "passed", "vulnerabilities": 0},
+            },
+        },
+    )
+    smoke_evidence = {
+        "schema_version": 1,
+        "native_executable": "OpenEvo Desktop",
+        "bundled_external_bin": "openevo-desktop-sidecar",
+        "renderer_ready": True,
+        "sidecar_ready": True,
+        "bundled_external_bin_resolved": True,
+        "native_listener_fd_handoff": True,
+        "native_executable_fd_handoff": True,
+        "process_group_cleanup": True,
+    }
+    _write_json(root / "app-bundle-smoke.json", smoke_evidence)
+    _write_json(root / "dmg-copy-smoke.json", smoke_evidence)
+    return {"wheel": wheel, "framework_lock": framework_lock, "dmg": dmg}
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
