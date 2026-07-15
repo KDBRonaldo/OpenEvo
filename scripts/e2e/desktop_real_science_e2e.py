@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -48,6 +49,14 @@ MAX_NATIVE_FRAME_BYTES = 512
 MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 128 * 1024
 MAX_EVIDENCE_ITEMS = 64
+REQUIRED_TARGET_IDS = ("agent_system", "skill_bundle", "text_memory")
+RUNTIME_CONTEXT_RECEIPT_PREFIX = "Runtime context receipt v1: "
+CONTEXT_CANARY_INSTRUCTION = (
+    "\n\nOpenEvo E2E context canary v1: when OPENEVO_MEMORY_FILE, "
+    "OPENEVO_SKILLS_DIR, and OPENEVO_AGENT_SYSTEM_FILE are set, read the memory file, "
+    "the root SKILL.md, and the agent-system file before completing the task. Do not "
+    "print environment values, filesystem locations, credentials, or file contents."
+)
 TERMINAL_OPERATION_STATES = frozenset({"succeeded", "failed", "cancelled"})
 TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled"})
 FRAMEWORK_LOCK_KEYS = frozenset(
@@ -72,6 +81,41 @@ FORBIDDEN_EVIDENCE_KEYS = frozenset(
         "raw_secret",
         "session_token",
         "ssh_auth_sock",
+        "mutation_token",
+        "password",
+        "passphrase",
+        "private_key",
+    }
+)
+EVIDENCE_ALLOWED_KEYS = frozenset(
+    {
+        "schema_version", "kind", "issue", "real_process_boundary", "outcome",
+        "started_at", "finished_at", "release_assets", "sidecar", "core_wheel",
+        "framework_lock", "sha256", "byte_size", "filename", "distribution",
+        "version", "distribution_digest", "exact_embedded_assets_verified", "desktop",
+        "source_commit", "build_version", "openapi_sha256", "provider_kind",
+        "build_channel", "feature_flags", "legacy_route_rejected",
+        "authenticated_session_probe", "unauthenticated_session_rejected", "remote",
+        "host_sha256", "port", "user_sha256", "host_key_fingerprint_sha256",
+        "project", "project_id_sha256", "execution_mode", "capture_mode",
+        "token_level_metrics_available", "target_ids", "method_ids", "registry_digest",
+        "validation_check_count", "sessions", "ordinal", "run_id_sha256", "status",
+        "required_relation", "required_revision", "pinned_revision", "id_sha256",
+        "generation", "manifest_sha256", "timeline", "logs", "count",
+        "content_sha256", "evidence_truncated", "phase_values", "status_values",
+        "stream_values", "level_values", "artifacts", "artifact_id_sha256",
+        "artifact_type", "target_id", "selected", "promoted", "produced_revision",
+        "release_enabled", "source_artifact_count", "artifact_count",
+        "artifact_evidence_truncated",
+        "artifact_inspections", "document_count", "total_documents", "total_utf8_bytes",
+        "truncated", "runtime_document_sha256", "runtime_context_receipt_sha256",
+        "context", "adapter_count", "reuse", "successor_generation_delta",
+        "session_2_pinned_session_1_successor", "session_1_artifacts_reused",
+        "session_2_runtime_injection_verified", "session_2_lineage_verified",
+        "reused_artifact_count", "successor_revision", "cleanup",
+        "desktop_disconnect_succeeded", "sidecar_shutdown_succeeded",
+        "core_ownership_release_requested", "failure", "stage", "code", "http_status",
+        "agent_system", "skill_bundle", "text_memory",
     }
 )
 ABSOLUTE_WINDOWS_PATH = re.compile(r"^[A-Za-z]:[\\/]")
@@ -143,28 +187,20 @@ class NativeCredentials:
 @dataclass
 class NativeSidecar:
     process: subprocess.Popen[bytes]
+    process_group_id: int
     base_url: str
     credentials: NativeCredentials = field(repr=False)
     process_log: BinaryIO = field(repr=False)
 
     def terminate(self) -> bool:
-        graceful = True
-        if self.process.poll() is None:
-            try:
-                os.killpg(self.process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                self.process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                graceful = False
-                try:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                self.process.wait(timeout=10)
-        self.process_log.close()
-        return graceful and self.process.poll() is not None
+        try:
+            return _terminate_process_group(
+                self.process,
+                process_group_id=self.process_group_id,
+                graceful_timeout_seconds=30,
+            )
+        finally:
+            self.process_log.close()
 
 
 @dataclass(frozen=True)
@@ -173,6 +209,8 @@ class SessionObservation:
     run: dict[str, Any]
     context: dict[str, Any]
     artifacts: tuple[dict[str, Any], ...]
+    document_sha256_by_target: dict[str, str]
+    runtime_context_receipt_sha256: str | None
 
 
 class LocalApi:
@@ -275,8 +313,6 @@ class DesktopScienceWorkflow:
         host_key_algorithm: str,
         expected_host_key_fingerprint: str,
         codex_model: str,
-        target_id: str,
-        method_id: str,
         task_title: str,
         task_objective: str,
         poll_seconds: float,
@@ -290,22 +326,24 @@ class DesktopScienceWorkflow:
         self._host_key_algorithm = host_key_algorithm
         self._expected_host_key_fingerprint = expected_host_key_fingerprint
         self._codex_model = codex_model
-        self._target_id = target_id
-        self._method_id = method_id
         self._task_title = task_title
-        self._task_objective = task_objective
+        self._task_objective = task_objective.rstrip() + CONTEXT_CANARY_INSTRUCTION
         self._poll_seconds = poll_seconds
         self._activation_timeout = activation_timeout_seconds
         self._run_timeout = run_timeout_seconds
         self._nonce = secrets.token_hex(12)
         self.profile_id: str | None = None
         self.project_id: str | None = None
+        self._method_ids: dict[str, str] = {}
 
     def run(self) -> dict[str, object]:
         profile = self._create_and_confirm_profile()
         project = self._create_and_activate_project(profile)
-        capabilities = self._assert_supported_target(project)
+        capabilities = self._select_and_activate_targets(project)
+        project = self._get_project()
         validation = self._validate_project(project)
+        if validation.get("registry_digest") != capabilities["registry_digest"]:
+            raise E2EFailure("project_validation", "registry_digest_changed")
 
         first_run = self._create_run(project, ordinal=1)
         first_run = self._wait_run(first_run, ordinal=1)
@@ -333,8 +371,8 @@ class DesktopScienceWorkflow:
                 "execution_mode": "codex_subscription_transcript",
                 "capture_mode": "transcript",
                 "token_level_metrics_available": False,
-                "target_id": self._target_id,
-                "method_id": self._method_id,
+                "target_ids": list(REQUIRED_TARGET_IDS),
+                "method_ids": dict(sorted(self._method_ids.items())),
                 "registry_digest": capabilities["registry_digest"],
                 "validation_check_count": len(validation.get("checks", [])),
             },
@@ -463,11 +501,12 @@ class DesktopScienceWorkflow:
                 },
                 "evolution": {
                     "targets": {
-                        self._target_id: {
-                            "enabled": True,
-                            "method": self._method_id,
+                        target_id: {
+                            "enabled": False,
+                            "method": None,
                             "config": {},
                         }
+                        for target_id in REQUIRED_TARGET_IDS
                     }
                 },
             },
@@ -475,34 +514,42 @@ class DesktopScienceWorkflow:
         )
         assert project is not None
         self.project_id = _text(project, "project_id", "project_create")
+        return self._activate_project(project, stage="project_bootstrap_activate")
+
+    def _activate_project(
+        self,
+        project: dict[str, Any],
+        *,
+        stage: str,
+    ) -> dict[str, Any]:
         operation = self._api.request(
             "POST",
             f"/desktop/v1/projects/{self.project_id}/activate",
-            stage="project_activate",
+            stage=stage,
             headers={
-                "Idempotency-Key": self._idempotency("project-activate"),
-                "If-Match": _etag(project, "project_activate"),
+                "Idempotency-Key": self._idempotency(stage),
+                "If-Match": _etag(project, stage),
             },
             expected_status=202,
         )
         assert operation is not None
         operation = self._wait_operation(
             operation,
-            stage="project_activate",
+            stage=stage,
             timeout_seconds=self._activation_timeout,
         )
-        _require_operation_success(operation, "project_activate")
+        _require_operation_success(operation, stage)
         project = self._get_project()
         remote = project.get("remote")
         if project.get("state") != "active" or not isinstance(remote, dict):
-            raise E2EFailure("project_activate", "project_not_active")
+            raise E2EFailure(stage, "project_not_active")
         if remote.get("status") != "ready" or not isinstance(
             remote.get("active_revision"), dict
         ):
-            raise E2EFailure("project_activate", "remote_project_not_ready")
+            raise E2EFailure(stage, "remote_project_not_ready")
         return project
 
-    def _assert_supported_target(self, project: dict[str, Any]) -> dict[str, Any]:
+    def _select_and_activate_targets(self, project: dict[str, Any]) -> dict[str, Any]:
         capabilities = self._api.request(
             "GET",
             f"/desktop/v1/projects/{self.project_id}/capabilities",
@@ -515,30 +562,75 @@ class DesktopScienceWorkflow:
         targets = body.get("targets")
         if not isinstance(targets, list):
             raise E2EFailure("project_capabilities", "invalid_target_inventory")
-        target = next(
-            (
-                item
-                for item in targets
-                if isinstance(item, dict) and item.get("target_id") == self._target_id
-            ),
-            None,
-        )
-        if target is None:
-            raise E2EFailure("project_capabilities", "target_not_supported")
-        methods = [
-            item
-            for key in ("methods", "accepted_methods")
-            for item in target.get(key, [])
-            if isinstance(item, dict) and item.get("method_id") == self._method_id
-        ]
-        if not methods or not any(
-            isinstance(item.get("support"), dict)
-            and item["support"].get("overall") == "supported"
-            for item in methods
-        ):
-            raise E2EFailure("project_capabilities", "method_not_supported")
         if capabilities.get("project_etag") != project.get("etag"):
             raise E2EFailure("project_capabilities", "project_etag_mismatch")
+        target_map = {
+            item.get("target_id"): item for item in targets if isinstance(item, dict)
+        }
+        selections: dict[str, dict[str, object]] = {}
+        for target_id in REQUIRED_TARGET_IDS:
+            target = target_map.get(target_id)
+            if not isinstance(target, dict):
+                raise E2EFailure("project_capabilities", "required_target_not_supported")
+            visible_methods = target.get("methods")
+            if not isinstance(visible_methods, list):
+                raise E2EFailure("project_capabilities", "invalid_method_inventory")
+            supported = [
+                method
+                for method in visible_methods
+                if isinstance(method, dict)
+                and isinstance(method.get("support"), dict)
+                and method["support"].get("overall") == "supported"
+                and isinstance(method.get("method_id"), str)
+                and _is_sha256(method.get("implementation_identity_digest"))
+            ]
+            stable = [
+                method for method in supported if method.get("maturity") == "stable"
+            ]
+            effective_default = target.get("effective_default_method_id")
+            selected = next(
+                (method for method in stable if method["method_id"] == effective_default),
+                min(stable, key=lambda method: method["method_id"], default=None),
+            )
+            if selected is None:
+                selected = next(
+                    (
+                        method
+                        for method in supported
+                        if method["method_id"] == effective_default
+                    ),
+                    None,
+                )
+            if selected is None:
+                raise E2EFailure("project_capabilities", "stable_method_not_supported")
+            try:
+                default_config = json.loads(selected["default_config_json"])
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise E2EFailure(
+                    "project_capabilities", "invalid_method_default_config"
+                ) from exc
+            if not isinstance(default_config, dict):
+                raise E2EFailure(
+                    "project_capabilities", "invalid_method_default_config"
+                )
+            method_id = str(selected["method_id"])
+            self._method_ids[target_id] = method_id
+            selections[target_id] = {
+                "enabled": True,
+                "method": method_id,
+                "config": default_config,
+            }
+        patched = self._api.request(
+            "PATCH",
+            f"/desktop/v1/projects/{self.project_id}",
+            stage="project_target_selection",
+            headers={"If-Match": _etag(project, "project_target_selection")},
+            body={"evolution": {"targets": selections}},
+        )
+        assert patched is not None
+        activated = self._activate_project(patched, stage="project_target_activate")
+        if _nested(activated, "remote", "registry_digest") != body["registry_digest"]:
+            raise E2EFailure("project_target_activate", "registry_digest_changed")
         return body
 
     def _validate_project(self, project: dict[str, Any]) -> dict[str, Any]:
@@ -612,12 +704,15 @@ class DesktopScienceWorkflow:
             stage=f"session_{ordinal}_context",
         )
         assert context is not None
-        target_artifact = next(
-            (artifact for artifact in artifacts if artifact.get("target_id") == self._target_id),
-            None,
-        )
-        inspection: dict[str, object] | None = None
-        if target_artifact is not None:
+        inspections: dict[str, dict[str, object]] = {}
+        document_sha256_by_target: dict[str, str] = {}
+        for target_id in REQUIRED_TARGET_IDS:
+            target_artifacts = [
+                artifact for artifact in artifacts if artifact.get("target_id") == target_id
+            ]
+            if len(target_artifacts) != 1:
+                continue
+            target_artifact = target_artifacts[0]
             artifact_id = _text(
                 target_artifact,
                 "id",
@@ -639,7 +734,13 @@ class DesktopScienceWorkflow:
                     f"session_{ordinal}_artifact_content",
                     "artifact_identity_mismatch",
                 )
-            inspection = {
+            document_sha256 = _required_target_document_sha256(
+                content,
+                target_id=target_id,
+                stage=f"session_{ordinal}_artifact_content",
+            )
+            document_sha256_by_target[target_id] = document_sha256
+            inspections[target_id] = {
                 "artifact_id_sha256": _digest_text(artifact_id),
                 "document_count": len(content.get("documents", []))
                 if isinstance(content.get("documents"), list)
@@ -647,7 +748,21 @@ class DesktopScienceWorkflow:
                 "total_documents": content.get("total_documents"),
                 "total_utf8_bytes": content.get("total_utf8_bytes"),
                 "truncated": content.get("truncated"),
+                "runtime_document_sha256": document_sha256,
             }
+
+        receipt_digests = [
+            message.removeprefix(RUNTIME_CONTEXT_RECEIPT_PREFIX)
+            for item in logs
+            if isinstance((message := item.get("message")), str)
+            and message.startswith(RUNTIME_CONTEXT_RECEIPT_PREFIX)
+            and _is_sha256(message.removeprefix(RUNTIME_CONTEXT_RECEIPT_PREFIX))
+        ]
+        if len(receipt_digests) > 1:
+            raise E2EFailure(
+                f"session_{ordinal}_logs", "multiple_runtime_context_receipts"
+            )
+        runtime_context_receipt_sha256 = receipt_digests[0] if receipt_digests else None
 
         evidence = {
             "ordinal": ordinal,
@@ -670,7 +785,8 @@ class DesktopScienceWorkflow:
             ],
             "artifact_count": len(artifacts),
             "artifact_evidence_truncated": len(artifacts) > MAX_EVIDENCE_ITEMS,
-            "artifact_inspection": inspection,
+            "artifact_inspections": inspections,
+            "runtime_context_receipt_sha256": runtime_context_receipt_sha256,
             "context": {
                 "status": context.get("status"),
                 "capture_mode": context.get("capture_mode"),
@@ -685,7 +801,14 @@ class DesktopScienceWorkflow:
                 else -1,
             },
         }
-        return SessionObservation(evidence, run, context, tuple(artifacts))
+        return SessionObservation(
+            evidence,
+            run,
+            context,
+            tuple(artifacts),
+            document_sha256_by_target,
+            runtime_context_receipt_sha256,
+        )
 
     def _assert_successful_session(
         self,
@@ -715,10 +838,31 @@ class DesktopScienceWorkflow:
         logs_evidence = observation.evidence.get("logs")
         if not isinstance(logs_evidence, dict) or logs_evidence.get("count", 0) < 1:
             raise E2EFailure(f"session_{ordinal}_logs", "logs_missing")
-        if not any(artifact.get("target_id") == self._target_id for artifact in observation.artifacts):
-            raise E2EFailure(f"session_{ordinal}_artifacts", "target_artifact_missing")
-        if observation.evidence.get("artifact_inspection") is None:
-            raise E2EFailure(f"session_{ordinal}_artifacts", "artifact_inspection_missing")
+        artifacts_by_target = {
+            target_id: [
+                artifact
+                for artifact in observation.artifacts
+                if artifact.get("target_id") == target_id
+            ]
+            for target_id in REQUIRED_TARGET_IDS
+        }
+        if any(len(items) != 1 for items in artifacts_by_target.values()):
+            raise E2EFailure(
+                f"session_{ordinal}_artifacts", "required_target_artifact_set_invalid"
+            )
+        if set(observation.document_sha256_by_target) != set(REQUIRED_TARGET_IDS):
+            raise E2EFailure(
+                f"session_{ordinal}_artifacts", "artifact_inspection_incomplete"
+            )
+        revisions = {
+            json.dumps(artifact.get("produced_revision"), sort_keys=True)
+            for items in artifacts_by_target.values()
+            for artifact in items
+        }
+        if len(revisions) != 1:
+            raise E2EFailure(
+                f"session_{ordinal}_artifacts", "output_revision_inconsistent"
+            )
 
     def _assert_successor_reuse(
         self,
@@ -727,19 +871,35 @@ class DesktopScienceWorkflow:
     ) -> dict[str, object]:
         first_pin = _revision(first.run.get("pinned_revision"), "reuse_first_pin")
         second_pin = _revision(second.run.get("pinned_revision"), "reuse_second_pin")
-        first_outputs = [
-            artifact
-            for artifact in first.artifacts
-            if artifact.get("target_id") == self._target_id
-        ]
-        if not first_outputs:
+        first_outputs = {
+            target_id: next(
+                (
+                    artifact
+                    for artifact in first.artifacts
+                    if artifact.get("target_id") == target_id
+                ),
+                None,
+            )
+            for target_id in REQUIRED_TARGET_IDS
+        }
+        if any(artifact is None for artifact in first_outputs.values()):
             raise E2EFailure("successor_reuse", "first_session_output_missing")
         successor = _revision(
-            first_outputs[0].get("produced_revision"),
+            first_outputs[REQUIRED_TARGET_IDS[0]].get("produced_revision"),
             "reuse_successor_revision",
         )
-        if any(artifact.get("produced_revision") != successor for artifact in first_outputs):
+        if any(
+            artifact.get("produced_revision") != successor
+            for artifact in first_outputs.values()
+        ):
             raise E2EFailure("successor_reuse", "output_revision_inconsistent")
+        if any(
+            artifact.get("selected") is not True
+            or artifact.get("promoted") is not True
+            or artifact.get("release_enabled") is not True
+            for artifact in first_outputs.values()
+        ):
+            raise E2EFailure("successor_reuse", "successor_artifact_not_selected")
         if successor["generation"] != first_pin["generation"] + 1:
             raise E2EFailure("successor_reuse", "successor_generation_invalid")
         required = _revision(
@@ -749,25 +909,60 @@ class DesktopScienceWorkflow:
         if second_pin != successor or required != successor:
             raise E2EFailure("successor_reuse", "second_session_did_not_pin_successor")
         first_artifact_ids = {
-            _text(artifact, "id", "successor_reuse") for artifact in first_outputs
+            target_id: _text(artifact, "id", "successor_reuse")
+            for target_id, artifact in first_outputs.items()
         }
         context_artifacts = second.context.get("artifacts")
         if not isinstance(context_artifacts, list):
             raise E2EFailure("successor_reuse", "second_context_invalid")
-        reused = [
-            item
+        reused = {
+            target_id: item
+            for target_id, artifact_id in first_artifact_ids.items()
             for item in context_artifacts
             if isinstance(item, dict)
-            and item.get("artifact_id") in first_artifact_ids
-            and item.get("target_id") == self._target_id
+            and item.get("artifact_id") == artifact_id
+            and item.get("target_id") == target_id
+            and item.get("artifact_type") == target_id
             and item.get("revision") == successor
-        ]
-        if not reused:
+        }
+        if set(reused) != set(REQUIRED_TARGET_IDS):
             raise E2EFailure("successor_reuse", "first_artifact_not_in_second_context")
+        second_outputs = {
+            target_id: next(
+                (
+                    artifact
+                    for artifact in second.artifacts
+                    if artifact.get("target_id") == target_id
+                ),
+                None,
+            )
+            for target_id in REQUIRED_TARGET_IDS
+        }
+        for target_id, artifact in second_outputs.items():
+            lineage = artifact.get("lineage") if isinstance(artifact, dict) else None
+            source_artifact_ids = (
+                lineage.get("source_artifact_ids") if isinstance(lineage, dict) else None
+            )
+            if (
+                not isinstance(source_artifact_ids, list)
+                or first_artifact_ids[target_id] not in source_artifact_ids
+            ):
+                raise E2EFailure("successor_reuse", "successor_lineage_missing")
+        expected_receipt = {
+            "schema_version": "1",
+            "context_injected": True,
+            "context_artifact_ids": sorted(first_artifact_ids.values()),
+        }
+        expected_receipt_sha256 = _canonical_object_sha256(expected_receipt)
+        if second.runtime_context_receipt_sha256 != expected_receipt_sha256:
+            raise E2EFailure("successor_reuse", "runtime_context_receipt_mismatch")
         return {
             "successor_generation_delta": 1,
             "session_2_pinned_session_1_successor": True,
-            "session_1_artifact_reused": True,
+            "session_1_artifacts_reused": True,
+            "session_2_runtime_injection_verified": True,
+            "session_2_lineage_verified": True,
+            "runtime_context_receipt_sha256": expected_receipt_sha256,
             "reused_artifact_count": len(reused),
             "successor_revision": _revision_evidence(successor, "successor_reuse"),
         }
@@ -816,7 +1011,7 @@ class DesktopScienceWorkflow:
         return f"real-science-e2e-{self._nonce}-{action}"
 
 
-def _build_assets(root: Path) -> ReleaseAssets:
+def _build_assets(root: Path, *, timeout_seconds: float) -> ReleaseAssets:
     root.mkdir(parents=True, exist_ok=True)
     output = root / "core-release-assets"
     command = [
@@ -826,16 +1021,33 @@ def _build_assets(root: Path) -> ReleaseAssets:
         str(output),
     ]
     with TemporaryFile(mode="w+b") as build_log:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=REPOSITORY_ROOT,
             stdin=subprocess.DEVNULL,
             stdout=build_log,
             stderr=subprocess.STDOUT,
-            check=False,
             env=_build_environment(),
+            start_new_session=True,
         )
-        if result.returncode != 0:
+        process_group_id = os.getpgid(process.pid)
+        if process_group_id != process.pid:
+            _terminate_process_group(
+                process,
+                process_group_id=process_group_id,
+                graceful_timeout_seconds=0,
+            )
+            raise E2EFailure("release_assets", "build_process_group_invalid")
+        try:
+            returncode = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            _terminate_process_group(
+                process,
+                process_group_id=process_group_id,
+                graceful_timeout_seconds=0,
+            )
+            raise E2EFailure("release_assets", "sidecar_build_timeout") from exc
+        if returncode != 0:
             raise E2EFailure("release_assets", "sidecar_build_failed")
         build_log.seek(0)
         lines = build_log.read().decode("utf-8", errors="replace").splitlines()
@@ -975,6 +1187,8 @@ def _launch_sidecar(sidecar: Path, root: Path) -> NativeSidecar:
         str(root / "state"),
     ]
     log_guard = _duplicate_fd(process_log.fileno())
+    process: subprocess.Popen[bytes] | None = None
+    process_group_id: int | None = None
     try:
         with _fixed_descriptors(listener.fileno(), executable_fd):
             process = subprocess.Popen(
@@ -987,14 +1201,34 @@ def _launch_sidecar(sidecar: Path, root: Path) -> NativeSidecar:
                 pass_fds=(LISTENER_FD, EXECUTABLE_FD),
                 start_new_session=True,
             )
+            process_group_id = os.getpgid(process.pid)
+            if process_group_id != process.pid:
+                _terminate_process_group(
+                    process,
+                    process_group_id=process_group_id,
+                    graceful_timeout_seconds=0,
+                )
+                raise E2EFailure("native_launch", "sidecar_process_group_invalid")
     except BaseException:
+        if process is not None and process_group_id is not None:
+            _terminate_process_group(
+                process,
+                process_group_id=process_group_id,
+                graceful_timeout_seconds=0,
+            )
         process_log.close()
         raise
     finally:
         os.close(log_guard)
         os.close(executable_fd)
         listener.close()
+    assert process is not None and process_group_id is not None
     if process.stdin is None:
+        _terminate_process_group(
+            process,
+            process_group_id=process_group_id,
+            graceful_timeout_seconds=0,
+        )
         process_log.close()
         raise E2EFailure("native_launch", "credential_channel_missing")
     try:
@@ -1002,11 +1236,16 @@ def _launch_sidecar(sidecar: Path, root: Path) -> NativeSidecar:
         process.stdin.close()
         process.stdin = None
     except OSError as exc:
-        _terminate_process(process)
+        _terminate_process_group(
+            process,
+            process_group_id=process_group_id,
+            graceful_timeout_seconds=0,
+        )
         process_log.close()
         raise E2EFailure("native_launch", "credential_frame_delivery_failed") from exc
     native = NativeSidecar(
         process=process,
+        process_group_id=process_group_id,
         base_url=f"http://127.0.0.1:{port}",
         credentials=credentials,
         process_log=process_log,
@@ -1023,7 +1262,7 @@ def _wait_sidecar_ready(native: NativeSidecar) -> None:
     api = LocalApi(native.base_url, native.credentials.session_token)
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
-        if native.process.poll() is not None:
+        if _process_exited_without_reap(native.process):
             raise E2EFailure("native_launch", "sidecar_exited_before_readiness")
         challenge = secrets.token_hex(32)
         try:
@@ -1047,7 +1286,8 @@ def _wait_sidecar_ready(native: NativeSidecar) -> None:
             hashlib.sha256,
         ).hexdigest()
         if (
-            health.get("status") == "ok"
+            health.get("service") == "openevo-sidecar"
+            and health.get("status") == "ok"
             and health.get("protocol") == NATIVE_PROTOCOL
             and health.get("instance_id") == native.credentials.instance_id
             and hmac.compare_digest(str(health.get("instance_proof", "")), expected)
@@ -1058,6 +1298,35 @@ def _wait_sidecar_ready(native: NativeSidecar) -> None:
 
 
 def _release_identity(api: LocalApi) -> dict[str, object]:
+    try:
+        release_contract = json.loads(
+            (REPOSITORY_ROOT / "desktop/release-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise E2EFailure("desktop_version", "release_contract_unreadable") from exc
+    if (
+        not isinstance(release_contract, dict)
+        or set(release_contract)
+        != {
+            "accepted_openapi_digests",
+            "allowed_provider_kinds",
+            "required_feature_flags",
+            "schema_version",
+        }
+        or release_contract.get("schema_version") != "1"
+        or release_contract.get("allowed_provider_kinds") != ["desktop_sidecar"]
+        or not isinstance(release_contract.get("accepted_openapi_digests"), list)
+        or len(release_contract["accepted_openapi_digests"]) != 1
+        or not _is_sha256(release_contract["accepted_openapi_digests"][0])
+        or not isinstance(release_contract.get("required_feature_flags"), list)
+        or not all(
+            isinstance(flag, str) and flag
+            for flag in release_contract["required_feature_flags"]
+        )
+    ):
+        raise E2EFailure("desktop_version", "release_contract_invalid")
     version = api.request(
         "GET",
         "/version",
@@ -1066,6 +1335,7 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
     )
     assert version is not None
     required = {
+        "schema_version": "1",
         "api_name": "openevo-desktop-local-api",
         "preferred_major": 1,
         "provider_kind": "desktop_sidecar",
@@ -1073,8 +1343,11 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
     }
     if any(version.get(key) != value for key, value in required.items()):
         raise E2EFailure("desktop_version", "not_release_desktop_sidecar")
-    if version.get("supported_majors") != [1] or not _is_sha256(
-        version.get("openapi_sha256")
+    if (
+        version.get("supported_majors") != [1]
+        or version.get("openapi_sha256")
+        != release_contract["accepted_openapi_digests"][0]
+        or version.get("feature_flags") != release_contract["required_feature_flags"]
     ):
         raise E2EFailure("desktop_version", "desktop_contract_invalid")
     source_commit = version.get("source_commit")
@@ -1083,9 +1356,32 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
         not isinstance(source_commit, str)
         or re.fullmatch(r"[0-9a-f]{7,40}", source_commit) is None
         or not isinstance(build_version, str)
-        or not build_version
+        or not 0 < len(build_version) <= 512
+        or any(character in build_version for character in ("\x00", "\r", "\n"))
+        or build_version.startswith("/")
+        or ABSOLUTE_WINDOWS_PATH.match(build_version)
     ):
         raise E2EFailure("desktop_version", "desktop_build_identity_invalid")
+    api.request(
+        "GET",
+        "/openevo-api/desktop/shell",
+        stage="desktop_legacy_route",
+        expected_status=404,
+        authenticated=False,
+    )
+    api.request(
+        "GET",
+        "/openevo-native/session",
+        stage="desktop_session_probe",
+        expected_status=204,
+    )
+    api.request(
+        "GET",
+        "/openevo-native/session",
+        stage="desktop_session_probe_unauthenticated",
+        expected_status=403,
+        authenticated=False,
+    )
     return {
         "source_commit": source_commit,
         "build_version": build_version,
@@ -1093,6 +1389,9 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
         "provider_kind": version["provider_kind"],
         "build_channel": version["build_channel"],
         "feature_flags": sorted(version.get("feature_flags", [])),
+        "legacy_route_rejected": True,
+        "authenticated_session_probe": True,
+        "unauthenticated_session_rejected": True,
     }
 
 
@@ -1133,8 +1432,29 @@ def _audit_evidence(value: object, *, private_values: Sequence[str]) -> None:
         if isinstance(item, dict):
             for key, child in item.items():
                 lowered = str(key).lower()
-                if lowered in FORBIDDEN_EVIDENCE_KEYS or lowered.endswith("_path"):
+                if (
+                    lowered in FORBIDDEN_EVIDENCE_KEYS
+                    or lowered.endswith("_path")
+                    or any(
+                        fragment in lowered
+                        for fragment in (
+                            "bearer", "credential", "mutation_token", "password",
+                            "passphrase", "private_key", "ssh_auth_sock",
+                        )
+                    )
+                ):
                     raise E2EFailure("evidence", "forbidden_evidence_field")
+                if lowered not in EVIDENCE_ALLOWED_KEYS:
+                    raise E2EFailure("evidence", "evidence_field_not_allowlisted")
+                if lowered.endswith("sha256") and child is not None:
+                    valid_digest = _is_sha256(child) or (
+                        isinstance(child, list)
+                        and all(_is_sha256(digest) for digest in child)
+                    )
+                    if not valid_digest:
+                        raise E2EFailure("evidence", "invalid_evidence_digest")
+                if lowered in {"stage", "code"} and _safe_code(child) != child:
+                    raise E2EFailure("evidence", "invalid_evidence_code")
                 visit(child)
             return
         if isinstance(item, list):
@@ -1144,6 +1464,19 @@ def _audit_evidence(value: object, *, private_values: Sequence[str]) -> None:
         if isinstance(item, str):
             if item.startswith("/") or ABSOLUTE_WINDOWS_PATH.match(item):
                 raise E2EFailure("evidence", "host_path_in_evidence")
+            lowered = item.lower()
+            if (
+                item.startswith("~")
+                or lowered.startswith("file:")
+                or "://" in item
+                or "-----begin " in lowered
+                or "bearer " in lowered
+                or "ssh_auth_sock" in lowered
+                or any(ord(character) < 0x20 for character in item)
+            ):
+                raise E2EFailure("evidence", "sensitive_text_in_evidence")
+            if len(item.encode("utf-8")) > 512:
+                raise E2EFailure("evidence", "evidence_text_capacity_exceeded")
             if any(secret in item for secret in secrets_to_reject):
                 raise E2EFailure("evidence", "secret_in_evidence")
 
@@ -1158,13 +1491,27 @@ def _structural_check() -> None:
         launcher_text = launcher.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise E2EFailure("structural_check", "release_sources_unavailable") from exc
-    if contract_payload.get("allowed_provider_kinds") != ["desktop_sidecar"]:
+    if (
+        set(contract_payload)
+        != {
+            "accepted_openapi_digests",
+            "allowed_provider_kinds",
+            "required_feature_flags",
+            "schema_version",
+        }
+        or contract_payload.get("schema_version") != "1"
+        or contract_payload.get("allowed_provider_kinds") != ["desktop_sidecar"]
+        or len(contract_payload.get("accepted_openapi_digests", [])) != 1
+        or not _is_sha256(contract_payload["accepted_openapi_digests"][0])
+        or not contract_payload.get("required_feature_flags")
+    ):
         raise E2EFailure("structural_check", "release_provider_policy_invalid")
     required = (
         'parser.add_argument("--listener-fd", type=int, required=True)',
         'parser.add_argument("--native-instance-stdin", action="store_true", required=True)',
         "_read_native_instance_frame()",
         "uvicorn.Server(config).run(sockets=[listener])",
+        '_NATIVE_SESSION_PROBE_ROUTE = "/openevo-native/session"',
     )
     if any(marker not in launcher_text for marker in required):
         raise E2EFailure("structural_check", "native_boundary_missing")
@@ -1195,6 +1542,10 @@ def _event_inventory(
 
 
 def _artifact_evidence(artifact: Mapping[str, object], stage: str) -> dict[str, object]:
+    lineage = artifact.get("lineage")
+    source_artifact_ids = (
+        lineage.get("source_artifact_ids") if isinstance(lineage, dict) else None
+    )
     return {
         "artifact_id_sha256": _digest_text(_text(artifact, "id", stage)),
         "artifact_type": artifact.get("artifact_type"),
@@ -1203,10 +1554,48 @@ def _artifact_evidence(artifact: Mapping[str, object], stage: str) -> dict[str, 
         "byte_size": artifact.get("byte_size"),
         "selected": artifact.get("selected"),
         "promoted": artifact.get("promoted"),
+        "release_enabled": artifact.get("release_enabled"),
+        "source_artifact_count": len(source_artifact_ids)
+        if isinstance(source_artifact_ids, list)
+        else -1,
         "produced_revision": _revision_evidence(
             artifact.get("produced_revision"), stage
         ),
     }
+
+
+def _required_target_document_sha256(
+    content: Mapping[str, object],
+    *,
+    target_id: str,
+    stage: str,
+) -> str:
+    documents = content.get("documents")
+    if (
+        content.get("truncated") is not False
+        or not isinstance(documents, list)
+        or not documents
+        or content.get("total_documents") != len(documents)
+    ):
+        raise E2EFailure(stage, "artifact_content_not_complete")
+    complete = [
+        document
+        for document in documents
+        if isinstance(document, dict)
+        and document.get("truncated") is False
+        and _is_sha256(document.get("content_sha256"))
+    ]
+    if len(complete) != len(documents):
+        raise E2EFailure(stage, "artifact_document_not_complete")
+    if target_id == "skill_bundle":
+        selected = [
+            document for document in complete if document.get("relative_path") == "SKILL.md"
+        ]
+    else:
+        selected = complete if len(complete) == 1 else []
+    if len(selected) != 1:
+        raise E2EFailure(stage, "runtime_document_ambiguous")
+    return str(selected[0]["content_sha256"])
 
 
 def _revision_evidence(value: object, stage: str) -> dict[str, object]:
@@ -1294,6 +1683,17 @@ def _canonical_json(payload: object) -> bytes:
     ).encode("utf-8")
 
 
+def _canonical_object_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -1349,14 +1749,73 @@ def _fixed_descriptors(listener_fd: int, executable_fd: int) -> Iterator[None]:
         os.close(listener_guard)
 
 
-def _terminate_process(process: subprocess.Popen[Any]) -> None:
-    if process.poll() is not None:
-        return
+def _process_exited_without_reap(process: subprocess.Popen[Any]) -> bool:
+    if process.returncode is not None:
+        return True
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        result = os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except ChildProcessError:
+        return True
+    return result is not None
+
+
+def _wait_exited_without_reap(
+    process: subprocess.Popen[Any],
+    *,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while not _process_exited_without_reap(process):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    return True
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[Any],
+    *,
+    process_group_id: int,
+    graceful_timeout_seconds: float,
+) -> bool:
+    if (
+        process_group_id <= 0
+        or process_group_id != process.pid
+        or process.returncode is not None
+    ):
+        return False
+    try:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        return False
+    graceful = _process_exited_without_reap(process)
+    if not graceful:
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            graceful = True
+        else:
+            graceful = _wait_exited_without_reap(
+                process,
+                timeout_seconds=graceful_timeout_seconds,
+            )
+    # The unreaped group leader keeps the captured PGID authoritative while
+    # any descendants are force-closed.
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    process.wait(timeout=10)
+    if not _wait_exited_without_reap(process, timeout_seconds=10):
+        return False
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        return False
+    return graceful
 
 
 def _sidecar_environment() -> dict[str, str]:
@@ -1399,10 +1858,22 @@ def _validate_runtime_arguments(args: argparse.Namespace) -> None:
         return
     if not args.host or not args.user or not args.expected_host_key_fingerprint:
         raise E2EFailure("arguments", "remote_identity_required")
+    if not 1 <= args.port <= 65_535:
+        raise E2EFailure("arguments", "remote_port_invalid")
     if HOST_KEY_PATTERN.fullmatch(args.expected_host_key_fingerprint) is None:
         raise E2EFailure("arguments", "host_key_fingerprint_invalid")
     if not os.environ.get("SSH_AUTH_SOCK"):
         raise E2EFailure("arguments", "ssh_agent_unavailable")
+
+
+def _positive_finite_seconds(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return parsed
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1428,12 +1899,6 @@ def _parser() -> argparse.ArgumentParser:
         default=Path("desktop-real-science-e2e-evidence.json"),
     )
     parser.add_argument("--codex-model", default="gpt-5")
-    parser.add_argument(
-        "--target-id",
-        choices=("text_memory", "skill_bundle", "agent_system"),
-        default="text_memory",
-    )
-    parser.add_argument("--method-id", default="text_memory_expel_reflector")
     parser.add_argument("--task-title", default="Release Desktop science E2E")
     parser.add_argument(
         "--task-objective",
@@ -1442,9 +1907,22 @@ def _parser() -> argparse.ArgumentParser:
             "and complete without requesting user input."
         ),
     )
-    parser.add_argument("--poll-seconds", type=float, default=2.0)
-    parser.add_argument("--activation-timeout-seconds", type=float, default=1200.0)
-    parser.add_argument("--run-timeout-seconds", type=float, default=7200.0)
+    parser.add_argument("--poll-seconds", type=_positive_finite_seconds, default=2.0)
+    parser.add_argument(
+        "--activation-timeout-seconds",
+        type=_positive_finite_seconds,
+        default=1200.0,
+    )
+    parser.add_argument(
+        "--run-timeout-seconds",
+        type=_positive_finite_seconds,
+        default=7200.0,
+    )
+    parser.add_argument(
+        "--build-timeout-seconds",
+        type=_positive_finite_seconds,
+        default=1800.0,
+    )
     parser.add_argument(
         "--structural-check",
         action="store_true",
@@ -1493,7 +1971,9 @@ def main(argv: list[str] | None = None) -> int:
         root = Path(temporary)
         try:
             if args.sidecar is None:
-                assets = _build_assets(root / "build")
+                assets = _build_assets(
+                    root / "build", timeout_seconds=args.build_timeout_seconds
+                )
             else:
                 assets = _inspect_release_assets(
                     args.sidecar,
@@ -1513,8 +1993,6 @@ def main(argv: list[str] | None = None) -> int:
                 host_key_algorithm=args.host_key_algorithm,
                 expected_host_key_fingerprint=args.expected_host_key_fingerprint,
                 codex_model=args.codex_model,
-                target_id=args.target_id,
-                method_id=args.method_id,
                 task_title=args.task_title,
                 task_objective=args.task_objective,
                 poll_seconds=args.poll_seconds,

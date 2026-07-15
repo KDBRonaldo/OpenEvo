@@ -45,11 +45,14 @@ exact embedded wheel/lock pair. That mode uses
 `desktop/packaging/build_sidecar.py`; it is not a substitute for candidate
 signing, DMG copy smoke, or clean-machine rehearsal.
 
-The defaults select `text_memory` with
-`text_memory_expel_reflector`. A maintainer may pass another non-parametric
-text target and method exposed by the exact Core release. The runner still
-requires remote capabilities to report the selected method as supported and
-requires Core project validation to pass before the first run.
+The runner always enables `text_memory`, `skill_bundle`, and `agent_system`.
+There is no target or method override. For each target it selects the remote
+effective default when that method is visible, stable, and supported; otherwise
+it deterministically selects the first visible stable supported method. Because
+the current three built-ins are marked experimental, a release with no stable
+choice may use only its explicit visible, supported effective default; the
+runner never chooses another experimental method. Its remote default config is
+preserved. Missing support fails closed before the first run.
 
 ## Product-boundary flow
 
@@ -57,20 +60,35 @@ The runner performs these actions only through Desktop Local API v1:
 
 1. Start the real packaged sidecar with an inherited loopback listener,
    inherited executable descriptor, and one native credential frame on stdin.
+   Negotiate the exact frozen Desktop OpenAPI digest, provider kind, and feature
+   flags; require the legacy shell route to return 404; and require authenticated
+   and unauthenticated native session probes to return 204 and 403 respectively.
 2. Create an SSH-agent profile, connect, compare the candidate host key with
    the expected identity, and confirm it.
 3. Create a scratch project with
    `codex_subscription_transcript`, explicit transcript capture, no token-level
-   metrics, and one enabled text-evolution target.
-4. Activate the project, require compatible remote capabilities, and run Core
-   project validation.
+   metrics, and initially disabled drafts for all three required evolution
+   targets. Core compiles it to the exact `managed_science` runtime profile with
+   `container_user=host`; the existing experiment model remains fail closed for
+   any other subscription runtime shape.
+4. Activate the project, fetch capabilities through its active tunnel, select
+   all three remote stable methods, reactivate, and run Core project validation.
 5. Run session 1 to `succeeded`; inspect its timeline, logs, context, artifact
    summary, and bounded artifact content endpoint.
 6. Run session 2 to `succeeded`; prove that its exact pinned revision is the
-   generation-adjacent revision produced by session 1 and that a session-1
-   artifact appears in session 2's pinned context.
+   generation-adjacent revision produced by session 1. Require all three
+   session-1 artifacts in session 2's pinned context, require each session-2
+   artifact lineage to reference its matching predecessor, and verify the Core
+   runtime-context receipt digest. The receipt is derived from the real terminal
+   session metadata only after Gateway successfully injects the exact three
+   admitted artifact IDs; no Codex transcript or artifact content is retained.
 7. Request profile disconnect, then terminate and wait for the sidecar process
    group. Sidecar shutdown owns tunnel and Core attachment release.
+
+All polling, activation, run, HTTP, build, and shutdown waits are finite and
+positive. The build timeout is configurable with `--build-timeout-seconds`.
+Sidecar cleanup retains the unreaped process-group leader as PGID authority
+until descendants have been signalled and the leader can be reaped.
 
 Any missing product state fails the run. The script does not read a remote DB,
 invoke SSH commands directly after startup, call Core Control directly, or
@@ -80,13 +98,15 @@ manufacture a successor/artifact observation.
 
 The output is canonical JSON, mode `0600`, and at most 128 KiB. It contains
 release digests, build identity, redacted remote identity digests, state/count
-inventories, revision generations/manifests, artifact metadata digests, reuse
-booleans, and cleanup results.
+inventories, revision generations/manifests, artifact metadata digests, the
+runtime-context receipt digest, reuse booleans, and cleanup results. A closed
+field allowlist rejects every unrecognized evidence key.
 
 It does not contain:
 
 - the Desktop session credential or native handoff/readiness values;
-- a Core bearer, `SSH_AUTH_SOCK`, Codex authentication, or another raw secret;
+- a mutation token, Core bearer, password, passphrase, private key,
+  `SSH_AUTH_SOCK`, Codex authentication, or another raw secret;
 - host filesystem paths, remote host/user text, opaque resource IDs, log or
   timeline messages, or artifact document text.
 
@@ -103,8 +123,9 @@ uv run python scripts/e2e/desktop_real_science_e2e.py --structural-check
 uv run pytest -q tests/ci/test_desktop_real_science_e2e.py
 ```
 
-`--structural-check` verifies only the release provider policy and native
+`--structural-check` verifies only the frozen release contract shape and native
 launcher shape. It does not build assets, contact a remote host, launch the
 sidecar, or write evidence. Its success text explicitly states that E2E was not
-run. Unit tests use synthetic revision documents only to test fail-closed
-assertions and never emit a passing E2E artifact.
+run. Unit tests use synthetic capability/revision/session documents and real
+local child processes only to test fail-closed assertions and cleanup; they
+never emit a passing E2E artifact or claim a real Codex/SSH session ran.

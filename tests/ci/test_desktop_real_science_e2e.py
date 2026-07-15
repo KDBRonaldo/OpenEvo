@@ -4,9 +4,11 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import ModuleType
 from zipfile import ZipFile
 
@@ -63,8 +65,6 @@ def _workflow(module: ModuleType):
         host_key_algorithm="ssh-ed25519",
         expected_host_key_fingerprint="SHA256:" + "A" * 43 + "=",
         codex_model="gpt-5",
-        target_id="text_memory",
-        method_id="text_memory_expel_reflector",
         task_title="Structural test",
         task_objective="No real execution occurs in this structural test.",
         poll_seconds=0.01,
@@ -153,16 +153,43 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
     workflow = _workflow(module)
     predecessor = _revision("revision-0", 0)
     successor = _revision("revision-1", 1)
-    artifact = {
-        "id": "artifact-session-1",
-        "target_id": "text_memory",
-        "produced_revision": successor,
+    first_artifacts = tuple(
+        {
+            "id": f"artifact-session-1-{target_id}",
+            "target_id": target_id,
+            "produced_revision": successor,
+            "selected": True,
+            "promoted": True,
+            "release_enabled": True,
+            "lineage": {"source_artifact_ids": []},
+        }
+        for target_id in module.REQUIRED_TARGET_IDS
+    )
+    second_artifacts = tuple(
+        {
+            "id": f"artifact-session-2-{target_id}",
+            "target_id": target_id,
+            "produced_revision": _revision("revision-2", 2),
+            "lineage": {
+                "source_artifact_ids": [f"artifact-session-1-{target_id}"]
+            },
+        }
+        for target_id in module.REQUIRED_TARGET_IDS
+    )
+    receipt = {
+        "schema_version": "1",
+        "context_injected": True,
+        "context_artifact_ids": sorted(
+            artifact["id"] for artifact in first_artifacts
+        ),
     }
     first = module.SessionObservation(
         evidence={},
         run={"pinned_revision": predecessor},
         context={},
-        artifacts=(artifact,),
+        artifacts=first_artifacts,
+        document_sha256_by_target={target_id: "1" * 64 for target_id in module.REQUIRED_TARGET_IDS},
+        runtime_context_receipt_sha256=None,
     )
     second = module.SessionObservation(
         evidence={},
@@ -174,18 +201,23 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
             "artifacts": [
                 {
                     "artifact_id": artifact["id"],
-                    "target_id": "text_memory",
+                    "artifact_type": artifact["target_id"],
+                    "target_id": artifact["target_id"],
                     "revision": successor,
                 }
+                for artifact in first_artifacts
             ]
         },
-        artifacts=(),
+        artifacts=second_artifacts,
+        document_sha256_by_target={target_id: "2" * 64 for target_id in module.REQUIRED_TARGET_IDS},
+        runtime_context_receipt_sha256=module._canonical_object_sha256(receipt),
     )
 
     reuse = workflow._assert_successor_reuse(first, second)
 
     assert reuse["session_2_pinned_session_1_successor"] is True
-    assert reuse["session_1_artifact_reused"] is True
+    assert reuse["session_1_artifacts_reused"] is True
+    assert reuse["session_2_runtime_injection_verified"] is True
     second.run["pinned_revision"] = _revision("revision-2", 2)
     with pytest.raises(module.E2EFailure, match="second_session_did_not_pin_successor"):
         workflow._assert_successor_reuse(first, second)
@@ -195,8 +227,16 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
     ("payload", "private_values", "code"),
     [
         ({"session_token": "redacted"}, (), "forbidden_evidence_field"),
-        ({"value": "/private/desktop/state"}, (), "host_path_in_evidence"),
-        ({"value": "prefix-secret-value"}, ("secret-value",), "secret_in_evidence"),
+        ({"status": "/private/desktop/state"}, (), "host_path_in_evidence"),
+        ({"status": "prefix-secret-value"}, ("secret-value",), "secret_in_evidence"),
+        ({"mutation_token": "redacted"}, (), "forbidden_evidence_field"),
+        ({"password": "redacted"}, (), "forbidden_evidence_field"),
+        ({"passphrase": "redacted"}, (), "forbidden_evidence_field"),
+        ({"private_key": "redacted"}, (), "forbidden_evidence_field"),
+        ({"ssh_auth_sock": "redacted"}, (), "forbidden_evidence_field"),
+        ({"bearer": "redacted"}, (), "forbidden_evidence_field"),
+        ({"status": "file:///private/state"}, (), "sensitive_text_in_evidence"),
+        ({"raw_log": "redacted"}, (), "evidence_field_not_allowlisted"),
     ],
 )
 def test_evidence_audit_rejects_sensitive_values(
@@ -229,3 +269,241 @@ def test_bounded_evidence_contains_only_redacted_identity(tmp_path: Path) -> Non
     assert output.stat().st_size <= module.MAX_EVIDENCE_BYTES
     assert json.loads(output.read_text(encoding="utf-8")) == payload
     assert "compute.example.org" not in output.read_text(encoding="utf-8")
+
+
+def test_closed_evidence_schema_accepts_runtime_receipt_shape() -> None:
+    module = _load_runner()
+    digest = "a" * 64
+    payload = {
+        "project": {
+            "target_ids": list(module.REQUIRED_TARGET_IDS),
+            "method_ids": {target_id: f"method_{target_id}" for target_id in module.REQUIRED_TARGET_IDS},
+            "registry_digest": digest,
+        },
+        "sessions": [
+            {
+                "ordinal": 2,
+                "runtime_context_receipt_sha256": digest,
+                "artifact_inspections": {
+                    target_id: {
+                        "artifact_id_sha256": digest,
+                        "runtime_document_sha256": digest,
+                        "document_count": 1,
+                        "total_documents": 1,
+                        "total_utf8_bytes": 1,
+                        "truncated": False,
+                    }
+                    for target_id in module.REQUIRED_TARGET_IDS
+                },
+            }
+        ],
+        "reuse": {
+            "session_2_runtime_injection_verified": True,
+            "session_2_lineage_verified": True,
+            "runtime_context_receipt_sha256": digest,
+        },
+    }
+
+    module._audit_evidence(payload, private_values=())
+
+
+def test_capability_selection_enables_all_three_remote_supported_methods() -> None:
+    module = _load_runner()
+    project = {
+        "etag": '"' + "1" * 64 + '"',
+        "state": "active",
+        "remote": {
+            "status": "ready",
+            "active_revision": _revision("r0", 0),
+            "registry_digest": "a" * 64,
+        },
+    }
+
+    class FakeApi:
+        patched: dict[str, object] | None = None
+
+        def request(self, method: str, route: str, **kwargs: object):
+            if method == "GET" and route.endswith("/capabilities"):
+                return {
+                    "project_etag": project["etag"],
+                    "capabilities": {
+                        "registry_digest": "a" * 64,
+                        "targets": [
+                            {
+                                "target_id": target_id,
+                                "effective_default_method_id": f"remote-{target_id}",
+                                "methods": [
+                                    {
+                                        "method_id": f"remote-{target_id}",
+                                        "maturity": "experimental"
+                                        if target_id == "text_memory"
+                                        else "stable",
+                                        "support": {"overall": "supported"},
+                                        "implementation_identity_digest": "b" * 64,
+                                        "default_config_json": '{"limit":1}',
+                                    },
+                                    {
+                                        "method_id": f"experimental-{target_id}",
+                                        "maturity": "experimental",
+                                        "support": {"overall": "supported"},
+                                        "implementation_identity_digest": "c" * 64,
+                                        "default_config_json": "{}",
+                                    },
+                                ],
+                            }
+                            for target_id in module.REQUIRED_TARGET_IDS
+                        ],
+                    },
+                }
+            if method == "PATCH":
+                self.patched = kwargs["body"]  # type: ignore[assignment]
+                return {"etag": '"' + "2" * 64 + '"'}
+            if method == "POST" and route.endswith("/activate"):
+                return {"operation_id": "activate", "state": "succeeded"}
+            if method == "GET" and "/projects/" in route:
+                return project
+            raise AssertionError((method, route))
+
+    api = FakeApi()
+    workflow = _workflow(module)
+    workflow._api = api
+    workflow.project_id = "project-real-e2e"
+
+    capabilities = workflow._select_and_activate_targets(project)
+
+    assert capabilities["registry_digest"] == "a" * 64
+    targets = api.patched["evolution"]["targets"]  # type: ignore[index]
+    assert set(targets) == set(module.REQUIRED_TARGET_IDS)
+    for target_id, selection in targets.items():
+        assert selection == {
+            "enabled": True,
+            "method": f"remote-{target_id}",
+            "config": {"limit": 1},
+        }
+
+
+def test_release_negotiation_matches_native_host_contract() -> None:
+    module = _load_runner()
+    contract = json.loads(Path("desktop/release-contract.json").read_text(encoding="utf-8"))
+
+    class FakeApi:
+        calls: list[tuple[str, bool, int]] = []
+
+        def request(self, _method: str, route: str, **kwargs: object):
+            self.calls.append(
+                (
+                    route,
+                    bool(kwargs.get("authenticated", True)),
+                    int(kwargs.get("expected_status", 200)),
+                )
+            )
+            if route == "/version":
+                return {
+                    "schema_version": "1",
+                    "api_name": "openevo-desktop-local-api",
+                    "preferred_major": 1,
+                    "supported_majors": [1],
+                    "openapi_sha256": contract["accepted_openapi_digests"][0],
+                    "build_version": "0.1.0",
+                    "source_commit": "abcdef0",
+                    "build_channel": "release",
+                    "provider_kind": "desktop_sidecar",
+                    "feature_flags": contract["required_feature_flags"],
+                }
+            return None if kwargs.get("expected_status") == 204 else {}
+
+    api = FakeApi()
+    evidence = module._release_identity(api)
+
+    assert evidence["provider_kind"] == "desktop_sidecar"
+    assert ("/openevo-api/desktop/shell", False, 404) in api.calls
+    assert ("/openevo-native/session", True, 204) in api.calls
+    assert ("/openevo-native/session", False, 403) in api.calls
+
+
+@pytest.mark.parametrize(
+    ("override", "code"),
+    [
+        ({"openapi_sha256": "0" * 64}, "desktop_contract_invalid"),
+        ({"provider_kind": "contract_simulator"}, "not_release_desktop_sidecar"),
+        ({"feature_flags": ["remote_profiles"]}, "desktop_contract_invalid"),
+    ],
+)
+def test_release_negotiation_rejects_non_native_contract(
+    override: dict[str, object],
+    code: str,
+) -> None:
+    module = _load_runner()
+    contract = json.loads(Path("desktop/release-contract.json").read_text(encoding="utf-8"))
+
+    class FakeApi:
+        def request(self, _method: str, route: str, **_kwargs: object):
+            assert route == "/version"
+            return {
+                "schema_version": "1",
+                "api_name": "openevo-desktop-local-api",
+                "preferred_major": 1,
+                "supported_majors": [1],
+                "openapi_sha256": contract["accepted_openapi_digests"][0],
+                "build_version": "0.1.0",
+                "source_commit": "abcdef0",
+                "build_channel": "release",
+                "provider_kind": "desktop_sidecar",
+                "feature_flags": contract["required_feature_flags"],
+                **override,
+            }
+
+    with pytest.raises(module.E2EFailure, match=code):
+        module._release_identity(FakeApi())
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
+def test_timeout_arguments_require_finite_positive_values(value: str) -> None:
+    module = _load_runner()
+
+    with pytest.raises(SystemExit):
+        module._parser().parse_args(["--poll-seconds", value])
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_process_group_cleanup_kills_descendant_after_leader_exit() -> None:
+    module = _load_runner()
+    code = """
+import os, signal, sys, time
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sys.stdout.close()
+    while True:
+        time.sleep(1)
+print(child, flush=True)
+os._exit(0)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+        text=True,
+    )
+    assert process.stdout is not None
+    child_pid = int(process.stdout.readline().strip())
+    process.stdout.close()
+    assert module._wait_exited_without_reap(process, timeout_seconds=2)
+
+    assert module._terminate_process_group(
+        process,
+        process_group_id=process.pid,
+        graceful_timeout_seconds=0.1,
+    )
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
+        except (FileNotFoundError, IndexError):
+            break
+        if state == "Z":
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("descendant survived process-group cleanup")

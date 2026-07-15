@@ -42,6 +42,50 @@ _FRAMEWORK_LOCK_DIGEST = "c" * 64
 _PAYLOAD_DIGEST = "d" * 64
 
 
+def test_rollout_runtime_context_receipt_is_closed_and_canonical() -> None:
+    receipt = owner_module._rollout_runtime_context_receipt(
+        {
+            "results": [
+                {
+                    "metadata": {
+                        "evolution": {
+                            "context_injected": True,
+                            "context_id": "not-persisted-in-receipt",
+                            "context_artifact_ids": ["skill-1", "memory-1", "agent-1"],
+                        }
+                    }
+                }
+            ]
+        }
+    )
+
+    assert receipt == {
+        "schema_version": "1",
+        "context_injected": True,
+        "context_artifact_ids": ["agent-1", "memory-1", "skill-1"],
+    }
+    assert owner_module._runtime_context_receipt(
+        {"runtime_context_receipt": receipt}
+    ) == receipt
+
+
+@pytest.mark.parametrize(
+    "evolution",
+    [
+        {"context_injected": False, "context_artifact_ids": ["artifact-1"]},
+        {"context_injected": True, "context_artifact_ids": ["artifact-1", "artifact-1"]},
+        {"context_injected": True, "context_artifact_ids": "artifact-1"},
+    ],
+)
+def test_rollout_runtime_context_receipt_rejects_unproven_context(
+    evolution: object,
+) -> None:
+    with pytest.raises(ValueError, match="context"):
+        owner_module._rollout_runtime_context_receipt(
+            {"results": [{"metadata": {"evolution": evolution}}]}
+        )
+
+
 class _FakeServiceOwner:
     def __init__(
         self,

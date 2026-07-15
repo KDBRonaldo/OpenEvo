@@ -8,6 +8,7 @@ from openevo.backend.contracts.v1 import models as m
 from openevo.backend.contracts.v1.store import CoreControlStoreV1
 from openevo.backend.science_execution import compile_science_execution
 from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
+from openevo.experiments.models import ExperimentConfig
 from openevo.internal_auth import InternalServiceIdentity
 from openevo.runtime.managed import MANAGED_HOME, MANAGED_PATH, MANAGED_RUNTIME_RELEASES
 
@@ -118,6 +119,24 @@ def test_project_compiles_to_single_session_existing_experiment_path(tmp_path: P
     assert execution.submitted_task_id == (
         f"{execution.task_id}--run-run-public-1--round-0"
     )
+
+
+@pytest.mark.parametrize("field", ["profile", "container_user"])
+def test_subscription_runtime_contract_remains_fail_closed(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    execution = compile_science_execution(
+        _project(tmp_path),
+        run_id=f"run-missing-{field}",
+        binding=_binding(),
+        workspace_path=None,
+    )
+    payload = execution.config.model_dump(mode="python")
+    del payload["runtime"][field]
+
+    with pytest.raises(ValueError, match="subscription|managed runtime|container_user"):
+        ExperimentConfig.model_validate(payload)
 
 
 @pytest.mark.parametrize("capture_mode", [m.CaptureMode.TOKEN_LEVEL, m.CaptureMode.TRANSCRIPT])
