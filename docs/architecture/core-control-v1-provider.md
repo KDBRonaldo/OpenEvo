@@ -10,7 +10,9 @@ Control API v1 contract. The canonical HTTP and event schemas remain owned by
 provider it returns the original HTTP 501 contract-only response on every
 route. `create_core_control_app(...)` creates `CoreControlStoreV1`, binds
 `CoreControlProviderV1` to the same routes by canonical `operation_id`, and
-closes the store during application shutdown. It does not register a second
+constructs the release run owner through a factory that receives that exact
+store. Shutdown closes the run owner, managed service supervisor, and store in
+ownership order. It does not register a second
 route table, call Desktop `/openevo-api` routes, or call model APIs.
 
 `GET /version` and `GET /health` are anonymous. Every path with a versioned
@@ -44,7 +46,7 @@ before releasing the threads.
 | `/v1/services`, `/v1/services/{id}` | Reports `core-control` plus read-only summaries from the release-injected `CoreServiceSupervisor`. No service is inferred from files, Desktop commands, or legacy scaffold state. |
 | `/v1/events` | Durable ordered SSE with signed opaque record IDs, at-least-once replay, a 10,000-record maximum window, 15-second durable heartbeats, and typed 400/410 cursor errors. |
 | Environment doctor/repair | Typed 503 until a real environment owner and recoverable operation implementation are wired. |
-| Run, timeline, run log, run context, and run artifact-list routes | Typed 503 without an injected `CoreRunControl`; otherwise the complete frozen `/v1/runs*` family delegates to that owner. |
+| Run, timeline, run log, run context, and run artifact-list routes | The release launcher injects `CoreScienceRunOwner`, which durably executes and observes the complete frozen `/v1/runs*` family. Tests may omit the owner and receive typed 503. |
 | Standalone artifact routes | Typed 503 until run ownership exposes authoritative v1 artifact projections. |
 | Service restart/log routes | Typed 503 until durable operation ownership is implemented. The provider never invokes Desktop SSH lifecycle or infers services it cannot observe. |
 | Operation, referenced-log, diagnostic, and cache-cleanup routes | Typed 503 until their durable business owners are implemented. |
@@ -361,17 +363,22 @@ requires user action; detected durable-state corruption is non-retryable.
 Provider coverage is in
 `tests/backend/test_core_control_v1_provider.py`. The frozen contract tests in
 `tests/backend/test_contract_v1.py` continue to prove exact OpenAPI and event
-schema bytes and digests. This owner does not implement run admission,
-evolution-produced queued successors, serving preparation, or cross-session
-activation; those remain fail closed behind their existing routes and owners.
+schema bytes and digests. The release owner implements generation-bound run
+admission, managed service preparation, durable execution, artifact-list
+projection, and direct cross-session successor activation. Standalone artifact
+content/diff, environment repair, service mutation, and diagnostics remain fail
+closed.
 
-The provider accepts an optional internal `CoreRunControl` dependency. When it
+The provider accepts either an internal `CoreRunControl` dependency or a
+mutually exclusive factory that receives the provider's exact durable store. When it
 is absent, every frozen run route remains the same typed unavailable response.
 When present, the provider delegates the complete run route family and status
 counts to that owner and installs the private generation-authenticated admission
 endpoint; it does not compile experiments or inspect method logic itself. This
-dependency boundary is wired before the durable run implementation so the
-public OpenAPI and Desktop client remain unchanged while run ownership evolves.
+dependency boundary keeps the public OpenAPI and Desktop client unchanged while
+run ownership evolves. The release launcher always uses the factory to construct
+`CoreScienceRunOwner`; see `core-science-run-owner.md` for its persistence and
+cross-session contract.
 An anti-drift test derives every `/v1/runs*` operation ID from the frozen route
 table and requires exact equality with `RUN_OPERATION_IDS`; the run artifact
 route is therefore owned as `listCoreRunArtifactsV1`, its canonical operation

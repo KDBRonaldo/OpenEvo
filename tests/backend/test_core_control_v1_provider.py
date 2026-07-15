@@ -182,6 +182,7 @@ def _app(
     registry=None,
     service_supervisor=None,
     run_control=None,
+    run_control_factory=None,
     event_replay_limit: int = 10_000,
 ):
     return create_core_control_app(
@@ -193,6 +194,7 @@ def _app(
         evolution_registry=registry,
         service_supervisor=service_supervisor,
         run_control=run_control,
+        run_control_factory=run_control_factory,
         event_replay_limit=event_replay_limit,
     )
 
@@ -4812,6 +4814,34 @@ def test_injected_run_control_owns_frozen_routes_and_status_counts(tmp_path: Pat
     assert status.json()["active_runs"] == 2
     assert status.json()["queued_runs"] == 3
     assert run_control.close_calls == 1
+
+
+def test_run_control_factory_receives_and_shares_the_provider_store(tmp_path: Path) -> None:
+    run_control = _RecordingRunControl()
+    stores: list[CoreControlStoreV1] = []
+
+    def factory(store: CoreControlStoreV1) -> _RecordingRunControl:
+        stores.append(store)
+        return run_control
+
+    app = _app(tmp_path, run_control_factory=factory)
+    with TestClient(app) as client:
+        response = client.get("/v1/runs", headers=AUTH)
+        assert response.status_code == 200
+        assert stores == [app.state.core_control_provider.store]
+
+    assert run_control.close_calls == 1
+
+
+def test_run_control_factory_and_instance_are_mutually_exclusive(tmp_path: Path) -> None:
+    run_control = _RecordingRunControl()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _app(
+            tmp_path,
+            run_control=run_control,
+            run_control_factory=lambda _store: run_control,
+        )
+    assert not (tmp_path / "core-control-v1").exists()
 
 
 def test_run_control_operation_ids_exactly_match_frozen_run_routes(tmp_path: Path) -> None:

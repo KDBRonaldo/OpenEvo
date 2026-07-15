@@ -312,6 +312,7 @@ def test_supervised_launcher_builds_release_core_control_app(
     registry = object()
     app = object()
     service_supervisor = object()
+    run_owner = object()
     calls: dict[str, object] = {}
 
     monkeypatch.setattr(launcher, "require_host_global_service_root", lambda path: path)
@@ -323,6 +324,12 @@ def test_supervised_launcher_builds_release_core_control_app(
         return service_supervisor
 
     monkeypatch.setattr(launcher, "CoreServiceSupervisor", build_service_supervisor)
+
+    def build_run_owner(**kwargs: object) -> object:
+        calls["run_owner"] = kwargs
+        return run_owner
+
+    monkeypatch.setattr(launcher, "CoreScienceRunOwner", build_run_owner)
 
     def claim_spawn(**kwargs: object) -> None:
         calls["claim"] = kwargs
@@ -383,6 +390,14 @@ def test_supervised_launcher_builds_release_core_control_app(
     assert create["source_commit"] == release.source_commit
     assert create["evolution_registry"] is registry
     assert create["service_supervisor"] is service_supervisor
+    project_store = object()
+    assert create["run_control_factory"](project_store) is run_owner
+    assert calls["run_owner"] == {
+        "state_root": service_root / "state",
+        "project_store": project_store,
+        "service_supervisor": service_supervisor,
+        "executable_registry": registry,
+    }
     assert len(create["bearer_token"]) == 64
     server = calls["server"]
     assert calls["service_supervisor"] == {

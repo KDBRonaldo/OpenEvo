@@ -725,13 +725,19 @@ def create_core_control_app(
     evolution_registry: VerifiedExecutableRegistry | None = None,
     service_supervisor: CoreServiceControl | None = None,
     run_control: CoreRunControl | None = None,
+    run_control_factory: Callable[[CoreControlStoreV1], CoreRunControl] | None = None,
     event_replay_limit: int = 10_000,
 ) -> FastAPI:
     """Create a provider-backed app without adding a second route table."""
 
+    if run_control is not None and run_control_factory is not None:
+        raise ValueError("run_control and run_control_factory are mutually exclusive")
     store = CoreControlStoreV1(state_root, event_replay_limit=event_replay_limit)
     provider: CoreControlProviderV1 | None = None
+    resolved_run_control = run_control
     try:
+        if run_control_factory is not None:
+            resolved_run_control = run_control_factory(store)
         provider = CoreControlProviderV1(
             store,
             bearer_token=bearer_token,
@@ -740,7 +746,7 @@ def create_core_control_app(
             build_channel=build_channel,
             evolution_registry=evolution_registry,
             service_supervisor=service_supervisor,
-            run_control=run_control,
+            run_control=resolved_run_control,
         )
         app = create_core_control_contract_app(provider)
         contract_operation_ids = frozenset(
@@ -750,10 +756,16 @@ def create_core_control_app(
         )
         if provider.operation_ids != contract_operation_ids:
             raise RuntimeError("Core Control provider ownership does not cover the frozen routes")
-        if run_control is not None and service_supervisor is not None:
-            install_core_run_admission_endpoint(app, service_supervisor, run_control)
+        if resolved_run_control is not None and service_supervisor is not None:
+            install_core_run_admission_endpoint(
+                app,
+                service_supervisor,
+                resolved_run_control,
+            )
     except Exception:
         if provider is None:
+            if resolved_run_control is not None:
+                resolved_run_control.close()
             store.close()
         else:
             provider.close()

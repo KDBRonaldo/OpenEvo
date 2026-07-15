@@ -129,6 +129,7 @@ loop.
 
 See `docs/architecture/desktop-core-contract-v1.md` for the product boundary and
 `docs/architecture/core-control-v1-provider.md` for implemented ownership. The
-provider does not implement the run owner, evolution-produced queued successor
-orchestration, serving preparation, service restart, diagnostics, or artifact
-exhibition paths; those routes fail closed.
+release provider injects `CoreScienceRunOwner` for durable science execution,
+generation-bound admission, next-session successor activation, and run artifact
+lists. Standalone artifact content/diff, environment repair, service restart,
+diagnostics, and cache cleanup remain fail closed.

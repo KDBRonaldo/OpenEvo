@@ -16,6 +16,7 @@ from openevo.backend.runtime_identity import (
     load_or_create_core_bearer_token,
     require_host_global_service_root,
 )
+from openevo.backend.science_run_owner import CoreScienceRunOwner
 from openevo.backend.service import claim_core_service_spawn
 from openevo.backend.service_supervisor import CoreServiceSupervisor, ServiceLaunchMode
 from openevo.evolution.framework import (
@@ -111,6 +112,12 @@ def _serve_core_control(args: argparse.Namespace) -> int:
             build_channel="release",
             evolution_registry=registry,
             service_supervisor=service_supervisor,
+            run_control_factory=lambda store: CoreScienceRunOwner(
+                state_root=state_root,
+                project_store=store,
+                service_supervisor=service_supervisor,
+                executable_registry=registry,
+            ),
         )
     except BaseException:
         service_supervisor.close()
