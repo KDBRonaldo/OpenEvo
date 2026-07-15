@@ -71,6 +71,7 @@ from openevo.runtime.base import (
     RUNTIME_SESSION_DIR,
     RuntimeReadbackBudget,
     RuntimePathSecurityError,
+    _bounded_public_runtime_readback,
     _has_sealed_session_bind_readback,
     _sealed_session_bind_readback,
     validate_session_bind_path,
@@ -102,7 +103,6 @@ from openevo.evolution.agent_system import (
     ROOT_AGENT_SYSTEM_FILES,
     normalize_agent_system_target_path,
 )
-from openevo.evolution.artifact_payloads import ArtifactPayloadService
 from openevo.evolution.client import EvolutionClient
 from openevo.evolution.framework.handlers import PayloadManifestEntry, payload_tree_digest
 from openevo.evolution.runtime_injection import (
@@ -1324,24 +1324,20 @@ async def _runtime_injection_receipt_from_readback(
                 for entry in readback.files
             ]
         else:
-            await runtime.download_dir(target_dir, str(readback_root / "evolution"))
-            with ArtifactPayloadService(readback_root) as payloads:
-                snapshot = payloads.issue_snapshot(
-                    artifact_id="runtime-readback",
-                    artifact_type="runtime_readback",
-                    name="runtime-readback",
-                    uri=readback_root.as_uri(),
-                    manifest={},
-                    scores={},
-                    rank_index=0,
-                )
+            readback = await _bounded_public_runtime_readback(
+                runtime,
+                target_dir,
+                readback_root / "evolution",
+                budget=budget,
+                relative_prefix="evolution",
+            )
             files = [
                 {
                     "relative_path": entry.relative_path,
                     "size_bytes": entry.size_bytes,
                     "sha256": entry.sha256,
                 }
-                for entry in snapshot.payload_entries
+                for entry in readback.files
             ]
         if plan.agent_system_targets:
             files.extend(

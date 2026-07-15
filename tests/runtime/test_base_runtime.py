@@ -120,6 +120,141 @@ async def test_public_download_api_accepts_two_arguments_and_returns_none(
 
 
 @pytest.mark.asyncio
+async def test_compatibility_readback_accepts_257_files_with_receipt_budget(
+    tmp_path: Path,
+) -> None:
+    class PublicDownloadRuntime:
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            for index in range(257):
+                (target / f"file-{index:03d}.txt").write_bytes(b"x")
+
+    private_root = tmp_path / "compat-readback"
+    private_root.mkdir(mode=0o700)
+    private_root.chmod(0o700)
+    budget = RuntimeReadbackBudget()
+
+    readback = await runtime_base._bounded_public_runtime_readback(
+        PublicDownloadRuntime(),
+        "/custom/evolution",
+        private_root / "evolution",
+        budget=budget,
+        relative_prefix="evolution",
+    )
+
+    assert len(readback.files) == 257
+    assert budget.files_consumed == 257
+    assert budget.nodes_consumed == 514
+    assert budget.bytes_consumed == 257
+
+
+@pytest.mark.asyncio
+async def test_compatibility_readback_rejects_more_than_4096_files(
+    tmp_path: Path,
+) -> None:
+    class PublicDownloadRuntime:
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            for index in range(runtime_base.RUNTIME_READBACK_MAX_FILES + 1):
+                (target / f"file-{index:04d}.txt").touch()
+
+    private_root = tmp_path / "compat-readback"
+    private_root.mkdir(mode=0o700)
+    private_root.chmod(0o700)
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimePathSecurityError, match="file (quota|budget)"):
+        await runtime_base._bounded_public_runtime_readback(
+            PublicDownloadRuntime(),
+            "/custom/evolution",
+            private_root / "evolution",
+            budget=budget,
+            relative_prefix="evolution",
+        )
+
+    assert budget.files_consumed == budget.max_files
+    assert budget.nodes_consumed == budget.max_nodes
+    assert budget.bytes_consumed == budget.max_bytes
+
+
+@pytest.mark.asyncio
+async def test_compatibility_download_quota_cancels_public_download_before_completion(
+    tmp_path: Path,
+) -> None:
+    class PublicDownloadRuntime:
+        cancelled = False
+        completed = False
+
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            try:
+                for index in range(10_000):
+                    (target / f"file-{index:05d}.txt").touch()
+                    if index % 100 == 0:
+                        await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            self.completed = True
+
+    private_root = tmp_path / "compat-readback"
+    private_root.mkdir(mode=0o700)
+    private_root.chmod(0o700)
+    budget = RuntimeReadbackBudget()
+    runtime = PublicDownloadRuntime()
+
+    with pytest.raises(RuntimePathSecurityError, match="file quota"):
+        await runtime_base._bounded_public_runtime_readback(
+            runtime,
+            "/custom/evolution",
+            private_root / "evolution",
+            budget=budget,
+            relative_prefix="evolution",
+        )
+
+    assert runtime.cancelled is True
+    assert runtime.completed is False
+    assert len(list((private_root / "evolution").iterdir())) < 10_000
+    assert budget.files_consumed == budget.max_files
+    assert budget.nodes_consumed == budget.max_nodes
+    assert budget.bytes_consumed == budget.max_bytes
+
+
+@pytest.mark.asyncio
+async def test_compatibility_readback_rejects_more_than_64_mib(
+    tmp_path: Path,
+) -> None:
+    class PublicDownloadRuntime:
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            oversized = target / "oversized.bin"
+            with oversized.open("wb") as stream:
+                stream.truncate(runtime_base.RUNTIME_READBACK_MAX_BYTES + 1)
+
+    private_root = tmp_path / "compat-readback"
+    private_root.mkdir(mode=0o700)
+    private_root.chmod(0o700)
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimePathSecurityError, match="byte (quota|budget)"):
+        await runtime_base._bounded_public_runtime_readback(
+            PublicDownloadRuntime(),
+            "/custom/evolution",
+            private_root / "evolution",
+            budget=budget,
+            relative_prefix="evolution",
+        )
+
+    assert budget.files_consumed == budget.max_files
+    assert budget.nodes_consumed == budget.max_nodes
+    assert budget.bytes_consumed == budget.max_bytes
+
+
+@pytest.mark.asyncio
 async def test_docker_public_download_uses_docker_cp_outside_session_bind(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -779,6 +914,204 @@ async def test_trusted_readback_removes_its_failed_published_tree(
     assert verifications == 2
     assert not target.exists()
     assert list(target.parent.glob(".*.openevo-readback-*")) == []
+
+
+def _opened_cleanup_entry(
+    parent: Path,
+    name: str,
+    *,
+    is_directory: bool,
+) -> tuple[int, int, tuple[int, ...]]:
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    path = parent / name
+    if is_directory:
+        path.mkdir()
+        (path / "original.txt").write_text("original", encoding="utf-8")
+        entry_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            dir_fd=parent_fd,
+        )
+    else:
+        path.write_text("original", encoding="utf-8")
+        entry_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    return (
+        parent_fd,
+        entry_fd,
+        runtime_base._readback_object_identity(os.fstat(entry_fd)),
+    )
+
+
+def test_discard_readback_staging_preserves_raced_directory_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "cleanup"
+    parent.mkdir(mode=0o700)
+    parent_fd, staging_fd, identity = _opened_cleanup_entry(
+        parent,
+        "staging",
+        is_directory=True,
+    )
+    original_rename = runtime_base._rename_readback_cleanup_noreplace
+    displaced = parent / "displaced-staging"
+
+    def race_after_identity_check(
+        source_fd: int,
+        source_name: str,
+        target_fd: int,
+        target_name: str,
+    ) -> None:
+        (parent / source_name).rename(displaced)
+        replacement = parent / source_name
+        replacement.mkdir()
+        (replacement / "replacement.txt").write_text("replacement", encoding="utf-8")
+        original_rename(source_fd, source_name, target_fd, target_name)
+
+    monkeypatch.setattr(
+        runtime_base,
+        "_rename_readback_cleanup_noreplace",
+        race_after_identity_check,
+    )
+    try:
+        with pytest.raises(RuntimePathSecurityError, match="quarantine identity"):
+            runtime_base._discard_readback_staging(
+                parent_fd,
+                "staging",
+                staging_fd,
+                identity,
+            )
+    finally:
+        os.close(staging_fd)
+        os.close(parent_fd)
+
+    assert (displaced / "original.txt").read_text(encoding="utf-8") == "original"
+    quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "replacement.txt").read_text(encoding="utf-8") == (
+        "replacement"
+    )
+
+
+@pytest.mark.parametrize("is_directory", [False, True])
+def test_discard_readback_publication_preserves_raced_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    is_directory: bool,
+) -> None:
+    parent = tmp_path / "cleanup"
+    parent.mkdir(mode=0o700)
+    parent_fd, publication_fd, identity = _opened_cleanup_entry(
+        parent,
+        "publication",
+        is_directory=is_directory,
+    )
+    original_rename = runtime_base._rename_readback_cleanup_noreplace
+    displaced = parent / "displaced-publication"
+
+    def race_after_identity_check(
+        source_fd: int,
+        source_name: str,
+        target_fd: int,
+        target_name: str,
+    ) -> None:
+        (parent / source_name).rename(displaced)
+        replacement = parent / source_name
+        if is_directory:
+            replacement.mkdir()
+            (replacement / "replacement.txt").write_text(
+                "replacement",
+                encoding="utf-8",
+            )
+        else:
+            replacement.write_text("replacement", encoding="utf-8")
+        original_rename(source_fd, source_name, target_fd, target_name)
+
+    monkeypatch.setattr(
+        runtime_base,
+        "_rename_readback_cleanup_noreplace",
+        race_after_identity_check,
+    )
+    try:
+        with pytest.raises(RuntimePathSecurityError, match="quarantine identity"):
+            runtime_base._discard_readback_publication(
+                parent_fd,
+                "publication",
+                publication_fd,
+                identity,
+                is_directory=is_directory,
+            )
+    finally:
+        os.close(publication_fd)
+        os.close(parent_fd)
+
+    if is_directory:
+        assert (displaced / "original.txt").read_text(encoding="utf-8") == "original"
+        quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
+        assert len(quarantines) == 1
+        assert (quarantines[0] / "replacement.txt").read_text(encoding="utf-8") == (
+            "replacement"
+        )
+    else:
+        assert displaced.read_text(encoding="utf-8") == "original"
+        quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
+        assert len(quarantines) == 1
+        assert quarantines[0].read_text(encoding="utf-8") == "replacement"
+
+
+def test_discard_readback_publication_does_not_follow_raced_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "cleanup"
+    parent.mkdir(mode=0o700)
+    parent_fd, publication_fd, identity = _opened_cleanup_entry(
+        parent,
+        "publication",
+        is_directory=False,
+    )
+    original_rename = runtime_base._rename_readback_cleanup_noreplace
+    displaced = parent / "displaced-publication"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+
+    def race_after_identity_check(
+        source_fd: int,
+        source_name: str,
+        target_fd: int,
+        target_name: str,
+    ) -> None:
+        (parent / source_name).rename(displaced)
+        (parent / source_name).symlink_to(outside)
+        original_rename(source_fd, source_name, target_fd, target_name)
+
+    monkeypatch.setattr(
+        runtime_base,
+        "_rename_readback_cleanup_noreplace",
+        race_after_identity_check,
+    )
+    try:
+        with pytest.raises(RuntimePathSecurityError, match="quarantine identity"):
+            runtime_base._discard_readback_publication(
+                parent_fd,
+                "publication",
+                publication_fd,
+                identity,
+                is_directory=False,
+            )
+    finally:
+        os.close(publication_fd)
+        os.close(parent_fd)
+
+    assert displaced.read_text(encoding="utf-8") == "original"
+    assert outside.read_text(encoding="utf-8") == "outside"
+    quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].is_symlink()
 
 
 def test_copy_from_bind_mount_rejects_parent_symlink_without_reading_outside(

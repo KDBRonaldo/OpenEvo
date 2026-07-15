@@ -89,17 +89,25 @@ any host payload file is created.
 
 Host output is built below a random `0700` staging directory with `0600` files,
 fsynced, rechecked by held descriptors, and published with Linux
-`renameat2(RENAME_NOREPLACE)`. Normal failure removes the identity-bound partial
-staging tree; a raced destination replacement is never overwritten or removed.
+`renameat2(RENAME_NOREPLACE)`. Cleanup first binds the originally observed inode,
+renames the original name to a random no-replace quarantine, and accepts cleanup
+authority only after the held descriptor still matches that quarantine. Normal
+failure removes only that authority; an identity mismatch, raced replacement, or
+displaced object is preserved and the cleanup fails closed.
 The synchronous FD walk runs in a controlled worker thread. Timeout or task
 cancellation signals that worker and waits for bounded cleanup before returning
 to the event loop.
 
 Custom target directories, non-Linux Core hosts, and third-party runtimes keep
-the ordinary backend download behavior. Gateway ignores any backend return
-metadata and applies Core's bounded `ArtifactPayloadService` verification to the
-downloaded tree before constructing a receipt. This compatibility path does not
-claim the stronger source-tree mutation evidence of the private Linux bind walk.
+the ordinary two-argument backend download behavior. Gateway ignores backend
+return metadata and confines the destination below a held `0700` temporary root.
+A concurrent logical quota monitor rejects a visible tree above the same 4096
+files, 16384 node attempts, or 64 MiB authority. Immediately after download, a
+runtime-private no-follow scanner performs two stable enumerations and streamed
+hashing against the same non-refundable `RuntimeReadbackBudget`; agent-system
+readback receives only its remainder. This path does not use the evolution
+payload scanner's 256-file/16-GiB defaults and does not claim the stronger source
+mutation evidence of the private Linux bind walk on unsupported hosts.
 
 ## Docker vs Apptainer
 

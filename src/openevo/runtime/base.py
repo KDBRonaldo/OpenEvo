@@ -37,6 +37,8 @@ _COPY_MAX_DEPTH: Final[int] = 64
 _COPY_MAX_NODES: Final[int] = 100_000
 _COPY_CHUNK_BYTES: Final[int] = 64 * 1024
 _RENAME_NOREPLACE: Final[int] = 1
+_READBACK_QUARANTINE_ATTEMPTS: Final[int] = 128
+_DOWNLOAD_QUOTA_POLL_SECONDS: Final[float] = 0.01
 _IN_NONBLOCK: Final[int] = os.O_NONBLOCK
 _IN_CLOEXEC: Final[int] = os.O_CLOEXEC
 _IN_MODIFY: Final[int] = 0x00000002
@@ -1390,6 +1392,24 @@ def _rename_readback_noreplace(
     target_dir_fd: int,
     target: str,
 ) -> None:
+    _renameat2_noreplace(source_dir_fd, source, target_dir_fd, target)
+
+
+def _rename_readback_cleanup_noreplace(
+    source_dir_fd: int,
+    source: str,
+    target_dir_fd: int,
+    target: str,
+) -> None:
+    _renameat2_noreplace(source_dir_fd, source, target_dir_fd, target)
+
+
+def _renameat2_noreplace(
+    source_dir_fd: int,
+    source: str,
+    target_dir_fd: int,
+    target: str,
+) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
@@ -1422,25 +1442,27 @@ def _discard_readback_staging(
     staging_fd: int,
     staging_identity: tuple[int, ...],
 ) -> None:
-    try:
-        _remove_directory_contents(
-            staging_fd,
-            expected_owner=os.geteuid(),
-            depth=0,
-            budget=[RUNTIME_READBACK_MAX_NODES],
-        )
-    except (OSError, RuntimePathSecurityError):
-        return
-    try:
-        named = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
-    except OSError:
-        return
-    if _readback_object_identity(named) != staging_identity:
-        return
-    try:
-        os.rmdir(staging_name, dir_fd=parent_fd)
-    except OSError:
-        return
+    quarantine_name = _quarantine_readback_entry(
+        parent_fd,
+        staging_name,
+        staging_fd,
+        staging_identity,
+    )
+    _remove_directory_contents(
+        staging_fd,
+        expected_owner=os.geteuid(),
+        depth=0,
+        budget=[RUNTIME_READBACK_MAX_NODES],
+    )
+    os.fsync(staging_fd)
+    _require_quarantined_readback_binding(
+        parent_fd,
+        quarantine_name,
+        staging_fd,
+        staging_identity,
+    )
+    os.rmdir(quarantine_name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
 
 
 def _discard_readback_publication(
@@ -1451,29 +1473,96 @@ def _discard_readback_publication(
     *,
     is_directory: bool,
 ) -> None:
+    quarantine_name = _quarantine_readback_entry(
+        parent_fd,
+        target_name,
+        publication_fd,
+        publication_identity,
+    )
     if is_directory:
+        _remove_directory_contents(
+            publication_fd,
+            expected_owner=os.geteuid(),
+            depth=0,
+            budget=[RUNTIME_READBACK_MAX_NODES],
+        )
+        os.fsync(publication_fd)
+    _require_quarantined_readback_binding(
+        parent_fd,
+        quarantine_name,
+        publication_fd,
+        publication_identity,
+    )
+    if is_directory:
+        os.rmdir(quarantine_name, dir_fd=parent_fd)
+    else:
+        os.unlink(quarantine_name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def _quarantine_readback_entry(
+    parent_fd: int,
+    name: str,
+    held_fd: int,
+    expected_identity: tuple[int, ...],
+) -> str:
+    held = _readback_object_identity(os.fstat(held_fd))
+    if held != expected_identity:
+        raise RuntimePathSecurityError("runtime readback cleanup descriptor changed")
+    try:
+        first = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimePathSecurityError(
+            "runtime readback cleanup pathname is unavailable"
+        ) from exc
+    if _readback_object_identity(first) != expected_identity:
+        raise RuntimePathSecurityError("runtime readback cleanup pathname changed")
+
+    for _attempt in range(_READBACK_QUARANTINE_ATTEMPTS):
+        quarantine_name = f".openevo-readback-quarantine-{secrets.token_hex(24)}"
         try:
-            _remove_directory_contents(
-                publication_fd,
-                expected_owner=os.geteuid(),
-                depth=0,
-                budget=[RUNTIME_READBACK_MAX_NODES],
+            _rename_readback_cleanup_noreplace(
+                parent_fd,
+                name,
+                parent_fd,
+                quarantine_name,
             )
-        except (OSError, RuntimePathSecurityError):
-            return
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise RuntimePathSecurityError(
+            "runtime readback cleanup quarantine is unavailable"
+        )
+    os.fsync(parent_fd)
+    _require_quarantined_readback_binding(
+        parent_fd,
+        quarantine_name,
+        held_fd,
+        expected_identity,
+    )
+    return quarantine_name
+
+
+def _require_quarantined_readback_binding(
+    parent_fd: int,
+    quarantine_name: str,
+    held_fd: int,
+    expected_identity: tuple[int, ...],
+) -> None:
+    held = _readback_object_identity(os.fstat(held_fd))
     try:
-        named = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
-    except OSError:
-        return
-    if _readback_object_identity(named) != publication_identity:
-        return
-    try:
-        if is_directory:
-            os.rmdir(target_name, dir_fd=parent_fd)
-        else:
-            os.unlink(target_name, dir_fd=parent_fd)
-    except OSError:
-        return
+        named = os.stat(
+            quarantine_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise RuntimePathSecurityError(
+            "runtime readback quarantine pathname is unavailable"
+        ) from exc
+    if held != expected_identity or _readback_object_identity(named) != expected_identity:
+        raise RuntimePathSecurityError("runtime readback quarantine identity changed")
 
 
 def _source_ancestor_identities(
@@ -1889,6 +1978,7 @@ class BaseRuntime(ABC):
         except OSError as exc:
             raise RuntimePathSecurityError("trusted runtime readback failed closed") from exc
         finally:
+            cleanup_error: BaseException | None = None
             if mutation_authority is not None:
                 mutation_authority.close()
             if (
@@ -1898,22 +1988,29 @@ class BaseRuntime(ABC):
                 and payload_fd >= 0
                 and target_parent_pin is not None
             ):
-                _discard_readback_publication(
-                    target_parent_pin.descriptor,
-                    target_name,
-                    payload_fd,
-                    publication_identity,
-                    is_directory=expected_directory,
-                )
+                try:
+                    _discard_readback_publication(
+                        target_parent_pin.descriptor,
+                        target_name,
+                        payload_fd,
+                        publication_identity,
+                        is_directory=expected_directory,
+                    )
+                except BaseException as exc:
+                    cleanup_error = exc
             if payload_fd >= 0:
                 os.close(payload_fd)
             if staging_fd >= 0 and staging_name is not None and staging_identity is not None:
-                _discard_readback_staging(
-                    target_parent_pin.descriptor if target_parent_pin is not None else -1,
-                    staging_name,
-                    staging_fd,
-                    staging_identity,
-                )
+                try:
+                    _discard_readback_staging(
+                        target_parent_pin.descriptor if target_parent_pin is not None else -1,
+                        staging_name,
+                        staging_fd,
+                        staging_identity,
+                    )
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
                 os.close(staging_fd)
             if target_parent_pin is not None:
                 target_parent_pin.close()
@@ -1922,6 +2019,10 @@ class BaseRuntime(ABC):
             if source_parents is not None:
                 source_parents.close()
             session_pin.close()
+            if cleanup_error is not None:
+                raise RuntimePathSecurityError(
+                    "runtime readback cleanup could not preserve its authority"
+                ) from cleanup_error
 
     def _copy_from_bind_mount(self, runtime_path: str, local_path: Path) -> bool:
         relative_parts = _runtime_relative_parts(runtime_path)
@@ -2218,3 +2319,454 @@ async def _sealed_session_bind_readback(
         budget=budget,
         expected_directory=expected_directory,
     )
+
+
+class _RuntimeDownloadQuotaExceeded(RuntimePathSecurityError):
+    pass
+
+
+def _measure_runtime_download_tree(
+    directory_fd: int,
+    *,
+    expected_owner: int,
+    max_files: int,
+    max_nodes: int,
+    max_bytes: int,
+    usage: list[int],
+    depth: int,
+) -> None:
+    if depth > _COPY_MAX_DEPTH:
+        raise _RuntimeDownloadQuotaExceeded(
+            "runtime compatibility download exceeds the depth quota"
+        )
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            usage[1] += 1
+            if usage[1] > max_nodes:
+                raise _RuntimeDownloadQuotaExceeded(
+                    "runtime compatibility download exceeds the node quota"
+                )
+            observed = os.stat(
+                entry.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if observed.st_uid != expected_owner:
+                raise _RuntimeDownloadQuotaExceeded(
+                    "runtime compatibility download contains an unowned entry"
+                )
+            if stat.S_ISDIR(observed.st_mode):
+                child_fd = os.open(entry.name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+                try:
+                    _measure_runtime_download_tree(
+                        child_fd,
+                        expected_owner=expected_owner,
+                        max_files=max_files,
+                        max_nodes=max_nodes,
+                        max_bytes=max_bytes,
+                        usage=usage,
+                        depth=depth + 1,
+                    )
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+                raise _RuntimeDownloadQuotaExceeded(
+                    "runtime compatibility download contains a link or special file"
+                )
+            usage[0] += 1
+            if usage[0] > max_files:
+                raise _RuntimeDownloadQuotaExceeded(
+                    "runtime compatibility download exceeds the file quota"
+                )
+            if observed.st_size < 0 or observed.st_size > max_bytes - usage[2]:
+                raise _RuntimeDownloadQuotaExceeded(
+                    "runtime compatibility download exceeds the byte quota"
+                )
+            usage[2] += observed.st_size
+
+
+def _require_runtime_download_quota(
+    parent_fd: int,
+    target_name: str,
+    *,
+    expected_owner: int,
+    max_files: int,
+    max_nodes: int,
+    max_bytes: int,
+) -> None:
+    try:
+        observed = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != expected_owner:
+        raise _RuntimeDownloadQuotaExceeded(
+            "runtime compatibility download target is not an owned directory"
+        )
+    target_fd = os.open(target_name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    try:
+        if _readback_directory_identity(os.fstat(target_fd)) != _readback_directory_identity(
+            observed
+        ):
+            return
+        _measure_runtime_download_tree(
+            target_fd,
+            expected_owner=expected_owner,
+            max_files=max_files,
+            max_nodes=max_nodes,
+            max_bytes=max_bytes,
+            usage=[0, 0, 0],
+            depth=0,
+        )
+    except OSError:
+        return
+    finally:
+        os.close(target_fd)
+
+
+def _monitor_runtime_download_quota(
+    parent_fd: int,
+    target_name: str,
+    budget: RuntimeReadbackBudget,
+    stop: threading.Event,
+    expected_owner: int,
+) -> None:
+    try:
+        while True:
+            _require_runtime_download_quota(
+                parent_fd,
+                target_name,
+                expected_owner=expected_owner,
+                max_files=budget.remaining_files,
+                max_nodes=budget.remaining_nodes // 2,
+                max_bytes=budget.remaining_bytes,
+            )
+            if stop.wait(_DOWNLOAD_QUOTA_POLL_SECONDS):
+                _require_runtime_download_quota(
+                    parent_fd,
+                    target_name,
+                    expected_owner=expected_owner,
+                    max_files=budget.remaining_files,
+                    max_nodes=budget.remaining_nodes // 2,
+                    max_bytes=budget.remaining_bytes,
+                )
+                return
+    except _RuntimeDownloadQuotaExceeded:
+        budget.exhaust()
+        raise
+
+
+def _hash_runtime_readback_file(
+    parent_fd: int,
+    source: _ReadbackSourceEntry,
+    *,
+    budget: RuntimeReadbackBudget,
+    cancellation: threading.Event,
+) -> RuntimeReadbackFile:
+    budget.require_byte_capacity(source.stat.st_size)
+    source_fd = os.open(source.name, _FILE_READ_FLAGS, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(source_fd)
+        if _readback_file_identity(opened) != source.identity:
+            raise RuntimePathSecurityError(
+                "runtime compatibility readback file changed while opening"
+            )
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < opened.st_size:
+            _check_readback_cancel(cancellation)
+            chunk = os.pread(
+                source_fd,
+                min(_COPY_CHUNK_BYTES, opened.st_size - offset),
+                offset,
+            )
+            if not chunk:
+                raise RuntimePathSecurityError(
+                    "runtime compatibility readback ended before its verified size"
+                )
+            budget.consume_bytes(len(chunk))
+            digest.update(chunk)
+            offset += len(chunk)
+        source_after = os.fstat(source_fd)
+        named_after = os.stat(
+            source.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _readback_file_identity(source_after) != source.identity
+            or _readback_file_identity(named_after) != source.identity
+        ):
+            raise RuntimePathSecurityError(
+                "runtime compatibility readback file changed during hashing"
+            )
+        return RuntimeReadbackFile(
+            relative_path=source.relative_path,
+            size_bytes=opened.st_size,
+            sha256=digest.hexdigest(),
+        )
+    finally:
+        os.close(source_fd)
+
+
+def _scan_runtime_download_directory(
+    directory_fd: int,
+    *,
+    relative_prefix: str,
+    expected_owner: int,
+    budget: RuntimeReadbackBudget,
+    cancellation: threading.Event,
+    mutation_authority: _ReadbackMutationAuthority | None,
+    depth: int,
+) -> list[RuntimeReadbackFile]:
+    if depth > _COPY_MAX_DEPTH:
+        raise RuntimePathSecurityError(
+            "runtime compatibility readback exceeds the directory depth limit"
+        )
+    if mutation_authority is not None:
+        mutation_authority.add(directory_fd)
+    snapshot = _enumerate_readback_source_directory(
+        directory_fd,
+        relative_prefix=relative_prefix,
+        expected_owner=expected_owner,
+        budget=budget,
+        cancellation=cancellation,
+        consume_files=True,
+    )
+    files: list[RuntimeReadbackFile] = []
+    for source in snapshot.entries:
+        _check_readback_cancel(cancellation)
+        if source.is_directory:
+            child_fd = os.open(source.name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            try:
+                if _readback_directory_identity(os.fstat(child_fd)) != source.identity:
+                    raise RuntimePathSecurityError(
+                        "runtime compatibility readback directory changed while opening"
+                    )
+                files.extend(
+                    _scan_runtime_download_directory(
+                        child_fd,
+                        relative_prefix=source.relative_path,
+                        expected_owner=expected_owner,
+                        budget=budget,
+                        cancellation=cancellation,
+                        mutation_authority=mutation_authority,
+                        depth=depth + 1,
+                    )
+                )
+            finally:
+                os.close(child_fd)
+        else:
+            files.append(
+                _hash_runtime_readback_file(
+                    directory_fd,
+                    source,
+                    budget=budget,
+                    cancellation=cancellation,
+                )
+            )
+    _verify_readback_source_directory(
+        directory_fd,
+        snapshot,
+        relative_prefix=relative_prefix,
+        expected_owner=expected_owner,
+        budget=budget,
+        cancellation=cancellation,
+    )
+    return files
+
+
+def _scan_runtime_download_sync(
+    parent_fd: int,
+    target_name: str,
+    relative_prefix: str,
+    expected_parent_identity: tuple[int, ...],
+    expected_owner: int,
+    budget: RuntimeReadbackBudget,
+    cancellation: threading.Event,
+) -> RuntimeReadback:
+    _check_readback_cancel(cancellation)
+    if _directory_identity(os.fstat(parent_fd)) != expected_parent_identity:
+        raise RuntimePathSecurityError("runtime compatibility readback parent changed")
+    before = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode) or before.st_uid != expected_owner:
+        raise RuntimePathSecurityError(
+            "runtime compatibility readback target is not an owned directory"
+        )
+    target_fd = os.open(target_name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    mutation_authority: _ReadbackMutationAuthority | None = None
+    try:
+        target_identity = _readback_directory_identity(before)
+        if _readback_directory_identity(os.fstat(target_fd)) != target_identity:
+            raise RuntimePathSecurityError(
+                "runtime compatibility readback target changed while opening"
+            )
+        if sys.platform.startswith("linux"):
+            mutation_authority = _ReadbackMutationAuthority()
+            mutation_authority.add(parent_fd)
+        files = _scan_runtime_download_directory(
+            target_fd,
+            relative_prefix=relative_prefix,
+            expected_owner=expected_owner,
+            budget=budget,
+            cancellation=cancellation,
+            mutation_authority=mutation_authority,
+            depth=0,
+        )
+        named_after = os.stat(
+            target_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _readback_directory_identity(os.fstat(target_fd)) != target_identity
+            or _readback_directory_identity(named_after) != target_identity
+            or _directory_identity(os.fstat(parent_fd)) != expected_parent_identity
+        ):
+            raise RuntimePathSecurityError(
+                "runtime compatibility readback target changed during scanning"
+            )
+        if mutation_authority is not None:
+            mutation_authority.require_quiet()
+        return RuntimeReadback(
+            files=tuple(sorted(files, key=lambda item: item.relative_path))
+        )
+    finally:
+        if mutation_authority is not None:
+            mutation_authority.close()
+        os.close(target_fd)
+
+
+async def _stop_runtime_download_tasks(
+    download: asyncio.Task[object],
+    monitor: asyncio.Task[None],
+    stop: threading.Event,
+) -> None:
+    stop.set()
+    if not download.done():
+        download.cancel()
+    while not download.done() or not monitor.done():
+        try:
+            await asyncio.shield(asyncio.gather(download, monitor, return_exceptions=True))
+        except asyncio.CancelledError:
+            if not download.done():
+                download.cancel()
+
+
+async def _bounded_public_runtime_readback(
+    runtime: object,
+    remote_path: str,
+    local_path: Path,
+    *,
+    budget: RuntimeReadbackBudget,
+    relative_prefix: str,
+) -> RuntimeReadback:
+    if not isinstance(budget, RuntimeReadbackBudget):
+        raise TypeError("runtime compatibility readback requires the closed budget authority")
+    target_parts = _canonical_absolute_parts(
+        str(local_path.absolute()),
+        label="runtime compatibility readback target",
+    )
+    if not target_parts:
+        raise RuntimePathSecurityError(
+            "runtime compatibility readback target must not be the filesystem root"
+        )
+    target_parent = Path(os.sep).joinpath(*target_parts[:-1])
+    target_name = target_parts[-1]
+    parent_pin = _pin_absolute_directory(target_parent)
+    parent_state = os.fstat(parent_pin.descriptor)
+    if (
+        not stat.S_ISDIR(parent_state.st_mode)
+        or parent_state.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_state.st_mode) != 0o700
+    ):
+        parent_pin.close()
+        raise RuntimePathSecurityError(
+            "runtime compatibility readback parent is not private"
+        )
+    parent_identity = _directory_identity(parent_state)
+    try:
+        try:
+            os.stat(target_name, dir_fd=parent_pin.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimePathSecurityError(
+                "runtime compatibility readback target already exists"
+            )
+        download_method = getattr(runtime, "download_dir", None)
+        if not callable(download_method):
+            raise TypeError("runtime does not implement the public download contract")
+        stop = threading.Event()
+        download = asyncio.create_task(download_method(remote_path, str(local_path)))
+        monitor = asyncio.create_task(
+            asyncio.to_thread(
+                _monitor_runtime_download_quota,
+                parent_pin.descriptor,
+                target_name,
+                budget,
+                stop,
+                os.geteuid(),
+            )
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {download, monitor},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if monitor in done and monitor.exception() is not None:
+                monitor.result()
+            if download not in done:
+                raise RuntimePathSecurityError(
+                    "runtime compatibility download quota monitor stopped early"
+                )
+            download.result()
+            stop.set()
+            await monitor
+        except BaseException:
+            await _stop_runtime_download_tasks(download, monitor, stop)
+            raise
+
+        parent_pin.verify(label="runtime compatibility readback parent")
+        if _directory_identity(os.fstat(parent_pin.descriptor)) != parent_identity:
+            raise RuntimePathSecurityError(
+                "runtime compatibility readback parent changed during download"
+            )
+        cancellation = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                _scan_runtime_download_sync,
+                parent_pin.descriptor,
+                target_name,
+                relative_prefix,
+                parent_identity,
+                os.geteuid(),
+                budget,
+                cancellation,
+            )
+        )
+        try:
+            readback = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancellation.set()
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancellation.set()
+                except BaseException:
+                    break
+            if worker.done() and not worker.cancelled():
+                try:
+                    worker.result()
+                except BaseException:
+                    pass
+            raise
+        parent_pin.verify(label="runtime compatibility readback parent")
+        if _directory_identity(os.fstat(parent_pin.descriptor)) != parent_identity:
+            raise RuntimePathSecurityError(
+                "runtime compatibility readback parent changed during scanning"
+            )
+        return readback
+    finally:
+        parent_pin.close()

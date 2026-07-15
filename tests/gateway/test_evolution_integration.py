@@ -4648,6 +4648,73 @@ async def test_gateway_runtime_receipt_custom_target_uses_compatible_download(
 
 
 @pytest.mark.asyncio
+async def test_gateway_compatibility_readback_shares_budget_with_agent_system(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _managed, injection, _context, _artifact_ids, _runtime = (
+        await _stage_gateway_runtime_receipt_context(tmp_path)
+    )
+
+    class PublicDownloadRuntime:
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            for index in range(257):
+                (target / f"file-{index:03d}.txt").write_bytes(b"x")
+
+    observed: dict[str, object] = {}
+
+    async def agent_inventory(
+        _runtime: object,
+        *,
+        budget: RuntimeReadbackBudget,
+        sealed: bool,
+    ) -> list[dict[str, object]]:
+        observed["before"] = (
+            budget.files_consumed,
+            budget.nodes_consumed,
+            budget.bytes_consumed,
+        )
+        observed["sealed"] = sealed
+        observed["budget"] = budget
+        budget.consume_report(files=1, nodes=2, bytes_read=1)
+        return [
+            {
+                "relative_path": "agent_system_targets/AGENTS.md",
+                "size_bytes": 1,
+                "sha256": hashlib.sha256(b"a").hexdigest(),
+            }
+        ]
+
+    monkeypatch.setattr(
+        node_module,
+        "_runtime_agent_system_target_inventory",
+        agent_inventory,
+    )
+    monkeypatch.setattr(
+        node_module,
+        "receipt_from_runtime_readback",
+        lambda _authority, files: {"files": list(files)},
+    )
+
+    receipt = await node_module._runtime_injection_receipt_from_readback(
+        runtime=PublicDownloadRuntime(),
+        target_dir="/custom/evolution",
+        plan=injection.staged.injection_plan,
+    )
+
+    assert observed["before"] == (257, 514, 257)
+    assert observed["sealed"] is False
+    budget = observed["budget"]
+    assert isinstance(budget, RuntimeReadbackBudget)
+    assert budget.files_consumed == 258
+    assert budget.nodes_consumed == 516
+    assert budget.bytes_consumed == 258
+    assert len(receipt["files"]) == 258
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fallback", ["non_linux", "unavailable", "third_party"])
 async def test_gateway_runtime_receipt_without_sealed_primitive_uses_compatible_download(
     tmp_path: Path,

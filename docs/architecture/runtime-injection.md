@@ -127,6 +127,13 @@ files reject the receipt. Host output uses a private staging tree and atomic
 no-replace publication so a failed attempt cannot overwrite or delete a raced
 replacement.
 
+Readback cleanup never verifies one pathname and then deletes that original
+name. After binding the initially observed inode, it atomically renames the
+original name to a random no-replace quarantine and accepts cleanup authority
+only after the held FD and quarantined pathname still match. If a replacement
+wins the pre-rename race, the identity check retains the quarantine and displaced
+object and fails closed instead of deleting either pathname.
+
 One private non-refundable readback budget covers the canonical evolution tree
 and the separate agent-system target scan. Its closed maxima exactly match the
 receipt payload limits of 4096 files and 64 MiB; the 16384 node-attempt bound
@@ -144,10 +151,14 @@ session to succeed.
 
 For a custom target directory, non-Linux Core host, or third-party runtime,
 Gateway preserves the public backend download path. It ignores backend-returned
-inventory and runs the existing bounded `ArtifactPayloadService` verification
-over the downloaded tree. That compatibility fallback supports the same receipt
-comparison but does not assert the private Linux primitive's source mutation
-evidence.
+inventory and downloads below a held private temporary root with a concurrent
+logical file/node/byte quota. A runtime-private no-follow scanner then performs
+the exact receipt walk with the same 4096-file, 16384-node, and 64-MiB
+non-refundable budget used by the canonical path. Its consumption is carried
+forward to agent-system target readback. This deliberately does not reuse the
+evolution payload scanner's 256-file and 16-GiB defaults. The compatibility
+fallback supports the same receipt comparison but does not assert Linux source
+mutation evidence when that authority is unavailable.
 
 ## Benchmark/Science Consumers
 
