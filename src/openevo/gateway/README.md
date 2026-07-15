@@ -69,19 +69,27 @@ values to the managed home, managed binary path, and
 by a dedicated private host directory that is not below the session, workspace,
 artifact, or log tree.
 
-The gateway pins every component from the absolute filesystem anchor to the
-remote user's `~/.codex/auth.json`, opens the leaf with `O_NOFOLLOW`, and
+Supervisor readiness pins every component from the absolute filesystem anchor
+to the remote user's `~/.codex/auth.json`, opens the leaf with `O_NOFOLLOW`, and
 requires a user-owned, link-count-one regular file with private permissions and
-a bounded size. Readiness retains the descriptor, full inode identity, and
-content digest. Before any session registry, storage, directory, cleanup
-journal, or queue mutation, dispatch reads only that held descriptor into an
-anonymous memfd, verifies the descriptor, digest, and current pathname before
-and after the copy, validates the bounded JSON/redactor, and write-seals the
-memfd. The final source-authority check commits that private snapshot and is the
-run's point of no return. Replacement of the original auth pathname before or
-during that commit returns a stable retryable 503 with zero session side
-effects. Replacement after the commit is permitted: this run owns the sealed
-bytes and does not require the external source pathname to remain unchanged.
+a bounded size. It copies only from that held FD into an anonymous memfd,
+rechecks the descriptor, digest, and current pathname authority before and after
+the copy, validates bounded auth bytes, and write-seals the memfd. This final
+source-authority check commits the generation snapshot and is the credential
+point of no return. Replacement before or during that commit rejects readiness.
+Replacement afterward is permitted: login evidence and Gateway sessions both
+consume the sealed bytes and do not require the external pathname to remain
+unchanged. Gateway inherits only that CLOEXEC-safe snapshot FD and clones it
+before any session registry, storage, directory, cleanup journal, or queue
+mutation.
+
+For each subscription dispatch, Gateway then synchronously verifies the exact
+immutable managed image digest and label and finally verifies that the release
+tag still maps to that authority. The compiler-supplied `RuntimeSpec` contains
+only the immutable digest/reference, so tag replacement after this check cannot
+change the admitted run. Digest, label, tag, credential, or dispatcher readiness
+failure returns the stable typed retryable `gateway_readiness_failed` 503 before
+session registration or HTTP `REGISTERED`.
 
 Dispatch then creates and durably journals the private credential root and
 synchronously copies only from the sealed snapshot into a random `0700`
@@ -92,6 +100,12 @@ staging inode's device/inode is journaled before secret bytes are copied; after
 publication, its final full identity is recorded before dispatch registers or
 queues the session and before HTTP can return `REGISTERED`. Publication failure
 is also a stable retryable 503 and rolls back all newly owned session state.
+Before those mutations Gateway reserves an admission token from the dispatcher.
+Shutdown first sets `accepting=false` and waits for outstanding tokens; enqueue
+still requires `accepting=true`, publishes registry and the unbounded INIT queue
+under one lock, and consumes the token. A shutdown race or queue publication
+failure therefore takes the same typed 503 rollback path instead of returning
+`REGISTERED`.
 
 DockerRuntime reopens and revalidates the root and exact auth identities. It
 creates a separate empty home view plus an empty target placeholder and pins all

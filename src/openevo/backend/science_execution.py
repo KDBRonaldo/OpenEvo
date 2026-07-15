@@ -9,7 +9,12 @@ from openevo.backend.contracts.v1 import models as m
 from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.evolution.framework import EvolutionExecutionProfile
 from openevo.experiments.models import ExperimentConfig
-from openevo.runtime.managed import MANAGED_HOME, MANAGED_PATH, MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import (
+    MANAGED_HOME,
+    MANAGED_PATH,
+    MANAGED_RUNTIME_IMAGES,
+    require_immutable_managed_runtime_image,
+)
 
 
 _RUNTIME_WORKDIR = "/openevo/session/workspace"
@@ -53,6 +58,12 @@ def compile_science_execution(
     expected_image = MANAGED_RUNTIME_IMAGES["managed_science"]
     if binding.runtime_image != expected_image:
         raise ValueError("verified service runtime image differs from the Science runtime")
+    immutable_release = require_immutable_managed_runtime_image(
+        profile="managed_science",
+        image=binding.runtime_image_immutable_reference,
+    )
+    if immutable_release.image != binding.runtime_image:
+        raise ValueError("verified immutable image differs from the Science runtime")
     capture_mode = project.spec.capture_mode
     if subscription and capture_mode is not m.CaptureMode.TRANSCRIPT:
         raise ValueError("subscription science execution requires transcript capture")
@@ -95,7 +106,7 @@ def compile_science_execution(
             "runtime": {
                 "profile": "managed_science",
                 "kind": "docker",
-                "image": binding.runtime_image,
+                "image": binding.runtime_image_immutable_reference,
                 "container_user": "host",
                 "workdir": _RUNTIME_WORKDIR,
                 "env": runtime_env,

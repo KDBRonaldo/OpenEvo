@@ -47,6 +47,7 @@ from openevo.runtime.base import BaseRuntime
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     MANAGED_RUNTIME_IMAGES,
+    MANAGED_RUNTIME_RELEASES,
     ManagedCredentialMount,
 )
 from openevo.runtime.models import ExecInput, ExecResult, RuntimeSpec
@@ -237,7 +238,7 @@ async def test_gateway_rejects_subscription_before_image_user_runtime_or_auth_st
     session_dir.mkdir()
     runtime_spec = RuntimeSpec(
         profile="managed_science",
-        image=MANAGED_RUNTIME_IMAGES["managed_science"],
+        image=MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
         container_user="host",
     )
     request = SessionDispatchRequest(
@@ -430,7 +431,7 @@ def test_gateway_subscription_admission_accepts_transcript_capture_aliases(
         remaining_timeout_seconds=60,
         runtime=RuntimeSpec(
             profile="managed_science",
-            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            image=MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
             container_user="host",
         ),
         agent=AgentSpec(
@@ -567,7 +568,7 @@ async def test_subscription_initialization_exception_log_redacts_credential_cana
         remaining_timeout_seconds=60,
         runtime=RuntimeSpec(
             profile="managed_science",
-            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            image=MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
             container_user="host",
         ),
         agent=AgentSpec(

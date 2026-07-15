@@ -83,8 +83,9 @@ binding under one supervisor lifecycle lock. The lease prevents another model or
 runtime ensure from replacing the generation until runner and private admission
 work exits. Before creating service clients, output directories, runner work, or
 private admissions, the run owner independently
-requires the binding's generation digest, runtime identity digest, execution
-mode, and managed image to equal the snapshot and saved project request. A
+requires the binding's execution mode and managed image alias to match the saved
+project request, and its generation digest, runtime identity digest, mode, alias,
+and immutable image reference to equal the readiness snapshot. A
 concurrent model ensure therefore cannot move a run onto the replacement
 generation. Any mismatch fails the run with the static retryable 503
 `run_service_generation_changed`; supervisor detail and private state are not
@@ -110,8 +111,13 @@ supervisor exceptions, command output, authentication status, and runtime paths
 are not used as public error text; the provider retains the same static mapping
 if a run-control implementation propagates a supervisor failure directly.
 
-The rollout task payload is hashed before submission and bound to the current
-service generation, registry digest, framework-lock digest, task ID, and run.
+The rollout task payload is first validated by the closed `TaskRequest` model,
+including all defaults, then serialized once by the shared canonicalizer. The
+run owner binds that exact payload to the current service generation, registry
+digest, framework-lock digest, task ID, and run and sends the same payload on the
+wire. The rollout endpoint applies the same canonicalizer before admission, so
+an omitted default cannot produce a different digest from its materialized wire
+value.
 Gateway, rollout, and evolution private requests are accepted only through the
 generation-bound admission verifier. Core never exposes the private credential
 or service URLs through the Desktop contract.

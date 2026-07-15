@@ -7,7 +7,9 @@ import pytest
 
 from openevo.gateway import session_files
 from openevo.gateway.session_files import (
+    CODEX_CREDENTIAL_SNAPSHOT_FD_ENV,
     HeldCodexCredentialAuthority,
+    PreparedCodexCredentialSnapshot,
     SessionFileSecurityError,
     capture_session_root_identity,
     load_staged_codex_subscription_redactor,
@@ -88,6 +90,36 @@ def test_committed_snapshot_survives_later_auth_path_replacement(tmp_path: Path)
         assert (root / "home" / ".codex" / "auth.json").read_text() == original
         with pytest.raises(SessionFileSecurityError, match="changed"):
             authority.verify()
+    finally:
+        snapshot.close()
+        authority.close()
+
+
+def test_sealed_snapshot_inheritance_preserves_cloexec_and_exact_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = b'{"access_token":"inherited-readiness-secret"}\n'
+    source = _private_auth(tmp_path, original.decode("utf-8"))
+    authority = HeldCodexCredentialAuthority.open(source)
+    snapshot = authority.prepare_snapshot()
+    inherited_fd = os.dup(snapshot.inheritance_descriptor())
+    monkeypatch.setenv(CODEX_CREDENTIAL_SNAPSHOT_FD_ENV, str(inherited_fd))
+    try:
+        inherited = PreparedCodexCredentialSnapshot.from_inherited_environment(
+            required=True
+        )
+        assert inherited is not None
+        assert os.get_inheritable(inherited.inheritance_descriptor()) is False
+        clone = inherited.prepare_snapshot()
+        descriptor = clone.duplicate_verified_descriptor()
+        try:
+            assert os.pread(descriptor, clone.size, 0) == original
+            assert os.get_inheritable(descriptor) is False
+        finally:
+            os.close(descriptor)
+            clone.close()
+            inherited.close()
     finally:
         snapshot.close()
         authority.close()

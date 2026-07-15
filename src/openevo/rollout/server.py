@@ -22,6 +22,7 @@ from openevo.rollout.models import (
     SessionResult,
     TaskRequest,
     TaskStatus,
+    canonicalize_task_request,
 )
 from openevo.rollout.pipeline import Pipeline
 from openevo.internal_auth import (
@@ -156,17 +157,18 @@ async def submit_task_async(request: TaskRequest):
 
     Poll ``GET /rollout/task/{task_id}`` until status becomes terminal.
     """
+    canonical = canonicalize_task_request(request)
     await require_generation_bound_run_admission(
         identity=_internal_identity,
         verifier=_run_admission_verifier,
         operation=RunAdmissionOperation.ROLLOUT_TASK_SUBMIT,
-        payload=request.model_dump(mode="json"),
-        task_id=request.task_id,
+        payload=canonical.payload,
+        task_id=canonical.request.task_id,
         session_id=None,
     )
     state = get_state()
     try:
-        task_id = await state.manager.submit_task(request)
+        task_id = await state.manager.submit_task(canonical.request)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"task_id": task_id, "status": "running"}

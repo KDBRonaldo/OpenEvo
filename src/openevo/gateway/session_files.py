@@ -51,6 +51,7 @@ _CREDENTIAL_SNAPSHOT_SEALS: Final[int] = (
     _F_SEAL_SEAL | _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE
 )
 CODEX_CREDENTIAL_AUTHORITY_FD_ENV: Final[str] = "OPENEVO_CODEX_CREDENTIAL_AUTHORITY_FD"
+CODEX_CREDENTIAL_SNAPSHOT_FD_ENV: Final[str] = "OPENEVO_CODEX_CREDENTIAL_SNAPSHOT_FD"
 
 
 class SessionFileSecurityError(RuntimeError):
@@ -320,6 +321,84 @@ class PreparedCodexCredentialSnapshot:
     def size(self) -> int:
         return self._size
 
+    @property
+    def content_sha256(self) -> str:
+        return self._content_sha256
+
+    @property
+    def identity(self) -> CredentialFileIdentity:
+        return self._source_identity
+
+    @classmethod
+    def from_inherited_environment(
+        cls,
+        *,
+        required: bool,
+    ) -> PreparedCodexCredentialSnapshot | None:
+        """Adopt one sealed readiness snapshot inherited from the supervisor."""
+
+        raw_descriptor = os.environ.pop(CODEX_CREDENTIAL_SNAPSHOT_FD_ENV, None)
+        if raw_descriptor is None:
+            if required:
+                raise SessionFileSecurityError(
+                    "release Gateway is missing the Codex credential snapshot"
+                )
+            return None
+        descriptor = -1
+        try:
+            descriptor = int(raw_descriptor)
+            if descriptor < 3 or str(descriptor) != raw_descriptor:
+                raise ValueError
+            os.set_inheritable(descriptor, False)
+            opened = os.fstat(descriptor)
+            _require_prepared_snapshot(opened)
+            content = _read_fd_exact(descriptor, opened.st_size)
+            snapshot = cls(
+                descriptor=descriptor,
+                size=opened.st_size,
+                content_sha256=hashlib.sha256(content).hexdigest(),
+                source_identity=_auth_identity(opened),
+                redactor=CredentialRedactor.from_auth_json(content),
+            )
+            snapshot.verify()
+            descriptor = -1
+            return snapshot
+        except (OSError, ValueError, SessionFileSecurityError) as exc:
+            raise SessionFileSecurityError(
+                "inherited Codex credential snapshot is invalid"
+            ) from exc
+        finally:
+            if descriptor >= 3:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def inheritance_descriptor(self) -> int:
+        self.verify()
+        return self._descriptor
+
+    def prepare_snapshot(self) -> PreparedCodexCredentialSnapshot:
+        """Clone the sealed point-in-time authority for one session publication."""
+
+        self.verify()
+        descriptor = os.dup(self._descriptor)
+        try:
+            os.set_inheritable(descriptor, False)
+            snapshot = PreparedCodexCredentialSnapshot(
+                descriptor=descriptor,
+                size=self._size,
+                content_sha256=self._content_sha256,
+                source_identity=self._source_identity,
+                redactor=self._redactor,
+            )
+            snapshot.verify()
+            descriptor = -1
+            return snapshot
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
     def duplicate_verified_descriptor(self) -> int:
         self.verify()
         descriptor = os.dup(self._descriptor)
@@ -337,7 +416,8 @@ class PreparedCodexCredentialSnapshot:
             raise SessionFileSecurityError("prepared Codex auth snapshot is closed")
         try:
             opened = os.fstat(self._descriptor)
-            if opened.st_size != self._size or not stat.S_ISREG(opened.st_mode):
+            _require_prepared_snapshot(opened)
+            if opened.st_size != self._size:
                 raise SessionFileSecurityError("prepared Codex auth snapshot changed")
             if (
                 fcntl.fcntl(self._descriptor, _F_GET_SEALS)
@@ -2017,6 +2097,18 @@ def _require_private_auth(value: os.stat_result) -> None:
         )
     if value.st_size <= 0 or value.st_size > _AUTH_MAX_BYTES:
         raise SessionFileSecurityError("Codex subscription auth has an invalid or excessive size")
+
+
+def _require_prepared_snapshot(value: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or value.st_uid != os.geteuid()
+        or value.st_nlink != 0
+        or stat.S_IMODE(value.st_mode) != 0o600
+        or value.st_size <= 0
+        or value.st_size > _AUTH_MAX_BYTES
+    ):
+        raise SessionFileSecurityError("prepared Codex auth snapshot is invalid")
 
 
 def _require_private_staged_auth(

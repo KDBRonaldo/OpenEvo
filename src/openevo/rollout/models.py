@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
+import hashlib
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -59,6 +62,8 @@ def _default_builder_spec() -> StrategySpec:
 class TaskRequest(BaseModel):
     """Task submitted by the trainer."""
 
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
     task_id: str
     instruction: str
     num_samples: int = Field(default=1, ge=1)
@@ -69,6 +74,43 @@ class TaskRequest(BaseModel):
     evaluator: EvaluatorSpec | None = None
     callback_url: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalTaskRequest:
+    """One validated task request and its exact admission/wire representation."""
+
+    request: TaskRequest
+    payload: dict[str, object]
+    canonical_bytes: bytes
+    payload_sha256: str
+
+
+def canonicalize_task_request(
+    value: TaskRequest | Mapping[str, object],
+) -> CanonicalTaskRequest:
+    """Close, default, and serialize a task once for both admission and transport."""
+
+    request = value if isinstance(value, TaskRequest) else TaskRequest.model_validate(value)
+    payload = request.model_dump(
+        mode="json",
+        exclude_defaults=False,
+        exclude_none=False,
+        exclude_unset=False,
+    )
+    canonical_bytes = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return CanonicalTaskRequest(
+        request=request,
+        payload=payload,
+        canonical_bytes=canonical_bytes,
+        payload_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
+    )
 
 
 class SessionDispatchRequest(BaseModel):

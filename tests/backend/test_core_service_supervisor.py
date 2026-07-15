@@ -13,6 +13,7 @@ import time
 import pytest
 
 from openevo.backend import service_supervisor as supervisor_module
+from openevo.gateway import session_files as session_files_module
 from openevo.backend.contracts.v1.models import LogEntryV1, ServiceSummaryV1
 from openevo.backend.service_supervisor import (
     BoundedProbeCommandRunner,
@@ -39,6 +40,7 @@ from openevo.config import TopologyConfig
 from openevo.internal_auth import InternalServiceIdentity
 from openevo.gateway.session_files import (
     HeldCodexCredentialAuthority,
+    PreparedCodexCredentialSnapshot,
     SessionFileSecurityError,
 )
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
@@ -203,6 +205,9 @@ class FakeManagedScienceRuntimeProbe:
             if self.ready and self.auth_path is not None
             else None
         )
+        snapshot = authority.prepare_snapshot() if authority is not None else None
+        if authority is not None:
+            authority.close()
         return ManagedScienceRuntimeReadiness(
             ready=self.ready,
             code=(
@@ -211,12 +216,17 @@ class FakeManagedScienceRuntimeProbe:
                 else ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE
             ),
             identity_digest="f" * 64 if self.ready else None,
+            runtime_image_immutable_reference=(
+                MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+                if self.ready
+                else None
+            ),
             message=(
                 "Managed Science runtime bootstrap is verified."
                 if self.ready
                 else "Managed Science runtime image is not prepared."
             ),
-            credential_authority=authority,
+            credential_authority=snapshot,
         )
 
 
@@ -233,6 +243,7 @@ class BlockingManagedScienceRuntimeProbe(FakeManagedScienceRuntimeProbe):
                     ready=False,
                     code=ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE,
                     identity_digest=None,
+                    runtime_image_immutable_reference=None,
                     message="Managed Science runtime probe was cancelled.",
                 )
         raise AssertionError("cancellation did not interrupt the runtime probe")
@@ -250,11 +261,42 @@ class FakeProbeCommandRunner:
         self.image_id = image_id
         self.results = results or {}
         self.calls: list[tuple[str, ...]] = []
+        self.environments: list[dict[str, str]] = []
 
-    def run(self, argv, deadline, cancellation=None) -> ProbeCommandResult:
+    def hold_executable(self, name: str):
+        assert name == "codex"
+        runner = self
+
+        class FakeExecutable:
+            identity_digest = "e" * 64
+
+            def run(self, argv, deadline, cancellation=None, *, env=None):
+                return runner.run(
+                    ("codex", *argv),
+                    deadline,
+                    cancellation,
+                    env=env,
+                )
+
+            def close(self) -> None:
+                return None
+
+        return FakeExecutable()
+
+    def run(
+        self,
+        argv,
+        deadline,
+        cancellation=None,
+        *,
+        env=None,
+        pass_fds=(),
+    ) -> ProbeCommandResult:
         assert time.monotonic() < deadline
         assert cancellation is None or not cancellation.is_set()
+        assert pass_fds == ()
         self.calls.append(argv)
+        self.environments.append(dict(env or {}))
         if argv in self.results:
             return self.results[argv]
         if argv == ("codex", "--version"):
@@ -364,6 +406,9 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         assert snapshot.run_ready is True
         assert snapshot.run_readiness_code is ServiceRunReadinessCode.READY
         assert snapshot.runtime_image == "openevo/science-runtime:0.1.0"
+        assert snapshot.runtime_image_immutable_reference == (
+            MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+        )
         assert [service.id for service in snapshot.services] == [
             "evolution-backend",
             "rollout",
@@ -405,6 +450,9 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         binding = supervisor.run_binding()
         assert binding.execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
         assert binding.runtime_image == "openevo/science-runtime:0.1.0"
+        assert binding.runtime_image_immutable_reference == (
+            MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+        )
         assert binding.runtime_identity_digest == snapshot.runtime_identity_digest
         assert binding.generation_digest == snapshot.generation_digest
         assert binding.registry_digest == REGISTRY_DIGEST
@@ -638,7 +686,7 @@ def test_atomic_run_binding_lease_blocks_another_model_generation_until_release(
         supervisor.close()
 
 
-def test_auth_replacement_revokes_active_run_service_authority(
+def test_auth_replacement_after_snapshot_does_not_revoke_active_run_authority(
     tmp_path: Path,
     framework_lock: Path,
 ) -> None:
@@ -657,9 +705,8 @@ def test_auth_replacement_revokes_active_run_service_authority(
         replacement.chmod(0o600)
         os.replace(replacement, runtime_probe.auth_path)
 
-        assert supervisor.authenticates_run_service(lease.binding.request_headers()) is False
-        with pytest.raises(SupervisorStateError, match="credential authority changed"):
-            supervisor.run_binding()
+        assert supervisor.authenticates_run_service(lease.binding.request_headers()) is True
+        assert supervisor.run_binding() == lease.binding
     finally:
         if lease is not None:
             lease.close()
@@ -1775,6 +1822,233 @@ def test_local_managed_runtime_probe_binds_image_codex_and_private_auth(
     readiness.credential_authority.close()
 
 
+def test_local_probe_login_uses_snapshot_and_resists_source_path_aba(
+    tmp_path: Path,
+) -> None:
+    original = b'{"tokens":{"access_token":"original-private-token"}}'
+    auth = tmp_path / "auth.json"
+    auth.write_bytes(original)
+    auth.chmod(0o600)
+    probe_root = tmp_path / "probe-root"
+    probe_root.mkdir(mode=0o700)
+
+    class AbaRunner(FakeProbeCommandRunner):
+        observed_login_auth: bytes | None = None
+
+        def run(
+            self,
+            argv,
+            deadline,
+            cancellation=None,
+            *,
+            env=None,
+            pass_fds=(),
+        ) -> ProbeCommandResult:
+            if argv == ("codex", "login", "status"):
+                assert env is not None
+                snapshot_home = Path(env["CODEX_HOME"])
+                assert snapshot_home.parent == probe_root
+                self.observed_login_auth = (snapshot_home / "auth.json").read_bytes()
+                held_original = auth.with_name("auth.original")
+                replacement = auth.with_name("auth.replacement")
+                replacement.write_text(
+                    '{"tokens":{"access_token":"replacement-private-token"}}',
+                    encoding="utf-8",
+                )
+                replacement.chmod(0o600)
+                os.replace(auth, held_original)
+                os.replace(replacement, auth)
+                os.replace(auth, replacement)
+                os.replace(held_original, auth)
+                replacement.unlink()
+            return super().run(
+                argv,
+                deadline,
+                cancellation,
+                env=env,
+                pass_fds=pass_fds,
+            )
+
+    runner = AbaRunner()
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+        credential_probe_root=probe_root,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is True
+    assert runner.observed_login_auth == original
+    assert auth.read_bytes() == original
+    assert list(probe_root.iterdir()) == []
+    snapshot = readiness.credential_authority
+    assert isinstance(snapshot, PreparedCodexCredentialSnapshot)
+    descriptor = snapshot.duplicate_verified_descriptor()
+    try:
+        assert os.pread(descriptor, snapshot.size, 0) == original
+    finally:
+        os.close(descriptor)
+        snapshot.close()
+
+
+def test_local_probe_source_replacement_during_snapshot_never_runs_login(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":{"access_token":"original"}}', encoding="utf-8")
+    auth.chmod(0o600)
+    probe_root = tmp_path / "probe-root"
+    probe_root.mkdir(mode=0o700)
+    original_copy = session_files_module._copy_exact
+
+    def replace_during_copy(source_fd: int, target_fd: int, size: int) -> None:
+        original_copy(source_fd, target_fd, size)
+        replacement = auth.with_name("auth.replacement")
+        replacement.write_text(
+            '{"tokens":{"access_token":"replacement"}}',
+            encoding="utf-8",
+        )
+        replacement.chmod(0o600)
+        os.replace(replacement, auth)
+
+    monkeypatch.setattr(session_files_module, "_copy_exact", replace_during_copy)
+    runner = FakeProbeCommandRunner()
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+        credential_probe_root=probe_root,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE
+    assert runner.calls == [("codex", "--version")]
+    assert list(probe_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "version_result",
+    [
+        ProbeCommandResult(0, b"", b""),
+        ProbeCommandResult(0, b"codex-cli latest\n", b""),
+        ProbeCommandResult(0, b"codex-cli 1.2\n", b""),
+        ProbeCommandResult(0, b"codex-cli 01.2.3\n", b""),
+        ProbeCommandResult(0, b"codex-cli 1.02.3\n", b""),
+        ProbeCommandResult(0, b"codex-cli 1.2.03\n", b""),
+        ProbeCommandResult(0, b"codex-cli 1.2.3-01\n", b""),
+        ProbeCommandResult(0, b"codex-cli 1.2.3+\n", b""),
+        ProbeCommandResult(0, b" codex-cli 1.2.3\n", b""),
+        ProbeCommandResult(0, b"codex-cli 1.2.3\nextra\n", b""),
+        ProbeCommandResult(0, b"x" * 4097, b""),
+    ],
+)
+def test_local_probe_rejects_empty_unbounded_or_malformed_codex_version(
+    tmp_path: Path,
+    version_result: ProbeCommandResult,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":{"access_token":"private"}}', encoding="utf-8")
+    auth.chmod(0o600)
+    runner = FakeProbeCommandRunner(
+        results={("codex", "--version"): version_result}
+    )
+
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE
+    assert runner.calls == [("codex", "--version")]
+
+
+def test_local_probe_accepts_stderr_only_version_and_binds_exact_evidence(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":{"access_token":"private"}}', encoding="utf-8")
+    auth.chmod(0o600)
+
+    def readiness_for(version: bytes) -> ManagedScienceRuntimeReadiness:
+        runner = FakeProbeCommandRunner(
+            results={
+                ("codex", "--version"): ProbeCommandResult(0, b"", version),
+            }
+        )
+        return LocalManagedScienceRuntimeProbe(
+            command_runner=runner,
+            codex_auth_path=auth,
+        ).verify(
+            ManagedScienceRuntimeRequest(
+                runtime_image="openevo/science-runtime:0.1.0",
+                codex_model="gpt-5.1-codex-mini",
+            ),
+            time.monotonic() + 1,
+        )
+
+    first = readiness_for(b"codex-cli 1.2.3\n")
+    second = readiness_for(b"codex-cli 1.2.4\n")
+    try:
+        assert first.ready is True
+        assert second.ready is True
+        assert first.identity_digest != second.identity_digest
+    finally:
+        assert first.credential_authority is not None
+        assert second.credential_authority is not None
+        first.credential_authority.close()
+        second.credential_authority.close()
+
+
+def test_local_probe_accepts_legal_semver_prerelease_and_build(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":{"access_token":"private"}}', encoding="utf-8")
+    auth.chmod(0o600)
+    runner = FakeProbeCommandRunner(
+        results={
+            ("codex", "--version"): ProbeCommandResult(
+                0,
+                b"codex-cli 1.2.3-beta-1.0+build.01\n",
+                b"",
+            )
+        }
+    )
+
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    try:
+        assert readiness.ready is True
+    finally:
+        assert readiness.credential_authority is not None
+        readiness.credential_authority.close()
+
+
 def test_runtime_probe_exception_closes_held_credential_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1791,10 +2065,24 @@ def test_runtime_probe_exception_closes_held_credential_authority(
         return authority
 
     class ExplodingRunner(FakeProbeCommandRunner):
-        def run(self, argv, deadline, cancellation=None) -> ProbeCommandResult:
+        def run(
+            self,
+            argv,
+            deadline,
+            cancellation=None,
+            *,
+            env=None,
+            pass_fds=(),
+        ) -> ProbeCommandResult:
             if argv == ("docker", "--version"):
                 raise RuntimeError("controlled runtime probe failure")
-            return super().run(argv, deadline, cancellation)
+            return super().run(
+                argv,
+                deadline,
+                cancellation,
+                env=env,
+                pass_fds=pass_fds,
+            )
 
     monkeypatch.setattr(
         supervisor_module.HeldCodexCredentialAuthority,
@@ -1805,6 +2093,7 @@ def test_runtime_probe_exception_closes_held_credential_authority(
         command_runner=ExplodingRunner(),
         codex_auth_path=auth,
     )
+    before_fds = len(os.listdir("/proc/self/fd"))
 
     with pytest.raises(RuntimeError, match="controlled runtime probe failure"):
         probe.verify(
@@ -1818,6 +2107,7 @@ def test_runtime_probe_exception_closes_held_credential_authority(
     assert len(opened) == 1
     with pytest.raises(SessionFileSecurityError, match="closed"):
         opened[0].verify()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
 
 
 def test_local_managed_runtime_probe_rejects_wrong_release_digest_before_run(
@@ -1952,7 +2242,7 @@ def test_local_managed_runtime_probe_rejects_missing_auth_evidence(tmp_path: Pat
 
     assert readiness.ready is False
     assert readiness.code is ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE
-    assert runner.calls == [("codex", "--version"), ("codex", "login", "status")]
+    assert runner.calls == [("codex", "--version")]
 
 
 def test_real_probe_command_is_cancelled_and_reaped_within_bound() -> None:

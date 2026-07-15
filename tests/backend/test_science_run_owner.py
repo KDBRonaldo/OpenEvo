@@ -16,7 +16,7 @@ from openevo.backend.contracts.v1 import models as m
 from openevo.backend.contracts.v1.store import CoreControlStoreV1
 from openevo.backend.run_control import CoreRunControlError
 import openevo.backend.science_run_owner as owner_module
-from openevo.backend.science_run_owner import CoreScienceRunOwner
+from openevo.backend.science_run_owner import CoreScienceRunOwner, _AdmittingRolloutClient
 from openevo.backend.science_run_store import ScienceRunStore
 from openevo.backend.service_supervisor import (
     ServiceExecutionMode,
@@ -32,6 +32,8 @@ from openevo.internal_auth import (
     RunAdmissionError,
     RunAdmissionOperation,
 )
+from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
+from openevo.rollout.models import canonicalize_task_request
 from tests.framework_testkit import verified_builtin_registry
 
 
@@ -68,6 +70,9 @@ class _FakeServiceOwner:
             generation_digest=self.binding.generation_digest,
             services=(),
             runtime_image=self.binding.runtime_image if ready else None,
+            runtime_image_immutable_reference=(
+                self.binding.runtime_image_immutable_reference if ready else None
+            ),
             runtime_identity_digest=(self.binding.runtime_identity_digest if ready else None),
             status_message=None if ready else "secret probe output must not escape",
         )
@@ -202,6 +207,9 @@ def _binding(
     return ServiceRunBinding(
         execution_mode=ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
         runtime_image="openevo/science-runtime:0.1.0",
+        runtime_image_immutable_reference=(
+            MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+        ),
         runtime_identity_digest=runtime_identity_digest,
         generation_digest=identity.generation_digest,
         registry_digest=identity.registry_digest,
@@ -1018,9 +1026,13 @@ def test_admission_replays_only_exact_generation_payload_and_session(
         task_id = str(kwargs["task_ids"][0])
         admitted_task.append(task_id)
         assert (
-            kwargs["rollout_client"].submit_task(
-                {"task_id": task_id, "instruction": "exact admitted payload"}
-            )
+                kwargs["rollout_client"].submit_task(
+                    {
+                        "task_id": task_id,
+                        "instruction": "exact admitted payload",
+                        "agent": {"harness": "codex"},
+                    }
+                )
             == task_id
         )
         submitted.set()
@@ -1086,6 +1098,51 @@ def test_admission_replays_only_exact_generation_payload_and_session(
         runner_allowed.set()
         owner.close()
         store.close()
+
+
+def test_admitting_rollout_client_registers_and_sends_one_canonical_payload(
+    registry: object,
+) -> None:
+    binding = _binding(registry)
+    registration: dict[str, object] = {}
+
+    class Ledger:
+        def register_admission(self, **kwargs: object) -> bool:
+            registration.update(kwargs)
+            return True
+
+    class Owner:
+        _ledger = Ledger()
+
+    class Client:
+        def __init__(self) -> None:
+            self.payload: dict[str, Any] | None = None
+
+        def submit_task(self, payload: dict[str, Any]) -> str:
+            self.payload = payload
+            return str(payload["task_id"])
+
+        def get_task(self, task_id: str) -> dict[str, Any]:
+            return {"task_id": task_id}
+
+    client = Client()
+    raw = {
+        "task_id": "canonical-owner-task",
+        "instruction": "default every TaskRequest field once",
+        "agent": {"harness": "codex"},
+    }
+    canonical = canonicalize_task_request(raw)
+    admitting = _AdmittingRolloutClient(
+        client,
+        owner=Owner(),  # type: ignore[arg-type]
+        run_id="run-canonical-owner",
+        binding=binding,
+        cancellation=threading.Event(),
+    )
+
+    assert admitting.submit_task(raw) == "canonical-owner-task"
+    assert client.payload == canonical.payload
+    assert registration["payload_sha256"] == canonical.payload_sha256
 
 
 def test_invalid_artifact_projection_cannot_advance_successor_revision(

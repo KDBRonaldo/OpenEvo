@@ -49,6 +49,7 @@ from openevo.internal_auth import (
     RunAdmissionOperation,
 )
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
+from openevo.rollout.models import canonicalize_task_request
 
 
 _TERMINAL = frozenset(
@@ -926,6 +927,8 @@ class CoreScienceRunOwner:
             binding is None
             or binding.execution_mode is not snapshot.execution_mode
             or binding.runtime_image != snapshot.runtime_image
+            or binding.runtime_image_immutable_reference
+            != snapshot.runtime_image_immutable_reference
             or binding.runtime_identity_digest != snapshot.runtime_identity_digest
             or binding.generation_digest != snapshot.generation_digest
         ):
@@ -1189,9 +1192,8 @@ class _AdmittingRolloutClient:
     def submit_task(self, payload: dict[str, Any]) -> str:
         if self._cancellation.is_set():
             raise _RunCancelled()
-        task_id = payload.get("task_id")
-        if not isinstance(task_id, str) or not task_id:
-            raise ValueError("rollout payload has no task identity")
+        canonical = canonicalize_task_request(payload)
+        task_id = canonical.request.task_id
         accepted = self._owner._ledger.register_admission(
             run_id=self._run_id,
             operation=RunAdmissionOperation.ROLLOUT_TASK_SUBMIT.value,
@@ -1200,12 +1202,12 @@ class _AdmittingRolloutClient:
             generation_digest=self._binding.generation_digest,
             registry_digest=self._binding.registry_digest,
             framework_lock_digest=self._binding.framework_lock_digest,
-            payload_sha256=hashlib.sha256(_canonical_bytes(payload)).hexdigest(),
+            payload_sha256=canonical.payload_sha256,
             allow_create=True,
         )
         if not accepted:
             raise RuntimeError("rollout admission changed for an existing task")
-        submitted = self._client.submit_task(payload)
+        submitted = self._client.submit_task(canonical.payload)
         if submitted != task_id:
             raise RuntimeError("rollout service changed the admitted task identity")
         return submitted

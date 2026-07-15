@@ -19,11 +19,12 @@ from openevo.internal_auth import (
     CoreRunAdmissionHttpVerifier,
     INTERNAL_CREDENTIAL_FD_ENV,
     InternalServiceIdentity,
+    RunAdmissionError,
     RunAdmissionOperation,
     read_internal_service_identity,
 )
 from openevo.backend.run_admission import install_core_run_admission_endpoint
-from openevo.rollout.models import SessionDispatchRequest
+from openevo.rollout.models import SessionDispatchRequest, canonicalize_task_request
 from openevo.rollout import server as rollout_server
 
 
@@ -347,8 +348,6 @@ def test_release_rollout_submit_requires_generation_bound_run_admission(
                         "settings": {"capture_mode": "transcript"},
                     },
                     "runtime": {"image": "caller-supplied-image"},
-                    "run_ready": True,
-                    "admission": {"status": "admitted"},
                 },
             )
         assert response.status_code == 503
@@ -363,6 +362,84 @@ def test_release_rollout_submit_requires_generation_bound_run_admission(
         }
     finally:
         rollout_server.configure_server(str(topology_path), internal_identity=None)
+
+
+def test_rollout_endpoint_admits_only_defaulted_canonical_task_request(monkeypatch) -> None:
+    class Manager:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def submit_task(self, request) -> str:
+            self.requests.append(request)
+            return request.task_id
+
+    class Verifier:
+        def __init__(self, expected_digest: str) -> None:
+            self.expected_digest = expected_digest
+            self.checks = []
+
+        async def verify(self, check: GenerationBoundRunAdmissionCheck) -> None:
+            self.checks.append(check)
+            if check.payload_sha256 != self.expected_digest:
+                raise RunAdmissionError(
+                    "run_admission_denied",
+                    "Core run admission authority rejected the service request.",
+                    status_code=409,
+                    retryable=False,
+                )
+
+    raw = {
+        "task_id": "defaulted-task",
+        "instruction": "exercise canonical task defaults",
+        "agent": {"harness": "codex"},
+    }
+    canonical = canonicalize_task_request(raw)
+    manager = Manager()
+    identity = _identity("rollout")
+    verifier = Verifier(canonical.payload_sha256)
+    monkeypatch.setattr(
+        rollout_server,
+        "get_state",
+        lambda: SimpleNamespace(manager=manager),
+    )
+    rollout_server._internal_identity = identity
+    rollout_server._run_admission_verifier = verifier
+    try:
+        client = TestClient(rollout_server.app)
+        response = client.post(
+            "/rollout/task/submit",
+            headers=identity.request_headers(),
+            json=raw,
+        )
+        assert response.status_code == 200
+        assert response.json() == {"task_id": "defaulted-task", "status": "running"}
+        assert len(manager.requests) == 1
+        assert manager.requests[0].model_dump(mode="json") == canonical.payload
+        assert verifier.checks[0].payload_sha256 == canonical.payload_sha256
+
+        raw_digest = hashlib.sha256(
+            json.dumps(
+                raw,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        rejecting = Verifier(raw_digest)
+        rollout_server._run_admission_verifier = rejecting
+        denied = client.post(
+            "/rollout/task/submit",
+            headers=identity.request_headers(),
+            json=raw,
+        )
+        assert denied.status_code == 409
+        assert denied.json()["error"]["code"] == "run_admission_denied"
+        assert len(manager.requests) == 1
+        assert rejecting.checks[0].payload_sha256 == canonical.payload_sha256
+    finally:
+        rollout_server._internal_identity = None
+        rollout_server._run_admission_verifier = None
 
 
 def test_release_gateway_session_create_and_dispatch_require_run_admission(
@@ -638,9 +715,9 @@ def test_gateway_credential_publication_failure_is_typed_retryable_503(
         assert response.status_code == 503
         assert response.json() == {
             "error": {
-                "code": "credential_readiness_failed",
+                "code": "gateway_readiness_failed",
                 "message": (
-                    "The managed subscription credential was not ready for session admission."
+                    "Gateway security prerequisites were not ready for session admission."
                 ),
                 "retryable": True,
             }

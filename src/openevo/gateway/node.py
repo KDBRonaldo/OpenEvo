@@ -18,13 +18,15 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory, mkdtemp
-from typing import Any, Callable, cast
+from typing import Any, Awaitable, Callable, cast
 from urllib.parse import unquote, urlparse
 
 import httpx
 
 from openevo.config import EvolutionConfig
 from openevo.gateway.dispatcher import (
+    DispatcherAdmissionLease,
+    DispatcherUnavailableError,
     DispatcherSnapshot,
     ManagedSession,
     SessionDispatcher,
@@ -69,7 +71,10 @@ from openevo.runtime.base import (
     validate_session_bind_path,
 )
 from openevo.runtime.factory import create_runtime
-from openevo.runtime.docker import DockerRuntime
+from openevo.runtime.docker import (
+    DockerRuntime,
+    verify_managed_runtime_image_admission,
+)
 from openevo.runtime.managed import (
     MANAGED_SUBSCRIPTION_ENV,
     ManagedCredentialMount,
@@ -601,7 +606,12 @@ class GatewayNodeManager:
         evolution: EvolutionConfig | None = None,
         evolution_client: EvolutionClient | None = None,
         internal_headers: dict[str, str] | None = None,
-        credential_authority: HeldCodexCredentialAuthority | None = None,
+        credential_authority: (
+            HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
+        ) = None,
+        managed_image_authority_verifier: (
+            Callable[[RuntimeSpec], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         self.node_id = node_id
         self.gateway_url = gateway_url.rstrip("/")
@@ -619,6 +629,10 @@ class GatewayNodeManager:
         self.evolution_client = evolution_client
         self._internal_headers = dict(internal_headers or {})
         self._credential_authority = credential_authority
+        self._managed_image_authority_verifier = (
+            managed_image_authority_verifier
+            or verify_managed_runtime_image_admission
+        )
         self._client = httpx.AsyncClient(
             timeout=30.0,
             headers=self._internal_headers,
@@ -777,6 +791,26 @@ class GatewayNodeManager:
                 raise GatewayReadinessError(
                     "managed subscription credential readiness failed"
                 ) from exc
+            try:
+                await self._managed_image_authority_verifier(runtime_spec)
+            except (OSError, RuntimeError, ValueError) as exc:
+                prepared_credential.close()
+                raise GatewayReadinessError(
+                    "managed runtime image authority was not ready for admission"
+                ) from exc
+            except BaseException:
+                prepared_credential.close()
+                raise
+
+        dispatcher_admission: DispatcherAdmissionLease | None = None
+        try:
+            dispatcher_admission = await self._dispatcher.reserve_admission()
+        except DispatcherUnavailableError as exc:
+            if prepared_credential is not None:
+                prepared_credential.close()
+            raise GatewayReadinessError(
+                "gateway dispatcher was not ready for admission"
+            ) from exc
 
         session_dir: Path | None = None
         session_root_identity: tuple[int, int, int] | None = None
@@ -835,7 +869,16 @@ class GatewayNodeManager:
                 metadata=dict(request.metadata),
             )
             self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
-            await self._dispatcher.enqueue(managed)
+            try:
+                await self._dispatcher.enqueue(
+                    managed,
+                    admission=dispatcher_admission,
+                )
+                dispatcher_admission = None
+            except DispatcherUnavailableError as exc:
+                raise GatewayReadinessError(
+                    "gateway dispatcher was not ready for admission"
+                ) from exc
         except BaseException:
             try:
                 self.storage.delete_session(session_id)
@@ -880,6 +923,8 @@ class GatewayNodeManager:
                     )
             raise
         finally:
+            if dispatcher_admission is not None:
+                await self._dispatcher.release_admission(dispatcher_admission)
             if prepared_credential is not None:
                 prepared_credential.close()
 

@@ -9,7 +9,9 @@ import logging
 import os
 import re
 import shlex
+import signal
 import stat
+import shutil
 from hashlib import sha256
 from pathlib import Path
 from typing import Final, Literal
@@ -19,6 +21,7 @@ from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     ManagedCredentialMount,
     managed_runtime_image_release,
+    require_immutable_managed_runtime_image,
     verified_managed_runtime_image_reference,
 )
 from openevo.runtime.models import ExecResult, RuntimeSpec
@@ -33,6 +36,8 @@ _CONTAINER_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _OWNERSHIP_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _OWNERSHIP_RECORD_LIMIT: Final[int] = 1024
 _CREDENTIAL_VIEW_NAME: Final[str] = ".openevo-codex-home"
+_IMAGE_INSPECT_MAX_BYTES: Final[int] = 1024 * 1024
+_IMAGE_INSPECT_TIMEOUT_SECONDS: Final[float] = 10.0
 _OwnershipState = Literal[
     "none",
     "create_pending",
@@ -41,6 +46,103 @@ _OwnershipState = Literal[
     "verified",
     "absent",
 ]
+
+
+async def verify_managed_runtime_image_admission(spec: RuntimeSpec) -> None:
+    """Synchronously bind a managed request to its release alias and exact image."""
+
+    release = require_immutable_managed_runtime_image(
+        profile=spec.profile,
+        image=spec.image,
+    )
+    await _inspect_managed_runtime_image(
+        profile=spec.profile,
+        requested_image=spec.image,
+    )
+    # The alias check is last. Once it maps to the already-verified immutable
+    # authority, later tag changes are irrelevant because the runtime request
+    # contains only the immutable reference.
+    await _inspect_managed_runtime_image(
+        profile=spec.profile,
+        requested_image=release.image,
+    )
+
+
+async def _inspect_managed_runtime_image(
+    *,
+    profile: str | None,
+    requested_image: str,
+) -> str:
+    docker = shutil.which("docker", path=os.environ.get("PATH", os.defpath))
+    if docker is None:
+        raise RuntimeError("managed runtime image authority is unavailable")
+    process = await asyncio.create_subprocess_exec(
+        docker,
+        "image",
+        "inspect",
+        requested_image,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={
+            key: os.environ[key]
+            for key in ("HOME", "LANG", "LC_ALL", "PATH")
+            if key in os.environ
+        },
+        cwd="/",
+        start_new_session=True,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    aggregate = [0]
+    stdout = bytearray()
+    stderr = bytearray()
+
+    async def drain(reader: asyncio.StreamReader, destination: bytearray) -> None:
+        while chunk := await reader.read(64 * 1024):
+            aggregate[0] += len(chunk)
+            if aggregate[0] > _IMAGE_INSPECT_MAX_BYTES:
+                raise RuntimeError("managed runtime image inspect output exceeded its limit")
+            destination.extend(chunk)
+
+    tasks = [
+        asyncio.create_task(drain(process.stdout, stdout)),
+        asyncio.create_task(drain(process.stderr, stderr)),
+    ]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(process.wait(), *tasks),
+            timeout=_IMAGE_INSPECT_TIMEOUT_SECONDS,
+        )
+    except BaseException:
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await process.wait()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    if process.returncode != 0:
+        raise RuntimeError("managed runtime image inspect failed")
+    try:
+        payload = json.loads(bytes(stdout).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("managed runtime image inspect returned invalid JSON") from exc
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        raise RuntimeError("managed runtime image inspect was not singular")
+    record = payload[0]
+    config = record.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    try:
+        return verified_managed_runtime_image_reference(
+            profile=profile,
+            image=requested_image,
+            image_id=record.get("Id"),
+            repo_digests=record.get("RepoDigests"),
+            labels=labels,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _object_identity(value: os.stat_result) -> tuple[int, int]:

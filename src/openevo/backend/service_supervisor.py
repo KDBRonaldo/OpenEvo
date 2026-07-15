@@ -23,10 +23,12 @@ import re
 import secrets
 import selectors
 import signal
+import shutil
 import socket
 import stat
 import subprocess
 import sys
+from tempfile import mkdtemp
 import threading
 import time
 from typing import Protocol
@@ -54,10 +56,18 @@ from openevo.backend.contracts.v1.models import (
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
 from openevo.gateway.session_files import (
     CODEX_CREDENTIAL_AUTHORITY_FD_ENV,
+    CODEX_CREDENTIAL_SNAPSHOT_FD_ENV,
     HeldCodexCredentialAuthority,
+    PreparedCodexCredentialSnapshot,
     SessionFileSecurityError,
+    capture_session_root_identity,
+    remove_credential_tree,
+    stage_codex_subscription_auth,
 )
-from openevo.runtime.managed import verified_managed_runtime_image_reference
+from openevo.runtime.managed import (
+    require_immutable_managed_runtime_image,
+    verified_managed_runtime_image_reference,
+)
 from openevo.internal_auth import (
     INTERNAL_CREDENTIAL_FD_ENV,
     INTERNAL_LISTEN_FD_ENV,
@@ -119,6 +129,19 @@ _ROOT_MODE = 0o700
 _FILE_MODE = 0o600
 _MAX_LOG_LINE_BYTES = 16_384
 _MIN_SENSITIVE_CREDENTIAL_PREFIX_BYTES = 8
+_CODEX_VERSION_MAX_BYTES = 4096
+_SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
+_SEMVER_PRERELEASE_IDENTIFIER = (
+    r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+)
+_SEMVER_BUILD_IDENTIFIER = r"[0-9A-Za-z-]+"
+_PROBE_EXECUTABLE_MAX_BYTES = 256 * 1024 * 1024
+_CODEX_VERSION_RE = re.compile(
+    rf"^codex(?:-cli)? {_SEMVER_NUMBER}\.{_SEMVER_NUMBER}\.{_SEMVER_NUMBER}"
+    rf"(?:-{_SEMVER_PRERELEASE_IDENTIFIER}"
+    rf"(?:\.{_SEMVER_PRERELEASE_IDENTIFIER})*)?"
+    rf"(?:\+{_SEMVER_BUILD_IDENTIFIER}(?:\.{_SEMVER_BUILD_IDENTIFIER})*)?$"
+)
 
 
 def _state_digest(value: str) -> str:
@@ -267,7 +290,9 @@ class ServiceProcessSpec:
         compare=False,
     )
     listen_fd: int | None = field(default=None, repr=False, compare=False)
-    codex_credential_authority: HeldCodexCredentialAuthority | None = field(
+    codex_credential_authority: (
+        HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
+    ) = field(
         default=None,
         repr=False,
         compare=False,
@@ -315,8 +340,11 @@ class ManagedScienceRuntimeReadiness:
     ready: bool
     code: ServiceRunReadinessCode
     identity_digest: str | None
+    runtime_image_immutable_reference: str | None
     message: str
-    credential_authority: HeldCodexCredentialAuthority | None = field(
+    credential_authority: (
+        HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
+    ) = field(
         default=None,
         repr=False,
         compare=False,
@@ -327,6 +355,13 @@ class ManagedScienceRuntimeReadiness:
             raise ValueError("managed runtime readiness code does not match ready state")
         if self.ready != (self.identity_digest is not None):
             raise ValueError("ready managed runtime evidence requires an identity digest")
+        if self.ready != (self.runtime_image_immutable_reference is not None):
+            raise ValueError("ready managed runtime evidence requires an immutable image")
+        if self.runtime_image_immutable_reference is not None:
+            require_immutable_managed_runtime_image(
+                profile="managed_science",
+                image=self.runtime_image_immutable_reference,
+            )
         if self.ready != (self.credential_authority is not None):
             raise ValueError("ready managed runtime evidence requires held credential authority")
         if self.identity_digest is not None:
@@ -343,12 +378,33 @@ class ProbeCommandResult:
 
 
 class ProbeCommandRunner(Protocol):
+    def hold_executable(self, name: str) -> ProbeExecutableAuthority: ...
+
     def run(
         self,
         argv: tuple[str, ...],
         deadline: float,
         cancellation: threading.Event | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        pass_fds: tuple[int, ...] = (),
     ) -> ProbeCommandResult: ...
+
+
+class ProbeExecutableAuthority(Protocol):
+    @property
+    def identity_digest(self) -> str: ...
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        deadline: float,
+        cancellation: threading.Event | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+    ) -> ProbeCommandResult: ...
+
+    def close(self) -> None: ...
 
 
 class ManagedScienceRuntimeProbe(Protocol):
@@ -400,11 +456,17 @@ class BoundedProbeCommandRunner:
             raise ValueError("probe output limit is outside the supported bounds")
         self._max_output_bytes = max_output_bytes
 
+    def hold_executable(self, name: str) -> ProbeExecutableAuthority:
+        return _HeldProbeExecutable.open(name, self)
+
     def run(
         self,
         argv: tuple[str, ...],
         deadline: float,
         cancellation: threading.Event | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        pass_fds: tuple[int, ...] = (),
     ) -> ProbeCommandResult:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -412,13 +474,24 @@ class BoundedProbeCommandRunner:
         process: subprocess.Popen[bytes] | None = None
         selector: selectors.BaseSelector | None = None
         try:
+            process_env = _controlled_environment()
+            for key, value in (env or {}).items():
+                if key != "CODEX_HOME" or not os.path.isabs(value):
+                    raise OSError("probe environment override is invalid")
+                if not value or any(ord(char) < 0x20 for char in value):
+                    raise OSError("probe environment override is invalid")
+                process_env[key] = value
+            if any(fd < 3 for fd in pass_fds) or len(set(pass_fds)) != len(pass_fds):
+                raise OSError("probe inherited descriptor set is invalid")
             process = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=_controlled_environment(),
+                env=process_env,
                 cwd="/",
+                close_fds=True,
+                pass_fds=pass_fds,
                 start_new_session=True,
             )
             stdout = process.stdout
@@ -525,6 +598,165 @@ def _is_chatgpt_subscription_status(stdout: bytes, stderr: bytes) -> bool:
     return statuses == ["Logged in using ChatGPT"]
 
 
+class _HeldProbeExecutable:
+    """One no-follow executable inode used by every command in a probe."""
+
+    def __init__(
+        self,
+        *,
+        descriptor: int,
+        identity: tuple[int, int, int, int, int, int, int, int],
+        content_sha256: str,
+        runner: BoundedProbeCommandRunner,
+    ) -> None:
+        self._descriptor = descriptor
+        self._identity = identity
+        self._content_sha256 = content_sha256
+        self._runner = runner
+        self._closed = False
+        self._identity_digest = _digest_json(
+            {
+                "content_sha256": content_sha256,
+                "identity": identity,
+            }
+        )
+
+    @classmethod
+    def open(
+        cls,
+        name: str,
+        runner: BoundedProbeCommandRunner,
+    ) -> _HeldProbeExecutable:
+        candidate = shutil.which(name, path=_controlled_environment().get("PATH"))
+        if candidate is None:
+            raise OSError(f"{name} executable is unavailable")
+        resolved = Path(candidate).resolve(strict=True)
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            identity = _probe_executable_identity(opened)
+            content_sha256 = _digest_probe_executable(descriptor, opened.st_size)
+            authority = cls(
+                descriptor=descriptor,
+                identity=identity,
+                content_sha256=content_sha256,
+                runner=runner,
+            )
+            authority._verify()
+            descriptor = -1
+            return authority
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    @property
+    def identity_digest(self) -> str:
+        return self._identity_digest
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        deadline: float,
+        cancellation: threading.Event | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+    ) -> ProbeCommandResult:
+        self._verify()
+        try:
+            return self._runner.run(
+                (f"/proc/self/fd/{self._descriptor}", *argv),
+                deadline,
+                cancellation,
+                env=env,
+                pass_fds=(self._descriptor,),
+            )
+        finally:
+            self._verify()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        os.close(self._descriptor)
+
+    def _verify(self) -> None:
+        if self._closed:
+            raise OSError("held probe executable is closed")
+        opened = os.fstat(self._descriptor)
+        if _probe_executable_identity(opened) != self._identity:
+            raise OSError("held probe executable identity changed")
+        if _digest_probe_executable(self._descriptor, opened.st_size) != self._content_sha256:
+            raise OSError("held probe executable content changed")
+
+
+def _probe_executable_identity(
+    opened: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid not in {0, os.geteuid()}
+        or opened.st_nlink < 1
+        or not (stat.S_IMODE(opened.st_mode) & 0o111)
+        or opened.st_size <= 0
+        or opened.st_size > _PROBE_EXECUTABLE_MAX_BYTES
+    ):
+        raise OSError("probe executable identity is invalid")
+    return (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_mode,
+        opened.st_uid,
+        opened.st_nlink,
+        opened.st_size,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    )
+
+
+def _digest_probe_executable(descriptor: int, expected_size: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < expected_size:
+        chunk = os.pread(descriptor, min(1024 * 1024, expected_size - offset), offset)
+        if not chunk:
+            raise OSError("probe executable digest ended early")
+        digest.update(chunk)
+        offset += len(chunk)
+    if os.pread(descriptor, 1, expected_size):
+        raise OSError("probe executable grew during digest")
+    return digest.hexdigest()
+
+
+def _valid_codex_version(result: ProbeCommandResult) -> bool:
+    if result.returncode != 0 or len(result.stdout) + len(result.stderr) > _CODEX_VERSION_MAX_BYTES:
+        return False
+    candidates: list[str] = []
+    try:
+        for payload in (result.stdout, result.stderr):
+            if not payload:
+                continue
+            decoded = payload.decode("utf-8")
+            line = decoded.removesuffix("\r\n").removesuffix("\n")
+            if decoded not in {line, f"{line}\n", f"{line}\r\n"}:
+                return False
+            if line:
+                candidates.append(line)
+    except UnicodeDecodeError:
+        return False
+    return len(candidates) == 1 and _CODEX_VERSION_RE.fullmatch(candidates[0]) is not None
+
+
+def _command_evidence(result: ProbeCommandResult) -> dict[str, object]:
+    return {
+        "returncode": result.returncode,
+        "stderr_hex": result.stderr.hex(),
+        "stdout_hex": result.stdout.hex(),
+    }
+
+
 class LocalManagedScienceRuntimeProbe:
     """Verify the runtime, managed image, and Codex subscription bootstrap."""
 
@@ -533,9 +765,11 @@ class LocalManagedScienceRuntimeProbe:
         *,
         command_runner: ProbeCommandRunner | None = None,
         codex_auth_path: Path | None = None,
+        credential_probe_root: Path | None = None,
     ) -> None:
         self._command_runner = command_runner or BoundedProbeCommandRunner()
         self._codex_auth_path = codex_auth_path or (Path.home() / ".codex" / "auth.json")
+        self._credential_probe_root = credential_probe_root
 
     def verify(
         self,
@@ -543,109 +777,197 @@ class LocalManagedScienceRuntimeProbe:
         deadline: float,
         cancellation: threading.Event | None = None,
     ) -> ManagedScienceRuntimeReadiness:
-        codex = self._command_runner.run(("codex", "--version"), deadline, cancellation)
-        if codex.returncode != 0:
-            return ManagedScienceRuntimeReadiness(
-                ready=False,
-                code=ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
-                identity_digest=None,
-                message="Codex CLI is unavailable at the managed Science bootstrap boundary.",
-            )
-        auth = self._command_runner.run(("codex", "login", "status"), deadline, cancellation)
-        if auth.returncode != 0 or not _is_chatgpt_subscription_status(auth.stdout, auth.stderr):
-            return ManagedScienceRuntimeReadiness(
-                ready=False,
-                code=ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
-                identity_digest=None,
-                message="Codex subscription login is unavailable on the remote Core host.",
-            )
         try:
-            credential_authority = HeldCodexCredentialAuthority.open(self._codex_auth_path)
+            codex_executable = self._command_runner.hold_executable("codex")
+        except (OSError, ValueError):
+            return _runtime_not_ready(
+                ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
+                "Codex CLI is unavailable at the managed Science bootstrap boundary.",
+            )
+        credential_snapshot: PreparedCodexCredentialSnapshot | None = None
+        try:
+            try:
+                codex = codex_executable.run(("--version",), deadline, cancellation)
+            except (OSError, ValueError):
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
+                    "Codex CLI is unavailable at the managed Science bootstrap boundary.",
+                )
+            if not _valid_codex_version(codex):
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
+                    "Codex CLI version evidence is invalid at the managed Science bootstrap boundary.",
+                )
+
+            credential_snapshot = self._prepare_login_snapshot()
+            if credential_snapshot is None:
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
+                    "Codex subscription login evidence is invalid on the remote Core host.",
+                )
+            auth: ProbeCommandResult | None = None
+            login_root: Path | None = None
+            login_root_identity: tuple[int, int, int] | None = None
+            login_auth_identity = None
+            cleanup_failed = False
+            try:
+                login_root = Path(
+                    mkdtemp(
+                        prefix="openevo-codex-login-",
+                        dir=self._credential_probe_root,
+                    )
+                )
+                login_root_identity = capture_session_root_identity(login_root)
+                os.chmod(login_root, 0o700)
+                staged = stage_codex_subscription_auth(
+                    source=self._codex_auth_path,
+                    prepared_snapshot=credential_snapshot,
+                    session_dir=login_root,
+                    session_identity=login_root_identity,
+                    target_home_parts=(),
+                )
+                login_auth_identity = staged.auth_identity
+                auth = codex_executable.run(
+                    ("login", "status"),
+                    deadline,
+                    cancellation,
+                    env={"CODEX_HOME": os.fspath(login_root)},
+                )
+            except (OSError, ValueError, SessionFileSecurityError):
+                auth = None
+            finally:
+                if login_root is not None and login_root_identity is not None:
+                    try:
+                        remove_credential_tree(
+                            login_root,
+                            login_root_identity,
+                            login_auth_identity,
+                        )
+                    except (OSError, SessionFileSecurityError):
+                        cleanup_failed = True
+            if (
+                cleanup_failed
+                or auth is None
+                or auth.returncode != 0
+                or not _is_chatgpt_subscription_status(auth.stdout, auth.stderr)
+            ):
+                credential_snapshot.close()
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
+                    "Codex subscription login is unavailable on the remote Core host.",
+                )
+
+            try:
+                runtime = self._command_runner.run(
+                    ("docker", "--version"), deadline, cancellation
+                )
+            except BaseException:
+                credential_snapshot.close()
+                raise
+            if runtime.returncode != 0:
+                credential_snapshot.close()
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
+                    "The managed Science runtime executable is unavailable.",
+                )
+            try:
+                image_result = self._command_runner.run(
+                    ("docker", "image", "inspect", request.runtime_image),
+                    deadline,
+                    cancellation,
+                )
+            except BaseException:
+                credential_snapshot.close()
+                raise
+            if image_result.returncode != 0:
+                credential_snapshot.close()
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
+                    "Managed Science runtime image is not prepared.",
+                )
+            try:
+                image_payload = json.loads(image_result.stdout.decode("utf-8"))
+                if not isinstance(image_payload, list) or len(image_payload) != 1:
+                    raise ValueError("Docker inspect returned an unexpected image set")
+                image = image_payload[0]
+                if not isinstance(image, dict):
+                    raise ValueError("Docker inspect image is not an object")
+                image_id = image.get("Id")
+                repo_digests = image.get("RepoDigests")
+                config = image.get("Config")
+                labels = config.get("Labels") if isinstance(config, dict) else None
+                immutable_image = verified_managed_runtime_image_reference(
+                    profile="managed_science",
+                    image=request.runtime_image,
+                    image_id=image_id,
+                    repo_digests=repo_digests,
+                    labels=labels,
+                )
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ):
+                credential_snapshot.close()
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
+                    "Managed Science bootstrap evidence is invalid.",
+                )
+            readiness = ManagedScienceRuntimeReadiness(
+                ready=True,
+                code=ServiceRunReadinessCode.READY,
+                identity_digest=_digest_json(
+                    {
+                        "auth_content_sha256": credential_snapshot.content_sha256,
+                        "auth_identity": credential_snapshot.identity,
+                        "codex_executable_identity_digest": (
+                            codex_executable.identity_digest
+                        ),
+                        "codex_model": request.codex_model,
+                        "codex_version_evidence": _command_evidence(codex),
+                        "runtime_version_evidence": _command_evidence(runtime),
+                        "runtime_image": request.runtime_image,
+                        "runtime_image_id": image_id,
+                        "runtime_image_immutable_reference": immutable_image,
+                    }
+                ),
+                runtime_image_immutable_reference=immutable_image,
+                message="Managed Science runtime bootstrap is verified.",
+                credential_authority=credential_snapshot,
+            )
+            credential_snapshot = None
+            return readiness
+        finally:
+            if credential_snapshot is not None:
+                credential_snapshot.close()
+            codex_executable.close()
+
+    def _prepare_login_snapshot(self) -> PreparedCodexCredentialSnapshot | None:
+        authority: HeldCodexCredentialAuthority | None = None
+        try:
+            authority = HeldCodexCredentialAuthority.open(self._codex_auth_path)
+            # prepare_snapshot performs the source FD/path checks before and after
+            # copying. Its sealed memfd commit is the point after which source-path
+            # replacement is irrelevant to this readiness generation.
+            return authority.prepare_snapshot()
         except (OSError, SessionFileSecurityError, ValueError):
-            return ManagedScienceRuntimeReadiness(
-                ready=False,
-                code=ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
-                identity_digest=None,
-                message="Codex subscription login evidence is invalid on the remote Core host.",
-            )
-        try:
-            runtime = self._command_runner.run(("docker", "--version"), deadline, cancellation)
-        except BaseException:
-            credential_authority.close()
-            raise
-        if runtime.returncode != 0:
-            credential_authority.close()
-            return ManagedScienceRuntimeReadiness(
-                ready=False,
-                code=ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
-                identity_digest=None,
-                message="The managed Science runtime executable is unavailable.",
-            )
-        try:
-            image_result = self._command_runner.run(
-                ("docker", "image", "inspect", request.runtime_image),
-                deadline,
-                cancellation,
-            )
-        except BaseException:
-            credential_authority.close()
-            raise
-        if image_result.returncode != 0:
-            credential_authority.close()
-            return ManagedScienceRuntimeReadiness(
-                ready=False,
-                code=ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
-                identity_digest=None,
-                message="Managed Science runtime image is not prepared.",
-            )
-        try:
-            image_payload = json.loads(image_result.stdout.decode("utf-8"))
-            if not isinstance(image_payload, list) or len(image_payload) != 1:
-                raise ValueError("Docker inspect returned an unexpected image set")
-            image = image_payload[0]
-            if not isinstance(image, dict):
-                raise ValueError("Docker inspect image is not an object")
-            image_id = image.get("Id")
-            repo_digests = image.get("RepoDigests")
-            config = image.get("Config")
-            labels = config.get("Labels") if isinstance(config, dict) else None
-            immutable_image = verified_managed_runtime_image_reference(
-                profile="managed_science",
-                image=request.runtime_image,
-                image_id=image_id,
-                repo_digests=repo_digests,
-                labels=labels,
-            )
-        except (
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-            ValueError,
-        ):
-            credential_authority.close()
-            return ManagedScienceRuntimeReadiness(
-                ready=False,
-                code=ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
-                identity_digest=None,
-                message="Managed Science bootstrap evidence is invalid.",
-            )
-        return ManagedScienceRuntimeReadiness(
-            ready=True,
-            code=ServiceRunReadinessCode.READY,
-            identity_digest=_digest_json(
-                {
-                    "auth_content_sha256": credential_authority.content_sha256,
-                    "auth_identity": credential_authority.identity,
-                    "codex_model": request.codex_model,
-                    "codex_version_output_digest": hashlib.sha256(codex.stdout).hexdigest(),
-                    "runtime_version_output_digest": hashlib.sha256(runtime.stdout).hexdigest(),
-                    "runtime_image": request.runtime_image,
-                    "runtime_image_id": image_id,
-                    "runtime_image_immutable_reference": immutable_image,
-                }
-            ),
-            message="Managed Science runtime bootstrap is verified.",
-            credential_authority=credential_authority,
-        )
+            return None
+        finally:
+            if authority is not None:
+                authority.close()
+
+
+def _runtime_not_ready(
+    code: ServiceRunReadinessCode,
+    message: str,
+) -> ManagedScienceRuntimeReadiness:
+    return ManagedScienceRuntimeReadiness(
+        ready=False,
+        code=code,
+        identity_digest=None,
+        runtime_image_immutable_reference=None,
+        message=message,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,6 +1065,7 @@ class ServiceGroupSnapshot:
     generation_digest: str
     services: tuple[SupervisorServiceSummary, ...]
     runtime_image: str | None
+    runtime_image_immutable_reference: str | None
     runtime_identity_digest: str | None
     status_message: str | None = None
 
@@ -752,9 +1075,17 @@ class ServiceGroupSnapshot:
         if self.run_ready and (
             not self.services_available
             or self.runtime_image not in set(MANAGED_RUNTIME_IMAGES.values())
+            or self.runtime_image_immutable_reference is None
             or self.runtime_identity_digest is None
         ):
             raise ValueError("run-ready service group lacks runtime evidence")
+        if self.runtime_image_immutable_reference is not None:
+            release = require_immutable_managed_runtime_image(
+                profile="managed_science",
+                image=self.runtime_image_immutable_reference,
+            )
+            if self.runtime_image is not None and release.image != self.runtime_image:
+                raise ValueError("service group immutable image does not match its alias")
 
     def service(self, service_id: str) -> SupervisorServiceSummary:
         for service in self.services:
@@ -769,6 +1100,7 @@ class ServiceRunBinding:
 
     execution_mode: ServiceExecutionMode
     runtime_image: str
+    runtime_image_immutable_reference: str
     runtime_identity_digest: str
     generation_digest: str
     registry_digest: str
@@ -783,6 +1115,12 @@ class ServiceRunBinding:
             raise ValueError("service run binding execution mode is invalid")
         if self.runtime_image not in set(MANAGED_RUNTIME_IMAGES.values()):
             raise ValueError("service run binding image is not Core-managed")
+        release = require_immutable_managed_runtime_image(
+            profile="managed_science",
+            image=self.runtime_image_immutable_reference,
+        )
+        if release.image != self.runtime_image:
+            raise ValueError("service run binding immutable image does not match its alias")
         _require_digest(self.runtime_identity_digest, "runtime_identity_digest")
 
     def request_headers(self) -> dict[str, str]:
@@ -1038,7 +1376,15 @@ class RealSubprocessBackend:
                 pass_fds.append(credential_read_fd)
             if spec.codex_credential_authority is not None:
                 authority_fd = spec.codex_credential_authority.inheritance_descriptor()
-                child_env[CODEX_CREDENTIAL_AUTHORITY_FD_ENV] = str(authority_fd)
+                authority_env = (
+                    CODEX_CREDENTIAL_SNAPSHOT_FD_ENV
+                    if isinstance(
+                        spec.codex_credential_authority,
+                        PreparedCodexCredentialSnapshot,
+                    )
+                    else CODEX_CREDENTIAL_AUTHORITY_FD_ENV
+                )
+                child_env[authority_env] = str(authority_fd)
                 pass_fds.append(authority_fd)
             if spec.listen_fd is not None:
                 child_env[INTERNAL_LISTEN_FD_ENV] = str(spec.listen_fd)
@@ -1686,7 +2032,10 @@ class CoreServiceSupervisor:
             self._active_plan_key: str | None = None
             self._active_credential: str | None = None
             self._active_runtime_request: ManagedScienceRuntimeRequest | None = None
-            self._active_credential_authority: HeldCodexCredentialAuthority | None = None
+            self._active_runtime_image_immutable_reference: str | None = None
+            self._active_credential_authority: (
+                HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
+            ) = None
             self._active_run_lease: object | None = None
             self._active_cancellation: threading.Event | None = None
             self._ledger = self._load_or_initialize_ledger()
@@ -1814,6 +2163,9 @@ class CoreServiceSupervisor:
                     "registry_digest": self._release_identity.registry_digest,
                     "runtime_identity_digest": plan_runtime_identity,
                     "runtime_image": runtime_request.runtime_image,
+                    "runtime_image_immutable_reference": (
+                        runtime.runtime_image_immutable_reference
+                    ),
                 }
             )
             if self._active_run_lease is not None:
@@ -1923,6 +2275,9 @@ class CoreServiceSupervisor:
             self._active_plan_key = plan_key
             self._active_credential = credential
             self._active_runtime_request = runtime_request
+            self._active_runtime_image_immutable_reference = (
+                runtime.runtime_image_immutable_reference
+            )
             self._active_credential_authority = candidate_authority
             if not runtime.ready:
                 try:
@@ -2061,11 +2416,13 @@ class CoreServiceSupervisor:
         snapshot = self._group_snapshot()
         credential = self._active_credential
         runtime_request = self._active_runtime_request
+        immutable_runtime_image = self._active_runtime_image_immutable_reference
         runtime_identity = snapshot.runtime_identity_digest
         if (
             not snapshot.run_ready
             or credential is None
             or runtime_request is None
+            or immutable_runtime_image is None
             or runtime_identity is None
         ):
             raise SupervisorStateError("managed service group is not ready for a run")
@@ -2086,6 +2443,7 @@ class CoreServiceSupervisor:
         return ServiceRunBinding(
             execution_mode=snapshot.execution_mode,
             runtime_image=runtime_request.runtime_image,
+            runtime_image_immutable_reference=immutable_runtime_image,
             runtime_identity_digest=runtime_identity,
             generation_digest=snapshot.generation_digest,
             registry_digest=self._release_identity.registry_digest,
@@ -2244,7 +2602,9 @@ class CoreServiceSupervisor:
         generation_digest: str,
         credential: str,
         listeners: Mapping[str, socket.socket],
-        credential_authority: HeldCodexCredentialAuthority | None,
+        credential_authority: (
+            HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
+        ),
     ) -> tuple[tuple[ServiceProcessSpec, ...], dict[str, object]]:
         root = self._root.path
         topology_path = root / "topology.json"
@@ -2600,7 +2960,7 @@ class CoreServiceSupervisor:
 
     def _active_credential_authority_matches(
         self,
-        candidate: HeldCodexCredentialAuthority,
+        candidate: HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot,
     ) -> bool:
         active = self._active_credential_authority
         if (
@@ -2623,7 +2983,7 @@ class CoreServiceSupervisor:
         specs: tuple[ServiceProcessSpec, ...],
         deadline: float,
         cancellation: threading.Event,
-        candidate: HeldCodexCredentialAuthority,
+        candidate: HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot,
     ) -> bool:
         try:
             return self._is_current_group_healthy(
@@ -2649,6 +3009,7 @@ class CoreServiceSupervisor:
     def _release_active_credential_authority(self) -> None:
         authority = self._active_credential_authority
         self._active_credential_authority = None
+        self._active_runtime_image_immutable_reference = None
         if authority is not None:
             authority.close()
 
@@ -2914,6 +3275,11 @@ class CoreServiceSupervisor:
                 self._active_runtime_request.runtime_image
                 if execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
                 and self._active_runtime_request is not None
+                else None
+            ),
+            runtime_image_immutable_reference=(
+                self._active_runtime_image_immutable_reference
+                if execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
                 else None
             ),
             runtime_identity_digest=self._ledger.runtime_identity_digest,
@@ -3685,6 +4051,8 @@ def _binding_matches_snapshot(
         snapshot.run_ready
         and binding.execution_mode is snapshot.execution_mode
         and binding.runtime_image == snapshot.runtime_image
+        and binding.runtime_image_immutable_reference
+        == snapshot.runtime_image_immutable_reference
         and binding.runtime_identity_digest == snapshot.runtime_identity_digest
         and binding.generation_digest == snapshot.generation_digest
     )

@@ -118,12 +118,32 @@ def managed_runtime_image_release(
     profile: str | None,
     image: str | None,
 ) -> ManagedRuntimeImageRelease | None:
-    """Return the trusted release only for an exact managed profile binding."""
+    """Return the release for its alias or one exact immutable authority."""
 
-    if not require_exact_managed_runtime_binding(profile=profile, image=image):
+    if profile is None:
         return None
-    assert profile is not None
-    return MANAGED_RUNTIME_RELEASES[profile]
+    if profile not in MANAGED_RUNTIME_RELEASES:
+        raise ValueError(f"runtime profile/image binding is not Core-managed: {profile!r}")
+    release = MANAGED_RUNTIME_RELEASES[profile]
+    if image not in {release.image, release.trusted_digest, release.immutable_reference}:
+        raise ValueError(
+            "runtime profile/image binding does not match the exact Core-managed image release "
+            f"for profile {profile!r}"
+        )
+    return release
+
+
+def require_immutable_managed_runtime_image(
+    *,
+    profile: str | None,
+    image: str | None,
+) -> ManagedRuntimeImageRelease:
+    """Require one exact immutable digest/reference for a managed release."""
+
+    release = managed_runtime_image_release(profile=profile, image=image)
+    if release is None or image not in {release.trusted_digest, release.immutable_reference}:
+        raise ValueError("managed runtime execution requires an immutable image authority")
+    return release
 
 
 def verified_managed_runtime_image_reference(
@@ -170,11 +190,11 @@ def require_managed_subscription_runtime(
     if profile not in MANAGED_RUNTIME_IMAGES:
         raise ValueError("subscription execution requires a managed runtime profile")
     try:
-        require_exact_managed_runtime_binding(profile=profile, image=image)
+        require_immutable_managed_runtime_image(profile=profile, image=image)
     except ValueError as exc:
         raise ValueError(
-            "subscription execution requires the exact managed runtime image "
-            f"{MANAGED_RUNTIME_IMAGES[profile]!r} for profile {profile!r}"
+            "subscription execution requires the exact immutable managed runtime "
+            f"image for profile {profile!r}"
         ) from exc
     if backend != "docker":
         raise ValueError("subscription execution requires the managed Docker runtime")
@@ -193,7 +213,7 @@ def require_managed_runtime_binding(
 
     if profile is None:
         return False
-    require_exact_managed_runtime_binding(profile=profile, image=image)
+    managed_runtime_image_release(profile=profile, image=image)
     if backend != "docker":
         raise ValueError("Core-managed runtime profiles require the Docker runtime")
     if container_user != "host":
@@ -214,6 +234,7 @@ __all__ = [
     "ManagedRuntimeImageRelease",
     "ManagedCredentialMount",
     "managed_runtime_image_release",
+    "require_immutable_managed_runtime_image",
     "verified_managed_runtime_image_reference",
     "reject_managed_subscription_env",
     "require_exact_managed_runtime_binding",

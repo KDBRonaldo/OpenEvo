@@ -14,8 +14,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from openevo.runtime import docker as docker_module
 from openevo.runtime.base import RuntimePathSecurityError
-from openevo.runtime.docker import DockerRuntime, _CREDENTIAL_VIEW_NAME
+from openevo.runtime.docker import (
+    DockerRuntime,
+    _CREDENTIAL_VIEW_NAME,
+    verify_managed_runtime_image_admission,
+)
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     MANAGED_RUNTIME_RELEASES,
@@ -37,6 +42,23 @@ def _managed_image_record(
         "RepoDigests": [] if repo_digests is None else repo_digests,
         "Config": {"Labels": {"io.openevo.managed-runtime": "true"}},
     }
+
+
+class _InspectProcess:
+    def __init__(self, *, returncode: int, stdout: bytes, stderr: bytes = b"") -> None:
+        self._planned_returncode = returncode
+        self.returncode: int | None = None
+        self.pid = 987654
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_data(stdout)
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_data(stderr)
+        self.stderr.feed_eof()
+
+    async def wait(self) -> int:
+        self.returncode = self._planned_returncode
+        return self._planned_returncode
 
 
 def _real_docker_unavailable(reason: str) -> None:
@@ -750,6 +772,76 @@ async def test_credential_create_reconciliation_log_omits_traceback_canary(
     assert secret not in caplog.text
     assert "Traceback" not in caplog.text
     assert "CanaryFailure" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_managed_image_admission_checks_alias_and_exact_immutable_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = MANAGED_RUNTIME_RELEASES["managed_science"]
+    inspected: list[str] = []
+
+    async def create_process(*args, **_kwargs):
+        inspected.append(args[-1])
+        return _InspectProcess(
+            returncode=0,
+            stdout=json.dumps(
+                [_managed_image_record(release.trusted_digest)]
+            ).encode("utf-8"),
+        )
+
+    monkeypatch.setattr(docker_module.shutil, "which", lambda *_args, **_kwargs: "/docker")
+    monkeypatch.setattr(docker_module.asyncio, "create_subprocess_exec", create_process)
+    spec = RuntimeSpec(
+        profile="managed_science",
+        image=release.trusted_digest,
+        container_user="host",
+    )
+
+    await verify_managed_runtime_image_admission(spec)
+
+    assert inspected == [release.trusted_digest, release.image]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["replaced", "deleted"])
+async def test_managed_image_tag_mutation_fails_synchronous_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    release = MANAGED_RUNTIME_RELEASES["managed_science"]
+    inspected: list[str] = []
+
+    async def create_process(*args, **_kwargs):
+        inspected.append(args[-1])
+        if args[-1] == release.trusted_digest:
+            return _InspectProcess(
+                returncode=0,
+                stdout=json.dumps(
+                    [_managed_image_record(release.trusted_digest)]
+                ).encode("utf-8"),
+            )
+        if failure == "deleted":
+            return _InspectProcess(returncode=1, stdout=b"", stderr=b"missing")
+        return _InspectProcess(
+            returncode=0,
+            stdout=json.dumps(
+                [_managed_image_record("sha256:" + "1" * 64)]
+            ).encode("utf-8"),
+        )
+
+    monkeypatch.setattr(docker_module.shutil, "which", lambda *_args, **_kwargs: "/docker")
+    monkeypatch.setattr(docker_module.asyncio, "create_subprocess_exec", create_process)
+    spec = RuntimeSpec(
+        profile="managed_science",
+        image=release.trusted_digest,
+        container_user="host",
+    )
+
+    with pytest.raises(RuntimeError):
+        await verify_managed_runtime_image_admission(spec)
+
+    assert inspected == [release.trusted_digest, release.image]
 
 
 @pytest.mark.asyncio

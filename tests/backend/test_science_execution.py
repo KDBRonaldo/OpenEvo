@@ -9,7 +9,7 @@ from openevo.backend.contracts.v1.store import CoreControlStoreV1
 from openevo.backend.science_execution import compile_science_execution
 from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.internal_auth import InternalServiceIdentity
-from openevo.runtime.managed import MANAGED_HOME, MANAGED_PATH
+from openevo.runtime.managed import MANAGED_HOME, MANAGED_PATH, MANAGED_RUNTIME_RELEASES
 
 
 def _project(
@@ -70,6 +70,9 @@ def _binding(
     return ServiceRunBinding(
         execution_mode=execution_mode,
         runtime_image="openevo/science-runtime:0.1.0",
+        runtime_image_immutable_reference=(
+            MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+        ),
         runtime_identity_digest="d" * 64,
         generation_digest="b" * 64,
         registry_digest="a" * 64,
@@ -99,7 +102,9 @@ def test_project_compiles_to_single_session_existing_experiment_path(tmp_path: P
     assert execution.config.agent.env == {}
     assert execution.config.agent.settings["capture_mode"] == "transcript"
     assert execution.config.runtime.profile == "managed_science"
-    assert execution.config.runtime.image == "openevo/science-runtime:0.1.0"
+    assert execution.config.runtime.image == (
+        MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+    )
     assert execution.config.runtime.container_user == "host"
     assert execution.config.runtime.env == {"HOME": MANAGED_HOME, "PATH": MANAGED_PATH}
     assert execution.config.runtime.prepare[0].command.startswith(

@@ -9,7 +9,6 @@ from dataclasses import dataclass
 import json
 import logging
 import os
-from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
@@ -27,6 +26,7 @@ from openevo.gateway.node import (
 )
 from openevo.gateway.session_files import (
     HeldCodexCredentialAuthority,
+    PreparedCodexCredentialSnapshot,
     SessionFileSecurityError,
 )
 from openevo.gateway.proxy import (
@@ -93,7 +93,9 @@ _configured_topology_path: str | None = None
 _configured_node_id: str | None = None
 _internal_identity: InternalServiceIdentity | None = None
 _run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None
-_credential_authority: HeldCodexCredentialAuthority | None = None
+_credential_authority: (
+    HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
+) = None
 
 
 def _require_credential_authority() -> None:
@@ -119,7 +121,9 @@ def configure_server(
     node_id: str | None = None,
     internal_identity: InternalServiceIdentity | None = None,
     run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None,
-    credential_authority: HeldCodexCredentialAuthority | None = None,
+    credential_authority: (
+        HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
+    ) = None,
 ) -> None:
     global _configured_topology_path, _configured_node_id
     global _internal_identity, _run_admission_verifier, _credential_authority, _state
@@ -637,8 +641,8 @@ async def create_session(request: Request):
             await state.node_manager.dispatch(dispatch_request)
         except GatewayReadinessError as exc:
             raise RunAdmissionError(
-                "credential_readiness_failed",
-                "The managed subscription credential was not ready for session admission.",
+                "gateway_readiness_failed",
+                "Gateway security prerequisites were not ready for session admission.",
                 status_code=503,
                 retryable=True,
             ) from exc
@@ -985,8 +989,7 @@ def serve(
         required=False,
         expected_service_id="gateway",
     )
-    credential_authority = HeldCodexCredentialAuthority.from_inherited_environment(
-        Path.home() / ".codex" / "auth.json",
+    credential_authority = PreparedCodexCredentialSnapshot.from_inherited_environment(
         required=internal_identity is not None,
     )
     configure_server(

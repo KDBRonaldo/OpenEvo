@@ -143,28 +143,35 @@ these entry points in dependency order:
 Each subscription ensure request also carries the bounded Codex model and one of
 the existing Core-owned managed Science runtime image tags. Before any service
 is spawned, `ManagedScienceRuntimeProbe` revalidates the pre-Core bootstrap
-boundary under the same total deadline. The default local probe uses controlled
-argv, never a shell, to check `codex --version`, `codex login status`,
-`docker --version`, and `docker image inspect`. Login status must report a
-ChatGPT subscription login; an absent login, failed status command, malformed
-output, or API-key login fails closed. The image tag must resolve to the exact
+boundary under the same total deadline. The default local probe resolves Codex
+once, opens the regular executable no-follow, hashes and records its exact inode
+and bytes, and invokes both version and login checks through that held FD. The
+version check must return zero and exactly one bounded UTF-8 `codex`/`codex-cli`
+semantic-version line on stdout or stderr. Its complete canonical stdout,
+stderr, and exit evidence plus the executable identity enter the runtime
+identity digest. Empty, malformed, multi-line, or oversized output fails closed.
+
+The probe opens `~/.codex/auth.json` no-follow before login, requires a
+link-count-one owner-owned `0600` bounded file, and copies only from that held FD
+into a write-sealed anonymous snapshot. It rechecks held inode/content and the
+source pathname authority before and after the copy. That final check is the
+credential point of no return: replacement before or during it rejects
+readiness; replacement afterward is irrelevant to this generation. The probe
+publishes those sealed bytes into a temporary private `CODEX_HOME`, runs the
+exact held Codex executable's `login status` against that home, and removes the
+temporary tree on every normal, error, timeout, or cancellation exit. Login
+status must report a ChatGPT subscription login; an absent login, failed status
+command, malformed output, or API-key login fails closed.
+
+The image tag must resolve to the exact
 `MANAGED_RUNTIME_RELEASES["managed_science"]` trusted digest, have a SHA-256
 image ID, and carry the `io.openevo.managed-runtime=true` label produced by the
-managed Science Dockerfile. Supervisor preflight and Docker runtime creation use
-the same authoritative verifier; the latter receives the verified immutable
-image reference rather than the mutable tag. It opens `~/.codex/auth.json`
-no-follow, requires a link-count-one owner-owned `0600` file, and retains that
-read-only descriptor, content digest, and verified absolute-directory pin as
-the generation's credential authority. Only the FD number is inherited by
-Gateway; auth content is never placed in argv, ordinary environment values,
-logs, public APIs, or durable state. Before any session side effect, Gateway
-copies only from that FD into a sealed anonymous snapshot and revalidates the
-held inode, digest, and current pathname before and after the copy. The final
-authority check commits the per-run snapshot: replacement before that point
-fails with a typed retryable 503, while replacement afterward does not revoke
-the committed run or require the source pathname to remain stable. Gateway
-synchronously publishes the committed bytes to the private Codex home before
-session registration, queueing, or HTTP success. Probe stdout and stderr are drained concurrently without
+managed Science Dockerfile. Readiness retains both the release alias and the
+verified immutable digest/reference. The sealed credential snapshot, not the
+original pathname authority, is inherited by Gateway through a CLOEXEC-safe FD;
+Gateway clones only that snapshot before any session side effect. Auth content
+is never placed in argv, ordinary environment values, logs, public APIs, or
+durable state. Probe stdout and stderr are drained concurrently without
 `communicate()`. One hard aggregate byte budget covers both streams; crossing it
 immediately kills the complete probe process group and performs a bounded leader
 reap. Cancellation and deadline paths use the same group-wide bounded cleanup.
@@ -177,8 +184,9 @@ The code and non-secret runtime identity are retained in the private service
 ledger so a missing executable cannot be reported as a missing image and a
 failed auth check cannot be presented as a ready generation.
 
-The resulting non-secret runtime evidence digest, exact managed image tag, and
-Codex model are bound into the service generation. The Codex model is also the
+The resulting non-secret runtime evidence digest, managed image release alias,
+exact immutable image reference, and Codex model are bound into the service
+generation. The Codex model is also the
 topology's non-serving model identity. The supervisor topology deliberately has
 no evolution context, latest-promoted lookup, event-export fail-open policy, or
 runtime injection choice. Per-task `RuntimeSpec`, an admission-pinned exact
@@ -251,17 +259,20 @@ internal service graph above is live. `run_ready` additionally requires typed
 runtime readiness evidence and the private generation-bound run-admission
 endpoint installed by the release launcher. Otherwise `run_readiness_code`
 names the closed prerequisite or service/admission failure. `run_binding()`
-requires that stronger state and carries the exact execution mode, managed image,
-and runtime evidence digest to the science execution compiler.
+requires that stronger state and carries the exact execution mode, managed image
+release alias, immutable digest/reference, and runtime evidence digest to the
+science execution compiler. The compiler places only the immutable image
+authority in `RuntimeSpec`; execution never consumes the mutable tag.
 
 The run owner uses `ensure_run_binding()` rather than composing `ensure()` and
 `run_binding()` across separate lock acquisitions. The supervisor holds the same
 lifecycle mutex while it verifies readiness, captures the snapshot, refreshes
 process identity, and issues the binding. The snapshot carries the exact managed
-image in addition to execution mode, generation digest, and runtime identity
-digest. Before returning, the supervisor requires all four fields to match the
-binding and returns a process-local generation lease. While the run owner holds
-that lease, an exact same-plan readiness replay may inspect the healthy group,
+image alias and immutable reference in addition to execution mode, generation
+digest, and runtime identity digest. Before returning, the supervisor requires
+all five fields to match the binding and returns a process-local generation
+lease. While the run owner holds that lease, an exact same-plan readiness replay
+may inspect the healthy group,
 but a different model/runtime plan or force-restart fails before stop, spawn, or
 generation mutation. The run owner releases the lease after runner and admission
 work exits. A concurrent ensure therefore cannot replace the generation between
@@ -284,6 +295,11 @@ task/session identity, and the SHA-256 digest of the canonical validated payload
 It does not receive the credential, raw instruction, runtime, environment, or an
 open request object. Request fields such as `run_ready` or `admission` have no
 authority and are excluded by validation before the canonical digest is built.
+For rollout submission, one shared `TaskRequest` canonicalizer rejects extra
+fields, materializes every default, and serializes with one fixed inclusion
+policy. The run owner registers and sends that exact payload; the rollout
+endpoint canonicalizes the validated model with the same helper before checking
+admission or invoking its manager.
 
 The supervisor now binds each release child to the host-global Core daemon's
 fixed loopback-only private verifier endpoint. Rollout and Gateway forward only
@@ -355,10 +371,13 @@ process-group termination and stale-owner recovery probes. No test downloads a m
 
 Residual integration risks remain explicit:
 
-- the existing managed image tag is bound to the locally inspected Docker image
-  ID and managed-runtime label, but this slice does not add signed container
-  image provenance; release bootstrap remains responsible for preparing the
-  expected image;
+- the managed image alias is synchronously checked against the full release
+  digest and managed-runtime label before Gateway session side effects, and the
+  immutable authority is checked again by Docker before create. This is not a
+  daemon-level image lease: deletion of the exact local image between those two
+  checks fails INIT rather than changing execution back to the mutable tag;
+- this slice does not add signed container image provenance; release bootstrap
+  remains responsible for preparing the expected image;
 - Linux `/proc` and parent-death behavior are the release-host process identity
   path; other platforms need an equivalent verified backend before support;
 - automatic crash restart is intentionally absent; Core reports failure and a

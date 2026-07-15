@@ -34,6 +34,10 @@ _SUBSCRIPTION_AUTH_MODES: Final[frozenset[str]] = frozenset(
 )
 
 
+class DispatcherUnavailableError(RuntimeError):
+    """The dispatcher cannot atomically accept more session work."""
+
+
 class SessionStage(str, Enum):
     INIT = "INIT"
     READY = "READY"
@@ -60,6 +64,13 @@ class DispatcherSnapshot:
             + self.postrun_queue_depth
             + self.postrun_inflight
         )
+
+
+@dataclass(frozen=True, slots=True)
+class DispatcherAdmissionLease:
+    """Ephemeral right to publish one session while shutdown waits."""
+
+    token: object = field(repr=False)
 
 
 @dataclass(slots=True)
@@ -143,11 +154,14 @@ class SessionDispatcher:
         self._ready_slots = asyncio.Semaphore(max_run_workers)
         self._sessions: dict[str, ManagedSession] = {}
         self._lock = asyncio.Lock()
+        self._condition = asyncio.Condition(self._lock)
         self._workers: list[asyncio.Task[None]] = []
         self._started = False
+        self._accepting = False
+        self._admission_tokens: set[object] = set()
 
     async def start(self) -> None:
-        async with self._lock:
+        async with self._condition:
             if self._started:
                 return
             self._workers = [
@@ -162,11 +176,15 @@ class SessionDispatcher:
                 ),
             ]
             self._started = True
+            self._accepting = True
 
     async def stop(self) -> list[ManagedSession]:
-        if not self._started:
-            return []
-        async with self._lock:
+        async with self._condition:
+            if not self._started:
+                return []
+            self._accepting = False
+            while self._admission_tokens:
+                await self._condition.wait()
             self._started = False
             sessions = list(self._sessions.values())
             self._sessions.clear()
@@ -198,17 +216,51 @@ class SessionDispatcher:
             await asyncio.gather(*workers, return_exceptions=True)
         return sessions
 
-    async def enqueue(self, managed: ManagedSession) -> None:
-        async with self._lock:
-            if not self._started:
-                raise RuntimeError("dispatcher has not been started")
-            if managed.session_id in self._sessions:
-                raise ValueError(f"session {managed.session_id} is already enqueued")
-            self._sessions[managed.session_id] = managed
-            # The queue is unbounded. Publish while still holding the registry
-            # lock so cancellation cannot strand a registered session between
-            # the in-memory admission and its INIT work item.
-            self._init_queue.put_nowait(managed.session_id)
+    async def reserve_admission(self) -> DispatcherAdmissionLease:
+        async with self._condition:
+            if not self._started or not self._accepting:
+                raise DispatcherUnavailableError("dispatcher has not been started")
+            token = object()
+            self._admission_tokens.add(token)
+            return DispatcherAdmissionLease(token=token)
+
+    async def release_admission(self, lease: DispatcherAdmissionLease) -> None:
+        async with self._condition:
+            if lease.token in self._admission_tokens:
+                self._admission_tokens.remove(lease.token)
+                self._condition.notify_all()
+
+    async def enqueue(
+        self,
+        managed: ManagedSession,
+        *,
+        admission: DispatcherAdmissionLease | None = None,
+    ) -> None:
+        async with self._condition:
+            try:
+                if not self._started or not self._accepting:
+                    raise DispatcherUnavailableError("dispatcher has not been started")
+                if admission is not None and admission.token not in self._admission_tokens:
+                    raise DispatcherUnavailableError(
+                        "dispatcher admission lease is unavailable"
+                    )
+                if managed.session_id in self._sessions:
+                    raise ValueError(f"session {managed.session_id} is already enqueued")
+                try:
+                    self._sessions[managed.session_id] = managed
+                    # The queue is unbounded. Publish while still holding the registry
+                    # lock so cancellation cannot strand a registered session between
+                    # the in-memory admission and its INIT work item.
+                    self._init_queue.put_nowait(managed.session_id)
+                except Exception as exc:
+                    self._sessions.pop(managed.session_id, None)
+                    raise DispatcherUnavailableError(
+                        "dispatcher could not publish the INIT work item"
+                    ) from exc
+            finally:
+                if admission is not None and admission.token in self._admission_tokens:
+                    self._admission_tokens.remove(admission.token)
+                    self._condition.notify_all()
 
     async def cancel(
         self,

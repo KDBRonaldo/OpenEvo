@@ -19,7 +19,7 @@ from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
 from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.models import ExecInput, ExecResult, PrepareAction, RuntimeSpec
-from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 from openevo.trajectory.models import EvaluatorSpec, StrategySpec
 from openevo.trajectory.registry import (
     default_builder_registry,
@@ -91,7 +91,7 @@ def _subscription_dispatch_request(session_id: str) -> SessionDispatchRequest:
         remaining_timeout_seconds=10,
         runtime=RuntimeSpec(
             profile="managed_science",
-            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            image=MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest,
             container_user="host",
         ),
         agent=AgentSpec(
@@ -99,6 +99,192 @@ def _subscription_dispatch_request(session_id: str) -> SessionDispatchRequest:
             settings={"auth_mode": "subscription", "capture_mode": "transcript"},
         ),
     )
+
+
+async def _accept_managed_image_authority(spec: RuntimeSpec) -> None:
+    assert spec.image == MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+
+
+async def _reject_managed_image_authority(_spec: RuntimeSpec) -> None:
+    raise RuntimeError("managed image tag changed")
+
+
+@pytest.mark.asyncio
+async def test_managed_image_tag_mutation_has_zero_session_side_effects(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"image-race-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="image-race",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+        managed_image_authority_verifier=_reject_managed_image_authority,
+    )
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    before_fds = len(os.listdir("/proc/self/fd"))
+    try:
+        with pytest.raises(GatewayReadinessError, match="image authority"):
+            await manager.dispatch(_subscription_dispatch_request("image-tag-race"))
+        assert registry.get("image-tag-race") is None
+        assert storage.get_session_metadata("image-tag-race") is None
+        assert (await manager._dispatcher.snapshot()).active_count == 0
+        assert {path.relative_to(tmp_path) for path in tmp_path.rglob("*")} == before
+        assert len(os.listdir("/proc/self/fd")) == before_fds
+    finally:
+        await manager._client.aclose()
+        authority.close()
+
+
+@pytest.mark.asyncio
+async def test_closed_dispatcher_is_typed_and_rolls_back_all_session_side_effects(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"dispatcher-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="dispatcher-closed",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
+    )
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    try:
+        with pytest.raises(GatewayReadinessError, match="dispatcher"):
+            await manager.dispatch(_subscription_dispatch_request("dispatcher-closed"))
+        assert registry.get("dispatcher-closed") is None
+        assert storage.get_session_metadata("dispatcher-closed") is None
+        assert (await manager._dispatcher.snapshot()).active_count == 0
+        assert {path.relative_to(tmp_path) for path in tmp_path.rglob("*")} == before
+    finally:
+        await manager._client.aclose()
+        authority.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_shutdown_after_reservation_rejects_enqueue_and_rolls_back(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"dispatcher-race-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="dispatcher-shutdown-race",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
+    )
+    manager._dispatcher._started = True
+    manager._dispatcher._accepting = True
+    real_enqueue = manager._dispatcher.enqueue
+    stop_task: asyncio.Task[list[ManagedSession]] | None = None
+
+    async def stop_before_enqueue(managed: ManagedSession, *, admission) -> None:
+        nonlocal stop_task
+        stop_task = asyncio.create_task(manager._dispatcher.stop())
+        await asyncio.sleep(0)
+        assert manager._dispatcher._accepting is False
+        await real_enqueue(managed, admission=admission)
+
+    manager._dispatcher.enqueue = stop_before_enqueue  # type: ignore[method-assign]
+    try:
+        with pytest.raises(GatewayReadinessError, match="dispatcher"):
+            await manager.dispatch(_subscription_dispatch_request("dispatcher-race"))
+        assert stop_task is not None
+        assert await stop_task == []
+        assert registry.get("dispatcher-race") is None
+        assert storage.get_session_metadata("dispatcher-race") is None
+        assert (await manager._dispatcher.snapshot()).active_count == 0
+        assert list(tmp_path.glob("session-dispatch-*")) == []
+        assert list(tmp_path.glob("credentials-dispatch-*")) == []
+    finally:
+        await manager._client.aclose()
+        authority.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_queue_failure_is_typed_and_rolls_back_session_state(
+    tmp_path: Path,
+) -> None:
+    class FailingQueue:
+        def put_nowait(self, _session_id: str) -> None:
+            raise RuntimeError("injected queue publication failure")
+
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"queue-failure-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="dispatcher-queue-failure",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
+    )
+    manager._dispatcher._started = True
+    manager._dispatcher._accepting = True
+    manager._dispatcher._init_queue = FailingQueue()  # type: ignore[assignment]
+    try:
+        with pytest.raises(GatewayReadinessError, match="dispatcher"):
+            await manager.dispatch(_subscription_dispatch_request("queue-failure"))
+        assert registry.get("queue-failure") is None
+        assert storage.get_session_metadata("queue-failure") is None
+        assert (await manager._dispatcher.snapshot()).active_count == 0
+        assert list(tmp_path.glob("session-queue-fa-*")) == []
+        assert list(tmp_path.glob("credentials-queue-fa-*")) == []
+    finally:
+        manager._dispatcher._started = False
+        manager._dispatcher._accepting = False
+        await manager._client.aclose()
+        authority.close()
 
 
 @pytest.mark.asyncio
@@ -125,6 +311,7 @@ async def test_subscription_authority_race_has_zero_session_side_effects(
         evaluators=default_evaluator_registry(),
         session_base_dir=str(tmp_path),
         credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
     )
     before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
     original_copy = session_files._copy_exact
@@ -174,6 +361,7 @@ async def test_closed_subscription_authority_has_zero_session_side_effects(
         evaluators=default_evaluator_registry(),
         session_base_dir=str(tmp_path),
         credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
     )
     before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
     authority.close()
@@ -210,7 +398,10 @@ async def test_subscription_publication_failure_rolls_back_session_side_effects(
         evaluators=default_evaluator_registry(),
         session_base_dir=str(tmp_path),
         credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
     )
+    manager._dispatcher._started = True
+    manager._dispatcher._accepting = True
 
     def fail_publication(*_args, **_kwargs) -> None:
         raise OSError("injected renameat2 failure")
@@ -262,7 +453,10 @@ async def test_subscription_snapshot_is_point_of_no_return_for_source_path(
         evaluators=default_evaluator_registry(),
         session_base_dir=str(tmp_path),
         credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
     )
+    manager._dispatcher._started = True
+    manager._dispatcher._accepting = True
     real_stage = manager._stage_codex_subscription_auth
     admitted: list[ManagedSession] = []
 
@@ -273,8 +467,9 @@ async def test_subscription_snapshot_is_point_of_no_return_for_source_path(
         os.replace(replacement, auth)
         return real_stage(*args, **kwargs)
 
-    async def capture_enqueue(managed: ManagedSession) -> None:
+    async def capture_enqueue(managed: ManagedSession, *, admission) -> None:
         admitted.append(managed)
+        await manager._dispatcher.release_admission(admission)
 
     monkeypatch.setattr(manager, "_stage_codex_subscription_auth", replace_after_snapshot)
     monkeypatch.setattr(manager._dispatcher, "enqueue", capture_enqueue)
@@ -311,19 +506,27 @@ async def test_subscription_dispatch_cancellation_releases_snapshot_and_session_
         evaluators=default_evaluator_registry(),
         session_base_dir=str(tmp_path),
         credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
     )
     manager._dispatcher._started = True
+    manager._dispatcher._accepting = True
     before_fds = len(os.listdir("/proc/self/fd"))
-    await manager._dispatcher._lock.acquire()
+    enqueue_entered = asyncio.Event()
+    enqueue_blocked = asyncio.Event()
+
+    async def block_enqueue(_managed: ManagedSession, *, admission) -> None:
+        del admission
+        enqueue_entered.set()
+        await enqueue_blocked.wait()
+
+    manager._dispatcher.enqueue = block_enqueue  # type: ignore[method-assign]
     task = asyncio.create_task(
         manager.dispatch(_subscription_dispatch_request("cancelled-admission"))
     )
     try:
-        async with asyncio.timeout(5):
-            while manager.session_registry.get("cancelled-admission") is None:
-                await asyncio.sleep(0)
+        await asyncio.wait_for(enqueue_entered.wait(), timeout=5)
+        assert manager.session_registry.get("cancelled-admission") is not None
         task.cancel()
-        manager._dispatcher._lock.release()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert manager.session_registry.get("cancelled-admission") is None
@@ -343,8 +546,7 @@ async def test_subscription_dispatch_cancellation_releases_snapshot_and_session_
         )
         assert len(os.listdir("/proc/self/fd")) == before_fds
     finally:
-        if manager._dispatcher._lock.locked():
-            manager._dispatcher._lock.release()
+        enqueue_blocked.set()
         manager._dispatcher._started = False
         await manager._client.aclose()
         authority.close()
