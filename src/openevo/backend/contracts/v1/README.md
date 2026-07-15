@@ -157,3 +157,11 @@ lists. Core Control owns verified text artifact get/content/diff for
 `text_memory`, `skill_bundle`, and `agent_system`; `parametric_memory` content
 remains unsupported. Environment repair, service restart, diagnostics, and cache
 cleanup remain fail closed.
+
+Revision artifact-authority migration first budgets every old recovery table by
+count, SQL blob length, per-value size, and aggregate bytes, then reads required
+rows one at a time with exact-length guards. It backfills only from an existing
+activation binding plus retained idempotency record, or one uniquely matching
+legacy response closure. Missing or ambiguous durable evidence aborts startup
+with a restore-or-rebuild maintenance action; migration never signs an empty
+authority merely because retention removed its source record.

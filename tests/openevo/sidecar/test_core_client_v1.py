@@ -22,6 +22,7 @@ from desktop.sidecar.core_client_v1 import (
     CoreProjectBootstrapResultV1,
     CoreSseStreamV1,
     CoreTunnelConnectionV1,
+    MAX_CORE_ARTIFACT_RESPONSE_BYTES,
     MAX_CORE_JSON_RESPONSE_BYTES,
     MAX_CORE_SSE_FRAME_BYTES,
     MAX_CORE_SSE_RESPONSE_BYTES,
@@ -266,6 +267,7 @@ def _artifact(
     *,
     digest: str,
     run_id: str | None = "run-1",
+    source_artifact_ids: list[str] | None = None,
 ) -> v1.SkillBundleArtifactSummaryV1:
     revision = _revision_ref()
     return v1.SkillBundleArtifactSummaryV1(
@@ -291,7 +293,7 @@ def _artifact(
             method_id="method-1",
             job_id="job-1",
             source_dataset_ids=[],
-            source_artifact_ids=[],
+            source_artifact_ids=source_artifact_ids or [],
         ),
         scores=[],
         metadata=v1.SkillBundleArtifactMetadataV1(document_count=1),
@@ -2027,7 +2029,12 @@ def test_artifact_diff_uses_final_document_changes_union() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == f"/v1/projects/{PROJECT_ID}/artifacts/artifact-current":
             return httpx.Response(
-                200, json=_artifact("artifact-current", digest="a" * 64).model_dump(mode="json")
+                200,
+                json=_artifact(
+                    "artifact-current",
+                    digest="a" * 64,
+                    source_artifact_ids=["artifact-previous"],
+                ).model_dump(mode="json"),
             )
         if request.url.path == f"/v1/projects/{PROJECT_ID}/artifacts/artifact-previous":
             return httpx.Response(
@@ -2042,6 +2049,246 @@ def test_artifact_diff_uses_final_document_changes_union() -> None:
 
     assert result == v1.ArtifactDiffV1.model_validate_json(json.dumps(payload), strict=True)
     assert result.document_changes == []
+
+
+def test_artifact_diff_does_not_refetch_historical_detail() -> None:
+    requested_paths: list[str] = []
+    payload = {
+        "schema_version": "1",
+        "artifact_id": "artifact-current",
+        "artifact_content_sha256": "a" * 64,
+        "previous_artifact_id": "artifact-previous",
+        "previous_artifact_content_sha256": "b" * 64,
+        "document_changes": [],
+        "total_document_changes": 0,
+        "total_hunks": 0,
+        "total_lines": 0,
+        "truncated": False,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path.endswith("/artifact-current"):
+            return httpx.Response(
+                200,
+                json=_artifact(
+                    "artifact-current",
+                    digest="a" * 64,
+                    source_artifact_ids=["artifact-previous"],
+                ).model_dump(mode="json"),
+            )
+        if request.url.path.endswith("/artifact-previous"):
+            return httpx.Response(404, json=_api_error_payload(404))
+        return httpx.Response(200, json=payload)
+
+    client = _client(handler)
+    client.get_artifact("artifact-current", project_id=PROJECT_ID)
+
+    result = client.artifact_diff("artifact-current", project_id=PROJECT_ID)
+
+    assert result.previous_artifact_id == "artifact-previous"
+    assert not any(path.endswith("/artifact-previous") for path in requested_paths)
+
+
+def test_artifact_diff_rejects_predecessor_outside_current_lineage() -> None:
+    payload = {
+        "schema_version": "1",
+        "artifact_id": "artifact-current",
+        "artifact_content_sha256": "a" * 64,
+        "previous_artifact_id": "artifact-substituted",
+        "previous_artifact_content_sha256": "b" * 64,
+        "document_changes": [],
+        "total_document_changes": 0,
+        "total_hunks": 0,
+        "total_lines": 0,
+        "truncated": False,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/artifact-current"):
+            return httpx.Response(
+                200,
+                json=_artifact(
+                    "artifact-current",
+                    digest="a" * 64,
+                    source_artifact_ids=["artifact-authorized"],
+                ).model_dump(mode="json"),
+            )
+        return httpx.Response(200, json=payload)
+
+    client = _client(handler)
+    client.get_artifact("artifact-current", project_id=PROJECT_ID)
+
+    with pytest.raises(CoreClientErrorV1) as raised:
+        client.artifact_diff("artifact-current", project_id=PROJECT_ID)
+
+    assert raised.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+@pytest.mark.parametrize(
+    ("character", "repeat"),
+    [
+        ("\0", v1.MAX_ARTIFACT_PREVIEW_UTF8_BYTES),
+        ("\n", v1.MAX_ARTIFACT_PREVIEW_UTF8_BYTES),
+        ("界", v1.MAX_ARTIFACT_PREVIEW_UTF8_BYTES // 3),
+    ],
+)
+def test_artifact_content_response_budget_covers_worst_case_json_escaping(
+    character: str,
+    repeat: int,
+) -> None:
+    content = character * repeat
+    content_bytes = content.encode("utf-8")
+    digest = hashlib.sha256(content_bytes).hexdigest()
+    empty_digest = hashlib.sha256(b"").hexdigest()
+    documents = [
+        v1.ArtifactDocumentPreviewV1(
+            document_id="document-1",
+            display_name="SKILL.md",
+            relative_path="SKILL.md",
+            mime_type="text/markdown",
+            content=content,
+            content_sha256=digest,
+            byte_size=len(content_bytes),
+            truncated=False,
+        )
+    ]
+    for index in range(1, v1.MAX_ARTIFACT_PREVIEW_DOCUMENTS):
+        documents.append(
+            v1.ArtifactDocumentPreviewV1(
+                document_id=f"document-{index}",
+                display_name=f"Document {index}",
+                relative_path=f"document-{index}.md",
+                mime_type="text/markdown",
+                content="",
+                content_sha256=empty_digest,
+                byte_size=0,
+                truncated=False,
+            )
+        )
+    payload = v1.ArtifactContentV1(
+        artifact_id="artifact-current",
+        artifact_type=v1.ArtifactType.SKILL_BUNDLE,
+        documents=documents,
+        total_documents=v1.MAX_ARTIFACT_PREVIEW_DOCUMENTS,
+        total_utf8_bytes=len(content_bytes),
+        returned_utf8_bytes=len(content_bytes),
+        truncated=False,
+    )
+    response_bytes = json.dumps(
+        payload.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(response_bytes) <= MAX_CORE_ARTIFACT_RESPONSE_BYTES
+    if character == "\0":
+        assert len(response_bytes) > MAX_CORE_JSON_RESPONSE_BYTES
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/artifact-current"):
+            return httpx.Response(
+                200,
+                json=_artifact("artifact-current", digest="a" * 64).model_dump(mode="json"),
+            )
+        return httpx.Response(
+            200,
+            content=response_bytes,
+            headers={"content-type": "application/json"},
+        )
+
+    client = _client(handler)
+    client.get_artifact("artifact-current", project_id=PROJECT_ID)
+    result = client.artifact_content("artifact-current", project_id=PROJECT_ID)
+
+    assert result.returned_utf8_bytes == len(content_bytes)
+    assert result.documents[0].content == content
+
+
+def test_artifact_diff_response_budget_covers_maximum_escaped_text_and_lines() -> None:
+    old_document = v1.ArtifactDiffDocumentIdentityV1(
+        artifact_id="artifact-previous",
+        artifact_content_sha256="b" * 64,
+        document_id="d" * 128,
+        relative_path="p" * 256,
+        content_sha256="c" * 64,
+    )
+    new_document = v1.ArtifactDiffDocumentIdentityV1(
+        artifact_id="artifact-current",
+        artifact_content_sha256="a" * 64,
+        document_id="e" * 128,
+        relative_path="p" * 256,
+        content_sha256="d" * 64,
+    )
+    changes: list[v1.ModifiedArtifactDocumentChangeV1] = []
+    next_line = 1
+    for _ in range(v1.MAX_ARTIFACT_DIFF_HUNKS):
+        lines = [
+            v1.ArtifactDiffLineV1(
+                kind=v1.DiffLineKind.ADDED,
+                new_line_number=next_line + index,
+                text="\0" * 256,
+            )
+            for index in range(64)
+        ]
+        hunk = v1.ArtifactDiffHunkV1(
+            old_document=old_document,
+            new_document=new_document,
+            old_start=0,
+            old_count=0,
+            new_start=next_line,
+            new_count=64,
+            lines=lines,
+        )
+        changes.append(
+            v1.ModifiedArtifactDocumentChangeV1(
+                kind=v1.ArtifactDocumentChangeKind.MODIFIED,
+                old_document=old_document,
+                new_document=new_document,
+                hunks=[hunk],
+            )
+        )
+        next_line += 64
+    payload = v1.ArtifactDiffV1(
+        artifact_id="artifact-current",
+        artifact_content_sha256="a" * 64,
+        previous_artifact_id="artifact-previous",
+        previous_artifact_content_sha256="b" * 64,
+        document_changes=changes,
+        total_document_changes=v1.MAX_ARTIFACT_PREVIEW_DOCUMENTS,
+        total_hunks=v1.MAX_ARTIFACT_DIFF_HUNKS,
+        total_lines=v1.MAX_ARTIFACT_DIFF_LINES,
+        truncated=False,
+    )
+    response_bytes = json.dumps(
+        payload.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(response_bytes) <= MAX_CORE_ARTIFACT_RESPONSE_BYTES
+    assert len(response_bytes) > MAX_CORE_JSON_RESPONSE_BYTES
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/artifact-current"):
+            return httpx.Response(
+                200,
+                json=_artifact(
+                    "artifact-current",
+                    digest="a" * 64,
+                    source_artifact_ids=["artifact-previous"],
+                ).model_dump(mode="json"),
+            )
+        return httpx.Response(
+            200,
+            content=response_bytes,
+            headers={"content-type": "application/json"},
+        )
+
+    client = _client(handler)
+    client.get_artifact("artifact-current", project_id=PROJECT_ID)
+    result = client.artifact_diff("artifact-current", project_id=PROJECT_ID)
+
+    assert result.total_lines == v1.MAX_ARTIFACT_DIFF_LINES
+    assert result.document_changes[-1].hunks[-1].lines[-1].text == "\0" * 256
 
 
 def test_close_is_idempotent_and_prevents_new_requests() -> None:
@@ -2387,7 +2634,7 @@ def test_close_seals_json_in_post_lease_cache_transaction_window(monkeypatch) ->
     assert client._lease_owners == {}
 
 
-def test_nested_artifact_diff_cannot_hold_close_past_deadline(monkeypatch) -> None:
+def test_artifact_diff_cannot_hold_close_past_deadline(monkeypatch) -> None:
     import desktop.sidecar.core_client_v1 as core_client_module
 
     monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
@@ -2403,18 +2650,20 @@ def test_nested_artifact_diff_cannot_hold_close_past_deadline(monkeypatch) -> No
         "total_lines": 0,
         "truncated": False,
     }
-    nested_request_started = threading.Event()
-    release_nested_request = threading.Event()
+    diff_request_started = threading.Event()
+    release_diff_request = threading.Event()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == f"/v1/projects/{PROJECT_ID}/artifacts/artifact-current":
-            artifact = _artifact("artifact-current", digest="a" * 64)
+            artifact = _artifact(
+                "artifact-current",
+                digest="a" * 64,
+                source_artifact_ids=["artifact-previous"],
+            )
             return httpx.Response(200, json=artifact.model_dump(mode="json"))
-        if request.url.path == f"/v1/projects/{PROJECT_ID}/artifacts/artifact-previous":
-            nested_request_started.set()
-            release_nested_request.wait(1)
-            artifact = _artifact("artifact-previous", digest="b" * 64)
-            return httpx.Response(200, json=artifact.model_dump(mode="json"))
+        if request.url.path.endswith("/artifact-current/diff"):
+            diff_request_started.set()
+            release_diff_request.wait(1)
         return httpx.Response(200, json=payload)
 
     client = _client(handler)
@@ -2442,13 +2691,13 @@ def test_nested_artifact_diff_cannot_hold_close_past_deadline(monkeypatch) -> No
     request_thread = threading.Thread(target=read_diff)
     close_thread = threading.Thread(target=close_client)
     request_thread.start()
-    assert nested_request_started.wait(1)
+    assert diff_request_started.wait(1)
     close_thread.start()
     try:
         close_thread.join(0.25)
         assert not close_thread.is_alive()
     finally:
-        release_nested_request.set()
+        release_diff_request.set()
         request_thread.join(1)
         close_thread.join(1)
 

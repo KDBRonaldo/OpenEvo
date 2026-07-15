@@ -2380,6 +2380,27 @@ class CoreControlStoreV1:
         return self._validated_revision_row(row)
 
     def _validated_revision_row(self, row: sqlite3.Row) -> m.RevisionV1:
+        revision = self._validated_revision_record(row)
+        predecessor_revision = None
+        if revision.revision.generation > 0:
+            predecessor_row = self._connection.execute(
+                "SELECT revision_id, project_id, generation, identity_hmac, "
+                "activation_request_digest, document_json, resource_version, "
+                "created_at, updated_at FROM project_revisions "
+                "WHERE project_id = ? AND generation = ?",
+                (revision.revision.project_id, revision.revision.generation - 1),
+            ).fetchone()
+            if predecessor_row is None:
+                raise StoreCorruptionError("project revision predecessor is missing")
+            predecessor_revision = self._validated_revision_record(predecessor_row)
+        _validate_revision_identity(
+            self._signing_key,
+            revision,
+            predecessor=predecessor_revision,
+        )
+        return revision
+
+    def _validated_revision_record(self, row: sqlite3.Row) -> m.RevisionV1:
         revision = _validate_bytes(m.RevisionV1, row["document_json"])
         revision_data = revision.model_dump(mode="python", exclude={"etag"})
         activation_request_digest = row["activation_request_digest"]
@@ -2403,49 +2424,6 @@ class CoreControlStoreV1:
             )
         ):
             raise StoreCorruptionError("project revision row identity is invalid")
-        predecessor_revision = None
-        if revision.revision.generation > 0:
-            predecessor_row = self._connection.execute(
-                "SELECT * FROM project_revisions WHERE project_id = ? AND generation = ?",
-                (revision.revision.project_id, revision.revision.generation - 1),
-            ).fetchone()
-            if predecessor_row is None:
-                raise StoreCorruptionError("project revision predecessor is missing")
-            predecessor_revision = _validate_bytes(
-                m.RevisionV1,
-                predecessor_row["document_json"],
-            )
-            predecessor_data = predecessor_revision.model_dump(
-                mode="python",
-                exclude={"etag"},
-            )
-            predecessor_activation_digest = predecessor_row["activation_request_digest"]
-            if (
-                predecessor_revision.revision.id != predecessor_row["revision_id"]
-                or predecessor_revision.revision.project_id != predecessor_row["project_id"]
-                or predecessor_revision.revision.generation != predecessor_row["generation"]
-                or predecessor_revision.created_at != predecessor_row["created_at"]
-                or predecessor_revision.updated_at != predecessor_row["updated_at"]
-                or int(predecessor_row["resource_version"]) != 1
-                or predecessor_revision.etag != _etag(predecessor_data, version=1)
-                or (
-                    predecessor_activation_digest is not None
-                    and not _is_sha256(predecessor_activation_digest)
-                )
-                or not hmac.compare_digest(
-                    predecessor_row["identity_hmac"],
-                    self._revision_identity_hmac(
-                        predecessor_revision.revision.id,
-                        predecessor_activation_digest,
-                    ),
-                )
-            ):
-                raise StoreCorruptionError("project revision predecessor is invalid")
-        _validate_revision_identity(
-            self._signing_key,
-            revision,
-            predecessor=predecessor_revision,
-        )
         return revision
 
     def _validated_revision_artifact_authority_row(
@@ -3349,11 +3327,42 @@ class CoreControlStoreV1:
             ),
         )
 
-    def _recovery_budget_snapshot(self) -> _RecoveryBudgetSnapshot:
+    def _migration_recovery_table_specs(
+        self,
+        *,
+        revision_ledger_v1: bool,
+        include_activation_bindings: bool,
+    ) -> tuple[_RecoveryTableSpec, ...]:
+        specs: list[_RecoveryTableSpec] = []
+        for spec in self._recovery_table_specs():
+            if spec.table == "revision_artifact_authorities":
+                continue
+            if spec.table == "revision_activation_bindings" and not include_activation_bindings:
+                continue
+            if spec.table == "project_revisions" and revision_ledger_v1:
+                specs.append(
+                    _RecoveryTableSpec(
+                        "project_revisions",
+                        tuple(
+                            column
+                            for column in spec.bounded_columns
+                            if column != "activation_request_digest"
+                        ),
+                        spec.max_rows,
+                    )
+                )
+                continue
+            specs.append(spec)
+        return tuple(specs)
+
+    def _budget_snapshot_for_specs(
+        self,
+        specs: tuple[_RecoveryTableSpec, ...],
+    ) -> _RecoveryBudgetSnapshot:
         total_rows = 0
         total_bytes = 0
         tables: dict[_RecoveryTableName, _RecoveryTableUsage] = {}
-        for spec in self._recovery_table_specs():
+        for spec in specs:
             totals = ["COUNT(*)"] + [
                 f"COALESCE(SUM(length(CAST({column} AS BLOB))), 0)"
                 for column in spec.bounded_columns
@@ -3385,6 +3394,83 @@ class CoreControlStoreV1:
                 raise StoreCorruptionError("Core Control aggregate startup quota is exceeded")
             tables[spec.table] = _RecoveryTableUsage(row_count, blob_bytes)
         return _RecoveryBudgetSnapshot(total_rows, total_bytes, tables)
+
+    def _recovery_budget_snapshot(self) -> _RecoveryBudgetSnapshot:
+        return self._budget_snapshot_for_specs(self._recovery_table_specs())
+
+    def _migration_guarded_rows(
+        self,
+        spec: _RecoveryTableSpec,
+        snapshot: _RecoveryBudgetSnapshot,
+        *,
+        columns: tuple[str, ...],
+    ):
+        expected = snapshot.tables.get(spec.table)
+        if expected is None:
+            raise StoreCorruptionError(
+                f"Core Control {spec.table} migration table is not accounted"
+            )
+        bounded = tuple(column for column in columns if column in spec.bounded_columns)
+        last_rowid = 0
+        seen = 0
+        seen_bytes = 0
+        while True:
+            length_columns = [
+                f"length(CAST({column} AS BLOB)) AS {column}_byte_length"
+                for column in bounded
+            ]
+            metadata = self._connection.execute(
+                f"SELECT rowid AS _migration_rowid"
+                f"{', ' if length_columns else ''}{', '.join(length_columns)} "
+                f"FROM {spec.table} WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (last_rowid, _RECOVERY_PAGE_SIZE),
+            ).fetchmany(_RECOVERY_PAGE_SIZE)
+            if not metadata:
+                break
+            for lengths in metadata:
+                seen += 1
+                if seen > spec.max_rows:
+                    raise StoreCorruptionError(
+                        f"Core Control {spec.table} recovery quota is exceeded"
+                    )
+                last_rowid = int(lengths["_migration_rowid"])
+                selected: list[str] = []
+                parameters: list[object] = []
+                expected_lengths: dict[str, int | None] = {}
+                for column in columns:
+                    if column not in spec.bounded_columns:
+                        selected.append(column)
+                        continue
+                    byte_length = lengths[f"{column}_byte_length"]
+                    expected_length = None if byte_length is None else int(byte_length)
+                    expected_lengths[column] = expected_length
+                    if expected_length is None:
+                        selected.append(
+                            f"CASE WHEN {column} IS NULL THEN {column} END AS {column}"
+                        )
+                    else:
+                        seen_bytes += expected_length
+                        selected.append(
+                            f"CASE WHEN length(CAST({column} AS BLOB)) = ? "
+                            f"THEN {column} END AS {column}"
+                        )
+                        parameters.append(expected_length)
+                parameters.append(last_rowid)
+                row = self._connection.execute(
+                    f"SELECT {', '.join(selected)} FROM {spec.table} WHERE rowid = ?",
+                    tuple(parameters),
+                ).fetchone()
+                if row is None or any(
+                    (expected_length is None and row[column] is not None)
+                    or (expected_length is not None and row[column] is None)
+                    for column, expected_length in expected_lengths.items()
+                ):
+                    raise StoreCorruptionError(
+                        f"Core Control {spec.table} migration scan changed"
+                    )
+                yield row
+        if seen != expected.rows or seen_bytes != expected.blob_bytes:
+            raise StoreCorruptionError(f"Core Control {spec.table} migration scan changed")
 
     def _recovery_rows(
         self,
@@ -4496,6 +4582,12 @@ class CoreControlStoreV1:
 
     def _migrate_revision_ledger_v1_schema(self) -> None:
         with self._transaction():
+            migration_budget = self._budget_snapshot_for_specs(
+                self._migration_recovery_table_specs(
+                    revision_ledger_v1=True,
+                    include_activation_bindings=False,
+                )
+            )
             self._connection.execute(
                 "ALTER TABLE project_revisions RENAME TO project_revisions_v1"
             )
@@ -4511,62 +4603,270 @@ class CoreControlStoreV1:
             self._connection.execute("DROP TABLE project_revisions_v1")
             self._connection.execute(_REVISION_ACTIVATION_BINDINGS_SCHEMA)
             self._connection.execute(_REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
-            self._backfill_revision_artifact_authorities()
+            self._backfill_revision_artifact_authorities(
+                migration_budget,
+                activation_bindings_existed=False,
+            )
+            self._budget_snapshot_for_specs(self._recovery_table_specs())
             self._verify_schema_fingerprint()
 
     def _migrate_revision_artifact_authority_schema(self) -> None:
         with self._transaction():
+            migration_budget = self._budget_snapshot_for_specs(
+                self._migration_recovery_table_specs(
+                    revision_ledger_v1=False,
+                    include_activation_bindings=True,
+                )
+            )
             self._connection.execute(_REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
-            self._backfill_revision_artifact_authorities()
+            self._backfill_revision_artifact_authorities(
+                migration_budget,
+                activation_bindings_existed=True,
+            )
+            self._budget_snapshot_for_specs(self._recovery_table_specs())
             self._verify_schema_fingerprint()
 
-    def _backfill_revision_artifact_authorities(self) -> None:
-        revision_rows = self._connection.execute(
-            "SELECT * FROM project_revisions ORDER BY project_id, generation"
-        ).fetchall()
-        if len(revision_rows) > _MAX_REVISIONS:
-            raise StoreCorruptionError("project revision recovery quota is exceeded")
-        for revision_row in revision_rows:
-            revision = self._validated_revision_row(revision_row)
-            producing_run_id: str | None = None
-            context_artifact_ids: dict[str, list[str]] = {}
-            binding_row = self._connection.execute(
-                "SELECT * FROM revision_activation_bindings WHERE revision_id = ?",
-                (revision.revision.id,),
-            ).fetchone()
-            if (
-                binding_row is not None
-                and binding_row["operation_id"] == "activateCoreEvolutionRevisionInternalV1"
+    def _backfill_revision_artifact_authorities(
+        self,
+        migration_budget: _RecoveryBudgetSnapshot,
+        *,
+        activation_bindings_existed: bool,
+    ) -> None:
+        specs = {spec.table: spec for spec in self._recovery_table_specs()}
+        revision_rows = list(
+            self._migration_guarded_rows(
+                specs["project_revisions"],
+                migration_budget,
+                columns=(
+                    "revision_id",
+                    "project_id",
+                    "generation",
+                    "identity_hmac",
+                    "activation_request_digest",
+                    "document_json",
+                    "resource_version",
+                    "created_at",
+                    "updated_at",
+                ),
+            )
+        )
+        revision_rows.sort(key=lambda row: (row["project_id"], int(row["generation"])))
+        idempotency_rows = {
+            (row["operation_id"], row["resource_scope"], row["idempotency_key"]): row
+            for row in self._migration_guarded_rows(
+                specs["idempotency_records"],
+                migration_budget,
+                columns=(
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "request_json",
+                    "semantic_headers_json",
+                    "status_code",
+                    "response_type",
+                    "response_json",
+                    "etag",
+                    "created_at_epoch",
+                    "expires_at_epoch",
+                ),
+            )
+        }
+        bindings_by_revision: dict[str, sqlite3.Row] = {}
+        if activation_bindings_existed:
+            for binding_row in self._migration_guarded_rows(
+                specs["revision_activation_bindings"],
+                migration_budget,
+                columns=(
+                    "revision_id",
+                    "project_id",
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "identity_hmac",
+                ),
             ):
                 self._validate_revision_activation_binding_row(binding_row)
-                record_row = self._connection.execute(
-                    "SELECT * FROM idempotency_records WHERE operation_id = ? "
-                    "AND resource_scope = ? AND idempotency_key = ?",
+                if binding_row["revision_id"] in bindings_by_revision:
+                    raise StoreCorruptionError(
+                        "revision artifact authority migration binding is ambiguous"
+                    )
+                bindings_by_revision[binding_row["revision_id"]] = binding_row
+
+        publication_owners: dict[str, tuple[str, str]] = {}
+        for owner_row in self._migration_guarded_rows(
+            specs["workspace_publication_owners"],
+            migration_budget,
+            columns=(
+                "snapshot_id",
+                "content_id",
+                "publication_sha256",
+                "project_id",
+                "upload_id",
+                "identity_hmac",
+                "published_at",
+            ),
+        ):
+            owner = self._validate_publication_owner_row(owner_row)
+            if owner_row["snapshot_id"] in publication_owners:
+                raise StoreCorruptionError(
+                    "revision artifact authority migration publication owner is ambiguous"
+                )
+            publication_owners[owner_row["snapshot_id"]] = owner
+
+        validated_records: dict[tuple[str, str, str], tuple[sqlite3.Row, BaseModel | None]] = {}
+        candidates_by_revision: dict[
+            str, list[tuple[sqlite3.Row, BaseModel | None]]
+        ] = {}
+        for key, record_row in idempotency_rows.items():
+            model = _validate_idempotency_row(
+                record_row,
+                signing_key=self._signing_key,
+                publication_owner_lookup=publication_owners.get,
+            )
+            validated_records[key] = (record_row, model)
+            project = _idempotency_ready_project(model)
+            if project is not None and project.active_revision is not None:
+                candidates_by_revision.setdefault(project.active_revision.id, []).append(
+                    (record_row, model)
+                )
+
+        migrated_revisions: dict[tuple[str, int], m.RevisionV1] = {}
+        for revision_row in revision_rows:
+            revision = self._validated_revision_record(revision_row)
+            generation = revision.revision.generation
+            predecessor = (
+                None
+                if generation == 0
+                else migrated_revisions.get((revision.revision.project_id, generation - 1))
+            )
+            if generation > 0 and predecessor is None:
+                raise StoreCorruptionError("project revision predecessor is missing")
+            _validate_revision_identity(
+                self._signing_key,
+                revision,
+                predecessor=predecessor,
+            )
+            migrated_revisions[(revision.revision.project_id, generation)] = revision
+            binding_row = bindings_by_revision.get(revision.revision.id)
+            if binding_row is None:
+                candidates = candidates_by_revision.get(revision.revision.id, [])
+                if activation_bindings_existed or len(candidates) != 1:
+                    self._raise_unrecoverable_artifact_authority_migration()
+                record_row, record_model = candidates[0]
+                binding_values = {
+                    "idempotency_key": record_row["idempotency_key"],
+                    "operation_id": record_row["operation_id"],
+                    "project_id": revision.revision.project_id,
+                    "request_digest": record_row["request_digest"],
+                    "resource_scope": record_row["resource_scope"],
+                    "revision_id": revision.revision.id,
+                }
+                self._connection.execute(
+                    "UPDATE project_revisions SET activation_request_digest = ?, "
+                    "identity_hmac = ? WHERE revision_id = ? "
+                    "AND activation_request_digest IS NULL",
+                    (
+                        record_row["request_digest"],
+                        self._revision_identity_hmac(
+                            revision.revision.id,
+                            record_row["request_digest"],
+                        ),
+                        revision.revision.id,
+                    ),
+                )
+                self._connection.execute(
+                    "INSERT INTO revision_activation_bindings(revision_id, project_id, "
+                    "operation_id, resource_scope, idempotency_key, request_digest, "
+                    "identity_hmac) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        binding_values["revision_id"],
+                        binding_values["project_id"],
+                        binding_values["operation_id"],
+                        binding_values["resource_scope"],
+                        binding_values["idempotency_key"],
+                        binding_values["request_digest"],
+                        self._revision_activation_binding_hmac(binding_values),
+                    ),
+                )
+                binding_row = self._connection.execute(
+                    "SELECT revision_id, project_id, operation_id, resource_scope, "
+                    "idempotency_key, request_digest, identity_hmac "
+                    "FROM revision_activation_bindings WHERE revision_id = ?",
+                    (revision.revision.id,),
+                ).fetchone()
+                if binding_row is None:
+                    raise StoreCorruptionError(
+                        "revision artifact authority migration binding is missing"
+                    )
+            else:
+                record = validated_records.get(
                     (
                         binding_row["operation_id"],
                         binding_row["resource_scope"],
                         binding_row["idempotency_key"],
-                    ),
-                ).fetchone()
-                if record_row is not None:
-                    request, _headers = _validate_idempotency_request_envelope(record_row)
-                    if not isinstance(request, _EvolutionRevisionActivationRequest):
-                        raise StoreCorruptionError(
-                            "revision artifact authority migration request is invalid"
-                        )
-                    if (
-                        request.project_id != revision.revision.project_id
-                        or request.predecessor != revision.predecessor_revision
-                        or request.run_id != binding_row["idempotency_key"]
-                        or binding_row["request_digest"] != record_row["request_digest"]
-                        or revision_row["activation_request_digest"]
-                        != record_row["request_digest"]
-                    ):
-                        raise StoreCorruptionError(
-                            "revision artifact authority migration closure is invalid"
-                        )
-                    producing_run_id = request.run_id
-                    context_artifact_ids = request.context_artifact_ids
+                    )
+                )
+                if record is None:
+                    self._raise_unrecoverable_artifact_authority_migration()
+                record_row, record_model = record
+
+            self._validate_revision_activation_binding_row(binding_row)
+            project = _idempotency_ready_project(record_model)
+            if (
+                project is None
+                or project.active_revision is None
+                or project.id != revision.revision.project_id
+                or binding_row["project_id"] != project.id
+                or binding_row["operation_id"] != record_row["operation_id"]
+                or binding_row["resource_scope"] != record_row["resource_scope"]
+                or binding_row["idempotency_key"] != record_row["idempotency_key"]
+                or not hmac.compare_digest(
+                    binding_row["request_digest"], record_row["request_digest"]
+                )
+                or project.active_revision != revision.revision
+                or revision.project_snapshot != project.current_project_snapshot
+                or revision.task_snapshot != project.current_task_snapshot
+                or revision.workspace_snapshot != project.current_workspace_snapshot
+                or revision.registry_digest != project.registry_digest
+                or revision.updated_at != project.updated_at
+            ):
+                raise StoreCorruptionError(
+                    "revision artifact authority migration response closure is invalid"
+                )
+            stored_activation_digest = self._connection.execute(
+                "SELECT activation_request_digest FROM project_revisions "
+                "WHERE revision_id = ?",
+                (revision.revision.id,),
+            ).fetchone()
+            if (
+                stored_activation_digest is None
+                or not hmac.compare_digest(
+                    stored_activation_digest[0], record_row["request_digest"]
+                )
+            ):
+                raise StoreCorruptionError(
+                    "revision artifact authority migration request binding is invalid"
+                )
+            producing_run_id: str | None = None
+            context_artifact_ids: dict[str, list[str]] = {}
+            if binding_row["operation_id"] == "activateCoreEvolutionRevisionInternalV1":
+                request, _headers = _validate_idempotency_request_envelope(record_row)
+                if not isinstance(request, _EvolutionRevisionActivationRequest):
+                    raise StoreCorruptionError(
+                        "revision artifact authority migration request is invalid"
+                    )
+                if (
+                    request.project_id != revision.revision.project_id
+                    or request.predecessor != revision.predecessor_revision
+                    or request.run_id != binding_row["idempotency_key"]
+                ):
+                    raise StoreCorruptionError(
+                        "revision artifact authority migration closure is invalid"
+                    )
+                producing_run_id = request.run_id
+                context_artifact_ids = request.context_artifact_ids
             authority = _RevisionArtifactAuthorityEnvelope(
                 revision=revision.revision,
                 producing_run_id=producing_run_id,
@@ -4589,6 +4889,14 @@ class CoreControlStoreV1:
                     authority_json,
                 ),
             )
+
+    @staticmethod
+    def _raise_unrecoverable_artifact_authority_migration() -> None:
+        raise StoreCorruptionError(
+            "revision artifact authority migration cannot reconstruct an unambiguous "
+            "durable activation authority; maintenance action: restore the pre-migration "
+            "database with its retained idempotency records, or rebuild Core Control state"
+        )
 
     def _create_pending_store_identity(self, *, include_base_schema: bool) -> None:
         store_id = secrets.token_hex(_STORE_ID_BYTES)
@@ -5800,6 +6108,17 @@ def _validate_idempotency_row(
         operation_id, resource_scope, request, semantic_headers, model
     )
     return model
+
+
+def _idempotency_ready_project(model: BaseModel | None) -> m.ProjectV1 | None:
+    project: m.ProjectV1 | None = None
+    if isinstance(model, m.ProjectV1):
+        project = model
+    elif isinstance(model, m.WorkspaceUploadFinalizeResponseV1):
+        project = model.project
+    if project is None or project.status is not m.ProjectStatus.READY:
+        return None
+    return project
 
 
 def _validate_response_core_owned_ids(

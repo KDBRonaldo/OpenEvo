@@ -748,6 +748,14 @@ lineage predecessor. Revision authority is independent of seven-day
 idempotency retention, and project deletion cascades it with the revision
 ledger.
 
+The sidecar does not issue a current-only artifact-detail request for that
+historical predecessor. It requires the current summary lineage to name the
+predecessor and consumes the predecessor ID and content digest already bound by
+Core's validated `ArtifactDiffV1`; a cached predecessor, when present, must
+match but is not required. Content and diff use a dedicated 32 MiB response
+limit, covering Core's 2 MiB UTF-8 payload after worst-case six-byte JSON
+escaping plus the closed document/hunk/line structure.
+
 `ArtifactDiffV1.document_changes` is the document-level authority; `hunks` may
 be empty. Desktop therefore renders rename operations and empty-document
 additions/removals from the change object itself instead of treating zero hunks

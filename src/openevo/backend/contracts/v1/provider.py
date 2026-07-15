@@ -800,7 +800,7 @@ class CoreControlProviderV1:
         if not reachability:
             raise ResourceNotFoundError("artifact", artifact_id)
         if self._run_control is None:
-            raise StoreCorruptionError("artifact reachability has no run authority")
+            raise _artifact_authority_error()
 
         matches: list[m.ArtifactSummaryBaseV1] = []
         for reachable in reachability:

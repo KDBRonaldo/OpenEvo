@@ -140,12 +140,21 @@ that revision's durable typed artifact authority. A predecessor artifact is not
 directly readable after it leaves the current head; diff may resolve it only
 when the current artifact's authoritative lineage names it. The authority is
 revision-owned and survives idempotency replay-record retention.
+Authority-table migration signs a row only when the old durable activation
+binding and idempotency closure still prove it, or when a legacy ledger has one
+unambiguous retained response closure. Missing or ambiguous inputs stop startup
+with an explicit restore-or-rebuild maintenance action. Migration accounts row
+count, per-value length, and aggregate bytes before exact-length guarded row
+reads; rejected data is never decoded into Python first.
 
 Content inspection uses a separate small no-follow scanner budget before
 hashing, verifies digest, size, complete inventory, and UTF-8 for every returned
 document, and never returns artifact URI, scanner handle, or host path. Diff
 applies line and comparison budgets before its bounded matcher. Unavailable
-managed authority uses the declared HTTP 503 error contract.
+managed authority uses the declared retryable HTTP 503 error contract. The
+2 MiB returned UTF-8 budget can expand sixfold under legal JSON control-character
+escaping, so Desktop reserves a separate 32 MiB artifact-response envelope for
+content and diff rather than applying its ordinary 4 MiB JSON response limit.
 
 ## Version
 

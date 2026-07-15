@@ -55,6 +55,10 @@ from openevo.backend.contracts.v1.workspace import (
     WorkspaceArchiveError,
     verify_workspace_archive,
 )
+from desktop.sidecar.core_client_v1 import (
+    CoreControlClientV1,
+    CoreTunnelConnectionV1,
+)
 from tests.framework_testkit import verified_builtin_registry
 
 
@@ -188,13 +192,14 @@ def _app(
     evolution_artifact_root: Path | None = None,
     artifact_loader=None,
     event_replay_limit: int = 10_000,
+    build_channel: str = "test",
 ):
     return create_core_control_app(
         state_root=state_root,
         bearer_token=TOKEN,
         build_version="0.1.0",
         source_commit="a" * 40,
-        build_channel="test",
+        build_channel=build_channel,
         evolution_registry=registry,
         service_supervisor=service_supervisor,
         run_control=run_control,
@@ -3179,6 +3184,132 @@ def test_artifact_authority_schema_migrates_live_activation_envelope(
     assert authority["context_artifact_ids"] == {"text_memory": ["migrated-memory"]}
 
 
+def test_artifact_authority_migration_fails_closed_without_durable_binding(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("DROP TABLE revision_artifact_authorities")
+        connection.execute("DELETE FROM idempotency_records")
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revision_activation_bindings"
+        ).fetchone()[0] == 0
+
+    with pytest.raises(
+        StoreCorruptionError,
+        match="maintenance action: restore the pre-migration database",
+    ):
+        CoreControlStoreV1(tmp_path)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_schema "
+            "WHERE type = 'table' AND name = 'revision_artifact_authorities'"
+        ).fetchone()[0] == 0
+
+
+def test_revision_ledger_migration_rejects_ambiguous_retained_response_closure(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        signing_key = bytes(
+            connection.execute("SELECT value FROM metadata WHERE key = 'signing_key'").fetchone()[
+                0
+            ]
+        )
+        revision = connection.execute(
+            "SELECT revision_id, project_id, generation, document_json, resource_version, "
+            "created_at, updated_at FROM project_revisions"
+        ).fetchone()
+        assert revision is not None
+        connection.execute(
+            "INSERT INTO idempotency_records(operation_id, resource_scope, idempotency_key, "
+            "request_digest, request_json, semantic_headers_json, status_code, response_type, "
+            "response_json, etag, created_at_epoch, expires_at_epoch) "
+            "SELECT operation_id, resource_scope, 'ambiguous-create-replay', request_digest, "
+            "request_json, semantic_headers_json, status_code, response_type, response_json, "
+            "etag, created_at_epoch, expires_at_epoch FROM idempotency_records "
+            "WHERE operation_id = 'createCoreProjectV1'"
+        )
+        connection.execute("DROP TABLE revision_artifact_authorities")
+        connection.execute("DROP TABLE revision_activation_bindings")
+        connection.execute("DROP TABLE project_revisions")
+        connection.execute(store_module._PROJECT_REVISIONS_SCHEMA_V1)
+        identity_hmac = hmac.new(
+            signing_key,
+            f"resource.v1:revision:{revision[0]}".encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        connection.execute(
+            "INSERT INTO project_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (*revision[:3], identity_hmac, *revision[3:]),
+        )
+
+    with pytest.raises(
+        StoreCorruptionError,
+        match="cannot reconstruct an unambiguous durable activation authority",
+    ):
+        CoreControlStoreV1(tmp_path)
+
+
+def test_artifact_authority_migration_rejects_oversize_before_revision_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, _ = _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE revision_artifact_authorities")
+        connection.execute(
+            "UPDATE project_revisions SET document_json = zeroblob(?) "
+            "WHERE revision_id = ?",
+            (store_module._MAX_STARTUP_VALUE_BYTES + 1, project["active_revision"]["id"]),
+        )
+
+    original_validate_bytes = store_module._validate_bytes
+
+    def reject_revision_decode(model, value):
+        if model is m.RevisionV1:
+            raise AssertionError("oversize revision entered Python validation")
+        return original_validate_bytes(model, value)
+
+    monkeypatch.setattr(store_module, "_validate_bytes", reject_revision_decode)
+    with pytest.raises(StoreCorruptionError, match="project_revisions recovery quota"):
+        CoreControlStoreV1(tmp_path)
+
+
+def test_artifact_authority_migration_rejects_non_utf8_revision_bytes(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, _ = _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE revision_artifact_authorities")
+        connection.execute(
+            "UPDATE project_revisions SET document_json = ? WHERE revision_id = ?",
+            (sqlite3.Binary(b"\x80"), project["active_revision"]["id"]),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="persisted RevisionV1 is invalid"):
+        CoreControlStoreV1(tmp_path)
+
+
 @pytest.mark.parametrize("budget_kind", ["rows", "bytes"])
 def test_revision_ledger_backfill_cannot_exceed_startup_recovery_budget(
     tmp_path: Path,
@@ -3245,17 +3376,17 @@ def test_revision_ledger_backfill_cannot_exceed_startup_recovery_budget(
         CoreControlStoreV1(tmp_path)
 
     with sqlite3.connect(database) as connection:
-        assert (
-            connection.execute("SELECT COUNT(*) FROM revision_activation_bindings").fetchone()[0]
-            == 0
-        )
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM project_revisions "
-                "WHERE activation_request_digest IS NOT NULL"
-            ).fetchone()[0]
-            == 0
-        )
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert "revision_activation_bindings" not in table_names
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(project_revisions)")
+        }
+        assert "activation_request_digest" not in columns
 
 
 def test_project_revision_manifest_corruption_fails_closed_on_restart(
@@ -5612,6 +5743,7 @@ def test_artifact_diff_uses_reachable_cross_revision_lineage(tmp_path: Path) -> 
         run_control=run_control,
         evolution_artifact_root=artifact_root,
         artifact_loader=records.__getitem__,
+        build_channel="release",
     )
     project = _ready_provider_project(app, registry)
     project, previous = _publish_artifact_summary(
@@ -5634,11 +5766,46 @@ def test_artifact_diff_uses_reachable_cross_revision_lineage(tmp_path: Path) -> 
         source_artifact_ids=[previous.id],
     )
 
+    forwarded_paths: list[str] = []
     with TestClient(app) as client:
         historical = client.get(f"/v1/projects/{project.id}/artifacts/{previous.id}", headers=AUTH)
         response = client.get(
             f"/v1/projects/{project.id}/artifacts/{current.id}/diff", headers=AUTH
         )
+
+        def forward(request: httpx.Request) -> httpx.Response:
+            target = request.url.raw_path.decode("ascii")
+            if request.url.query and "?" not in target:
+                target = f"{target}?{request.url.query.decode('ascii')}"
+            forwarded_paths.append(target.split("?", 1)[0])
+            forwarded_headers = dict(request.headers)
+            forwarded_headers["authorization"] = AUTH["Authorization"]
+            forwarded = client.request(
+                request.method,
+                target,
+                headers=forwarded_headers,
+                content=request.content,
+            )
+            return httpx.Response(
+                forwarded.status_code,
+                headers=dict(forwarded.headers),
+                content=forwarded.content,
+                request=request,
+            )
+
+        sidecar = CoreControlClientV1(
+            CoreTunnelConnectionV1(
+                endpoint="http://127.0.0.1:48765",
+                bearer_token="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg",
+                project_id=project.id,
+                session_id="cross-layer-artifact-diff",
+            ),
+            transport=httpx.MockTransport(forward),
+        )
+        sidecar.version()
+        sidecar.get_artifact(current.id, project_id=project.id)
+        sidecar_diff = sidecar.artifact_diff(current.id, project_id=project.id)
+        sidecar.close()
 
     assert historical.status_code == 404
     assert historical.json()["code"] == "artifact_not_found"
@@ -5648,12 +5815,64 @@ def test_artifact_diff_uses_reachable_cross_revision_lineage(tmp_path: Path) -> 
     assert payload["artifact_content_sha256"] == current.content_sha256
     assert payload["previous_artifact_id"] == previous.id
     assert payload["previous_artifact_content_sha256"] == previous.content_sha256
+    assert sidecar_diff.previous_artifact_id == previous.id
+    historical_detail_path = f"/v1/projects/{project.id}/artifacts/{previous.id}"
+    assert historical_detail_path not in forwarded_paths
     assert payload["truncated"] is False
     assert [change["kind"] for change in payload["document_changes"]] == ["modified"]
     lines = payload["document_changes"][0]["hunks"][0]["lines"]
     assert {line["kind"] for line in lines} == {"context", "removed", "added"}
     assert any(line["text"] == "Remove beta." for line in lines)
     assert any(line["text"] == "Add gamma." for line in lines)
+
+
+def test_artifact_read_without_run_authority_uses_retryable_503_contract(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    record, digest, byte_size, _path = _artifact_payload(
+        artifact_root,
+        artifact_id="memory-without-run-authority",
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="durable reachability\n",
+    )
+    run_control = _ArtifactRunControl()
+    state_root = tmp_path / "state"
+    app = _app(
+        state_root,
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader={"memory-without-run-authority": record}.__getitem__,
+    )
+    project = _ready_provider_project(app, registry)
+    project, summary = _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id="run-without-authority",
+        record=record,
+        content_sha256=digest,
+        byte_size=byte_size,
+    )
+    app.state.core_control_provider.close()
+
+    restarted = _app(
+        state_root,
+        registry=registry,
+        evolution_artifact_root=artifact_root,
+        artifact_loader={"memory-without-run-authority": record}.__getitem__,
+    )
+    with TestClient(restarted) as client:
+        response = client.get(
+            f"/v1/projects/{project.id}/artifacts/{summary.id}",
+            headers=AUTH,
+        )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "artifact_authority_invalid"
+    assert response.json()["retryable"] is True
 
 
 def test_artifact_diff_rejects_repeated_20k_lines_before_matcher(

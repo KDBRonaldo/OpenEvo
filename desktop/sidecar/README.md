@@ -1049,6 +1049,14 @@ Events without a direct project identity are yielded only when their declared
 run or service parent is already bound to the active project; otherwise the
 stream fails closed with snapshot-refresh-required semantics.
 
+Artifact diff authorization is current-summary lineage plus the predecessor
+identity/digest carried by the strict Core diff response. Default diff never
+re-fetches the historical predecessor through the current-only detail route;
+an optional cached predecessor can only add an equality check. Artifact content
+and diff have a dedicated 32 MiB response bound so every legal 2 MiB Core text
+payload, including NUL/newline/Unicode worst-case JSON escaping and maximum
+closed diff structure, remains receivable without widening other JSON routes.
+
 Workspace upload snapshots bind each strong ETag one-to-one to one canonical
 representation for that upload: neither the same ETag with different state nor
 the same state with a different ETag is accepted. Offset, status, and update

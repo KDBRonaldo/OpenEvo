@@ -33,7 +33,10 @@ from openevo.evolution.framework.profiles import execution_profile_for_release_m
 MAX_CORE_ERROR_RESPONSE_BYTES = 64 * 1024
 MAX_CORE_JSON_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CORE_CAPABILITIES_RESPONSE_BYTES = 8 * 1024 * 1024
-MAX_CORE_ARTIFACT_RESPONSE_BYTES = 4 * 1024 * 1024
+# Artifact content and diff text are bounded by Core to 2 MiB of UTF-8. JSON can
+# expand each input byte to six ASCII bytes (for example, NUL -> ``\u0000``),
+# while bounded diff structure contributes additional fixed overhead.
+MAX_CORE_ARTIFACT_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_CORE_LOG_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_CORE_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_CORE_WORKSPACE_CHUNK_REQUEST_BYTES = ((v1.MAX_WORKSPACE_CHUNK_BYTES + 2) // 3) * 4 + 4096
@@ -1431,7 +1434,6 @@ class CoreControlClientV1:
         self._require_member(v1.ResourceChangeType.ARTIFACT, artifact_id)
         params = None
         if previous_artifact_id is not None:
-            self._require_member(v1.ResourceChangeType.ARTIFACT, previous_artifact_id)
             params = {"previous_artifact_id": _opaque_request(previous_artifact_id)}
         result = self._json(
             "GET",
@@ -1445,16 +1447,22 @@ class CoreControlClientV1:
             and result.previous_artifact_id != previous_artifact_id
         ):
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
-        if previous_artifact_id is None:
-            self.get_artifact(result.previous_artifact_id, project_id=project_id)
         with self._membership_lock:
             current = self._artifacts.get(artifact_id)
             previous = self._artifacts.get(result.previous_artifact_id)
         if (
             current is None
-            or previous is None
             or result.artifact_content_sha256 != current.content_sha256
-            or result.previous_artifact_content_sha256 != previous.content_sha256
+            or result.previous_artifact_id not in current.lineage.source_artifact_ids
+            or (
+                previous is not None
+                and (
+                    previous.project_id != current.project_id
+                    or previous.target_id != current.target_id
+                    or previous.artifact_type is not current.artifact_type
+                    or result.previous_artifact_content_sha256 != previous.content_sha256
+                )
+            )
         ):
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
