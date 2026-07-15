@@ -105,7 +105,7 @@ jobs:
       - name: Upload exact Core release inputs
         uses: actions/upload-artifact@v4
         with:
-          name: openevo-core-release-inputs-${{ github.sha }}
+          name: openevo-core-release-inputs-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/openevo-release-inputs/openevo-*.whl
             ${{ runner.temp }}/openevo-release-inputs/framework-lock.json
@@ -141,7 +141,7 @@ jobs:
       - name: Download exact Core release inputs
         uses: actions/download-artifact@v4
         with:
-          name: openevo-core-release-inputs-${{ github.sha }}
+          name: openevo-core-release-inputs-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .openevo-release-inputs
 
       - name: Verify transferred Core release input manifest

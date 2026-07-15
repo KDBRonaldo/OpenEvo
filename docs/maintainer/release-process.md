@@ -79,10 +79,10 @@ be inspected before removal.
 The pull-request release smoke keeps platform responsibilities separate. Its
 macOS packaging job builds the wheel/lock pair once, verifies a two-member
 SHA-256 manifest, and uploads the exact inputs under an artifact name bound to
-the source commit. The Linux Core job depends on that producer, verifies the
-downloaded manifest against the digest passed through the job output, rechecks
-both member digests, and only then installs the wheel and runs
-`openevo-core-service`. It must not rebuild the wheel or lock, and it rechecks
+the source commit, workflow run, and run attempt. The Linux Core job depends on
+that producer, verifies the downloaded manifest against the digest passed
+through the job output, rechecks both member digests, and only then installs the
+wheel and runs `openevo-core-service`. It must not rebuild the wheel or lock, and it rechecks
 those final candidate bytes after the service smoke. Conversely, the macOS
 packaging job must not run the Linux-only Core service lifecycle.
 
@@ -124,25 +124,35 @@ best stochastic result.
 ## Draft Release Validation
 
 The manual workflow creates a uniquely tagged GitHub draft prerelease only after
-its macOS and Linux candidate jobs succeed. It uploads the required outputs,
-downloads every asset into a clean directory, and verifies:
+its macOS and Linux candidate jobs succeed. Cross-job Actions artifact names
+bind source commit, workflow run, and run attempt so a full rerun cannot collide
+with immutable v4 artifacts from an earlier attempt. It uploads the required
+outputs, downloads every asset into a clean directory, and verifies:
 
 - asset names and architectures are expected;
 - SHA256 files match downloaded bytes;
 - the Core descriptor references the uploaded Core artifact;
 - the DMG version and bundled/fetched descriptor match the candidate commit;
-- release notes state unsigned/not-notarized status, available and unavailable
-  execution modes, known limitations, benchmark gate status and rescue counts,
-  privacy/security behavior, and install/upgrade/uninstall steps. A
-  packaging-only draft must state `0 of 3` completed benchmark gates and mark
-  all three rescue counts
-  `pending`; the immutable packaging draft must not be edited or promoted;
+- release notes exactly match the release-tool-owned canonical packaging
+  document. It states unsigned/not-notarized status, available and unavailable execution
+  modes, known limitations, `0 of 3` benchmark gates with all three rescue
+  counts `pending`, privacy/security behavior, and install/upgrade/uninstall
+  retention for both `~/.openevo/desktop` and remote data;
+- the GitHub draft title, tag, target commit, body, draft state, and prerelease
+  state match the candidate at the point the workflow completes;
 - no unclassified development, secret, benchmark-private, or source-checkout
   files are present.
 
-If upload or redownload validation fails after draft creation, the workflow
-deletes that draft and its candidate tag. A successful run leaves the draft and
-candidate tag for review; it does not publish the release.
+If creation, upload, redownload, metadata validation, or verification-record
+upload fails or is cancelled, an `always()` cleanup retries deletion and then
+requires both the draft and candidate tag to be absent. A successful run leaves
+the draft and candidate tag for review; it does not publish the release.
+
+A GitHub draft remains administratively mutable after the workflow. The
+workflow provides point-in-time verification, not an immutable GitHub object.
+Any later edit, asset replacement, or tag movement invalidates the candidate;
+delete it and run a new candidate rather than attempting to repair or promote
+the edited draft.
 
 Two fresh-context `gpt-5.6-sol` high-effort reviews must approve product/spec
 compliance and release risk before a candidate reaches `stable`.
@@ -150,8 +160,9 @@ compliance and release risk before a candidate reaches `stable`.
 ## Publication
 
 Final External Beta publication remains disabled. The packaging-only draft from
-this workflow must not be edited, retagged, or promoted. After the science,
-benchmark, privacy, signing-policy, and final product gates are implemented and
+this workflow is review evidence only and must not be edited, retagged, or
+promoted. After the science, benchmark, privacy, signing-policy, and final
+product gates are implemented and
 pass, create a new final candidate from a reviewed `stable` commit. That future
 path must generate final release notes and a new manifest/checksum inventory,
 roundtrip every asset again, and publish only those unchanged revalidated bytes.

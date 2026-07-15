@@ -45,30 +45,15 @@ FINAL_ROLES = tuple(role for role, _name in REQUIRED_INPUT_ROLES) + (
     "core_descriptor",
     "checksums",
 )
-RELEASE_NOTES_REQUIRED_LINES = (
-    "## Supported Workflows",
-    "Codex subscription transcript mode: available in this candidate.",
-    "Self-Deployed Reference mode: unavailable in this candidate.",
-    "## Known Limitations",
-    "Parameter evolution is not included in this candidate.",
-    "PyPI is not used for this release.",
-    "Only the declared architecture was built.",
-    "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.",
-    "## Validation Results",
-    "Benchmark gates completed by this packaging candidate: 0 of 3.",
-    "Textual-memory pass@1 rescue count: pending.",
-    "Trajectory-to-skill pass@1 rescue count: pending.",
-    "Agent-system pass@1 rescue count: pending.",
-    "## Security And Privacy",
-    "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
-    "Credential-canary verification for release assets: pending.",
-    "## Install, Upgrade, And Uninstall",
-)
-RELEASE_NOTES_REQUIRED_PREFIXES = (
-    "Install:",
-    "Upgrade:",
-    "Uninstall:",
-)
+DRAFT_RELEASE_METADATA_KEYS = {
+    "body",
+    "isDraft",
+    "isPrerelease",
+    "name",
+    "tagName",
+    "targetCommitish",
+    "url",
+}
 
 
 class CandidateError(RuntimeError):
@@ -127,6 +112,84 @@ def _require_safe_basename(value: object, subject: str) -> str:
     ):
         raise CandidateError(f"{subject} must be one safe filename")
     return value
+
+
+def render_candidate_release_notes(
+    *,
+    source_commit: str,
+    version: str,
+    architecture: str,
+) -> str:
+    if SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
+        raise CandidateError("source_commit must be one full lowercase Git commit")
+    if not version or any(character.isspace() for character in version):
+        raise CandidateError("candidate version is invalid")
+    if architecture not in ARCHITECTURE_TARGETS:
+        raise CandidateError("candidate architecture must be an actual supported architecture")
+    return "\n".join(
+        (
+            f"# OpenEvo Desktop {version} unsigned draft prerelease",
+            "",
+            f"Source commit: {source_commit}",
+            f"Architecture: {architecture}",
+            f"Minimum macOS: {MINIMUM_MACOS_VERSION}",
+            "",
+            "This candidate is unsigned and not notarized. A browser-downloaded copy may require manual approval in Privacy & Security; that quarantined path is not validated by this packaging workflow.",
+            "",
+            "## Supported Workflows",
+            "",
+            "Codex subscription transcript mode: available in this candidate.",
+            "It runs subscription-authenticated Codex on the remote server with transcript capture and non-parametric evolution.",
+            "Self-Deployed Reference mode: unavailable in this candidate.",
+            "The shipped Desktop release authority blocks saving or running that mode; its Core-side reference architecture is not a Desktop product claim.",
+            "",
+            "## Known Limitations",
+            "",
+            "Parameter evolution is not included in this candidate.",
+            "PyPI is not used for this release.",
+            "Only the declared architecture was built.",
+            "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.",
+            "This packaging-only draft does not satisfy the science E2E, benchmark, secret-canary/privacy, signing, notarization, or final-publication gates.",
+            "",
+            "## Validation Results",
+            "",
+            "Benchmark gates completed by this packaging candidate: 0 of 3.",
+            "Textual-memory pass@1 rescue count: pending.",
+            "Trajectory-to-skill pass@1 rescue count: pending.",
+            "Agent-system pass@1 rescue count: pending.",
+            "No benchmark performance claim is made by this draft.",
+            "The exact Core wheel, app bundle, copied DMG app, dependency evidence, and downloaded draft assets are validated by this workflow.",
+            "",
+            "## Security And Privacy",
+            "",
+            "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
+            "Credential-canary verification for release assets: pending.",
+            "This workflow does not claim credential-free assets until the separate secret-canary gate passes.",
+            "Diagnostics sharing is explicit. Science data can be sent to the remote server and harness or model provider selected by the user. The full secret-canary/privacy release gate remains pending.",
+            "",
+            "## Install, Upgrade, And Uninstall",
+            "",
+            "Install: this workflow validates mounting and copying the DMG without browser-download quarantine. For maintainer testing, copy OpenEvo Desktop to Applications; the Privacy & Security allow flow remains unvalidated.",
+            "Upgrade: this draft has no automatic updater; quit the app and replace it with a newer reviewed DMG. Remote Core upgrade compatibility is not proven by this packaging-only candidate.",
+            "Uninstall: quit OpenEvo Desktop and remove it from Applications. Local Desktop data under ~/.openevo/desktop is retained unless deleted separately. Remote Core state, task data, model downloads, and runtime caches are also retained.",
+            "",
+        )
+    )
+
+
+def write_candidate_release_notes(
+    path: Path,
+    *,
+    source_commit: str,
+    version: str,
+    architecture: str,
+) -> None:
+    payload = render_candidate_release_notes(
+        source_commit=source_commit,
+        version=version,
+        architecture=architecture,
+    )
+    _write_new(path, payload.encode("utf-8"))
 
 
 def _single_match(root: Path, pattern: str, subject: str) -> Path:
@@ -367,22 +430,66 @@ def _validate_release_notes(
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise CandidateError("Release notes are unreadable") from exc
-    required_identity = (source_commit, version, architecture, "unsigned", "not notarized")
-    lowered = text.lower()
-    if any(value.lower() not in lowered for value in required_identity):
-        raise CandidateError("Release notes do not bind commit, version, architecture, and signing status")
-    lines = tuple(line.strip().casefold() for line in text.splitlines() if line.strip())
-    missing_lines = [
-        value for value in RELEASE_NOTES_REQUIRED_LINES if value.casefold() not in lines
-    ]
-    missing_prefixes = [
-        value
-        for value in RELEASE_NOTES_REQUIRED_PREFIXES
-        if not any(line.startswith(value.casefold()) for line in lines)
-    ]
-    if missing_lines or missing_prefixes:
-        missing = ", ".join((*missing_lines, *missing_prefixes))
-        raise CandidateError(f"Release notes are missing required release content: {missing}")
+    expected = render_candidate_release_notes(
+        source_commit=source_commit,
+        version=version,
+        architecture=architecture,
+    )
+    if text != expected:
+        raise CandidateError("Release notes do not match the canonical packaging draft")
+
+
+def _validate_draft_release_metadata(
+    metadata_path: Path,
+    *,
+    release_notes: Path,
+    expected_tag: str,
+    expected_target: str,
+    expected_title: str,
+) -> None:
+    metadata = _load_json(metadata_path)
+    if type(metadata) is not dict or set(metadata) != DRAFT_RELEASE_METADATA_KEYS:
+        raise CandidateError("Draft release metadata does not use the closed review schema")
+    try:
+        body = release_notes.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CandidateError("Release notes are unreadable") from exc
+    release_body = metadata.get("body")
+    if type(release_body) is not str or release_body.rstrip("\n") != body.rstrip("\n"):
+        raise CandidateError("Draft release body does not match the candidate release notes")
+    expected = {
+        "isDraft": True,
+        "isPrerelease": True,
+        "name": expected_title,
+        "tagName": expected_tag,
+        "targetCommitish": expected_target,
+    }
+    if any(metadata.get(field) != value for field, value in expected.items()):
+        raise CandidateError("Draft release identity or state does not match the candidate")
+    url = metadata.get("url")
+    if type(url) is not str or not url.startswith("https://github.com/"):
+        raise CandidateError("Draft release URL is invalid")
+
+
+def validate_draft_release_metadata(
+    metadata_path: Path,
+    *,
+    release_notes: Path,
+    expected_tag: str,
+    expected_target: str,
+    expected_title: str,
+) -> list[str]:
+    try:
+        _validate_draft_release_metadata(
+            metadata_path,
+            release_notes=release_notes,
+            expected_tag=expected_tag,
+            expected_target=expected_target,
+            expected_title=expected_title,
+        )
+    except CandidateError as exc:
+        return [str(exc)]
+    return []
 
 
 def _file_entry(role: str, path: Path) -> dict[str, object]:
@@ -685,6 +792,11 @@ def validate_candidate_manifest(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    write_notes = subparsers.add_parser("write-notes")
+    write_notes.add_argument("output", type=Path)
+    write_notes.add_argument("--source-commit", required=True)
+    write_notes.add_argument("--version", required=True)
+    write_notes.add_argument("--architecture", required=True)
     create = subparsers.add_parser("create")
     create.add_argument("candidate_root", type=Path)
     create.add_argument("--source-commit", required=True)
@@ -696,8 +808,23 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("manifest", type=Path)
     validate.add_argument("--expected-source-commit")
     validate.add_argument("--expected-core-platform")
+    validate_draft = subparsers.add_parser("validate-draft")
+    validate_draft.add_argument("metadata", type=Path)
+    validate_draft.add_argument("--release-notes", type=Path, required=True)
+    validate_draft.add_argument("--expected-tag", required=True)
+    validate_draft.add_argument("--expected-target", required=True)
+    validate_draft.add_argument("--expected-title", required=True)
     args = parser.parse_args(argv)
     try:
+        if args.command == "write-notes":
+            write_candidate_release_notes(
+                args.output,
+                source_commit=args.source_commit,
+                version=args.version,
+                architecture=args.architecture,
+            )
+            print(args.output)
+            return 0
         if args.command == "create":
             path = create_candidate_manifest(
                 args.candidate_root,
@@ -708,6 +835,18 @@ def main(argv: list[str] | None = None) -> int:
                 registry_digest=args.registry_digest,
             )
             print(path)
+            return 0
+        if args.command == "validate-draft":
+            errors = validate_draft_release_metadata(
+                args.metadata,
+                release_notes=args.release_notes,
+                expected_tag=args.expected_tag,
+                expected_target=args.expected_target,
+                expected_title=args.expected_title,
+            )
+            if errors:
+                raise CandidateError("; ".join(errors))
+            print(f"OpenEvo draft release metadata validation passed: {args.metadata}")
             return 0
         errors = validate_candidate_manifest(
             args.manifest,

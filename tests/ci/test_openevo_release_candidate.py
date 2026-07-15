@@ -20,32 +20,152 @@ def _load_module():
 
 
 def _release_notes_text() -> str:
-    return (
-        "# OpenEvo 0.1.0 unsigned candidate\n\n"
-        "Source commit: 8e45af371eef49a86530a849041f7dcf047620ec\n"
-        "Architecture: aarch64\n\n"
-        "UNSIGNED AND NOT NOTARIZED.\n\n"
-        "## Supported Workflows\n\n"
-        "Codex subscription transcript mode: available in this candidate.\n"
-        "Self-Deployed Reference mode: unavailable in this candidate.\n\n"
-        "## Known Limitations\n\n"
-        "Parameter evolution is not included in this candidate.\n"
-        "PyPI is not used for this release.\n"
-        "Only the declared architecture was built.\n"
-        "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.\n\n"
-        "## Validation Results\n\n"
-        "Benchmark gates completed by this packaging candidate: 0 of 3.\n"
-        "Textual-memory pass@1 rescue count: pending.\n"
-        "Trajectory-to-skill pass@1 rescue count: pending.\n"
-        "Agent-system pass@1 rescue count: pending.\n\n"
-        "## Security And Privacy\n\n"
-        "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.\n"
-        "Credential-canary verification for release assets: pending.\n\n"
-        "## Install, Upgrade, And Uninstall\n\n"
-        "Install: open the DMG and copy OpenEvo Desktop to Applications.\n"
-        "Upgrade: quit the app and replace it with a newer reviewed DMG.\n"
-        "Uninstall: quit the app and remove it from Applications.\n"
+    candidate = _load_module()
+    return candidate.render_candidate_release_notes(
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
     )
+
+
+def test_candidate_release_notes_are_one_canonical_document() -> None:
+    notes = _release_notes_text()
+
+    assert notes.endswith("\n")
+    assert "Self-Deployed Reference mode: unavailable in this candidate." in notes
+    assert "Credential-canary verification for release assets: pending." in notes
+    assert "Local Desktop data under ~/.openevo/desktop is retained" in notes
+
+
+def test_write_notes_command_creates_but_never_replaces_canonical_document(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    output = tmp_path / "release-notes.md"
+    arguments = [
+        "write-notes",
+        str(output),
+        "--source-commit",
+        "8e45af371eef49a86530a849041f7dcf047620ec",
+        "--version",
+        "0.1.0",
+        "--architecture",
+        "aarch64",
+    ]
+
+    assert candidate.main(arguments) == 0
+    assert output.read_text(encoding="utf-8") == _release_notes_text()
+    assert candidate.main(arguments) == 1
+
+
+def test_candidate_manifest_rejects_extra_or_contradictory_release_claims(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    notes = tmp_path / "release-notes.md"
+    notes.write_text(
+        notes.read_text(encoding="utf-8")
+        + "Self-Deployed Reference mode: available and fully validated.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(candidate.CandidateError, match="canonical packaging draft"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="a" * 64,
+        )
+
+
+def _draft_release_metadata(*, body: str) -> dict[str, object]:
+    return {
+        "body": body,
+        "isDraft": True,
+        "isPrerelease": True,
+        "name": "OpenEvo Desktop 0.1.0 unsigned candidate",
+        "tagName": "openevo-desktop-v0.1.0-exhibition.123.2",
+        "targetCommitish": "8e45af371eef49a86530a849041f7dcf047620ec",
+        "url": "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/example",
+    }
+
+
+def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> None:
+    candidate = _load_module()
+    notes = tmp_path / "release-notes.md"
+    notes.write_text(_release_notes_text(), encoding="utf-8")
+    metadata = tmp_path / "draft-release.json"
+    metadata.write_text(
+        json.dumps(
+            _draft_release_metadata(body=notes.read_text(encoding="utf-8").rstrip("\n"))
+        ),
+        encoding="utf-8",
+    )
+
+    assert candidate.validate_draft_release_metadata(
+        metadata,
+        release_notes=notes,
+        expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+        expected_target="8e45af371eef49a86530a849041f7dcf047620ec",
+        expected_title="OpenEvo Desktop 0.1.0 unsigned candidate",
+    ) == []
+    assert (
+        candidate.main(
+            [
+                "validate-draft",
+                str(metadata),
+                "--release-notes",
+                str(notes),
+                "--expected-tag",
+                "openevo-desktop-v0.1.0-exhibition.123.2",
+                "--expected-target",
+                "8e45af371eef49a86530a849041f7dcf047620ec",
+                "--expected-title",
+                "OpenEvo Desktop 0.1.0 unsigned candidate",
+            ]
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("body", "edited body"),
+        ("isDraft", False),
+        ("isPrerelease", False),
+        ("name", "edited title"),
+        ("tagName", "edited-tag"),
+        ("targetCommitish", "f" * 40),
+    ],
+)
+def test_draft_release_metadata_rejects_review_surface_mutation(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    candidate = _load_module()
+    notes = tmp_path / "release-notes.md"
+    notes.write_text(_release_notes_text(), encoding="utf-8")
+    payload = _draft_release_metadata(
+        body=notes.read_text(encoding="utf-8").rstrip("\n")
+    )
+    payload[field] = replacement
+    metadata = tmp_path / "draft-release.json"
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
+
+    errors = candidate.validate_draft_release_metadata(
+        metadata,
+        release_notes=notes,
+        expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+        expected_target="8e45af371eef49a86530a849041f7dcf047620ec",
+        expected_title="OpenEvo Desktop 0.1.0 unsigned candidate",
+    )
+
+    assert errors
 
 
 def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> None:

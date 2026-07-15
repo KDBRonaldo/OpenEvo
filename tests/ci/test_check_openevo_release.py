@@ -825,7 +825,10 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "FSUnlinkObject" not in macos_job
     assert "openevo-core-service ensure" not in macos_job
 
-    artifact_name = "openevo-core-release-inputs-${{ github.sha }}"
+    artifact_name = (
+        "openevo-core-release-inputs-${{ github.sha }}-"
+        "${{ github.run_id }}-${{ github.run_attempt }}"
+    )
     assert "outputs:\n      manifest_sha256: " in macos_job
     assert "steps.release_inputs.outputs.manifest_sha256" in macos_job
     assert "id: release_inputs" in macos_job
@@ -1166,8 +1169,10 @@ def test_pre_external_beta_release_artifact_workflow_is_disabled() -> None:
 
 def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease() -> None:
     workflow = Path(".github/workflows/openevo-desktop-candidate.yml")
+    candidate_tool = Path("scripts/ci/openevo_release_candidate.py")
 
     text = workflow.read_text(encoding="utf-8")
+    candidate_tool_text = candidate_tool.read_text(encoding="utf-8")
 
     for marker in (
         "workflow_dispatch:",
@@ -1217,6 +1222,24 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "actions/upload-artifact@v4",
         "actions/download-artifact@v4",
         "retention-days: 14",
+        "openevo_release_candidate.py write-notes",
+        "permissions:\n      contents: write",
+        "gh release create",
+        "--draft",
+        "--prerelease",
+        "gh release upload",
+        "gh release download",
+        "diff -qr candidate-artifacts downloaded-draft",
+        "validate-draft",
+        "gh release view",
+        "steps.verified.outputs.complete != 'true'",
+        "if: ${{ always()",
+        "git ls-remote --exit-code --tags origin",
+        "gh release delete",
+    ):
+        assert marker in text
+
+    for marker in (
         "unsigned and not notarized",
         "## Supported Workflows",
         "Codex subscription transcript mode: available in this candidate.",
@@ -1234,20 +1257,13 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "## Security And Privacy",
         "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
         "Credential-canary verification for release assets: pending.",
+        "Local Desktop data under ~/.openevo/desktop is retained",
         "## Install, Upgrade, And Uninstall",
         "Install:",
         "Upgrade:",
         "Uninstall:",
-        "permissions:\n      contents: write",
-        "gh release create",
-        "--draft",
-        "--prerelease",
-        "gh release upload",
-        "gh release download",
-        "diff -qr candidate-artifacts downloaded-draft",
-        "gh release delete",
     ):
-        assert marker in text
+        assert marker in candidate_tool_text
 
     assert "smoke_openevo_remote_capabilities.py" not in text
 
@@ -1259,6 +1275,13 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert "needs: [macos-candidate, linux-core-candidate]" in text
     assert text.index("gh release create") < text.index("gh release upload")
     assert text.index("gh release upload") < text.index("gh release download")
+    candidate_artifact_name = (
+        "openevo-desktop-candidate-${{ github.sha }}-"
+        "${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+    assert text.count(candidate_artifact_name) == 3
+    assert "openevo-desktop-candidate-${{ github.sha }}\n" not in text
+    assert "if: failure() && steps.release.outputs.tag != ''" not in text
     assert text.count("contents: write") == 1
     assert "softprops/action-gh-release" not in text
     assert "cargo audit --ignore" not in text

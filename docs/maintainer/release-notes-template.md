@@ -75,6 +75,7 @@ manifest, checksum inventory, and draft roundtrip from reviewed source.
 - Upgrade steps and compatibility:
 - Rollback limitations:
 - Desktop uninstall steps:
+- Local `~/.openevo/desktop` data retention and cleanup:
 - Remote state/model/runtime cache cleanup:
 - Troubleshooting guide:
 - Support issue link:

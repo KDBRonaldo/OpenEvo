@@ -69,7 +69,8 @@ The repository currently provides:
   the sole producer of the exact Core wheel and canonical
   `framework-lock.json` used by that workflow. The job verifies a two-entry
   SHA-256 manifest, exports its digest as a job output, and uploads the pair and
-  manifest under a source-commit-qualified Actions artifact name. The dependent
+  manifest under an Actions artifact name qualified by source commit, workflow
+  run, and run attempt. The dependent
   Linux Core job downloads that exact artifact, verifies the transferred
   manifest against the producer's digest and then verifies both members before
   install. It does not rebuild either release input. The Linux job owns the
@@ -86,7 +87,9 @@ The repository currently provides:
   installs, framework-verifies, and service-smokes the same final Core wheel
   bytes. Only after both jobs pass does a write-scoped job create an unsigned
   draft prerelease, upload every manifest member, download every asset into an
-  empty directory, revalidate the closed inventory, and compare all bytes;
+  empty directory, revalidate the closed inventory, compare all bytes, and
+  validate the review-facing draft fields. A separate run-attempt-qualified
+  Actions artifact retains that point-in-time metadata record;
 - a disabled `.github/workflows/openevo-release-artifact.yml` placeholder that
   publishes nothing.
 
@@ -724,16 +727,22 @@ The replacement workflow must:
    and copied observations to match the declared candidate architecture;
 6. exercise first-run through a descriptor-matched remote Core health check;
 7. create a draft GitHub prerelease, upload all required assets, download them into
-   a clean directory, and revalidate names, versions, commits, and checksums;
-8. leave the checksum-bound packaging candidate as an unpublished draft for
-   review; do not edit, retag, promote, or publish it as a final release.
+   a clean directory, and revalidate names, versions, commits, checksums, title,
+   tag, target commit, body, draft state, and prerelease state;
+8. retain the point-in-time draft verification record as a run-attempt-qualified
+   Actions artifact and leave the candidate as an unpublished review draft.
 
 Final publication remains disabled. The manual candidate workflow implements
-the packaging-level draft roundtrip and deletes a newly created draft and its
-candidate tag if upload or redownload validation fails. It deliberately leaves
+the packaging-level draft roundtrip and retries deletion of a newly created
+draft and candidate tag if the job fails or is cancelled before its final
+verification marker. It deliberately leaves
 a successful candidate as an unsigned draft prerelease; a maintainer cannot use
 that result to bypass the still-pending science, benchmark, privacy, review,
 signing, or notarization gates.
+
+The GitHub draft is administratively mutable; it is not an immutable publication
+authority. Any post-workflow edit, asset replacement, or tag movement
+invalidates the candidate and requires deleting it and running a new candidate.
 
 ## Packaged Runtime Rules
 

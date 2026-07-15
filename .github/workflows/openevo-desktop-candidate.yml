@@ -231,67 +231,11 @@ jobs:
       - name: Write release notes and authoritative candidate manifest
         id: candidate
         run: |
-          cat > candidate-artifacts/release-notes.md <<EOF
-          # OpenEvo Desktop ${OPENEVO_VERSION} unsigned draft prerelease
-
-          Source commit: ${GITHUB_SHA}
-          Architecture: ${OPENEVO_ARCHITECTURE}
-          Minimum macOS: 12.0
-
-          This candidate is unsigned and not notarized. A browser-downloaded copy
-          may require manual approval in Privacy & Security; that quarantined path
-          is not validated by this packaging workflow.
-
-          ## Supported Workflows
-
-          Codex subscription transcript mode: available in this candidate.
-          It runs subscription-authenticated Codex on the remote server with
-          transcript capture and non-parametric evolution.
-          Self-Deployed Reference mode: unavailable in this candidate.
-          The shipped Desktop release authority blocks saving or running that mode;
-          its Core-side reference architecture is not a Desktop product claim.
-
-          ## Known Limitations
-
-          Parameter evolution is not included in this candidate.
-          PyPI is not used for this release.
-          Only the declared architecture was built.
-          Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.
-          This packaging-only draft does not satisfy the science E2E, benchmark,
-          secret-canary/privacy, signing, notarization, or final-publication gates.
-
-          ## Validation Results
-
-          Benchmark gates completed by this packaging candidate: 0 of 3.
-          Textual-memory pass@1 rescue count: pending.
-          Trajectory-to-skill pass@1 rescue count: pending.
-          Agent-system pass@1 rescue count: pending.
-          No benchmark performance claim is made by this draft.
-          The exact Core wheel, app bundle, copied DMG app, dependency evidence, and
-          downloaded draft assets are validated by this workflow.
-
-          ## Security And Privacy
-
-          No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.
-          Credential-canary verification for release assets: pending.
-          This workflow does not claim credential-free assets until the separate
-          secret-canary gate passes.
-          Diagnostics sharing is explicit. Science data can be sent to the remote
-          server and harness or model provider selected by the user. The full
-          secret-canary/privacy release gate remains pending.
-
-          ## Install, Upgrade, And Uninstall
-
-          Install: this workflow validates mounting and copying the DMG without
-          browser-download quarantine. For maintainer testing, copy OpenEvo Desktop
-          to Applications; the Privacy & Security allow flow remains unvalidated.
-          Upgrade: this draft has no automatic updater; quit the app and replace it
-          with a newer reviewed DMG. Remote Core upgrade compatibility is not proven
-          by this packaging-only candidate.
-          Uninstall: quit OpenEvo Desktop and remove it from Applications. Removing
-          the app does not automatically delete remote Core state, task data, model
-          downloads, or runtime caches.
-          EOF
+          uv run python scripts/ci/openevo_release_candidate.py write-notes \
+            candidate-artifacts/release-notes.md \
+            --source-commit "$GITHUB_SHA" \
+            --version "$OPENEVO_VERSION" \
+            --architecture "$OPENEVO_ARCHITECTURE"
           uv run python scripts/ci/openevo_release_candidate.py create \
             candidate-artifacts \
             --source-commit "$GITHUB_SHA" \
@@ -312,7 +256,7 @@ jobs:
       - name: Upload exact candidate for cross-platform verification
         uses: actions/upload-artifact@v4
         with:
-          name: openevo-desktop-candidate-${{ github.sha }}
+          name: openevo-desktop-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: candidate-artifacts/*
           if-no-files-found: error
           retention-days: 14
@@ -321,7 +265,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: openevo-desktop-candidate-failure-evidence-${{ github.sha }}
+          name: openevo-desktop-candidate-failure-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             candidate-artifacts/dependency-inventory.json
             candidate-artifacts/license-inventory.json
@@ -360,7 +304,7 @@ jobs:
       - name: Download exact final candidate bytes
         uses: actions/download-artifact@v4
         with:
-          name: openevo-desktop-candidate-${{ github.sha }}
+          name: openevo-desktop-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: candidate-artifacts
 
       - name: Verify candidate manifest and transferred manifest bytes
@@ -468,7 +412,7 @@ jobs:
       - name: Download validated candidate bytes
         uses: actions/download-artifact@v4
         with:
-          name: openevo-desktop-candidate-${{ github.sha }}
+          name: openevo-desktop-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: candidate-artifacts
 
       - name: Revalidate candidate before draft creation
@@ -481,28 +425,37 @@ jobs:
             candidate-artifacts/release-candidate.json \
             --expected-source-commit "$GITHUB_SHA"
 
-      - name: Create unsigned draft prerelease and upload exact assets
+      - name: Prepare unique draft release identity
         id: release
-        env:
-          CANDIDATE_LABEL: ${{ inputs.candidate_label }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           version="$(python -c \
             'import json; print(json.load(open("candidate-artifacts/release-candidate.json"))["version"])')"
           tag="openevo-desktop-v${version}-${CANDIDATE_LABEL}.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          title="OpenEvo Desktop ${version} unsigned candidate"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          gh release create "$tag" \
-            --target "$GITHUB_SHA" \
-            --title "OpenEvo Desktop ${version} unsigned candidate" \
-            --notes-file candidate-artifacts/release-notes.md \
-            --draft \
-            --prerelease
-          gh release upload "$tag" candidate-artifacts/*
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+        env:
+          CANDIDATE_LABEL: ${{ inputs.candidate_label }}
 
-      - name: Download every draft asset into a clean directory and verify exact bytes
+      - name: Create unsigned draft prerelease and upload exact assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TITLE" \
+            --notes-file candidate-artifacts/release-notes.md \
+            --draft \
+            --prerelease
+          gh release upload "$RELEASE_TAG" candidate-artifacts/*
+
+      - name: Verify every draft asset and review-facing field
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
         run: |
           mkdir downloaded-draft
           gh release download "$RELEASE_TAG" --dir downloaded-draft --pattern '*'
@@ -511,9 +464,45 @@ jobs:
             --expected-source-commit "$GITHUB_SHA"
           diff -qr candidate-artifacts downloaded-draft
 
+          gh release view "$RELEASE_TAG" \
+            --json body,isDraft,isPrerelease,name,tagName,targetCommitish,url \
+            > "$RUNNER_TEMP/draft-release.json"
+          python scripts/ci/openevo_release_candidate.py validate-draft \
+            "$RUNNER_TEMP/draft-release.json" \
+            --release-notes candidate-artifacts/release-notes.md \
+            --expected-tag "$RELEASE_TAG" \
+            --expected-target "$GITHUB_SHA" \
+            --expected-title "$RELEASE_TITLE"
+
+      - name: Retain point-in-time draft verification record
+        uses: actions/upload-artifact@v4
+        with:
+          name: openevo-desktop-draft-verification-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/draft-release.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Mark draft roundtrip complete
+        id: verified
+        run: echo "complete=true" >> "$GITHUB_OUTPUT"
+
       - name: Delete an unverified draft and its candidate tag
-        if: failure() && steps.release.outputs.tag != ''
+        if: ${{ always() && steps.release.outputs.tag != '' && steps.verified.outputs.complete != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: gh release delete "$RELEASE_TAG" --yes --cleanup-tag
+        run: |
+          for attempt in 1 2 3; do
+            if gh release delete "$RELEASE_TAG" --yes --cleanup-tag; then
+              break
+            fi
+            sleep "$attempt"
+          done
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Unverified draft still exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Unverified candidate tag still exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
