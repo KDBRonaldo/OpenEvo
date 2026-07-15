@@ -27,6 +27,7 @@ GOOD_ENTRY_POINTS = "\n".join(
     [
         "[console_scripts]",
         "openevo-backend = openevo.backend.launcher:main",
+        "openevo-core-service = openevo.backend.service:main",
         "",
     ]
 )
@@ -837,14 +838,15 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "outer_source" not in linux_job
     assert "python -m build" not in linux_job
     assert "dist/*.whl" not in linux_job
-    assert "openevo-core-service" in capability_smoke_text
-    assert '"ensure"' in capability_smoke_text
-    assert '"consume-attachment"' in capability_smoke_text
-    assert '"stop"' in capability_smoke_text
-    assert '"--replace-mismatched"' in capability_smoke_text
-    assert 'f"bootstrap-{secrets.token_hex(16)}.json"' in capability_smoke_text
+    assert "ensure_core_service" in capability_smoke_text
+    assert "stop_core_service" in capability_smoke_text
+    assert 'parser.add_argument("--framework-lock"' in capability_smoke_text
+    assert "load_framework_distribution_lock" in capability_smoke_text
+    assert "TemporaryDirectory" not in capability_smoke_text
+    assert "shutil.copy2" not in capability_smoke_text
     smoke_body = capability_smoke_text.split("def smoke(", 1)[1].split("def main(", 1)[0]
-    assert "try:\n        ensure_result = _run_core_service(" in smoke_body
+    assert "attachment = ensure_core_service(" in smoke_body
+    assert "if not attachment.attached:" in smoke_body
     assert "sidecar_smoke.smoke_sidecar" in capability_smoke_text
     assert "TestClient" not in capability_smoke_text
     assert "create_sidecar_app" not in capability_smoke_text
@@ -855,7 +857,8 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert '"--native-instance-stdin"' in sidecar_process_smoke_text
     assert "pass_fds=" in sidecar_process_smoke_text
     assert "--backend-base-url" not in sidecar_process_smoke_text
-    assert "/openevo-api/desktop/capabilities" in sidecar_process_smoke_text
+    assert "/desktop/v1/state" in sidecar_process_smoke_text
+    assert "/openevo-native/session" in sidecar_process_smoke_text
     assert "source Desktop harness, not a packaged app" in desktop_smoke_text
     assert "EXPECTED_METHOD_IDS" in framework_smoke_text
     assert "EXPECTED_TARGET_IDS" in framework_smoke_text
@@ -883,7 +886,7 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     )
 
 
-def test_remote_capability_smoke_stops_core_when_ensure_fails(
+def test_remote_capability_smoke_does_not_stop_without_attachment_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -896,13 +899,10 @@ def test_remote_capability_smoke_stops_core_when_ensure_fails(
     imported = tmp_path / "installed/openevo/__init__.py"
     imported.parent.mkdir(parents=True)
     imported.write_text("", encoding="utf-8")
-    executable = tmp_path / "bin/python"
-    executable.parent.mkdir()
-    executable.write_text("", encoding="utf-8")
-    executable.with_name("openevo-core-service").write_text("", encoding="utf-8")
     digest = "a" * 64
 
     class LockedIdentity:
+        distribution = "openevo"
         distribution_version = "0.1.0"
         distribution_digest = digest
         wheel_filename = wheel.name
@@ -913,30 +913,26 @@ def test_remote_capability_smoke_stops_core_when_ensure_fails(
             assert path == sidecar
             assert timeout_seconds == 1.0
 
-    calls: list[tuple[str, ...]] = []
+    stop_calls: list[Path] = []
 
-    def run_core_service(_executable, *arguments, **kwargs):
-        del kwargs
-        calls.append(arguments)
-        if arguments[0] == "ensure":
-            raise RuntimeError("injected ensure failure")
-        return subprocess.CompletedProcess(arguments, 0, "", "")
+    def ensure_core_service(**_kwargs):
+        raise RuntimeError("injected ensure failure")
 
-    import openevo.backend.runtime_identity as runtime_identity
-    import openevo.evolution.framework as framework
+    def stop_core_service(*, service_root, **_kwargs):
+        stop_calls.append(Path(service_root))
 
     monkeypatch.setattr(smoke.openevo, "__file__", str(imported))
     monkeypatch.setattr(smoke.metadata, "version", lambda _: "0.1.0")
     monkeypatch.setattr(smoke, "_sha256", lambda _: digest)
     monkeypatch.setattr(
-        framework,
+        smoke,
         "load_framework_distribution_lock",
         lambda _: (LockedIdentity(), wheel.resolve()),
     )
     monkeypatch.setattr(smoke, "_load_sidecar_smoke", lambda: SidecarSmoke())
-    monkeypatch.setattr(runtime_identity, "default_core_service_root", lambda: tmp_path / "core")
-    monkeypatch.setattr(smoke.sys, "executable", str(executable))
-    monkeypatch.setattr(smoke, "_run_core_service", run_core_service)
+    monkeypatch.setattr(smoke, "default_core_service_root", lambda: tmp_path / "core")
+    monkeypatch.setattr(smoke, "ensure_core_service", ensure_core_service)
+    monkeypatch.setattr(smoke, "stop_core_service", stop_core_service)
 
     with pytest.raises(RuntimeError, match="injected ensure failure"):
         smoke.smoke(
@@ -947,8 +943,7 @@ def test_remote_capability_smoke_stops_core_when_ensure_fails(
             timeout_seconds=1.0,
         )
 
-    assert calls[0][0] == "ensure"
-    assert calls[-1][0] == "stop"
+    assert stop_calls == []
 
 
 def test_pre_external_beta_release_artifact_workflow_is_disabled() -> None:
@@ -1200,18 +1195,33 @@ def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
     source.write_text(
         module._BOOTLOADER_MACOS_INCLUDE_NEEDLE
         + module._BOOTLOADER_RESOLVER_NEEDLE
-        + module._BOOTLOADER_ARCHIVE_NEEDLE,
+        + module._BOOTLOADER_ARCHIVE_NEEDLE
+        + module._BOOTLOADER_RESTART_NEEDLE
+        + module._BOOTLOADER_CHILD_MAIN_NEEDLE,
         encoding="utf-8",
     )
+    utils_source = tmp_path / "bootloader/src/pyi_utils_posix.c"
+    utils_source.write_text(
+        module._BOOTLOADER_POSIX_INCLUDE_NEEDLE
+        + module._BOOTLOADER_NATIVE_HANDOFF_NEEDLE
+        + module._BOOTLOADER_CHILD_EXEC_NEEDLE,
+        encoding="utf-8",
+    )
+    utils_header = tmp_path / "bootloader/src/pyi_utils.h"
+    utils_header.write_text(module._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
 
     module._patch_fd_bound_bootloader(tmp_path)
 
     patched = source.read_text(encoding="utf-8")
+    patched_utils = utils_source.read_text(encoding="utf-8")
     assert patched.count('getenv("OPENEVO_NATIVE_EXECUTABLE_PATH")') == 1
+    assert patched.count('getenv("OPENEVO_NATIVE_LISTENER_FD")') == 1
     assert patched.count("pyi_archive_open(openevo_archive_path)") == 1
     assert patched.count("fstat(4, &openevo_fd_stat)") == 1
     assert patched.count("lstat(openevo_native_path, &openevo_path_stat)") == 1
     assert patched.count("lstat(openevo_resolved_path, &openevo_resolved_stat)") == 1
+    assert "SO_ACCEPTCONN" in patched_utils
+    assert "pyi_utils_openevo_native_handoff_restore()" in patched_utils
 
 
 def test_pre_external_beta_pypi_publish_workflow_is_disabled() -> None:
@@ -1430,9 +1440,16 @@ def _write_fake_sidecar(path: Path) -> None:
                 "            return",
                 "        if self.path == '/version':",
                 "            body = json.dumps({",
+                "                'schema_version': '1',",
+                "                'api_name': 'openevo-desktop-local-api',",
+                "                'preferred_major': 1,",
+                "                'supported_majors': [1],",
                 "                'provider_kind': 'desktop_sidecar',",
                 "                'build_channel': 'release',",
                 "                'openapi_sha256': 'a' * 64,",
+                "                'build_version': '0.1.0',",
+                "                'source_commit': '89baeb26',",
+                "                'feature_flags': [],",
                 "            }).encode()",
                 "            self.send_response(200)",
                 "            self.send_header('Content-Type', 'application/json')",
@@ -1451,6 +1468,11 @@ def _write_fake_sidecar(path: Path) -> None:
                 "            self.send_header('Content-Length', str(len(body)))",
                 "            self.end_headers()",
                 "            self.wfile.write(body)",
+                "            return",
+                "        if self.path == '/openevo-native/session':",
+                "            status = 204 if self.headers.get('X-OpenEvo-Desktop-Session') == session_token else 403",
+                "            self.send_response(status)",
+                "            self.end_headers()",
                 "            return",
                 "        if self.path == '/openevo':",
                 "            body = b'<script src=\"/assets/index.js\"></script>'",

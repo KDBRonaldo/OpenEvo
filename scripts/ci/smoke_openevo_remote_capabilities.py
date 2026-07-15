@@ -9,13 +9,12 @@ from importlib import metadata, util
 import json
 from pathlib import Path
 import re
-import shutil
-import tempfile
 from types import ModuleType
 
 import openevo
 from openevo.backend.runtime_identity import default_core_service_root
 from openevo.backend.service import ensure_core_service, stop_core_service
+from openevo.evolution.framework import load_framework_distribution_lock
 
 
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -48,12 +47,14 @@ def _load_sidecar_smoke() -> ModuleType:
 
 def smoke(
     wheel_path: Path,
+    framework_lock_path: Path,
     sidecar_path: Path,
     *,
     source_commit: str,
     timeout_seconds: float,
 ) -> dict[str, str]:
     wheel = wheel_path.resolve(strict=True)
+    framework_lock = framework_lock_path.resolve(strict=True)
     sidecar = sidecar_path.resolve(strict=True)
     script_parents = Path(__file__).resolve().parents
     repository_src = script_parents[2] / "src" if len(script_parents) > 2 else None
@@ -63,69 +64,59 @@ def smoke(
 
     version = metadata.version("openevo")
     digest = _sha256(wheel)
+    locked_identity, locked_wheel = load_framework_distribution_lock(framework_lock)
+    if (
+        locked_identity.distribution != "openevo"
+        or locked_identity.distribution_version != version
+        or locked_identity.distribution_digest != digest
+        or locked_identity.wheel_filename != wheel.name
+        or locked_wheel.resolve(strict=True) != wheel
+    ):
+        raise RuntimeError("packaged framework lock does not bind the exact Core wheel")
+
     sidecar_smoke = _load_sidecar_smoke()
-    with tempfile.TemporaryDirectory(
-        prefix="openevo-remote-capability-smoke-"
-    ) as temp_dir:
-        root = Path(temp_dir)
-        locked_wheel = root / wheel.name
-        shutil.copy2(wheel, locked_wheel)
-        lock_path = root / "framework-lock.json"
-        lock_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": "1",
-                    "distribution": "openevo",
-                    "distribution_version": version,
-                    "distribution_digest": digest,
-                    "wheel_filename": locked_wheel.name,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            encoding="utf-8",
+    service_root = default_core_service_root()
+    attachment = ensure_core_service(
+        service_root=service_root,
+        framework_lock=framework_lock,
+        source_commit=_source_commit(source_commit),
+        deadline_seconds=timeout_seconds,
+    )
+    base_url = f"http://127.0.0.1:{attachment.port}"
+    headers = {"Authorization": f"Bearer {attachment.bearer_token}"}
+    try:
+        sidecar_smoke.smoke_sidecar(
+            sidecar,
+            timeout_seconds=timeout_seconds,
         )
-        service_root = default_core_service_root()
-        attachment = ensure_core_service(
-            service_root=service_root,
-            framework_lock=lock_path,
-            source_commit=_source_commit(source_commit),
-            deadline_seconds=timeout_seconds,
-        )
-        base_url = f"http://127.0.0.1:{attachment.port}"
-        headers = {"Authorization": f"Bearer {attachment.bearer_token}"}
-        try:
-            sidecar_smoke.smoke_sidecar(
-                sidecar,
-                timeout_seconds=timeout_seconds,
+        registry_digests: set[str] = set()
+        for execution_mode in (
+            "codex_subscription_transcript",
+            "self-deployed",
+        ):
+            payload = sidecar_smoke._read_json(
+                f"{base_url}/v1/capabilities?execution_mode={execution_mode}",
+                headers=headers,
             )
-            registry_digests: set[str] = set()
-            for execution_mode in (
-                "codex_subscription_transcript",
-                "self-deployed",
-            ):
-                payload = sidecar_smoke._read_json(
-                    f"{base_url}/v1/capabilities?execution_mode={execution_mode}",
-                    headers=headers,
-                )
-                sidecar_smoke._assert_capabilities(
-                    payload,
-                    execution_mode=execution_mode,
-                    expected_core_version=version,
-                )
-                registry_digests.add(payload["registry_digest"])
-            if len(registry_digests) != 1:
-                raise RuntimeError("exact Core release modes resolved different registries")
-            registry_digest = next(iter(registry_digests))
-        finally:
-            if not attachment.attached:
-                stop_core_service(
-                    service_root=service_root,
-                    deadline_seconds=min(timeout_seconds, 60.0),
-                )
+            sidecar_smoke._assert_capabilities(
+                payload,
+                execution_mode=execution_mode,
+                expected_core_version=version,
+            )
+            registry_digests.add(payload["registry_digest"])
+        if len(registry_digests) != 1:
+            raise RuntimeError("exact Core release modes resolved different registries")
+        registry_digest = next(iter(registry_digests))
+    finally:
+        if not attachment.attached:
+            stop_core_service(
+                service_root=service_root,
+                deadline_seconds=min(timeout_seconds, 60.0),
+            )
 
     return {
         "core_import_path": str(import_path),
+        "framework_lock_sha256": _sha256(framework_lock),
         "registry_digest": registry_digest,
         "sidecar_path": str(sidecar),
         "wheel_sha256": digest,
@@ -135,6 +126,7 @@ def smoke(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wheel", type=Path, required=True)
+    parser.add_argument("--framework-lock", type=Path, required=True)
     parser.add_argument("--sidecar", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
@@ -143,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             smoke(
                 args.wheel,
+                args.framework_lock,
                 args.sidecar,
                 source_commit=args.source_commit,
                 timeout_seconds=args.timeout_seconds,
