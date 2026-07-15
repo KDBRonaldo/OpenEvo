@@ -74,7 +74,11 @@ host-user execution. Runtime config, compiled `RuntimeSpec`, Core launcher, and
 Gateway admission independently enforce the profile alias, while the release
 contract binds that alias to a full trusted `sha256` rather than trusting the
 tag. Release bootstrap pulls `repository@digest`, tags it only as a local alias,
-and verifies Docker `RepoDigests`/image ID. DockerRuntime repeats the proof
+and verifies that alias against Docker `RepoDigests`/image ID. The compiler's
+immutable `runtime.image` therefore serves as the bootstrap pull authority,
+rather than a local alias;
+`docker tag`, development `docker build -t`, and bootstrap inspect always target
+the release lock's human-readable image tag. DockerRuntime repeats the proof
 immediately before create and uses the matched immutable reference before any
 subscription credential mount is added. Registry tag drift, no digest, or an
 identity mismatch fails closed.
@@ -557,9 +561,10 @@ expected version; otherwise it fails clearly and does not install an unpinned
 latest package from PyPI.
 For managed Science runtime profiles, bootstrap also prepares the runtime image
 without requiring the user to provide one. It runs
-`docker pull <repository>@<trusted-digest>`, creates the internal alias, and
-fails unless inspect proves the expected RepoDigest/image ID. Explicit developer
-mode may instead use the digest-pinned fallback Dockerfile and receives the same
+`docker pull <repository>@<trusted-digest>`, creates the release tag as the local
+alias, inspects that alias, and fails unless inspect proves the expected
+RepoDigest/image ID. Explicit developer mode may instead use the digest-pinned
+fallback Dockerfile and receives the same
 proxy environment and standard proxy build args, but it must produce the same
 trusted digest. If the remote Docker daemon needs registry mirrors or
 daemon-level proxy configuration, bootstrap reports the failure instead of

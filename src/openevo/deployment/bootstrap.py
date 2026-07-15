@@ -607,7 +607,7 @@ def _runtime_image_command(
     build_args = " ".join(
         f"--build-arg {arg_name}" for arg_name in _DOCKER_PROXY_BUILD_ARGS
     )
-    image_ref = shlex.quote(runtime_image)
+    image_ref = shlex.quote(managed_runtime_release.image)
     immutable_ref = shlex.quote(managed_runtime_release.immutable_reference)
     commands = [unset_proxy]
     if managed_runtime_mode == "development":
@@ -633,7 +633,10 @@ def _runtime_image_command(
             ]
         )
     commands.append(
-        _managed_runtime_inspect_command(runtime_image, managed_runtime_release)
+        _managed_runtime_inspect_command(
+            managed_runtime_release.image,
+            managed_runtime_release,
+        )
     )
     return "\n".join(commands)
 

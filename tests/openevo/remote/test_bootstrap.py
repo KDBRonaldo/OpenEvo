@@ -19,7 +19,7 @@ from openevo.deployment.preflight import (
     PreflightReport,
     RemoteCommandResult,
 )
-from openevo.projects.science import ScienceProjectConfig
+from openevo.projects.science import ScienceProjectConfig, compile_science_project
 from openevo.deployment import RemoteProfileConfig, build_sidecar_science_plan
 from openevo.deployment.planner import SidecarSciencePlan
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
@@ -556,6 +556,43 @@ def test_build_remote_bootstrap_plan_derives_subscription_steps() -> None:
         "check_codex_subscription"
     )
     assert "hf_snapshot_download" not in steps_by_id
+
+
+@pytest.mark.parametrize("runtime_profile", ["managed_science", "python_research"])
+@pytest.mark.parametrize("managed_runtime_mode", ["release", "development"])
+def test_compiled_managed_runtime_uses_tag_only_as_local_bootstrap_alias(
+    runtime_profile: str,
+    managed_runtime_mode: str,
+) -> None:
+    project = _project(environment={"profile": runtime_profile})
+    compiled = compile_science_project(project)
+    sidecar_plan = build_sidecar_science_plan(project, _profile())
+    plan = build_remote_bootstrap_plan(
+        sidecar_plan,
+        managed_runtime_mode=managed_runtime_mode,
+    )
+    docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
+    release = MANAGED_RUNTIME_RELEASES[runtime_profile]
+
+    assert compiled.runtime.image == release.immutable_reference
+    assert sidecar_plan.experiment["runtime"]["image"] == release.immutable_reference
+    assert f"docker pull {release.immutable_reference}" in docker_step.command
+    assert (
+        f"docker tag {release.immutable_reference} {release.image}"
+        in docker_step.command
+    )
+    assert f"docker tag {release.immutable_reference} {release.immutable_reference}" not in (
+        docker_step.command
+    )
+    assert f"-t {release.immutable_reference}" not in docker_step.command
+    if managed_runtime_mode == "development":
+        assert f"-t {release.image}" in docker_step.command
+    else:
+        assert "docker build" not in docker_step.command
+    assert f"image = {release.image!r}" in docker_step.command
+    assert f"image = {release.immutable_reference!r}" not in docker_step.command
+    assert docker_step.manifest["image"] == release.immutable_reference
+    assert docker_step.manifest["trusted_digest"] == release.trusted_digest
 
 
 def test_managed_runtime_bootstrap_builds_image_when_pull_fails() -> None:
