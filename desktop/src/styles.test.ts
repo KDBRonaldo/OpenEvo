@@ -11,4 +11,16 @@ describe("Desktop product responsive CSS", () => {
       /@media\s*\(max-width:\s*1000px\)[\s\S]*?\.system-grid\s*{\s*grid-template-columns:\s*minmax\(0,\s*1fr\);/,
     );
   });
+
+  it("projects target switch keyboard focus onto the visible track without layout shift", () => {
+    expect(styles).toMatch(/--focus-ring:\s*#7abca5;/);
+
+    const focusRule = styles.match(
+      /\.target-toggle input:not\(:disabled\):focus-visible\s*\+\s*\.switch-track\s*{([^}]*)}/,
+    )?.[1];
+    expect(focusRule).toBeDefined();
+    expect(focusRule).toMatch(/outline:\s*3px solid var\(--focus-ring\);/);
+    expect(focusRule).toMatch(/outline-offset:\s*2px;/);
+    expect(focusRule).not.toMatch(/(?:border|margin|padding|width|height):/);
+  });
 });

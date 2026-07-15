@@ -31,6 +31,11 @@ pre.json {
 
 /* OpenEvo Desktop product renderer */
 .product-shell,
+.product-boot {
+  --focus-ring: #7abca5;
+}
+
+.product-shell,
 .product-shell * {
   box-sizing: border-box;
 }
@@ -2072,6 +2077,11 @@ pre.json {
   transform: translateX(13px);
 }
 
+.target-toggle input:not(:disabled):focus-visible + .switch-track {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
 .target-toggle input:disabled + .switch-track {
   opacity: 0.45;
 }
@@ -2118,7 +2128,7 @@ pre.json {
 
 .product-shell :focus-visible,
 .product-boot :focus-visible {
-  outline: 3px solid #7abca5;
+  outline: 3px solid var(--focus-ring);
   outline-offset: 2px;
 }
 

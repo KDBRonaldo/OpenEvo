@@ -412,6 +412,24 @@ describe("DesktopProductApp", () => {
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
     expect(button("Save and activate").disabled).toBe(false);
 
+    const firstToggle = document.querySelector<HTMLInputElement>(".target-toggle input[role='switch']");
+    if (!firstToggle) throw new Error("Evolution target switch was not found.");
+    expect(firstToggle.type).toBe("checkbox");
+    expect(firstToggle.disabled).toBe(false);
+    expect(firstToggle.tabIndex).toBe(0);
+    expect(firstToggle.closest("label")).not.toBeNull();
+    firstToggle.focus();
+    expect(document.activeElement).toBe(firstToggle);
+    const firstTrack = firstToggle.nextElementSibling;
+    if (!(firstTrack instanceof HTMLElement) || !firstTrack.classList.contains("switch-track")) {
+      throw new Error("Evolution target switch track was not adjacent to its checkbox.");
+    }
+    const initiallyChecked = firstToggle.checked;
+    await act(async () => firstTrack.click());
+    expect(firstToggle.checked).toBe(!initiallyChecked);
+    await act(async () => firstTrack.click());
+    expect(firstToggle.checked).toBe(initiallyChecked);
+
     const prepared = await provider.refresh();
     if (prepared.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     const draft = prepared.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
