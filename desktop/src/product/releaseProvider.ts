@@ -3,13 +3,11 @@ import type { DesktopApiClientV1, FetchLike } from "../api/v1/client";
 import { createDesktopApiClient, DesktopContractError } from "../api/v1/client";
 import {
   projectSourceV1Schema,
-  remoteProfileV1Schema,
   type DesktopBootstrapContextV1,
   type ProjectSourceV1,
-  type RemoteProfileV1,
 } from "../api/v1/schemas";
 import { createLocalApiDesktopProductProvider } from "./localApiProvider";
-import type { DesktopProductProvider, ProjectSourceSelectionIntent } from "./provider";
+import { type DesktopProductProvider, type ProjectSourceSelectionIntent } from "./provider";
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 
 export interface ReleaseNativeBridge {
@@ -18,18 +16,6 @@ export interface ReleaseNativeBridge {
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
   cancelProjectSource(actionId: string): Promise<unknown>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
-  configureCredential(
-    profileId: string,
-    slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
-    etag: string,
-    actionId: string,
-  ): Promise<unknown>;
-  clearCredential(
-    profileId: string,
-    slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
-    etag: string,
-    actionId: string,
-  ): Promise<unknown>;
 }
 
 export interface ReleaseProviderAdapterContext {
@@ -38,18 +24,6 @@ export interface ReleaseProviderAdapterContext {
     selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
     cancelProjectSource(actionId: string): Promise<void>;
     settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
-    configureCredential(
-      profileId: string,
-      slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
-      etag: string,
-      actionId: string,
-    ): Promise<RemoteProfileV1>;
-    clearCredential(
-      profileId: string,
-      slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
-      etag: string,
-      actionId: string,
-    ): Promise<RemoteProfileV1>;
   };
 }
 
@@ -71,18 +45,6 @@ const tauriNativeBridge: ReleaseNativeBridge = {
   settleProjectSource: (actionId, outcome) => invoke("settle_project_source", {
     actionId,
     outcome,
-  }),
-  configureCredential: (profileId, slotKind, etag, actionId) => invoke("configure_credential", {
-    profileId,
-    slotKind,
-    etag,
-    actionId,
-  }),
-  clearCredential: (profileId, slotKind, etag, actionId) => invoke("clear_credential", {
-    profileId,
-    slotKind,
-    etag,
-    actionId,
   }),
 };
 
@@ -130,25 +92,6 @@ export async function createReleaseDesktopProductProvider(
       },
       settleProjectSource: async (actionId, outcome) => {
         await native.settleProjectSource(actionId, outcome);
-      },
-      configureCredential: async (profileId, slotKind, etag, actionId) => {
-        const profile = remoteProfileV1Schema.parse(
-          await native.configureCredential(profileId, slotKind, etag, actionId),
-        );
-        if (profile.profile_id !== profileId
-          || !profile.credential_slots.some((slot) => slot.kind === slotKind)) {
-          throw new DesktopContractError("Native credential response does not match the requested profile slot");
-        }
-        return profile;
-      },
-      clearCredential: async (profileId, slotKind, etag, actionId) => {
-        const profile = remoteProfileV1Schema.parse(
-          await native.clearCredential(profileId, slotKind, etag, actionId),
-        );
-        if (profile.profile_id !== profileId) {
-          throw new DesktopContractError("Native credential response does not match the requested profile");
-        }
-        return profile;
       },
     },
   };

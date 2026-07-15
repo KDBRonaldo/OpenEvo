@@ -4,10 +4,9 @@
 
 1. Install OpenEvo Desktop from the macOS `.dmg`.
 2. Launch the app and add a remote workspace.
-3. Enter the remote server host, port, and user, then choose SSH agent, password,
-   or private key. Passwords and key passphrases are collected by a macOS secure
-   prompt. Private keys are selected with the macOS file picker. Desktop shows
-   only whether each required credential slot is configured.
+3. Enter the remote server host, port, and user. This candidate supports SSH
+   agent authentication only. Load the required identity into your existing
+   agent before connecting.
 4. Configure proxy, pip index, and Hugging Face mirror settings if needed, then
    connect. Verify the server fingerprint when Desktop asks for host trust.
 5. Desktop runs remote checks, provisions the supported Python runtime when

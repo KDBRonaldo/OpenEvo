@@ -6,7 +6,6 @@ import {
   projectCreateV1Schema,
   projectPatchV1Schema,
   projectSourceV1Schema,
-  remoteProfileV1Schema,
   type ApiErrorV1,
   type ArtifactContentV1,
   type ArtifactDiffV1,
@@ -46,14 +45,10 @@ const MAX_CONCURRENCY = 6;
 const MAX_SSE_BUFFER_BYTES = 1_048_576 + 4;
 const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
 
-type CredentialSlotKind = RemoteProfileV1["credential_slots"][number]["kind"];
-
 export interface LocalApiNativeBridge {
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
   cancelProjectSource(actionId: string): Promise<unknown>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
-  configureCredential(profileId: string, slotKind: CredentialSlotKind, etag: string, actionId: string): Promise<unknown>;
-  clearCredential(profileId: string, slotKind: CredentialSlotKind, etag: string, actionId: string): Promise<unknown>;
 }
 
 export interface LocalApiDesktopProductProviderOptions {
@@ -173,41 +168,6 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
       throw new DesktopContractError("Profile mutation returned the wrong profile");
     }
     assertProfileFields(profile, expected, "Updated profile does not match the request");
-    this.invalidate();
-    return profile;
-  }
-
-  async configureCredential(
-    profileId: string,
-    slotKind: CredentialSlotKind,
-    intent: ProductResourceMutationIntent,
-  ): Promise<RemoteProfileV1> {
-    this.assertIntent(intent);
-    const profile = remoteProfileV1Schema.parse(
-      await this.native.configureCredential(profileId, slotKind, intent.etag, intent.actionId),
-    );
-    if (profile.profile_id !== profileId) {
-      throw new DesktopContractError("Native credential response returned the wrong profile");
-    }
-    if (!profile.credential_slots.some((slot) => slot.kind === slotKind)) {
-      throw new DesktopContractError("Native credential response omitted the configured credential slot");
-    }
-    this.invalidate();
-    return profile;
-  }
-
-  async clearCredential(
-    profileId: string,
-    slotKind: CredentialSlotKind,
-    intent: ProductResourceMutationIntent,
-  ): Promise<RemoteProfileV1> {
-    this.assertIntent(intent);
-    const profile = remoteProfileV1Schema.parse(
-      await this.native.clearCredential(profileId, slotKind, intent.etag, intent.actionId),
-    );
-    if (profile.profile_id !== profileId) {
-      throw new DesktopContractError("Native credential response returned the wrong profile");
-    }
     this.invalidate();
     return profile;
   }

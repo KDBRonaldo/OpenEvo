@@ -418,15 +418,13 @@ Local project projection.
 IDs in stable identity order, with the same recovery-row upper bound, for
 assembling `DesktopStateV1` without an unbounded query.
 
-The production credential resolver supports `ssh_agent`, `native_password`, and
-`native_private_key`. Native secret material arrives only on the authenticated,
-private native handoff route and remains in the bounded process-memory vault.
-The resolver copies it into one lifecycle-owned SSH adapter and clears that copy
-after transport construction; profile authentication changes, profile deletion,
-sidecar replacement, and sidecar stop clear the corresponding vault entries.
-Credential values and native references never enter the Local API or provider
-store. Profile proxy URLs and `no_proxy` are projected into the remote profile,
-but user information in proxy URLs is rejected by the contract.
+The production release resolver supports only `ssh_agent`. Native password and
+private-key authentication are reserved contract values and are rejected by
+create, patch, and connect; startup clears historical credential-slot status.
+The packaged sidecar has no credential vault or native credential handoff route.
+Authenticated proxy and Hugging Face token slots are unavailable. Profile proxy
+URLs and `no_proxy` are projected into the remote profile, but user information
+in proxy URLs is rejected by the contract.
 
 When release composition supplies an active `DesktopCoreBridgeV1`, the provider
 forwards capability and validation reads plus Core-owned runs, timelines, logs,

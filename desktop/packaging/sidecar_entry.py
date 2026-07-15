@@ -7,9 +7,6 @@ from pathlib import Path
 import re
 import sys
 
-from desktop.server.launcher import main
-
-
 BUILD_METADATA_RELATIVE_PATH = Path("desktop/packaging/sidecar-build-metadata.json")
 BUILD_METADATA_MAX_BYTES = 1024
 NATIVE_EXECUTABLE_PATH_ENV = "OPENEVO_NATIVE_EXECUTABLE_PATH"
@@ -58,13 +55,16 @@ def _load_packaged_build_metadata() -> _PackagedBuildMetadata:
 
 
 if __name__ == "__main__":
-    from desktop.sidecar.ssh_credentials import (
-        is_native_askpass_invocation,
-        native_askpass_main,
+    from openevo.deployment.system_executables import (
+        OWNED_SUBPROCESS_BIRTH_ARGUMENT,
+        run_packaged_owned_subprocess_birth,
     )
 
-    if is_native_askpass_invocation():
-        raise SystemExit(native_askpass_main())
+    if OWNED_SUBPROCESS_BIRTH_ARGUMENT in sys.argv:
+        run_packaged_owned_subprocess_birth(sys.argv)
+        raise SystemExit(126)
+    from desktop.server.launcher import main
+
     if os.environ.pop(NATIVE_LISTENER_FD_ENV, None) != "3":
         raise ValueError("invalid packaged native listener handoff")
     if os.environ.pop(NATIVE_EXECUTABLE_FD_ENV, None) != "4":

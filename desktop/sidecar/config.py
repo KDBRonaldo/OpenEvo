@@ -31,6 +31,7 @@ class _StrictFrozenModel(BaseModel):
         frozen=True,
         strict=True,
         validate_default=True,
+        hide_input_in_errors=True,
     )
 
 
@@ -49,14 +50,14 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
     remote_port: int = Field(default=22, ge=1, le=65535)
     remote_user: str
     auth_method: Literal["ssh_agent", "private_key", "password_ref"] = "ssh_agent"
-    private_key_path: str | None = None
-    password_ref: str | None = None
-    passphrase_ref: str | None = None
+    private_key_path: str | None = Field(default=None, repr=False)
+    password_ref: str | None = Field(default=None, repr=False)
+    passphrase_ref: str | None = Field(default=None, repr=False)
     workspace_root: str | None = None
-    http_proxy: str | None = None
-    https_proxy: str | None = None
+    http_proxy: str | None = Field(default=None, repr=False)
+    https_proxy: str | None = Field(default=None, repr=False)
     no_proxy: str | None = None
-    pip_index_url: str | None = None
+    pip_index_url: str | None = Field(default=None, repr=False)
     huggingface_endpoint: str | None = None
     hf_home: str | None = None
     execution_mode: DesktopExecutionMode = "codex_subscription_transcript"
@@ -128,8 +129,7 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
                 or self.source_branch is not None
             ):
                 raise ValueError(
-                    "scratch source must not set source_path, source_url, or "
-                    "source_branch"
+                    "scratch source must not set source_path, source_url, or source_branch"
                 )
 
         if self.source_branch is not None and self.source_type != "git_repository":
@@ -191,9 +191,7 @@ def save_desktop_project_config(
     project, profile = build_desktop_project_configs(draft)
     root = config_root.expanduser()
     paths = DesktopProjectConfigPaths(
-        science_config_path=(
-            root / "projects" / _slugify(project.project.name) / "science.yaml"
-        ),
+        science_config_path=(root / "projects" / _slugify(project.project.name) / "science.yaml"),
         remote_profile_path=root / "profiles" / f"{_slugify(profile.id)}.yaml",
     )
     paths.science_config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -232,9 +230,7 @@ def load_desktop_project_config(
     profile_path = root / "profiles" / f"{_slugify(project.remote_profile)}.yaml"
     profile = load_remote_profile_config(profile_path)
     if profile.id != project.remote_profile:
-        raise ValueError(
-            "Saved Desktop remote profile id does not match project remote_profile."
-        )
+        raise ValueError("Saved Desktop remote profile id does not match project remote_profile.")
     paths = DesktopProjectConfigPaths(
         science_config_path=science_path,
         remote_profile_path=profile_path,

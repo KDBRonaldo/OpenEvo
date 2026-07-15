@@ -10,10 +10,8 @@ from desktop.sidecar.contracts.v1.models import (
     HostKeyAcceptV1,
     RemoteProfileV1,
 )
-from desktop.sidecar.native_credentials import NativeCredentialVault
 from desktop.sidecar.remote_lifecycle import (
     DesktopRemoteLifecycle,
-    NativeCredentialSshResolver,
     RemoteConnectionFailedError,
     RemoteCredentialUnavailableError,
     RemoteLifecycleSupersededError,
@@ -268,7 +266,7 @@ def test_existing_trust_connects_without_a_new_probe() -> None:
     assert host_keys.probes == []
 
 
-def test_native_credentials_fail_closed_until_the_broker_supplies_auth() -> None:
+def test_native_authentication_modes_fail_closed_in_release() -> None:
     host_keys = FakeHostKeys((_candidate(),))
     lifecycle = DesktopRemoteLifecycle(cast(object, host_keys))
 
@@ -278,22 +276,6 @@ def test_native_credentials_fail_closed_until_the_broker_supplies_auth() -> None
     assert lifecycle.snapshot().profile_id == "profile-1"
     assert lifecycle.snapshot().state == "failed"
     assert host_keys.probes == []
-
-
-def test_native_credential_resolver_projects_refs_only_inside_sidecar_memory() -> None:
-    vault = NativeCredentialVault()
-    vault.replace(
-        "profile-1",
-        authentication_kind="native_password",
-        password=bytearray(b"credential-canary"),
-    )
-    resolver = NativeCredentialSshResolver(vault, helper_executable="/bin/false")
-
-    auth = resolver.auth_for_profile(_profile(authentication_kind="native_password"))
-
-    assert auth.method == "password_ref"
-    assert auth.password_ref == "native-profile:profile-1"
-    assert "credential-canary" not in repr(auth)
 
 
 def test_replacement_closes_active_transport_before_credential_resolution() -> None:

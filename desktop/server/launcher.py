@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import base64
-from collections import deque
 from typing import Annotated, Callable
 from dataclasses import dataclass, field
 import json
-from hashlib import sha256
 from pathlib import Path
 import re
 import secrets
@@ -27,8 +24,6 @@ from desktop.sidecar.native_workspace import (
     NativeWorkspaceArchiveError,
     prepare_native_workspace,
 )
-from desktop.sidecar.native_credentials import NativeCredentialError
-from desktop.sidecar.provider_store import ProviderStoreError, ResourceNotFoundError
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import NATIVE_SIDECAR_PROTOCOL
 from desktop.sidecar.release_runtime import bundled_core_asset_root
@@ -54,11 +49,8 @@ _NATIVE_SESSION_PROBE_ROUTE = "/openevo-native/session"
 _NATIVE_WORKSPACE_IMPORT_ROUTE = "/openevo-native/workspace-imports"
 _NATIVE_WORKSPACE_CANCEL_ROUTE = "/openevo-native/workspace-imports/cancel"
 _NATIVE_WORKSPACE_DISCARD_ROUTE = "/openevo-native/workspace-imports/discard"
-_NATIVE_CREDENTIAL_ROUTE = "/openevo-native/credentials"
 _NATIVE_WORKSPACE_REQUEST_MAX_BYTES = 8192
-_NATIVE_CREDENTIAL_REQUEST_MAX_BYTES = 1_450_000
 _MAX_NATIVE_WORKSPACE_OPERATIONS = 64
-_MAX_NATIVE_CREDENTIAL_DELIVERIES = 512
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{7,40}")
 
 
@@ -82,7 +74,7 @@ _NativeText = Annotated[
 
 
 class _NativeWorkspaceImportRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
 
     schema_version: Literal["1"]
     kind: Literal["native_folder_snapshot"]
@@ -95,11 +87,16 @@ class _NativeWorkspaceImportRequest(BaseModel):
             pattern=r"^[^\x00-\x20\x7f](?:[^\x00-\x1f\x7f]*[^\x00-\x20\x7f])?$",
         ),
     ]
-    selected_path: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=4096)]
+    selected_path: Annotated[
+        str,
+        Field(repr=False),
+        StringConstraints(strict=True, min_length=1, max_length=4096),
+    ]
     selected_device: Annotated[int, Field(strict=True, ge=0, le=2**64 - 1)]
     selected_inode: Annotated[int, Field(strict=True, ge=1, le=2**64 - 1)]
     cancellation_token: Annotated[
         str,
+        Field(repr=False),
         StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
     ]
     project_id: _NativeText | None = None
@@ -117,7 +114,7 @@ class _NativeWorkspaceImportResponse(BaseModel):
 
 
 class _NativeWorkspaceDiscardRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
 
     schema_version: Literal["1"]
     action_id: Annotated[
@@ -132,13 +129,14 @@ class _NativeWorkspaceDiscardRequest(BaseModel):
     import_ref: WorkspaceImportRefV1
     lease_token: Annotated[
         str,
+        Field(repr=False),
         StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
     ]
     project_id: _NativeText | None = None
 
 
 class _NativeWorkspaceCancelRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
 
     schema_version: Literal["1"]
     action_id: Annotated[
@@ -152,42 +150,9 @@ class _NativeWorkspaceCancelRequest(BaseModel):
     ]
     cancellation_token: Annotated[
         str,
+        Field(repr=False),
         StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
     ]
-
-
-class _NativeCredentialRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    schema_version: Literal["1"]
-    delivery_id: Annotated[
-        str,
-        StringConstraints(strict=True, pattern=r"^[0-9a-f]{32}$"),
-    ]
-    profile_id: _NativeText
-    expected_etag: Annotated[
-        str,
-        StringConstraints(strict=True, pattern=r'^"[0-9a-f]{64}"$'),
-    ] | None = None
-    operation: Literal["replace", "delete"]
-    authentication_kind: Literal[
-        "native_private_key",
-        "native_password",
-    ]
-    slot_kind: Literal[
-        "ssh_password",
-        "ssh_private_key",
-        "ssh_private_key_passphrase",
-    ] | None = None
-    password_b64: Annotated[str, StringConstraints(strict=True, max_length=21_848)] | None = None
-    private_key_b64: Annotated[
-        str,
-        StringConstraints(strict=True, max_length=1_398_104),
-    ] | None = None
-    passphrase_b64: Annotated[
-        str,
-        StringConstraints(strict=True, max_length=21_848),
-    ] | None = None
 
 
 @dataclass(frozen=True)
@@ -244,35 +209,6 @@ class _NativeWorkspaceOperations:
                 del self._active[operation.action_id]
 
 
-class _NativeCredentialDeliveries:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._responses: dict[str, tuple[str, dict[str, object]]] = {}
-        self._order: deque[str] = deque()
-
-    def replay(self, delivery_id: str, digest: str) -> dict[str, object] | None:
-        with self._lock:
-            existing = self._responses.get(delivery_id)
-            if existing is None:
-                return None
-            if not secrets.compare_digest(existing[0], digest):
-                raise ValueError("native credential delivery identity conflicts")
-            return existing[1]
-
-    def remember(self, delivery_id: str, digest: str, response: dict[str, object]) -> None:
-        with self._lock:
-            existing = self._responses.get(delivery_id)
-            if existing is not None:
-                if not secrets.compare_digest(existing[0], digest):
-                    raise ValueError("native credential delivery identity conflicts")
-                return
-            while len(self._responses) >= _MAX_NATIVE_CREDENTIAL_DELIVERIES:
-                oldest = self._order.popleft()
-                self._responses.pop(oldest, None)
-            self._responses[delivery_id] = (digest, response)
-            self._order.append(delivery_id)
-
-
 def create_app(
     *,
     static_root: Path | str | None = None,
@@ -303,8 +239,6 @@ def create_app(
     expected_handoff_token = native_frame.handoff_token.encode("ascii")
     workspace_import_store = app.state.desktop_release_provider.workspace_import_store
     workspace_operations = _NativeWorkspaceOperations()
-    credential_deliveries = _NativeCredentialDeliveries()
-    native_credentials = app.state.native_credentials
 
     @app.get(
         _NATIVE_SESSION_PROBE_ROUTE,
@@ -453,107 +387,6 @@ def create_app(
             return _native_workspace_error(status_code=409)
         return Response(status_code=204)
 
-    @app.post(
-        _NATIVE_CREDENTIAL_ROUTE,
-        include_in_schema=False,
-        status_code=200,
-    )
-    async def native_credential_delivery(request: Request) -> Response:
-        if not _native_credential_matches(
-            request,
-            header_name=_NATIVE_HANDOFF_HEADER_BYTES,
-            expected=expected_handoff_token,
-        ):
-            return _native_credential_error(status_code=403)
-        content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
-        if content_type != "application/json":
-            return _native_credential_error(status_code=415)
-        password: bytearray | None = None
-        private_key: bytearray | None = None
-        passphrase: bytearray | None = None
-        try:
-            encoded = await _read_bounded_native_body(
-                request,
-                max_bytes=_NATIVE_CREDENTIAL_REQUEST_MAX_BYTES,
-            )
-            document = json.loads(
-                encoded.decode("utf-8", errors="strict"),
-                object_pairs_hook=_strict_json_object,
-            )
-            parsed = _NativeCredentialRequest.model_validate(document)
-            delivery_digest = sha256(encoded).hexdigest()
-            replayed = credential_deliveries.replay(parsed.delivery_id, delivery_digest)
-            if replayed is not None:
-                return JSONResponse(status_code=200, content=replayed)
-            try:
-                profile = app.state.desktop_release_provider.native_credential_profile(
-                    parsed.profile_id
-                )
-            except ResourceNotFoundError:
-                return _native_credential_error(status_code=404)
-            if profile.authentication_kind != parsed.authentication_kind:
-                return _native_credential_error(status_code=410)
-            if parsed.expected_etag is not None and profile.etag != parsed.expected_etag:
-                return _native_credential_error(status_code=409)
-            if parsed.operation == "replace":
-                if parsed.slot_kind is not None:
-                    raise ValueError("native credential replacement must be profile-complete")
-                password = _decode_native_secret(parsed.password_b64)
-                private_key = _decode_native_secret(parsed.private_key_b64)
-                passphrase = _decode_native_secret(parsed.passphrase_b64)
-                statuses = native_credentials.replace(
-                    parsed.profile_id,
-                    authentication_kind=parsed.authentication_kind,
-                    password=password,
-                    private_key=private_key,
-                    passphrase=passphrase,
-                )
-                password = private_key = passphrase = None
-            else:
-                if parsed.slot_kind is None or any(
-                    value is not None
-                    for value in (
-                        parsed.password_b64,
-                        parsed.private_key_b64,
-                        parsed.passphrase_b64,
-                    )
-                ):
-                    raise ValueError("native credential deletion must identify one slot")
-                statuses = native_credentials.delete_slot(
-                    parsed.profile_id,
-                    parsed.slot_kind,
-                )
-                if not statuses:
-                    statuses = native_credentials.statuses_for(
-                        parsed.profile_id,
-                        parsed.authentication_kind,
-                    )
-            updated = app.state.desktop_release_provider.set_native_credential_slots(
-                parsed.profile_id,
-                statuses,
-                expected_etag=parsed.expected_etag,
-            )
-            response = updated.model_dump(mode="json")
-            credential_deliveries.remember(
-                parsed.delivery_id,
-                delivery_digest,
-                response,
-            )
-        except (
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-            ValueError,
-            ValidationError,
-            NativeCredentialError,
-            ProviderStoreError,
-            OSError,
-        ):
-            _zero_native_secret(password)
-            _zero_native_secret(private_key)
-            _zero_native_secret(passphrase)
-            return _native_credential_error(status_code=409)
-        return JSONResponse(status_code=200, content=response)
-
     return create_desktop_app(app, static_root=static_root)
 
 
@@ -598,30 +431,6 @@ def _native_workspace_cancelled() -> JSONResponse:
             "message": "OpenEvo Desktop cancelled the selected research folder import.",
         },
     )
-
-
-def _native_credential_error(*, status_code: int) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "code": "native_credential_failed",
-            "message": "OpenEvo Desktop could not update the selected SSH credential.",
-        },
-    )
-
-
-def _decode_native_secret(value: str | None) -> bytearray | None:
-    if value is None:
-        return None
-    try:
-        return bytearray(base64.b64decode(value, validate=True))
-    except (ValueError, base64.binascii.Error) as exc:
-        raise ValueError("native credential encoding is invalid") from exc
-
-
-def _zero_native_secret(value: bytearray | None) -> None:
-    if value is not None:
-        value[:] = b"\x00" * len(value)
 
 
 def _ingest_native_workspace(

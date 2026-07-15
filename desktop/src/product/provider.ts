@@ -135,8 +135,6 @@ export interface DesktopProductProvider {
   subscribe(listener: (signal: ProductSubscriptionSignal) => void): () => void;
   createProfile(input: ProfileCreateV1, intent: ProductMutationIntent): Promise<RemoteProfileV1>;
   updateProfile(profileId: string, input: ProfilePatchV1, intent: ProductResourceMutationIntent): Promise<RemoteProfileV1>;
-  configureCredential(profileId: string, slotKind: RemoteProfileV1["credential_slots"][number]["kind"], intent: ProductResourceMutationIntent): Promise<RemoteProfileV1>;
-  clearCredential(profileId: string, slotKind: RemoteProfileV1["credential_slots"][number]["kind"], intent: ProductResourceMutationIntent): Promise<RemoteProfileV1>;
   connectProfile(profileId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   acceptHostKey(profileId: string, input: HostKeyAcceptV1, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   createProject(input: ProjectCreateV1, intent: ProductMutationIntent): Promise<ProjectV1>;
@@ -179,8 +177,6 @@ export const unavailableDesktopProductProvider: DesktopProductProvider = {
   },
   createProfile: unavailable,
   updateProfile: unavailable,
-  configureCredential: unavailable,
-  clearCredential: unavailable,
   connectProfile: unavailable,
   acceptHostKey: unavailable,
   createProject: unavailable,

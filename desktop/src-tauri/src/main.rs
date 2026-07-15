@@ -15,9 +15,6 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
-use credential_vault::{CredentialBundle, CredentialManager};
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -26,9 +23,6 @@ use sha2::{Digest, Sha256};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tempfile::TempDir;
-use zeroize::Zeroizing;
-
-mod credential_vault;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("OpenEvo Desktop native sidecar FD execution supports only Linux and macOS");
@@ -45,7 +39,6 @@ const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
 const NATIVE_WORKSPACE_IMPORT_ROUTE: &str = "/openevo-native/workspace-imports";
 const NATIVE_WORKSPACE_CANCEL_ROUTE: &str = "/openevo-native/workspace-imports/cancel";
 const NATIVE_WORKSPACE_DISCARD_ROUTE: &str = "/openevo-native/workspace-imports/discard";
-const NATIVE_CREDENTIAL_ROUTE: &str = "/openevo-native/credentials";
 const NATIVE_SESSION_HEADER: &str = "X-OpenEvo-Desktop-Session";
 const NATIVE_HANDOFF_HEADER: &str = "X-OpenEvo-Native-Handoff";
 const NATIVE_LISTENER_FD_ENV: &str = "OPENEVO_NATIVE_LISTENER_FD";
@@ -66,11 +59,6 @@ const SIDECAR_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const SIDECAR_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
 const NATIVE_WORKSPACE_RESPONSE_MAX_BYTES: usize = 8192;
-const NATIVE_CREDENTIAL_RESPONSE_MAX_BYTES: usize = 64 * 1024;
-const NATIVE_CREDENTIAL_BODY_MAX_BYTES: usize = 1_450_000;
-#[cfg(target_os = "macos")]
-const NATIVE_SECRET_MAX_BYTES: usize = 16 * 1024;
-const NATIVE_CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const NATIVE_WORKSPACE_IMPORT_TIMEOUT: Duration = Duration::from_secs(300);
 const NATIVE_WORKSPACE_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
 const NATIVE_WORKSPACE_CANCEL_GRACE: Duration = Duration::from_secs(3);
@@ -624,7 +612,7 @@ struct NegotiatedContractV1 {
     feature_flags: Vec<FeatureFlagV1>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 struct DesktopBootstrapContextV1 {
     schema_version: &'static str,
     endpoint: String,
@@ -637,7 +625,7 @@ struct HostStatus {
     state: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct NativeWorkspaceImportRequest<'a> {
     schema_version: &'static str,
     kind: &'static str,
@@ -650,7 +638,7 @@ struct NativeWorkspaceImportRequest<'a> {
     project_id: Option<&'a str>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct NativeWorkspaceCancelRequestV1<'a> {
     schema_version: &'static str,
     action_id: &'a str,
@@ -684,7 +672,7 @@ struct NativeProjectSourceV1 {
     import_ref: NativeWorkspaceImportRefV1,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeWorkspaceImportResponseV1 {
     schema_version: String,
@@ -692,7 +680,7 @@ struct NativeWorkspaceImportResponseV1 {
     lease_token: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct NativeWorkspaceDiscardRequestV1<'a> {
     schema_version: &'static str,
     action_id: &'a str,
@@ -702,29 +690,7 @@ struct NativeWorkspaceDiscardRequestV1<'a> {
     project_id: Option<&'a str>,
 }
 
-#[derive(Debug, Serialize)]
-struct NativeCredentialRequestV1<'a> {
-    schema_version: &'static str,
-    delivery_id: &'a str,
-    profile_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected_etag: Option<&'a str>,
-    operation: &'a str,
-    authentication_kind: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    slot_kind: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    password_b64: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    private_key_b64: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    passphrase_b64: Option<&'a str>,
-}
-
-#[derive(Clone)]
-struct DesktopCredentialState(Arc<CredentialManager>);
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct PendingNativeWorkspaceImport {
     sidecar_instance: [u8; INSTANCE_ID_BYTES],
     action_id: String,
@@ -2522,7 +2488,6 @@ fn pre_exec_error() -> std::io::Error {
     std::io::Error::from_raw_os_error(libc::EIO)
 }
 
-#[derive(Debug)]
 struct LoopbackHttpResponse {
     status: u16,
     body: String,
@@ -3107,178 +3072,6 @@ fn discard_native_workspace_source(
         return Err(workspace_import_error());
     }
     Ok(())
-}
-
-fn replace_native_credentials(
-    stream: &mut TcpStream,
-    handoff_token: &str,
-    bundle: &CredentialBundle,
-    expected_etag: Option<&str>,
-) -> HostResult<(u16, Option<serde_json::Value>)> {
-    let password_b64 = bundle
-        .password
-        .as_ref()
-        .map(|value| Zeroizing::new(BASE64_STANDARD.encode(value.as_slice())));
-    let private_key_b64 = bundle
-        .private_key
-        .as_ref()
-        .map(|value| Zeroizing::new(BASE64_STANDARD.encode(value.as_slice())));
-    let passphrase_b64 = bundle
-        .passphrase
-        .as_ref()
-        .map(|value| Zeroizing::new(BASE64_STANDARD.encode(value.as_slice())));
-    send_native_credential_request(
-        stream,
-        handoff_token,
-        &bundle.record,
-        expected_etag,
-        "replace",
-        None,
-        password_b64.as_deref().map(String::as_str),
-        private_key_b64.as_deref().map(String::as_str),
-        passphrase_b64.as_deref().map(String::as_str),
-    )
-}
-
-fn delete_native_credential(
-    stream: &mut TcpStream,
-    handoff_token: &str,
-    record: &credential_vault::CredentialRecord,
-    expected_etag: &str,
-    slot_kind: &str,
-) -> HostResult<serde_json::Value> {
-    let (status, profile) = send_native_credential_request(
-        stream,
-        handoff_token,
-        record,
-        Some(expected_etag),
-        "delete",
-        Some(slot_kind),
-        None,
-        None,
-        None,
-    )?;
-    if status != 200 {
-        return Err(native_credential_error());
-    }
-    profile.ok_or_else(native_credential_error)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn send_native_credential_request(
-    stream: &mut TcpStream,
-    handoff_token: &str,
-    record: &credential_vault::CredentialRecord,
-    expected_etag: Option<&str>,
-    operation: &str,
-    slot_kind: Option<&str>,
-    password_b64: Option<&str>,
-    private_key_b64: Option<&str>,
-    passphrase_b64: Option<&str>,
-) -> HostResult<(u16, Option<serde_json::Value>)> {
-    if !is_valid_native_text(&record.profile_id)
-        || !matches!(
-            record.authentication_kind.as_str(),
-            "native_password" | "native_private_key"
-        )
-        || !matches!(operation, "replace" | "delete")
-        || expected_etag.is_some_and(|etag| !is_valid_etag(etag))
-    {
-        return Err(native_credential_error());
-    }
-    let mut delivery = [0_u8; 16];
-    OsRng
-        .try_fill_bytes(&mut delivery)
-        .map_err(|_| native_credential_error())?;
-    let delivery_id = encode_hex(&delivery);
-    let request = NativeCredentialRequestV1 {
-        schema_version: "1",
-        delivery_id: &delivery_id,
-        profile_id: &record.profile_id,
-        expected_etag,
-        operation,
-        authentication_kind: &record.authentication_kind,
-        slot_kind,
-        password_b64,
-        private_key_b64,
-        passphrase_b64,
-    };
-    let body = Zeroizing::new(serde_json::to_vec(&request).map_err(|_| native_credential_error())?);
-    if body.len() > NATIVE_CREDENTIAL_BODY_MAX_BYTES {
-        return Err(native_credential_error());
-    }
-    let response = loopback_http_request_on_stream(
-        stream,
-        "POST",
-        NATIVE_CREDENTIAL_ROUTE,
-        Some((NATIVE_HANDOFF_HEADER, handoff_token)),
-        Some(body.as_slice()),
-        Instant::now() + NATIVE_CREDENTIAL_TIMEOUT,
-        NATIVE_CREDENTIAL_RESPONSE_MAX_BYTES,
-    )
-    .map_err(|_| native_credential_error())?;
-    if response.status != 200 {
-        return Ok((response.status, None));
-    }
-    let profile: serde_json::Value =
-        serde_json::from_str(&response.body).map_err(|_| native_credential_error())?;
-    validate_native_credential_profile(&profile, &record.profile_id)?;
-    Ok((response.status, Some(profile)))
-}
-
-fn validate_native_credential_profile(
-    profile: &serde_json::Value,
-    expected_profile_id: &str,
-) -> HostResult<()> {
-    let object = profile.as_object().ok_or_else(native_credential_error)?;
-    if object.get("profile_id").and_then(serde_json::Value::as_str) != Some(expected_profile_id)
-        || object
-            .get("credential_slots")
-            .and_then(serde_json::Value::as_array)
-            .is_none()
-        || contains_private_credential_key(profile)
-    {
-        return Err(native_credential_error());
-    }
-    Ok(())
-}
-
-fn contains_private_credential_key(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
-            matches!(
-                key.as_str(),
-                "password"
-                    | "password_b64"
-                    | "password_ref"
-                    | "private_key"
-                    | "private_key_b64"
-                    | "private_key_path"
-                    | "passphrase"
-                    | "passphrase_b64"
-                    | "passphrase_ref"
-                    | "token"
-                    | "selected_path"
-            ) || contains_private_credential_key(value)
-        }),
-        serde_json::Value::Array(values) => values.iter().any(contains_private_credential_key),
-        _ => false,
-    }
-}
-
-fn is_valid_etag(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 66
-        && bytes.first() == Some(&b'"')
-        && bytes.last() == Some(&b'"')
-        && bytes[1..65].iter().copied().all(is_lower_hex)
-}
-
-fn native_credential_error() -> NativeHostError {
-    NativeHostError::new(
-        "native_credential_unavailable",
-        "OpenEvo Desktop could not update the selected SSH credential.",
-    )
 }
 
 fn validate_native_project_source(source: &NativeProjectSourceV1) -> HostResult<()> {
@@ -4854,15 +4647,9 @@ fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStat
 fn start_sidecar(
     _app: tauri::AppHandle,
     state: tauri::State<'_, DesktopHostState>,
-    credentials: tauri::State<'_, DesktopCredentialState>,
 ) -> HostResult<DesktopBootstrapContextV1> {
     let bundled_path = bundled_sidecar_path();
-    let context = start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref())?;
-    if let Err(error) = rehydrate_native_credentials(&state, &credentials.0) {
-        let _ = stop_sidecar_inner(&state);
-        return Err(error);
-    }
-    Ok(context)
+    start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref())
 }
 
 #[tauri::command]
@@ -5039,232 +4826,6 @@ async fn settle_project_source(
     Ok(())
 }
 
-#[tauri::command(rename_all = "camelCase")]
-async fn configure_credential(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DesktopHostState>,
-    credentials: tauri::State<'_, DesktopCredentialState>,
-    profile_id: String,
-    slot_kind: String,
-    etag: String,
-    action_id: String,
-) -> HostResult<serde_json::Value> {
-    validate_native_credential_action(&profile_id, &slot_kind, &etag, &action_id)?;
-    let expected_instance = active_sidecar_instance(&state)?;
-    let manager = Arc::clone(&credentials.0);
-    match slot_kind.as_str() {
-        "ssh_password" | "ssh_private_key_passphrase" => {
-            let prompt_kind = slot_kind.clone();
-            let secret =
-                tauri::async_runtime::spawn_blocking(move || collect_native_secret(&prompt_kind))
-                    .await
-                    .map_err(|_| native_credential_error())??;
-            if slot_kind == "ssh_password" {
-                manager
-                    .configure_password(&profile_id, secret)
-                    .map_err(|_| native_credential_error())?;
-            } else {
-                manager
-                    .configure_passphrase(&profile_id, secret)
-                    .map_err(|_| native_credential_error())?;
-            }
-        }
-        "ssh_private_key" => {
-            let selected = tauri::async_runtime::spawn_blocking(move || {
-                app.dialog().file().blocking_pick_file()
-            })
-            .await
-            .map_err(|_| native_credential_error())?
-            .ok_or_else(native_credential_error)?
-            .into_path()
-            .map_err(|_| native_credential_error())?;
-            manager
-                .configure_private_key(&profile_id, &selected)
-                .map_err(|_| native_credential_error())?;
-        }
-        _ => return Err(native_credential_error()),
-    }
-    let bundle = manager
-        .bundle(&profile_id)
-        .map_err(|_| native_credential_error())?;
-    if !credential_bundle_is_complete(&bundle) {
-        return Err(native_credential_error());
-    }
-    let ActiveSidecarConnection {
-        mut stream,
-        handoff_token,
-    } = active_sidecar_connection(&state, expected_instance)?;
-    let (status, profile) = tauri::async_runtime::spawn_blocking(move || {
-        replace_native_credentials(&mut stream, handoff_token.expose(), &bundle, Some(&etag))
-    })
-    .await
-    .map_err(|_| native_credential_error())??;
-    if status != 200 {
-        return Err(native_credential_error());
-    }
-    profile.ok_or_else(native_credential_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-async fn clear_credential(
-    state: tauri::State<'_, DesktopHostState>,
-    credentials: tauri::State<'_, DesktopCredentialState>,
-    profile_id: String,
-    slot_kind: String,
-    etag: String,
-    action_id: String,
-) -> HostResult<serde_json::Value> {
-    validate_native_credential_action(&profile_id, &slot_kind, &etag, &action_id)?;
-    let expected_instance = active_sidecar_instance(&state)?;
-    credentials
-        .0
-        .clear_slot(&profile_id, &slot_kind)
-        .map_err(|_| native_credential_error())?;
-    let record = credentials
-        .0
-        .records()
-        .map_err(|_| native_credential_error())?
-        .into_iter()
-        .find(|record| record.profile_id == profile_id)
-        .ok_or_else(native_credential_error)?;
-    let ActiveSidecarConnection {
-        mut stream,
-        handoff_token,
-    } = active_sidecar_connection(&state, expected_instance)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        delete_native_credential(
-            &mut stream,
-            handoff_token.expose(),
-            &record,
-            &etag,
-            &slot_kind,
-        )
-    })
-    .await
-    .map_err(|_| native_credential_error())?
-}
-
-fn rehydrate_native_credentials(
-    state: &DesktopHostState,
-    credentials: &CredentialManager,
-) -> HostResult<()> {
-    let expected_instance = active_sidecar_instance(state)?;
-    for record in credentials
-        .records()
-        .map_err(|_| native_credential_error())?
-    {
-        let bundle = credentials
-            .bundle(&record.profile_id)
-            .map_err(|_| native_credential_error())?;
-        if !credential_bundle_is_complete(&bundle) {
-            let required_slot = match record.authentication_kind.as_str() {
-                "native_password" => "ssh_password",
-                "native_private_key" => "ssh_private_key",
-                _ => return Err(native_credential_error()),
-            };
-            credentials
-                .clear_slot(&record.profile_id, required_slot)
-                .map_err(|_| native_credential_error())?;
-            continue;
-        }
-        let ActiveSidecarConnection {
-            mut stream,
-            handoff_token,
-        } = active_sidecar_connection(state, expected_instance)?;
-        let (status, _profile) =
-            replace_native_credentials(&mut stream, handoff_token.expose(), &bundle, None)?;
-        if matches!(status, 404 | 410) {
-            credentials
-                .remove_profile(&record.profile_id)
-                .map_err(|_| native_credential_error())?;
-        } else if status != 200 {
-            return Err(native_credential_error());
-        }
-    }
-    Ok(())
-}
-
-fn credential_bundle_is_complete(bundle: &CredentialBundle) -> bool {
-    match bundle.record.authentication_kind.as_str() {
-        "native_password" => bundle.password.is_some(),
-        "native_private_key" => bundle.private_key.is_some(),
-        _ => false,
-    }
-}
-
-fn validate_native_credential_action(
-    profile_id: &str,
-    slot_kind: &str,
-    etag: &str,
-    action_id: &str,
-) -> HostResult<()> {
-    if !is_valid_native_text(profile_id)
-        || !matches!(
-            slot_kind,
-            "ssh_password" | "ssh_private_key" | "ssh_private_key_passphrase"
-        )
-        || !is_valid_etag(etag)
-        || action_id.len() < 16
-        || !is_valid_native_text(action_id)
-    {
-        return Err(native_credential_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn collect_native_secret(slot_kind: &str) -> HostResult<Zeroizing<Vec<u8>>> {
-    let prompt = match slot_kind {
-        "ssh_password" => "Enter the SSH password for this remote workspace.",
-        "ssh_private_key_passphrase" => "Enter the passphrase for the selected SSH key.",
-        _ => return Err(native_credential_error()),
-    };
-    let script = format!(
-        "set promptResult to display dialog {} default answer \"\" with hidden answer buttons {{\"Cancel\", \"Save\"}} default button \"Save\" cancel button \"Cancel\"\nreturn text returned of promptResult\n",
-        serde_json::to_string(prompt).map_err(|_| native_credential_error())?
-    );
-    let mut child = Command::new("/usr/bin/osascript")
-        .arg("-")
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| native_credential_error())?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(native_credential_error)?
-        .write_all(script.as_bytes())
-        .map_err(|_| native_credential_error())?;
-    let stdout = child.stdout.take().ok_or_else(native_credential_error)?;
-    let mut secret = Zeroizing::new(Vec::with_capacity(256));
-    stdout
-        .take((NATIVE_SECRET_MAX_BYTES + 2) as u64)
-        .read_to_end(&mut secret)
-        .map_err(|_| native_credential_error())?;
-    let status = child.wait().map_err(|_| native_credential_error())?;
-    while secret
-        .last()
-        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
-    {
-        secret.pop();
-    }
-    if !status.success()
-        || secret.is_empty()
-        || secret.len() > NATIVE_SECRET_MAX_BYTES
-        || secret.contains(&0)
-    {
-        return Err(native_credential_error());
-    }
-    Ok(secret)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn collect_native_secret(_slot_kind: &str) -> HostResult<Zeroizing<Vec<u8>>> {
-    Err(native_credential_error())
-}
-
 fn sidecar_state_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_state_unavailable",
@@ -5283,17 +4844,6 @@ fn main() {
     let app = match tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(DesktopHostState::default())
-        .setup(|app| {
-            let root = app
-                .path()
-                .app_local_data_dir()
-                .map_err(|_| std::io::Error::other("native credential root unavailable"))?
-                .join("native-credentials-v1");
-            let credentials = CredentialManager::open(root)
-                .map_err(|_| std::io::Error::other("native credential registry unavailable"))?;
-            app.manage(DesktopCredentialState(Arc::new(credentials)));
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![
             host_status,
             start_sidecar,
@@ -5301,9 +4851,7 @@ fn main() {
             renderer_ready,
             select_project_source,
             cancel_project_source,
-            settle_project_source,
-            configure_credential,
-            clear_credential
+            settle_project_source
         ])
         .build(tauri::generate_context!())
     {
@@ -5340,6 +4888,13 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::{mpsc, Arc, Barrier, Mutex};
+
+    fn expect_host_error<T>(result: HostResult<T>) -> NativeHostError {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("operation unexpectedly succeeded"),
+        }
+    }
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -6334,7 +5889,7 @@ mod tests {
         });
         let started = Instant::now();
 
-        let error = loopback_http_request(
+        let error = expect_host_error(loopback_http_request(
             port,
             "GET",
             "/health",
@@ -6342,8 +5897,7 @@ mod tests {
             None,
             Duration::from_millis(60),
             1024,
-        )
-        .unwrap_err();
+        ));
         server.join().unwrap();
 
         assert_eq!(error.code, "sidecar_health_unavailable");
@@ -6557,7 +6111,7 @@ mod tests {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let started = Instant::now();
 
-        let error = register_native_workspace_source(
+        let error = expect_host_error(register_native_workspace_source(
             &mut stream,
             &"8d".repeat(HANDOFF_TOKEN_BYTES),
             NativeWorkspaceSelection {
@@ -6569,8 +6123,7 @@ mod tests {
                 project_id: None,
             },
             &operation,
-        )
-        .unwrap_err();
+        ));
         drop(stream);
         cancel_thread.join().unwrap();
         server.join().unwrap();
@@ -6870,7 +6423,7 @@ mod tests {
 
             let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
             let operation = test_picker_operation("native-source-action-0002");
-            let error = register_native_workspace_source(
+            let error = expect_host_error(register_native_workspace_source(
                 &mut stream,
                 &"7c".repeat(SESSION_TOKEN_BYTES),
                 NativeWorkspaceSelection {
@@ -6882,8 +6435,7 @@ mod tests {
                     project_id: None,
                 },
                 &operation,
-            )
-            .unwrap_err();
+            ));
             server.join().unwrap();
 
             assert_eq!(error.code, "workspace_import_failed");
@@ -7246,7 +6798,7 @@ mod tests {
             Ordering::Release,
         );
 
-        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        let error = expect_host_error(start_sidecar_inner(&state, LaunchPolicy::Release, None));
 
         assert_eq!(error.code, "bundled_sidecar_missing");
         assert!(state.sidecar.lock().unwrap().is_none());
@@ -7551,7 +7103,7 @@ mod tests {
             assert!(managed.spawn_pending);
             assert!(managed.child.is_none());
         }
-        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        let error = expect_host_error(start_sidecar_inner(&state, LaunchPolicy::Release, None));
         assert_eq!(error.code, "sidecar_start_in_progress");
 
         assert_eq!(stop_sidecar_inner(&state).unwrap().state, "stopped");
@@ -7595,7 +7147,7 @@ mod tests {
             assert_owned_resources(managed, &private_root, listener_port);
         }
 
-        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        let error = expect_host_error(start_sidecar_inner(&state, LaunchPolicy::Release, None));
         assert_eq!(error.code, "sidecar_stop_failed_owned");
         assert!(private_root.exists());
 
@@ -7631,13 +7183,12 @@ mod tests {
         let (managed, private_root, listener_port) = managed_test_sidecar();
         *state.sidecar.lock().unwrap() = Some(managed);
 
-        let error = start_sidecar_inner_with(
+        let error = expect_host_error(start_sidecar_inner_with(
             &state,
             LaunchPolicy::Release,
             None,
             &ScriptedProcessControl::wait_failure(),
-        )
-        .unwrap_err();
+        ));
 
         assert_eq!(error.code, "sidecar_process_inspection_failed");
         {
@@ -7679,7 +7230,7 @@ mod tests {
         assert_managed_resources(managed, &private_root, listener_port);
         drop(guard);
 
-        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        let error = expect_host_error(start_sidecar_inner(&state, LaunchPolicy::Release, None));
         assert_eq!(error.code, "sidecar_start_in_progress");
         stop_sidecar_inner(&state).unwrap();
         assert!(!private_root.exists());
@@ -7797,7 +7348,7 @@ mod tests {
         }
         assert!(state.spawn_handoff.lock().unwrap().is_none());
         drop(startup_claim);
-        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        let error = expect_host_error(start_sidecar_inner(&state, LaunchPolicy::Release, None));
         assert_eq!(error.code, "sidecar_stop_failed_owned");
         assert_eq!(stop_sidecar_inner(&state).unwrap().state, "stopped");
         assert!(state.sidecar.lock().unwrap().is_none());
@@ -7836,7 +7387,7 @@ mod tests {
             assert_eq!(managed.lifecycle, ManagedLifecycle::CleanupPending);
             assert_owned_resources(managed, &private_root, listener_port);
         }
-        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        let error = expect_host_error(start_sidecar_inner(&state, LaunchPolicy::Release, None));
         assert_eq!(error.code, "sidecar_stop_failed_owned");
         stop_sidecar_inner(&state).unwrap();
         assert!(!private_root.exists());
@@ -7932,8 +7483,11 @@ mod tests {
         managed.status.state = "starting".to_string();
         managed.status.url = None;
         *state.sidecar.lock().unwrap() = Some(managed);
-        let error = publish_sidecar_gated(&state, startup_epoch, test_bootstrap_state())
-            .expect_err("cancelled startup must not publish");
+        let error = expect_host_error(publish_sidecar_gated(
+            &state,
+            startup_epoch,
+            test_bootstrap_state(),
+        ));
         assert_eq!(error.code, "sidecar_start_cancelled");
         drop(startup_claim);
         stop_sidecar_inner(&state).unwrap();

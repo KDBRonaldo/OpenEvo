@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import Literal
 
 from openevo.deployment.profile import RemoteProfileConfig
+from openevo.deployment.system_executables import (
+    SSH_KEYSCAN_EXECUTABLE,
+    VerifiedSystemExecutable,
+)
 
 HostKeyAlgorithm = Literal[
     "ssh-ed25519",
@@ -230,7 +234,7 @@ class ProviderKnownHostStore:
         _validate_profile_identity(profile)
         keyscan_timeout = _keyscan_timeout(timeout_seconds)
         argv = [
-            "ssh-keyscan",
+            SSH_KEYSCAN_EXECUTABLE,
             "-T",
             str(keyscan_timeout),
             "-t",
@@ -1103,13 +1107,21 @@ def _request_tunnel_closure(store_key: tuple[int, int, str], profile_id: str) ->
 
 
 def _run_keyscan(argv: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        argv,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-    )
+    if not argv or argv[0] != SSH_KEYSCAN_EXECUTABLE:
+        raise ValueError("ssh-keyscan executable is not fixed")
+    with VerifiedSystemExecutable.open(SSH_KEYSCAN_EXECUTABLE) as executable:
+        completed = subprocess.run(
+            argv,
+            executable=executable.execution_path,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env={},
+            pass_fds=(executable.descriptor,),
+        )
+        executable.verify_path_binding()
+        return completed
 
 
 def _parse_keyscan_output(

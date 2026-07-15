@@ -226,12 +226,14 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       this.failProfileCreateWithUnknownError = false;
       throw new Error("profile response was lost");
     }
-    const credentialKinds = credentialKindsForProfile(input.authentication_kind ?? "ssh_agent", input.proxy);
+    if ((input.authentication_kind ?? "ssh_agent") !== "ssh_agent") {
+      throw new Error("SSH agent is the only authentication method supported by this release.");
+    }
     const profile = remoteProfileV1Schema.parse({
       schema_version: "1",
       profile_id: `profile-fixture-${this.profiles.length + 1}`,
       ...input,
-      credential_slots: credentialKinds.map((kind) => ({ kind, status: "empty", updated_at: null })),
+      credential_slots: [],
       connection_state: "disconnected",
       host_key_fingerprint: null,
       etag: ETAG_A,
@@ -269,15 +271,14 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     }
     const authenticationKind = input.authentication_kind ?? current.authentication_kind;
     const proxy = input.proxy ?? current.proxy;
-    const requiredKinds = credentialKindsForProfile(authenticationKind, proxy);
-    const credentialSlots = requiredKinds.map((kind) =>
-      current.credential_slots.find((slot) => slot.kind === kind) ?? { kind, status: "empty" as const, updated_at: null },
-    );
+    if (authenticationKind !== "ssh_agent") {
+      throw new Error("SSH agent is the only authentication method supported by this release.");
+    }
     const updated = remoteProfileV1Schema.parse({
       ...current,
       ...input,
       authentication_kind: authenticationKind,
-      credential_slots: credentialSlots,
+      credential_slots: [],
       proxy,
       etag: ETAG_D,
       updated_at: NOW,
@@ -287,50 +288,11 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(updated);
   }
 
-  async configureCredential(
-    profileId: string,
-    slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
-    intent: ProductResourceMutationIntent,
-  ): Promise<RemoteProfileV1> {
-    const current = this.requireProfile(profileId);
-    this.checkIntent(intent, `profile:credential:${profileId}:${slotKind}`, current.etag);
-    const slot = current.credential_slots.find((item) => item.kind === slotKind);
-    if (!slot) throw new Error("This credential is not used by the selected authentication method.");
-    const updated = remoteProfileV1Schema.parse({
-      ...current,
-      credential_slots: current.credential_slots.map((item) => item.kind === slotKind ? { ...item, status: "stored", updated_at: NOW } : item),
-      updated_at: NOW,
-      etag: ETAG_D,
-    });
-    this.profiles = this.profiles.map((profile) => profile.profile_id === profileId ? updated : profile);
-    this.emit();
-    return structuredClone(updated);
-  }
-
-  async clearCredential(
-    profileId: string,
-    slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
-    intent: ProductResourceMutationIntent,
-  ): Promise<RemoteProfileV1> {
-    const current = this.requireProfile(profileId);
-    this.checkIntent(intent, `profile:credential-clear:${profileId}:${slotKind}`, current.etag);
-    const updated = remoteProfileV1Schema.parse({
-      ...current,
-      credential_slots: current.credential_slots.map((item) => item.kind === slotKind ? { ...item, status: "empty", updated_at: NOW } : item),
-      updated_at: NOW,
-      etag: ETAG_D,
-    });
-    this.profiles = this.profiles.map((profile) => profile.profile_id === profileId ? updated : profile);
-    this.emit();
-    return structuredClone(updated);
-  }
-
   async connectProfile(profileId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
     const profile = this.requireProfile(profileId);
     this.checkIntent(intent, `profile:connect:${profileId}`, profile.etag);
-    const requiredCredential = credentialKindsForAuth(profile.authentication_kind)[0];
-    if (requiredCredential && profile.credential_slots.find((slot) => slot.kind === requiredCredential)?.status !== "stored") {
-      throw new Error("Configure the required credential before connecting.");
+    if (profile.authentication_kind !== "ssh_agent") {
+      throw new Error("SSH agent is the only authentication method supported by this release.");
     }
     this.activeOperation = this.makeOperation("profile_connect", "running", "Connecting securely", 1, 4);
     this.state = this.connectionState("connecting", { operationId: this.activeOperation.operation_id });
@@ -2123,25 +2085,6 @@ export function createFixtureDesktopProductProvider(
 
 function isTerminal(state: RunV1["status"]): boolean {
   return state === "succeeded" || state === "failed" || state === "cancelled";
-}
-
-function credentialKindsForAuth(
-  authenticationKind: RemoteProfileV1["authentication_kind"],
-): RemoteProfileV1["credential_slots"][number]["kind"][] {
-  if (authenticationKind === "native_password") return ["ssh_password"];
-  if (authenticationKind === "native_private_key") return ["ssh_private_key", "ssh_private_key_passphrase"];
-  return [];
-}
-
-function credentialKindsForProfile(
-  authenticationKind: RemoteProfileV1["authentication_kind"],
-  proxy: { http_url?: string | null; https_url?: string | null } | undefined,
-): RemoteProfileV1["credential_slots"][number]["kind"][] {
-  return [
-    ...credentialKindsForAuth(authenticationKind),
-    ...(proxy?.http_url ? ["http_proxy_password" as const] : []),
-    ...(proxy?.https_url ? ["https_proxy_password" as const] : []),
-  ];
 }
 
 function capabilityExecutionMode(capabilities: ProjectCapabilitiesV1): ProjectV1["execution"]["mode"] {

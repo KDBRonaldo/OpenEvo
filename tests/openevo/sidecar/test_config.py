@@ -69,9 +69,7 @@ def test_desktop_project_config_draft_builds_existing_models() -> None:
     assert project.task.source.path == "/datasets/folding-baseline"
     assert project.execution.mode == "codex_subscription_transcript"
     assert project.execution.codex_model == "gpt-5.5"
-    assert project.evolution.model_dump(mode="json") == {
-        "targets": EVOLUTION_TARGETS
-    }
+    assert project.evolution.model_dump(mode="json") == {"targets": EVOLUTION_TARGETS}
     assert profile.id == "science-team"
     assert profile.host == "gpu.example.edu"
     assert profile.port == 22
@@ -79,6 +77,37 @@ def test_desktop_project_config_draft_builds_existing_models() -> None:
     assert profile.auth.method == "ssh_agent"
     assert profile.proxy.https_proxy == "http://127.0.0.1:7890"
     assert profile.proxy.huggingface_endpoint == "https://hf-mirror.com"
+
+
+def test_draft_secret_references_and_credentialed_urls_are_repr_safe() -> None:
+    key_canary = "/private/SECRET_DRAFT_KEY_PATH"
+    reference_canary = "SECRET_DRAFT_REFERENCE"
+    proxy_canary = "http://proxy-user:SECRET_DRAFT_PROXY@example.test"
+    draft = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT
+        | {
+            "auth_method": "private_key",
+            "private_key_path": key_canary,
+            "passphrase_ref": reference_canary,
+            "https_proxy": proxy_canary,
+        }
+    )
+
+    rendered = repr(draft)
+    assert key_canary not in rendered
+    assert reference_canary not in rendered
+    assert proxy_canary not in rendered
+
+    with pytest.raises(ValidationError) as exc_info:
+        DesktopProjectConfigDraft.model_validate(
+            VALID_DRAFT
+            | {
+                "auth_method": "invalid-auth",
+                "password_ref": reference_canary,
+            }
+        )
+    assert reference_canary not in str(exc_info.value)
+    assert reference_canary not in repr(exc_info.value)
 
 
 def test_desktop_project_config_draft_defaults_subscription_codex_model() -> None:
@@ -180,16 +209,12 @@ def test_save_desktop_project_config_writes_deterministic_yaml(tmp_path: Path) -
 
     assert project.path == paths.science_config_path
     assert profile.path == paths.remote_profile_path
-    assert paths.science_config_path == (
-        tmp_path / "projects" / "protein-design" / "science.yaml"
-    )
+    assert paths.science_config_path == (tmp_path / "projects" / "protein-design" / "science.yaml")
     assert paths.remote_profile_path == tmp_path / "profiles" / "science-team.yaml"
     assert paths.science_config_path.is_file()
     assert paths.remote_profile_path.is_file()
     science_yaml = yaml.safe_load(paths.science_config_path.read_text(encoding="utf-8"))
-    remote_yaml = yaml.safe_load(
-        paths.remote_profile_path.read_text(encoding="utf-8")
-    )
+    remote_yaml = yaml.safe_load(paths.remote_profile_path.read_text(encoding="utf-8"))
     assert science_yaml["project"]["name"] == "Protein Design"
     assert science_yaml["remote_profile"] == "science-team"
     assert science_yaml["task"]["source"]["path"] == "/datasets/folding-baseline"
@@ -265,9 +290,7 @@ def test_list_desktop_project_configs_returns_non_secret_summaries(
     assert first.remote_profile_id == "alpha"
     assert first.remote_host == "gpu.example.edu"
     assert first.remote_user == "alice"
-    assert first.science_config_path == (
-        tmp_path / "projects" / "alpha-project" / "science.yaml"
-    )
+    assert first.science_config_path == (tmp_path / "projects" / "alpha-project" / "science.yaml")
     assert first.remote_profile_path == tmp_path / "profiles" / "alpha.yaml"
     assert "password" not in first.model_dump_json()
     assert "private_key_path" not in first.model_dump_json()
@@ -420,9 +443,7 @@ def test_load_desktop_project_config_loads_saved_models(tmp_path: Path) -> None:
     assert project.remote_profile == "science-team"
     assert profile.id == "science-team"
     assert profile.host == "gpu.example.edu"
-    assert paths.science_config_path == (
-        tmp_path / "projects" / "protein-design" / "science.yaml"
-    )
+    assert paths.science_config_path == (tmp_path / "projects" / "protein-design" / "science.yaml")
     assert paths.remote_profile_path == tmp_path / "profiles" / "science-team.yaml"
 
 
@@ -434,6 +455,5 @@ def test_desktop_project_config_draft_rejects_raw_secret_fields() -> None:
 def test_desktop_project_config_draft_validates_source_requirements() -> None:
     with pytest.raises(ValidationError, match="source_url"):
         DesktopProjectConfigDraft.model_validate(
-            (VALID_DRAFT | {"source_type": "git_repository"})
-            | {"source_path": None}
+            (VALID_DRAFT | {"source_type": "git_repository"}) | {"source_path": None}
         )

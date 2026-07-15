@@ -78,6 +78,12 @@ jobs:
           test -x "$sidecar"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
 
+      - name: Exercise packaged fixed-executable birth dispatch
+        run: |
+          uv run python -m pytest \
+            tests/openevo/remote/test_system_executables.py::test_packaged_sidecar_dispatches_owned_subprocess_birth_to_held_executable \
+            -q
+
       - name: Check OpenEvo Desktop Tauri host
         working-directory: desktop/src-tauri
         run: |
@@ -141,6 +147,14 @@ jobs:
             tests/openevo/sidecar/test_workspace_import_lifecycle.py \
             -q
 
+      - name: Exercise macOS fixed SSH executable and process authority
+        run: |
+          uv run python -m pytest \
+            tests/openevo/remote/test_system_executables.py \
+            tests/openevo/remote/test_host_keys.py \
+            tests/openevo/remote/test_ssh_transport.py \
+            -q
+
       - name: Exercise macOS Core release ACL and cleanup policy
         run: |
           uv run python -m pytest \
@@ -162,6 +176,12 @@ jobs:
         run: |
           cargo test --locked tests::macos_release_uses_private_path_and_keeps_the_verified_fd -- --exact
           cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
+
+      - name: Exercise packaged fixed-executable birth dispatch
+        run: |
+          uv run python -m pytest \
+            tests/openevo/remote/test_system_executables.py::test_packaged_sidecar_dispatches_owned_subprocess_birth_to_held_executable \
+            -q
 
       - name: Remove generated sidecar inventory
         if: always()

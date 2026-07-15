@@ -326,8 +326,8 @@ describe("DesktopProductApp", () => {
     setInput("Server address", "lab.example.test");
     setInput("User name", "researcher");
     expect(screenText()).toContain("SSH agent");
-    expect(screenText()).toContain("Private key");
-    expect(screenText()).toContain("Password");
+    expect(screenText()).not.toContain("Private key");
+    expect(screenText()).not.toContain("Password");
     await clickButton("Save workspace");
     expect(screenText()).toContain("Connect the remote workspace");
     expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
@@ -597,35 +597,17 @@ describe("DesktopProductApp", () => {
     });
   });
 
-  it("configures a missing native password without exposing secret input", async () => {
+  it("exposes only SSH agent authentication in the release UI", async () => {
     provider = createFixtureDesktopProductProvider();
-    await provider.createProfile({
-      name: "Legacy server",
-      host: "legacy.example.test",
-      port: 22,
-      user: "researcher",
-      authentication_kind: "native_password",
-      proxy: { http_url: null, https_url: null, no_proxy: [] },
-    }, { actionId: "legacy-profile-create-0001", streamEpoch: 1 });
     root = await renderProduct(provider);
 
     await clickAria("Remote workspace settings");
-    expect(screenText()).toContain("Server password");
-    expect(screenText()).toContain("Not configured");
+    expect(screenText()).toContain("Authentication");
+    expect(screenText()).toContain("SSH agent");
+    expect(screenText()).not.toContain("Server password");
+    expect(screenText()).not.toContain("Private key");
     expect(document.querySelector('input[type="password"]')).toBeNull();
-    const credentialButton = document.querySelector<HTMLButtonElement>(".credential-editor button.secondary-button");
-    if (!credentialButton) throw new Error("Credential configure button was not found.");
-    await clickElement(credentialButton);
-    expect(screenText()).toContain("Stored securely");
-
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(refreshed.snapshot.profiles[0]?.authentication_kind).toBe("native_password");
-    expect(refreshed.snapshot.profiles[0]?.credential_slots[0]?.status).toBe("stored");
-
-    await clickAria("Remove Server password");
-    expect(screenText()).toContain("Not configured");
-    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(document.querySelector(".credential-editor")).toBeNull();
   });
 
   it("commits the later revision and pins it in the next session", async () => {
@@ -773,7 +755,8 @@ describe("DesktopProductApp", () => {
       expect(text).not.toContain(forbidden);
     }
     expect(document.querySelector('input[type="password"]')).toBeNull();
-    expect(screenText()).toContain("Stored securely");
+    expect(screenText()).toContain("SSH agent");
+    expect(screenText()).not.toContain("Stored securely");
   });
 
   it("blocks mutations while the event stream is stale and recovers from a snapshot refresh", async () => {

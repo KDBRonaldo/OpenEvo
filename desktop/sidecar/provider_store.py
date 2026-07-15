@@ -165,22 +165,16 @@ _PERSISTENCE_DENIED_CONFIG_KEYS = {
 }
 
 
-def _empty_credential_slots(
+def _release_credential_slots(
     authentication_kind: str,
 ) -> tuple[CredentialSlotStatusV1, ...]:
-    if authentication_kind == "ssh_agent":
-        return ()
-    if authentication_kind == "native_password":
-        return (CredentialSlotStatusV1(kind="ssh_password", status="empty"),)
-    if authentication_kind == "native_private_key":
-        return (
-            CredentialSlotStatusV1(kind="ssh_private_key", status="empty"),
-            CredentialSlotStatusV1(
-                kind="ssh_private_key_passphrase",
-                status="empty",
-            ),
+    if authentication_kind != "ssh_agent":
+        raise ContractValidationError(
+            "SSH agent is the only authentication mode supported by this release"
         )
-    raise ContractValidationError("profile authentication kind is invalid")
+    return ()
+
+
 _PERSISTENCE_DENIED_CONFIG_SUFFIXES = tuple(sorted(_PERSISTENCE_DENIED_CONFIG_KEYS))
 _ALLOWED_PROJECT_CONFIG_PATH_KEYS = {"targetpath"}
 _SECRET_KEY_SUFFIXES = (
@@ -1454,7 +1448,7 @@ class ProviderMutation:
                 _canonical_json_bytes(
                     [
                         slot.model_dump(mode="json")
-                        for slot in _empty_credential_slots(request.authentication_kind)
+                        for slot in _release_credential_slots(request.authentication_kind)
                     ]
                 ),
                 timestamp,
@@ -3503,15 +3497,10 @@ class DesktopProviderStore:
                 validated_patch.model_fields_set & protected_connection_fields
             ):
                 raise ResourceInUseError("profile", profile_id)
-            previous = self._profile_from_row(row)
             current = _decode_json_object(bytes(row["document_json"]), label="profile")
             current.update(validated_patch.model_dump(mode="json", exclude_unset=True))
             validated = _validate_json_model(RemoteProfileCreateV1, current)
-            credential_slots = (
-                previous.credential_slots
-                if validated.authentication_kind == previous.authentication_kind
-                else _empty_credential_slots(validated.authentication_kind)
-            )
+            credential_slots = _release_credential_slots(validated.authentication_kind)
             version = cast(int, row["resource_version"]) + 1
             timestamp = self._timestamp()
             connection.execute(
@@ -3534,56 +3523,8 @@ class DesktopProviderStore:
             )
             return self._profile_from_row(self._require_profile_row(connection, profile_id))
 
-    def set_native_profile_credential_slots(
-        self,
-        profile_id: str,
-        credential_slots: tuple[CredentialSlotStatusV1, ...],
-        *,
-        expected_etag: str | None = None,
-    ) -> RemoteProfileV1:
-        """Persist only native credential availability metadata for one profile."""
-
-        self._validate_resource_id(profile_id)
-        if expected_etag is not None:
-            self._validate_if_match(expected_etag)
-        with self._transaction(write=True) as connection:
-            row = self._require_profile_row(connection, profile_id)
-            if expected_etag is not None:
-                self._require_etag("profile", profile_id, row, expected_etag)
-            current = self._profile_from_row(row)
-            expected_kinds = tuple(
-                slot.kind for slot in _empty_credential_slots(current.authentication_kind)
-            )
-            if tuple(slot.kind for slot in credential_slots) != expected_kinds:
-                raise ContractValidationError(
-                    "native credential slots do not match profile authentication"
-                )
-            if any(slot.status == "unavailable" for slot in credential_slots):
-                raise ContractValidationError(
-                    "native credential custody cannot persist unavailable status"
-                )
-            if current.credential_slots == credential_slots:
-                return current
-            timestamp = self._timestamp()
-            connection.execute(
-                """
-                UPDATE remote_profiles
-                SET credential_slots_json = ?, resource_version = resource_version + 1,
-                    updated_at = ?
-                WHERE profile_id = ?
-                """,
-                (
-                    _canonical_json_bytes(
-                        [slot.model_dump(mode="json") for slot in credential_slots]
-                    ),
-                    timestamp,
-                    profile_id,
-                ),
-            )
-            return self._profile_from_row(self._require_profile_row(connection, profile_id))
-
-    def reset_native_profile_credential_slots(self) -> None:
-        """Drop stale process-memory availability during sidecar startup."""
+    def reset_release_credential_slots(self) -> None:
+        """Remove credential metadata for modes unavailable in this release."""
 
         with self._transaction(write=True) as connection:
             rows = connection.execute(
@@ -3591,7 +3532,7 @@ class DesktopProviderStore:
             ).fetchall()
             for row in rows:
                 current = self._profile_from_row(row)
-                expected = _empty_credential_slots(current.authentication_kind)
+                expected: tuple[CredentialSlotStatusV1, ...] = ()
                 if current.credential_slots == expected:
                     continue
                 connection.execute(
@@ -3602,9 +3543,7 @@ class DesktopProviderStore:
                     WHERE profile_id = ?
                     """,
                     (
-                        _canonical_json_bytes(
-                            [slot.model_dump(mode="json") for slot in expected]
-                        ),
+                        _canonical_json_bytes([slot.model_dump(mode="json") for slot in expected]),
                         self._timestamp(),
                         current.profile_id,
                     ),

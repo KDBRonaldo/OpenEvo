@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import signal
 import socket
 import subprocess
@@ -54,6 +53,36 @@ class RecordingRunner:
             stdout="out",
             stderr="err",
         )
+
+
+class _TestExecutableAuthority:
+    def __init__(self, path: str) -> None:
+        self.descriptor = os.open(path, os.O_RDONLY)
+
+    @property
+    def execution_path(self) -> str:
+        return f"/dev/fd/{self.descriptor}"
+
+    def verify_path_binding(self) -> None:
+        os.fstat(self.descriptor)
+
+    def close(self) -> None:
+        descriptor, self.descriptor = self.descriptor, -1
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+@pytest.fixture(autouse=True)
+def _allow_test_python_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    production_prepare = ssh_module._prepare_verified_spawn
+
+    def prepare(argv: list[str]):
+        if argv and argv[0] == sys.executable:
+            executable = _TestExecutableAuthority(sys.executable)
+            return executable, [], list(argv)
+        return production_prepare(argv)
+
+    monkeypatch.setattr(ssh_module, "_prepare_verified_spawn", prepare)
 
 
 class FailSecondCallRunner(RecordingRunner):
@@ -112,22 +141,6 @@ class RecordingCoreConnectionStarter:
         process = FakeTunnelProcess()
         self.processes.append(process)
         return process
-
-
-class RecordingCredentialAdapter:
-    def __init__(self) -> None:
-        self.closed = False
-        self.environment_calls = 0
-
-    def ssh_options(self) -> list[str]:
-        return ["-o", "PreferredAuthentications=password"]
-
-    def prepare_process_environment(self) -> dict[str, str]:
-        self.environment_calls += 1
-        return {"SSH_ASKPASS": "/private/helper", "DISPLAY": "openevo-native"}
-
-    def close(self) -> None:
-        self.closed = True
 
 
 class FakeTunnelProcess:
@@ -231,7 +244,7 @@ def _expected_ssh_base(
     *,
     key_path: Path | None = None,
 ) -> list[str]:
-    argv = ["ssh", "-F", "/dev/null", "-p", str(profile.port)]
+    argv = [ssh_module.SSH_EXECUTABLE, "-F", "/dev/null", "-p", str(profile.port)]
     if key_path is not None:
         argv.extend(
             [
@@ -245,8 +258,29 @@ def _expected_ssh_base(
                 "IdentityAgent=none",
             ]
         )
+    else:
+        argv.extend(
+            [
+                "-o",
+                "IdentityFile=none",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "IdentityAgent=SSH_AUTH_SOCK",
+            ]
+        )
     argv.extend(
         [
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "ChallengeResponseAuthentication=no",
+            "-o",
+            "GSSAPIAuthentication=no",
+            "-o",
+            "HostbasedAuthentication=no",
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
@@ -606,7 +640,7 @@ def test_private_key_auth_adds_identity_file_as_argv(tmp_path: Path) -> None:
 
     argv = runner.calls[0][0]
     assert argv[0:10] == [
-        "ssh",
+        ssh_module.SSH_EXECUTABLE,
         "-F",
         "/dev/null",
         "-p",
@@ -624,7 +658,10 @@ def test_private_key_auth_adds_identity_file_as_argv(tmp_path: Path) -> None:
     _assert_marked_command(argv[-1], "true")
 
 
-@pytest.mark.skipif(shutil.which("ssh") is None, reason="OpenSSH is unavailable")
+@pytest.mark.skipif(
+    not Path(ssh_module.SSH_EXECUTABLE).is_file(),
+    reason="fixed OpenSSH binary is unavailable",
+)
 def test_private_key_final_openssh_config_contains_only_explicit_identity(
     tmp_path: Path,
 ) -> None:
@@ -657,6 +694,40 @@ def test_private_key_final_openssh_config_contains_only_explicit_identity(
     assert effective["identitiesonly"] == ["yes"]
     assert effective["identityagent"] == ["none"]
     assert effective["identityfile"] == ["none", str(key)]
+
+
+@pytest.mark.skipif(
+    not Path(ssh_module.SSH_EXECUTABLE).is_file(),
+    reason="fixed OpenSSH binary is unavailable",
+)
+def test_ssh_agent_final_openssh_config_has_no_authentication_fallback(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingRunner()
+    profile = _profile()
+    transport = _transport(tmp_path, profile=profile, runner=runner)
+
+    transport.run("true")
+
+    argv = runner.calls[0][0]
+    inspected = subprocess.run(
+        [argv[0], "-G", *argv[1:-3], argv[-2]],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={},
+    )
+    effective: dict[str, list[str]] = {}
+    for line in inspected.stdout.splitlines():
+        name, _, value = line.partition(" ")
+        effective.setdefault(name, []).append(value)
+    assert effective["identityfile"] == ["none"]
+    assert effective["identitiesonly"] == ["yes"]
+    assert effective["identityagent"] == ["SSH_AUTH_SOCK"]
+    assert effective["passwordauthentication"] == ["no"]
+    assert effective["kbdinteractiveauthentication"] == ["no"]
+    assert effective["gssapiauthentication"] == ["no"]
+    assert effective["hostbasedauthentication"] == ["no"]
 
 
 def test_private_key_isolation_is_identical_for_command_rsync_and_tunnel(
@@ -897,26 +968,6 @@ def test_password_ref_auth_is_not_supported_without_vault() -> None:
     assert "secret-id" not in str(exc_info.value)
 
 
-def test_password_ref_uses_only_a_trusted_process_adapter(tmp_path: Path) -> None:
-    profile = _profile(auth={"method": "password_ref", "password_ref": "secret-id"})
-    adapter = RecordingCredentialAdapter()
-    transport = SshRemoteExecutorTransport(
-        profile,
-        trusted_host=_trusted_binding(tmp_path, profile),
-        credential_adapter=adapter,
-    )
-
-    argv = transport._ssh_base_argv(tmp_path / "known-hosts")
-    environment = transport._process_environment()
-
-    assert "PreferredAuthentications=password" in argv
-    assert "BatchMode=no" in argv
-    assert "secret-id" not in repr((argv, environment))
-    assert adapter.environment_calls == 1
-    transport.close()
-    assert adapter.closed
-
-
 def test_passphrase_ref_is_not_supported_without_vault(tmp_path: Path) -> None:
     key = tmp_path / "id_ed25519"
     key.write_text("key", encoding="utf-8")
@@ -990,7 +1041,7 @@ def test_upload_dir_creates_remote_parent_and_runs_rsync(tmp_path: Path) -> None
         lease_option
     )
     assert runner.calls[1][0] == [
-        "rsync",
+        ssh_module.RSYNC_EXECUTABLE,
         "-az",
         "--delete",
         "-e",
@@ -1126,17 +1177,29 @@ def test_tunnel_popen_cancellation_owns_and_reaps_entire_process_group(
         for value in actual:
             if value.startswith("UserKnownHostsFile="):
                 lease_paths.append(Path(value.removeprefix("UserKnownHostsFile=")))
-        if len(actual) >= 5 and actual[3] == ssh_module._SUBPROCESS_BIRTH_LAUNCHER:
+        if len(actual) >= 7 and actual[3] == ssh_module._SUBPROCESS_BIRTH_LAUNCHER:
+            production_executable_fd = int(actual[6])
+            test_executable_fd = os.open(sys.executable, os.O_RDONLY)
             replacement = [
-                *actual[:5],
+                *actual[:6],
+                str(test_executable_fd),
                 sys.executable,
                 "-c",
                 sleeper,
                 str(descendant_path),
             ]
+            kwargs["pass_fds"] = tuple(
+                test_executable_fd if descriptor == production_executable_fd else descriptor
+                for descriptor in kwargs.get("pass_fds", ())
+            )
         else:
+            test_executable_fd = -1
             replacement = [sys.executable, "-c", sleeper, str(descendant_path)]
-        process = original_popen(replacement, *args, **kwargs)
+        try:
+            process = original_popen(replacement, *args, **kwargs)
+        finally:
+            if test_executable_fd >= 0:
+                os.close(test_executable_fd)
         spawned.append(process)
         deadline = time.monotonic() + 3
         while not descendant_path.exists() and time.monotonic() < deadline:
@@ -2230,7 +2293,15 @@ def test_core_connection_authority_passes_birth_and_peer_fds_to_exact_ssh_child(
         "initialize_observer",
         lambda _self: None,
     )
-    argv = ["ssh", "-F", "/dev/null", "-W", "127.0.0.1:8765", "--", "host"]
+    argv = [
+        ssh_module.SSH_EXECUTABLE,
+        "-F",
+        "/dev/null",
+        "-W",
+        "127.0.0.1:8765",
+        "--",
+        "host",
+    ]
     authority = ssh_module._OwnedSubprocessAuthority(trust_ownership=None)
     authority.acquire()
 
@@ -2239,13 +2310,16 @@ def test_core_connection_authority_passes_birth_and_peer_fds_to_exact_ssh_child(
     assert authority.process is process
     assert len(observed) == 1
     actual_argv, kwargs = observed[0]
-    birth_fd = int(actual_argv[4])
+    birth_fd = int(actual_argv[5])
+    executable_fd = int(actual_argv[6])
     assert actual_argv == [
         sys.executable,
         "-I",
         "-c",
         ssh_module._SUBPROCESS_BIRTH_LAUNCHER,
+        ssh_module.OWNED_SUBPROCESS_BIRTH_ARGUMENT,
         str(birth_fd),
+        str(executable_fd),
         *argv,
     ]
     assert kwargs == {
@@ -2253,9 +2327,11 @@ def test_core_connection_authority_passes_birth_and_peer_fds_to_exact_ssh_child(
         "stdout": 42,
         "stderr": subprocess.DEVNULL,
         "close_fds": True,
-        "pass_fds": (birth_fd, 42),
+        "pass_fds": (birth_fd, executable_fd, 42),
         "text": False,
         "start_new_session": True,
+        "executable": sys.executable,
+        "env": {},
     }
     process.returncode = 0
     authority.mark_group_cleanup_confirmed()
@@ -2361,6 +2437,7 @@ def test_core_tunnel_close_quarantines_lease_cleanup_cancellation() -> None:
         connection_argv=["ssh"],
         trust_lease=lease,
         trusted_host=TrustedHost(),
+        process_environment={},
     )
 
     with pytest.raises(Cancelled):

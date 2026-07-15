@@ -662,36 +662,27 @@ nonterminal reservations, writing
 their cancelled operation and idempotency response together. SSH success alone
 reports `core_not_started`, not an online Core.
 
-The native host implements the SSH credential broker. On macOS, password and
-passphrase create, update, existence, read, and delete operations use Generic
-Password items in Keychain service `org.openevo.desktop.ssh`; random account IDs
-are private native references. A private `0700` registry with a `0600` atomic
-JSON file persists only profile/authentication bindings, Keychain account IDs,
-and the path selected by the native private-key picker. It never stores secret
-bytes, and Desktop never creates a plaintext private-key copy. Linux production
-builds fail closed; Linux tests use a strict in-memory fake that preserves
-create-before-update and delete semantics.
+The exhibition candidate does not ship a native SSH credential broker. Desktop
+release profile creation and patch accept only `ssh_agent`; historical
+`native_password` and `native_private_key` values remain parseable as reserved
+contract values but cannot connect; the user must explicitly save the profile as
+SSH agent before it can connect.
+Startup clears historical credential-slot status. There is no Tauri password
+prompt, private-key picker, Keychain registry, sidecar credential vault, askpass
+helper, `ssh-agent` child, `ssh-add` child, or native credential handoff route in
+the packaged composition. Linux and macOS therefore share the same fail-closed
+boundary. Authenticated proxy slots and the self-deployed Hugging Face token slot
+are likewise reserved and unavailable; HTTP(S) proxy URLs without user-info
+remain supported.
 
-Tauri secure prompts and the native file picker collect credential input. React
-receives only credential-slot status. Tauri sends a complete profile credential
-bundle through the hidden `/openevo-native/credentials` route, authenticated by
-the per-sidecar native handoff credential. The route is absent from OpenAPI,
-accepts a closed and bounded request, rejects replay identity conflicts, and
-returns only a validated public profile projection. The sidecar keeps bytes in
-a bounded mutable-memory vault, resets persisted slot status at startup, and is
-rehydrated from the private native registry after every sidecar start. Missing
-or authentication-changed profiles remove stale native registry and Keychain
-entries. Profile authentication changes, deletion, sidecar replacement, and
-sidecar stop clear corresponding sidecar buffers.
-
-Password and passphrase delivery to OpenSSH uses forced one-shot askpass IPC;
-private keys use a session-scoped `ssh-agent` and `ssh-add -` stdin. Secrets are
-not placed in argv, environment values, logs, errors, API resources, or status.
-Local key paths, raw SSH commands, and trust-store paths likewise remain outside
-Local API models, idempotency envelopes, error responses, and renderer state.
-These native-host changes and Linux/macOS externalBin combination smokes do not
-prove code signing, notarization, closure of the same-UID pathname TOCTOU described
-above, mounted/copied macOS application launch, first-run
+Release SSH, ssh-keyscan, and rsync calls use platform-fixed allowlisted absolute
+binaries. The launcher verifies root ownership, regular-file type, executable
+mode, non-group/world-writable ancestors and file metadata, holds the executable
+identity through process birth, and supplies a closed environment containing at
+most a validated `SSH_AUTH_SOCK`. Process-group birth and cleanup authority is
+retained across cancellation. These changes and Linux/macOS externalBin
+combination smokes do not prove code signing, notarization, mounted/copied macOS
+application launch, first-run
 remote bootstrap, or downloaded artifact identity, and do not make the DMG
 release-ready. ACL contract tests cover inherited/mutating entries, unknown
 tags/permissions, post-initialization mutation, and cleanup replacement windows.
@@ -706,7 +697,7 @@ Core supervisor API with that lock and checks bearer protection,
 both release profiles, registry identity, and target-rooted methods over HTTP.
 It separately starts a Linux packaged sidecar fixture built from the same commit
 through the same inherited-listener
-and one-shot native credential frame used by the Rust host, verifies the native
+and native instance frame used by the Rust host, verifies the native
 readiness proof, frozen release digest and features, strict Desktop state,
 Desktop session protection, and packaged assets, and rejects
 the removed legacy `/openevo-api/desktop/capabilities` route. End-to-end remote
@@ -809,9 +800,8 @@ signing, or notarization gates.
 ## Packaged Runtime Rules
 
 - Tauri owns sidecar lifecycle, native state, private launch preparation, local
-  listener allocation, and bounded process-group shutdown/recovery. Keychain
-  resolution and renderer-visible native diagnostics are not implemented in
-  phase one.
+  listener allocation, and bounded process-group shutdown/recovery. User-secret
+  Keychain resolution and native credential commands are not packaged.
 - The sidecar binds locally, opens the SSH/Core connection, and forwards typed
   operations. It does not execute science runs after Core is healthy.
 - Packaged resources contain no credentials, benchmark automation, source

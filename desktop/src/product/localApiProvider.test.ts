@@ -340,7 +340,7 @@ describe("LocalApiDesktopProductProvider", () => {
     await expect(provider.getArtifactDiff("artifact-memory-fixture-1")).rejects.toThrow(/wrong artifact/i);
   });
 
-  it("uses only strict native source and credential bridge results", async () => {
+  it("uses only strict native source bridge results", async () => {
     const client = mockClient();
     const native = {
       selectProjectSource: vi.fn().mockResolvedValue({
@@ -350,8 +350,6 @@ describe("LocalApiDesktopProductProvider", () => {
       }),
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
-      configureCredential: vi.fn().mockResolvedValue(profile()),
-      clearCredential: vi.fn().mockResolvedValue(profile()),
     };
     const provider = new LocalApiDesktopProductProvider({ client, native, fetch: vi.fn<FetchLike>() });
     const refreshed = await provider.refresh();
@@ -370,20 +368,6 @@ describe("LocalApiDesktopProductProvider", () => {
     await provider.cancelProjectSource("renderer-action-source-0001");
     expect(native.cancelProjectSource).toHaveBeenCalledWith("renderer-action-source-0001");
 
-    const next = await provider.refresh();
-    if (next.status !== "fresh") throw new Error("expected a fresh fixture");
-    await provider.configureCredential("profile-fixture-1", "ssh_private_key", {
-      actionId: "renderer-action-credential-0001",
-      streamEpoch: next.snapshot.stream.epoch,
-      etag: ETAG_A,
-    });
-    expect(native.configureCredential).toHaveBeenCalledWith(
-      "profile-fixture-1",
-      "ssh_private_key",
-      ETAG_A,
-      "renderer-action-credential-0001",
-    );
-
     native.selectProjectSource.mockResolvedValueOnce({
       kind: "scratch",
       display_name: "Cross-wired scratch source",
@@ -397,14 +381,6 @@ describe("LocalApiDesktopProductProvider", () => {
       streamEpoch: finalRefresh.snapshot.stream.epoch,
     })).rejects.toThrow();
 
-    native.configureCredential.mockResolvedValueOnce(profile({
-      credential_slots: [{ kind: "ssh_password", status: "stored", updated_at: NOW }],
-    }));
-    await expect(provider.configureCredential("profile-fixture-1", "ssh_private_key", {
-      actionId: "renderer-action-credential-0002",
-      streamEpoch: finalRefresh.snapshot.stream.epoch,
-      etag: ETAG_A,
-    })).rejects.toThrow(/credential slot/i);
   });
 
   it("treats duplicate events as safe and an out-of-order sequence as a reload gap", async () => {
@@ -542,8 +518,6 @@ function createProvider(client: DesktopApiClientV1, fetch: FetchLike = vi.fn<Fet
       selectProjectSource: vi.fn(),
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
-      configureCredential: vi.fn(),
-      clearCredential: vi.fn(),
     },
     fetch,
     reconnectDelaysMs: [],

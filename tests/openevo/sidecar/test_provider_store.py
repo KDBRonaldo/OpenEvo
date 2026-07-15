@@ -22,7 +22,6 @@ import desktop.sidecar.provider_store as provider_store_module
 from desktop.sidecar.contracts.v1.models import (
     ApiErrorV1,
     ConnectionOperationResultV1,
-    CredentialSlotStatusV1,
     LocalOperationV1,
     NormalizedCheckV1,
     ProjectCreateV1,
@@ -67,7 +66,7 @@ def _profile(name: str = "Research server") -> dict[str, object]:
         "host": "compute.example.org",
         "port": 2222,
         "user": "researcher",
-        "authentication_kind": "native_password",
+        "authentication_kind": "ssh_agent",
         "proxy": {
             "https_url": "https://proxy.example.org",
             "no_proxy": ("localhost", "127.0.0.1"),
@@ -1370,6 +1369,74 @@ def test_patch_revalidates_contract_and_rejects_explicit_null(tmp_path: Path) ->
     assert store.get_profile(profile.profile_id) == profile
 
 
+@pytest.mark.parametrize("authentication_kind", ["native_password", "native_private_key"])
+def test_release_store_rejects_native_auth_and_never_synthesizes_reserved_slots(
+    tmp_path: Path,
+    authentication_kind: str,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    request = {
+        **_profile(),
+        "authentication_kind": authentication_kind,
+        "proxy": {
+            "http_url": "http://proxy.example.org",
+            "https_url": "https://proxy.example.org",
+            "no_proxy": (),
+        },
+    }
+
+    with pytest.raises(ContractValidationError, match="SSH agent"):
+        store.create_profile(request, idempotency_key=f"reject-{authentication_kind}-0001")
+
+    accepted = _create_profile(store, key=f"accept-{authentication_kind}-0001")
+    assert accepted.credential_slots == ()
+
+
+def test_release_startup_clears_historical_native_slots_without_silent_auth_fallback(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store, key="historical-native-profile-0001")
+    historical_document = {
+        **_profile(),
+        "authentication_kind": "native_private_key",
+    }
+    historical_slots = [
+        {"kind": "ssh_private_key", "status": "stored", "updated_at": None},
+        {
+            "kind": "ssh_private_key_passphrase",
+            "status": "stored",
+            "updated_at": None,
+        },
+    ]
+    with store._transaction(write=True) as connection:
+        connection.execute(
+            """
+            UPDATE remote_profiles
+            SET document_json = ?, credential_slots_json = ?
+            WHERE profile_id = ?
+            """,
+            (
+                provider_store_module._canonical_json_bytes(historical_document),
+                provider_store_module._canonical_json_bytes(historical_slots),
+                profile.profile_id,
+            ),
+        )
+
+    store.reset_release_credential_slots()
+
+    historical = store.get_profile(profile.profile_id)
+    assert historical.authentication_kind == "native_private_key"
+    assert historical.credential_slots == ()
+    switched = store.patch_profile(
+        historical.profile_id,
+        {"authentication_kind": "ssh_agent"},
+        if_match=historical.etag,
+    )
+    assert switched.authentication_kind == "ssh_agent"
+    assert switched.credential_slots == ()
+
+
 def test_project_roundtrips_unknown_evolution_config_and_blocks_profile_delete(
     tmp_path: Path,
 ) -> None:
@@ -2538,13 +2605,7 @@ def test_profile_runtime_state_resets_but_terminal_replay_is_frozen_on_restart(
             profile.profile_id,
             if_match=profile.etag,
             connection_state="connected",
-            credential_slots=(
-                CredentialSlotStatusV1(
-                    kind="ssh_password",
-                    status="stored",
-                    updated_at="2026-07-14T12:00:00Z",
-                ),
-            ),
+            credential_slots=(),
             host_key_fingerprint="SHA256:renderer-safe-fingerprint",
         )
         return 202, transaction.create_local_operation(
@@ -2569,7 +2630,7 @@ def test_profile_runtime_state_resets_but_terminal_replay_is_frozen_on_restart(
     )
     connected = store.get_profile(profile.profile_id)
     assert connected.connection_state == "connected"
-    assert connected.credential_slots[0].status == "stored"
+    assert connected.credential_slots == ()
     assert connected.host_key_fingerprint == "SHA256:renderer-safe-fingerprint"
     store.close()
     reopened = DesktopProviderStore(root)

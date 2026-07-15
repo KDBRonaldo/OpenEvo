@@ -72,8 +72,6 @@ describe("Desktop product provider boundary", () => {
       }),
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
-      configureCredential: vi.fn(),
-      clearCredential: vi.fn(),
     };
     const fetchMock = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(version));
     const adapterFactory = vi.fn(async ({ native: bridge }) => {
@@ -101,8 +99,6 @@ describe("Desktop product provider boundary", () => {
         selectProjectSource: vi.fn(),
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
-        configureCredential: vi.fn(),
-        clearCredential: vi.fn(),
       },
     });
     expect(provider.providerKind).toBe("desktop_sidecar");
@@ -187,8 +183,6 @@ describe("Desktop product provider boundary", () => {
         selectProjectSource: vi.fn(),
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
-        configureCredential: vi.fn(),
-        clearCredential: vi.fn(),
       },
       adapterFactory,
     })).rejects.toThrow(/forbidden provider kind/i);
@@ -202,8 +196,6 @@ describe("Desktop product provider boundary", () => {
         selectProjectSource: vi.fn(),
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
-        configureCredential: vi.fn(),
-        clearCredential: vi.fn(),
       },
       adapterFactory,
     })).rejects.toThrow(/missing required release features/i);
@@ -232,8 +224,6 @@ describe("Desktop product provider boundary", () => {
         }),
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
-        configureCredential: vi.fn(),
-        clearCredential: vi.fn(),
       },
       adapterFactory: async ({ native }) => {
         await native.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0002", streamEpoch: 1 });
@@ -253,8 +243,6 @@ describe("Desktop product provider boundary", () => {
         }),
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
-        configureCredential: vi.fn(),
-        clearCredential: vi.fn(),
       },
       adapterFactory: async ({ native }) => {
         await native.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0003", streamEpoch: 1 });
@@ -263,10 +251,10 @@ describe("Desktop product provider boundary", () => {
     })).rejects.toThrow(/requested kind/i);
   });
 
-  it("rejects a native credential response cross-wired to another profile or slot", async () => {
+  it("does not expose a native credential command to the release adapter", async () => {
     const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
     const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
-    await expect(createReleaseDesktopProductProvider({
+    await createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
@@ -274,50 +262,27 @@ describe("Desktop product provider boundary", () => {
         selectProjectSource: vi.fn(),
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
-        configureCredential: vi.fn().mockResolvedValue({
-          ...CONTRACT_FIXTURE_V1.profile,
-          profile_id: "profile-cross-wired",
-          credential_slots: [{ kind: "ssh_password", status: "stored", updated_at: "2026-07-14T12:00:00Z" }],
-        }),
-        clearCredential: vi.fn(),
       },
       adapterFactory: async ({ native }) => {
-        await native.configureCredential(
-          "profile-fixture-1",
-          "ssh_private_key",
-          `"${"a".repeat(64)}"`,
-          "credential-action-0001",
-        );
+        expect("configureCredential" in native).toBe(false);
         return unavailableDesktopProductProvider;
       },
-    })).rejects.toThrow(/profile slot/i);
+    });
   });
 
-  it("routes credential collection through the native command", async () => {
+  it("never invokes a Tauri credential command", async () => {
     const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
     const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "start_sidecar") return releaseBootstrap(digest, flags);
-      if (command === "configure_credential") return {
-        ...CONTRACT_FIXTURE_V1.profile,
-        credential_slots: [{ kind: "ssh_private_key", status: "stored", updated_at: "2026-07-14T12:00:00Z" }],
-      };
       throw new Error(`Unexpected Tauri command: ${command}`);
     });
 
     await createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
-      adapterFactory: async ({ native }) => {
-        await native.configureCredential(
-          "profile-fixture-1",
-          "ssh_private_key",
-          `"${"a".repeat(64)}"`,
-          "credential-action-0002",
-        );
-        return unavailableDesktopProductProvider;
-      },
+      adapterFactory: async () => unavailableDesktopProductProvider,
     });
-    expect(invokeMock.mock.calls.some(([command]) => command === "configure_credential")).toBe(true);
+    expect(invokeMock.mock.calls.some(([command]) => command === "configure_credential")).toBe(false);
   });
 
   it("rejects an older refresh result after a newer refresh has started", () => {

@@ -24,7 +24,6 @@ from desktop.sidecar.event_broker_v1 import (
     DesktopEventCursorExpiredError,
     DesktopEventSubscriberLimitError,
 )
-from desktop.sidecar.native_credentials import NativeCredentialVault
 from desktop.sidecar.provider_store import (
     ContractValidationError,
     CursorExpiredError,
@@ -55,7 +54,6 @@ from desktop.sidecar.release_runtime import (
 )
 from desktop.sidecar.remote_lifecycle import (
     DesktopRemoteLifecycle,
-    NativeCredentialSshResolver,
     RemoteCredentialUnavailableError,
     RemoteLifecycleError,
     RemoteLifecycleSupersededError,
@@ -280,7 +278,6 @@ def create_release_desktop_local_api_app(
     core_assets_root: Path | str | None = None,
     core_bridge: DesktopCoreBridgeV1 | None = None,
     event_broker: DesktopEventBrokerV1 | None = None,
-    native_credentials: NativeCredentialVault | None = None,
 ) -> FastAPI:
     """Create the release Desktop Local API v1 app and own its durable store."""
 
@@ -294,22 +291,17 @@ def create_release_desktop_local_api_app(
         raise ValueError("packaged Core assets cannot be combined with injected Core resources")
     encoded_session_token = session_token.encode("utf-8")
     store = DesktopProviderStore(state_root, clock=clock)
-    if native_credentials is None:
-        native_credentials = NativeCredentialVault()
-    store.reset_native_profile_credential_slots()
+    store.reset_release_credential_slots()
     lifecycle = remote_lifecycle
     workspace_import_store: WorkspaceImportStore | None = None
     core_runtime: DesktopReleaseCoreRuntimeV1 | None = None
     try:
         if lifecycle is None:
-            native_ssh = NativeCredentialSshResolver(native_credentials)
             lifecycle = DesktopRemoteLifecycle(
                 ProviderKnownHostStore(
                     store.state_root / "ssh-host-keys",
                     secure_ancestor=store.state_root,
-                ),
-                auth_resolver=native_ssh.auth_for_profile,
-                transport_factory=native_ssh.transport_for,
+                )
             )
         workspace_import_store = WorkspaceImportStore(
             store.state_root / "workspace-imports",
@@ -333,7 +325,6 @@ def create_release_desktop_local_api_app(
             readiness_key=readiness_key,
             execution_mode_capabilities=RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
             remote_lifecycle=lifecycle,
-            native_credentials=native_credentials,
             core_runtime=core_runtime,
             core_bridge=core_bridge,
             event_broker=event_broker,
@@ -356,16 +347,12 @@ def create_release_desktop_local_api_app(
                         lifecycle.close()
                 finally:
                     try:
-                        native_credentials.close()
+                        store.close()
                     finally:
-                        try:
-                            store.close()
-                        finally:
-                            if workspace_import_store is not None:
-                                workspace_import_store.close()
+                        if workspace_import_store is not None:
+                            workspace_import_store.close()
         raise
     app.state.desktop_release_provider = provider
-    app.state.native_credentials = native_credentials
 
     @app.middleware("http")
     async def authenticate_desktop_session(request: Request, call_next):
@@ -468,7 +455,7 @@ def create_release_desktop_local_api_app(
                 message="The selected SSH credential is not available to OpenEvo Desktop.",
                 category="connection",
                 repair_action="user_input_required",
-                next_action="Choose SSH agent authentication or configure the native credential.",
+                next_action="Switch this remote workspace to SSH agent authentication.",
             )
         if isinstance(exc, RemoteLifecycleSupersededError):
             return _error_response(

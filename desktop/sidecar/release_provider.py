@@ -23,7 +23,6 @@ from desktop.sidecar.contracts.v1.models import (
     ConnectionFailureV1,
     ContractNegotiationV1,
     CoreConnectionStateV1,
-    CredentialSlotStatusV1,
     DesktopStateV1,
     ExecutionModeCapabilitiesV1,
     ExecutionModeCapabilityV1,
@@ -50,7 +49,6 @@ from desktop.sidecar.core_bridge_v1 import (
 )
 from desktop.sidecar.core_client_v1 import CORE_OPENAPI_SHA256
 from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError, DesktopEventBrokerV1
-from desktop.sidecar.native_credentials import NativeCredentialVault
 from desktop.sidecar.provider_store import (
     DesktopProviderStore,
     ETagConflictError,
@@ -145,9 +143,7 @@ class DesktopCoreRuntimeOwnerV1(Protocol):
         *,
         active_project: Callable[[], CoreRuntimeSessionBinding | None],
         publish: Callable[[], None],
-        session_lost: Callable[
-            [CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1], None
-        ],
+        session_lost: Callable[[CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1], None],
     ) -> None: ...
 
     def stop(self) -> None: ...
@@ -315,7 +311,6 @@ class DesktopReleaseProvider:
         readiness_key: bytes,
         execution_mode_capabilities: ExecutionModeCapabilitiesV1,
         remote_lifecycle: DesktopRemoteLifecycle,
-        native_credentials: NativeCredentialVault | None = None,
         core_runtime: DesktopCoreRuntimeOwnerV1 | None = None,
         core_bridge: DesktopCoreBridgeV1 | None = None,
         event_broker: DesktopEventBrokerV1 | None = None,
@@ -330,7 +325,6 @@ class DesktopReleaseProvider:
         self._store = store
         self._workspace_import_store = workspace_import_store
         self._remote_lifecycle = remote_lifecycle
-        self._native_credentials = native_credentials
         self._core_runtime = core_runtime
         self._core_bridge = core_runtime.core_bridge if core_runtime is not None else core_bridge
         self._event_broker = (
@@ -446,33 +440,13 @@ class DesktopReleaseProvider:
                         self._remote_lifecycle.close()
                     finally:
                         try:
-                            if self._native_credentials is not None:
-                                self._native_credentials.close()
+                            self._store.close()
                         finally:
-                            try:
-                                self._store.close()
-                            finally:
-                                self._workspace_import_store.close()
+                            self._workspace_import_store.close()
 
     @property
     def workspace_import_store(self) -> WorkspaceImportStore:
         return self._workspace_import_store
-
-    def native_credential_profile(self, profile_id: str) -> RemoteProfileV1:
-        return self._store.get_profile(profile_id)
-
-    def set_native_credential_slots(
-        self,
-        profile_id: str,
-        credential_slots: tuple[CredentialSlotStatusV1, ...],
-        *,
-        expected_etag: str | None,
-    ) -> RemoteProfileV1:
-        return self._store.set_native_profile_credential_slots(
-            profile_id,
-            credential_slots,
-            expected_etag=expected_etag,
-        )
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handler = self._handlers.get(operation_id)
@@ -580,17 +554,11 @@ class DesktopReleaseProvider:
     def _update_profile(self, arguments: Mapping[str, object]) -> Response:
         profile_id = cast(str, arguments["profile_id"])
         self._require_profile_not_connected(profile_id)
-        previous = self._store.get_profile(profile_id)
         profile = self._store.patch_profile(
             profile_id,
             cast(RemoteProfilePatchV1, arguments["request"]),
             if_match=cast(str, arguments["if_match"]),
         )
-        if (
-            self._native_credentials is not None
-            and profile.authentication_kind != previous.authentication_kind
-        ):
-            self._native_credentials.remove_profile(profile_id)
         return self._resource_response(profile)
 
     def _delete_profile(self, arguments: Mapping[str, object]) -> Response:
@@ -600,8 +568,6 @@ class DesktopReleaseProvider:
             profile_id,
             if_match=cast(str, arguments["if_match"]),
         )
-        if self._native_credentials is not None:
-            self._native_credentials.remove_profile(profile_id)
         return Response(status_code=204)
 
     def _connect_profile(self, arguments: Mapping[str, object]) -> Response:
@@ -991,9 +957,7 @@ class DesktopReleaseProvider:
                 message="The selected SSH credential is not available to OpenEvo Desktop.",
                 retryable=False,
                 repair_action=RepairAction.USER_ACTION_REQUIRED,
-                next_action=(
-                    "Choose SSH agent authentication or configure the native credential."
-                ),
+                next_action="Switch this remote workspace to SSH agent authentication.",
             )
         if isinstance(error, RemoteLifecycleSupersededError):
             return DesktopReleaseProvider._action_error(
@@ -1077,7 +1041,7 @@ class DesktopReleaseProvider:
             code = "ssh_credential_unavailable"
             message = "The selected SSH credential is not available to OpenEvo Desktop."
             retryable = False
-            next_action = "Choose SSH agent authentication or configure the native credential."
+            next_action = "Switch this remote workspace to SSH agent authentication."
         elif isinstance(error, RemoteLifecycleSupersededError):
             code = "connection_operation_superseded"
             message = "A newer connection action replaced this SSH operation."
@@ -1347,9 +1311,7 @@ class DesktopReleaseProvider:
             if activation is not None and (owns_session or operation.state == "cancelled"):
                 try:
                     with self._project_session_lock:
-                        self._require_bridge("activateProject").deactivate_project(
-                            work.project_id
-                        )
+                        self._require_bridge("activateProject").deactivate_project(work.project_id)
                 except Exception:
                     _LOGGER.warning(
                         "could not retire Core session after failed activation commit",
@@ -1624,9 +1586,7 @@ class DesktopReleaseProvider:
     def _list_runs(self, arguments: Mapping[str, object]) -> object:
         return self._invoke_active_core(
             "listRuns",
-            lambda bridge, project: bridge.list_runs(
-                project, **self._page_arguments(arguments)
-            ),
+            lambda bridge, project: bridge.list_runs(project, **self._page_arguments(arguments)),
         )
 
     def _create_run(self, arguments: Mapping[str, object]) -> object:
@@ -1713,9 +1673,7 @@ class DesktopReleaseProvider:
     def _get_run_context(self, arguments: Mapping[str, object]) -> object:
         return self._invoke_active_core(
             "getRunContext",
-            lambda bridge, project: bridge.run_context(
-                project, cast(str, arguments["run_id"])
-            ),
+            lambda bridge, project: bridge.run_context(project, cast(str, arguments["run_id"])),
         )
 
     def _list_run_artifacts(self, arguments: Mapping[str, object]) -> object:
@@ -1893,15 +1851,9 @@ class DesktopReleaseProvider:
 
     def _owns_retirement_locked(self, generation: int, project_id: str) -> bool:
         binding = self._core_session_binding
-        return (
-            generation == self._session_generation
-            and (
-                binding is None
-                or (
-                    binding.generation == generation
-                    and binding.project.project_id == project_id
-                )
-            )
+        return generation == self._session_generation and (
+            binding is None
+            or (binding.generation == generation and binding.project.project_id == project_id)
         )
 
     def _require_bridge(self, operation_id: str) -> DesktopCoreBridgeV1:

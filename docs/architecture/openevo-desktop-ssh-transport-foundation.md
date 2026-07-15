@@ -283,20 +283,19 @@ Supported:
   clears default identities with `IdentityFile=none`, sets `IdentitiesOnly=yes`,
   and disables agent use with `IdentityAgent=none`.
 
-The generic Core transport also accepts `password_ref` and `passphrase_ref` only
-when its owner supplies a `SshProcessCredentialAdapter`. The Desktop sidecar
-resolves those internal references from its process-memory native vault. A
-password adapter forces one prompt through an owner-only, same-UID, one-shot Unix
-socket askpass exchange. A private-key adapter starts a session-scoped
-`ssh-agent`, sends the selected key to `ssh-add -` over stdin, and uses the same
-askpass IPC for an optional passphrase. Secret bytes never enter argv,
-environment values, process output, or OpenSSH configuration, and the adapter
-interrupts pending prompts and clears mutable buffers on close. The selected
-private key is never copied to a new plaintext file.
+`password_ref` and `passphrase_ref` fail closed. The Desktop release never
+constructs the generic `private_key` pathname mode: it accepts only `ssh_agent`.
+Native password/private-key/passphrase modes, askpass, private agents, and
+`ssh-add` are absent from the packaged composition. The generic pathname mode
+remains an internal non-Desktop transport contract and is not advertised as a
+release capability.
 
-Callers that provide a reference without an adapter still fail closed. The
-legacy developer shell capability route is not part of the packaged Desktop
-contract and does not advertise native credential availability.
+Release process launches use fixed `/usr/bin/ssh`, `/usr/bin/ssh-keyscan`, and
+`/usr/bin/rsync` identities after root-owner, mode, type, ancestor, and pathname
+binding verification. The exact main executable is invoked through its held FD;
+the environment is empty except for an owner-validated `SSH_AUTH_SOCK` in agent
+mode. `PATH`, shell configuration, askpass variables, and ambient proxy values
+are not inherited.
 
 ## Command Execution
 

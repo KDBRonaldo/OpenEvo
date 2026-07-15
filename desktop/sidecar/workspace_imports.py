@@ -149,7 +149,7 @@ class WorkspaceImportOwnership:
                 raise ValueError(f"workspace import {label} is invalid")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class PendingWorkspaceImport:
     """Private native-host lease paired with the public opaque import reference."""
 

@@ -18,7 +18,8 @@ remote OpenEvo Core Backend
 ```
 
 The Tauri/Rust host owns the native process lifecycle, Desktop session
-credential, macOS Keychain access, native file selection, and secret handoff.
+credential, and native workspace selection. The exhibition release has no
+user-secret Keychain or secret-handoff surface.
 The renderer never receives SSH passwords, key passphrases, backend bearer
 tokens, proxy passwords, raw host paths, remote commands, or the Core URL.
 
@@ -371,8 +372,9 @@ memory.
 The store persists only closed Local API fields. Unknown evolution method
 config is recursively checked with case- and separator-normalized denylisted
 keys for credentials/secrets, host paths, and raw diagnostics. The only
-credential data persisted here is Keychain slot status; secret values, native
-credential references, commands, raw process output, Core URLs, and
+credential-shaped fields are reserved slot statuses, which release startup
+resets to empty; secret values, native credential references, commands, raw
+process output, Core URLs, and
 bearer/session tokens are not persisted in resource or idempotency data.
 Idempotency responses are retained for a bounded seven-day replay window and
 the live record count is bounded; exhaustion fails closed without evicting an
@@ -512,18 +514,13 @@ the state invalidation event is emitted only after that combined publication.
 The renderer therefore cannot observe `succeeded` together with a bootstrapping
 or offline Core snapshot.
 
-Local profile responses expose an authentication kind and an opaque native
-credential slot status, never a credential reference or secret. Network proxy
-URLs must not contain user information; proxy credentials use native slots.
-For SSH password/private-key profiles, Tauri owns the secure prompt or file
-picker, macOS Keychain account references, and private native registry. The
-sidecar receives complete credential bundles only through its process-owned
-native handoff route and keeps them in bounded memory for SSH adapter creation.
-Renderer DTOs contain only `empty`/`stored` slot status; selected paths and
-secret/recovery material are not renderer or public Local API fields.
-An optional `hugging_face_token` slot supports gated self-deployed models. It is
-read from macOS Keychain only for the bounded remote model-preparation action
-and is never returned to React or stored in project/Core configuration.
+Local profile schemas retain authentication-kind and credential-slot enums for
+closed historical parsing. The exhibition release accepts and connects only
+`ssh_agent`, returns no production slots, and clears historical slot status at
+startup. Native password/private-key/passphrase, authenticated proxy, and
+`hugging_face_token` slots are reserved and unavailable. There is no native
+credential route or renderer bridge. Network proxy URLs must not contain user
+information; unauthenticated HTTP(S) proxy URLs and `no_proxy` remain supported.
 Profile creation defaults an omitted port to `22`, authentication kind to
 `ssh_agent`, and proxy configuration to an empty proxy. Execution settings
 default omitted capture fields to `capture_mode="transcript"` and

@@ -20,14 +20,15 @@ class _StrictFrozenModel(BaseModel):
         frozen=True,
         strict=True,
         validate_default=True,
+        hide_input_in_errors=True,
     )
 
 
 class SSHAuthConfig(_StrictFrozenModel):
     method: Literal["ssh_agent", "private_key", "password_ref"] = "ssh_agent"
-    private_key_path: str | None = None
-    password_ref: str | None = None
-    passphrase_ref: str | None = None
+    private_key_path: str | None = Field(default=None, repr=False)
+    password_ref: str | None = Field(default=None, repr=False)
+    passphrase_ref: str | None = Field(default=None, repr=False)
 
     @field_validator("private_key_path", "password_ref", "passphrase_ref")
     @classmethod
@@ -45,8 +46,7 @@ class SSHAuthConfig(_StrictFrozenModel):
                 or self.passphrase_ref is not None
             ):
                 raise ValueError(
-                    "ssh_agent auth must not set private_key_path, "
-                    "password_ref, or passphrase_ref"
+                    "ssh_agent auth must not set private_key_path, password_ref, or passphrase_ref"
                 )
         elif self.method == "private_key":
             if self.private_key_path is None:
@@ -64,14 +64,14 @@ class SSHAuthConfig(_StrictFrozenModel):
 
 
 class ProxySettings(_StrictFrozenModel):
-    http_proxy: str | None = None
-    https_proxy: str | None = None
+    http_proxy: str | None = Field(default=None, repr=False)
+    https_proxy: str | None = Field(default=None, repr=False)
     no_proxy: str | None = None
     docker_registry_mirror: str | None = None
-    pip_index_url: str | None = None
+    pip_index_url: str | None = Field(default=None, repr=False)
     huggingface_endpoint: str | None = None
     hf_home: str | None = None
-    extra_env: dict[str, str] = Field(default_factory=dict)
+    extra_env: dict[str, str] = Field(default_factory=dict, repr=False)
 
     @field_validator(
         "http_proxy",

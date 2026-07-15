@@ -135,7 +135,7 @@ def test_probe_uses_closed_keyscan_algorithm_set_and_parses_host_forms(
     assert runner.calls == [
         (
             [
-                "ssh-keyscan",
+                host_keys_module.SSH_KEYSCAN_EXECUTABLE,
                 "-T",
                 "5",
                 "-t",

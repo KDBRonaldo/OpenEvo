@@ -1318,9 +1318,7 @@ def test_remote_asset_finalize_preserves_busy_incoming_until_lease_owner_finishe
     )
     finalized = json.loads(capsys.readouterr().out)
 
-    assert finalized["wheel_path"] == str(
-        service_root / "assets" / BUNDLE_ID / WHEEL_NAME
-    )
+    assert finalized["wheel_path"] == str(service_root / "assets" / BUNDLE_ID / WHEEL_NAME)
     assert not incoming.exists()
     assert list((service_root / "asset-staging").iterdir()) == []
 
@@ -1438,7 +1436,7 @@ def test_stage_core_assets_prepares_fresh_host_uploads_private_snapshot_and_fina
     assert all(0 < timeout <= 20 for _command, timeout in secret_calls)
     assert len(runner.calls) == 1
     argv, timeout = runner.calls[0]
-    assert argv[0] == "rsync"
+    assert argv[0] == "/usr/bin/rsync"
     compile(core_assets._REMOTE_RSYNC_LEASE_SCRIPT, "<rsync-lease>", "exec")
     assert "--chmod=F600,D700" in argv
     assert f"--filter=protect /{core_assets.CORE_ASSET_TRANSFER_LEASE}" in argv
@@ -1634,9 +1632,7 @@ def test_core_python_runtime_bootstraps_verified_uv_when_python_and_uv_are_absen
     )
 
     assert completed.returncode == 0, completed.stderr
-    selection = core_runtime.parse_core_supervisor_runtime_preflight(
-        SecretStr(completed.stdout)
-    )
+    selection = core_runtime.parse_core_supervisor_runtime_preflight(SecretStr(completed.stdout))
     assert selection.reason == "ready"
     assert selection.authority is not None
     assert selection.authority.executable_path == str(provisioned)

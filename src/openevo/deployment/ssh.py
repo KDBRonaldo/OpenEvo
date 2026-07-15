@@ -47,6 +47,14 @@ from openevo.deployment.core_runtime import (
 from openevo.deployment.host_keys import TrustedKnownHostsBinding
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import RemoteProfileConfig
+from openevo.deployment.system_executables import (
+    OWNED_SUBPROCESS_BIRTH_ARGUMENT,
+    RSYNC_EXECUTABLE,
+    SSH_EXECUTABLE,
+    VerifiedSshAgentSocket,
+    VerifiedSystemExecutable,
+    closed_ssh_environment,
+)
 
 CompletedRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 PortAllocator = Callable[[], int]
@@ -82,8 +90,11 @@ _SUBPROCESS_BIRTH_LAUNCHER = """
 import os
 import sys
 
-birth_fd = int(sys.argv[1])
-argv = sys.argv[2:]
+if sys.argv[1] != "--openevo-owned-subprocess-birth-v1":
+    raise SystemExit(126)
+birth_fd = int(sys.argv[2])
+executable_fd = int(sys.argv[3])
+argv = sys.argv[4:]
 try:
     os.fchmod(birth_fd, 0o600)
     os.ftruncate(birth_fd, 0)
@@ -95,7 +106,8 @@ try:
     os.fsync(birth_fd)
 finally:
     os.close(birth_fd)
-os.execvp(argv[0], argv)
+os.set_inheritable(executable_fd, False)
+os.execve(f"/dev/fd/{executable_fd}", argv, dict(os.environ))
 """
 
 
@@ -198,16 +210,6 @@ class TunnelProcess(Protocol):
     def wait(self, timeout: float | None = None) -> int: ...
 
 
-class SshProcessCredentialAdapter(Protocol):
-    """Trusted process-local SSH authentication adapter with no secret env values."""
-
-    def ssh_options(self) -> list[str]: ...
-
-    def prepare_process_environment(self) -> dict[str, str] | None: ...
-
-    def close(self) -> None: ...
-
-
 class _OwnedSubprocessProcess(Protocol):
     pid: int
     returncode: int | None
@@ -233,11 +235,11 @@ class _CoreTunnelEndpoint:
         connection_argv: list[str],
         trust_lease: AbstractContextManager[Path],
         trusted_host: TrustedKnownHostsBinding,
-        credential_adapter: SshProcessCredentialAdapter | None = None,
+        process_environment: dict[str, str],
     ) -> None:
         self._connection_starter = connection_starter
         self._connection_argv = connection_argv
-        self._credential_adapter = credential_adapter
+        self._process_environment = process_environment
         self._trust_lease: AbstractContextManager[Path] | None = trust_lease
         self._guard = threading.RLock()
         self._close_guard = threading.Lock()
@@ -300,7 +302,7 @@ class _CoreTunnelEndpoint:
                     authority.spawn_tunnel(
                         list(self._connection_argv),
                         stream_fd=child_stream.fileno(),
-                        env=self._process_environment(),
+                        env=dict(self._process_environment),
                     )
                     child.process = authority.process
                 else:
@@ -339,11 +341,6 @@ class _CoreTunnelEndpoint:
             failure,
             streams=(local_stream, child_stream),
         )
-
-    def _process_environment(self) -> dict[str, str] | None:
-        if self._credential_adapter is None:
-            return None
-        return self._credential_adapter.prepare_process_environment()
 
     def _poison_locked(self, *, pending_child: _TunnelChild | None = None) -> None:
         if pending_child is not None:
@@ -765,11 +762,10 @@ class SshRemoteExecutorTransport:
         tunnel_starter: TunnelStarter | None = None,
         port_allocator: PortAllocator | None = None,
         core_connection_starter: CoreConnectionStarter | None = None,
-        credential_adapter: SshProcessCredentialAdapter | None = None,
     ) -> None:
         invalid_request = False
         try:
-            _validate_supported_auth(profile, credential_adapter=credential_adapter)
+            _validate_supported_auth(profile)
             _validate_remote_identity(profile.user, "user", _REMOTE_USER_RE)
             _validate_remote_host(profile.host)
             _validate_port(profile.port, "remote profile port")
@@ -791,7 +787,7 @@ class SshRemoteExecutorTransport:
         self._tunnel_starter = tunnel_starter
         self._port_allocator = port_allocator or _allocate_local_port
         self._core_connection_starter = core_connection_starter
-        self._credential_adapter = credential_adapter
+        self._subprocess_environment = closed_ssh_environment(profile.auth.method)
         self._closed = False
         self._core_asset_authority_lock = threading.Lock()
         self._core_asset_authorities: dict[
@@ -811,7 +807,6 @@ class SshRemoteExecutorTransport:
             self._closed = True
             subprocesses = tuple(self._active_subprocesses)
             tunnels = tuple(self._active_tunnels)
-            credential_adapter = self._credential_adapter
         for authority in subprocesses:
             try:
                 authority.request_group_termination()
@@ -831,8 +826,6 @@ class SshRemoteExecutorTransport:
                 name="openevo-ssh-transport-close",
                 daemon=True,
             ).start()
-        if credential_adapter is not None:
-            credential_adapter.close()
 
     def _require_open(self) -> None:
         with self._operation_guard:
@@ -901,12 +894,8 @@ class SshRemoteExecutorTransport:
         finally:
             trust_ownership.release_if_caller_owned()
 
-    def _process_environment(self) -> dict[str, str] | None:
-        if self._credential_adapter is None:
-            return None
-        if not self._uses_default_runner:
-            raise RuntimeError("credential adapters require the managed subprocess runner")
-        return self._credential_adapter.prepare_process_environment()
+    def _process_environment(self) -> dict[str, str]:
+        return dict(self._subprocess_environment)
 
     def run(
         self,
@@ -1693,7 +1682,7 @@ class SshRemoteExecutorTransport:
                 connection_argv=connection_argv,
                 trust_lease=trust_lease,
                 trusted_host=self._trusted_host,
-                credential_adapter=self._credential_adapter,
+                process_environment=self._process_environment(),
             )
         except BaseException as exc:
             if isinstance(exc, Exception):
@@ -1724,10 +1713,8 @@ class SshRemoteExecutorTransport:
     def _ssh_base_argv(self, known_hosts_file: Path) -> list[str]:
         profile = self._profile
         trusted_host = self._trusted_host
-        argv = ["ssh", "-F", "/dev/null", "-p", str(profile.port)]
-        if self._credential_adapter is not None:
-            argv.extend(self._credential_adapter.ssh_options())
-        elif profile.auth.method == "private_key":
+        argv = [SSH_EXECUTABLE, "-F", "/dev/null", "-p", str(profile.port)]
+        if profile.auth.method == "private_key":
             key_path = Path(str(profile.auth.private_key_path)).expanduser()
             argv.extend(
                 [
@@ -1741,8 +1728,29 @@ class SshRemoteExecutorTransport:
                     "IdentityAgent=none",
                 ]
             )
+        else:
+            argv.extend(
+                [
+                    "-o",
+                    "IdentityFile=none",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "IdentityAgent=SSH_AUTH_SOCK",
+                ]
+            )
         argv.extend(
             [
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "KbdInteractiveAuthentication=no",
+                "-o",
+                "ChallengeResponseAuthentication=no",
+                "-o",
+                "GSSAPIAuthentication=no",
+                "-o",
+                "HostbasedAuthentication=no",
                 "-o",
                 "StrictHostKeyChecking=yes",
                 "-o",
@@ -1762,7 +1770,7 @@ class SshRemoteExecutorTransport:
                 "-o",
                 f"HostKeyAlgorithms={trusted_host.algorithm}",
                 "-o",
-                "BatchMode=yes" if self._credential_adapter is None else "BatchMode=no",
+                "BatchMode=yes",
                 "-l",
                 profile.user,
             ]
@@ -1777,7 +1785,7 @@ class SshRemoteExecutorTransport:
     ) -> list[str]:
         ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
         return [
-            "rsync",
+            RSYNC_EXECUTABLE,
             "-az",
             "--delete",
             "-e",
@@ -1797,7 +1805,7 @@ class SshRemoteExecutorTransport:
         _validate_remote_absolute_path(remote_root, "remote_root")
         ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
         return [
-            "rsync",
+            RSYNC_EXECUTABLE,
             "--recursive",
             "--delete",
             f"--filter=protect /{CORE_ASSET_TRANSFER_LEASE}",
@@ -1934,6 +1942,7 @@ class _OwnedSubprocessAuthority:
         self.exit_observer: _SubprocessExitObserver | None = None
         self._trust_ownership = trust_ownership
         self._birth_record: BinaryIO | None = None
+        self._agent_socket_authority: VerifiedSshAgentSocket | None = None
         self._spawn_outcome_unknown = False
         self._group_cleanup_confirmed = False
         self._slot_held = False
@@ -2004,7 +2013,7 @@ class _OwnedSubprocessAuthority:
             self.initialize_observer()
         except BaseException:
             try:
-                if self.process is None:
+                if self.process is None and self._spawn_outcome_unknown:
                     self._recover_spawned_process(
                         deadline=time.monotonic() + _SUBPROCESS_BIRTH_RECOVERY_SECONDS
                     )
@@ -2029,24 +2038,38 @@ class _OwnedSubprocessAuthority:
         if birth_record is None:
             raise RuntimeError("subprocess birth authority is unavailable")
         birth_record_fd = birth_record.fileno()
-        self._spawn_outcome_unknown = True
-        options: dict[str, object] = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "text": False,
-            "start_new_session": True,
-            "pass_fds": (birth_record_fd,),
-        }
-        if env is not None:
-            options["env"] = env
-        process = _OWNED_SUBPROCESS_POPEN(
-            _subprocess_birth_argv(argv, birth_record_fd),
-            **options,
-        )
-        self.process_group_id = process.pid
-        self.process = process
-        self._spawn_outcome_unknown = False
+        executable, nested, spawn_argv = _prepare_verified_spawn(argv)
+        try:
+            self._acquire_agent_socket_authority(env)
+            descriptors = (birth_record_fd, executable.descriptor)
+            self._spawn_outcome_unknown = True
+            process = _OWNED_SUBPROCESS_POPEN(
+                _subprocess_birth_argv(
+                    spawn_argv,
+                    birth_record_fd,
+                    executable.descriptor,
+                ),
+                executable=sys.executable,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                start_new_session=True,
+                close_fds=True,
+                pass_fds=descriptors,
+                env={} if env is None else env,
+            )
+            self.process_group_id = process.pid
+            self.process = process
+            self._spawn_outcome_unknown = False
+            executable.verify_path_binding()
+            for item in nested:
+                item.verify_path_binding()
+            self._verify_agent_socket_authority()
+        finally:
+            for item in reversed(nested):
+                item.close()
+            executable.close()
 
     def _spawn_tunnel(
         self,
@@ -2059,26 +2082,40 @@ class _OwnedSubprocessAuthority:
         if birth_record is None:
             raise RuntimeError("subprocess birth authority is unavailable")
         birth_record_fd = birth_record.fileno()
-        pass_fds = (birth_record_fd,) if stream_fd is None else (birth_record_fd, stream_fd)
-        self._spawn_outcome_unknown = True
-        options: dict[str, object] = {
-            "stdin": subprocess.DEVNULL if stream_fd is None else stream_fd,
-            "stdout": subprocess.DEVNULL if stream_fd is None else stream_fd,
-            "stderr": subprocess.DEVNULL,
-            "close_fds": True,
-            "text": False,
-            "start_new_session": True,
-            "pass_fds": pass_fds,
-        }
-        if env is not None:
-            options["env"] = env
-        process = _TUNNEL_SUBPROCESS_POPEN(
-            _subprocess_birth_argv(argv, birth_record_fd),
-            **options,
-        )
-        self.process_group_id = process.pid
-        self.process = process
-        self._spawn_outcome_unknown = False
+        executable, nested, spawn_argv = _prepare_verified_spawn(argv)
+        try:
+            self._acquire_agent_socket_authority(env)
+            descriptors = [birth_record_fd, executable.descriptor]
+            if stream_fd is not None:
+                descriptors.append(stream_fd)
+            self._spawn_outcome_unknown = True
+            process = _TUNNEL_SUBPROCESS_POPEN(
+                _subprocess_birth_argv(
+                    spawn_argv,
+                    birth_record_fd,
+                    executable.descriptor,
+                ),
+                executable=sys.executable,
+                stdin=subprocess.DEVNULL if stream_fd is None else stream_fd,
+                stdout=subprocess.DEVNULL if stream_fd is None else stream_fd,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                text=False,
+                start_new_session=True,
+                pass_fds=tuple(descriptors),
+                env={} if env is None else env,
+            )
+            self.process_group_id = process.pid
+            self.process = process
+            self._spawn_outcome_unknown = False
+            executable.verify_path_binding()
+            for item in nested:
+                item.verify_path_binding()
+            self._verify_agent_socket_authority()
+        finally:
+            for item in reversed(nested):
+                item.close()
+            executable.close()
 
     def _recover_spawned_process(self, *, deadline: float) -> bool:
         if self.process is not None:
@@ -2100,6 +2137,21 @@ class _OwnedSubprocessAuthority:
             if remaining <= 0:
                 return False
             time.sleep(min(0.01, remaining))
+
+    def _acquire_agent_socket_authority(self, env: dict[str, str] | None) -> None:
+        if self._agent_socket_authority is not None:
+            raise RuntimeError("SSH agent socket authority is already held")
+        environment = {} if env is None else env
+        if set(environment) - {"SSH_AUTH_SOCK"}:
+            raise RuntimeError("subprocess environment is not closed")
+        socket_path = environment.get("SSH_AUTH_SOCK")
+        if socket_path is not None:
+            self._agent_socket_authority = VerifiedSshAgentSocket.open(socket_path)
+
+    def _verify_agent_socket_authority(self) -> None:
+        authority = self._agent_socket_authority
+        if authority is not None:
+            authority.verify_path_binding()
 
     def initialize_observer(self) -> None:
         process = self.process
@@ -2208,6 +2260,10 @@ class _OwnedSubprocessAuthority:
             return False
         if self._birth_record is birth_record:
             self._birth_record = None
+        agent_socket_authority = self._agent_socket_authority
+        if agent_socket_authority is not None:
+            agent_socket_authority.close()
+            self._agent_socket_authority = None
         trust_ownership = self._trust_ownership
         if trust_ownership is not None and not trust_ownership.release_for(self):
             self.retain()
@@ -2234,7 +2290,41 @@ class _OwnedSubprocessAuthority:
         return process.returncode is not None
 
 
-def _subprocess_birth_argv(argv: list[str], birth_record_fd: int) -> list[str]:
+def _prepare_verified_spawn(
+    argv: list[str],
+) -> tuple[VerifiedSystemExecutable, list[VerifiedSystemExecutable], list[str]]:
+    if not argv:
+        raise RuntimeError("subprocess argv is empty")
+    executable = VerifiedSystemExecutable.open(argv[0])
+    nested: list[VerifiedSystemExecutable] = []
+    spawn_argv = list(argv)
+    try:
+        if argv[0] == RSYNC_EXECUTABLE:
+            try:
+                command_index = spawn_argv.index("-e") + 1
+                command = shlex.split(spawn_argv[command_index])
+            except (ValueError, IndexError) as exc:
+                raise RuntimeError("rsync SSH command is missing") from exc
+            if not command or command[0] != SSH_EXECUTABLE:
+                raise RuntimeError("rsync SSH executable is not fixed")
+            ssh = VerifiedSystemExecutable.open(SSH_EXECUTABLE)
+            nested.append(ssh)
+            spawn_argv[command_index] = " ".join(shlex.quote(part) for part in command)
+        elif argv[0] != SSH_EXECUTABLE:
+            raise RuntimeError("subprocess executable is not supported")
+        return executable, nested, spawn_argv
+    except BaseException:
+        for item in reversed(nested):
+            item.close()
+        executable.close()
+        raise
+
+
+def _subprocess_birth_argv(
+    argv: list[str],
+    birth_record_fd: int,
+    executable_fd: int,
+) -> list[str]:
     if not argv:
         raise RuntimeError("subprocess argv is empty")
     return [
@@ -2242,7 +2332,9 @@ def _subprocess_birth_argv(argv: list[str], birth_record_fd: int) -> list[str]:
         "-I",
         "-c",
         _SUBPROCESS_BIRTH_LAUNCHER,
+        OWNED_SUBPROCESS_BIRTH_ARGUMENT,
         str(birth_record_fd),
+        str(executable_fd),
         *argv,
     ]
 
@@ -3026,9 +3118,7 @@ def _wait_for_local_port(
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if tunnel._leader_exited():
-            raise RuntimeError(
-                "SSH tunnel exited before it became ready."
-            )
+            raise RuntimeError("SSH tunnel exited before it became ready.")
         try:
             with socket.create_connection(
                 (tunnel.local_host, tunnel.local_port),
@@ -3045,12 +3135,10 @@ def _wait_for_local_port(
 
 def _validate_supported_auth(
     profile: RemoteProfileConfig,
-    *,
-    credential_adapter: SshProcessCredentialAdapter | None,
 ) -> None:
-    if profile.auth.method == "password_ref" and credential_adapter is None:
+    if profile.auth.method == "password_ref":
         raise ValueError("SSH transport does not support password_ref auth yet")
-    if profile.auth.passphrase_ref is not None and credential_adapter is None:
+    if profile.auth.passphrase_ref is not None:
         raise ValueError("SSH transport does not support passphrase_ref auth yet")
 
 

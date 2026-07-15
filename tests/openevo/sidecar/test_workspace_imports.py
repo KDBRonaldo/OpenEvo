@@ -632,6 +632,7 @@ def test_pending_import_lease_adopts_and_discards_idempotently(tmp_path: Path) -
         "extracted_byte_size",
     }
     assert len(pending.lease_token) == 64
+    assert pending.lease_token not in repr(pending)
     assert _stored_directory(root, pending.import_ref).is_dir()
     with pytest.raises(WorkspaceImportIntegrityError, match="lease token"):
         store.discard_pending(

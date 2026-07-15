@@ -46,8 +46,8 @@ describe("Desktop Local API v1 schemas", () => {
     expect(healthV1Schema.parse(CONTRACT_FIXTURE_V1.health).status).toBe("ok");
     expect(apiErrorV1Schema.parse(CONTRACT_FIXTURE_V1.error).code).toBe("project_not_ready");
     expect(desktopStateV1Schema.parse(CONTRACT_FIXTURE_V1.state).contract.compatible).toBe(true);
-    expect(remoteProfileV1Schema.parse(CONTRACT_FIXTURE_V1.profile).authentication_kind).toBe("native_private_key");
-    expect(remoteProfileV1Schema.parse(CONTRACT_FIXTURE_V1.profile).credential_slots.at(-1)?.kind).toBe("hugging_face_token");
+    expect(remoteProfileV1Schema.parse(CONTRACT_FIXTURE_V1.profile).authentication_kind).toBe("ssh_agent");
+    expect(remoteProfileV1Schema.parse(CONTRACT_FIXTURE_V1.profile).credential_slots).toEqual([]);
     expect(projectV1Schema.parse(CONTRACT_FIXTURE_V1.project).remote?.model_preparation.status).toBe("ready");
     expect(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation).state).toBe("running");
     expect(localLogEntryV1Schema.parse(CONTRACT_FIXTURE_V1.operationLog).source).toBe("connection");

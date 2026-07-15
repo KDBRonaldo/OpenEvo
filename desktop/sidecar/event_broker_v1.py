@@ -79,7 +79,7 @@ class _PublishedFrame:
 
 @dataclass(slots=True)
 class _Subscriber:
-    token: str
+    token: str = field(repr=False)
     pending: deque[_PublishedFrame] = field(default_factory=deque)
     pending_bytes: int = 0
     overflowed: bool = False

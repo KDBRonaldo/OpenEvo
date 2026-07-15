@@ -116,14 +116,12 @@ before guarded discard, so the renderer never owns recovery authority. Source
 replacement, reset, stale completion, and failed save paths discard, while a
 successful create/patch settles as adopted only after the sidecar has durably
 committed the project reference. Only the opaque source reference enters the
-renderer DTO or public Desktop Local API. The release UI exposes SSH agent,
-password, and private-key authentication. Password and passphrase controls
-invoke an operating-system secure prompt; the key control invokes the native
-file picker. React receives only the updated `RemoteProfileV1` slot status and
-never receives a password, private-key byte, passphrase, selected host path,
-Keychain account, or handoff token. An empty required slot remains visible and
-blocks connect until the user configures it. Proxy-secret credential brokers
-remain outside this implementation.
+renderer DTO or public Desktop Local API. The release UI exposes only SSH agent
+authentication. Historical password/private-key values are shown as unavailable
+and save only by switching to SSH agent. No credential prompt, key picker,
+credential slot mutation, Keychain account, or secret handoff is exposed to
+React. Authenticated proxy and Hugging Face token slots remain reserved and
+unavailable; proxy URLs without user-info remain supported.
 
 New projects default to the first release-supported mode, currently the
 Core-owned Codex subscription transcript profile and its release-tested
