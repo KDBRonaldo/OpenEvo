@@ -50,6 +50,7 @@ from openevo.rollout.timer import StageTimer
 from openevo.runtime import base as runtime_base
 from openevo.runtime.base import (
     BaseRuntime,
+    RuntimePathSecurityError,
     RuntimeReadbackBudget,
 )
 from openevo.runtime.managed import (
@@ -4645,6 +4646,129 @@ async def test_gateway_runtime_receipt_custom_target_uses_compatible_download(
 
     assert receipt["schema_version"] == "3"
     assert runtime.downloads and runtime.downloads[0][0] == target_dir
+
+
+@pytest.mark.asyncio
+async def test_gateway_compatibility_cleanup_preserves_background_root_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _managed, injection, _context, _artifact_ids, runtime = (
+        await _stage_gateway_runtime_receipt_context(tmp_path)
+    )
+    runtime.spec = runtime.spec.model_copy(
+        update={"import_path": "tests.runtime:PluginRuntime"}
+    )
+    monkeypatch.setattr(runtime_base.tempfile, "gettempdir", lambda: str(tmp_path))
+    original_download = runtime.download_dir
+    original_rename = runtime_base._rename_readback_cleanup_noreplace
+    race_requested = threading.Event()
+    race_complete = threading.Event()
+    root_path: Path | None = None
+    displaced = tmp_path / "displaced-readback-root"
+
+    def background_writer() -> None:
+        assert race_requested.wait(2)
+        assert root_path is not None
+        root_path.rename(displaced)
+        root_path.mkdir(mode=0o700)
+        (root_path / "replacement.txt").write_text("replacement", encoding="utf-8")
+        race_complete.set()
+
+    writer = threading.Thread(target=background_writer, daemon=True)
+
+    async def download_and_arm(remote_path: str, local_path: str) -> None:
+        nonlocal root_path
+        await original_download(remote_path, local_path)
+        root_path = Path(local_path).parent
+        writer.start()
+
+    def race_root_after_identity_check(
+        source_fd: int,
+        source_name: str,
+        target_fd: int,
+        target_name: str,
+    ) -> None:
+        if source_name.startswith("openevo-evolution-readback-"):
+            race_requested.set()
+            assert race_complete.wait(2)
+        original_rename(source_fd, source_name, target_fd, target_name)
+
+    monkeypatch.setattr(runtime, "download_dir", download_and_arm)
+    monkeypatch.setattr(
+        runtime_base,
+        "_rename_readback_cleanup_noreplace",
+        race_root_after_identity_check,
+    )
+
+    with pytest.raises(RuntimePathSecurityError, match="quarantine identity"):
+        await node_module._runtime_injection_receipt_from_readback(
+            runtime=runtime,
+            target_dir=manager.evolution.context.target_dir,
+            plan=injection.staged.injection_plan,
+        )
+
+    writer.join(timeout=2)
+    assert writer.is_alive() is False
+    assert displaced.is_dir()
+    quarantines = list(tmp_path.glob(".openevo-readback-quarantine-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "replacement.txt").read_text(encoding="utf-8") == (
+        "replacement"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gateway_deadline_is_bounded_when_public_download_refuses_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _managed, injection, _context, _artifact_ids, _runtime = (
+        await _stage_gateway_runtime_receipt_context(tmp_path)
+    )
+    monkeypatch.setattr(runtime_base.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    class RefusingRuntime:
+        started = asyncio.Event()
+        release = threading.Event()
+        cancellation_seen = False
+
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            (target / "partial.txt").write_text("partial", encoding="utf-8")
+            self.started.set()
+            while not self.release.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    self.cancellation_seen = True
+
+    runtime = RefusingRuntime()
+    receipt = asyncio.create_task(
+        node_module._runtime_injection_receipt_from_readback(
+            runtime=runtime,
+            target_dir="/custom/evolution",
+            plan=injection.staged.injection_plan,
+        )
+    )
+    await asyncio.wait_for(runtime.started.wait(), timeout=1)
+    started = asyncio.get_running_loop().time()
+
+    with pytest.raises(RuntimePathSecurityError, match="hard join bound"):
+        await asyncio.wait_for(receipt, timeout=0.05)
+
+    try:
+        assert asyncio.get_running_loop().time() - started < 1.8
+        assert runtime.cancellation_seen is True
+        assert list(tmp_path.glob(".openevo-readback-quarantine-*"))
+    finally:
+        runtime.release.set()
+        deadline = asyncio.get_running_loop().time() + 2
+        while list(tmp_path.glob(".openevo-readback-quarantine-*")):
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("deferred Gateway readback cleanup did not complete")
+            await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio

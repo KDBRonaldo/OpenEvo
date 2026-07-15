@@ -133,6 +133,10 @@ original name to a random no-replace quarantine and accepts cleanup authority
 only after the held FD and quarantined pathname still match. If a replacement
 wins the pre-rename race, the identity check retains the quarantine and displaced
 object and fails closed instead of deleting either pathname.
+The rule is recursive: each file or directory child receives its own random
+no-replace quarantine and held-FD identity check before deletion. The Gateway
+readback temporary root is created and cleaned by the same Core authority rather
+than `TemporaryDirectory` pathname recursion.
 
 One private non-refundable readback budget covers the canonical evolution tree
 and the separate agent-system target scan. Its closed maxima exactly match the
@@ -152,13 +156,22 @@ session to succeed.
 For a custom target directory, non-Linux Core host, or third-party runtime,
 Gateway preserves the public backend download path. It ignores backend-returned
 inventory and downloads below a held private temporary root with a concurrent
-logical file/node/byte quota. A runtime-private no-follow scanner then performs
-the exact receipt walk with the same 4096-file, 16384-node, and 64-MiB
-non-refundable budget used by the canonical path. Its consumption is carried
-forward to agent-system target readback. This deliberately does not reuse the
-evolution payload scanner's 256-file and 16-GiB defaults. The compatibility
-fallback supports the same receipt comparison but does not assert Linux source
-mutation evidence when that authority is unavailable.
+logical file/node/byte quota. On Linux destinations, a cumulative event ledger
+charges created files/nodes and closed-write bytes even when the entry is later
+deleted. A surviving entry gives the scanner credit only while pathname and
+inode still match, so download and scan share one non-refundable accounting
+authority without double charging the same receipt object. Download failure,
+event loss, monitor/inspection errors, and unprovable work exhaust that
+authority before agent-system target readback can run.
+
+A runtime-private no-follow scanner then performs the exact receipt walk with
+the same 4096-file, 16384-node, and 64-MiB limits. The temporary root and every
+recursive child are removed only through FD-bound random quarantine. A public
+downloader that does not accept cancellation has a one-second hard join bound;
+afterward Core quarantines its root, reports unresolved ownership, and schedules
+cleanup only after the task exits. Non-Linux compatibility retains the final
+bounded scanner but does not assert Linux event-generation evidence. This path
+does not reuse the evolution payload scanner's 256-file and 16-GiB defaults.
 
 ## Benchmark/Science Consumers
 

@@ -69,6 +69,26 @@ def _runtime(tmp_path: Path) -> ProbeRuntime:
     return ProbeRuntime(RuntimeSpec(image="runtime:latest"), "session", session_dir)
 
 
+async def _compatibility_readback(
+    runtime: object,
+    tmp_path: Path,
+    *,
+    budget: RuntimeReadbackBudget,
+) -> runtime_base.RuntimeReadback:
+    temporary = runtime_base._create_runtime_readback_temporary_root(parent=tmp_path)
+    try:
+        return await runtime_base._bounded_public_runtime_readback(
+            runtime,
+            "/custom/evolution",
+            temporary.path / "evolution",
+            budget=budget,
+            relative_prefix="evolution",
+            temporary_root=temporary,
+        )
+    finally:
+        await runtime_base._cleanup_runtime_readback_temporary_root(temporary)
+
+
 def test_public_download_contract_remains_abstract_two_argument_none_api() -> None:
     assert BaseRuntime.download_file.__isabstractmethod__ is True
     assert BaseRuntime.download_dir.__isabstractmethod__ is True
@@ -130,17 +150,12 @@ async def test_compatibility_readback_accepts_257_files_with_receipt_budget(
             for index in range(257):
                 (target / f"file-{index:03d}.txt").write_bytes(b"x")
 
-    private_root = tmp_path / "compat-readback"
-    private_root.mkdir(mode=0o700)
-    private_root.chmod(0o700)
     budget = RuntimeReadbackBudget()
 
-    readback = await runtime_base._bounded_public_runtime_readback(
+    readback = await _compatibility_readback(
         PublicDownloadRuntime(),
-        "/custom/evolution",
-        private_root / "evolution",
+        tmp_path,
         budget=budget,
-        relative_prefix="evolution",
     )
 
     assert len(readback.files) == 257
@@ -160,21 +175,16 @@ async def test_compatibility_readback_rejects_more_than_4096_files(
             for index in range(runtime_base.RUNTIME_READBACK_MAX_FILES + 1):
                 (target / f"file-{index:04d}.txt").touch()
 
-    private_root = tmp_path / "compat-readback"
-    private_root.mkdir(mode=0o700)
-    private_root.chmod(0o700)
     budget = RuntimeReadbackBudget()
 
     with pytest.raises(RuntimePathSecurityError, match="file (quota|budget)"):
-        await runtime_base._bounded_public_runtime_readback(
+        await _compatibility_readback(
             PublicDownloadRuntime(),
-            "/custom/evolution",
-            private_root / "evolution",
+            tmp_path,
             budget=budget,
-            relative_prefix="evolution",
         )
 
-    assert budget.files_consumed == budget.max_files
+    assert budget.files_consumed == budget.max_files + 1
     assert budget.nodes_consumed == budget.max_nodes
     assert budget.bytes_consumed == budget.max_bytes
 
@@ -186,6 +196,7 @@ async def test_compatibility_download_quota_cancels_public_download_before_compl
     class PublicDownloadRuntime:
         cancelled = False
         completed = False
+        written = 0
 
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
@@ -193,6 +204,7 @@ async def test_compatibility_download_quota_cancels_public_download_before_compl
             try:
                 for index in range(10_000):
                     (target / f"file-{index:05d}.txt").touch()
+                    self.written += 1
                     if index % 100 == 0:
                         await asyncio.sleep(0.001)
             except asyncio.CancelledError:
@@ -200,25 +212,20 @@ async def test_compatibility_download_quota_cancels_public_download_before_compl
                 raise
             self.completed = True
 
-    private_root = tmp_path / "compat-readback"
-    private_root.mkdir(mode=0o700)
-    private_root.chmod(0o700)
     budget = RuntimeReadbackBudget()
     runtime = PublicDownloadRuntime()
 
-    with pytest.raises(RuntimePathSecurityError, match="file quota"):
-        await runtime_base._bounded_public_runtime_readback(
+    with pytest.raises(RuntimePathSecurityError, match="file (quota|budget)"):
+        await _compatibility_readback(
             runtime,
-            "/custom/evolution",
-            private_root / "evolution",
+            tmp_path,
             budget=budget,
-            relative_prefix="evolution",
         )
 
     assert runtime.cancelled is True
     assert runtime.completed is False
-    assert len(list((private_root / "evolution").iterdir())) < 10_000
-    assert budget.files_consumed == budget.max_files
+    assert runtime.written < 10_000
+    assert budget.files_consumed > budget.max_files
     assert budget.nodes_consumed == budget.max_nodes
     assert budget.bytes_consumed == budget.max_bytes
 
@@ -235,23 +242,171 @@ async def test_compatibility_readback_rejects_more_than_64_mib(
             with oversized.open("wb") as stream:
                 stream.truncate(runtime_base.RUNTIME_READBACK_MAX_BYTES + 1)
 
-    private_root = tmp_path / "compat-readback"
-    private_root.mkdir(mode=0o700)
-    private_root.chmod(0o700)
     budget = RuntimeReadbackBudget()
 
     with pytest.raises(RuntimePathSecurityError, match="byte (quota|budget)"):
-        await runtime_base._bounded_public_runtime_readback(
+        await _compatibility_readback(
             PublicDownloadRuntime(),
-            "/custom/evolution",
-            private_root / "evolution",
+            tmp_path,
             budget=budget,
-            relative_prefix="evolution",
         )
 
-    assert budget.files_consumed == budget.max_files
-    assert budget.nodes_consumed == budget.max_nodes
-    assert budget.bytes_consumed == budget.max_bytes
+    assert budget.files_consumed >= budget.max_files
+    assert budget.nodes_consumed >= budget.max_nodes
+    assert budget.bytes_consumed >= budget.max_bytes
+
+
+@pytest.mark.asyncio
+async def test_compatibility_download_accounts_create_unlink_churn(
+    tmp_path: Path,
+) -> None:
+    class ChurningRuntime:
+        attempted = 0
+
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            await asyncio.sleep(0.05)
+            churn = target / "churn.tmp"
+            for _index in range(5_000):
+                churn.touch()
+                churn.unlink()
+                self.attempted += 1
+
+    runtime = ChurningRuntime()
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimePathSecurityError):
+        await _compatibility_readback(runtime, tmp_path, budget=budget)
+
+    assert runtime.attempted == 5_000
+    assert budget.files_consumed >= budget.max_files
+    assert budget.nodes_consumed >= budget.max_nodes
+    assert budget.bytes_consumed >= budget.max_bytes
+
+
+@pytest.mark.asyncio
+async def test_compatibility_download_accounts_write_unlink_byte_churn(
+    tmp_path: Path,
+) -> None:
+    class ChurningRuntime:
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            await asyncio.sleep(0.05)
+            for index in range(65):
+                churn = target / f"churn-{index:02d}.bin"
+                with churn.open("wb") as stream:
+                    stream.truncate(1024 * 1024)
+                await asyncio.sleep(0.01)
+                churn.unlink()
+
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimePathSecurityError, match="byte budget"):
+        await _compatibility_readback(ChurningRuntime(), tmp_path, budget=budget)
+
+    assert budget.files_consumed >= budget.max_files
+    assert budget.nodes_consumed >= budget.max_nodes
+    assert budget.bytes_consumed >= budget.max_bytes
+
+
+@pytest.mark.asyncio
+async def test_compatibility_download_failure_exhausts_shared_budget(
+    tmp_path: Path,
+) -> None:
+    class FailingRuntime:
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            (target / "partial.txt").write_text("partial", encoding="utf-8")
+            raise RuntimeError("injected public download failure")
+
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimeError, match="injected public download failure"):
+        await _compatibility_readback(FailingRuntime(), tmp_path, budget=budget)
+
+    assert budget.files_consumed >= budget.max_files
+    assert budget.nodes_consumed >= budget.max_nodes
+    assert budget.bytes_consumed >= budget.max_bytes
+
+
+@pytest.mark.asyncio
+async def test_compatibility_monitor_oserror_exhausts_shared_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PublicDownloadRuntime:
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            (target / "result.txt").write_text("result", encoding="utf-8")
+
+    def fail_quota_inspection(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected quota inspection failure")
+
+    monkeypatch.setattr(
+        runtime_base,
+        "_require_runtime_download_quota",
+        fail_quota_inspection,
+    )
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimePathSecurityError, match="monitor failed closed"):
+        await _compatibility_readback(PublicDownloadRuntime(), tmp_path, budget=budget)
+
+    assert budget.files_consumed >= budget.max_files
+    assert budget.nodes_consumed >= budget.max_nodes
+    assert budget.bytes_consumed >= budget.max_bytes
+
+
+@pytest.mark.asyncio
+async def test_compatibility_download_refusing_cancellation_has_hard_join_bound(
+    tmp_path: Path,
+) -> None:
+    class RefusingRuntime:
+        started = asyncio.Event()
+        release = threading.Event()
+        cancellation_seen = False
+
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir()
+            (target / "result.txt").write_text("result", encoding="utf-8")
+            self.started.set()
+            while not self.release.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    self.cancellation_seen = True
+
+    runtime = RefusingRuntime()
+    budget = RuntimeReadbackBudget()
+    task = asyncio.create_task(
+        _compatibility_readback(runtime, tmp_path, budget=budget)
+    )
+    await asyncio.wait_for(runtime.started.wait(), timeout=1)
+    started = asyncio.get_running_loop().time()
+    task.cancel()
+
+    with pytest.raises(RuntimePathSecurityError, match="hard join bound"):
+        await asyncio.wait_for(task, timeout=2)
+
+    try:
+        assert asyncio.get_running_loop().time() - started < 1.8
+        assert runtime.cancellation_seen is True
+        assert list(tmp_path.glob(".openevo-readback-quarantine-*"))
+        assert budget.files_consumed >= budget.max_files
+        assert budget.nodes_consumed >= budget.max_nodes
+        assert budget.bytes_consumed >= budget.max_bytes
+    finally:
+        runtime.release.set()
+        deadline = asyncio.get_running_loop().time() + 2
+        while list(tmp_path.glob(".openevo-readback-quarantine-*")):
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("deferred runtime readback cleanup did not complete")
+            await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
@@ -1112,6 +1267,144 @@ def test_discard_readback_publication_does_not_follow_raced_symlink(
     quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
     assert len(quarantines) == 1
     assert quarantines[0].is_symlink()
+
+
+@pytest.mark.parametrize("child_is_directory", [False, True])
+def test_discard_readback_publication_preserves_raced_child_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    child_is_directory: bool,
+) -> None:
+    parent = tmp_path / "cleanup"
+    parent.mkdir(mode=0o700)
+    parent_fd, publication_fd, identity = _opened_cleanup_entry(
+        parent,
+        "publication",
+        is_directory=True,
+    )
+    publication = parent / "publication"
+    child = publication / "child"
+    if child_is_directory:
+        child.mkdir()
+        (child / "original-child.txt").write_text("original", encoding="utf-8")
+    else:
+        child.write_text("original", encoding="utf-8")
+    original_rename = runtime_base._rename_readback_cleanup_noreplace
+    raced = False
+
+    def race_child_after_identity_check(
+        source_fd: int,
+        source_name: str,
+        target_fd: int,
+        target_name: str,
+    ) -> None:
+        nonlocal raced
+        if source_name == "child" and not raced:
+            raced = True
+            os.rename(
+                "child",
+                "displaced-child",
+                src_dir_fd=source_fd,
+                dst_dir_fd=source_fd,
+            )
+            if child_is_directory:
+                os.mkdir("child", mode=0o700, dir_fd=source_fd)
+                child_fd = os.open(
+                    "child",
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY,
+                    dir_fd=source_fd,
+                )
+                try:
+                    replacement_fd = os.open(
+                        "replacement-child.txt",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=child_fd,
+                    )
+                    os.write(replacement_fd, b"replacement")
+                    os.close(replacement_fd)
+                finally:
+                    os.close(child_fd)
+            else:
+                replacement_fd = os.open(
+                    "child",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=source_fd,
+                )
+                os.write(replacement_fd, b"replacement")
+                os.close(replacement_fd)
+        original_rename(source_fd, source_name, target_fd, target_name)
+
+    monkeypatch.setattr(
+        runtime_base,
+        "_rename_readback_cleanup_noreplace",
+        race_child_after_identity_check,
+    )
+    try:
+        with pytest.raises(RuntimePathSecurityError, match="quarantine identity"):
+            runtime_base._discard_readback_publication(
+                parent_fd,
+                "publication",
+                publication_fd,
+                identity,
+                is_directory=True,
+            )
+    finally:
+        os.close(publication_fd)
+        os.close(parent_fd)
+
+    assert raced is True
+    top_quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
+    assert len(top_quarantines) == 1
+    quarantined_publication = top_quarantines[0]
+    child_quarantines = list(
+        quarantined_publication.glob(".openevo-readback-quarantine-*")
+    )
+    assert len(child_quarantines) == 1
+    displaced = quarantined_publication / "displaced-child"
+    if child_is_directory:
+        assert (displaced / "original-child.txt").read_text(encoding="utf-8") == (
+            "original"
+        )
+        assert (child_quarantines[0] / "replacement-child.txt").read_text(
+            encoding="utf-8"
+        ) == "replacement"
+    else:
+        assert displaced.read_text(encoding="utf-8") == "original"
+        assert child_quarantines[0].read_text(encoding="utf-8") == "replacement"
+
+
+def test_discard_readback_publication_does_not_follow_nested_symlink(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "cleanup"
+    parent.mkdir(mode=0o700)
+    parent_fd, publication_fd, identity = _opened_cleanup_entry(
+        parent,
+        "publication",
+        is_directory=True,
+    )
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    (parent / "publication" / "child-link").symlink_to(outside)
+    try:
+        with pytest.raises(RuntimePathSecurityError, match="link or special file"):
+            runtime_base._discard_readback_publication(
+                parent_fd,
+                "publication",
+                publication_fd,
+                identity,
+                is_directory=True,
+            )
+    finally:
+        os.close(publication_fd)
+        os.close(parent_fd)
+
+    assert outside.read_text(encoding="utf-8") == "outside"
+    top_quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
+    assert len(top_quarantines) == 1
+    assert (top_quarantines[0] / "child-link").is_symlink()
 
 
 def test_copy_from_bind_mount_rejects_parent_symlink_without_reading_outside(

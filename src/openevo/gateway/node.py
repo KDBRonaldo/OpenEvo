@@ -72,6 +72,8 @@ from openevo.runtime.base import (
     RuntimeReadbackBudget,
     RuntimePathSecurityError,
     _bounded_public_runtime_readback,
+    _cleanup_runtime_readback_temporary_root,
+    _create_runtime_readback_temporary_root,
     _has_sealed_session_bind_readback,
     _sealed_session_bind_readback,
     validate_session_bind_path,
@@ -1300,9 +1302,9 @@ async def _runtime_injection_receipt_from_readback(
     plan: RuntimeInjectionPlan,
 ) -> dict[str, object]:
     budget = RuntimeReadbackBudget()
-    temporary = TemporaryDirectory(prefix="openevo-evolution-readback-")
+    temporary = _create_runtime_readback_temporary_root()
     try:
-        readback_root = Path(temporary.name)
+        readback_root = temporary.path
         sealed = (
             target_dir == _CANONICAL_EVOLUTION_TARGET_DIR
             and _has_sealed_session_bind_readback(runtime)
@@ -1330,6 +1332,7 @@ async def _runtime_injection_receipt_from_readback(
                 readback_root / "evolution",
                 budget=budget,
                 relative_prefix="evolution",
+                temporary_root=temporary,
             )
             files = [
                 {
@@ -1350,16 +1353,7 @@ async def _runtime_injection_receipt_from_readback(
             files.sort(key=lambda item: str(item["relative_path"]))
         return receipt_from_runtime_readback(plan.authority, files)
     finally:
-        cleanup = asyncio.create_task(asyncio.to_thread(temporary.cleanup))
-        cleanup_cancelled = False
-        while not cleanup.done():
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                cleanup_cancelled = True
-        cleanup.result()
-        if cleanup_cancelled:
-            raise asyncio.CancelledError
+        await _cleanup_runtime_readback_temporary_root(temporary)
 
 
 async def _runtime_agent_system_target_inventory(
