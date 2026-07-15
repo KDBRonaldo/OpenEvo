@@ -93,11 +93,11 @@ type PendingProjectActivation = {
 };
 type PendingRunRetry = {
   readonly runId: string;
-  readonly runEtag: string;
-  readonly actionId: string;
+  readonly intent: ProductResourceMutationIntent;
   readonly errorOwner: number;
   readonly originalAttemptCount: number;
   readonly originalAttemptIds: readonly string[];
+  readonly originalAttemptSnapshots: readonly string[];
   readonly originalCurrentAttemptId: string | null;
   reconciled: boolean;
 };
@@ -395,7 +395,7 @@ export function DesktopProductApp({
   const settingsCapability = projectCapability(snapshot, settingsProject);
   const projectServices = projectSessionReady ? snapshot.services : [];
   const servicesNeedAttention = projectSessionReady
-    && projectServices.some((service) => service.status !== "running");
+    && (projectServices.length === 0 || projectServices.some((service) => service.status !== "running"));
   const canCreateProject = profile?.connection_state === "connected";
   const coreCanActivateProject = connection.profile_id === profile?.profile_id
     && (displayedConnectionState === "online"
@@ -405,7 +405,7 @@ export function DesktopProductApp({
     && profile?.connection_state === "connected"
     && snapshot.state.contract.compatible;
   const activationReason = getProjectActivationReason(snapshot, project, profile, actionState);
-  const startReason = getStartReason(snapshot, project, profile, activeRun, actionState);
+  const startReason = getStartReason(snapshot, project, profile, projectServices, activeRun, actionState);
   const canStart = startReason === null;
 
   const cancelActiveOperation = async () => {
@@ -438,23 +438,28 @@ export function DesktopProductApp({
     }
     const existing = pendingRunRetry.current;
     const errorOwner = reserveActionErrorOwner();
-    const sameFailedSnapshot = existing?.runId === run.id && existing.runEtag === run.etag;
+    const sameUnprovenRetry = existing?.runId === run.id && !retryAdvancedRun(run, existing);
+    const intent = sameUnprovenRetry
+      ? existing.intent
+      : resourceIntent(snapshot, run.etag);
     const pending = {
       runId: run.id,
-      runEtag: run.etag,
-      actionId: sameFailedSnapshot ? existing.actionId : newActionId(),
+      intent,
       errorOwner,
-      originalAttemptCount: sameFailedSnapshot ? existing.originalAttemptCount : run.attempt_count,
-      originalAttemptIds: sameFailedSnapshot ? existing.originalAttemptIds : run.attempts.map((attempt) => attempt.id),
-      originalCurrentAttemptId: sameFailedSnapshot ? existing.originalCurrentAttemptId : run.current_attempt_id,
+      originalAttemptCount: sameUnprovenRetry ? existing.originalAttemptCount : run.attempt_count,
+      originalAttemptIds: sameUnprovenRetry ? existing.originalAttemptIds : run.attempts.map((attempt) => attempt.id),
+      originalAttemptSnapshots: sameUnprovenRetry
+        ? existing.originalAttemptSnapshots
+        : run.attempts.map(canonicalJsonSnapshot),
+      originalCurrentAttemptId: sameUnprovenRetry ? existing.originalCurrentAttemptId : run.current_attempt_id,
       reconciled: false,
     };
     pendingRunRetry.current = pending;
-    setPendingRetryPoll(pending);
+    setPendingRetryPoll(null);
     let retryResponse: RunV1 | null = null;
     void act(
       async () => {
-        retryResponse = await retryRun.call(provider, run.id, resourceIntent(snapshot, run.etag, pending.actionId));
+        retryResponse = await retryRun.call(provider, run.id, pending.intent);
         return retryResponse;
       },
       null,
@@ -471,6 +476,8 @@ export function DesktopProductApp({
         clearPendingRetry(pending);
       } else if (result.refreshedSnapshot && retryAdvancedInSnapshot(result.refreshedSnapshot, pending)) {
         clearPendingRetry(pending);
+      } else {
+        setPendingRetryPoll(pending);
       }
     });
   };
@@ -1669,7 +1676,8 @@ function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
 function SystemWorkspace({ snapshot, profile, services, projectSessionReady, busy, onConnect, onConfigure, onRefresh }: { snapshot: DesktopProductSnapshot; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onConfigure: () => void; onRefresh: () => void }) {
   const core = snapshot.state.core;
   const readyServices = services.filter((service) => service.status === "running").length;
-  const servicesNeedAttention = services.some((service) => service.status !== "running");
+  const servicesNeedAttention = projectSessionReady
+    && (services.length === 0 || services.some((service) => service.status !== "running"));
   return (
     <div className="workspace-stack" data-testid="system-workspace">
       <div className="workspace-heading"><div><p className="eyebrow">System</p><h1>Remote environment</h1><p>Connection, service status, and model availability.</p></div></div>
@@ -1684,7 +1692,7 @@ function SystemWorkspace({ snapshot, profile, services, projectSessionReady, bus
           </dl>
           <div className="system-button-row">
             <button className="secondary-button" type="button" onClick={onConfigure}><Settings size={15} /> {profile ? "Edit" : "Add workspace"}</button>
-            {profile && core.state !== "online" ? <button className="secondary-button" type="button" onClick={onConnect} disabled={busy || isConnectionBusy(core.state) || missingCredentialReason(profile) !== null} title={busy ? "A connection action is already running" : missingCredentialReason(profile) ?? "Reconnect remote workspace"}><RefreshCw size={15} /> Reconnect</button> : null}
+            {profile && (core.state !== "online" || servicesNeedAttention) ? <button className="secondary-button" type="button" onClick={onConnect} disabled={busy || isConnectionBusy(core.state) || missingCredentialReason(profile) !== null} title={busy ? "A connection action is already running" : missingCredentialReason(profile) ?? "Reconnect remote workspace"}><RefreshCw size={15} /> Reconnect</button> : null}
           </div>
         </section>
       </div>
@@ -1730,6 +1738,7 @@ function RemoteWorkspaceDrawer({
   onSave: (intent: ProfileSaveIntent) => Promise<ProfileSaveAttemptResult>;
   onCreateObserved: (profile: RemoteProfileV1) => void;
 }) {
+  useBodyScrollLock();
   const [name, setName] = useState(profile?.name ?? "Research server");
   const [host, setHost] = useState(profile?.host ?? "");
   const [port, setPort] = useState(String(profile?.port ?? 22));
@@ -1850,6 +1859,7 @@ function SettingsDrawer({
   onCancelSource: (actionId: string) => Promise<void>;
   onSettleSource: (actionId: string, outcome: "adopt" | "discard") => Promise<void>;
 }) {
+  useBodyScrollLock();
   const [name, setName] = useState(project?.name ?? "New research project");
   const [title, setTitle] = useState(project?.task.title ?? "Research task");
   const [objective, setObjective] = useState(project?.task.objective ?? "");
@@ -1869,6 +1879,8 @@ function SettingsDrawer({
   const sourceSelectionGeneration = useRef(0);
   const sourceSelectionInFlight = useRef(false);
   const sourceSelectionMounted = useRef(true);
+  const folderSourceButtonRef = useRef<HTMLButtonElement | null>(null);
+  const restoreFolderSourceFocus = useRef(false);
   const activeSourceActionId = useRef<string | null>(null);
   const pendingSourceActionId = useRef<string | null>(null);
   const onCancelSourceRef = useRef(onCancelSource);
@@ -1893,12 +1905,14 @@ function SettingsDrawer({
     if (actionId !== null) await onSettleSource(actionId, outcome);
   }, [onSettleSource, takePendingSourceAction]);
   const close = useCallback(() => {
+    restoreFolderSourceFocus.current = false;
     invalidateSourceSelection();
     void cancelActiveSource();
     void settlePendingSource("discard").finally(onClose);
   }, [cancelActiveSource, invalidateSourceSelection, onClose, settlePendingSource]);
   const guardedClose = useGuardedDrawerClose(dirty, close);
   const requestClose = () => {
+    restoreFolderSourceFocus.current = false;
     invalidateSourceSelection();
     void cancelActiveSource();
     guardedClose.requestClose();
@@ -1933,9 +1947,10 @@ function SettingsDrawer({
     setDirty(false);
     setSourceError(null);
   };
-  const selectSource = async () => {
+  const selectSource = async (restoreFocus: boolean) => {
     if (sourceSelectionInFlight.current) return;
     sourceSelectionInFlight.current = true;
+    restoreFolderSourceFocus.current = restoreFocus;
     const generation = sourceSelectionGeneration.current + 1;
     sourceSelectionGeneration.current = generation;
     setSelectingSource(true);
@@ -1968,10 +1983,16 @@ function SettingsDrawer({
       if (sourceSelectionMounted.current) setSelectingSource(false);
     }
   };
+  useLayoutEffect(() => {
+    if (selectingSource || !restoreFolderSourceFocus.current) return;
+    restoreFolderSourceFocus.current = false;
+    queueMicrotask(() => folderSourceButtonRef.current?.focus());
+  }, [selectingSource]);
   useEffect(() => {
     sourceSelectionMounted.current = true;
     return () => {
       sourceSelectionMounted.current = false;
+      restoreFolderSourceFocus.current = false;
       sourceSelectionGeneration.current += 1;
       const activeActionId = activeSourceActionId.current;
       activeSourceActionId.current = null;
@@ -2039,7 +2060,7 @@ function SettingsDrawer({
             <h3>Research source</h3>
             <div className="segmented-control wide" role="radiogroup" aria-label="Research source" onKeyDown={handleTablistKeyDown}>
               <button type="button" role="radio" aria-checked={source.kind === "scratch"} tabIndex={source.kind === "scratch" ? 0 : -1} className={source.kind === "scratch" ? "active" : ""} disabled={selectingSource || busy} onClick={() => { invalidateSourceSelection(); void settlePendingSource("discard").then(() => { setSource({ kind: "scratch", display_name: "New workspace", import_ref: null }); setSourceError(null); markDirty(); }); }}>Scratch</button>
-              <button type="button" role="radio" aria-checked={source.kind === "native_folder_snapshot"} tabIndex={source.kind === "native_folder_snapshot" ? 0 : -1} className={source.kind === "native_folder_snapshot" ? "active" : ""} disabled={selectingSource || busy} onClick={() => void selectSource()}>{selectingSource ? "Selecting..." : "Folder snapshot"}</button>
+              <button ref={folderSourceButtonRef} type="button" role="radio" aria-checked={source.kind === "native_folder_snapshot"} tabIndex={source.kind === "native_folder_snapshot" ? 0 : -1} className={source.kind === "native_folder_snapshot" ? "active" : ""} disabled={selectingSource || busy} onClick={(event) => void selectSource(document.activeElement === event.currentTarget)}>{selectingSource ? "Selecting..." : "Folder snapshot"}</button>
             </div>
             <div className="source-summary"><FolderOpen size={17} /><span><strong>{source.display_name}</strong><small>{source.kind === "scratch" ? "A new managed workspace will be created." : "A native snapshot reference is ready."}</small></span></div>
             {sourceError ? <p className="form-error" role="alert">{sourceError}</p> : null}
@@ -2470,23 +2491,25 @@ function getProjectActivationReason(
     : "Reconnect this project's remote workspace before activation.";
 }
 
-function getStartReason(snapshot: DesktopProductSnapshot, project: ProjectV1 | null, profile: RemoteProfileV1 | null, activeRun: RunV1 | null, actionState: AsyncState): string | null {
+function getStartReason(snapshot: DesktopProductSnapshot, project: ProjectV1 | null, profile: RemoteProfileV1 | null, services: readonly ServiceV1[], activeRun: RunV1 | null, actionState: AsyncState): string | null {
   if (!project) return "Create or select a project first.";
   if (project.evolution_configuration_state === "pending") return "Finish evolution setup before starting a session.";
   const modeCapability = executionModeCapability(snapshot.executionModeCapabilities, project.execution.mode);
   if (modeCapability.support_state !== "supported") return modeCapability.message;
   if (snapshot.stream.status !== "fresh") return "Refresh this view before starting a session.";
-  if (!profile || snapshot.state.core.state !== "online" || !snapshot.state.core.active_tunnel || snapshot.state.core.profile_id !== profile.profile_id) return "Connect this project's remote workspace before starting a session.";
-  if (!project.remote) return "Activate this project on its assigned remote workspace before starting a session.";
+  if (!profile || profile.profile_id !== project.profile_id) return "Configure this project's remote workspace before starting a session.";
+  if (!project.remote || project.state !== "active") return "Activate this project on its assigned remote workspace before starting a session.";
   const active = snapshot.state.active_project;
-  if (!active || active.project_id !== project.project_id || active.profile_id !== project.profile_id || active.project_etag !== project.etag || active.connection_state !== "ready") return "Activate this project on its assigned remote workspace before starting a session.";
-  if (project.state !== "active") return "Activate this project before starting a session.";
+  if (!active || active.project_id !== project.project_id || active.profile_id !== project.profile_id || active.project_etag !== project.etag) return "Activate this project on its assigned remote workspace before starting a session.";
+  if (snapshot.state.core.state !== "online" || !snapshot.state.core.active_tunnel || snapshot.state.core.profile_id !== profile.profile_id || active.connection_state !== "ready") return "Connect this project's remote workspace before starting a session.";
   const capability = snapshot.capability;
   if (!capability || capability.status !== "ready" || capability.projectId !== project.project_id || capability.executionMode !== project.execution.mode || capability.value.project_id !== project.project_id || capabilityExecutionMode(capability.value.capabilities) !== project.execution.mode) return "Remote capabilities are unavailable for this project and mode.";
   const invalidTarget = evolutionTargetRows(capability.value.capabilities, project.evolution.targets).find((row) => row.selection.enabled && !row.valid);
   if (invalidTarget) return invalidTarget.reason;
   const validation = snapshot.validation;
   if (!validation || validation.status !== "ready" || validation.projectId !== project.project_id || validation.executionMode !== project.execution.mode || validation.projectEtag !== project.etag || validation.value.project_id !== project.project_id || validation.value.project_etag !== project.etag || validation.value.registry_digest !== capability.value.capabilities.registry_digest || !validation.value.valid) return "Project validation is not current for this project and mode.";
+  if (services.length === 0) return "Remote service status is unavailable. Open System and reconnect before starting a session.";
+  if (services.some((service) => service.status !== "running")) return "Remote services need attention. Open System and reconnect before starting a session.";
   if (activeRun) return "Wait for the active session to finish or cancel it.";
   if (actionState === "working") return "Wait for the current action to finish.";
   return null;
@@ -2572,13 +2595,19 @@ function retryAdvancedInSnapshot(
 
 function retryAdvancedRun(run: RunV1, pending: PendingRunRetry): boolean {
   if (run.id !== pending.runId
-    || run.attempt_count <= pending.originalAttemptCount
+    || pending.originalAttemptIds.length !== pending.originalAttemptCount
+    || pending.originalAttemptSnapshots.length !== pending.originalAttemptCount
+    || run.attempt_count !== pending.originalAttemptCount + 1
     || run.current_attempt_id === null
     || run.current_attempt?.id !== run.current_attempt_id
+    || run.attempts[pending.originalAttemptCount]?.id !== run.current_attempt_id
     || run.current_attempt_id === pending.originalCurrentAttemptId
     || pending.originalAttemptIds.includes(run.current_attempt_id)
     || run.attempts.length !== run.attempt_count) return false;
-  return pending.originalAttemptIds.every((attemptId, index) => run.attempts[index]?.id === attemptId);
+  return pending.originalAttemptSnapshots.every((attemptSnapshot, index) =>
+    run.attempts[index]?.id === pending.originalAttemptIds[index]
+    && canonicalJsonSnapshot(run.attempts[index]) === attemptSnapshot
+  );
 }
 
 function mergeAuthoritativeRetryRun(
@@ -2587,12 +2616,26 @@ function mergeAuthoritativeRetryRun(
   pending: PendingRunRetry,
 ): DesktopProductSnapshot {
   const index = snapshot.runs.findIndex((run) => run.id === pending.runId);
-  if (index < 0) return snapshot;
+  if (index < 0) return { ...snapshot, runs: [response, ...snapshot.runs] };
   const current = snapshot.runs[index];
   if (!current || retryAdvancedRun(current, pending) || current.attempt_count > response.attempt_count) return snapshot;
   const runs = [...snapshot.runs];
   runs[index] = response;
   return { ...snapshot, runs };
+}
+
+function canonicalJsonSnapshot(value: unknown): string {
+  return JSON.stringify(sortCanonicalJsonValue(value));
+}
+
+function sortCanonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortCanonicalJsonValue);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, sortCanonicalJsonValue(child)]),
+  );
 }
 
 function canReadmitRun(
@@ -2708,6 +2751,26 @@ function mutationIntent(snapshot: DesktopProductSnapshot, actionId = newActionId
 
 function resourceIntent(snapshot: DesktopProductSnapshot, etag: string, actionId = newActionId()): ProductResourceMutationIntent {
   return { ...mutationIntent(snapshot, actionId), etag };
+}
+
+let bodyScrollLockCount = 0;
+let bodyOverflowBeforeLock = "";
+
+function useBodyScrollLock(): void {
+  useLayoutEffect(() => {
+    if (bodyScrollLockCount === 0) {
+      bodyOverflowBeforeLock = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+    }
+    bodyScrollLockCount += 1;
+    return () => {
+      bodyScrollLockCount = Math.max(0, bodyScrollLockCount - 1);
+      if (bodyScrollLockCount === 0) {
+        document.body.style.overflow = bodyOverflowBeforeLock;
+        bodyOverflowBeforeLock = "";
+      }
+    };
+  }, []);
 }
 
 function useGuardedDrawerClose(dirty: boolean, onClose: () => void) {

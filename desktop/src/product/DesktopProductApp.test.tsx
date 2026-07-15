@@ -420,7 +420,7 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Activate this project");
     expect(optionalButton("Connect")).toBeNull();
     expect(button("Start session").disabled).toBe(true);
-    expect(button("Start session").title).toContain("Connect this project's remote workspace");
+    expect(button("Start session").title).toContain("Activate this project");
   });
 
   it("keeps new-project setup open until remote evolution defaults are saved and activated", async () => {
@@ -1108,7 +1108,7 @@ describe("DesktopProductApp", () => {
     expect(screenText()).not.toContain("The retry response was lost.");
   });
 
-  it("keeps an accepted retry response visible when the following snapshot still lags", async () => {
+  it("keeps an accepted retry response visible when the following snapshot omits the run", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
     root = await renderProduct(provider);
@@ -1121,7 +1121,13 @@ describe("DesktopProductApp", () => {
     if (!advancedRun) throw new Error("Expected the advanced retry run.");
     const retryRun = vi.fn(async () => advancedRun);
     Object.assign(provider, { retryRun });
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({ status: "fresh", snapshot: failed.snapshot });
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: {
+        ...failed.snapshot,
+        runs: failed.snapshot.runs.filter((run) => run.id !== advancedRun.id),
+      },
+    });
 
     await clickButton("Retry session");
     await flush();
@@ -1210,13 +1216,15 @@ describe("DesktopProductApp", () => {
     if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     await clickButton("Retry session");
     await flush();
+    const retryCalls = retryRun.mock.calls as unknown as Array<[string, ProductResourceMutationIntent]>;
+    const originalIntent = retryCalls[0]?.[1];
 
     vi.spyOn(provider, "refresh").mockResolvedValueOnce({
       status: "fresh",
       snapshot: {
         ...failed.snapshot,
         runs: failed.snapshot.runs.map((run) => run.id === "run-failed-model"
-          ? { ...run, status: "queued", etag: `"${"f".repeat(64)}"` }
+          ? { ...run, etag: `"${"f".repeat(64)}"` }
           : run),
       },
     });
@@ -1225,6 +1233,101 @@ describe("DesktopProductApp", () => {
 
     expect(screenText()).toContain("Action could not be completed");
     expect(screenText()).toContain("The retry response was lost.");
+    await clickButton("Retry session");
+    await flush();
+    expect(retryRun).toHaveBeenCalledTimes(2);
+    expect(retryCalls[1]?.[1]).toEqual(originalIntent);
+  });
+
+  it("does not reconcile a retry when an original attempt was rewritten", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    const retryRun = vi.fn(async () => {
+      throw new DesktopProductUserError("The retry response was lost.");
+    });
+    Object.assign(provider, { retryRun });
+    root = await renderProduct(provider);
+
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    await clickButton("Retry session");
+    await flush();
+    const advanced = withAdvancedRetry(failed.snapshot);
+    const rewritten = {
+      ...advanced,
+      runs: advanced.runs.map((run) => run.id === "run-failed-model"
+        ? {
+            ...run,
+            attempts: run.attempts.map((attempt, index) => index === 0
+              ? { ...attempt, updated_at: "2026-07-15T00:00:00Z" }
+              : attempt),
+          }
+        : run),
+    };
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({ status: "fresh", snapshot: rewritten });
+
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+
+    expect(screenText()).toContain("Action could not be completed");
+    expect(screenText()).toContain("The retry response was lost.");
+  });
+
+  it("does not reconcile one retry from a snapshot with two appended attempts", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    const retryRun = vi.fn(async () => {
+      throw new DesktopProductUserError("The retry response was lost.");
+    });
+    Object.assign(provider, { retryRun });
+    root = await renderProduct(provider);
+
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    await clickButton("Retry session");
+    await flush();
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: withTwoAdvancedRetries(failed.snapshot),
+    });
+
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+
+    expect(screenText()).toContain("Action could not be completed");
+    expect(screenText()).toContain("The retry response was lost.");
+  });
+
+  it("starts retry reconciliation polling only after the request becomes ambiguous", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    const retryRequest = deferred<RunV1>();
+    const retryRun = vi.fn(() => retryRequest.promise);
+    Object.assign(provider, { retryRun });
+    root = await renderProduct(provider);
+
+    await clickButton("Cancel session");
+    const refresh = vi.spyOn(provider, "refresh");
+    await act(async () => {
+      button("Retry session").click();
+      await Promise.resolve();
+    });
+    const refreshesWhileRequestStarted = refresh.mock.calls.length;
+    await advance(2_005);
+    expect(refresh).toHaveBeenCalledTimes(refreshesWhileRequestStarted);
+
+    await act(async () => {
+      retryRequest.reject(new DesktopProductUserError("The retry response was lost."));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await flush();
+    const refreshesAfterAmbiguousResult = refresh.mock.calls.length;
+    await advance(1_005);
+    expect(refresh.mock.calls.length).toBeGreaterThan(refreshesAfterAmbiguousResult);
   });
 
   it("does not let retry completion clear a newer operation error", async () => {
@@ -1542,14 +1645,47 @@ describe("DesktopProductApp", () => {
     expect(document.querySelector('#artifact-view-panel[role="tabpanel"]')?.getAttribute("aria-labelledby")).toBe(changes.id);
   });
 
+  it("restores keyboard focus after a native folder selection settles", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const selected = await provider.selectProjectSource({
+      kind: "native_folder_snapshot",
+      projectId: "project-fixture-1",
+      actionId: "source-focus-fixture",
+      streamEpoch: 1,
+    });
+    const pending = deferred<ProjectSourceV1>();
+    vi.spyOn(provider, "selectProjectSource").mockImplementation(() => pending.promise);
+    root = await renderProduct(provider);
+    await clickAria("Project settings");
+
+    const sourceChoices = document.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Research source"]');
+    const scratch = sourceChoices?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]');
+    const folder = Array.from(sourceChoices?.querySelectorAll<HTMLButtonElement>('[role="radio"]') ?? [])
+      .find((choice) => choice.textContent?.includes("Folder snapshot"));
+    if (!scratch || !folder) throw new Error("Research source controls were not found.");
+    scratch.focus();
+    await pressKey(scratch, "ArrowDown");
+    expect(folder.disabled).toBe(true);
+
+    await act(async () => pending.resolve(selected));
+    await flush();
+
+    expect(folder.disabled).toBe(false);
+    expect(document.activeElement).toBe(folder);
+  });
+
   it("keeps services read-only and does not render unavailable diagnostics or restart controls", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
     const refresh = vi.spyOn(provider, "refresh");
+    const reconnect = vi.spyOn(provider, "connectProfile");
     root = await renderProduct(provider);
 
     expect(screenText()).toContain("Remote services need attention");
+    expect(button("Start session").disabled).toBe(true);
+    expect(button("Start session").title).toContain("Remote services need attention");
     await clickButton("Open System");
     await clickButton("System");
+    expect(button("Reconnect").disabled).toBe(false);
     expect(optionalButton("Run diagnostics")).toBeNull();
     expect(document.querySelector('button[aria-label="Run diagnostics"]')).toBeNull();
     expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
@@ -1557,6 +1693,20 @@ describe("DesktopProductApp", () => {
     const refreshesBeforeAction = refresh.mock.calls.length;
     await clickButton("Refresh status");
     expect(refresh.mock.calls.length).toBeGreaterThan(refreshesBeforeAction);
+    await clickButton("Reconnect");
+    expect(reconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when a ready project has no authoritative service status", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useEmptyServicesScenario();
+    root = await renderProduct(provider);
+
+    expect(button("Start session").disabled).toBe(true);
+    expect(button("Start session").title).toContain("Remote service status is unavailable");
+    await clickButton("Open System");
+    expect(screenText()).toContain("Services are unavailable for this project.");
+    expect(button("Reconnect").disabled).toBe(false);
   });
 
   it("requires explicit activation after a project switch", async () => {
@@ -1912,6 +2062,22 @@ describe("DesktopProductApp", () => {
     expect(document.activeElement).toBe(opener);
   });
 
+  it("locks background scrolling while a modal drawer is open", async () => {
+    document.body.style.overflow = "auto";
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    expect(document.body.style.overflow).toBe("hidden");
+    await clickAria("Close settings");
+    expect(document.body.style.overflow).toBe("auto");
+
+    await clickAria("Remote workspace settings");
+    expect(document.body.style.overflow).toBe("hidden");
+    await clickAria("Close connection settings");
+    expect(document.body.style.overflow).toBe("auto");
+  });
+
   it("keeps first-backdrop focus inside a dirty remote workspace confirmation", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     root = await renderProduct(provider);
@@ -2094,6 +2260,52 @@ function withAdvancedRetry(snapshot: DesktopProductSnapshot): DesktopProductSnap
   return {
     ...snapshot,
     runs: snapshot.runs.map((run) => run.id === queuedRun.id ? queuedRun : run),
+  };
+}
+
+function withTwoAdvancedRetries(snapshot: DesktopProductSnapshot): DesktopProductSnapshot {
+  const once = withAdvancedRetry(snapshot);
+  const first = once.runs.find((run) => run.id === "run-failed-model");
+  if (!first?.current_attempt) throw new Error("Expected the first retry attempt.");
+  const failedFirstRetry = {
+    ...first.current_attempt,
+    status: "failed" as const,
+    queued_reason: null,
+    error: snapshot.runs.find((run) => run.id === first.id)?.current_error ?? null,
+    started_at: first.current_attempt.created_at,
+    finished_at: first.current_attempt.updated_at,
+  };
+  const queuedReason = {
+    code: "admission_pending" as const,
+    summary: "A later retry was admitted.",
+    retry_after_seconds: null,
+  };
+  const secondRetry = {
+    ...first.current_attempt,
+    id: "attempt-run-failed-model-retry-2",
+    number: first.attempt_count + 1,
+    status: "queued" as const,
+    queued_reason: queuedReason,
+    error: null,
+    started_at: null,
+    finished_at: null,
+  };
+  const twice: RunV1 = {
+    ...first,
+    status: "queued",
+    queued_reason: queuedReason,
+    current_attempt_id: secondRetry.id,
+    current_attempt: secondRetry,
+    current_error: null,
+    attempt_count: first.attempt_count + 1,
+    attempts: [...first.attempts.slice(0, -1), failedFirstRetry, secondRetry],
+    started_at: null,
+    finished_at: null,
+    etag: `"${"d".repeat(64)}"`,
+  };
+  return {
+    ...once,
+    runs: once.runs.map((run) => run.id === twice.id ? twice : run),
   };
 }
 

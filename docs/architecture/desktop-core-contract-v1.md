@@ -686,17 +686,19 @@ The renderer independently requires the selected `ProjectV1` to match the
 active project ID, profile ID, and ETag and requires a ready compatible tunnel
 before exposing service rows or the inference-service projection. Restart is
 resolved only from that gated collection. Therefore selecting B cannot display
-or mutate A's services, and the same active project can request reactivation
-after its connection becomes unreadable.
+or mutate A's services, and the same active project must reconnect after its
+connection becomes unreadable.
 
 Renderer recovery actions follow the authoritative connection reason. An
 `offline` state with `core_not_started`, a matching connected profile, and a
 compatible contract exposes project activation without also asking the user to
 connect again, because activation owns Core startup. Any other unreadable or
 lost tunnel exposes reconnect recovery and hides project activation until the
-connection is authoritative. A selected ready project with a non-running
-service shows a Research warning and a read-only System status refresh; this
-release does not infer or expose service restart.
+connection is authoritative. A selected ready project with an empty service
+collection or any non-running service fails closed before run admission.
+Research shows the reason, and System offers read-only status refresh plus full
+remote-workspace reconnect; this release does not infer or expose individual
+service restart.
 
 ### Sidecar Mapping
 
@@ -958,13 +960,17 @@ those identities, current attempt/error, `updated_at`, and strong ETag. A run
 has at most 100 attempts; detail embeds all of them in contiguous number order,
 and current attempt ID, number, status, error, and run ID must match the run.
 Retry creates a new attempt; it never rewrites a terminal attempt.
-After an ambiguous retry response, the renderer retains the same idempotency key
-and polls bounded authoritative snapshots. It reconciles success only when the
-same run preserves the complete original attempt prefix and appends a new
-current attempt. A missing run, a changed status, or ETag churn without that
-append is not success and cannot clear the retry error. A validated retry
-response carrying that proof is authoritative for the run and remains visible
-when an immediately following aggregate snapshot still lags it.
+After an ambiguous retry response, the renderer retains the complete original
+mutation intent: idempotency key, observed stream epoch, and ETag. ETag or status
+churn without advancement cannot replace that intent; an explicit retry replays
+it exactly. Bounded authoritative polling starts only after the mutation has
+become ambiguous. Reconciliation succeeds only when the same run preserves the
+canonical complete original attempt prefix and contains exactly one appended
+current attempt. A missing run, a rewritten terminal attempt, multiple appended
+attempts, or ETag/status churn without that one append is not success and cannot
+clear the retry error. A validated retry response carrying the same proof is
+authoritative for the run and remains visible even when the immediately
+following aggregate snapshot omits or lags it.
 
 Evolution is cross-session. A successful task seals its dataset, runs every
 enabled target, validates and materializes all outputs, and then atomically

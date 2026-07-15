@@ -106,6 +106,22 @@ describe("product preview scenarios", () => {
         "skill_bundle",
         "text_memory",
       ]);
+      const predecessorArtifacts = refreshed.snapshot.artifacts.filter((artifact) =>
+        artifact.produced_revision.generation === 1
+      );
+      expect(predecessorArtifacts).toHaveLength(3);
+      expect(predecessorArtifacts.every((artifact) =>
+        artifact.run_id === null && artifact.lineage.source_dataset_ids.length === 0
+      )).toBe(true);
+      expect(activeArtifacts.every((artifact) =>
+        artifact.run_id === run?.id
+        && artifact.lineage.source_dataset_ids.length === 1
+        && artifact.lineage.source_artifact_ids.length === 1
+        && predecessorArtifacts.some((predecessor) =>
+          predecessor.id === artifact.lineage.source_artifact_ids[0]
+          && predecessor.target_id === artifact.target_id
+        )
+      )).toBe(true);
     },
   );
 

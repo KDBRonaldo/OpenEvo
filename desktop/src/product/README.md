@@ -90,13 +90,16 @@ request resolves, and superseded requests cannot publish into the new identity.
 Failed-session recovery calls `retryRun` with the failed run's current ETag and
 a stable action ID. While that request is pending, Start and every recovery
 control are disabled. The returned object is contract-validated by the provider,
-but the renderer waits for the authoritative refresh before changing run or
-attempt state. A rejected or unknown request remains visibly failed, presents
-the typed error, and retains the action ID for an exact retry while the same run
-and ETag remain authoritative. Every later fresh snapshot also reconciles that
-pending retry, so an SSE or polling observation of a new attempt clears only
-the error owned by that retry. Errors from newer or concurrent actions are not
-cleared by an older reconciliation.
+and a response that proves one appended attempt is authoritative even when the
+immediately following aggregate snapshot omits or lags that run. A rejected or
+unknown request remains visibly failed, presents the typed error, and retains
+the complete original action ID, stream epoch, and ETag for exact replay while
+the same run has not proved advancement; ETag churn alone does not replace that
+intent. Bounded polling starts only after the request becomes ambiguous. A later
+fresh snapshot reconciles the pending retry only when it preserves the canonical
+complete original attempt prefix and contains exactly one appended current
+attempt. That reconciliation clears only the error owned by the retry; errors
+from newer or concurrent actions remain owned by those actions.
 The Research view renders at most the latest 200
 matching records and separates agent, evolution, and system streams; SSE
 snapshot epochs trigger an authoritative output refresh while a session runs.
@@ -160,14 +163,20 @@ project ID). Changing that identity discards the previous component-local draft
 and pending capability UI before rendering the new form. Project-only workspace
 sync is not exposed by the release provider. Initial folder selection creates a
 real immutable native snapshot used by activation; selecting the folder again
-creates the replacement snapshot when project content changes.
+creates the replacement snapshot when project content changes. Both modal
+drawers lock background scrolling and restore the opener on close. When the
+native folder picker temporarily disables its radio control, keyboard focus is
+restored to that control after the picker settles.
 
 The System view exposes connection and read-only service state. It does not show
 diagnostics, service restart, repair, or workspace-sync controls because the
 release provider has no verified handlers for them. Nonterminal local
 connect/bootstrap/activation operations expose the frozen Local API cancel
 action, interrupt their exact transport/process/tunnel authority, and return to
-the authoritative disconnected or draft state before retry.
+the authoritative disconnected or draft state before retry. A ready project
+with an empty service collection or any non-running service fails closed at
+`Start session`; System exposes status refresh plus a full remote-workspace
+Reconnect action instead of treating the degraded environment as runnable.
 
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation
@@ -225,8 +234,8 @@ Selecting project B while A is active, or losing A's tunnel, produces an empty
 service view. Services are read-only in this release; the frozen restart route
 remains reserved and the release provider returns
 `provider_capability_unavailable` if it is called directly. An active project
-whose connection is no longer ready shows activation again so it can establish
-a new session. Connection and activation mutations use the local
+whose tunnel is lost exposes reconnect recovery; only a retired or draft project
+requires activation again. Connection and activation mutations use the local
 `LocalOperationV1` lifecycle. HTTP
 409, 410, and 412 responses trigger an
 authoritative snapshot reload; an expired cursor is reset before reload.
@@ -253,8 +262,9 @@ action ID for exact retry.
 
 Editing a saved active project demotes it to a draft and retires its Core
 session. After a successful save, the authoritative snapshot has no active
-project binding, reports `active_tunnel=false`, and requires connection and
-activation again before `Start session` is enabled. The simulator mirrors this
+project binding, reports `active_tunnel=false`, and requires activation again
+before `Start session` is enabled. Activation owns Core startup for this
+`core_not_started` state. The simulator mirrors this
 terminal provider state so UI tests cannot accidentally continue on the stale
 pre-edit tunnel.
 
@@ -273,7 +283,10 @@ from the owning project. The ordinary three-target fixture generates only text
 memory, skill, and agent-system artifacts. Generic simulator tests that
 exercise the closed `parametric_memory` artifact subtype must opt in with
 `includeParametricMemory`; artifact execution-mode and model compatibility are
-derived from the owning project rather than hard-coded. Artifact
+derived from the owning project rather than hard-coded. The completed preview's
+generation-one predecessors are explicit seed artifacts with no run or dataset
+attribution. Its completed run owns only generation-two outputs, whose lineage
+names both their generation-one parent and source dataset. Artifact
 lists use selected artifacts whose `membership_revisions` include that exact
 active revision, without excluding any authoritative discriminated-union
 subtype, and sort them by `created_at` and then `id`. This includes

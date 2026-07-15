@@ -828,7 +828,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       ...project,
       remote: project.remote ? { ...project.remote, active_revision: successor, observed_at: NOW } : null,
     })];
-    this.createArtifacts(run.id, 1);
+    this.createArtifacts(null, 1);
     this.createArtifacts(run.id, 2);
   }
 
@@ -927,10 +927,13 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.appendTimeline(runId, "revision", "succeeded", `Revision ${successorGeneration} active`, "The successor revision is ready for the next session.");
   }
 
-  private createArtifacts(runId: string, generation: number): void {
-    const run = this.requireRun(runId);
-    const project = this.projects.find((candidate) => candidate.remote?.core_project_id === run.project_id);
+  private createArtifacts(runId: string | null, generation: number): void {
+    const run = runId === null ? null : this.requireRun(runId);
+    const project = run
+      ? this.projects.find((candidate) => candidate.remote?.core_project_id === run.project_id)
+      : this.projects[0];
     if (!project) throw new Error("The artifact fixture project was not found.");
+    const coreProjectId = run?.project_id ?? this.requireCoreProjectId(project);
     const modelRef = project.execution.codex_model ?? project.execution.hf_model;
     if (!modelRef) throw new Error("The artifact fixture project does not select a model.");
     const prior = this.artifacts;
@@ -951,9 +954,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     for (const variant of variants) {
       const artifactId = `artifact-${variant.target_id}-${generation}`;
       const parent = prior.find((artifact) => artifact.target_id === variant.target_id);
-      const revision = this.revision(generation, run.project_id);
+      const revision = this.revision(generation, coreProjectId);
+      const sourceDatasetIds = runId === null ? [] : [`dataset-fixture-${generation}`];
       const metadata = variant.artifact_type === "text_memory"
-        ? { record_count: generation, source_dataset_ids: [`dataset-fixture-${generation}`] }
+        ? { record_count: generation, source_dataset_ids: sourceDatasetIds }
         : variant.artifact_type === "skill_bundle"
           ? { document_count: 2, root_document: "SKILL.md" as const }
           : variant.artifact_type === "agent_system"
@@ -961,7 +965,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
             : { adapter_id: `adapter-fixture-${generation}`, base_model_ref: modelRef, adapter_format: "lora" as const };
       const artifact = artifactV1Schema.parse({
         id: artifactId,
-        project_id: run.project_id,
+        project_id: coreProjectId,
         run_id: runId,
         target_id: variant.target_id,
         artifact_type: variant.artifact_type,
@@ -972,9 +976,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         produced_revision: revision,
         membership_revisions: [revision],
         lineage: {
-          method_id: `reference_${variant.target_id}`,
-          job_id: `job-fixture-${generation}-${variant.target_id}`,
-          source_dataset_ids: [`dataset-fixture-${generation}`],
+          method_id: runId === null ? "fixture_seed" : `reference_${variant.target_id}`,
+          job_id: runId === null ? `job-fixture-seed-${variant.target_id}` : `job-fixture-${generation}-${variant.target_id}`,
+          source_dataset_ids: sourceDatasetIds,
           source_artifact_ids: parent ? [parent.id] : [],
         },
         compatibility: {
@@ -1783,6 +1787,11 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.services = this.services.map((service) => service.kind === "inference"
       ? serviceV1Schema.parse({ ...service, status: "starting", status_message: "Preparing the selected model.", model_preparation: service.model_preparation ? { ...service.model_preparation, status: "downloading", downloaded_bytes: 512, total_bytes: 1_024 } : null })
       : service);
+  }
+
+  useEmptyServicesScenario(): void {
+    this.services = [];
+    this.emit();
   }
 
   useAuthoritativeArtifactOrderingScenario(): void {
