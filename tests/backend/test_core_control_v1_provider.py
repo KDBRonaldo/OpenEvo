@@ -5383,11 +5383,12 @@ def test_run_mutation_singleflight_capacity_fails_closed_when_all_entries_are_ac
 
 def test_run_mutation_singleflight_does_not_evict_a_resolving_waiter() -> None:
     singleflight = provider_module._RunMutationSingleFlight(1)
-    retained = provider_module._RunMutationFlight("a" * 64)
+    retained_identity = ("deleteCoreRunV1", "scope-a", "key-a")
+    retained = provider_module._RunMutationFlight(retained_identity, "a" * 64)
     retained.future.set_result("owner-result")
     retained.owner_active = False
     retained.waiters = 1
-    singleflight._entries[("deleteCoreRunV1", "scope-a", "key-a")] = retained
+    singleflight._entries[retained_identity] = retained
 
     with pytest.raises(provider_module.CoreControlHTTPError) as raised:
         singleflight.invoke(
@@ -5406,6 +5407,39 @@ def test_run_mutation_singleflight_does_not_evict_a_resolving_waiter() -> None:
         )
         == "second-owner-result"
     )
+
+
+def test_retired_failed_run_mutation_freezes_digest_without_replaying_error() -> None:
+    singleflight = provider_module._RunMutationSingleFlight(2)
+    identity = ("cancelCoreRunV1", "scope-a", "key-a")
+    retired = provider_module._RunMutationFlight(identity, "a" * 64)
+    retired.future.set_exception(
+        provider_module._run_control_http_error(
+            CoreRunControlError(
+                "run_owner_temporarily_unavailable",
+                "The managed run owner is unavailable.",
+                http_status=503,
+                retryable=True,
+            )
+        )
+    )
+    retired.owner_active = False
+    retired.waiters = 1
+    singleflight._retired.add(retired)
+
+    with pytest.raises(provider_module.CoreControlHTTPError) as conflict:
+        singleflight.invoke(identity, "b" * 64, lambda: "unexpected-owner-call")
+    assert conflict.value.error.code == "idempotency_key_reused"
+
+    owner_calls = 0
+
+    def retry_owner() -> str:
+        nonlocal owner_calls
+        owner_calls += 1
+        return "owner-retried"
+
+    assert singleflight.invoke(identity, "a" * 64, retry_owner) == "owner-retried"
+    assert owner_calls == 1
 
 
 def test_run_mutation_shutdown_drains_admitted_leader_and_waiter_before_owner_close(
@@ -5526,6 +5560,155 @@ def test_run_mutation_shutdown_drain_timeout_retains_owner_for_idempotent_retry(
         assert provider._run_control is run_control
         allow_callback.set()
         assert mutation.result(timeout=10) == "owner-retried"
+
+    provider.close()
+    provider.close()
+    assert run_control.close_calls == 1
+
+
+def test_failed_run_mutation_shutdown_waits_for_admitted_waiter_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "failed-shutdown-waiter-key",
+    }
+    run_control = _BlockingRetryableThenSuccessfulRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+    waiter_exiting = threading.Event()
+    allow_waiter_exit = threading.Event()
+    original_release_waiter = provider._run_mutations._release_waiter
+
+    def release_waiter_through_barrier(entry) -> None:
+        waiter_exiting.set()
+        assert allow_waiter_exit.wait(timeout=5)
+        original_release_waiter(entry)
+
+    monkeypatch.setattr(
+        provider._run_mutations, "_release_waiter", release_waiter_through_barrier
+    )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        leader = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        assert run_control.entered.wait(timeout=5)
+        waiter = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+
+        deadline = time.monotonic() + 5
+        while True:
+            with provider._run_mutations._lock:
+                entries = tuple(provider._run_mutations._entries.values())
+                waiter_count = sum(entry.waiters for entry in entries)
+            if waiter_count == 1:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("failed-flight waiter did not join")
+            time.sleep(0.005)
+
+        run_control.release.set()
+        with pytest.raises(provider_module.CoreControlHTTPError) as leader_raised:
+            leader.result(timeout=10)
+        assert waiter_exiting.wait(timeout=5)
+
+        closed = executor.submit(provider.close)
+        deadline = time.monotonic() + 5
+        while True:
+            with provider._run_mutations._lock:
+                closing = provider._run_mutations._closing
+            if closing:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("provider close did not stop admission")
+            time.sleep(0.005)
+        assert run_control.close_calls == 0
+        assert not closed.done()
+
+        allow_waiter_exit.set()
+        with pytest.raises(provider_module.CoreControlHTTPError) as waiter_raised:
+            waiter.result(timeout=10)
+        closed.result(timeout=10)
+        assert waiter_raised.value.error == leader_raised.value.error
+
+    provider.close()
+    assert run_control.close_calls == 1
+
+    restarted_control = _SuccessfulMutationRunControl()
+    restarted = _app(tmp_path, run_control=restarted_control)
+    with TestClient(restarted):
+        assert (
+            restarted.state.core_control_provider.invoke(
+                "cancelCoreRunV1", arguments
+            )
+            == "owner-retried"
+        )
+    assert [invocation[0] for invocation in restarted_control.invocations] == [
+        "cancelCoreRunV1"
+    ]
+
+
+def test_failed_run_mutation_waiter_drain_timeout_preserves_idempotent_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_module, "_RUN_MUTATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05
+    )
+    arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "failed-shutdown-timeout-key",
+    }
+    run_control = _BlockingRetryableThenSuccessfulRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+    waiter_exiting = threading.Event()
+    allow_waiter_exit = threading.Event()
+    original_release_waiter = provider._run_mutations._release_waiter
+
+    def release_waiter_through_barrier(entry) -> None:
+        waiter_exiting.set()
+        assert allow_waiter_exit.wait(timeout=5)
+        original_release_waiter(entry)
+
+    monkeypatch.setattr(
+        provider._run_mutations, "_release_waiter", release_waiter_through_barrier
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        leader = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+        assert run_control.entered.wait(timeout=5)
+        waiter = executor.submit(provider.invoke, "cancelCoreRunV1", arguments)
+
+        deadline = time.monotonic() + 5
+        while True:
+            with provider._run_mutations._lock:
+                entries = tuple(provider._run_mutations._entries.values())
+                waiter_count = sum(entry.waiters for entry in entries)
+            if waiter_count == 1:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("failed-flight waiter did not join")
+            time.sleep(0.005)
+
+        run_control.release.set()
+        with pytest.raises(provider_module.CoreControlHTTPError):
+            leader.result(timeout=10)
+        assert waiter_exiting.wait(timeout=5)
+
+        started_at = time.monotonic()
+        with pytest.raises(RuntimeError, match="run mutations did not drain"):
+            provider.close()
+        assert time.monotonic() - started_at < 1
+        assert run_control.close_calls == 0
+        assert provider._run_control is run_control
+
+        allow_waiter_exit.set()
+        with pytest.raises(provider_module.CoreControlHTTPError):
+            waiter.result(timeout=10)
 
     provider.close()
     provider.close()

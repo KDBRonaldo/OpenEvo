@@ -134,11 +134,19 @@ def _run_control_http_error(exc: CoreRunControlError) -> _RunControlHTTPError:
 
 
 class _RunMutationFlight:
-    __slots__ = ("drained", "future", "owner_active", "request_digest", "waiters")
+    __slots__ = (
+        "drained",
+        "future",
+        "identity",
+        "owner_active",
+        "request_digest",
+        "waiters",
+    )
 
-    def __init__(self, request_digest: str) -> None:
+    def __init__(self, identity: tuple[str, str, str], request_digest: str) -> None:
         self.drained: Future[None] = Future()
         self.future: Future[object] = Future()
+        self.identity = identity
         self.owner_active = True
         self.request_digest = request_digest
         self.waiters = 0
@@ -153,6 +161,7 @@ class _RunMutationSingleFlight:
         self._entries: OrderedDict[tuple[str, str, str], _RunMutationFlight] = (
             OrderedDict()
         )
+        self._retired: set[_RunMutationFlight] = set()
         self._closing = False
 
     def invoke(
@@ -173,10 +182,15 @@ class _RunMutationSingleFlight:
                 self._entries.move_to_end(identity)
                 owner = False
             else:
+                for retired in self._retired:
+                    if retired.identity == identity and not hmac.compare_digest(
+                        retired.request_digest, request_digest
+                    ):
+                        raise _idempotency_conflict_error()
                 self._evict_completed_locked()
-                if len(self._entries) >= self._capacity:
+                if len(self._entries) + len(self._retired) >= self._capacity:
                     raise _run_mutation_capacity_error()
-                entry = _RunMutationFlight(request_digest)
+                entry = _RunMutationFlight(identity, request_digest)
                 future = entry.future
                 self._entries[identity] = entry
                 owner = True
@@ -190,9 +204,7 @@ class _RunMutationSingleFlight:
                     replay.headers = dict(exc.headers)
                     raise replay from exc
             finally:
-                with self._lock:
-                    entry.waiters -= 1
-                    self._resolve_drain_locked(entry)
+                self._release_waiter(entry)
 
         try:
             result = call()
@@ -203,6 +215,8 @@ class _RunMutationSingleFlight:
                     del self._entries[identity]
                 future.set_exception(exc)
                 entry.owner_active = False
+                if entry.waiters > 0 and not self._closing:
+                    self._retired.add(entry)
                 self._resolve_drain_locked(entry)
             raise
         with self._lock:
@@ -220,11 +234,19 @@ class _RunMutationSingleFlight:
     def close(self) -> tuple[Future[None], ...]:
         with self._lock:
             self._closing = True
-            entries = tuple(self._entries.values())
+            entries = tuple(self._entries.values()) + tuple(self._retired)
             for entry in entries:
                 self._resolve_drain_locked(entry)
             self._entries.clear()
+            self._retired.clear()
             return tuple(entry.drained for entry in entries)
+
+    def _release_waiter(self, entry: _RunMutationFlight) -> None:
+        with self._lock:
+            entry.waiters -= 1
+            if entry.waiters == 0:
+                self._retired.discard(entry)
+            self._resolve_drain_locked(entry)
 
     def _resolve_drain_locked(self, entry: _RunMutationFlight) -> None:
         if (
@@ -236,7 +258,7 @@ class _RunMutationSingleFlight:
             entry.drained.set_result(None)
 
     def _evict_completed_locked(self) -> None:
-        while len(self._entries) >= self._capacity:
+        while len(self._entries) + len(self._retired) >= self._capacity:
             completed_identity = next(
                 (
                     identity

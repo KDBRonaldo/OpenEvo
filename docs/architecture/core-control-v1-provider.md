@@ -398,20 +398,26 @@ create, cancel, retry, and delete run mutations. Concurrent requests with the
 same operation, scope, key, and digest share one owner call and receive the same
 success or error payload. A concurrent request that reuses the identity with a
 different digest conflicts before owner invocation. Successful results remain
-in a bounded process-local LRU replay cache; completed errors leave the table
-after their current waiters are released. Retryable owner errors can therefore
-be retried immediately, while non-retryable errors continue to replay from
-durable provider storage. Eviction, process crash, and restart fall back to the
-run owner's durable idempotency authority. When all entries are active, a new
-identity fails with a typed retryable capacity error. Shutdown stops admission
-to the table, freezes the admitted drain set, and waits up to 30 seconds for
-every admitted callback and coalesced waiter to resolve before it closes or
-clears the run owner. The wait never holds the single-flight lock. A timeout
-leaves the owner, store, and same drain set intact; a later idempotent `close()`
-continues that drain instead of admitting new work or losing authority. Only a
-completed drain permits owner and store teardown, so an admitted leader cannot
-fall through to a synthetic unavailable response or persist one as a
-non-retryable idempotency result. Non-run operations and run reads are unchanged.
+in a bounded process-local LRU replay cache. A failed flight leaves the replay
+map immediately, but while admitted waiters are still resolving it remains in a
+non-replay drain set that shares the same 256-entry capacity bound. An exact
+digest may start a fresh owner call instead of replaying that error; a different
+digest still conflicts until the concurrent failed flight drains. Retryable
+owner errors can therefore be retried, while non-retryable errors continue to
+replay from durable provider storage. Eviction, process crash, and restart fall
+back to the run owner's durable idempotency authority. When replay and drain
+entries exhaust capacity, a new identity fails with a typed retryable capacity
+error.
+
+Shutdown stops admission to both sets, freezes their combined drain authority,
+and waits up to 30 seconds for every admitted callback and coalesced waiter to
+resolve before it closes or clears the run owner. The wait never holds the
+single-flight lock. A timeout leaves the owner, store, and same drain set intact;
+a later idempotent `close()` continues that drain instead of admitting new work
+or losing authority. Only a completed drain permits owner and store teardown, so
+neither a delayed leader nor an awakened failure waiter can escape authority,
+fall through to a synthetic unavailable response, or permit premature teardown.
+Non-run operations and run reads are unchanged.
 
 The run owner's science execution projection preserves the exact project
 `capture_mode` in both experiment agent settings and the evolution execution
