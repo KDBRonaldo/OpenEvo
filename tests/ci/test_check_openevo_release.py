@@ -1648,6 +1648,28 @@ def _desktop_state_payload() -> dict[str, object]:
             "core": None,
             "failure": None,
         },
+        "execution_mode_capabilities": {
+            "schema_version": "1",
+            "modes": [
+                {
+                    "mode": "codex_subscription_transcript",
+                    "display_name": "Subscription",
+                    "support_state": "supported",
+                    "reason_code": None,
+                    "message": "Available in this OpenEvo Desktop release.",
+                },
+                {
+                    "mode": "self-deployed",
+                    "display_name": "Self-deployed",
+                    "support_state": "unavailable",
+                    "reason_code": "self_deployed_release_unavailable",
+                    "message": (
+                        "Self-deployed execution is not available in this OpenEvo "
+                        "Desktop release. Choose Subscription to save or run this project."
+                    ),
+                },
+            ],
+        },
         "active_project": None,
         "pending_operation_ids": [],
     }

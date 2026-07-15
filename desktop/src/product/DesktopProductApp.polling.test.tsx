@@ -215,6 +215,13 @@ function productionHarness(options: { readonly includeSecondProject?: boolean } 
     project_id: "project-fixture-2",
     name: "Second production project",
     task: { title: "Second production task", objective: "Exercise production refresh ownership." },
+    execution: {
+      mode: "codex_subscription_transcript",
+      capture_mode: "transcript",
+      token_level_metrics_available: false,
+      codex_model: "gpt-5.5",
+      hf_model: null,
+    },
     state: "draft",
     remote: null,
     etag: ETAG_C,
