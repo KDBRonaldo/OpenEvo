@@ -901,9 +901,12 @@ def _darwin_extended_acl_entries(file_fd: int) -> tuple[tuple[int, int], ...]:
     libc.acl_get_permset_mask_np.restype = ctypes.c_int
     libc.acl_free.argtypes = [ctypes.c_void_p]
     libc.acl_free.restype = ctypes.c_int
+    ctypes.set_errno(0)
     acl = libc.acl_get_fd_np(file_fd, _DARWIN_ACL_TYPE_EXTENDED)
     if not acl:
         error = ctypes.get_errno()
+        if error == errno.ENOENT:
+            return ()
         raise RuntimeError(f"macOS extended ACL cannot be read from held FD: errno {error}")
     entries: list[tuple[int, int]] = []
     try:

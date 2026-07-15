@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import importlib.util
 import hashlib
 from io import BytesIO
@@ -11,7 +12,7 @@ import struct
 import subprocess
 import sys
 import time
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
@@ -1001,6 +1002,51 @@ def test_core_release_output_rejects_acl_added_after_initialization(
             pass
 
     assert deleted == []
+
+
+class _FakeDarwinAclFunction:
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.argtypes: object = None
+        self.restype: object = None
+
+    def __call__(self, *_args: object) -> object:
+        return self.result
+
+
+def _fake_darwin_acl_libc() -> SimpleNamespace:
+    return SimpleNamespace(
+        acl_get_fd_np=_FakeDarwinAclFunction(None),
+        acl_get_entry=_FakeDarwinAclFunction(0),
+        acl_get_tag_type=_FakeDarwinAclFunction(0),
+        acl_get_permset_mask_np=_FakeDarwinAclFunction(0),
+        acl_free=_FakeDarwinAclFunction(0),
+    )
+
+
+def test_macos_fd_acl_treats_enoent_as_no_extended_acl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder.ctypes, "CDLL", lambda *_args, **_kwargs: _fake_darwin_acl_libc())
+    monkeypatch.setattr(builder.ctypes, "get_errno", lambda: errno.ENOENT)
+
+    assert builder._darwin_extended_acl_entries(41) == ()
+
+
+@pytest.mark.parametrize("error", [0, errno.EBADF, errno.EIO])
+def test_macos_fd_acl_rejects_non_enoent_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    error: int,
+) -> None:
+    builder = _load_builder()
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder.ctypes, "CDLL", lambda *_args, **_kwargs: _fake_darwin_acl_libc())
+    monkeypatch.setattr(builder.ctypes, "get_errno", lambda: error)
+
+    with pytest.raises(RuntimeError, match=rf"errno {error}$"):
+        builder._darwin_extended_acl_entries(41)
 
 
 @pytest.mark.parametrize(

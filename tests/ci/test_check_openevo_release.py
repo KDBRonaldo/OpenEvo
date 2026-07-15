@@ -203,8 +203,12 @@ def test_sidecar_smoke_rejects_invalid_desktop_state() -> None:
         smoke._assert_desktop_state({"schema_version": "1"})
 
 
-def test_bundle_smoke_launches_tauri_main_and_requires_native_evidence(tmp_path: Path) -> None:
+def test_bundle_smoke_launches_tauri_main_and_requires_native_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     smoke = _load_bundle_smoke_module()
+    monkeypatch.setattr(smoke.sys, "platform", "linux")
     app = tmp_path / "OpenEvo Desktop.app"
     executable = app / "Contents" / "MacOS" / "OpenEvo Desktop"
     sidecar = app / "Contents" / "MacOS" / "openevo-desktop-sidecar"

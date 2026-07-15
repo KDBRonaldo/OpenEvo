@@ -122,6 +122,11 @@ runner architecture. `release-candidate.json` repeats those normalized slice
 lists under `macos.native_architectures`, while the file inventory binds both
 complete smoke reports by size and SHA256.
 
+The portable app-smoke unit fixture uses an emitted evidence record because its
+executable is a test script, not Mach-O. It never substitutes for candidate
+evidence: macOS candidate runs always inspect and launch the real Tauri binary
+and packaged sidecar with `file`, `lipo`, native window, and FD checks.
+
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
 best stochastic result.
