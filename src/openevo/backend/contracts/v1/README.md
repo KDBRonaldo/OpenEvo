@@ -67,6 +67,19 @@ retains both authorities. The cleanup and coalescing do not apply to non-run
 operations or run reads, and a post-commit verification failure stops before
 owner invocation so a later retry can recover.
 
+Artifact inspection never authorizes an evolution artifact by opaque ID alone.
+The provider first verifies a signed revision-activation envelope that binds the
+artifact to a project, revision, and producing run, then requires the run owner's
+authoritative artifact page to return the exact typed summary. Content metadata
+comes from the authenticated managed evolution service, while bytes are opened
+only through `ArtifactPayloadService` under the Core-owned artifact root. The
+scanner rejects symlinks, path/identity drift, binary documents, unsupported
+types, digest/size mismatches, more than 128 documents, aggregate previews over
+2 MiB, and individual documents over 1 MiB. Diff accepts only an earlier
+same-project, same-target, same-type artifact named by the current artifact's
+lineage and returns bounded structured changes. Unreachable IDs are 404;
+unsupported, invalid, or oversized payloads fail closed with typed 422 errors.
+
 `SseFrameV1` freezes matching wire `id`, `event`, and typed `data`; every
 non-heartbeat envelope binds its change resource identity, ETag or digest, and
 applicable parent identity. A frame ID is a stream record cursor, while
@@ -140,5 +153,7 @@ See `docs/architecture/desktop-core-contract-v1.md` for the product boundary and
 `docs/architecture/core-control-v1-provider.md` for implemented ownership. The
 release provider injects `CoreScienceRunOwner` for durable science execution,
 generation-bound admission, next-session successor activation, and run artifact
-lists. Standalone artifact content/diff, environment repair, service restart,
-diagnostics, and cache cleanup remain fail closed.
+lists. Core Control owns verified text artifact get/content/diff for
+`text_memory`, `skill_bundle`, and `agent_system`; `parametric_memory` content
+remains unsupported. Environment repair, service restart, diagnostics, and cache
+cleanup remain fail closed.

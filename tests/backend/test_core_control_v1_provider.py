@@ -41,6 +41,7 @@ from openevo.backend.contracts.v1.store import (
     IdempotencyConflictError,
     StoreCorruptionError,
 )
+from openevo.evolution.artifact_payloads import ArtifactPayloadService
 from openevo.backend.run_control import RUN_OPERATION_IDS, CoreRunControlError
 from openevo.backend.service_supervisor import (
     ServiceComponent,
@@ -183,6 +184,8 @@ def _app(
     service_supervisor=None,
     run_control=None,
     run_control_factory=None,
+    evolution_artifact_root: Path | None = None,
+    artifact_loader=None,
     event_replay_limit: int = 10_000,
 ):
     return create_core_control_app(
@@ -195,6 +198,8 @@ def _app(
         service_supervisor=service_supervisor,
         run_control=run_control,
         run_control_factory=run_control_factory,
+        evolution_artifact_root=evolution_artifact_root,
+        artifact_loader=artifact_loader,
         event_replay_limit=event_replay_limit,
     )
 
@@ -4674,6 +4679,191 @@ class _RecordingRunControl:
         self.close_calls += 1
 
 
+class _ArtifactRunControl(_RecordingRunControl):
+    def __init__(self) -> None:
+        super().__init__()
+        self.artifacts: dict[str, list[m.ArtifactSummaryV1]] = {}
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self.invocations.append((operation_id, arguments))
+        if operation_id != "listCoreRunArtifactsV1":
+            return super().invoke(operation_id, arguments)
+        run_id = str(arguments["run_id"])
+        if run_id not in self.artifacts:
+            raise CoreRunControlError(
+                "run_not_found",
+                "The run does not exist.",
+                http_status=404,
+                retryable=False,
+            )
+        artifact_type = arguments["artifact_type"]
+        values = [
+            artifact
+            for artifact in self.artifacts[run_id]
+            if artifact_type is None or artifact.artifact_type is artifact_type
+        ]
+        return m.ArtifactPageV1(items=values, next_cursor=None, has_more=False)
+
+
+def _artifact_payload(
+    artifact_root: Path,
+    *,
+    artifact_id: str,
+    artifact_type: m.ArtifactType,
+    content: str | bytes,
+    extra_documents: Mapping[str, str | bytes] | None = None,
+) -> tuple[dict[str, object], str, int, Path]:
+    output = artifact_root / "workers" / f"job-{artifact_id}" / str(artifact_type)
+    output.mkdir(mode=0o700, parents=True)
+    if artifact_type is m.ArtifactType.TEXT_MEMORY:
+        relative_path = "memory.md"
+        manifest: dict[str, object] = {"content_path": relative_path, "record_count": 1}
+        uri_path = output / relative_path
+    elif artifact_type is m.ArtifactType.SKILL_BUNDLE:
+        relative_path = "SKILL.md"
+        manifest = {"entrypoint": relative_path, "files": [relative_path]}
+        uri_path = output
+    elif artifact_type is m.ArtifactType.AGENT_SYSTEM:
+        relative_path = "AGENTS.md"
+        manifest = {"content_path": relative_path, "target_path": relative_path}
+        uri_path = output / relative_path
+    else:
+        relative_path = "adapter.bin"
+        manifest = {
+            "adapter_id": artifact_id,
+            "base_model": "gpt-5.1-codex-mini",
+            "adapter_format": "lora",
+        }
+        uri_path = output
+    primary = output / relative_path
+    primary.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if isinstance(content, bytes):
+        primary.write_bytes(content)
+    else:
+        primary.write_text(content, encoding="utf-8")
+    for path, value in (extra_documents or {}).items():
+        destination = output / path
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if isinstance(value, bytes):
+            destination.write_bytes(value)
+        else:
+            destination.write_text(value, encoding="utf-8")
+    record: dict[str, object] = {
+        "artifact_id": artifact_id,
+        "type": str(artifact_type),
+        "name": f"{artifact_type.value} artifact",
+        "version": 1,
+        "state": "active",
+        "uri": uri_path.absolute().as_uri(),
+        "manifest": manifest,
+        "compatibility": {},
+        "scores": {},
+        "tags": [],
+        "promoted": True,
+    }
+    with ArtifactPayloadService(artifact_root) as payloads:
+        snapshot = payloads.issue_snapshot(
+            artifact_id=artifact_id,
+            artifact_type=str(artifact_type),
+            name=str(record["name"]),
+            uri=str(record["uri"]),
+            manifest=manifest,
+            scores={},
+            rank_index=0,
+        )
+    return (
+        record,
+        snapshot.payload_manifest_digest,
+        sum(entry.size_bytes for entry in snapshot.payload_entries),
+        primary,
+    )
+
+
+def _ready_provider_project(app, registry, *, key: str = "artifact-project-create") -> m.ProjectV1:
+    result = app.state.core_control_provider.store.create_project(
+        m.ProjectCreateV1.model_validate(_project_create()),
+        idempotency_key=key,
+        registry_digest=registry.snapshot.registry_digest,
+    )
+    assert isinstance(result.model, m.ProjectV1)
+    assert result.model.active_revision is not None
+    return result.model
+
+
+def _publish_artifact_summary(
+    app,
+    run_control: _ArtifactRunControl,
+    project: m.ProjectV1,
+    *,
+    run_id: str,
+    record: Mapping[str, object],
+    content_sha256: str,
+    byte_size: int,
+    source_artifact_ids: list[str] | None = None,
+) -> tuple[m.ProjectV1, m.ArtifactSummaryV1]:
+    artifact_id = str(record["artifact_id"])
+    artifact_type = m.ArtifactType(str(record["type"]))
+    assert project.active_revision is not None
+    revision = app.state.core_control_provider.store.activate_evolution_revision(
+        project.id,
+        predecessor=project.active_revision,
+        run_id=run_id,
+        context_artifact_ids={artifact_type.value: [artifact_id]},
+    )
+    project = app.state.core_control_provider.store.get_project(project.id)
+    common: dict[str, object] = {
+        "id": artifact_id,
+        "project_id": project.id,
+        "run_id": run_id,
+        "target_id": artifact_type.value,
+        "display_name": record["name"],
+        "summary": "Verified provider artifact fixture.",
+        "byte_size": byte_size,
+        "produced_revision": revision.revision,
+        "membership_revisions": [revision.revision],
+        "content_sha256": content_sha256,
+        "selected": True,
+        "promoted": True,
+        "release_enabled": artifact_type is not m.ArtifactType.PARAMETRIC_MEMORY,
+        "compatibility": {
+            "execution_modes": [project.spec.execution_mode],
+            "harness_ids": [project.spec.harness_id],
+            "base_model_refs": [project.spec.agent_model_ref],
+        },
+        "lineage": {
+            "method_id": f"{artifact_type.value}_method",
+            "job_id": f"job-{artifact_id}",
+            "source_dataset_ids": ["dataset-1"],
+            "source_artifact_ids": source_artifact_ids or [],
+        },
+        "scores": [{"name": "quality", "value": 1.0}],
+        "created_at": revision.created_at,
+        "artifact_type": artifact_type,
+    }
+    if artifact_type is m.ArtifactType.TEXT_MEMORY:
+        common["metadata"] = {"record_count": 1, "source_dataset_ids": ["dataset-1"]}
+        summary = m.TextMemoryArtifactSummaryV1.model_validate(common)
+    elif artifact_type is m.ArtifactType.SKILL_BUNDLE:
+        common["metadata"] = {
+            "document_count": 1,
+            "root_document": "SKILL.md",
+        }
+        summary = m.SkillBundleArtifactSummaryV1.model_validate(common)
+    elif artifact_type is m.ArtifactType.AGENT_SYSTEM:
+        common["metadata"] = {"target_path": "AGENTS.md"}
+        summary = m.AgentSystemArtifactSummaryV1.model_validate(common)
+    else:
+        common["release_enabled"] = False
+        common["metadata"] = {
+            "adapter_id": artifact_id,
+            "base_model_ref": project.spec.agent_model_ref,
+            "adapter_format": "lora",
+        }
+        summary = m.ParametricMemoryArtifactSummaryV1.model_validate(common)
+    run_control.artifacts[run_id] = [summary]
+    return project, summary
+
+
 class _FailingRunControl(_RecordingRunControl):
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         del operation_id, arguments
@@ -4881,6 +5071,358 @@ def test_run_control_operation_ids_exactly_match_frozen_run_routes(tmp_path: Pat
         )
 
     assert RUN_OPERATION_IDS == frozen_run_operation_ids
+
+
+@pytest.mark.parametrize(
+    ("artifact_type", "content", "relative_path"),
+    [
+        (m.ArtifactType.TEXT_MEMORY, "# Memory\n\nKeep verified evidence.\n", "memory.md"),
+        (m.ArtifactType.SKILL_BUNDLE, "# Skill\n\nUse the verified workflow.\n", "SKILL.md"),
+        (m.ArtifactType.AGENT_SYSTEM, "# Agent system\n\nCheck every result.\n", "AGENTS.md"),
+    ],
+)
+def test_artifact_list_get_and_verified_text_content(
+    tmp_path: Path,
+    artifact_type: m.ArtifactType,
+    content: str,
+    relative_path: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    artifact_id = f"artifact-{artifact_type.value}"
+    record, digest, byte_size, _primary = _artifact_payload(
+        artifact_root,
+        artifact_id=artifact_id,
+        artifact_type=artifact_type,
+        content=content,
+    )
+    records = {artifact_id: record}
+    run_control = _ArtifactRunControl()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader=records.__getitem__,
+    )
+    project = _ready_provider_project(app, registry)
+    _project, summary = _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id=f"run-{artifact_type.value}",
+        record=record,
+        content_sha256=digest,
+        byte_size=byte_size,
+    )
+
+    with TestClient(app) as client:
+        listed = client.get(
+            f"/v1/runs/{summary.run_id}/artifacts",
+            headers=AUTH,
+        )
+        fetched = client.get(f"/v1/artifacts/{artifact_id}", headers=AUTH)
+        preview = client.get(f"/v1/artifacts/{artifact_id}/content", headers=AUTH)
+
+    assert listed.status_code == fetched.status_code == preview.status_code == 200
+    assert listed.json()["items"] == [fetched.json()]
+    assert "uri" not in fetched.json()
+    assert preview.json() == {
+        "schema_version": "1",
+        "artifact_id": artifact_id,
+        "artifact_type": artifact_type.value,
+        "documents": [
+            {
+                "document_id": provider_module._artifact_document_id(
+                    artifact_id, relative_path
+                ),
+                "display_name": relative_path,
+                "relative_path": relative_path,
+                "mime_type": "text/markdown",
+                "content": content,
+                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "byte_size": len(content.encode("utf-8")),
+                "truncated": False,
+            }
+        ],
+        "total_documents": 1,
+        "total_utf8_bytes": len(content.encode("utf-8")),
+        "returned_utf8_bytes": len(content.encode("utf-8")),
+        "truncated": False,
+    }
+
+
+def test_artifact_lookup_does_not_authorize_unreachable_evolution_output(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    record, _digest, _byte_size, _primary = _artifact_payload(
+        artifact_root,
+        artifact_id="foreign-artifact",
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="secret foreign output\n",
+    )
+    loader_calls: list[str] = []
+
+    def loader(artifact_id: str) -> Mapping[str, object]:
+        loader_calls.append(artifact_id)
+        return record
+
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=_ArtifactRunControl(),
+        evolution_artifact_root=artifact_root,
+        artifact_loader=loader,
+    )
+    _ready_provider_project(app, registry)
+    with TestClient(app) as client:
+        fetched = client.get("/v1/artifacts/foreign-artifact", headers=AUTH)
+        content = client.get("/v1/artifacts/foreign-artifact/content", headers=AUTH)
+
+    assert fetched.status_code == content.status_code == 404
+    assert fetched.json()["code"] == content.json()["code"] == "artifact_not_found"
+    assert loader_calls == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "symlink"])
+def test_artifact_content_fails_closed_for_missing_or_symlink_payload(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    artifact_id = f"artifact-{damage}"
+    record, digest, byte_size, primary = _artifact_payload(
+        artifact_root,
+        artifact_id=artifact_id,
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="verified memory\n",
+    )
+    run_control = _ArtifactRunControl()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader={artifact_id: record}.__getitem__,
+    )
+    project = _ready_provider_project(app, registry)
+    _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id=f"run-{damage}",
+        record=record,
+        content_sha256=digest,
+        byte_size=byte_size,
+    )
+    primary.unlink()
+    if damage == "symlink":
+        secret = tmp_path / "outside-secret.md"
+        secret.write_text("must not be exposed\n", encoding="utf-8")
+        primary.symlink_to(secret)
+
+    with TestClient(app) as client:
+        response = client.get(f"/v1/artifacts/{artifact_id}/content", headers=AUTH)
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "artifact_content_invalid"
+    assert "must not be exposed" not in response.text
+    assert os.fspath(tmp_path) not in response.text
+
+
+@pytest.mark.parametrize(
+    ("artifact_id", "artifact_type", "content", "expected_code"),
+    [
+        (
+            "artifact-oversize",
+            m.ArtifactType.TEXT_MEMORY,
+            "x" * (m.MAX_ARTIFACT_PREVIEW_UTF8_BYTES + 1),
+            "artifact_content_oversize",
+        ),
+        (
+            "artifact-binary",
+            m.ArtifactType.TEXT_MEMORY,
+            b"\xff\xfe\x00",
+            "artifact_content_invalid",
+        ),
+        (
+            "artifact-parametric",
+            m.ArtifactType.PARAMETRIC_MEMORY,
+            b"adapter",
+            "artifact_content_type_unsupported",
+        ),
+    ],
+)
+def test_artifact_content_rejects_oversize_binary_and_unsupported_types(
+    tmp_path: Path,
+    artifact_id: str,
+    artifact_type: m.ArtifactType,
+    content: str | bytes,
+    expected_code: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    record, digest, byte_size, _primary = _artifact_payload(
+        artifact_root,
+        artifact_id=artifact_id,
+        artifact_type=artifact_type,
+        content=content,
+    )
+    run_control = _ArtifactRunControl()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader={artifact_id: record}.__getitem__,
+    )
+    project = _ready_provider_project(app, registry)
+    _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id=f"run-{artifact_id}",
+        record=record,
+        content_sha256=digest,
+        byte_size=byte_size,
+    )
+
+    with TestClient(app) as client:
+        response = client.get(f"/v1/artifacts/{artifact_id}/content", headers=AUTH)
+
+    assert response.status_code == 422
+    assert response.json()["code"] == expected_code
+
+
+def test_artifact_diff_uses_reachable_cross_revision_lineage(tmp_path: Path) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    previous_record, previous_digest, previous_size, _previous_path = _artifact_payload(
+        artifact_root,
+        artifact_id="memory-previous",
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="# Memory\n\nKeep alpha.\nRemove beta.\n",
+    )
+    current_record, current_digest, current_size, _current_path = _artifact_payload(
+        artifact_root,
+        artifact_id="memory-current",
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="# Memory\n\nKeep alpha.\nAdd gamma.\n",
+    )
+    records = {
+        "memory-previous": previous_record,
+        "memory-current": current_record,
+    }
+    run_control = _ArtifactRunControl()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader=records.__getitem__,
+    )
+    project = _ready_provider_project(app, registry)
+    project, previous = _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id="run-memory-previous",
+        record=previous_record,
+        content_sha256=previous_digest,
+        byte_size=previous_size,
+    )
+    _project, current = _publish_artifact_summary(
+        app,
+        run_control,
+        project,
+        run_id="run-memory-current",
+        record=current_record,
+        content_sha256=current_digest,
+        byte_size=current_size,
+        source_artifact_ids=[previous.id],
+    )
+
+    with TestClient(app) as client:
+        response = client.get(f"/v1/artifacts/{current.id}/diff", headers=AUTH)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["artifact_id"] == current.id
+    assert payload["artifact_content_sha256"] == current.content_sha256
+    assert payload["previous_artifact_id"] == previous.id
+    assert payload["previous_artifact_content_sha256"] == previous.content_sha256
+    assert payload["truncated"] is False
+    assert [change["kind"] for change in payload["document_changes"]] == ["modified"]
+    lines = payload["document_changes"][0]["hunks"][0]["lines"]
+    assert {line["kind"] for line in lines} == {"context", "removed", "added"}
+    assert any(line["text"] == "Remove beta." for line in lines)
+    assert any(line["text"] == "Add gamma." for line in lines)
+
+
+def test_artifact_diff_rejects_cross_project_predecessor(tmp_path: Path) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed-artifacts"
+    records: dict[str, Mapping[str, object]] = {}
+    run_control = _ArtifactRunControl()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        run_control=run_control,
+        evolution_artifact_root=artifact_root,
+        artifact_loader=records.__getitem__,
+    )
+    first_project = _ready_provider_project(app, registry, key="artifact-project-first")
+    second_project = _ready_provider_project(app, registry, key="artifact-project-second")
+    first_record, first_digest, first_size, _ = _artifact_payload(
+        artifact_root,
+        artifact_id="first-project-memory",
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="first project\n",
+    )
+    second_record, second_digest, second_size, _ = _artifact_payload(
+        artifact_root,
+        artifact_id="second-project-memory",
+        artifact_type=m.ArtifactType.TEXT_MEMORY,
+        content="second project\n",
+    )
+    records.update(
+        {
+            "first-project-memory": first_record,
+            "second-project-memory": second_record,
+        }
+    )
+    _first_project, first = _publish_artifact_summary(
+        app,
+        run_control,
+        first_project,
+        run_id="run-first-project",
+        record=first_record,
+        content_sha256=first_digest,
+        byte_size=first_size,
+    )
+    _second_project, second = _publish_artifact_summary(
+        app,
+        run_control,
+        second_project,
+        run_id="run-second-project",
+        record=second_record,
+        content_sha256=second_digest,
+        byte_size=second_size,
+        source_artifact_ids=[first.id],
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/v1/artifacts/{second.id}/diff",
+            headers=AUTH,
+            params={"previous_artifact_id": first.id},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "artifact_not_found"
 
 
 @pytest.mark.parametrize(

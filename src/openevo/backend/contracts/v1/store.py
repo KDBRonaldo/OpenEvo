@@ -59,6 +59,7 @@ _MAX_SCHEMA_BYTES = 256 * 1024
 _RECOVERY_PAGE_SIZE = 256
 _MAX_PROJECTS = 10_000
 _MAX_REVISIONS = 100_000
+_MAX_ARTIFACT_REACHABILITY_ROWS = 128
 _MAX_UPLOADS = 20_000
 _MAX_PUBLICATION_OWNERS = _MAX_UPLOADS + _IDEMPOTENCY_LIMIT
 _MAX_CLEANUP_INTENTS = _MAX_PROJECTS + (2 * _MAX_UPLOADS)
@@ -206,6 +207,15 @@ class StoredResult:
     model: BaseModel | None
     etag: str | None = None
     replayed: bool = False
+
+
+@dataclass(frozen=True)
+class ArtifactReachability:
+    artifact_id: str
+    artifact_type: m.ArtifactType
+    project_id: str
+    run_id: str
+    revision: m.RevisionRefV1
 
 
 @dataclass(frozen=True)
@@ -774,6 +784,121 @@ class CoreControlStoreV1:
             revision = self._validated_revision_row(row)
             self._verify_lifecycle_storage()
             return revision
+
+    def artifact_reachability(self, artifact_id: str) -> list[ArtifactReachability]:
+        """Return every signed revision activation that makes an artifact reachable."""
+
+        if (
+            not isinstance(artifact_id, str)
+            or not 1 <= len(artifact_id.encode("utf-8")) <= 128
+            or any(ord(character) < 0x21 or ord(character) == 0x7F for character in artifact_id)
+        ):
+            raise ValueError("artifact ID is outside the Core Control identity policy")
+        operation_id = "activateCoreEvolutionRevisionInternalV1"
+        needle = _canonical_bytes(artifact_id)
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            self._connection.execute("BEGIN")
+            try:
+                cursor = self._connection.execute(
+                    "SELECT bindings.* FROM revision_activation_bindings AS bindings "
+                    "JOIN project_revisions AS revisions "
+                    "ON revisions.revision_id = bindings.revision_id "
+                    "JOIN idempotency_records AS records "
+                    "ON records.operation_id = bindings.operation_id "
+                    "AND records.resource_scope = bindings.resource_scope "
+                    "AND records.idempotency_key = bindings.idempotency_key "
+                    "WHERE bindings.operation_id = ? "
+                    "AND instr(CAST(records.request_json AS BLOB), ?) > 0 "
+                    "ORDER BY revisions.generation ASC, bindings.revision_id ASC LIMIT ?",
+                    (operation_id, needle, _MAX_ARTIFACT_REACHABILITY_ROWS + 1),
+                )
+                binding_rows = cursor.fetchmany(_MAX_ARTIFACT_REACHABILITY_ROWS + 1)
+                if cursor.fetchone() is not None or len(binding_rows) > _MAX_ARTIFACT_REACHABILITY_ROWS:
+                    raise StoreCorruptionError(
+                        "artifact reachability exceeds its closed revision bound"
+                    )
+                reachable: list[ArtifactReachability] = []
+                for binding_row in binding_rows:
+                    self._validate_revision_activation_binding_row(binding_row)
+                    revision_row = self._connection.execute(
+                        "SELECT * FROM project_revisions WHERE revision_id = ?",
+                        (binding_row["revision_id"],),
+                    ).fetchone()
+                    record_row = self._connection.execute(
+                        "SELECT * FROM idempotency_records WHERE operation_id = ? "
+                        "AND resource_scope = ? AND idempotency_key = ?",
+                        (
+                            binding_row["operation_id"],
+                            binding_row["resource_scope"],
+                            binding_row["idempotency_key"],
+                        ),
+                    ).fetchone()
+                    if revision_row is None or record_row is None:
+                        raise StoreCorruptionError(
+                            "artifact reachability authority is incomplete"
+                        )
+                    revision = self._validated_revision_row(revision_row)
+                    model = _validate_idempotency_row(
+                        record_row,
+                        signing_key=self._signing_key,
+                        publication_owner_lookup=self._publication_owner_for_snapshot,
+                    )
+                    request, _headers = _validate_idempotency_request_envelope(record_row)
+                    self._validate_idempotency_revision_request(record_row, model)
+                    if not isinstance(request, _EvolutionRevisionActivationRequest):
+                        raise StoreCorruptionError(
+                            "artifact reachability request has the wrong type"
+                        )
+                    if (
+                        not isinstance(model, m.ProjectV1)
+                        or model.active_revision != revision.revision
+                        or request.project_id != revision.revision.project_id
+                        or request.predecessor != revision.predecessor_revision
+                        or request.run_id != binding_row["idempotency_key"]
+                        or binding_row["project_id"] != request.project_id
+                        or binding_row["request_digest"] != record_row["request_digest"]
+                        or revision_row["activation_request_digest"]
+                        != record_row["request_digest"]
+                    ):
+                        raise StoreCorruptionError(
+                            "artifact reachability revision closure is invalid"
+                        )
+                    artifact_types = [
+                        artifact_type
+                        for artifact_type, artifact_ids in request.context_artifact_ids.items()
+                        if artifact_id in artifact_ids
+                    ]
+                    if not artifact_types:
+                        continue
+                    if len(artifact_types) != 1:
+                        raise StoreCorruptionError(
+                            "artifact is reachable under more than one typed context"
+                        )
+                    try:
+                        artifact_type = m.ArtifactType(artifact_types[0])
+                    except ValueError as exc:
+                        raise StoreCorruptionError(
+                            "artifact reachability uses an unsupported type"
+                        ) from exc
+                    reachable.append(
+                        ArtifactReachability(
+                            artifact_id=artifact_id,
+                            artifact_type=artifact_type,
+                            project_id=request.project_id,
+                            run_id=request.run_id,
+                            revision=revision.revision,
+                        )
+                    )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                try:
+                    self._connection.execute("ROLLBACK")
+                finally:
+                    self._verify_database_transaction_boundary()
+                raise
+            self._verify_database_transaction_boundary()
+            return reachable
 
     def get_revision_head(self, project_id: str) -> m.RevisionHeadV1:
         with self._mutex:

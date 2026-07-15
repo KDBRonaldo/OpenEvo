@@ -4,15 +4,18 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import difflib
 import hashlib
 import hmac
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import threading
 from typing import Any, NoReturn, cast
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+import httpx
 
 from openevo import __version__
 from openevo.backend.service_control import CoreServiceControl, CoreServiceControlError
@@ -22,6 +25,11 @@ from openevo.backend.run_control import (
     CoreRunControl,
     CoreRunControlError,
 )
+from openevo.evolution.artifact_payloads import (
+    ArtifactPayloadBudgetExceeded,
+    ArtifactPayloadService,
+)
+from openevo.evolution.framework.contracts import MAX_CONTRIBUTION_TEXT
 from openevo.evolution.framework import (
     CapabilityAudience,
     EvolutionExecutionProfile,
@@ -35,6 +43,11 @@ from openevo.evolution.framework.builtins import (
 from openevo.experiments import (
     ProjectEvolutionValidationError,
     validate_project_evolution_selections,
+)
+from openevo.experiments.clients import EvolutionHttpClient
+from openevo.evolution.models import (
+    ArtifactResponse as EvolutionArtifactResponse,
+    ArtifactState as EvolutionArtifactState,
 )
 
 from . import models as m
@@ -55,6 +68,7 @@ from .store import (
     ResourceNotFoundError,
     StoreCorruptionError,
     StoredResult,
+    ArtifactReachability,
     _failed_idempotency_identity,
 )
 
@@ -78,6 +92,30 @@ _RUN_MUTATION_OPERATION_IDS = frozenset(
 )
 _RUN_MUTATION_SINGLEFLIGHT_CAPACITY = 256
 _RUN_MUTATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 30.0
+_ARTIFACT_PAGE_LIMIT = 100
+_MAX_ARTIFACT_SOURCE_REVISIONS = 128
+_TEXT_ARTIFACT_TYPES = frozenset(
+    {
+        m.ArtifactType.TEXT_MEMORY,
+        m.ArtifactType.SKILL_BUNDLE,
+        m.ArtifactType.AGENT_SYSTEM,
+    }
+)
+_TEXT_ARTIFACT_MIME_TYPES = frozenset(
+    {
+        "application/json",
+        "application/toml",
+        "application/x-sh",
+        "application/yaml",
+        "text/css",
+        "text/csv",
+        "text/html",
+        "text/javascript",
+        "text/markdown",
+        "text/plain",
+        "text/x-python",
+    }
+)
 
 _UNAVAILABLE_OPERATIONS = frozenset(
     {
@@ -93,9 +131,6 @@ _UNAVAILABLE_OPERATIONS = frozenset(
         "getCoreRunLogsV1",
         "getCoreRunContextV1",
         "listCoreRunArtifactsV1",
-        "getCoreArtifactV1",
-        "getCoreArtifactContentV1",
-        "getCoreArtifactDiffV1",
         "restartCoreServiceV1",
         "getCoreServiceLogsV1",
         "getCoreOperationV1",
@@ -107,6 +142,23 @@ _UNAVAILABLE_OPERATIONS = frozenset(
         "cleanupCoreCachesV1",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedArtifactDocument:
+    document_id: str
+    display_name: str
+    relative_path: str
+    mime_type: str
+    content: str
+    content_sha256: str
+    byte_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedArtifactContent:
+    summary: m.ArtifactSummaryV1
+    documents: tuple[_VerifiedArtifactDocument, ...]
 
 
 class _RunControlHTTPError(CoreControlHTTPError):
@@ -292,6 +344,8 @@ class CoreControlProviderV1:
         evolution_registry: VerifiedExecutableRegistry | None = None,
         service_supervisor: CoreServiceControl | None = None,
         run_control: CoreRunControl | None = None,
+        evolution_artifact_root: str | Path | None = None,
+        artifact_loader: Callable[[str], Mapping[str, object]] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         try:
@@ -316,6 +370,12 @@ class CoreControlProviderV1:
         self._registry = evolution_registry
         self._service_supervisor = service_supervisor
         self._run_control = run_control
+        self._evolution_artifact_root = (
+            None
+            if evolution_artifact_root is None
+            else Path(evolution_artifact_root).expanduser().absolute()
+        )
+        self._artifact_loader = artifact_loader
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._started_at = self._timestamp()
         self._version = m.VersionResponseV1(
@@ -343,6 +403,9 @@ class CoreControlProviderV1:
             "listCoreProjectRevisionsV1": self._list_project_revisions,
             "getCoreProjectRevisionHeadV1": self._get_project_revision_head,
             "getCoreRevisionV1": self._get_revision,
+            "getCoreArtifactV1": self._get_artifact,
+            "getCoreArtifactContentV1": self._get_artifact_content,
+            "getCoreArtifactDiffV1": self._get_artifact_diff,
             "createCoreWorkspaceUploadV1": self._create_upload,
             "getCoreWorkspaceUploadV1": self._get_upload,
             "putCoreWorkspaceUploadChunkV1": self._put_upload_chunk,
@@ -662,6 +725,248 @@ class CoreControlProviderV1:
         revision = self.store.get_revision(cast(str, arguments["revision_id"]))
         return _model_response(revision, etag=revision.etag)
 
+    def _get_artifact(self, arguments: Mapping[str, object]) -> m.ArtifactSummaryV1:
+        return self._artifact_summary(cast(str, arguments["artifact_id"]))
+
+    def _get_artifact_content(self, arguments: Mapping[str, object]) -> m.ArtifactContentV1:
+        verified = self._verified_artifact_content(
+            self._artifact_summary(cast(str, arguments["artifact_id"]))
+        )
+        documents = [
+            m.ArtifactDocumentPreviewV1(
+                document_id=document.document_id,
+                display_name=document.display_name,
+                relative_path=document.relative_path,
+                mime_type=document.mime_type,
+                content=document.content,
+                content_sha256=document.content_sha256,
+                byte_size=document.byte_size,
+                truncated=False,
+            )
+            for document in verified.documents
+        ]
+        total_bytes = sum(document.byte_size for document in verified.documents)
+        return m.ArtifactContentV1(
+            artifact_id=verified.summary.id,
+            artifact_type=verified.summary.artifact_type,
+            documents=documents,
+            total_documents=len(documents),
+            total_utf8_bytes=total_bytes,
+            returned_utf8_bytes=total_bytes,
+            truncated=False,
+        )
+
+    def _get_artifact_diff(self, arguments: Mapping[str, object]) -> m.ArtifactDiffV1:
+        current = self._artifact_summary(cast(str, arguments["artifact_id"]))
+        previous = self._previous_artifact_summary(
+            current,
+            cast(str | None, arguments["previous_artifact_id"]),
+        )
+        current_content = self._verified_artifact_content(current)
+        previous_content = self._verified_artifact_content(previous)
+        return _artifact_diff(previous_content, current_content)
+
+    def _artifact_summary(self, artifact_id: str) -> m.ArtifactSummaryV1:
+        reachability = self.store.artifact_reachability(artifact_id)
+        if not reachability:
+            raise ResourceNotFoundError("artifact", artifact_id)
+        if self._run_control is None:
+            raise StoreCorruptionError("artifact reachability has no run authority")
+
+        matches: list[m.ArtifactSummaryBaseV1] = []
+        for reachable in reachability:
+            after: str | None = None
+            while True:
+                page = self._run_control.invoke(
+                    "listCoreRunArtifactsV1",
+                    {
+                        "run_id": reachable.run_id,
+                        "limit": _ARTIFACT_PAGE_LIMIT,
+                        "after": after,
+                        "sort": "created_at",
+                        "direction": "asc",
+                        "artifact_type": reachable.artifact_type,
+                    },
+                )
+                if not isinstance(page, m.ArtifactPageV1):
+                    raise StoreCorruptionError("run artifact authority returned the wrong type")
+                for item in page.items:
+                    if item.id != artifact_id:
+                        continue
+                    if not _summary_matches_reachability(item, reachable):
+                        raise StoreCorruptionError(
+                            "run artifact summary does not match revision reachability"
+                        )
+                    matches.append(item)
+                if not page.has_more:
+                    break
+                if page.next_cursor is None or page.next_cursor == after:
+                    raise StoreCorruptionError("run artifact pagination did not advance")
+                after = page.next_cursor
+        unique = {item.model_dump_json(): item for item in matches}
+        if len(unique) != 1:
+            raise StoreCorruptionError(
+                "artifact does not have exactly one authoritative run output"
+            )
+        return cast(m.ArtifactSummaryV1, next(iter(unique.values())))
+
+    def _previous_artifact_summary(
+        self,
+        current: m.ArtifactSummaryV1,
+        requested_id: str | None,
+    ) -> m.ArtifactSummaryV1:
+        source_ids = current.lineage.source_artifact_ids
+        if requested_id is not None and requested_id not in source_ids:
+            raise ResourceNotFoundError("artifact", requested_id)
+        candidate_ids = [requested_id] if requested_id is not None else list(source_ids)
+        if len(candidate_ids) > _MAX_ARTIFACT_SOURCE_REVISIONS:
+            raise StoreCorruptionError("artifact lineage exceeds its diff source bound")
+        candidates: list[m.ArtifactSummaryBaseV1] = []
+        for candidate_id in candidate_ids:
+            assert candidate_id is not None
+            try:
+                candidate = self._artifact_summary(candidate_id)
+            except ResourceNotFoundError:
+                if requested_id is not None:
+                    raise
+                continue
+            if _is_valid_diff_predecessor(candidate, current):
+                candidates.append(candidate)
+            elif requested_id is not None:
+                raise ResourceNotFoundError("artifact", requested_id)
+        if not candidates:
+            raise _error(
+                409,
+                code="artifact_diff_base_missing",
+                message="The artifact has no reachable compatible predecessor.",
+                category=m.ErrorCategory.ARTIFACT,
+                retryable=False,
+                repair_action=m.RepairAction.USER_ACTION_REQUIRED,
+                next_action="Select an artifact whose lineage contains a prior revision output.",
+            )
+        candidates.sort(
+            key=lambda item: (item.produced_revision.generation, item.created_at, item.id)
+        )
+        return cast(m.ArtifactSummaryV1, candidates[-1])
+
+    def _verified_artifact_content(
+        self, summary: m.ArtifactSummaryV1
+    ) -> _VerifiedArtifactContent:
+        if summary.artifact_type not in _TEXT_ARTIFACT_TYPES:
+            raise _artifact_content_error(
+                "artifact_content_type_unsupported",
+                "This typed artifact does not expose UTF-8 document content.",
+            )
+        if summary.byte_size > m.MAX_ARTIFACT_PREVIEW_UTF8_BYTES:
+            raise _artifact_content_error(
+                "artifact_content_oversize",
+                "The artifact exceeds the bounded inspection byte budget.",
+            )
+        if self._evolution_artifact_root is None:
+            raise _artifact_authority_error()
+        record = self._load_evolution_artifact(summary.id)
+        try:
+            if (
+                record.artifact_id != summary.id
+                or m.ArtifactType(str(record.type)) is not summary.artifact_type
+                or record.name != summary.display_name
+                or record.state is not EvolutionArtifactState.ACTIVE
+            ):
+                raise ValueError("artifact metadata identity does not match its summary")
+            with ArtifactPayloadService(self._evolution_artifact_root) as payloads:
+                snapshot = payloads.issue_snapshot(
+                    artifact_id=record.artifact_id,
+                    artifact_type=str(record.type),
+                    name=record.name,
+                    uri=record.uri,
+                    manifest=record.manifest,
+                    scores=record.scores,
+                    rank_index=0,
+                )
+                payload_bytes = sum(entry.size_bytes for entry in snapshot.payload_entries)
+                if (
+                    snapshot.payload_manifest_digest != summary.content_sha256
+                    or payload_bytes != summary.byte_size
+                ):
+                    raise ValueError("artifact payload no longer matches its run summary")
+                if (
+                    len(snapshot.payload_entries) > m.MAX_ARTIFACT_PREVIEW_DOCUMENTS
+                    or payload_bytes > m.MAX_ARTIFACT_PREVIEW_UTF8_BYTES
+                    or any(
+                        entry.size_bytes > MAX_CONTRIBUTION_TEXT
+                        for entry in snapshot.payload_entries
+                    )
+                ):
+                    raise ArtifactPayloadBudgetExceeded(
+                        "artifact exceeds the inspection preview budget"
+                    )
+                if any(
+                    entry.media_type not in _TEXT_ARTIFACT_MIME_TYPES
+                    for entry in snapshot.payload_entries
+                ):
+                    raise ValueError("artifact payload contains a non-text document")
+                selected_paths = _selected_artifact_paths(summary, record, snapshot)
+                entries = {
+                    entry.relative_path: entry for entry in snapshot.payload_entries
+                }
+                documents: list[_VerifiedArtifactDocument] = []
+                for relative_path in selected_paths:
+                    entry = entries[relative_path]
+                    content = payloads.read_utf8_prefix(
+                        snapshot.payload_handle,
+                        relative_path,
+                        max_chars=entry.size_bytes,
+                        max_bytes=entry.size_bytes,
+                    )
+                    if len(content.encode("utf-8")) != entry.size_bytes:
+                        raise ValueError("artifact document read was unexpectedly truncated")
+                    display_name = PurePosixPath(relative_path).name
+                    if not display_name or len(display_name) > 128:
+                        raise ValueError("artifact document display name is invalid")
+                    documents.append(
+                        _VerifiedArtifactDocument(
+                            document_id=_artifact_document_id(summary.id, relative_path),
+                            display_name=display_name,
+                            relative_path=relative_path,
+                            mime_type=entry.media_type,
+                            content=content,
+                            content_sha256=entry.sha256,
+                            byte_size=entry.size_bytes,
+                        )
+                    )
+                payloads.verify_inventory_identity(snapshot.payload_handle)
+        except ArtifactPayloadBudgetExceeded as exc:
+            raise _artifact_content_error(
+                "artifact_content_oversize",
+                "The artifact exceeds the bounded inspection byte budget.",
+            ) from exc
+        except (OSError, ValueError) as exc:
+            raise _artifact_content_error(
+                "artifact_content_invalid",
+                "The artifact payload failed verified UTF-8 inspection.",
+            ) from exc
+        return _VerifiedArtifactContent(summary=summary, documents=tuple(documents))
+
+    def _load_evolution_artifact(self, artifact_id: str) -> EvolutionArtifactResponse:
+        try:
+            if self._artifact_loader is not None:
+                payload = self._artifact_loader(artifact_id)
+            else:
+                binding_factory = getattr(self._service_supervisor, "run_binding", None)
+                if not callable(binding_factory):
+                    raise RuntimeError("evolution artifact authority is not bound")
+                binding = binding_factory()
+                with EvolutionHttpClient(
+                    binding.evolution_backend_url,
+                    headers=binding.request_headers(),
+                ) as client:
+                    payload = client.get_artifact(artifact_id)
+            return EvolutionArtifactResponse.model_validate(payload)
+        except CoreControlHTTPError:
+            raise
+        except (httpx.HTTPError, RuntimeError, TypeError, ValueError) as exc:
+            raise _artifact_authority_error() from exc
+
     def _create_upload(self, arguments: Mapping[str, object]) -> Response:
         return _stored_response(
             self.store.create_upload(
@@ -900,6 +1205,356 @@ class CoreControlProviderV1:
         )
 
 
+def _summary_matches_reachability(
+    summary: m.ArtifactSummaryBaseV1,
+    reachable: ArtifactReachability,
+) -> bool:
+    return (
+        summary.id == reachable.artifact_id
+        and summary.artifact_type is reachable.artifact_type
+        and summary.project_id == reachable.project_id
+        and summary.run_id == reachable.run_id
+        and summary.produced_revision == reachable.revision
+        and reachable.revision in summary.membership_revisions
+    )
+
+
+def _is_valid_diff_predecessor(
+    previous: m.ArtifactSummaryBaseV1,
+    current: m.ArtifactSummaryBaseV1,
+) -> bool:
+    return (
+        previous.id != current.id
+        and previous.project_id == current.project_id
+        and previous.target_id == current.target_id
+        and previous.artifact_type is current.artifact_type
+        and previous.produced_revision.generation < current.produced_revision.generation
+    )
+
+
+def _selected_artifact_paths(
+    summary: m.ArtifactSummaryBaseV1,
+    record: EvolutionArtifactResponse,
+    snapshot: Any,
+) -> tuple[str, ...]:
+    entries = {entry.relative_path: entry for entry in snapshot.payload_entries}
+    if summary.artifact_type is m.ArtifactType.SKILL_BUNDLE:
+        if not isinstance(summary, m.SkillBundleArtifactSummaryV1):
+            raise ValueError("skill artifact summary has the wrong type")
+        if "SKILL.md" not in entries or summary.metadata.document_count != len(entries):
+            raise ValueError("skill bundle inventory does not match its summary")
+        return tuple(sorted(entries))
+    if summary.artifact_type is m.ArtifactType.TEXT_MEMORY:
+        if not isinstance(summary, m.TextMemoryArtifactSummaryV1):
+            raise ValueError("text memory summary has the wrong type")
+        content_path = record.manifest.get("content_path")
+        record_count = record.manifest.get("record_count", 0)
+        if content_path != "memory.md" or record_count != summary.metadata.record_count:
+            raise ValueError("text memory manifest does not match its summary")
+    elif summary.artifact_type is m.ArtifactType.AGENT_SYSTEM:
+        if not isinstance(summary, m.AgentSystemArtifactSummaryV1):
+            raise ValueError("agent system summary has the wrong type")
+        content_path = record.manifest.get("content_path")
+        if record.manifest.get("target_path") != summary.metadata.target_path:
+            raise ValueError("agent system target does not match its summary")
+    else:
+        raise ValueError("artifact type does not expose text documents")
+    if not isinstance(content_path, str) or content_path not in entries:
+        raise ValueError("artifact content path is absent from its verified inventory")
+    return (content_path,)
+
+
+def _artifact_document_id(artifact_id: str, relative_path: str) -> str:
+    digest = hashlib.sha256(
+        artifact_id.encode("utf-8") + b"\0" + relative_path.encode("utf-8")
+    ).hexdigest()
+    return f"document-{digest}"
+
+
+def _artifact_content_error(code: str, message: str) -> CoreControlHTTPError:
+    return _error(
+        422,
+        code=code,
+        message=message,
+        category=m.ErrorCategory.ARTIFACT,
+        retryable=False,
+        repair_action=m.RepairAction.USER_ACTION_REQUIRED,
+        next_action="Regenerate the artifact from a supported bounded UTF-8 payload.",
+    )
+
+
+def _artifact_authority_error() -> CoreControlHTTPError:
+    return _error(
+        502,
+        code="artifact_authority_invalid",
+        message="Core could not verify the authoritative evolution artifact record.",
+        category=m.ErrorCategory.ARTIFACT,
+        retryable=True,
+        repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Retry after the managed evolution service is healthy.",
+    )
+
+
+def _diff_document_identity(
+    artifact: _VerifiedArtifactContent,
+    document: _VerifiedArtifactDocument,
+) -> m.ArtifactDiffDocumentIdentityV1:
+    return m.ArtifactDiffDocumentIdentityV1(
+        artifact_id=artifact.summary.id,
+        artifact_content_sha256=artifact.summary.content_sha256,
+        document_id=document.document_id,
+        relative_path=document.relative_path,
+        content_sha256=document.content_sha256,
+    )
+
+
+def _artifact_diff(
+    previous: _VerifiedArtifactContent,
+    current: _VerifiedArtifactContent,
+) -> m.ArtifactDiffV1:
+    old_by_path = {document.relative_path: document for document in previous.documents}
+    new_by_path = {document.relative_path: document for document in current.documents}
+    if any(
+        len(line) > 16_384
+        for document in (*previous.documents, *current.documents)
+        for line in document.content.splitlines()
+    ):
+        raise _artifact_content_error(
+            "artifact_diff_oversize",
+            "The artifact diff exceeds the bounded structured diff budget.",
+        )
+    changes: list[Any] = []
+
+    for path in sorted(old_by_path.keys() & new_by_path.keys()):
+        old_document = old_by_path[path]
+        new_document = new_by_path[path]
+        if old_document.content_sha256 == new_document.content_sha256:
+            continue
+        old_identity = _diff_document_identity(previous, old_document)
+        new_identity = _diff_document_identity(current, new_document)
+        changes.append(
+            m.ModifiedArtifactDocumentChangeV1(
+                kind=m.ArtifactDocumentChangeKind.MODIFIED,
+                old_document=old_identity,
+                new_document=new_identity,
+                hunks=_modified_document_hunks(
+                    old_document,
+                    new_document,
+                    old_identity=old_identity,
+                    new_identity=new_identity,
+                ),
+            )
+        )
+
+    removed = {path: old_by_path[path] for path in old_by_path.keys() - new_by_path.keys()}
+    added = {path: new_by_path[path] for path in new_by_path.keys() - old_by_path.keys()}
+    for old_path in sorted(tuple(removed)):
+        old_document = removed[old_path]
+        new_path = next(
+            (
+                path
+                for path in sorted(added)
+                if added[path].content_sha256 == old_document.content_sha256
+            ),
+            None,
+        )
+        if new_path is None:
+            continue
+        new_document = added.pop(new_path)
+        removed.pop(old_path)
+        old_identity = _diff_document_identity(previous, old_document)
+        new_identity = _diff_document_identity(current, new_document)
+        changes.append(
+            m.RenamedArtifactDocumentChangeV1(
+                kind=m.ArtifactDocumentChangeKind.RENAMED,
+                old_document=old_identity,
+                new_document=new_identity,
+                hunks=[],
+            )
+        )
+
+    for path, old_document in sorted(removed.items()):
+        old_identity = _diff_document_identity(previous, old_document)
+        changes.append(
+            m.RemovedArtifactDocumentChangeV1(
+                kind=m.ArtifactDocumentChangeKind.REMOVED,
+                old_document=old_identity,
+                hunks=_whole_document_hunks(
+                    old_document,
+                    old_identity=old_identity,
+                    new_identity=None,
+                ),
+            )
+        )
+    for path, new_document in sorted(added.items()):
+        new_identity = _diff_document_identity(current, new_document)
+        changes.append(
+            m.AddedArtifactDocumentChangeV1(
+                kind=m.ArtifactDocumentChangeKind.ADDED,
+                new_document=new_identity,
+                hunks=_whole_document_hunks(
+                    new_document,
+                    old_identity=None,
+                    new_identity=new_identity,
+                ),
+            )
+        )
+
+    hunks = [hunk for change in changes for hunk in change.hunks]
+    lines = [line for hunk in hunks for line in hunk.lines]
+    if (
+        len(changes) > m.MAX_ARTIFACT_PREVIEW_DOCUMENTS
+        or len(hunks) > m.MAX_ARTIFACT_DIFF_HUNKS
+        or len(lines) > m.MAX_ARTIFACT_DIFF_LINES
+        or sum(len(line.text.encode("utf-8")) for line in lines)
+        > m.MAX_ARTIFACT_PREVIEW_UTF8_BYTES
+        or any(len(line.text) > 16_384 for line in lines)
+    ):
+        raise _artifact_content_error(
+            "artifact_diff_oversize",
+            "The artifact diff exceeds the bounded structured diff budget.",
+        )
+    return m.ArtifactDiffV1(
+        artifact_id=current.summary.id,
+        artifact_content_sha256=current.summary.content_sha256,
+        previous_artifact_id=previous.summary.id,
+        previous_artifact_content_sha256=previous.summary.content_sha256,
+        document_changes=changes,
+        total_document_changes=len(changes),
+        total_hunks=len(hunks),
+        total_lines=len(lines),
+        truncated=False,
+    )
+
+
+def _whole_document_hunks(
+    document: _VerifiedArtifactDocument,
+    *,
+    old_identity: m.ArtifactDiffDocumentIdentityV1 | None,
+    new_identity: m.ArtifactDiffDocumentIdentityV1 | None,
+) -> list[m.ArtifactDiffHunkV1]:
+    text_lines = document.content.splitlines()
+    if not text_lines:
+        return []
+    if len(text_lines) > 512:
+        raise _artifact_content_error(
+            "artifact_diff_oversize",
+            "The artifact diff exceeds the bounded structured diff budget.",
+        )
+    if old_identity is None:
+        lines = [
+            m.ArtifactDiffLineV1(
+                kind=m.DiffLineKind.ADDED,
+                old_line_number=None,
+                new_line_number=index,
+                text=text,
+            )
+            for index, text in enumerate(text_lines, 1)
+        ]
+        return [
+            m.ArtifactDiffHunkV1(
+                old_document=None,
+                new_document=new_identity,
+                old_start=0,
+                old_count=0,
+                new_start=1,
+                new_count=len(lines),
+                lines=lines,
+            )
+        ]
+    lines = [
+        m.ArtifactDiffLineV1(
+            kind=m.DiffLineKind.REMOVED,
+            old_line_number=index,
+            new_line_number=None,
+            text=text,
+        )
+        for index, text in enumerate(text_lines, 1)
+    ]
+    return [
+        m.ArtifactDiffHunkV1(
+            old_document=old_identity,
+            new_document=None,
+            old_start=1,
+            old_count=len(lines),
+            new_start=0,
+            new_count=0,
+            lines=lines,
+        )
+    ]
+
+
+def _modified_document_hunks(
+    old_document: _VerifiedArtifactDocument,
+    new_document: _VerifiedArtifactDocument,
+    *,
+    old_identity: m.ArtifactDiffDocumentIdentityV1,
+    new_identity: m.ArtifactDiffDocumentIdentityV1,
+) -> list[m.ArtifactDiffHunkV1]:
+    old_lines = old_document.content.splitlines()
+    new_lines = new_document.content.splitlines()
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    hunks: list[m.ArtifactDiffHunkV1] = []
+    for group in matcher.get_grouped_opcodes(3):
+        lines: list[m.ArtifactDiffLineV1] = []
+        old_start = group[0][1]
+        new_start = group[0][3]
+        old_count = 0
+        new_count = 0
+        for tag, old_begin, old_end, new_begin, new_end in group:
+            if tag == "equal":
+                for offset, text in enumerate(old_lines[old_begin:old_end]):
+                    lines.append(
+                        m.ArtifactDiffLineV1(
+                            kind=m.DiffLineKind.CONTEXT,
+                            old_line_number=old_begin + offset + 1,
+                            new_line_number=new_begin + offset + 1,
+                            text=text,
+                        )
+                    )
+                old_count += old_end - old_begin
+                new_count += new_end - new_begin
+            if tag in {"delete", "replace"}:
+                for offset, text in enumerate(old_lines[old_begin:old_end]):
+                    lines.append(
+                        m.ArtifactDiffLineV1(
+                            kind=m.DiffLineKind.REMOVED,
+                            old_line_number=old_begin + offset + 1,
+                            new_line_number=None,
+                            text=text,
+                        )
+                    )
+                old_count += old_end - old_begin
+            if tag in {"insert", "replace"}:
+                for offset, text in enumerate(new_lines[new_begin:new_end]):
+                    lines.append(
+                        m.ArtifactDiffLineV1(
+                            kind=m.DiffLineKind.ADDED,
+                            old_line_number=None,
+                            new_line_number=new_begin + offset + 1,
+                            text=text,
+                        )
+                    )
+                new_count += new_end - new_begin
+        if len(lines) > 512:
+            raise _artifact_content_error(
+                "artifact_diff_oversize",
+                "The artifact diff exceeds the bounded structured diff budget.",
+            )
+        hunks.append(
+            m.ArtifactDiffHunkV1(
+                old_document=old_identity,
+                new_document=new_identity,
+                old_start=old_start + 1 if old_count else old_start,
+                old_count=old_count,
+                new_start=new_start + 1 if new_count else new_start,
+                new_count=new_count,
+                lines=lines,
+            )
+        )
+    return hunks
+
+
 def create_core_control_app(
     *,
     state_root: str | Path,
@@ -911,6 +1566,8 @@ def create_core_control_app(
     service_supervisor: CoreServiceControl | None = None,
     run_control: CoreRunControl | None = None,
     run_control_factory: Callable[[CoreControlStoreV1], CoreRunControl] | None = None,
+    evolution_artifact_root: str | Path | None = None,
+    artifact_loader: Callable[[str], Mapping[str, object]] | None = None,
     event_replay_limit: int = 10_000,
 ) -> FastAPI:
     """Create a provider-backed app without adding a second route table."""
@@ -920,6 +1577,14 @@ def create_core_control_app(
     store = CoreControlStoreV1(state_root, event_replay_limit=event_replay_limit)
     provider: CoreControlProviderV1 | None = None
     resolved_run_control = run_control
+    resolved_artifact_root = evolution_artifact_root
+    if resolved_artifact_root is None and service_supervisor is not None:
+        resolved_artifact_root = (
+            Path(state_root).expanduser().absolute().parent
+            / "managed-services"
+            / "evolution"
+            / "artifacts"
+        )
     try:
         if run_control_factory is not None:
             resolved_run_control = run_control_factory(store)
@@ -932,6 +1597,8 @@ def create_core_control_app(
             evolution_registry=evolution_registry,
             service_supervisor=service_supervisor,
             run_control=resolved_run_control,
+            evolution_artifact_root=resolved_artifact_root,
+            artifact_loader=artifact_loader,
         )
         app = create_core_control_contract_app(provider)
         contract_operation_ids = frozenset(
