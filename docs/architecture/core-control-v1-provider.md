@@ -404,10 +404,14 @@ be retried immediately, while non-retryable errors continue to replay from
 durable provider storage. Eviction, process crash, and restart fall back to the
 run owner's durable idempotency authority. When all entries are active, a new
 identity fails with a typed retryable capacity error. Shutdown stops admission
-to the table before closing the run owner, then waits for active mutation
-leaders before closing the store. It does not hold the single-flight lock while
-waiting for leaders or the bounded provider executor. Non-run operations and run
-reads are unchanged.
+to the table, freezes the admitted drain set, and waits up to 30 seconds for
+every admitted callback and coalesced waiter to resolve before it closes or
+clears the run owner. The wait never holds the single-flight lock. A timeout
+leaves the owner, store, and same drain set intact; a later idempotent `close()`
+continues that drain instead of admitting new work or losing authority. Only a
+completed drain permits owner and store teardown, so an admitted leader cannot
+fall through to a synthetic unavailable response or persist one as a
+non-retryable idempotency result. Non-run operations and run reads are unchanged.
 
 The run owner's science execution projection preserves the exact project
 `capture_mode` in both experiment agent settings and the evolution execution

@@ -4768,12 +4768,6 @@ class _BlockingNonRetryableRunControl(_RecordingRunControl):
         )
 
 
-class _CloseReleasesRunControl(_BlockingSuccessfulRunControl):
-    def close(self) -> None:
-        self.close_calls += 1
-        self.release.set()
-
-
 def _run_failure_error(*, retryable: bool) -> ApiErrorV1:
     error = CoreRunControlError(
         "run_owner_temporarily_unavailable" if retryable else "run_request_rejected",
@@ -5387,30 +5381,155 @@ def test_run_mutation_singleflight_capacity_fails_closed_when_all_entries_are_ac
         assert first.result(timeout=10) == "owner-retried"
 
 
-def test_run_mutation_singleflight_shutdown_does_not_deadlock_waiters(
+def test_run_mutation_singleflight_does_not_evict_a_resolving_waiter() -> None:
+    singleflight = provider_module._RunMutationSingleFlight(1)
+    retained = provider_module._RunMutationFlight("a" * 64)
+    retained.future.set_result("owner-result")
+    retained.owner_active = False
+    retained.waiters = 1
+    singleflight._entries[("deleteCoreRunV1", "scope-a", "key-a")] = retained
+
+    with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+        singleflight.invoke(
+            ("deleteCoreRunV1", "scope-b", "key-b"),
+            "b" * 64,
+            lambda: "second-owner-result",
+        )
+    assert raised.value.error.code == "run_mutation_capacity_exhausted"
+
+    retained.waiters = 0
+    assert (
+        singleflight.invoke(
+            ("deleteCoreRunV1", "scope-b", "key-b"),
+            "b" * 64,
+            lambda: "second-owner-result",
+        )
+        == "second-owner-result"
+    )
+
+
+def test_run_mutation_shutdown_drains_admitted_leader_and_waiter_before_owner_close(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     arguments = {
         "run_id": "run-1",
         "if_match": '"' + "a" * 64 + '"',
         "idempotency_key": "shutdown-key",
     }
-    run_control = _CloseReleasesRunControl()
+    run_control = _SuccessfulMutationRunControl()
     app = _app(tmp_path, run_control=run_control)
     provider = app.state.core_control_provider
+    leader_joined = threading.Event()
+    allow_callback = threading.Event()
+    original_invoke = provider._run_mutations.invoke
+
+    def invoke_through_barrier(identity, request_digest, call):
+        def paused_call():
+            leader_joined.set()
+            assert allow_callback.wait(timeout=5)
+            assert run_control.close_calls == 0
+            return call()
+
+        return original_invoke(identity, request_digest, paused_call)
+
+    monkeypatch.setattr(provider._run_mutations, "invoke", invoke_through_barrier)
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         first = executor.submit(provider.invoke, "deleteCoreRunV1", arguments)
-        assert run_control.entered.wait(timeout=5)
+        assert leader_joined.wait(timeout=5)
         second = executor.submit(provider.invoke, "deleteCoreRunV1", arguments)
-        time.sleep(0.05)
+
+        deadline = time.monotonic() + 5
+        while True:
+            with provider._run_mutations._lock:
+                entries = tuple(provider._run_mutations._entries.values())
+                waiter_count = sum(entry.waiters for entry in entries)
+            if waiter_count == 1:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("single-flight waiter did not join")
+            time.sleep(0.005)
+
         closed = executor.submit(provider.close)
-        closed.result(timeout=10)
+        deadline = time.monotonic() + 5
+        while True:
+            with provider._run_mutations._lock:
+                closing = provider._run_mutations._closing
+            if closing:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("provider close did not stop admission")
+            time.sleep(0.005)
+        assert run_control.close_calls == 0
+        assert not closed.done()
+        allow_callback.set()
         assert first.result(timeout=10) == "owner-retried"
         assert second.result(timeout=10) == "owner-retried"
+        closed.result(timeout=10)
 
+    provider.close()
     assert run_control.close_calls == 1
     assert [invocation[0] for invocation in run_control.invocations] == ["deleteCoreRunV1"]
+
+    restarted_control = _SuccessfulMutationRunControl()
+    restarted = _app(tmp_path, run_control=restarted_control)
+    with TestClient(restarted):
+        assert (
+            restarted.state.core_control_provider.invoke(
+                "deleteCoreRunV1", arguments
+            )
+            == "owner-retried"
+        )
+    assert [invocation[0] for invocation in restarted_control.invocations] == [
+        "deleteCoreRunV1"
+    ]
+
+
+def test_run_mutation_shutdown_drain_timeout_retains_owner_for_idempotent_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_module, "_RUN_MUTATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05
+    )
+    arguments = {
+        "run_id": "run-1",
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "shutdown-timeout-key",
+    }
+    run_control = _SuccessfulMutationRunControl()
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+    leader_joined = threading.Event()
+    allow_callback = threading.Event()
+    original_invoke = provider._run_mutations.invoke
+
+    def invoke_through_barrier(identity, request_digest, call):
+        def paused_call():
+            leader_joined.set()
+            assert allow_callback.wait(timeout=5)
+            return call()
+
+        return original_invoke(identity, request_digest, paused_call)
+
+    monkeypatch.setattr(provider._run_mutations, "invoke", invoke_through_barrier)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        mutation = executor.submit(provider.invoke, "deleteCoreRunV1", arguments)
+        assert leader_joined.wait(timeout=5)
+        started_at = time.monotonic()
+        with pytest.raises(RuntimeError, match="run mutations did not drain"):
+            provider.close()
+        assert time.monotonic() - started_at < 1
+        assert run_control.close_calls == 0
+        assert provider._run_control is run_control
+        allow_callback.set()
+        assert mutation.result(timeout=10) == "owner-retried"
+
+    provider.close()
+    provider.close()
+    assert run_control.close_calls == 1
 
 
 def test_legacy_retryable_cleanup_does_not_delete_concurrent_non_retryable_replacement(

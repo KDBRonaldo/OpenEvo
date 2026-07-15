@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -77,6 +77,7 @@ _RUN_MUTATION_OPERATION_IDS = frozenset(
     }
 )
 _RUN_MUTATION_SINGLEFLIGHT_CAPACITY = 256
+_RUN_MUTATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 30.0
 
 _UNAVAILABLE_OPERATIONS = frozenset(
     {
@@ -132,15 +133,26 @@ def _run_control_http_error(exc: CoreRunControlError) -> _RunControlHTTPError:
     )
 
 
+class _RunMutationFlight:
+    __slots__ = ("drained", "future", "owner_active", "request_digest", "waiters")
+
+    def __init__(self, request_digest: str) -> None:
+        self.drained: Future[None] = Future()
+        self.future: Future[object] = Future()
+        self.owner_active = True
+        self.request_digest = request_digest
+        self.waiters = 0
+
+
 class _RunMutationSingleFlight:
     def __init__(self, capacity: int) -> None:
         if capacity < 1:
             raise ValueError("run mutation single-flight capacity must be positive")
         self._capacity = capacity
         self._lock = threading.Lock()
-        self._entries: OrderedDict[
-            tuple[str, str, str], tuple[str, Future[object]]
-        ] = OrderedDict()
+        self._entries: OrderedDict[tuple[str, str, str], _RunMutationFlight] = (
+            OrderedDict()
+        )
         self._closing = False
 
     def invoke(
@@ -154,62 +166,84 @@ class _RunMutationSingleFlight:
                 raise _run_mutation_closing_error()
             entry = self._entries.get(identity)
             if entry is not None:
-                retained_digest, future = entry
-                if not hmac.compare_digest(retained_digest, request_digest):
+                if not hmac.compare_digest(entry.request_digest, request_digest):
                     raise _idempotency_conflict_error()
+                entry.waiters += 1
+                future = entry.future
                 self._entries.move_to_end(identity)
                 owner = False
             else:
                 self._evict_completed_locked()
                 if len(self._entries) >= self._capacity:
                     raise _run_mutation_capacity_error()
-                future = Future()
-                self._entries[identity] = (request_digest, future)
+                entry = _RunMutationFlight(request_digest)
+                future = entry.future
+                self._entries[identity] = entry
                 owner = True
 
         if not owner:
             try:
-                return future.result()
-            except CoreControlHTTPError as exc:
-                replay = CoreControlHTTPError.from_error(exc.error)
-                replay.headers = dict(exc.headers)
-                raise replay from exc
+                try:
+                    return future.result()
+                except CoreControlHTTPError as exc:
+                    replay = CoreControlHTTPError.from_error(exc.error)
+                    replay.headers = dict(exc.headers)
+                    raise replay from exc
+            finally:
+                with self._lock:
+                    entry.waiters -= 1
+                    self._resolve_drain_locked(entry)
 
         try:
             result = call()
         except BaseException as exc:
             with self._lock:
                 retained = self._entries.get(identity)
-                if retained is not None and retained[1] is future:
+                if retained is entry:
                     del self._entries[identity]
                 future.set_exception(exc)
+                entry.owner_active = False
+                self._resolve_drain_locked(entry)
             raise
         with self._lock:
             if self._closing:
                 retained = self._entries.get(identity)
-                if retained is not None and retained[1] is future:
+                if retained is entry:
                     del self._entries[identity]
             else:
                 self._entries.move_to_end(identity)
             future.set_result(result)
+            entry.owner_active = False
+            self._resolve_drain_locked(entry)
         return result
 
-    def close(self) -> tuple[Future[object], ...]:
+    def close(self) -> tuple[Future[None], ...]:
         with self._lock:
             self._closing = True
-            active = tuple(
-                future for _, future in self._entries.values() if not future.done()
-            )
+            entries = tuple(self._entries.values())
+            for entry in entries:
+                self._resolve_drain_locked(entry)
             self._entries.clear()
-            return active
+            return tuple(entry.drained for entry in entries)
+
+    def _resolve_drain_locked(self, entry: _RunMutationFlight) -> None:
+        if (
+            self._closing
+            and not entry.owner_active
+            and entry.waiters == 0
+            and not entry.drained.done()
+        ):
+            entry.drained.set_result(None)
 
     def _evict_completed_locked(self) -> None:
         while len(self._entries) >= self._capacity:
             completed_identity = next(
                 (
                     identity
-                    for identity, (_, future) in self._entries.items()
-                    if future.done()
+                    for identity, entry in self._entries.items()
+                    if not entry.owner_active
+                    and entry.waiters == 0
+                    and entry.future.done()
                 ),
                 None,
             )
@@ -255,6 +289,7 @@ class CoreControlProviderV1:
         self._run_mutations = _RunMutationSingleFlight(
             _RUN_MUTATION_SINGLEFLIGHT_CAPACITY
         )
+        self._run_mutation_drain: tuple[Future[None], ...] | None = None
         self._authorization = b"Bearer " + token_bytes
         self._registry = evolution_registry
         self._service_supervisor = service_supervisor
@@ -301,15 +336,19 @@ class CoreControlProviderV1:
         with self._close_lock:
             if self._closed:
                 return
-            active_run_mutations = self._run_mutations.close()
+            if self._run_mutation_drain is None:
+                self._run_mutation_drain = self._run_mutations.close()
+            _, pending_run_mutations = wait(
+                self._run_mutation_drain,
+                timeout=_RUN_MUTATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+            )
+            if pending_run_mutations:
+                raise RuntimeError(
+                    "admitted run mutations did not drain before shutdown timeout"
+                )
             if self._run_control is not None:
                 self._run_control.close()
                 self._run_control = None
-            for mutation in active_run_mutations:
-                try:
-                    mutation.result()
-                except BaseException:
-                    pass
             if self._service_supervisor is not None:
                 self._service_supervisor.close()
                 self._service_supervisor = None
