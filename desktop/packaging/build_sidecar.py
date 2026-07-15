@@ -62,6 +62,10 @@ _DARWIN_ACL_EXTENDED_ALLOW = 1
 _DARWIN_ACL_EXTENDED_DENY = 2
 _DARWIN_ACL_KNOWN_PERMISSIONS = sum(1 << bit for bit in (*range(1, 14), 20))
 _DARWIN_ACL_MUTATING_PERMISSIONS = sum(1 << bit for bit in (2, 4, 5, 6, 8, 10, 12, 13))
+_DARWIN_FILESEC_ACL = 5
+_DARWIN_FILESEC_REMOVE_ACL = 1
+_DARWIN_F_GETPATH = 50
+_DARWIN_PATH_BUFFER_BYTES = 1024
 _DARWIN_CARBON_CORE = (
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/CarbonCore.framework/CarbonCore"
 )
@@ -941,11 +945,45 @@ def _delete_darwin_extended_acl(file_fd: int) -> None:
     if sys.platform != "darwin":
         return
     libc = ctypes.CDLL(None, use_errno=True)
-    libc.acl_delete_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
-    libc.acl_delete_fd_np.restype = ctypes.c_int
-    if libc.acl_delete_fd_np(file_fd, _DARWIN_ACL_TYPE_EXTENDED) != 0:
+    libc.filesec_init.argtypes = []
+    libc.filesec_init.restype = ctypes.c_void_p
+    libc.filesec_set_property.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    libc.filesec_set_property.restype = ctypes.c_int
+    libc.fchmodx_np.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    libc.fchmodx_np.restype = ctypes.c_int
+    libc.filesec_free.argtypes = [ctypes.c_void_p]
+    libc.filesec_free.restype = None
+    ctypes.set_errno(0)
+    filesec = libc.filesec_init()
+    if not filesec:
         error = ctypes.get_errno()
         raise RuntimeError(f"macOS extended ACL cannot be cleared from held FD: errno {error}")
+    try:
+        ctypes.set_errno(0)
+        if (
+            libc.filesec_set_property(
+                filesec,
+                _DARWIN_FILESEC_ACL,
+                ctypes.c_void_p(_DARWIN_FILESEC_REMOVE_ACL),
+            )
+            != 0
+        ):
+            error = ctypes.get_errno()
+            raise RuntimeError(
+                f"macOS extended ACL cannot be cleared from held FD: errno {error}"
+            )
+        ctypes.set_errno(0)
+        if libc.fchmodx_np(file_fd, filesec) != 0:
+            error = ctypes.get_errno()
+            raise RuntimeError(
+                f"macOS extended ACL cannot be cleared from held FD: errno {error}"
+            )
+    finally:
+        libc.filesec_free(filesec)
 
 
 def _validate_darwin_acl_entries(
@@ -1814,6 +1852,59 @@ def _core_release_fd_removal_supported() -> bool:
     return sys.platform == "darwin"
 
 
+def _darwin_path_for_held_fd(object_fd: int) -> bytes:
+    try:
+        payload = fcntl.fcntl(
+            object_fd,
+            _DARWIN_F_GETPATH,
+            bytes(_DARWIN_PATH_BUFFER_BYTES),
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Core release cleanup could not resolve the held macOS object path; "
+            "the quarantined object was preserved"
+        ) from exc
+    if not isinstance(payload, bytes) or len(payload) != _DARWIN_PATH_BUFFER_BYTES:
+        raise RuntimeError(
+            "Core release cleanup received an invalid held macOS object path; "
+            "the quarantined object was preserved"
+        )
+    path = payload.split(b"\0", 1)[0]
+    if not path or not os.path.isabs(path):
+        raise RuntimeError(
+            "Core release cleanup received an invalid held macOS object path; "
+            "the quarantined object was preserved"
+        )
+    return path
+
+
+def _require_darwin_fd_path_identity(
+    object_fd: int,
+    path: bytes,
+    *,
+    is_directory: bool,
+) -> None:
+    held = os.fstat(object_fd)
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(
+            "Core release cleanup held inode path cannot be verified; "
+            "the quarantined object was preserved"
+        ) from exc
+    if (
+        (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino)
+        or stat.S_ISDIR(current.st_mode) != is_directory
+        or stat.S_ISDIR(held.st_mode) != is_directory
+        or current.st_nlink <= 0
+        or held.st_nlink <= 0
+    ):
+        raise RuntimeError(
+            "Core release cleanup held inode path identity changed; "
+            "the quarantined object was preserved"
+        )
+
+
 def _prepare_core_release_fd_removal(
     object_fd: int,
     *,
@@ -1824,6 +1915,12 @@ def _prepare_core_release_fd_removal(
             "Core release cleanup cannot safely remove an inode on this platform; "
             "the quarantined object was preserved"
         )
+    object_path = _darwin_path_for_held_fd(object_fd)
+    _require_darwin_fd_path_identity(
+        object_fd,
+        object_path,
+        is_directory=is_directory,
+    )
     try:
         carbon_core = ctypes.CDLL(_DARWIN_CARBON_CORE)
     except OSError as exc:
@@ -1841,10 +1938,8 @@ def _prepare_core_release_fd_removal(
     carbon_core.FSUnlinkObject.restype = ctypes.c_int16
     reference = _DarwinFileSystemReference()
     reference_is_directory = ctypes.c_uint8()
-    # This descriptor path cannot be rebound by another process; FSUnlinkObject
-    # later consumes only the resulting opaque reference, never the cleanup name.
     result = carbon_core.FSPathMakeRef(
-        os.fsencode(f"/dev/fd/{object_fd}"),
+        object_path,
         ctypes.byref(reference),
         ctypes.byref(reference_is_directory),
     )
@@ -1853,6 +1948,17 @@ def _prepare_core_release_fd_removal(
             "Core release cleanup could not bind the held inode to a macOS file-system "
             f"reference (status {result}); the quarantined object was preserved"
         )
+    rechecked_path = _darwin_path_for_held_fd(object_fd)
+    if rechecked_path != object_path:
+        raise RuntimeError(
+            "Core release cleanup held inode path changed while creating its macOS "
+            "reference; the quarantined object was preserved"
+        )
+    _require_darwin_fd_path_identity(
+        object_fd,
+        rechecked_path,
+        is_directory=is_directory,
+    )
     return carbon_core, reference
 
 

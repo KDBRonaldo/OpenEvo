@@ -1176,6 +1176,71 @@ def test_macos_fd_acl_rejects_invalid_entry_iteration_result(
         builder._darwin_extended_acl_entries(41)
 
 
+def test_macos_fd_acl_removal_uses_filesec_fd_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    calls: list[tuple[object, ...]] = []
+
+    def set_property(filesec: int, property_id: int, value: object) -> int:
+        calls.append(("set", filesec, property_id, value.value))
+        return 0
+
+    def apply(filesec_fd: int, filesec: int) -> int:
+        calls.append(("apply", filesec_fd, filesec))
+        return 0
+
+    libc = SimpleNamespace(
+        filesec_init=_FakeDarwinAclFunction(0x1000),
+        filesec_set_property=_FakeDarwinAclFunction(set_property),
+        fchmodx_np=_FakeDarwinAclFunction(apply),
+        filesec_free=_FakeDarwinAclFunction(
+            lambda filesec: calls.append(("free", filesec))
+        ),
+    )
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+
+    builder._delete_darwin_extended_acl(41)
+
+    assert calls == [
+        ("set", 0x1000, 5, 1),
+        ("apply", 41, 0x1000),
+        ("free", 0x1000),
+    ]
+
+
+@pytest.mark.parametrize("failure", ["init", "property", "apply"])
+def test_macos_fd_acl_removal_failures_preserve_fail_closed_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    builder = _load_builder()
+    freed: list[int] = []
+
+    def fail(stage: str, result: object) -> object:
+        if failure == stage:
+            builder.ctypes.set_errno(errno.EIO)
+            return None if stage == "init" else -1
+        return result
+
+    libc = SimpleNamespace(
+        filesec_init=_FakeDarwinAclFunction(lambda: fail("init", 0x1000)),
+        filesec_set_property=_FakeDarwinAclFunction(
+            lambda *_args: fail("property", 0)
+        ),
+        fchmodx_np=_FakeDarwinAclFunction(lambda *_args: fail("apply", 0)),
+        filesec_free=_FakeDarwinAclFunction(freed.append),
+    )
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+
+    with pytest.raises(RuntimeError, match="cannot be cleared"):
+        builder._delete_darwin_extended_acl(41)
+
+    assert freed == ([] if failure == "init" else [0x1000])
+
+
 @pytest.mark.parametrize(
     "entries",
     [
@@ -2037,6 +2102,136 @@ def test_cleanup_receipt_syscall_boundary_preserves_replacement(
     ]
     assert len(replacement_names) == 1
     assert (output / replacement_names[0]).read_bytes() == replacement
+
+
+@pytest.mark.parametrize("is_directory", [False, True])
+def test_darwin_fd_removal_binds_real_f_getpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    is_directory: bool,
+) -> None:
+    builder = _load_builder(install_fd_removal_testkit=False)
+    target = tmp_path / "held-object"
+    if is_directory:
+        target.mkdir()
+    else:
+        target.write_bytes(b"held")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if is_directory:
+        flags |= os.O_DIRECTORY
+    target_fd = os.open(target, flags)
+    observed_paths: list[bytes] = []
+
+    def get_path(file_fd: int, command: int, buffer: bytes) -> bytes:
+        assert file_fd == target_fd
+        assert command == 50
+        encoded = os.fsencode(target)
+        assert len(encoded) < len(buffer)
+        return encoded + bytes(len(buffer) - len(encoded))
+
+    def make_reference(
+        encoded_path: bytes,
+        _reference_out: object,
+        is_directory_out: object,
+    ) -> int:
+        observed_paths.append(encoded_path)
+        is_directory_out._obj.value = int(is_directory)
+        return 0
+
+    carbon = SimpleNamespace(
+        FSPathMakeRef=_FakeDarwinAclFunction(make_reference),
+        FSUnlinkObject=_FakeDarwinAclFunction(0),
+    )
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder.fcntl, "fcntl", get_path)
+    monkeypatch.setattr(builder.ctypes, "CDLL", lambda *_args, **_kwargs: carbon)
+    try:
+        builder._prepare_core_release_fd_removal(
+            target_fd,
+            is_directory=is_directory,
+        )
+    finally:
+        os.close(target_fd)
+
+    assert observed_paths == [os.fsencode(target)]
+
+
+def test_darwin_fd_removal_rejects_f_getpath_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder(install_fd_removal_testkit=False)
+    target = tmp_path / "held-object"
+    other = tmp_path / "other-object"
+    target.write_bytes(b"held")
+    other.write_bytes(b"other")
+    target_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    carbon_called = False
+
+    def get_path(_file_fd: int, _command: int, buffer: bytes) -> bytes:
+        encoded = os.fsencode(other)
+        return encoded + bytes(len(buffer) - len(encoded))
+
+    def make_reference(*_args: object) -> int:
+        nonlocal carbon_called
+        carbon_called = True
+        return 0
+
+    carbon = SimpleNamespace(
+        FSPathMakeRef=_FakeDarwinAclFunction(make_reference),
+        FSUnlinkObject=_FakeDarwinAclFunction(0),
+    )
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder.fcntl, "fcntl", get_path)
+    monkeypatch.setattr(builder.ctypes, "CDLL", lambda *_args, **_kwargs: carbon)
+    try:
+        with pytest.raises(RuntimeError, match="held inode|identity"):
+            builder._prepare_core_release_fd_removal(target_fd, is_directory=False)
+    finally:
+        os.close(target_fd)
+
+    assert carbon_called is False
+
+
+def test_darwin_fd_removal_rechecks_path_after_fsref_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder(install_fd_removal_testkit=False)
+    target = tmp_path / "held-object"
+    preserved = tmp_path / "preserved-object"
+    target.write_bytes(b"held")
+    target_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+
+    def get_path(_file_fd: int, _command: int, buffer: bytes) -> bytes:
+        encoded = os.fsencode(target)
+        return encoded + bytes(len(buffer) - len(encoded))
+
+    def replace_during_reference(
+        _encoded_path: bytes,
+        _reference_out: object,
+        is_directory_out: object,
+    ) -> int:
+        target.rename(preserved)
+        target.write_bytes(b"replacement")
+        is_directory_out._obj.value = 0
+        return 0
+
+    carbon = SimpleNamespace(
+        FSPathMakeRef=_FakeDarwinAclFunction(replace_during_reference),
+        FSUnlinkObject=_FakeDarwinAclFunction(0),
+    )
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder.fcntl, "fcntl", get_path)
+    monkeypatch.setattr(builder.ctypes, "CDLL", lambda *_args, **_kwargs: carbon)
+    try:
+        with pytest.raises(RuntimeError, match="held inode|identity|changed"):
+            builder._prepare_core_release_fd_removal(target_fd, is_directory=False)
+    finally:
+        os.close(target_fd)
+
+    assert preserved.read_bytes() == b"held"
+    assert target.read_bytes() == b"replacement"
 
 
 def test_native_fd_removal_is_fail_closed_when_platform_has_no_safe_primitive(

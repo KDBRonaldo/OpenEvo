@@ -197,6 +197,9 @@ lookup error, and every unknown, unreadable, or mutating ACL entry, fails closed
 Darwin ACL iteration accepts only `acl_get_entry` success `0` and treats only
 `-1/EINVAL` as the end of the held ACL; all other result/errno combinations fail
 closed before any artifact export or recovery.
+Apple's `acl_delete_fd_np` is not implemented. Inherited ACL normalization uses
+`filesec_set_property(FILESEC_ACL, _FILESEC_REMOVE_ACL)` followed by
+`fchmodx_np` on the held FD, then rereads the ACL and inode metadata.
 After opening and validating the child, but before its first inventory or any
 recovery, the builder takes a non-blocking exclusive `flock` on that same held
 output-directory descriptor. Contention fails closed with an explicit
@@ -262,9 +265,11 @@ tombstone bound to the output device/inode. Cleanup moves each authorized entry
 to an identity-named quarantine, clears member payloads through the held descriptor,
 and removes the transaction marker last. The empty held tombstone is then moved
 no-replace to one deterministic purge name and checked against the receipt.
-For final member, marker, directory, and receipt removal, macOS prepares an opaque
-`FSRef` from the held FD before entering the syscall boundary and calls
-`FSUnlinkObject`; the final call does not receive the mutable cleanup name.
+For final member, marker, directory, and receipt removal, macOS obtains the real
+path from the held FD with `F_GETPATH`, verifies that path against the held inode
+before and after preparing an opaque `FSRef`, then enters the syscall boundary
+and calls `FSUnlinkObject`; the final call does not receive the mutable cleanup
+name.
 Unsupported platforms and rejected filesystems preserve the object and fail
 closed. Linux unit and subprocess tests install a test-only conditional-removal
 model so portable transaction and crash cases remain executable; macOS CI uses

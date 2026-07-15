@@ -127,6 +127,11 @@ executable is a test script, not Mach-O. It never substitutes for candidate
 evidence: macOS candidate runs always inspect and launch the real Tauri binary
 and packaged sidecar with `file`, `lipo`, native window, and FD checks.
 
+macOS release cleanup uses only supported FD-bound metadata APIs. ACL removal is
+applied through `filesec` and `fchmodx_np`; identity-bound deletion resolves a
+held FD with `F_GETPATH`, verifies its inode around `FSRef` creation, and lets
+`FSUnlinkObject` consume the opaque reference after the final race-test boundary.
+
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
 best stochastic result.
