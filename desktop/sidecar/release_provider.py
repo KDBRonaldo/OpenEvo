@@ -1476,6 +1476,7 @@ class DesktopReleaseProvider:
                 if_match=cast(str, arguments["if_match"]),
                 idempotency_key=cast(str, arguments["idempotency_key"]),
             ),
+            enforce_execution_mode_support=True,
         )
 
     def _list_run_timeline(self, arguments: Mapping[str, object]) -> object:
@@ -1558,6 +1559,7 @@ class DesktopReleaseProvider:
                 if_match=cast(str, arguments["if_match"]),
                 idempotency_key=cast(str, arguments["idempotency_key"]),
             ),
+            enforce_execution_mode_support=True,
         )
 
     def _get_core_operation(self, arguments: Mapping[str, object]) -> object:
@@ -1747,12 +1749,18 @@ class DesktopReleaseProvider:
         self,
         operation_id: str,
         call: Callable[[DesktopCoreBridgeV1, ProjectV1], object],
+        *,
+        enforce_execution_mode_support: bool = False,
     ) -> object:
         bridge = self._require_bridge(operation_id)
         with self._project_session_lock:
             binding = self._active_project_for_runtime()
             if binding is None:
                 raise ProviderStoreError("Desktop has no active project for this Core request")
+            if enforce_execution_mode_support:
+                self._require_supported_execution_mode(
+                    operation_id, binding.project.execution.mode
+                )
             try:
                 return call(bridge, binding.project)
             except DesktopCoreBridgeErrorV1 as exc:

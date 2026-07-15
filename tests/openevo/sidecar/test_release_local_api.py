@@ -28,6 +28,7 @@ from desktop.sidecar.provider_store import (
 )
 import desktop.sidecar.release_app as release_app_module
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
+from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
 from desktop.sidecar.remote_lifecycle import (
     DesktopRemoteLifecycle,
     RemoteConnectionFailedError,
@@ -404,6 +405,55 @@ def test_release_execution_mode_gate_rejects_create_update_activate_and_run(
 
         bridge.activate_project.assert_not_called()
         bridge.create_run.assert_not_called()
+
+
+def test_release_execution_mode_gate_rejects_retry_and_restart_before_core(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    app = _app(tmp_path / "state", core_bridge=bridge)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Unavailable release mode server",
+            key="create-profile-unavailable-retry-0001",
+        ).json()
+        request = _project(profile["profile_id"])
+        request["execution"] = {
+            "mode": "self-deployed",
+            "hf_model": "open-models/release-gated-model",
+        }
+        provider = app.state.desktop_release_provider
+        project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(request),
+            idempotency_key="seed-unavailable-retry-project-0001",
+        )
+        provider._active_project_for_runtime = (  # type: ignore[method-assign]
+            lambda: CoreRuntimeSessionBinding(project=project, generation=1)
+        )
+        headers = {
+            **SESSION_HEADERS,
+            "If-Match": project.etag,
+            "Idempotency-Key": "unavailable-retry-mutation-0001",
+        }
+
+        retry = client.post("/desktop/v1/runs/run-1/retry", headers=headers)
+        retry_replay = client.post("/desktop/v1/runs/run-1/retry", headers=headers)
+        restart = client.post("/desktop/v1/services/service-1/restart", headers=headers)
+        restart_replay = client.post(
+            "/desktop/v1/services/service-1/restart", headers=headers
+        )
+
+        for response, category in (
+            (retry, "run"),
+            (retry_replay, "run"),
+            (restart, "service"),
+            (restart_replay, "service"),
+        ):
+            assert response.status_code == 409
+            assert response.json()["code"] == "self_deployed_release_unavailable"
+            assert response.json()["category"] == category
+        assert bridge.method_calls == []
 
 
 def test_release_discovery_health_and_desktop_session_auth(

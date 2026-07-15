@@ -339,6 +339,49 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
         provider.close()
 
 
+@pytest.mark.parametrize(
+    ("operation_id", "method_name", "arguments"),
+    (
+        (
+            "retryRun",
+            "retry_run",
+            {
+                "run_id": "run-supported-1",
+                "idempotency_key": "run-retry-supported-routing-0001",
+                "if_match": ETAG_A,
+            },
+        ),
+        (
+            "restartService",
+            "restart_service",
+            {
+                "service_id": "service-supported-1",
+                "idempotency_key": "service-restart-supported-routing-0001",
+                "if_match": ETAG_A,
+            },
+        ),
+    ),
+)
+def test_release_provider_allows_supported_subscription_retry_and_restart(
+    tmp_path: Path,
+    operation_id: str,
+    method_name: str,
+    arguments: dict[str, object],
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, _, project = _provider(tmp_path, bridge)
+    result = object()
+    method = getattr(bridge, method_name)
+    method.return_value = result
+    try:
+        assert project.execution.mode == "codex_subscription_transcript"
+        assert provider.invoke(operation_id, arguments) is result
+        method.assert_called_once()
+        assert method.call_args.args[0] == project
+    finally:
+        provider.close()
+
+
 def test_run_creation_requires_current_local_project_etag(tmp_path: Path) -> None:
     bridge = Mock(spec=DesktopCoreBridgeV1)
     provider, _, project = _provider(tmp_path, bridge)
