@@ -58,6 +58,13 @@ describe("product preview scenarios", () => {
         expect.objectContaining({ mode: "self-deployed", support_state: "unavailable" }),
       ]));
       expect(refreshed.snapshot.runs.every((run) => run.execution_mode === "codex_subscription_transcript")).toBe(true);
+      if (scenario !== "offline") {
+        expect(refreshed.snapshot.capability).toMatchObject({
+          status: "ready",
+          executionMode: "codex_subscription_transcript",
+          value: { capabilities: { evaluated_profile: { execution_mode: "subscription" } } },
+        });
+      }
       expect(refreshed.snapshot.artifacts.every((artifact) =>
         artifact.compatibility.execution_modes.length === 1
         && artifact.compatibility.execution_modes[0] === "codex_subscription_transcript"
@@ -112,6 +119,7 @@ describe("product preview scenarios", () => {
     expect(refreshed.snapshot.runs).toHaveLength(1);
     expect(run?.status).toBe("failed");
     expect(run?.pinned_revision?.generation).toBe(1);
+    expect(run?.pinned_revision).toEqual(refreshed.snapshot.projects[0]?.remote?.active_revision);
     expect(run?.revision_transition).toBeNull();
     expect(refreshed.snapshot.projects[0]?.remote?.active_revision?.generation).toBe(1);
     expect(refreshed.snapshot.artifacts).toEqual([]);

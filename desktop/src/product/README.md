@@ -266,9 +266,12 @@ membership revision refs must agree on the complete revision identity. Artifact
 fixtures preserve the cross-session boundary: a completed run remains pinned to
 its predecessor, its active transition names the next generation as successor,
 and only the project head advances. A later session then pins that newly active
-revision. The ordinary three-target fixture generates only text memory, skill,
-and agent-system artifacts. Generic simulator tests that exercise the closed
-`parametric_memory` artifact subtype must opt in with
+revision. Fixture revision references reuse the exact complete project-head
+identity, including the manifest digest; a matching generation alone is not
+sufficient. Project capabilities likewise derive their evaluated execution mode
+from the owning project. The ordinary three-target fixture generates only text
+memory, skill, and agent-system artifacts. Generic simulator tests that
+exercise the closed `parametric_memory` artifact subtype must opt in with
 `includeParametricMemory`; artifact execution-mode and model compatibility are
 derived from the owning project rather than hard-coded. Artifact
 lists use selected artifacts whose `membership_revisions` include that exact

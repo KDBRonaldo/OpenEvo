@@ -157,7 +157,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.projects = newUser ? [] : [this.makeProjectFixture(options.projectExecutionMode)];
     this.state = newUser ? this.makeNewUserState() : this.makeState(online ? "online" : "offline");
     this.capabilities = online
-      ? this.makeCapabilities(this.projects[0]?.project_id ?? "project-fixture-1")
+      ? this.makeCapabilities(
+          this.projects[0]?.project_id ?? "project-fixture-1",
+          this.projects[0]?.execution.mode ?? "self-deployed",
+        )
       : null;
     this.validation = this.capabilities && this.projects[0]
       ? this.makeValidation(this.projects[0], this.capabilities)
@@ -340,8 +343,11 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       this.state = this.connectionState("online");
       this.updateProfileConnection(profileId, "connected");
       this.projects = this.projects.map((project) => ({ ...project, state: "active" }));
-      this.capabilities = this.makeCapabilities(this.projects[0]?.project_id ?? "project-fixture-1");
       const activeProject = this.projects[0];
+      this.capabilities = this.makeCapabilities(
+        activeProject?.project_id ?? "project-fixture-1",
+        activeProject?.execution.mode ?? "self-deployed",
+      );
       this.validation = activeProject ? this.makeValidation(activeProject, this.capabilities) : null;
       this.services = this.makeServices(true, false);
       this.emit();
@@ -367,7 +373,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     });
     this.projects = [...this.projects, project];
     this.capabilities = this.state.core.state === "online"
-      ? this.makeCapabilities(project.project_id)
+      ? this.makeCapabilities(project.project_id, project.execution.mode)
       : null;
     this.validation = this.capabilities ? this.makeValidation(project, this.capabilities) : null;
     this.emit();
@@ -1482,7 +1488,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       id: `revision-fixture-${generation}`,
       project_id: projectId,
       generation,
-      manifest_sha256: generation % 2 === 0 ? C : A,
+      manifest_sha256: generation % 2 === 0 ? A : C,
     } as const;
   }
 

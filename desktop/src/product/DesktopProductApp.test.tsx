@@ -1059,6 +1059,9 @@ describe("DesktopProductApp", () => {
     root = await renderProduct(provider);
 
     expect(screenText()).toContain("Latest session failed");
+    expect(screenText()).toContain("Revision 1");
+    expect(screenText()).not.toContain("Revision unknown");
+    expect(screenText()).not.toContain("Remote capabilities are unavailable for this project and mode.");
     expect(screenText()).toContain("The research session failed before evolution outputs were committed.");
     expect(screenText()).not.toContain("Latest session complete");
     expect(button("Retry session").disabled).toBe(false);
