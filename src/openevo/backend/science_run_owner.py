@@ -20,6 +20,7 @@ from openevo.backend.contracts.v1.store import (
     ResourceNotFoundError,
 )
 from openevo.backend.run_control import CoreRunControlError
+from openevo.backend.service_control import CoreServiceControlError
 from openevo.backend.science_execution import compile_science_execution
 from openevo.backend.science_run_store import (
     ScienceRunConflict,
@@ -241,49 +242,61 @@ class CoreScienceRunOwner:
     def _create_run(self, arguments: Mapping[str, object]) -> Response:
         request = cast(m.RunCreateV1, arguments["request"])
         idempotency_key = cast(str, arguments["idempotency_key"])
-        project = self._validate_create_request(request)
-        self._ensure_services(project)
-        input_context = self._ledger.revision_context(
-            request.project_id,
-            request.required_revision.revision.id,
-        )
-        now = self._timestamp()
-        run_id = f"run-{secrets.token_hex(16)}"
-        run = _run_model(
-            {
-                "id": run_id,
-                "project_id": request.project_id,
-                "project_snapshot": request.project_snapshot,
-                "task_snapshot": request.task_snapshot,
-                "workspace_snapshot": request.workspace_snapshot,
-                "registry_digest": request.expected_registry_digest,
-                "execution_mode": project.spec.execution_mode,
-                "capture_mode": project.spec.capture_mode,
-                "status": m.RunStatus.QUEUED,
-                "queued_reason": m.QueuedReasonV1(
-                    code=m.QueuedReasonCode.ADMISSION_PENDING,
-                    summary="Core is admitting the saved project revision.",
-                    retry_after_seconds=1,
-                ),
-                "attempt_count": 0,
-                "required_revision": request.required_revision,
-                "revision_transition": (
-                    None
-                    if request.required_revision.relation is m.RequiredRevisionRelation.ACTIVE
-                    else self._project_store.get_revision_head(request.project_id).transition
-                ),
-                "created_at": now,
-                "updated_at": now,
-                "attempts": [],
-            },
-            version=1,
-        )
-        stored, replayed = self._ledger.create_run(
+        replay, admission = self._ledger.begin_create_run(
             request=request,
             idempotency_key=idempotency_key,
-            run=run,
-            input_context=input_context,
         )
+        if replay is not None:
+            return _response(replay, status_code=202)
+        assert admission is not None
+        try:
+            project = self._validate_create_request(request)
+            self._ensure_services(project)
+            input_context = self._ledger.revision_context(
+                request.project_id,
+                request.required_revision.revision.id,
+            )
+            now = self._timestamp()
+            run_id = f"run-{secrets.token_hex(16)}"
+            run = _run_model(
+                {
+                    "id": run_id,
+                    "project_id": request.project_id,
+                    "project_snapshot": request.project_snapshot,
+                    "task_snapshot": request.task_snapshot,
+                    "workspace_snapshot": request.workspace_snapshot,
+                    "registry_digest": request.expected_registry_digest,
+                    "execution_mode": project.spec.execution_mode,
+                    "capture_mode": project.spec.capture_mode,
+                    "status": m.RunStatus.QUEUED,
+                    "queued_reason": m.QueuedReasonV1(
+                        code=m.QueuedReasonCode.ADMISSION_PENDING,
+                        summary="Core is admitting the saved project revision.",
+                        retry_after_seconds=1,
+                    ),
+                    "attempt_count": 0,
+                    "required_revision": request.required_revision,
+                    "revision_transition": (
+                        None
+                        if request.required_revision.relation
+                        is m.RequiredRevisionRelation.ACTIVE
+                        else self._project_store.get_revision_head(
+                            request.project_id
+                        ).transition
+                    ),
+                    "created_at": now,
+                    "updated_at": now,
+                    "attempts": [],
+                },
+                version=1,
+            )
+            stored, replayed = self._ledger.commit_create_run(
+                admission,
+                run=run,
+                input_context=input_context,
+            )
+        finally:
+            self._ledger.abort_create_run(admission)
         if not replayed:
             self._append_timeline(
                 stored,
@@ -834,20 +847,31 @@ class CoreScienceRunOwner:
 
     def _ensure_services(self, project: m.ProjectV1) -> ServiceGroupSnapshot:
         image = MANAGED_RUNTIME_IMAGES["managed_science"]
-        if project.spec.execution_mode is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
-            execution_mode = ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
-            snapshot = self._services.ensure(
-                ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
-                codex_model=project.spec.agent_model_ref,
-                runtime_image=image,
-            )
-        else:
-            execution_mode = ServiceExecutionMode.SELF_DEPLOYED
-            snapshot = self._services.ensure(
-                ServiceExecutionMode.SELF_DEPLOYED,
-                model_ref=project.spec.agent_model_ref,
-                runtime_image=image,
-            )
+        try:
+            if (
+                project.spec.execution_mode
+                is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+            ):
+                execution_mode = ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+                snapshot = self._services.ensure(
+                    ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                    codex_model=project.spec.agent_model_ref,
+                    runtime_image=image,
+                )
+            else:
+                execution_mode = ServiceExecutionMode.SELF_DEPLOYED
+                snapshot = self._services.ensure(
+                    ServiceExecutionMode.SELF_DEPLOYED,
+                    model_ref=project.spec.agent_model_ref,
+                    runtime_image=image,
+                )
+        except CoreServiceControlError as exc:
+            raise _owner_error(
+                "run_service_supervisor_failed",
+                "Core could not verify managed service readiness.",
+                503,
+                True,
+            ) from exc
         if snapshot.execution_mode is not execution_mode:
             raise _owner_error(
                 "run_service_mode_mismatch",

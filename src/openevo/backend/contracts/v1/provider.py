@@ -199,6 +199,18 @@ def _run_control_http_error(exc: CoreRunControlError) -> _RunControlHTTPError:
     )
 
 
+def _service_control_http_error(exc: CoreServiceControlError) -> CoreControlHTTPError:
+    return _error(
+        503,
+        code="core_service_supervisor_failed",
+        message="Core could not inspect or control its managed services.",
+        category=m.ErrorCategory.SERVICE,
+        retryable=True,
+        repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Retry after Core service ownership is restored.",
+    )
+
+
 class _RunMutationFlight:
     __slots__ = (
         "drained",
@@ -508,6 +520,8 @@ class CoreControlProviderV1:
                 return self._run_control.invoke(operation_id, arguments)
             except CoreRunControlError as exc:
                 raise _run_control_http_error(exc) from exc
+            except CoreServiceControlError as exc:
+                raise _service_control_http_error(exc) from exc
         if operation_id in _UNAVAILABLE_OPERATIONS:
             self._unavailable(operation_id)
         handler = self._handlers.get(operation_id)
@@ -621,15 +635,7 @@ class CoreControlProviderV1:
                 next_action="Inspect Core diagnostics before retrying.",
             ) from exc
         except CoreServiceControlError as exc:
-            raise _error(
-                503,
-                code="core_service_supervisor_failed",
-                message="Core could not inspect or control its managed services.",
-                category=m.ErrorCategory.SERVICE,
-                retryable=True,
-                repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
-                next_action="Retry after Core service ownership is restored.",
-            ) from exc
+            raise _service_control_http_error(exc) from exc
 
     def _version_response(self, arguments: Mapping[str, object]) -> m.VersionResponseV1:
         del arguments

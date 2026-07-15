@@ -52,6 +52,7 @@ from openevo.backend.contracts.v1.models import (
     ServiceSummaryV1,
 )
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import verified_managed_runtime_image_reference
 from openevo.internal_auth import (
     INTERNAL_CREDENTIAL_FD_ENV,
     INTERNAL_LISTEN_FD_ENV,
@@ -578,15 +579,16 @@ class LocalManagedScienceRuntimeProbe:
             if not isinstance(image, dict):
                 raise ValueError("Docker inspect image is not an object")
             image_id = image.get("Id")
+            repo_digests = image.get("RepoDigests")
             config = image.get("Config")
             labels = config.get("Labels") if isinstance(config, dict) else None
-            if (
-                not isinstance(image_id, str)
-                or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
-                or not isinstance(labels, dict)
-                or labels.get("io.openevo.managed-runtime") != "true"
-            ):
-                raise ValueError("Docker image lacks managed runtime identity")
+            immutable_image = verified_managed_runtime_image_reference(
+                profile="managed_science",
+                image=request.runtime_image,
+                image_id=image_id,
+                repo_digests=repo_digests,
+                labels=labels,
+            )
         except (
             UnicodeDecodeError,
             json.JSONDecodeError,
@@ -609,6 +611,7 @@ class LocalManagedScienceRuntimeProbe:
                     "runtime_version_output_digest": hashlib.sha256(runtime.stdout).hexdigest(),
                     "runtime_image": request.runtime_image,
                     "runtime_image_id": image_id,
+                    "runtime_image_immutable_reference": immutable_image,
                 }
             ),
             message="Managed Science runtime bootstrap is verified.",

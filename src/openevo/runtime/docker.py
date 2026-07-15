@@ -19,6 +19,7 @@ from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     ManagedCredentialMount,
     managed_runtime_image_release,
+    verified_managed_runtime_image_reference,
 )
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
@@ -663,25 +664,18 @@ class DockerRuntime(BaseRuntime):
         record = payload[0]
         if not isinstance(record, dict):
             raise RuntimeError("managed runtime image inspect record is invalid")
-        repo_digests = record.get("RepoDigests")
-        image_id = record.get("Id")
-        matched_reference = (
-            next(
-                (
-                    item
-                    for item in repo_digests
-                    if isinstance(item, str) and item.endswith(f"@{release.trusted_digest}")
-                ),
-                None,
+        config = record.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        try:
+            return verified_managed_runtime_image_reference(
+                profile=self.spec.profile,
+                image=self.spec.image,
+                image_id=record.get("Id"),
+                repo_digests=record.get("RepoDigests"),
+                labels=labels,
             )
-            if isinstance(repo_digests, list)
-            else None
-        )
-        if image_id == release.trusted_digest:
-            return release.trusted_digest
-        if matched_reference is not None:
-            return matched_reference
-        raise RuntimeError("managed runtime image digest mismatch")
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     async def _verify_adopted_credential_mount(self) -> None:
         authority = self._credential_mount

@@ -5114,6 +5114,12 @@ class _FailingRunControl(_RecordingRunControl):
         )
 
 
+class _SupervisorFailingRunControl(_RecordingRunControl):
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        del operation_id, arguments
+        raise SupervisorError("private-supervisor-detail")
+
+
 class _MutationFailingRunControl(_RecordingRunControl):
     def __init__(self, *, retryable: bool, fail_once: bool = False) -> None:
         super().__init__()
@@ -5242,6 +5248,17 @@ def test_service_supervisor_failure_is_typed_and_retryable(tmp_path: Path) -> No
     assert response.status_code == 503
     assert response.json()["code"] == "core_service_supervisor_failed"
     assert response.json()["retryable"] is True
+
+
+def test_run_route_supervisor_failure_is_static_typed_and_retryable(tmp_path: Path) -> None:
+    app = _app(tmp_path, run_control=_SupervisorFailingRunControl())
+    with TestClient(app) as client:
+        response = client.get("/v1/runs", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "core_service_supervisor_failed"
+    assert response.json()["retryable"] is True
+    assert "private-supervisor-detail" not in response.text
 
 
 def test_injected_run_control_owns_frozen_routes_and_status_counts(tmp_path: Path) -> None:

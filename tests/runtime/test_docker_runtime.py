@@ -27,6 +27,18 @@ from openevo.runtime.models import RuntimeSpec
 _REAL_DOCKER_IMAGE = "python:3.12-slim-bookworm"
 
 
+def _managed_image_record(
+    image_id: str,
+    *,
+    repo_digests: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "Id": image_id,
+        "RepoDigests": [] if repo_digests is None else repo_digests,
+        "Config": {"Labels": {"io.openevo.managed-runtime": "true"}},
+    }
+
+
 def _real_docker_unavailable(reason: str) -> None:
     if os.environ.get("OPENEVO_REQUIRE_REAL_DOCKER") == "1":
         pytest.fail(reason)
@@ -534,7 +546,7 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
         del kwargs
         if args[1:3] == ("image", "inspect"):
             digest = MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
-            return 0, f'[{{"Id":"{digest}","RepoDigests":[]}}]', None
+            return 0, json.dumps([_managed_image_record(digest)]), None
         if args[1] == "create":
             _write_mock_cidfile(args, container_id)
             return 0, container_id + "\n", None
@@ -597,7 +609,7 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
         del kwargs
         if args[1:3] == ("image", "inspect"):
             digest = MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
-            return 0, f'[{{"Id":"{digest}","RepoDigests":[]}}]', None
+            return 0, json.dumps([_managed_image_record(digest)]), None
         if args[1] == "create":
             credential_dir.rename(displaced)
             replacement = _credential_mount(credential_dir)
@@ -674,7 +686,7 @@ async def test_credential_mount_rejects_replacement_after_final_process_identity
         del kwargs
         if args[1:3] == ("image", "inspect"):
             digest = MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
-            return 0, f'[{{"Id":"{digest}","RepoDigests":[]}}]', None
+            return 0, json.dumps([_managed_image_record(digest)]), None
         if args[1] == "create":
             _write_mock_cidfile(args, container_id)
             return 0, container_id, None
@@ -764,6 +776,7 @@ async def test_managed_image_drift_fails_before_credential_mount_or_create(
     inspected = {
         "Id": "sha256:" + "c" * 64,
         "RepoDigests": repo_digests,
+        "Config": {"Labels": {"io.openevo.managed-runtime": "true"}},
     }
     run_command = AsyncMock(return_value=(0, json.dumps([inspected]), None))
     monkeypatch.setattr(runtime, "_run_local_command", run_command)
@@ -802,6 +815,7 @@ async def test_managed_repo_digest_is_the_immutable_docker_create_target(
                         {
                             "Id": "sha256:" + "d" * 64,
                             "RepoDigests": [release.immutable_reference],
+                            "Config": {"Labels": {"io.openevo.managed-runtime": "true"}},
                         }
                     ]
                 ),

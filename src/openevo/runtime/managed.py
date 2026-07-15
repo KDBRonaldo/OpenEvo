@@ -126,6 +126,38 @@ def managed_runtime_image_release(
     return MANAGED_RUNTIME_RELEASES[profile]
 
 
+def verified_managed_runtime_image_reference(
+    *,
+    profile: str | None,
+    image: str | None,
+    image_id: object,
+    repo_digests: object,
+    labels: object,
+) -> str:
+    """Validate inspected image evidence and return an immutable Docker reference."""
+
+    release = managed_runtime_image_release(profile=profile, image=image)
+    if release is None:
+        raise ValueError("managed runtime image release is unavailable")
+    if (
+        not isinstance(image_id, str)
+        or _SHA256_DIGEST_RE.fullmatch(image_id) is None
+        or not isinstance(labels, dict)
+        or labels.get("io.openevo.managed-runtime") != "true"
+    ):
+        raise ValueError("managed runtime image identity is invalid")
+    if repo_digests is not None and (
+        not isinstance(repo_digests, list)
+        or any(not isinstance(item, str) for item in repo_digests)
+    ):
+        raise ValueError("managed runtime repository digests are invalid")
+    if image_id == release.trusted_digest:
+        return release.trusted_digest
+    if isinstance(repo_digests, list) and release.immutable_reference in repo_digests:
+        return release.immutable_reference
+    raise ValueError("managed runtime image digest mismatch")
+
+
 def require_managed_subscription_runtime(
     *,
     profile: str | None,
@@ -182,6 +214,7 @@ __all__ = [
     "ManagedRuntimeImageRelease",
     "ManagedCredentialMount",
     "managed_runtime_image_release",
+    "verified_managed_runtime_image_reference",
     "reject_managed_subscription_env",
     "require_exact_managed_runtime_binding",
     "require_managed_runtime_binding",

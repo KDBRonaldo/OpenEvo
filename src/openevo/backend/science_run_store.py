@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -122,10 +123,21 @@ class ScienceRunPreconditionFailed(ScienceRunStoreError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class ScienceRunCreateAdmission:
+    project_id: str
+    idempotency_key: str
+    request_digest: str
+    request_json: bytes = field(repr=False)
+    _owner: object = field(repr=False, compare=False)
+
+
 class ScienceRunStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self._lock = threading.RLock()
+        self._create_condition = threading.Condition(self._lock)
+        self._create_admissions: dict[tuple[str, str], ScienceRunCreateAdmission] = {}
         self._closed = False
         self._prepare_root()
         self.database = self.root / "science-runs.sqlite3"
@@ -141,8 +153,106 @@ class ScienceRunStore:
         self._verify_database()
 
     def close(self) -> None:
-        with self._lock:
+        with self._create_condition:
             self._closed = True
+            self._create_condition.notify_all()
+
+    def begin_create_run(
+        self,
+        *,
+        request: m.RunCreateV1,
+        idempotency_key: str,
+    ) -> tuple[m.RunV1 | None, ScienceRunCreateAdmission | None]:
+        request_json = _model_bytes(request)
+        request_digest = hashlib.sha256(request_json).hexdigest()
+        identity = (request.project_id, idempotency_key)
+        with self._create_condition:
+            while True:
+                with self._reader() as connection:
+                    existing = _existing_create_run(
+                        connection,
+                        project_id=request.project_id,
+                        idempotency_key=idempotency_key,
+                        request_digest=request_digest,
+                        request_json=request_json,
+                    )
+                if existing is not None:
+                    return existing, None
+                pending = self._create_admissions.get(identity)
+                if pending is None:
+                    admission = ScienceRunCreateAdmission(
+                        project_id=request.project_id,
+                        idempotency_key=idempotency_key,
+                        request_digest=request_digest,
+                        request_json=request_json,
+                        _owner=object(),
+                    )
+                    self._create_admissions[identity] = admission
+                    return None, admission
+                if (
+                    pending.request_digest != request_digest
+                    or pending.request_json != request_json
+                ):
+                    raise ScienceRunConflict("run idempotency key was reused")
+                self._create_condition.wait()
+                if self._closed:
+                    raise ScienceRunStoreError("science run store is closed")
+
+    def commit_create_run(
+        self,
+        admission: ScienceRunCreateAdmission,
+        *,
+        run: m.RunV1,
+        input_context: Mapping[str, Sequence[str]],
+    ) -> tuple[m.RunV1, bool]:
+        context_json = _context_bytes(input_context)
+        identity = (admission.project_id, admission.idempotency_key)
+        with self._create_condition:
+            if self._create_admissions.get(identity) is not admission:
+                raise ScienceRunStoreError("science run create admission ownership is invalid")
+            try:
+                with self._transaction() as connection:
+                    existing = _existing_create_run(
+                        connection,
+                        project_id=admission.project_id,
+                        idempotency_key=admission.idempotency_key,
+                        request_digest=admission.request_digest,
+                        request_json=admission.request_json,
+                    )
+                    if existing is not None:
+                        return existing, True
+                    count = int(
+                        connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+                    )
+                    if count >= _MAX_RUNS:
+                        raise ScienceRunConflict("science run capacity is exhausted")
+                    connection.execute(
+                        "INSERT INTO runs(run_id, project_id, idempotency_key, "
+                        "request_digest, request_json, run_json, input_context_json, "
+                        "resource_version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                        (
+                            run.id,
+                            admission.project_id,
+                            admission.idempotency_key,
+                            admission.request_digest,
+                            admission.request_json,
+                            _model_bytes(run),
+                            context_json,
+                        ),
+                    )
+                    return run, False
+            finally:
+                self._release_create_admission(admission)
+
+    def abort_create_run(self, admission: ScienceRunCreateAdmission) -> None:
+        with self._create_condition:
+            self._release_create_admission(admission)
+
+    def _release_create_admission(self, admission: ScienceRunCreateAdmission) -> None:
+        identity = (admission.project_id, admission.idempotency_key)
+        if self._create_admissions.get(identity) is admission:
+            del self._create_admissions[identity]
+            self._create_condition.notify_all()
 
     def create_run(
         self,
@@ -152,40 +262,21 @@ class ScienceRunStore:
         run: m.RunV1,
         input_context: Mapping[str, Sequence[str]],
     ) -> tuple[m.RunV1, bool]:
-        request_json = _model_bytes(request)
-        request_digest = hashlib.sha256(request_json).hexdigest()
-        context_json = _context_bytes(input_context)
-        with self._lock, self._transaction() as connection:
-            existing = connection.execute(
-                "SELECT request_digest, request_json, run_json FROM runs "
-                "WHERE project_id = ? AND idempotency_key = ?",
-                (request.project_id, idempotency_key),
-            ).fetchone()
-            if existing is not None:
-                if (
-                    existing["request_digest"] != request_digest
-                    or bytes(existing["request_json"]) != request_json
-                ):
-                    raise ScienceRunConflict("run idempotency key was reused")
-                return _model(m.RunV1, existing["run_json"]), True
-            count = int(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0])
-            if count >= _MAX_RUNS:
-                raise ScienceRunConflict("science run capacity is exhausted")
-            connection.execute(
-                "INSERT INTO runs(run_id, project_id, idempotency_key, request_digest, "
-                "request_json, run_json, input_context_json, resource_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-                (
-                    run.id,
-                    request.project_id,
-                    idempotency_key,
-                    request_digest,
-                    request_json,
-                    _model_bytes(run),
-                    context_json,
-                ),
+        existing, admission = self.begin_create_run(
+            request=request,
+            idempotency_key=idempotency_key,
+        )
+        if existing is not None:
+            return existing, True
+        assert admission is not None
+        try:
+            return self.commit_create_run(
+                admission,
+                run=run,
+                input_context=input_context,
             )
-            return run, False
+        finally:
+            self.abort_create_run(admission)
 
     def get_run(self, run_id: str, *, include_deleted: bool = False) -> m.RunV1:
         with self._lock, self._reader() as connection:
@@ -804,6 +895,29 @@ def _artifact_model(payload: bytes | str) -> m.ArtifactSummaryV1:
     return _model(model_type, payload)
 
 
+def _existing_create_run(
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    idempotency_key: str,
+    request_digest: str,
+    request_json: bytes,
+) -> m.RunV1 | None:
+    existing = connection.execute(
+        "SELECT request_digest, request_json, run_json FROM runs "
+        "WHERE project_id = ? AND idempotency_key = ?",
+        (project_id, idempotency_key),
+    ).fetchone()
+    if existing is None:
+        return None
+    if (
+        existing["request_digest"] != request_digest
+        or bytes(existing["request_json"]) != request_json
+    ):
+        raise ScienceRunConflict("run idempotency key was reused")
+    return _model(m.RunV1, existing["run_json"])
+
+
 def _require_live_run(connection: sqlite3.Connection, run_id: str) -> m.RunV1:
     row = connection.execute(
         "SELECT run_json, deleted FROM runs WHERE run_id = ?", (run_id,)
@@ -889,6 +1003,7 @@ def _object_value(payload: bytes | str, *, label: str) -> dict[str, object]:
 
 __all__ = [
     "ScienceRunConflict",
+    "ScienceRunCreateAdmission",
     "ScienceRunNotFound",
     "ScienceRunPreconditionFailed",
     "ScienceRunStore",

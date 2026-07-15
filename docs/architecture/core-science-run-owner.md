@@ -32,6 +32,15 @@ returns a typed 503 and leaves no durable run. Fixed public messages are selecte
 from the closed readiness code, so command output and authentication material
 cannot enter the response.
 
+Durable idempotency is resolved before this volatile readiness work. An exact
+request replay returns the existing run even if host readiness has since changed,
+and a different payload under the same project/key returns 409 without probing
+services. A truly new request obtains a store-owned, per-key admission claim;
+the final SQLite insert rechecks the durable identity before commit. Concurrent
+same-key callers therefore cannot both run readiness or create separate runs,
+and a failed readiness probe releases the in-memory claim without writing a run,
+job, or per-run thread.
+
 After that admission preparation, Core persists the run before acknowledging
 HTTP 202. The normal state sequence is:
 
@@ -79,6 +88,11 @@ readiness is the supervisor snapshot described above, and both run creation and
 execution require it. The compiler also requires a service binding whose
 execution mode and managed image match the project; it does not reconstruct
 runtime readiness from project fields.
+
+Closed supervisor failures are translated to a static retryable run 503. Raw
+supervisor exceptions, command output, authentication status, and runtime paths
+are not used as public error text; the provider retains the same static mapping
+if a run-control implementation propagates a supervisor failure directly.
 
 The rollout task payload is hashed before submission and bound to the current
 service generation, registry digest, framework-lock digest, task ID, and run.

@@ -22,6 +22,7 @@ from openevo.backend.service_supervisor import (
     ServiceGroupSnapshot,
     ServiceRunBinding,
     ServiceRunReadinessCode,
+    SupervisorStateError,
 )
 from openevo.internal_auth import (
     GenerationBoundRunAdmissionCheck,
@@ -45,30 +46,37 @@ class _FakeServiceOwner:
         readiness_code: ServiceRunReadinessCode = ServiceRunReadinessCode.READY,
     ) -> None:
         self.binding = binding
-        ready = readiness_code is ServiceRunReadinessCode.READY
-        self.snapshot = ServiceGroupSnapshot(
-            execution_mode=binding.execution_mode,
-            services_available=ready,
-            run_ready=ready,
-            run_readiness_code=readiness_code,
-            generation_digest=binding.generation_digest,
-            services=(),
-            runtime_identity_digest=(binding.runtime_identity_digest if ready else None),
-            status_message=None if ready else "secret probe output must not escape",
-        )
+        self.ensure_error: BaseException | None = None
+        self.block_all_ensures = False
+        self.set_readiness(readiness_code)
         self.ensure_entered = threading.Event()
         self.ensure_allowed = threading.Event()
         self.ensure_allowed.set()
         self.ensure_calls = 0
 
+    def set_readiness(self, readiness_code: ServiceRunReadinessCode) -> None:
+        ready = readiness_code is ServiceRunReadinessCode.READY
+        self.snapshot = ServiceGroupSnapshot(
+            execution_mode=self.binding.execution_mode,
+            services_available=ready,
+            run_ready=ready,
+            run_readiness_code=readiness_code,
+            generation_digest=self.binding.generation_digest,
+            services=(),
+            runtime_identity_digest=(self.binding.runtime_identity_digest if ready else None),
+            status_message=None if ready else "secret probe output must not escape",
+        )
+
     def ensure(self, *args: object, **kwargs: object) -> ServiceGroupSnapshot:
         del args, kwargs
         self.ensure_calls += 1
         self.ensure_entered.set()
+        if self.ensure_error is not None:
+            raise self.ensure_error
         if (
-            threading.current_thread().name == "openevo-science-run-owner"
-            and not self.ensure_allowed.wait(5)
-        ):
+            self.block_all_ensures
+            or threading.current_thread().name == "openevo-science-run-owner"
+        ) and not self.ensure_allowed.wait(5):
             raise TimeoutError("test did not release service preparation")
         return self.snapshot
 
@@ -405,6 +413,94 @@ def test_create_is_idempotent_and_rejects_a_valid_mismatched_reuse(
         store.close()
 
 
+def test_create_replay_and_conflict_precede_volatile_readiness(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+    services.ensure_allowed.clear()
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        lambda *_args, **_kwargs: _completed_result(),
+    )
+    try:
+        request = _run_request(project)
+        created = _invoke_create(owner, request, "readiness-order")
+        services.set_readiness(ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE)
+        calls_before_replay = services.ensure_calls
+
+        replay = _invoke_create(owner, request, "readiness-order")
+        assert replay.id == created.id
+        assert services.ensure_calls == calls_before_replay
+
+        mismatched = request.model_copy(update={"expected_registry_digest": "e" * 64})
+        with pytest.raises(CoreRunControlError) as conflict:
+            _invoke_create(owner, mismatched, "readiness-order")
+        assert conflict.value.code == "run_conflict"
+        assert services.ensure_calls == calls_before_replay
+        assert len(owner._ledger.list_runs()) == 1
+    finally:
+        services.set_readiness(ServiceRunReadinessCode.READY)
+        services.ensure_allowed.set()
+        owner.close()
+        store.close()
+
+
+def test_concurrent_new_create_has_one_readiness_owner_and_one_durable_run(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+    services.block_all_ensures = True
+    services.ensure_allowed.clear()
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        lambda *_args, **_kwargs: _completed_result(),
+    )
+    results: list[m.RunV1] = []
+    errors: list[BaseException] = []
+
+    def create() -> None:
+        try:
+            results.append(_invoke_create(owner, _run_request(project), "concurrent-create"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=create)
+    second = threading.Thread(target=create)
+    try:
+        first.start()
+        assert services.ensure_entered.wait(5)
+        second.start()
+        time.sleep(0.05)
+        assert second.is_alive()
+        assert services.ensure_calls == 1
+        services.ensure_allowed.set()
+        first.join(5)
+        second.join(5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert len(results) == 2
+        assert results[0].id == results[1].id
+        assert len(owner._ledger.list_runs()) == 1
+    finally:
+        services.ensure_allowed.set()
+        first.join(5)
+        second.join(5)
+        owner.close()
+        store.close()
+
+
 @pytest.mark.parametrize(
     "readiness_code",
     [
@@ -412,6 +508,7 @@ def test_create_is_idempotent_and_rejects_a_valid_mismatched_reuse(
         ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
         ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
         ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
+        ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
     ],
 )
 def test_create_fails_before_persistence_when_subscription_prerequisite_is_missing(
@@ -442,6 +539,36 @@ def test_create_fails_before_persistence_when_subscription_prerequisite_is_missi
         assert owner._ledger.list_runs() == []
         assert runner_calls == []
         assert services.ensure_calls == 1
+    finally:
+        owner.close()
+        store.close()
+
+
+def test_create_maps_supervisor_failure_without_persisting_or_disclosing_detail(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+    services.ensure_error = SupervisorStateError("private-supervisor-detail")
+    runner_calls: list[object] = []
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        lambda config, **_kwargs: runner_calls.append(config) or _completed_result(),
+    )
+    try:
+        with pytest.raises(CoreRunControlError) as error:
+            _invoke_create(owner, _run_request(project), "supervisor-failure")
+
+        assert error.value.code == "run_service_supervisor_failed"
+        assert error.value.http_status == 503
+        assert error.value.retryable is True
+        assert "private-supervisor-detail" not in str(error.value)
+        assert owner._ledger.list_runs() == []
+        assert runner_calls == []
     finally:
         owner.close()
         store.close()

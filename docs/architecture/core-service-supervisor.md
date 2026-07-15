@@ -147,9 +147,13 @@ boundary under the same total deadline. The default local probe uses controlled
 argv, never a shell, to check `codex --version`, `codex login status`,
 `docker --version`, and `docker image inspect`. Login status must report a
 ChatGPT subscription login; an absent login, failed status command, malformed
-output, or API-key login fails closed. The image must have a SHA-256 image ID and the
-`io.openevo.managed-runtime=true` label produced by the managed Science
-Dockerfile. It opens `~/.codex/auth.json` no-follow, requires a link-count-one
+output, or API-key login fails closed. The image tag must resolve to the exact
+`MANAGED_RUNTIME_RELEASES["managed_science"]` trusted digest, have a SHA-256
+image ID, and carry the `io.openevo.managed-runtime=true` label produced by the
+managed Science Dockerfile. Supervisor preflight and Docker runtime creation use
+the same authoritative verifier; the latter receives the verified immutable
+image reference rather than the mutable tag. It opens `~/.codex/auth.json`
+no-follow, requires a link-count-one
 owner-owned `0600` file, and hashes only file metadata. It never reads or
 persists auth content or the login-status output. Probe stdout and stderr are drained concurrently without
 `communicate()`. One hard aggregate byte budget covers both streams; crossing it

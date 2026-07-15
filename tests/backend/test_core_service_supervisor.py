@@ -37,6 +37,7 @@ from openevo.backend.service_supervisor import (
 )
 from openevo.config import TopologyConfig
 from openevo.internal_auth import InternalServiceIdentity
+from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 from tests.framework_testkit import verified_builtin_registry
 
 
@@ -223,7 +224,9 @@ class BlockingManagedScienceRuntimeProbe(FakeManagedScienceRuntimeProbe):
 class FakeProbeCommandRunner:
     def __init__(
         self,
-        image_id: str = "1" * 64,
+        image_id: str = MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest.removeprefix(
+            "sha256:"
+        ),
         *,
         results: dict[tuple[str, ...], ProbeCommandResult] | None = None,
     ) -> None:
@@ -246,6 +249,7 @@ class FakeProbeCommandRunner:
         payload = [
             {
                 "Id": f"sha256:{self.image_id}",
+                "RepoDigests": [],
                 "Config": {"Labels": {"io.openevo.managed-runtime": "true"}},
             }
         ]
@@ -1622,6 +1626,31 @@ def test_local_managed_runtime_probe_binds_image_codex_and_private_auth(
         ("docker", "image", "inspect", "openevo/science-runtime:0.1.0"),
     ]
     assert "not-read-by-probe" not in readiness.message
+
+
+def test_local_managed_runtime_probe_rejects_wrong_release_digest_before_run(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":"not-read-by-probe"}', encoding="utf-8")
+    auth.chmod(0o600)
+    probe = LocalManagedScienceRuntimeProbe(
+        command_runner=FakeProbeCommandRunner(image_id="1" * 64),
+        codex_auth_path=auth,
+    )
+
+    readiness = probe.verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID
+    assert readiness.identity_digest is None
+    assert readiness.message == "Managed Science bootstrap evidence is invalid."
 
 
 @pytest.mark.parametrize(
