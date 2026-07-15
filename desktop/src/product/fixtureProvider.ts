@@ -17,6 +17,7 @@ import {
   projectValidationV1Schema,
   projectV1Schema,
   remoteProfileV1Schema,
+  revisionTransitionV1Schema,
   runV1Schema,
   serviceV1Schema,
   timelineEntryV1Schema,
@@ -64,11 +65,14 @@ const NOW = "2026-07-14T12:00:00Z";
 export interface FixtureProviderOptions {
   startOnline?: boolean;
   seedCompletedRun?: boolean;
+  seedFailedRun?: boolean;
   artifactTruncated?: boolean;
   degraded?: boolean;
   stepDelayMs?: number;
   newUser?: boolean;
   releaseExecutionModes?: boolean;
+  projectExecutionMode?: ProjectV1["execution"]["mode"];
+  includeParametricMemory?: boolean;
 }
 
 export class FixtureDesktopProductProvider implements DesktopProductProvider {
@@ -77,6 +81,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
   private readonly stepDelayMs: number;
   private readonly artifactTruncated: boolean;
+  private readonly includeParametricMemory: boolean;
   private state: DesktopStateV1;
   private readonly executionModeCapabilities: DesktopStateV1["execution_mode_capabilities"];
   private profiles: RemoteProfileV1[];
@@ -128,8 +133,12 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     }
     this.stepDelayMs = options.stepDelayMs ?? 80;
     this.artifactTruncated = options.artifactTruncated ?? false;
+    this.includeParametricMemory = options.includeParametricMemory ?? false;
+    if (options.seedCompletedRun && options.seedFailedRun) {
+      throw new Error("A fixture cannot seed both completed and failed runs.");
+    }
     const online = options.startOnline ?? false;
-    const newUser = options.newUser ?? (!online && !options.seedCompletedRun);
+    const newUser = options.newUser ?? (!online && !options.seedCompletedRun && !options.seedFailedRun);
     const releaseExecutionModes = executionModeCapabilitiesV1Schema.parse(RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1);
     this.executionModeCapabilities = options.releaseExecutionModes
       ? releaseExecutionModes
@@ -145,7 +154,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
             : capability),
         });
     this.profiles = newUser ? [] : [this.makeProfile(online ? "connected" : "disconnected")];
-    this.projects = newUser ? [] : [this.makeProjectFixture()];
+    this.projects = newUser ? [] : [this.makeProjectFixture(options.projectExecutionMode)];
     this.state = newUser ? this.makeNewUserState() : this.makeState(online ? "online" : "offline");
     this.capabilities = online
       ? this.makeCapabilities(this.projects[0]?.project_id ?? "project-fixture-1")
@@ -157,6 +166,8 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
     if (options.seedCompletedRun) {
       this.seedCompletedRun();
+    } else if (options.seedFailedRun) {
+      this.seedFailedRun();
     }
   }
 
@@ -642,6 +653,55 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(run);
   }
 
+  async retryRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1> {
+    const run = this.requireRun(runId);
+    this.checkIntent(intent, `run:retry:${runId}`, run.etag);
+    if (run.status !== "failed" || !run.current_attempt) {
+      throw new DesktopProductUserError("Only a failed session can be retried.");
+    }
+    const attemptNumber = run.attempt_count + 1;
+    const queuedReason = {
+      code: "admission_pending" as const,
+      summary: "The retry was admitted on the same session.",
+      retry_after_seconds: 1,
+    };
+    const attempt = {
+      ...run.current_attempt,
+      id: `attempt-${runId}-${attemptNumber}`,
+      number: attemptNumber,
+      status: "queued" as const,
+      queued_reason: queuedReason,
+      created_at: NOW,
+      updated_at: NOW,
+      started_at: null,
+      finished_at: null,
+      error: null,
+    };
+    const retried = runV1Schema.parse({
+      ...run,
+      status: "queued",
+      queued_reason: queuedReason,
+      current_attempt_id: attempt.id,
+      current_attempt: attempt,
+      attempt_count: attemptNumber,
+      current_error: null,
+      attempts: [...run.attempts, attempt],
+      updated_at: NOW,
+      started_at: null,
+      finished_at: null,
+      etag: run.etag === ETAG_A ? ETAG_B : ETAG_A,
+    });
+    this.replaceRun(retried);
+    this.appendTimeline(
+      runId,
+      "admission",
+      "pending",
+      "Retry admitted",
+      "A new attempt was appended to the same session.",
+    );
+    return structuredClone(retried);
+  }
+
   async cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1> {
     const run = this.requireRun(runId);
     this.checkIntent(intent, `run:cancel:${runId}`, run.etag);
@@ -720,28 +780,33 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     const successor = this.revision(2, coreProjectId);
     const base = structuredClone(CONTRACT_FIXTURE_V1.run);
     const attempt = { ...base.attempts[0], status: "succeeded" as const, finished_at: NOW };
-    const run = runV1Schema.parse({
-      ...base,
-      project_id: coreProjectId,
-      status: "succeeded",
-      queued_reason: null,
-      current_attempt: attempt,
-      current_error: null,
-      pinned_revision: successor,
-      required_revision: { revision: successor, reachable_from_revision_id: predecessor.id, relation: "successor" },
-      revision_transition: {
-        state: "active",
-        predecessor_revision: predecessor,
-        successor_revision: successor,
-        progress_completed: 4,
-        progress_total: 4,
-        message: "The successor revision is active.",
-        error: null,
-        updated_at: NOW,
-      },
-      attempts: [attempt],
-      finished_at: NOW,
+    const transition = revisionTransitionV1Schema.parse({
+      state: "active",
+      predecessor_revision: predecessor,
+      successor_revision: successor,
+      progress_completed: 4,
+      progress_total: 4,
+      message: "The successor revision is active.",
+      error: null,
+      updated_at: NOW,
     });
+    const run = {
+      ...runV1Schema.parse({
+        ...base,
+        project_id: coreProjectId,
+        execution_mode: project.execution.mode,
+        status: "succeeded",
+        queued_reason: null,
+        current_attempt: attempt,
+        current_error: null,
+        pinned_revision: predecessor,
+        required_revision: { revision: predecessor, reachable_from_revision_id: predecessor.id, relation: "active" },
+        revision_transition: null,
+        attempts: [attempt],
+        finished_at: NOW,
+      }),
+      revision_transition: transition,
+    } satisfies RunV1;
     this.runs = [run];
     this.timelines[run.id] = [
       this.timeline(1, "revision", "succeeded", "Revision 2 active", "The next session will use the new revision.", run.id),
@@ -761,8 +826,67 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.createArtifacts(run.id, 2);
   }
 
+  private seedFailedRun(): void {
+    const project = this.projects[0];
+    if (!project) return;
+    const coreProjectId = this.requireCoreProjectId(project);
+    const predecessor = this.revision(1, coreProjectId);
+    const base = structuredClone(CONTRACT_FIXTURE_V1.run);
+    const error = this.apiError(
+      409,
+      "session_execution_failed",
+      "The research session failed before evolution outputs were committed.",
+      "run",
+    ).apiError;
+    const attempt = {
+      ...base.attempts[0],
+      status: "failed" as const,
+      queued_reason: null,
+      updated_at: NOW,
+      finished_at: NOW,
+      error,
+    };
+    const run = runV1Schema.parse({
+      ...base,
+      project_id: coreProjectId,
+      execution_mode: project.execution.mode,
+      status: "failed",
+      queued_reason: null,
+      current_attempt: attempt,
+      current_error: error,
+      pinned_revision: predecessor,
+      required_revision: { revision: predecessor, reachable_from_revision_id: predecessor.id, relation: "active" },
+      revision_transition: null,
+      attempts: [attempt],
+      updated_at: NOW,
+      finished_at: NOW,
+    });
+    this.runs = [run];
+    this.timelines[run.id] = [
+      this.timeline(1, "terminal", "failed", "Session failed", "Revision 1 remains active and no successor was committed.", run.id, error),
+    ];
+    this.logs[run.id] = [
+      this.log(run, "core", "The session stopped before evolution outputs were committed."),
+    ];
+  }
+
   private finishRun(runId: string, successorGeneration: number): void {
     const run = this.requireRun(runId);
+    const predecessor = run.pinned_revision;
+    if (!predecessor || predecessor.generation + 1 !== successorGeneration) {
+      throw new Error("The successor must directly follow the run's pinned revision.");
+    }
+    const successor = this.revision(successorGeneration, run.project_id);
+    const transition = revisionTransitionV1Schema.parse({
+      state: "active",
+      predecessor_revision: predecessor,
+      successor_revision: successor,
+      progress_completed: 4,
+      progress_total: 4,
+      message: "The successor revision is active.",
+      error: null,
+      updated_at: NOW,
+    });
     const attempt = {
       ...run.current_attempt!,
       status: "succeeded" as const,
@@ -770,21 +894,25 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       updated_at: NOW,
       finished_at: NOW,
     };
-    const succeeded = runV1Schema.parse({
-      ...run,
-      status: "succeeded",
-      queued_reason: null,
-      current_attempt: attempt,
-      attempts: [...run.attempts.slice(0, -1), attempt],
-      updated_at: NOW,
-      finished_at: NOW,
-    });
+    const succeeded = {
+      ...runV1Schema.parse({
+        ...run,
+        status: "succeeded",
+        queued_reason: null,
+        current_attempt: attempt,
+        revision_transition: null,
+        attempts: [...run.attempts.slice(0, -1), attempt],
+        updated_at: NOW,
+        finished_at: NOW,
+      }),
+      revision_transition: transition,
+    } satisfies RunV1;
     this.replaceRun(succeeded);
     this.projects = this.projects.map((project) =>
       project.remote?.core_project_id === run.project_id
         ? projectV1Schema.parse({
             ...project,
-            remote: project.remote ? { ...project.remote, active_revision: this.revision(successorGeneration, run.project_id), observed_at: NOW } : null,
+            remote: project.remote ? { ...project.remote, active_revision: successor, observed_at: NOW } : null,
             updated_at: NOW,
           })
         : project,
@@ -795,13 +923,24 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   private createArtifacts(runId: string, generation: number): void {
     const run = this.requireRun(runId);
+    const project = this.projects.find((candidate) => candidate.remote?.core_project_id === run.project_id);
+    if (!project) throw new Error("The artifact fixture project was not found.");
+    const modelRef = project.execution.codex_model ?? project.execution.hf_model;
+    if (!modelRef) throw new Error("The artifact fixture project does not select a model.");
     const prior = this.artifacts;
-    const variants = [
+    const variants: Array<{
+      artifact_type: ArtifactV1["artifact_type"];
+      target_id: string;
+      display_name: string;
+      summary: string;
+    }> = [
       { artifact_type: "text_memory" as const, target_id: "text_memory", display_name: "Research memory", summary: "Durable findings and constraints from this session." },
       { artifact_type: "skill_bundle" as const, target_id: "skill_bundle", display_name: "Research skills", summary: "Reusable analysis and validation routines." },
       { artifact_type: "agent_system" as const, target_id: "agent_system", display_name: "Agent guidance", summary: "Updated operating guidance for the next session." },
-      { artifact_type: "parametric_memory" as const, target_id: "parametric_memory", display_name: "Parametric memory", summary: "Selected adapter state for the next session." },
     ];
+    if (this.includeParametricMemory) {
+      variants.push({ artifact_type: "parametric_memory", target_id: "parametric_memory", display_name: "Parametric memory", summary: "Selected adapter state for the next session." });
+    }
 
     for (const variant of variants) {
       const artifactId = `artifact-${variant.target_id}-${generation}`;
@@ -813,7 +952,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
           ? { document_count: 2, root_document: "SKILL.md" as const }
           : variant.artifact_type === "agent_system"
             ? { target_path: "AGENTS.md" }
-            : { adapter_id: `adapter-fixture-${generation}`, base_model_ref: "open-models/research-model-fixture-1", adapter_format: "lora" as const };
+            : { adapter_id: `adapter-fixture-${generation}`, base_model_ref: modelRef, adapter_format: "lora" as const };
       const artifact = artifactV1Schema.parse({
         id: artifactId,
         project_id: run.project_id,
@@ -833,9 +972,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
           source_artifact_ids: parent ? [parent.id] : [],
         },
         compatibility: {
-          execution_modes: ["self-deployed"],
+          execution_modes: [project.execution.mode],
           harness_ids: ["codex"],
-          base_model_refs: ["open-models/research-model-fixture-1"],
+          base_model_refs: [modelRef],
         },
         scores: [{ name: "quality", value: 0.82 + generation / 100 }],
         selected: true,
@@ -1019,6 +1158,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     title: string,
     message: string,
     runId = "run-fixture-1",
+    error: RunV1["current_error"] = null,
   ): TimelineEntryV1 {
     const run = this.runs.find((item) => item.id === runId);
     return timelineEntryV1Schema.parse({
@@ -1034,7 +1174,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       occurred_at: NOW,
       artifact_ids: [],
       content_sha256: sequence % 2 === 0 ? B : A,
-      error: null,
+      error,
     });
   }
 
@@ -1042,14 +1182,29 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return remoteProfileV1Schema.parse({ ...structuredClone(CONTRACT_FIXTURE_V1.profile), connection_state: connectionState });
   }
 
-  private makeProjectFixture(): ProjectV1 {
+  private makeProjectFixture(
+    executionMode: ProjectV1["execution"]["mode"] = "self-deployed",
+  ): ProjectV1 {
     const project = structuredClone(CONTRACT_FIXTURE_V1.project);
     const coreProjectId = this.fixtureCoreProjectId(project.project_id);
+    const subscription = executionMode === "codex_subscription_transcript";
+    const modelRef = subscription ? "gpt-5.5" : project.execution.hf_model;
     return projectV1Schema.parse({
       ...project,
+      execution: {
+        mode: executionMode,
+        capture_mode: "transcript",
+        token_level_metrics_available: false,
+        codex_model: subscription ? modelRef : null,
+        hf_model: subscription ? null : modelRef,
+      },
       remote: project.remote ? {
         ...project.remote,
         core_project_id: coreProjectId,
+        model_preparation: {
+          ...project.remote.model_preparation,
+          model_ref: modelRef,
+        },
         active_revision: project.remote.active_revision
           ? { ...project.remote.active_revision, project_id: coreProjectId }
           : null,
@@ -1205,6 +1360,8 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   private makeServices(online: boolean, degraded: boolean): ServiceV1[] {
     const status: ServiceV1["status"] = online ? (degraded ? "degraded" : "running") : "unavailable";
+    const execution = this.projects[0]?.execution;
+    const modelRef = execution?.codex_model ?? execution?.hf_model ?? "open-models/research-model-fixture-1";
     return [
       { id: "service-runtime-fixture", display_name: "OpenEvo runtime", kind: "control" as const },
       { id: "service-model-fixture", display_name: "Model service", kind: "inference" as const },
@@ -1217,6 +1374,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       error: null,
       model_preparation: service.kind === "inference" ? {
         ...structuredClone(CONTRACT_FIXTURE_V1.project.remote.model_preparation),
+        model_ref: modelRef,
         status: online ? "ready" : "unresolved",
         downloaded_bytes: online ? 1_024 : null,
         total_bytes: online ? 1_024 : null,

@@ -24,7 +24,12 @@ without becoming release dependencies.
 
 For renderer visual QA, run the Vite development server and open
 `/product-preview.html?scenario=<name>`. The closed scenario set is `new-user`,
-`offline`, `online`, `completed`, and `degraded`. This secondary HTML entry is
+`offline`, `online`, `completed`, `degraded`, and `failed`. Except for the empty
+`new-user` state, these scenarios use the release-supported
+`codex_subscription_transcript` profile with transcript capture and `gpt-5.5`.
+The `failed` scenario contains one genuinely failed run and exercises the
+same-run retry action; it does not add a successful run to make the history look
+healthy. This secondary HTML entry is
 served only by Vite during development; the Tauri release build starts from
 `index.html`, and `preview.tsx` also rejects production execution. The preview
 therefore exercises the real product components against strict contract
@@ -258,6 +263,14 @@ Revision generation is shown only from the authoritative
 through `ProjectV1.remote.core_project_id`, never the Desktop-local
 `project_id`. Matching pinned, required, predecessor, successor, produced, and
 membership revision refs must agree on the complete revision identity. Artifact
+fixtures preserve the cross-session boundary: a completed run remains pinned to
+its predecessor, its active transition names the next generation as successor,
+and only the project head advances. A later session then pins that newly active
+revision. The ordinary three-target fixture generates only text memory, skill,
+and agent-system artifacts. Generic simulator tests that exercise the closed
+`parametric_memory` artifact subtype must opt in with
+`includeParametricMemory`; artifact execution-mode and model compatibility are
+derived from the owning project rather than hard-coded. Artifact
 lists use selected artifacts whose `membership_revisions` include that exact
 active revision, without excluding any authoritative discriminated-union
 subtype, and sort them by `created_at` and then `id`. This includes

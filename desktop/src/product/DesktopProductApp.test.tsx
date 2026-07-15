@@ -672,6 +672,15 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Revision 3");
     expect(screenText()).toContain("Latest session complete");
 
+    const completed = await provider.refresh();
+    if (completed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
+    const evolvedRun = completed.snapshot.runs.find((run) => run.status === "succeeded" && run.id !== "run-fixture-1");
+    expect(evolvedRun?.pinned_revision?.generation).toBe(2);
+    expect(evolvedRun?.required_revision.revision.generation).toBe(2);
+    expect(evolvedRun?.revision_transition?.predecessor_revision.generation).toBe(2);
+    expect(evolvedRun?.revision_transition?.successor_revision.generation).toBe(3);
+    expect(evolvedRun?.revision_transition?.state).toBe("active");
+
     await clickButton("Start session");
     expect(screenText()).toContain("Pinned context");
     expect(screenText()).toContain("Revision 3");
@@ -691,7 +700,8 @@ describe("DesktopProductApp", () => {
     root = await renderProduct(provider);
     expect(screenText()).toContain("Latest session complete");
     await clickButton("Evolution");
-    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(4);
+    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(3);
+    expect(screenText()).not.toContain("Parametric memory");
   });
 
   it("keeps a terminal fixture run immutable when scheduled steps fire later", async () => {
@@ -1039,6 +1049,35 @@ describe("DesktopProductApp", () => {
     expect(startRun).not.toHaveBeenCalled();
   });
 
+  it("shows the failed preview outcome and retries by appending an attempt to the same run", async () => {
+    provider = createFixtureDesktopProductProvider({
+      startOnline: true,
+      seedFailedRun: true,
+      releaseExecutionModes: true,
+      projectExecutionMode: "codex_subscription_transcript",
+    });
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("Latest session failed");
+    expect(screenText()).toContain("The research session failed before evolution outputs were committed.");
+    expect(screenText()).not.toContain("Latest session complete");
+    expect(button("Retry session").disabled).toBe(false);
+
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
+    const failedRun = before.snapshot.runs[0];
+    if (!failedRun) throw new Error("Failed run fixture was not found.");
+    await clickButton("Retry session");
+
+    const after = await provider.refresh();
+    if (after.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
+    expect(after.snapshot.runs).toHaveLength(1);
+    expect(after.snapshot.runs[0]?.id).toBe(failedRun.id);
+    expect(after.snapshot.runs[0]?.attempt_count).toBe(2);
+    expect(after.snapshot.runs[0]?.attempts.map((attempt) => attempt.status)).toEqual(["failed", "queued"]);
+    expect(screenText()).toContain("The retry was admitted on the same session.");
+  });
+
   it("clears an unknown retry error when refresh proves the same run advanced", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
@@ -1230,7 +1269,7 @@ describe("DesktopProductApp", () => {
   });
 
   it("shows every selected revision member, including multiple artifacts for one target, in stable order", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, includeParametricMemory: true });
     provider.useAuthoritativeArtifactOrderingScenario();
     root = await renderProduct(provider);
     await clickButton("Evolution");
