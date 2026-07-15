@@ -347,21 +347,38 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
     if (this.retryRequestInFlight) {
       throw new DesktopProductUserError("OpenEvo is already sending this session retry.");
     }
+    let requestAuthority: ProductRunRetryRecovery;
     if (!exactReplay) {
       this.assertIntent(intent);
       const original = this.snapshot?.runs.find((run) => run.id === runId);
       if (!original || original.etag !== intent.etag) {
         throw new DesktopProductUserError("This session changed remotely. Refresh before retrying it.");
       }
-      await this.setRunRetryRecovery(createRunRetryRecovery(original, intent));
+      requestAuthority = createRunRetryRecovery(original, intent);
+    } else {
+      requestAuthority = this.retryReplay!;
     }
-    const requestAuthority = this.retryReplay;
-    if (!requestAuthority) {
-      throw new DesktopContractError("Run retry request has no durable recovery authority");
+    const terminalAttemptId = requestAuthority.originalRun.current_attempt_id;
+    if (terminalAttemptId === null) {
+      throw new DesktopContractError("Run retry recovery has no terminal attempt identity");
     }
+    // Claim synchronously so two callers cannot both cross the first durable
+    // write boundary before either recovery record becomes visible.
     this.retryRequestInFlight = requestAuthority;
+    if (!exactReplay) {
+      try {
+        await this.setRunRetryRecovery(requestAuthority);
+      } catch (error) {
+        if (this.retryRequestInFlight === requestAuthority) this.retryRequestInFlight = null;
+        throw error;
+      }
+    }
     try {
-      const run = await this.client.retryRun(runId, actionOptions(intent));
+      const run = await this.client.retryRun(
+        runId,
+        { terminal_attempt_id: terminalAttemptId },
+        actionOptions(intent),
+      );
       this.assertKnownRunResponse(run, runId, "Run retry returned the wrong run");
       const recovery = this.retryReplay;
       if (!recovery || recovery.runId !== runId || !sameRunRetryIntent(recovery.intent, intent)) {
@@ -376,6 +393,9 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
       return run;
     } catch (error) {
       if (error instanceof DesktopApiError) {
+        if (error.apiError.code === "core_mutation_outcome_unknown") {
+          throw new DesktopProductAmbiguousMutationError(undefined, error);
+        }
         if (this.retryReplay?.runId === runId && sameRunRetryIntent(this.retryReplay.intent, intent)) {
           await this.setRunRetryRecovery(null);
         }

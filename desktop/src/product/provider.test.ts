@@ -10,6 +10,7 @@ import {
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 import {
   createReleaseDesktopProductProvider,
+  nativeRunRetryRecoveryStore,
   reportReleaseDesktopReady,
 } from "./releaseProvider";
 
@@ -37,7 +38,7 @@ describe("Desktop product provider boundary", () => {
     expect(contract.allowedProviderKinds).toEqual(["desktop_sidecar"]);
     expect(Object.isFrozen(contract.acceptedOpenApiDigests)).toBe(true);
     expect(DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests).toEqual([
-      "07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861",
+      "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777",
     ]);
   });
 
@@ -133,6 +134,66 @@ describe("Desktop product provider boundary", () => {
 
     expect(provider.providerKind).toBe("desktop_sidecar");
     expect(native.readRunRetryRecovery).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses native compare-and-swap authority and reconciles a lost write response", async () => {
+    let durable: string | null = null;
+    const writeRunRetryRecovery = vi.fn(async (next: string | null, expected: string | null) => {
+      expect(durable).toBe(expected);
+      durable = next;
+    });
+    const native = {
+      readRunRetryRecovery: vi.fn(async () => durable),
+      writeRunRetryRecovery,
+    };
+    const store = await nativeRunRetryRecoveryStore(native);
+
+    await store.write("first");
+    await store.write("second");
+
+    expect(writeRunRetryRecovery).toHaveBeenNthCalledWith(1, "first", null);
+    expect(writeRunRetryRecovery).toHaveBeenNthCalledWith(2, "second", "first");
+    expect(store.read()).toBe("second");
+
+    writeRunRetryRecovery.mockImplementationOnce(async (next: string | null, expected: string | null) => {
+      expect(durable).toBe(expected);
+      durable = next;
+      throw new Error("native response lost after commit");
+    });
+    await expect(store.write("third")).resolves.toBeUndefined();
+    expect(store.read()).toBe("third");
+  });
+
+  it("fails closed when another Desktop process wins the native retry journal", async () => {
+    let durable: string | null = null;
+    const conflict = new Error("run_retry_recovery_conflict");
+    const native = {
+      readRunRetryRecovery: vi.fn(async () => durable),
+      writeRunRetryRecovery: vi.fn(async () => {
+        durable = "other-process-authority";
+        throw conflict;
+      }),
+    };
+    const store = await nativeRunRetryRecoveryStore(native);
+
+    await expect(store.write("this-process-authority")).rejects.toThrow(/another process/i);
+    expect(() => store.read()).toThrow(/restart/i);
+    await expect(store.write("replacement")).rejects.toThrow(/restart/i);
+    expect(native.writeRunRetryRecovery).toHaveBeenCalledTimes(1);
+    expect(durable).toBe("other-process-authority");
+  });
+
+  it("keeps a deterministic unchanged native write failure retryable", async () => {
+    const failure = new Error("native lock temporarily unavailable");
+    const native = {
+      readRunRetryRecovery: vi.fn().mockResolvedValue(null),
+      writeRunRetryRecovery: vi.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce(undefined),
+    };
+    const store = await nativeRunRetryRecoveryStore(native);
+
+    await expect(store.write("authority")).rejects.toBe(failure);
+    await expect(store.write("authority")).resolves.toBeUndefined();
+    expect(native.writeRunRetryRecovery).toHaveBeenNthCalledWith(2, "authority", null);
   });
 
   it("fails release startup when the native retry journal is unavailable or malformed", async () => {

@@ -32,6 +32,7 @@ import {
   runContextV1Schema,
   runCreateV1Schema,
   runPageV1Schema,
+  runRetryV1Schema,
   runV1Schema,
   servicePageV1Schema,
   sha256DigestSchema,
@@ -64,6 +65,7 @@ import {
   type RemoteProfileV1,
   type RunContextV1,
   type RunCreateV1,
+  type RunRetryV1,
   type RunSummaryV1,
   type RunV1,
   type ServiceV1,
@@ -233,7 +235,7 @@ export interface DesktopApiClientV1 {
   getRun(runId: string): Promise<RunV1>;
   deleteRun(runId: string, options: IfMatchRequestOptions): Promise<void>;
   cancelRun(runId: string, options: ActionRequestOptions): Promise<RunV1>;
-  retryRun(runId: string, options: ActionRequestOptions): Promise<RunV1>;
+  retryRun(runId: string, input: RunRetryV1, options: ActionRequestOptions): Promise<RunV1>;
   runTimeline(runId: string, options?: ListRequestOptions): Promise<PageV1<TimelineEntryV1>>;
   runLogs(runId: string, options?: ListRequestOptions): Promise<PageV1<LogEntryV1>>;
   runContext(runId: string): Promise<RunContextV1>;
@@ -491,8 +493,10 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
         idempotencyKey: actionOptions.idempotencyKey,
         ifMatch: actionOptions.ifMatch,
       }),
-    retryRun: (runId, actionOptions) =>
+    retryRun: (runId, input, actionOptions) =>
       request("POST", `${DESKTOP_API_V1_PREFIX}/runs/${segment(runId)}/retry`, runV1Schema, 202, {
+        body: input,
+        bodySchema: runRetryV1Schema,
         idempotencyKey: actionOptions.idempotencyKey,
         ifMatch: actionOptions.ifMatch,
       }),

@@ -31,7 +31,7 @@ const BUNDLED_SIDECAR_BINARY: &str = "openevo-desktop-sidecar";
 const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v1";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
-    "07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861";
+    "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V1";
 const SIDECAR_PROCESS_MARKER: &str = "OPENEVO_DESKTOP_SIDECAR_PROCESS_V1";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
@@ -68,6 +68,9 @@ const MAX_CANCELLED_PICKER_ACTIONS: usize = 64;
 const RUN_RETRY_RECOVERY_MAX_BYTES: usize = 1024 * 1024;
 const RUN_RETRY_RECOVERY_FILE_NAME: &str = ".7f3d8b24c1a94762";
 const RUN_RETRY_RECOVERY_TEMP_PREFIX: &str = ".7f3d8b24c1a94762.tmp.";
+const RUN_RETRY_RECOVERY_LOCK_FILE_NAME: &str = ".c41d73e981bf4a56";
+const RUN_RETRY_RECOVERY_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+const RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SIDECAR_TERM_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -4650,6 +4653,96 @@ struct RunRetryRecoveryRoot {
     inode: u64,
 }
 
+struct RunRetryRecoveryProcessLock {
+    root: RunRetryRecoveryRoot,
+    name: CString,
+    file: File,
+    identity: FileIdentity,
+}
+
+impl RunRetryRecoveryProcessLock {
+    fn acquire(path: &Path) -> HostResult<Self> {
+        let root =
+            open_run_retry_recovery_root(path, true)?.ok_or_else(run_retry_recovery_error)?;
+        root.validate()?;
+        let name = run_retry_recovery_lock_name();
+        let previous_identity = run_retry_recovery_identity_at_optional(&root.directory, &name)?;
+        if let Some(identity) = previous_identity.as_ref() {
+            validate_run_retry_recovery_lock_identity(identity)?;
+        }
+        let file = openat_file(
+            root.directory.as_raw_fd(),
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o600,
+        )
+        .map_err(|_| run_retry_recovery_error())?;
+        let identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
+        validate_run_retry_recovery_lock_identity(&identity)?;
+        validate_anchored_extended_acl(&file).map_err(|_| run_retry_recovery_error())?;
+        if previous_identity.is_some_and(|previous| previous != identity)
+            || run_retry_recovery_identity_at_optional(&root.directory, &name)?.as_ref()
+                != Some(&identity)
+        {
+            return Err(run_retry_recovery_error());
+        }
+        root.validate()?;
+
+        let deadline = Instant::now() + RUN_RETRY_RECOVERY_LOCK_TIMEOUT;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(code) if code == libc::EINTR => continue,
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(run_retry_recovery_error());
+                    }
+                    thread::sleep(
+                        RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL
+                            .min(deadline.saturating_duration_since(now)),
+                    );
+                }
+                _ => return Err(run_retry_recovery_error()),
+            }
+        }
+
+        let lock = Self {
+            root,
+            name,
+            file,
+            identity,
+        };
+        lock.validate()?;
+        Ok(lock)
+    }
+
+    fn validate(&self) -> HostResult<()> {
+        self.root.validate()?;
+        let open_identity = file_identity(&self.file).map_err(|_| run_retry_recovery_error())?;
+        validate_run_retry_recovery_lock_identity(&open_identity)?;
+        validate_anchored_extended_acl(&self.file).map_err(|_| run_retry_recovery_error())?;
+        if open_identity != self.identity
+            || run_retry_recovery_identity_at_optional(&self.root.directory, &self.name)?.as_ref()
+                != Some(&self.identity)
+        {
+            return Err(run_retry_recovery_error());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RunRetryRecoveryProcessLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 impl RunRetryRecoveryRoot {
     fn validate(&self) -> HostResult<()> {
         let reopened = open_run_retry_recovery_root(&self.path, false)?
@@ -4707,15 +4800,19 @@ fn run_retry_recovery_root_path(app: &tauri::AppHandle) -> HostResult<PathBuf> {
         .map_err(|_| run_retry_recovery_error())
 }
 
-fn with_run_retry_recovery_lock<T>(
+fn with_run_retry_recovery_transaction<T>(
     state: &DesktopHostState,
+    path: &Path,
     operation: impl FnOnce() -> HostResult<T>,
 ) -> HostResult<T> {
-    let _guard = state
+    let _thread_guard = state
         .run_retry_recovery
         .lock()
         .map_err(|_| run_retry_recovery_error())?;
-    operation()
+    let process_lock = RunRetryRecoveryProcessLock::acquire(path)?;
+    let result = operation();
+    process_lock.validate()?;
+    result
 }
 
 fn open_run_retry_recovery_root(
@@ -4851,6 +4948,14 @@ fn validate_run_retry_recovery_file_identity(identity: &FileIdentity) -> HostRes
     Ok(())
 }
 
+fn validate_run_retry_recovery_lock_identity(identity: &FileIdentity) -> HostResult<()> {
+    validate_run_retry_recovery_file_identity(identity)?;
+    if identity.size != 0 {
+        return Err(run_retry_recovery_error());
+    }
+    Ok(())
+}
+
 fn validate_run_retry_recovery_read_identity(identity: &FileIdentity) -> HostResult<()> {
     validate_run_retry_recovery_file_identity(identity)?;
     if identity.size > RUN_RETRY_RECOVERY_MAX_BYTES as u64 {
@@ -4861,6 +4966,10 @@ fn validate_run_retry_recovery_read_identity(identity: &FileIdentity) -> HostRes
 
 fn run_retry_recovery_name() -> CString {
     CString::new(RUN_RETRY_RECOVERY_FILE_NAME).expect("recovery file name has no NUL")
+}
+
+fn run_retry_recovery_lock_name() -> CString {
+    CString::new(RUN_RETRY_RECOVERY_LOCK_FILE_NAME).expect("recovery lock name has no NUL")
 }
 
 fn read_run_retry_recovery_from_root(
@@ -5103,6 +5212,25 @@ fn write_run_retry_recovery_at(path: &Path, value: Option<&str>) -> HostResult<(
     }
 }
 
+fn compare_and_swap_run_retry_recovery_at(
+    state: &DesktopHostState,
+    path: &Path,
+    expected_value: Option<&str>,
+    value: Option<&str>,
+) -> HostResult<()> {
+    with_run_retry_recovery_transaction(state, path, || {
+        if expected_value.is_some_and(|expected| expected.len() > RUN_RETRY_RECOVERY_MAX_BYTES)
+            || value.is_some_and(|new_value| new_value.len() > RUN_RETRY_RECOVERY_MAX_BYTES)
+        {
+            return Err(run_retry_recovery_too_large_error());
+        }
+        if read_run_retry_recovery_at(path)?.as_deref() != expected_value {
+            return Err(run_retry_recovery_conflict_error());
+        }
+        write_run_retry_recovery_at(path, value)
+    })
+}
+
 fn run_retry_recovery_error() -> NativeHostError {
     NativeHostError::new(
         "run_retry_recovery_unavailable",
@@ -5117,6 +5245,13 @@ fn run_retry_recovery_too_large_error() -> NativeHostError {
     )
 }
 
+fn run_retry_recovery_conflict_error() -> NativeHostError {
+    NativeHostError::new(
+        "run_retry_recovery_conflict",
+        "Saved run retry recovery state changed before this update could be applied.",
+    )
+}
+
 #[tauri::command]
 fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStatus> {
     host_status_inner(&state)
@@ -5127,22 +5262,24 @@ fn read_run_retry_recovery(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopHostState>,
 ) -> HostResult<Option<String>> {
-    with_run_retry_recovery_lock(&state, || {
-        let root = run_retry_recovery_root_path(&app)?;
-        read_run_retry_recovery_at(&root)
-    })
+    let root = run_retry_recovery_root_path(&app)?;
+    with_run_retry_recovery_transaction(&state, &root, || read_run_retry_recovery_at(&root))
 }
 
 #[tauri::command(rename_all = "camelCase")]
 fn write_run_retry_recovery(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopHostState>,
+    expected_value: Option<String>,
     value: Option<String>,
 ) -> HostResult<()> {
-    with_run_retry_recovery_lock(&state, || {
-        let root = run_retry_recovery_root_path(&app)?;
-        write_run_retry_recovery_at(&root, value.as_deref())
-    })
+    let root = run_retry_recovery_root_path(&app)?;
+    compare_and_swap_run_retry_recovery_at(
+        &state,
+        &root,
+        expected_value.as_deref(),
+        value.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -5412,6 +5549,10 @@ mod tests {
         root.join(RUN_RETRY_RECOVERY_FILE_NAME)
     }
 
+    fn run_retry_recovery_lock_target(root: &Path) -> PathBuf {
+        root.join(RUN_RETRY_RECOVERY_LOCK_FILE_NAME)
+    }
+
     #[test]
     fn run_retry_recovery_roundtrips_and_clears_private_state() {
         let temp = tempfile::tempdir().unwrap();
@@ -5437,6 +5578,54 @@ mod tests {
         write_run_retry_recovery_at(&root, None).unwrap();
         assert_eq!(read_run_retry_recovery_at(&root).unwrap(), None);
         assert!(!run_retry_recovery_target(&root).exists());
+    }
+
+    #[test]
+    fn run_retry_recovery_compare_and_swap_rejects_stale_process_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let first_state = DesktopHostState::default();
+        let second_state = DesktopHostState::default();
+
+        compare_and_swap_run_retry_recovery_at(&first_state, &root, None, Some("A")).unwrap();
+        let error = compare_and_swap_run_retry_recovery_at(&second_state, &root, None, Some("B"))
+            .unwrap_err();
+        assert_eq!(error.code, "run_retry_recovery_conflict");
+        assert_eq!(
+            read_run_retry_recovery_at(&root).unwrap().as_deref(),
+            Some("A")
+        );
+
+        compare_and_swap_run_retry_recovery_at(&second_state, &root, Some("A"), Some("B")).unwrap();
+        assert_eq!(
+            read_run_retry_recovery_at(&root).unwrap().as_deref(),
+            Some("B")
+        );
+        compare_and_swap_run_retry_recovery_at(&first_state, &root, Some("B"), Some("A")).unwrap();
+        compare_and_swap_run_retry_recovery_at(&second_state, &root, Some("A"), None).unwrap();
+        assert_eq!(read_run_retry_recovery_at(&root).unwrap(), None);
+    }
+
+    #[test]
+    fn run_retry_recovery_compare_and_swap_rejects_oversize_inputs_without_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let state = DesktopHostState::default();
+        let oversized = "x".repeat(RUN_RETRY_RECOVERY_MAX_BYTES + 1);
+
+        compare_and_swap_run_retry_recovery_at(&state, &root, None, Some("A")).unwrap();
+        let expected_error =
+            compare_and_swap_run_retry_recovery_at(&state, &root, Some(&oversized), Some("B"))
+                .unwrap_err();
+        assert_eq!(expected_error.code, "run_retry_recovery_too_large");
+        let value_error =
+            compare_and_swap_run_retry_recovery_at(&state, &root, Some("A"), Some(&oversized))
+                .unwrap_err();
+        assert_eq!(value_error.code, "run_retry_recovery_too_large");
+        assert_eq!(
+            read_run_retry_recovery_at(&root).unwrap().as_deref(),
+            Some("A")
+        );
     }
 
     #[test]
@@ -5499,6 +5688,14 @@ mod tests {
 
         symlink(&outside, &target).unwrap();
         assert!(read_run_retry_recovery_at(&root).is_err());
+        let state = DesktopHostState::default();
+        assert_eq!(
+            compare_and_swap_run_retry_recovery_at(&state, &root, None, Some("replacement"))
+                .unwrap_err()
+                .code,
+            "run_retry_recovery_unavailable"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
         assert!(write_run_retry_recovery_at(&root, None).is_err());
         assert!(write_run_retry_recovery_at(&root, Some("replacement")).is_err());
         fs::remove_file(&target).unwrap();
@@ -5540,7 +5737,7 @@ mod tests {
         let sidecar_state = state.clone();
         let sidecar_root = root.clone();
         let sidecar_writer = thread::spawn(move || {
-            let result = with_run_retry_recovery_lock(&sidecar_state, || {
+            let result = with_run_retry_recovery_transaction(&sidecar_state, &sidecar_root, || {
                 write_run_retry_recovery_at(&sidecar_root, Some("first"))
             });
             sidecar_tx.send(result).unwrap();
@@ -5557,9 +5754,10 @@ mod tests {
         let recovery_state = state.clone();
         let recovery_root = root.clone();
         let recovery_writer = thread::spawn(move || {
-            let result = with_run_retry_recovery_lock(&recovery_state, || {
-                write_run_retry_recovery_at(&recovery_root, Some("second"))
-            });
+            let result =
+                with_run_retry_recovery_transaction(&recovery_state, &recovery_root, || {
+                    write_run_retry_recovery_at(&recovery_root, Some("second"))
+                });
             recovery_tx.send(result).unwrap();
         });
         assert!(recovery_rx
@@ -5575,6 +5773,119 @@ mod tests {
             read_run_retry_recovery_at(&root).unwrap().as_deref(),
             Some("second")
         );
+    }
+
+    #[test]
+    fn run_retry_recovery_lock_serializes_across_processes_and_independent_states() {
+        const CHILD_ENV: &str = "OPENEVO_TEST_RUN_RETRY_LOCK_CHILD";
+        const ROOT_ENV: &str = "OPENEVO_TEST_RUN_RETRY_LOCK_ROOT";
+        const READY_ENV: &str = "OPENEVO_TEST_RUN_RETRY_LOCK_READY";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root = PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+            let ready = PathBuf::from(std::env::var_os(READY_ENV).unwrap());
+            let state = DesktopHostState::default();
+            with_run_retry_recovery_transaction(&state, &root, || {
+                fs::write(&ready, b"ready").map_err(|_| run_retry_recovery_error())?;
+                thread::sleep(Duration::from_secs(5));
+                Ok(())
+            })
+            .unwrap();
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let ready = temp.path().join("holder-ready");
+        let mut holder = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "tests::run_retry_recovery_lock_serializes_across_processes_and_independent_states",
+            )
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(ROOT_ENV, &root)
+            .env(READY_ENV, &ready)
+            .spawn()
+            .unwrap();
+
+        let ready_deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(
+                holder.try_wait().unwrap().is_none(),
+                "lock holder exited before acquiring the lock"
+            );
+            assert!(
+                Instant::now() < ready_deadline,
+                "lock holder did not acquire the lock"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let contender_state = DesktopHostState::default();
+        let contender_root = root.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            with_run_retry_recovery_transaction(&contender_state, &contender_root, || {
+                entered_tx.send(()).unwrap();
+                Ok(())
+            })
+        });
+        assert!(entered_rx.recv_timeout(Duration::from_millis(150)).is_err());
+
+        holder.kill().unwrap();
+        assert!(!holder.wait().unwrap().success());
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("contender did not enter after the holder process exited");
+        contender.join().unwrap().unwrap();
+        let lock_metadata = fs::symlink_metadata(run_retry_recovery_lock_target(&root)).unwrap();
+        assert!(lock_metadata.file_type().is_file());
+        assert_eq!(lock_metadata.nlink(), 1);
+        assert_eq!(lock_metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn run_retry_recovery_lock_rejects_unsafe_lockfiles_without_removing_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        open_run_retry_recovery_root(&root, true).unwrap().unwrap();
+        let lock = run_retry_recovery_lock_target(&root);
+        let outside = temp.path().join("outside-lock");
+        fs::write(&outside, b"outside").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+
+        symlink(&outside, &lock).unwrap();
+        let state = DesktopHostState::default();
+        assert_eq!(
+            with_run_retry_recovery_transaction(&state, &root, || Ok(()))
+                .unwrap_err()
+                .code,
+            "run_retry_recovery_unavailable"
+        );
+        assert!(fs::symlink_metadata(&lock)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        fs::remove_file(&lock).unwrap();
+
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(with_run_retry_recovery_transaction(&state, &root, || Ok(())).is_err());
+        assert_eq!(
+            fs::symlink_metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::remove_file(&lock).unwrap();
+
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = root.join("lock-alias");
+        hard_link(&lock, &alias).unwrap();
+        assert!(with_run_retry_recovery_transaction(&state, &root, || Ok(())).is_err());
+        assert_eq!(fs::symlink_metadata(&lock).unwrap().nlink(), 2);
+        assert_eq!(fs::symlink_metadata(&alias).unwrap().nlink(), 2);
     }
 
     #[test]

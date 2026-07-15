@@ -78,6 +78,29 @@ describe("Desktop Local API v1 client", () => {
     }
   });
 
+  it("binds run retry to the renderer-journaled terminal attempt", async () => {
+    const fetchMock = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(CONTRACT_FIXTURE_V1.run, 202));
+    const client = fixtureClient(fetchMock);
+    const terminalAttemptId = CONTRACT_FIXTURE_V1.run.current_attempt_id;
+    if (terminalAttemptId === null) throw new Error("fixture must expose a current attempt");
+
+    await client.retryRun(
+      CONTRACT_FIXTURE_V1.run.id,
+      { terminal_attempt_id: terminalAttemptId },
+      {
+        idempotencyKey: "retry-terminal-fixture-1",
+        ifMatch: CONTRACT_FIXTURE_V1.run.etag,
+      },
+    );
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe("http://127.0.0.1:43117/desktop/v1/runs/run-fixture-1/retry");
+    expect(JSON.parse(String(init?.body))).toEqual({ terminal_attempt_id: terminalAttemptId });
+    const headers = new Headers(init?.headers);
+    expect(headers.get("Idempotency-Key")).toBe("retry-terminal-fixture-1");
+    expect(headers.get("If-Match")).toBe(CONTRACT_FIXTURE_V1.run.etag);
+  });
+
   it("returns Core operations and exposes operation plus referenced-log reads", async () => {
     const fetchMock = vi
       .fn<FetchLike>()

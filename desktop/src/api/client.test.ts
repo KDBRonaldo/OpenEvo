@@ -208,7 +208,7 @@ function bootstrapContext(port: number, sessionToken: string) {
     negotiated_contract: {
       major: 1,
       openapi_sha256:
-        "07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861",
+        "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777",
       provider_kind: "desktop_sidecar",
       feature_flags: ["remote_profiles"],
     },

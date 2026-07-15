@@ -31,6 +31,7 @@ import {
   runContextV1Schema,
   runCreateV1Schema,
   runPageV1Schema,
+  runRetryV1Schema,
   runSummaryV1Schema,
   runV1Schema,
   serviceV1Schema,
@@ -78,6 +79,9 @@ describe("Desktop Local API v1 schemas", () => {
     expect(healthV1Schema.parse(criticalFixture.health).protocol).toBe("openevo-native-sidecar-v1");
     expect(desktopStateV1Schema.parse(criticalFixture.state).core.state).toBe("online");
     expect(runCreateV1Schema.parse(criticalFixture.run_create)).toEqual({ project_id: "project-fixture-1" });
+    expect(runRetryV1Schema.parse(criticalFixture.run_retry)).toEqual({
+      terminal_attempt_id: "attempt-terminal-fixture-1",
+    });
     expect(profileCreateV1Schema.parse(criticalFixture.profile_create.wire)).toEqual(criticalFixture.profile_create.normalized);
     expect(executionSettingsV1Schema.parse(criticalFixture.execution.wire)).toEqual(criticalFixture.execution.normalized);
     expect(profilePatchV1Schema.parse(criticalFixture.profile_patch.wire)).toEqual(criticalFixture.profile_patch.normalized);

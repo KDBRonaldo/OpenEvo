@@ -155,9 +155,7 @@ class CancellableBlockingRemoteLifecycle(BlockingRemoteLifecycle):
         self.started.set()
         assert self.release.wait(5)
         if self.cancelled.is_set():
-            raise RemoteLifecycleSupersededError(
-                "The profile connection was cancelled."
-            )
+            raise RemoteLifecycleSupersededError("The profile connection was cancelled.")
         self.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
         return RemoteConnectionResult(profile.profile_id, "connected")
 
@@ -276,9 +274,7 @@ def test_profile_create_accepts_json_array_for_no_proxy(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("no_proxy", ["localhost", {"host": "localhost"}, 1, True])
-def test_profile_create_rejects_non_array_no_proxy(
-    tmp_path: Path, no_proxy: object
-) -> None:
+def test_profile_create_rejects_non_array_no_proxy(tmp_path: Path, no_proxy: object) -> None:
     app = _app(tmp_path / "state")
     request = _profile()
     request["proxy"] = {
@@ -455,9 +451,7 @@ def test_create_run_gates_active_self_deployed_mode_before_request_project_ident
             key="create-profile-run-authority-0001",
         ).json()
         provider = app.state.desktop_release_provider
-        active_request = _project(
-            profile["profile_id"], name="Active unavailable project"
-        )
+        active_request = _project(profile["profile_id"], name="Active unavailable project")
         active_request["execution"] = {
             "mode": "self-deployed",
             "hf_model": "open-models/release-gated-model",
@@ -612,9 +606,10 @@ def test_activation_replay_rechecks_unavailable_release_mode_before_return(
         for replay_response in (response, conflicting_replay):
             assert replay_response.status_code == 409
             assert replay_response.json()["code"] == "self_deployed_release_unavailable"
-        assert provider._store.get_local_operation(
-            reservation.operation.operation_id
-        ) == reservation.operation
+        assert (
+            provider._store.get_local_operation(reservation.operation.operation_id)
+            == reservation.operation
+        )
         assert bridge.method_calls == []
         assert lifecycle.connect_calls == 0
         assert lifecycle.accept_calls == 0
@@ -798,9 +793,12 @@ def test_running_profile_connect_cancel_interrupts_lifecycle_and_is_replayable(
         assert connect_responses[0].json()["state"] == "cancelled"
         assert lifecycle.disconnect_calls == 1
         assert lifecycle.current == RemoteLifecycleSnapshot(None, "disconnected")
-        assert client.get(
-            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
-        ).json()["connection_state"] == "disconnected"
+        assert (
+            client.get(
+                f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+            ).json()["connection_state"]
+            == "disconnected"
+        )
 
 
 def test_release_execution_mode_gate_rejects_retry_and_dead_controls_fail_closed(
@@ -833,8 +831,11 @@ def test_release_execution_mode_gate_rejects_retry_and_dead_controls_fail_closed
             "Idempotency-Key": "unavailable-retry-mutation-0001",
         }
 
-        retry = client.post("/desktop/v1/runs/run-1/retry", headers=headers)
-        retry_replay = client.post("/desktop/v1/runs/run-1/retry", headers=headers)
+        retry_body = {"terminal_attempt_id": "attempt-terminal-1"}
+        retry = client.post("/desktop/v1/runs/run-1/retry", headers=headers, json=retry_body)
+        retry_replay = client.post(
+            "/desktop/v1/runs/run-1/retry", headers=headers, json=retry_body
+        )
         restart = client.post("/desktop/v1/services/service-1/restart", headers=headers)
         diagnostic = client.post(
             "/desktop/v1/diagnostics",
@@ -1103,9 +1104,7 @@ def test_remote_connection_lifecycle_is_etag_bound_and_idempotent(tmp_path: Path
         connected = client.post(
             f"/desktop/v1/profiles/{profile_id}/connect", headers=connect_headers
         )
-        replay = client.post(
-            f"/desktop/v1/profiles/{profile_id}/connect", headers=connect_headers
-        )
+        replay = client.post(f"/desktop/v1/profiles/{profile_id}/connect", headers=connect_headers)
         assert connected.status_code == replay.status_code == 202
         assert connected.json() == replay.json()
         assert connected.headers["etag"] == connected.json()["etag"]
@@ -1293,12 +1292,18 @@ def test_disconnect_of_non_owner_does_not_displace_actual_owner(tmp_path: Path) 
         assert failed.content == replay.content
         assert lifecycle.disconnect_calls == 0
         assert lifecycle.current == RemoteLifecycleSnapshot(owner["profile_id"], "connected")
-        assert client.get(
-            f"/desktop/v1/profiles/{owner['profile_id']}", headers=SESSION_HEADERS
-        ).json()["connection_state"] == "connected"
-        assert client.get(
-            f"/desktop/v1/profiles/{other['profile_id']}", headers=SESSION_HEADERS
-        ).json()["connection_state"] == "disconnected"
+        assert (
+            client.get(
+                f"/desktop/v1/profiles/{owner['profile_id']}", headers=SESSION_HEADERS
+            ).json()["connection_state"]
+            == "connected"
+        )
+        assert (
+            client.get(
+                f"/desktop/v1/profiles/{other['profile_id']}", headers=SESSION_HEADERS
+            ).json()["connection_state"]
+            == "disconnected"
+        )
         state = client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()["core"]
         assert state["profile_id"] == owner["profile_id"]
 
@@ -1606,9 +1611,7 @@ def test_exact_failed_replay_repairs_only_its_owned_transport(
         if transport_owner == "same":
             assert lifecycle.current == RemoteLifecycleSnapshot(None, "disconnected")
         elif transport_owner == "other":
-            assert lifecycle.current == RemoteLifecycleSnapshot(
-                "profile-other-owner", "connected"
-            )
+            assert lifecycle.current == RemoteLifecycleSnapshot("profile-other-owner", "connected")
         else:
             assert lifecycle.current == RemoteLifecycleSnapshot(None, "disconnected")
 
@@ -1864,9 +1867,12 @@ def test_committed_success_survives_full_budget_before_commit_error_returns(
         assert response.json()["state"] == "succeeded"
         assert lifecycle.disconnect_calls == 0
         assert lifecycle.current.profile_id == profile["profile_id"]
-        assert client.get(
-            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
-        ).json()["connection_state"] == "connected"
+        assert (
+            client.get(
+                f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+            ).json()["connection_state"]
+            == "connected"
+        )
 
 
 def test_late_success_keeps_cancelled_terminal_and_closes_its_transport(
@@ -1920,9 +1926,12 @@ def test_late_success_keeps_cancelled_terminal_and_closes_its_transport(
         assert lifecycle.connect_calls == 1
         assert lifecycle.disconnect_calls == 1
         assert lifecycle.current.state == "disconnected"
-        assert client.get(
-            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
-        ).json()["connection_state"] == "disconnected"
+        assert (
+            client.get(
+                f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+            ).json()["connection_state"]
+            == "disconnected"
+        )
 
 
 def test_pagination_cursor_and_typed_contract_errors(tmp_path: Path) -> None:

@@ -28,7 +28,11 @@ from desktop.sidecar.core_bridge_v1 import (
     DesktopCoreBridgeV1,
     map_project_create_v1,
 )
-from desktop.sidecar.core_client_v1 import CORE_OPENAPI_SHA256, CoreClientErrorV1
+from desktop.sidecar.core_client_v1 import (
+    CORE_OPENAPI_SHA256,
+    CoreClientErrorV1,
+    CoreMutationOutcomeUnknownV1,
+)
 from openevo.backend.contracts.v1 import models as core_v1
 from openevo.evolution.framework.profiles import execution_profile_for_release_mode
 
@@ -3916,7 +3920,7 @@ def test_bodyless_local_actions_derive_closed_core_requests(
         )
     )
     cancel_requests: list[core_v1.RunCancelRequestV1] = []
-    retry_requests: list[core_v1.RunRetryRequestV1] = []
+    retry_requests: list[tuple[core_v1.RunRetryRequestV1, str, str]] = []
     restart_requests: list[core_v1.ServiceRestartRequestV1] = []
 
     monkeypatch.setattr(client, "get_run", lambda *_args, **_kwargs: run)
@@ -3930,7 +3934,17 @@ def test_bodyless_local_actions_derive_closed_core_requests(
     def retry(
         _run_id: str, request: core_v1.RunRetryRequestV1, **_kwargs: object
     ) -> core_v1.RunV1:
-        retry_requests.append(request)
+        key = str(_kwargs["idempotency_key"])
+        etag = str(_kwargs["if_match"])
+        retry_requests.append((request, key, etag))
+        if key != "retry-run-00000001" or etag != ETAG_A:
+            status = 409 if key != "retry-run-00000001" else 412
+            raise CoreClientErrorV1(
+                status,
+                core_v1.ApiErrorV1.model_validate_json(
+                    json.dumps({**_core_error(), "http_status": status, "code": "retry_conflict"})
+                ),
+            )
         return run
 
     def restart(
@@ -3949,17 +3963,34 @@ def test_bodyless_local_actions_derive_closed_core_requests(
     monkeypatch.setattr(
         client,
         "get_run",
-        lambda *_args, **_kwargs: run.model_copy(
-            update={"current_attempt_id": "attempt-terminal-1"}
-        ),
+        lambda *_args, **_kwargs: pytest.fail("retry must not read the latest run attempt"),
     )
     monkeypatch.setattr(client, "retry_run", retry)
-    bridge.retry_run(
-        local_project,
-        "run-1",
-        if_match=ETAG_A,
-        idempotency_key="retry-run-00000001",
-    )
+    retry_authority = local_v1.RunRetryV1(terminal_attempt_id="attempt-terminal-1")
+    for _ in range(2):
+        bridge.retry_run(
+            local_project,
+            "run-1",
+            retry_authority,
+            if_match=ETAG_A,
+            idempotency_key="retry-run-00000001",
+        )
+    with pytest.raises(DesktopCoreBridgeErrorV1) as changed_key:
+        bridge.retry_run(
+            local_project,
+            "run-1",
+            retry_authority,
+            if_match=ETAG_A,
+            idempotency_key="retry-run-different-key-0002",
+        )
+    with pytest.raises(DesktopCoreBridgeErrorV1) as changed_etag:
+        bridge.retry_run(
+            local_project,
+            "run-1",
+            retry_authority,
+            if_match=ETAG_B,
+            idempotency_key="retry-run-00000001",
+        )
     monkeypatch.setattr(client, "restart_service", restart)
     bridge.restart_service(
         local_project,
@@ -3971,10 +4002,69 @@ def test_bodyless_local_actions_derive_closed_core_requests(
     assert cancel_requests == [
         core_v1.RunCancelRequestV1(reason=core_v1.RunCancelReason.USER_REQUESTED)
     ]
-    assert retry_requests == [core_v1.RunRetryRequestV1(terminal_attempt_id="attempt-terminal-1")]
+    expected_retry = core_v1.RunRetryRequestV1(terminal_attempt_id="attempt-terminal-1")
+    assert retry_requests[:2] == [
+        (expected_retry, "retry-run-00000001", ETAG_A),
+        (expected_retry, "retry-run-00000001", ETAG_A),
+    ]
+    assert changed_key.value.error.http_status == 409
+    assert changed_etag.value.error.http_status == 412
     assert restart_requests == [
         core_v1.ServiceRestartRequestV1(reason="Requested from OpenEvo Desktop.")
     ]
+
+
+def test_retry_post_response_bridge_gate_loss_is_an_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-local-project-0001")
+    client = bridge._active.client
+    run = _run(
+        core_v1.RunCreateV1(
+            project_id=CORE_PROJECT_ID,
+            project_snapshot=READY_PROJECT_SNAPSHOT,
+            task_snapshot=TASK_SNAPSHOT,
+            workspace_snapshot=WORKSPACE_SNAPSHOT,
+            expected_registry_digest=REGISTRY_DIGEST,
+            required_revision=core_v1.ReachableRequiredRevisionRefV1(
+                revision=REVISION,
+                reachable_from_revision_id=REVISION.id,
+                relation=core_v1.RequiredRevisionRelation.ACTIVE,
+            ),
+        )
+    )
+    monkeypatch.setattr(client, "retry_run", lambda *_args, **_kwargs: run)
+    original_gate = bridge._gate_token
+    gate_calls = 0
+
+    def lose_bridge_authority_after_response(
+        token: bridge_module._GenerationToken,
+        deadline: float,
+    ) -> None:
+        nonlocal gate_calls
+        gate_calls += 1
+        if gate_calls == 2:
+            raise bridge_module._bridge_error(
+                "active_project_session_superseded",
+                "A newer active project session superseded this result.",
+                retryable=True,
+            )
+        original_gate(token, deadline)
+
+    monkeypatch.setattr(bridge, "_gate_token", lose_bridge_authority_after_response)
+
+    with pytest.raises(CoreMutationOutcomeUnknownV1):
+        bridge.retry_run(
+            local_project,
+            "run-1",
+            local_v1.RunRetryV1(terminal_attempt_id="attempt-terminal-1"),
+            if_match=ETAG_A,
+            idempotency_key="retry-post-gate-loss-0001",
+        )
+
+    assert gate_calls == 2
 
 
 def test_close_rejects_new_calls_and_is_idempotent() -> None:

@@ -36,6 +36,7 @@ from desktop.sidecar.contracts.v1 import (
     RunCreateV1,
     RunContextV1,
     RunPageV1,
+    RunRetryV1,
     RunSummaryV1,
     RunV1,
     ReferencedLogPageV1,
@@ -280,9 +281,7 @@ def test_mutations_bind_idempotency_and_etag_to_renderer_intent() -> None:
         "/desktop/v1/projects/{project_id}/validate",
         "/desktop/v1/services/{service_id}/restart",
     ):
-        assert {"Idempotency-Key", "If-Match"}.issubset(
-            _required_headers(schema, "post", path)
-        )
+        assert {"Idempotency-Key", "If-Match"}.issubset(_required_headers(schema, "post", path))
 
     for path in (
         "/desktop/v1/profiles/{profile_id}",
@@ -302,9 +301,9 @@ def test_renderer_never_authors_core_admission_references() -> None:
     run_create = schema["components"]["schemas"]["RunCreateV1"]
     assert set(run_create["properties"]) == {"project_id"}
     assert run_create["required"] == ["project_id"]
-    assert "requestBody" not in schema["paths"][
-        "/desktop/v1/projects/{project_id}/validate"
-    ]["post"]
+    assert (
+        "requestBody" not in schema["paths"]["/desktop/v1/projects/{project_id}/validate"]["post"]
+    )
 
     RunCreateV1.model_validate({"project_id": "project-1"})
     for field in (
@@ -320,6 +319,35 @@ def test_renderer_never_authors_core_admission_references() -> None:
     ):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             RunCreateV1.model_validate({"project_id": "project-1", field: "forbidden"})
+
+
+def test_run_retry_body_is_closed_terminal_attempt_authority() -> None:
+    schema = desktop_openapi_document()
+    retry = schema["components"]["schemas"]["RunRetryV1"]
+    assert retry["additionalProperties"] is False
+    assert set(retry["properties"]) == {"terminal_attempt_id"}
+    assert retry["required"] == ["terminal_attempt_id"]
+    assert retry["properties"]["terminal_attempt_id"]["maxLength"] == 128
+    assert retry["properties"]["terminal_attempt_id"]["pattern"] == (
+        r"^[^\x00-\x20\x7f](?:[^\x00-\x1f\x7f]*[^\x00-\x20\x7f])?$"
+    )
+    operation = schema["paths"]["/desktop/v1/runs/{run_id}/retry"]["post"]
+    assert operation["requestBody"]["required"] is True
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/RunRetryV1"
+    }
+
+    assert RunRetryV1(terminal_attempt_id="attempt-terminal-1").terminal_attempt_id == (
+        "attempt-terminal-1"
+    )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        RunRetryV1.model_validate(
+            {"terminal_attempt_id": "attempt-terminal-1", "current_attempt_id": "attempt-new"}
+        )
+    with pytest.raises(ValidationError):
+        RunRetryV1(terminal_attempt_id="a" * 129)
+    with pytest.raises(ValidationError):
+        RunRetryV1(terminal_attempt_id=" attempt-terminal-1")
 
 
 def test_capabilities_are_lossless_and_model_readiness_is_typed() -> None:
@@ -392,19 +420,14 @@ def test_project_source_uses_only_opaque_native_imports() -> None:
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ProjectCreateV1.model_validate(
             imported
-            | {
-                "source": imported["source"]
-                | {"workspace_path": "/Users/researcher/private"}
-            }
+            | {"source": imported["source"] | {"workspace_path": "/Users/researcher/private"}}
         )
 
 
 def test_project_evolution_is_closed_lossless_and_aggregate_bounded() -> None:
     project = _project_payload()
     parsed = ProjectCreateV1.model_validate(project)
-    assert parsed.evolution.targets.root["text_memory"].config.model_dump() == {
-        "future_field": 1
-    }
+    assert parsed.evolution.targets.root["text_memory"].config.model_dump() == {"future_field": 1}
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ProjectCreateV1.model_validate(project | {"evolution": {"text_memory": {}}})
 
@@ -417,9 +440,7 @@ def test_project_evolution_is_closed_lossless_and_aggregate_bounded() -> None:
         for index in range(5)
     }
     with pytest.raises(ValidationError, match="aggregate byte budget"):
-        ProjectCreateV1.model_validate(
-            project | {"evolution": {"targets": oversized_targets}}
-        )
+        ProjectCreateV1.model_validate(project | {"evolution": {"targets": oversized_targets}})
 
     for invalid in (
         project | {"name": "x" * 129},
@@ -601,9 +622,7 @@ def test_events_are_invalidation_only_and_require_authoritative_identity() -> No
         EventEnvelopeV1.model_validate(changed)
 
     event_response = desktop_openapi_document()["paths"]["/desktop/v1/events"]["get"]
-    assert "Last-Event-ID" in {
-        parameter["name"] for parameter in event_response["parameters"]
-    }
+    assert "Last-Event-ID" in {parameter["name"] for parameter in event_response["parameters"]}
     assert set(event_response["responses"]["200"]["content"]) == {"text/event-stream"}
 
 
@@ -671,8 +690,7 @@ def test_local_pagination_and_dynamic_config_are_bounded() -> None:
 
 def test_cross_language_critical_fixture_matches_python_contract() -> None:
     fixture_path = (
-        Path(__file__).parents[3]
-        / "desktop/sidecar/contracts/v1/fixtures/contract-critical.json"
+        Path(__file__).parents[3] / "desktop/sidecar/contracts/v1/fixtures/contract-critical.json"
     )
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
 
@@ -682,18 +700,17 @@ def test_cross_language_critical_fixture_matches_python_contract() -> None:
     parse_json(HealthV1, fixture["health"])
     parse_json(DesktopStateV1, fixture["state"])
     parse_json(RunCreateV1, fixture["run_create"])
+    parse_json(RunRetryV1, fixture["run_retry"])
     parse_json(ProjectCreateV1, fixture["project_create"])
     parse_json(LocalOperationV1, fixture["operation_defaults"]["wire"])
-    assert fixture["state"]["contract"]["desktop_openapi_sha256"] == (
-        DESKTOP_OPENAPI_SHA256
-    )
+    assert fixture["state"]["contract"]["desktop_openapi_sha256"] == (DESKTOP_OPENAPI_SHA256)
 
 
 def test_snapshots_are_canonical_and_digests_are_stable() -> None:
     openapi_digest, events_digest = verify_contract_snapshots()
     assert openapi_digest == DESKTOP_OPENAPI_SHA256
     assert events_digest == DESKTOP_EVENTS_SCHEMA_SHA256
-    assert openapi_digest == "07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861"
+    assert openapi_digest == "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777"
     assert events_digest == "39e485b6c61688832ec0445502d2f1f9e8bd9548e9b81a0a4740bc5997d90936"
     snapshot_root = Path(__file__).parents[3] / "desktop/sidecar/contracts/v1"
     assert (snapshot_root / "openapi.json").read_bytes() == canonical_json_bytes(

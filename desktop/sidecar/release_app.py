@@ -15,7 +15,11 @@ from fastapi.responses import JSONResponse
 from desktop.sidecar.contracts.v1.app import DESKTOP_SESSION_HEADER, create_contract_app
 from desktop.sidecar.contracts.v1.models import ApiErrorV1
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1, DesktopCoreBridgeV1
-from desktop.sidecar.core_client_v1 import CoreClientErrorV1, CoreClientLocalErrorV1
+from desktop.sidecar.core_client_v1 import (
+    CoreClientErrorV1,
+    CoreClientLocalErrorV1,
+    CoreMutationOutcomeUnknownV1,
+)
 from desktop.sidecar.event_broker_v1 import (
     DesktopEventBrokerClosedError,
     DesktopEventBrokerError,
@@ -522,6 +526,22 @@ def create_release_desktop_local_api_app(
             category=category,
             retryable=exc.error.retryable,
             repair_action=("openevo_can_retry" if exc.error.retryable else "none"),
+        )
+
+    @app.exception_handler(CoreMutationOutcomeUnknownV1)
+    async def handle_core_mutation_outcome_unknown(
+        request: Request, exc: CoreMutationOutcomeUnknownV1
+    ) -> JSONResponse:
+        del exc
+        return _error_response(
+            request,
+            status_code=503,
+            code="core_mutation_outcome_unknown",
+            message="OpenEvo Core may have accepted this mutation, but its response was lost.",
+            category="run",
+            retryable=True,
+            repair_action="openevo_can_retry",
+            next_action="Retry only the exact saved mutation while Desktop reconciles Core state.",
         )
 
     @app.exception_handler(DesktopEventCursorExpiredError)

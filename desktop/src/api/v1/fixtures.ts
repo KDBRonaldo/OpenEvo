@@ -4,7 +4,7 @@ const C = "c".repeat(64);
 const ETAG_A = `"${A}"`;
 const ETAG_B = `"${B}"`;
 const NOW = "2026-07-14T12:00:00Z";
-const OPENAPI_DIGEST = "07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861";
+const OPENAPI_DIGEST = "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777";
 
 export const RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1 = {
   schema_version: "1",

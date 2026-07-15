@@ -200,6 +200,9 @@
   "run_create": {
     "project_id": "project-fixture-1"
   },
+  "run_retry": {
+    "terminal_attempt_id": "attempt-terminal-fixture-1"
+  },
   "service": {
     "display_name": "OpenEvo Core",
     "error": null,
@@ -223,7 +226,7 @@
     "contract": {
       "compatible": true,
       "core_openapi_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "desktop_openapi_sha256": "07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861",
+      "desktop_openapi_sha256": "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777",
       "selected_major": 1
     },
     "core": {

@@ -25,6 +25,7 @@ from desktop.sidecar.core_client_v1 import (
     CoreBootstrapTunnelConnectionV1,
     CoreClientErrorV1,
     CoreControlClientV1,
+    CoreMutationOutcomeUnknownV1,
     CoreProjectBootstrapClientV1,
     CoreTunnelConnectionV1,
 )
@@ -1353,9 +1354,7 @@ class DesktopCoreBridgeV1:
 
         return self._invoke_project(project, call)
 
-    def list_runs(
-        self, project: local_v1.ProjectV1, **kwargs: Any
-    ) -> core_v1.RunPageV1:
+    def list_runs(self, project: local_v1.ProjectV1, **kwargs: Any) -> core_v1.RunPageV1:
         return self._invoke_project(
             project, lambda session, _deadline: session.client.list_runs(**kwargs)
         )
@@ -1368,9 +1367,7 @@ class DesktopCoreBridgeV1:
             ),
         )
 
-    def delete_run(
-        self, project: local_v1.ProjectV1, run_id: str, *, if_match: str
-    ) -> None:
+    def delete_run(self, project: local_v1.ProjectV1, run_id: str, *, if_match: str) -> None:
         return self._invoke_project(
             project,
             lambda session, _deadline: session.client.delete_run(
@@ -1378,7 +1375,7 @@ class DesktopCoreBridgeV1:
                 project_id=session.project.id,
                 if_match=if_match,
                 idempotency_key=_derived_key(run_id, f"delete-{if_match}"),
-            )
+            ),
         )
 
     def cancel_run(
@@ -1413,35 +1410,29 @@ class DesktopCoreBridgeV1:
         self,
         project: local_v1.ProjectV1,
         run_id: str,
+        request: local_v1.RunRetryV1,
         *,
         if_match: str,
         idempotency_key: str,
     ) -> core_v1.RunV1:
+        session, _generation = self._session()
+        deadline = time.monotonic() + self._timeout
+
         def call(session: DesktopCoreActiveSessionV1, deadline: float) -> core_v1.RunV1:
-            run = self._core_external(
-                session.token,
-                deadline,
-                lambda: session.client.get_run(run_id, project_id=session.project.id),
-            )
-            if run.current_attempt_id is None:
-                raise _bridge_error(
-                    "run_retry_not_ready",
-                    "Core has no terminal run attempt to retry.",
-                    status=409,
-                )
-            return self._core_external(
-                session.token,
-                deadline,
-                lambda: session.client.retry_run(
-                    run_id,
-                    core_v1.RunRetryRequestV1(terminal_attempt_id=run.current_attempt_id),
-                    project_id=session.project.id,
-                    if_match=if_match,
-                    idempotency_key=idempotency_key,
-                ),
+            self._ensure_local_project_binding(session, project)
+            return session.client.retry_run(
+                run_id,
+                core_v1.RunRetryRequestV1(terminal_attempt_id=request.terminal_attempt_id),
+                project_id=session.project.id,
+                if_match=if_match,
+                idempotency_key=idempotency_key,
             )
 
-        return self._invoke_project(project, call)
+        return self._retry_core_external(
+            session.token,
+            deadline,
+            lambda: call(session, deadline),
+        )
 
     def run_timeline(
         self, project: local_v1.ProjectV1, run_id: str, **kwargs: Any
@@ -1450,7 +1441,7 @@ class DesktopCoreBridgeV1:
             project,
             lambda session, _deadline: session.client.run_timeline(
                 run_id, project_id=session.project.id, **kwargs
-            )
+            ),
         )
 
     def run_logs(
@@ -1460,12 +1451,10 @@ class DesktopCoreBridgeV1:
             project,
             lambda session, _deadline: session.client.run_logs(
                 run_id, project_id=session.project.id, **kwargs
-            )
+            ),
         )
 
-    def run_context(
-        self, project: local_v1.ProjectV1, run_id: str
-    ) -> core_v1.RunContextV1:
+    def run_context(self, project: local_v1.ProjectV1, run_id: str) -> core_v1.RunContextV1:
         return self._invoke_project(
             project,
             lambda session, _deadline: session.client.run_context(
@@ -1480,7 +1469,7 @@ class DesktopCoreBridgeV1:
             project,
             lambda session, _deadline: session.client.run_artifacts(
                 run_id, project_id=session.project.id, **kwargs
-            )
+            ),
         )
 
     def get_artifact(
@@ -1500,7 +1489,7 @@ class DesktopCoreBridgeV1:
             project,
             lambda session, _deadline: session.client.artifact_content(
                 artifact_id, project_id=session.project.id
-            )
+            ),
         )
 
     def artifact_diff(
@@ -1516,12 +1505,10 @@ class DesktopCoreBridgeV1:
                 artifact_id,
                 project_id=session.project.id,
                 previous_artifact_id=previous_artifact_id,
-            )
+            ),
         )
 
-    def list_services(
-        self, project: local_v1.ProjectV1, **kwargs: Any
-    ) -> core_v1.ServicePageV1:
+    def list_services(self, project: local_v1.ProjectV1, **kwargs: Any) -> core_v1.ServicePageV1:
         return self._invoke_project(
             project, lambda session, _deadline: session.client.list_services(**kwargs)
         )
@@ -1548,7 +1535,7 @@ class DesktopCoreBridgeV1:
                 core_v1.ServiceRestartRequestV1(reason="Requested from OpenEvo Desktop."),
                 if_match=if_match,
                 idempotency_key=idempotency_key,
-            )
+            ),
         )
 
     def service_logs(
@@ -1559,9 +1546,7 @@ class DesktopCoreBridgeV1:
             lambda session, _deadline: session.client.service_logs(service_id, **kwargs),
         )
 
-    def get_operation(
-        self, project: local_v1.ProjectV1, operation_id: str
-    ) -> core_v1.OperationV1:
+    def get_operation(self, project: local_v1.ProjectV1, operation_id: str) -> core_v1.OperationV1:
         return self._invoke_project(
             project, lambda session, _deadline: session.client.get_operation(operation_id)
         )
@@ -1582,7 +1567,7 @@ class DesktopCoreBridgeV1:
                 request,
                 if_match=if_match,
                 idempotency_key=idempotency_key,
-            )
+            ),
         )
 
     def logs_by_ref(
@@ -1604,7 +1589,7 @@ class DesktopCoreBridgeV1:
             project,
             lambda session, _deadline: session.client.create_diagnostic(
                 request, idempotency_key=idempotency_key
-            )
+            ),
         )
 
     def get_diagnostic(
@@ -1628,7 +1613,7 @@ class DesktopCoreBridgeV1:
                 diagnostic_id,
                 if_match=if_match,
                 idempotency_key=idempotency_key,
-            )
+            ),
         )
 
     def cache_cleanup(
@@ -1885,6 +1870,29 @@ class DesktopCoreBridgeV1:
             return self._external_call(token, deadline, action)
         except CoreClientErrorV1 as exc:
             raise _bridge_client_error(exc) from None
+
+    def _retry_core_external(
+        self,
+        token: _GenerationToken,
+        deadline: float,
+        action: Callable[[], _ResponseT],
+    ) -> _ResponseT:
+        core_response_received = False
+
+        def tracked_action() -> _ResponseT:
+            nonlocal core_response_received
+            result = action()
+            core_response_received = True
+            return result
+
+        try:
+            return self._external_call(token, deadline, tracked_action)
+        except CoreClientErrorV1 as exc:
+            raise _bridge_client_error(exc) from None
+        except DesktopCoreBridgeErrorV1:
+            if core_response_received:
+                raise CoreMutationOutcomeUnknownV1 from None
+            raise
 
     def _adapter_external(
         self,

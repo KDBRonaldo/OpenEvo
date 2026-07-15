@@ -39,6 +39,7 @@ from .models import (
     RunCreateV1,
     RunContextV1,
     RunPageV1,
+    RunRetryV1,
     RunV1,
     ServicePageV1,
     TimelinePageV1,
@@ -457,7 +458,12 @@ def create_contract_app(provider: DesktopLocalApiProviderV1 | None = None) -> Fa
         response_model=RunV1,
         status_code=202,
     )
-    def retry_run(run_id: ResourceId, idempotency_key: IdempotencyKey, if_match: IfMatch) -> RunV1:
+    def retry_run(
+        run_id: ResourceId,
+        request: RunRetryV1,
+        idempotency_key: IdempotencyKey,
+        if_match: IfMatch,
+    ) -> RunV1:
         _contract_only()
 
     @router.get(

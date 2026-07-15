@@ -11,7 +11,7 @@ import pytest
 
 from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1, DesktopCoreBridgeV1
-from desktop.sidecar.core_client_v1 import CoreClientErrorV1
+from desktop.sidecar.core_client_v1 import CoreClientErrorV1, CoreMutationOutcomeUnknownV1
 from desktop.sidecar.event_broker_v1 import (
     DesktopEventBrokerV1,
     DesktopEventCursorExpiredError,
@@ -192,9 +192,7 @@ def test_release_provider_forwards_core_owned_read_routes(tmp_path: Path) -> Non
             sort="kind",
             direction="asc",
         )
-        bridge.service_logs.assert_called_once_with(
-            project, "service-1", **_page_arguments()
-        )
+        bridge.service_logs.assert_called_once_with(project, "service-1", **_page_arguments())
         bridge.get_operation.assert_called_once_with(project, "core-operation-1")
         bridge.logs_by_ref.assert_called_once_with(project, "logs-1", **_page_arguments())
     finally:
@@ -210,6 +208,7 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
     bridge.cancel_run.return_value = result
     bridge.retry_run.return_value = result
     bridge.cache_cleanup.return_value = result
+    retry_request = local_v1.RunRetryV1(terminal_attempt_id="attempt-terminal-1")
     cache_request = core_v1.CacheCleanupRequestV1(
         scopes=[core_v1.CacheScope.BUILD_ARTIFACTS],
         older_than_days=30,
@@ -242,6 +241,7 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
                 "retryRun",
                 {
                     "run_id": "run-1",
+                    "request": retry_request,
                     "idempotency_key": "run-retry-routing-0001",
                     "if_match": ETAG_A,
                 },
@@ -274,6 +274,7 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
         bridge.retry_run.assert_called_once_with(
             project,
             "run-1",
+            retry_request,
             if_match=ETAG_A,
             idempotency_key="run-retry-routing-0001",
         )
@@ -292,16 +293,21 @@ def test_release_provider_allows_supported_subscription_retry(tmp_path: Path) ->
     provider, _, project = _provider(tmp_path, bridge)
     result = object()
     bridge.retry_run.return_value = result
+    retry_request = local_v1.RunRetryV1(terminal_attempt_id="attempt-terminal-1")
     try:
         assert project.execution.mode == "codex_subscription_transcript"
-        assert provider.invoke(
-            "retryRun",
-            {
-                "run_id": "run-supported-1",
-                "idempotency_key": "run-retry-supported-routing-0001",
-                "if_match": ETAG_A,
-            },
-        ) is result
+        assert (
+            provider.invoke(
+                "retryRun",
+                {
+                    "run_id": "run-supported-1",
+                    "request": retry_request,
+                    "idempotency_key": "run-retry-supported-routing-0001",
+                    "if_match": ETAG_A,
+                },
+            )
+            is result
+        )
         bridge.retry_run.assert_called_once()
         assert bridge.retry_run.call_args.args[0] == project
     finally:
@@ -566,3 +572,91 @@ def test_release_app_serves_bridge_results_and_preserves_typed_errors(tmp_path: 
         )
         assert response.status_code == 503
         assert response.json() == error.model_dump(mode="json")
+
+
+def test_release_app_retry_body_is_closed_and_forwarded(tmp_path: Path) -> None:
+    error = core_v1.ApiErrorV1(
+        request_id="core-retry-request-1",
+        code="run_retry_conflict",
+        http_status=409,
+        message="The retry authority conflicts with Core state.",
+        severity=ErrorSeverity.BLOCKING,
+        category=ErrorCategory.RUN,
+        retryable=False,
+        repair_action=RepairAction.UNSUPPORTED,
+        next_action="Refresh the run before creating another retry intent.",
+    )
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    bridge.retry_run.side_effect = DesktopCoreBridgeErrorV1(error)
+    token = "desktop-session-token-retry-body-00000001"
+    app = create_release_desktop_local_api_app(
+        state_root=tmp_path / "retry-body",
+        session_token=token,
+        instance_id="4" * 32,
+        readiness_key=b"v" * 32,
+        source_commit="1234567",
+        build_channel="test",
+        remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
+        core_bridge=bridge,
+    )
+    project = _bind_app_project(app)
+    headers = {
+        "X-OpenEvo-Desktop-Session": token,
+        "Idempotency-Key": "retry-body-forwarding-0001",
+        "If-Match": ETAG_A,
+    }
+    body = {"terminal_attempt_id": "attempt-terminal-1"}
+
+    with TestClient(app) as client:
+        response = client.post("/desktop/v1/runs/run-1/retry", headers=headers, json=body)
+        invalid = client.post(
+            "/desktop/v1/runs/run-1/retry",
+            headers=headers,
+            json={**body, "current_attempt_id": "attempt-new"},
+        )
+
+    assert response.status_code == 409
+    assert response.json() == error.model_dump(mode="json")
+    assert invalid.status_code == 422
+    bridge.retry_run.assert_called_once_with(
+        project,
+        "run-1",
+        local_v1.RunRetryV1(terminal_attempt_id="attempt-terminal-1"),
+        if_match=ETAG_A,
+        idempotency_key="retry-body-forwarding-0001",
+    )
+
+
+def test_release_app_retry_unknown_outcome_uses_the_stable_ambiguous_code(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    bridge.retry_run.side_effect = CoreMutationOutcomeUnknownV1()
+    token = "desktop-session-token-retry-unknown-00001"
+    app = create_release_desktop_local_api_app(
+        state_root=tmp_path / "retry-unknown",
+        session_token=token,
+        instance_id="5" * 32,
+        readiness_key=b"w" * 32,
+        source_commit="1234567",
+        build_channel="test",
+        remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
+        core_bridge=bridge,
+    )
+    _bind_app_project(app)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/desktop/v1/runs/run-1/retry",
+            headers={
+                "X-OpenEvo-Desktop-Session": token,
+                "Idempotency-Key": "retry-unknown-outcome-0001",
+                "If-Match": ETAG_A,
+            },
+            json={"terminal_attempt_id": "attempt-terminal-1"},
+        )
+
+    assert response.status_code == 503
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["code"] == "core_mutation_outcome_unknown"
+    assert response.json()["retryable"] is True

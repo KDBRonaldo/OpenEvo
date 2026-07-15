@@ -153,6 +153,7 @@ export function parseRunRetryRecovery(value: string): ProductRunRetryRecovery {
   if (originalRun.id !== recoveryWithoutAccepted.runId
     || originalRun.project_id !== recoveryWithoutAccepted.projectId
     || originalRun.etag !== recoveryWithoutAccepted.intent.etag
+    || originalRun.current_attempt_id === null
     || (acceptedRun !== null
       && (!retryRunProvesSingleAppend(acceptedRun, recoveryWithoutAccepted)
         || !retryResponseProvesAdmissionReset(acceptedRun, originalRun)))) {

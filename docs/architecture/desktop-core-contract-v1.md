@@ -964,14 +964,34 @@ Before transport, the release provider persists a bounded recovery record with
 the complete original `RunV1`, Core project ID, idempotency key, observed stream
 epoch, and ETag. The record is non-secret, limited to 1 MiB of UTF-8 JSON, and
 stored as one versioned file under the native Tauri application-data directory.
-The native host serializes access, uses a private owner-verified directory,
-atomically renames a mode-0600 temporary file, fsyncs the file and directory, and
-no-follow rereads the published bytes before acknowledging the write.
+The native host serializes access with both an in-process mutex and a bounded
+kernel lock on a persistent opaque lockfile. The private owner-verified directory
+and mode-0600, owner-owned, link-count-one regular lockfile are validated before
+and after every transaction; an unsafe or replaced lock fails closed, while a
+crashed process releases the kernel lock without deleting its identity anchor.
+Within that transaction the host atomically renames a mode-0600 temporary file,
+fsyncs the file and directory, and no-follow rereads the published bytes before
+acknowledging the write. Every mutation carries the renderer's exact previously
+observed value and is a compare-and-swap under the same two locks. A stale second
+process therefore receives a conflict without replacing the first process's
+journal. If the native commit succeeds but the IPC response is lost, the
+renderer rereads through the same verified native path: exact requested bytes
+confirm success, unchanged prior bytes preserve a retryable local failure, and
+any third value poisons the renderer store until application restart.
 Schema-invalid, oversized, identity-inconsistent, unreadable, or unsafe persisted
 data remains in place and fails startup closed; it is never silently treated as
 an absent retry. This persistence lets a
 renderer remount or application restart recover the exact intent instead of
 minting another retry action.
+
+The Local API retry request has one closed JSON body,
+`RunRetryV1 { terminal_attempt_id }`. The provider must populate it from the
+durable original run's `current_attempt_id`, never from a later aggregate. The
+sidecar translates that value directly to Core `RunRetryRequestV1` and does not
+GET the latest run before retry transport. Consequently an exact replay after a
+renderer, sidecar, or application restart preserves the same idempotency key,
+ETag, and canonical Core request body; a later attempt cannot replace the
+terminal attempt authority used by the first submission.
 
 After an ambiguous retry response, the provider and renderer retain that
 complete mutation intent. ETag or status
@@ -983,9 +1003,24 @@ cannot overwrite that authority. Bounded
 authoritative polling starts only after the mutation has become ambiguous. A
 snapshot received while the exact retry transport is still in flight cannot
 reconcile or clear the journal; transport settlement is an explicit prerequisite.
-typed API rejection is deterministic: the provider clears recovery before the
+Typed API rejection is deterministic: the provider clears recovery before the
 renderer performs any conflict refresh, so a concurrent append cannot turn that
 request into success or erase its error.
+
+For Core retry transport, failures before entering send remain deterministic
+local validation/availability errors, and a fully read, schema-valid Core
+`ApiErrorV1` remains a deterministic HTTP rejection. Once send begins, a send
+failure, response read loss, malformed/unbounded success response, response
+validation failure, or other loss of a typed HTTP outcome raises the private
+`core_mutation_outcome_unknown` condition. The Local API maps only that condition
+to a stable retryable 503 `ApiErrorV1` with the same code. The renderer treats
+that code as an ambiguous mutation rather than a deterministic typed rejection,
+keeps the durable retry journal, and permits only exact replay.
+The retry-specific bridge uses one external-call boundary: project/session
+binding and the pre-call generation gate remain deterministic, while loss of
+bridge generation authority after a Core response has returned is converted to
+the same unknown-outcome condition. The generic bridge post-gate must not turn a
+possibly committed retry into a deterministic session-superseded rejection.
 
 The release provider validates every 2xx retry response before returning it. The
 same run and project must preserve the canonical complete original attempt prefix

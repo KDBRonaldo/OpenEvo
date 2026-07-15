@@ -313,6 +313,7 @@ describe("LocalApiDesktopProductProvider", () => {
     expect(retried.id).toBe("run-fixture-1");
     expect(client.retryRun).toHaveBeenCalledWith(
       "run-fixture-1",
+      { terminal_attempt_id: retrySource.current_attempt_id },
       { idempotencyKey: "renderer-action-retry-0001", ifMatch: ETAG_A },
     );
     expect(client.createRun).toHaveBeenCalledTimes(1);
@@ -356,14 +357,18 @@ describe("LocalApiDesktopProductProvider", () => {
     expect(afterUnknown.snapshot.stream.epoch).toBeGreaterThan(intent.streamEpoch);
 
     await expect(provider.retryRun("run-fixture-1", intent)).resolves.toEqual(accepted);
-    expect(client.retryRun).toHaveBeenNthCalledWith(1, "run-fixture-1", {
-      idempotencyKey: intent.actionId,
-      ifMatch: intent.etag,
-    });
-    expect(client.retryRun).toHaveBeenNthCalledWith(2, "run-fixture-1", {
-      idempotencyKey: intent.actionId,
-      ifMatch: intent.etag,
-    });
+    expect(client.retryRun).toHaveBeenNthCalledWith(
+      1,
+      "run-fixture-1",
+      { terminal_attempt_id: retrySource.current_attempt_id },
+      { idempotencyKey: intent.actionId, ifMatch: intent.etag },
+    );
+    expect(client.retryRun).toHaveBeenNthCalledWith(
+      2,
+      "run-fixture-1",
+      { terminal_attempt_id: retrySource.current_attempt_id },
+      { idempotencyKey: intent.actionId, ifMatch: intent.etag },
+    );
   });
 
   it("retains exact replay authority when a 2xx retry rewrites the original prefix", async () => {
@@ -521,6 +526,42 @@ describe("LocalApiDesktopProductProvider", () => {
     expect(provider.getRunRetryRecovery()?.acceptedRun).toEqual(accepted);
   });
 
+  it("claims the first retry synchronously before its durable write settles", async () => {
+    const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    const accepted = advancedRetryRun(retrySource);
+    const firstWrite = deferred<void>();
+    const writes = vi.fn(() => firstWrite.promise);
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    client.retryRun = vi.fn().mockResolvedValue(accepted);
+    const provider = createProvider(client, undefined, {
+      read: () => null,
+      write: writes,
+    });
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    const firstIntent = {
+      actionId: "renderer-action-retry-first-writer-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    };
+
+    const first = provider.retryRun(retrySource.id, firstIntent);
+    await Promise.resolve();
+    expect(writes).toHaveBeenCalledTimes(1);
+    await expect(provider.retryRun(retrySource.id, {
+      ...firstIntent,
+      actionId: "renderer-action-retry-second-writer-0002",
+    })).rejects.toThrow(/already sending/i);
+    expect(writes).toHaveBeenCalledTimes(1);
+    expect(client.retryRun).not.toHaveBeenCalled();
+
+    firstWrite.resolve();
+    await expect(first).resolves.toEqual(accepted);
+    expect(client.retryRun).toHaveBeenCalledTimes(1);
+  });
+
   it("overlays an accepted retry across missing aggregates and keeps provider operations coherent", async () => {
     const client = mockClient();
     const retrySource = failedRetrySourceRun();
@@ -602,10 +643,11 @@ describe("LocalApiDesktopProductProvider", () => {
 
     expect(second.getRunRetryRecovery()?.intent).toEqual(intent);
     await expect(second.retryRun(retrySource.id, intent)).resolves.toEqual(accepted);
-    expect(secondClient.retryRun).toHaveBeenCalledWith(retrySource.id, {
-      idempotencyKey: intent.actionId,
-      ifMatch: intent.etag,
-    });
+    expect(secondClient.retryRun).toHaveBeenCalledWith(
+      retrySource.id,
+      { terminal_attempt_id: retrySource.current_attempt_id },
+      { idempotencyKey: intent.actionId, ifMatch: intent.etag },
+    );
   });
 
   it("does not send a retry when durable recovery cannot be written", async () => {
@@ -652,6 +694,47 @@ describe("LocalApiDesktopProductProvider", () => {
     await provider.refresh();
     await expect(provider.retryRun("run-fixture-1", intent)).rejects.toThrow(/refresh/i);
     expect(client.retryRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains exact replay authority when Core reports an unknown mutation outcome", async () => {
+    const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    client.retryRun = vi.fn().mockRejectedValue(new DesktopApiError(apiErrorV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.error,
+      code: "core_mutation_outcome_unknown",
+      message: "OpenEvo Core mutation outcome is unknown.",
+      category: "run",
+      http_status: 503,
+      retryable: true,
+      repair_action: "openevo_can_retry",
+      details: {},
+    })));
+    const provider = createProvider(client);
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    const intent = {
+      actionId: "renderer-action-retry-core-unknown-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    };
+
+    await expect(provider.retryRun(retrySource.id, intent))
+      .rejects.toBeInstanceOf(DesktopProductAmbiguousMutationError);
+    expect(provider.getRunRetryRecovery()).toMatchObject({
+      runId: retrySource.id,
+      intent,
+      originalRun: { current_attempt_id: retrySource.current_attempt_id },
+    });
+    await expect(provider.retryRun(retrySource.id, intent))
+      .rejects.toBeInstanceOf(DesktopProductAmbiguousMutationError);
+    expect(client.retryRun).toHaveBeenNthCalledWith(
+      2,
+      retrySource.id,
+      { terminal_attempt_id: retrySource.current_attempt_id },
+      { idempotencyKey: intent.actionId, ifMatch: intent.etag },
+    );
   });
 
   it("rejects schema-valid cross-wired mutation, action, content, and diff responses", async () => {

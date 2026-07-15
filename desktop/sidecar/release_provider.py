@@ -474,9 +474,7 @@ class DesktopReleaseProvider:
     def _get_state(self, arguments: Mapping[str, object]) -> DesktopStateV1:
         del arguments
         with self._project_session_lock:
-            active_projects = self._store.list_projects(
-                limit=2, filters={"state": "active"}
-            ).items
+            active_projects = self._store.list_projects(limit=2, filters={"state": "active"}).items
             with self._connection_state_lock:
                 core_state = self._core_state
                 core_binding = self._core_session_binding
@@ -1115,7 +1113,9 @@ class DesktopReleaseProvider:
                     raise ETagConflictError("project", project_id, previous.etag)
                 self._require_supported_execution_mode(
                     "updateProject",
-                    request.execution.mode if request.execution is not None else previous.execution.mode,
+                    request.execution.mode
+                    if request.execution is not None
+                    else previous.execution.mode,
                 )
                 if request.source is not None:
                     self._verify_project_source(request.source, project_id=project_id)
@@ -1571,9 +1571,7 @@ class DesktopReleaseProvider:
                         self._core_state = (
                             self._core_not_started_state(profile_id)
                             if profile_id is not None
-                            else CoreConnectionStateV1(
-                                state="disconnected", active_tunnel=False
-                            )
+                            else CoreConnectionStateV1(state="disconnected", active_tunnel=False)
                         )
         if operation.state in {"queued", "running", "cancelling"}:
             if operation.operation_kind == "project_activate":
@@ -1644,6 +1642,7 @@ class DesktopReleaseProvider:
             lambda bridge, project: bridge.retry_run(
                 project,
                 cast(str, arguments["run_id"]),
+                cast(local_v1.RunRetryV1, arguments["request"]),
                 if_match=cast(str, arguments["if_match"]),
                 idempotency_key=cast(str, arguments["idempotency_key"]),
             ),

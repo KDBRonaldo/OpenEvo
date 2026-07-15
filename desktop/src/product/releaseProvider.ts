@@ -19,7 +19,7 @@ export interface ReleaseNativeBridge {
   bootstrap(): Promise<unknown>;
   stop(): Promise<unknown>;
   readRunRetryRecovery?(): Promise<unknown>;
-  writeRunRetryRecovery?(value: string | null): Promise<unknown>;
+  writeRunRetryRecovery?(value: string | null, expectedValue: string | null): Promise<unknown>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
   cancelProjectSource(actionId: string): Promise<unknown>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
@@ -45,7 +45,10 @@ const tauriNativeBridge: ReleaseNativeBridge = {
   bootstrap: () => invoke<DesktopBootstrapContextV1>("start_sidecar"),
   stop: () => invoke("stop_sidecar"),
   readRunRetryRecovery: () => invoke("read_run_retry_recovery"),
-  writeRunRetryRecovery: (value) => invoke("write_run_retry_recovery", { value }),
+  writeRunRetryRecovery: (value, expectedValue) => invoke("write_run_retry_recovery", {
+    value,
+    expectedValue,
+  }),
   selectProjectSource: (intent) => invoke("select_project_source", {
     kind: intent.kind,
     actionId: intent.actionId,
@@ -118,24 +121,62 @@ export async function createReleaseDesktopProductProvider(
   return provider;
 }
 
-async function nativeRunRetryRecoveryStore(
-  native: ReleaseNativeBridge,
+export async function nativeRunRetryRecoveryStore(
+  native: Pick<ReleaseNativeBridge, "readRunRetryRecovery" | "writeRunRetryRecovery">,
 ): Promise<ProductRunRetryRecoveryStore> {
-  if (!native.readRunRetryRecovery || !native.writeRunRetryRecovery) {
+  const read = native.readRunRetryRecovery;
+  const write = native.writeRunRetryRecovery;
+  if (!read || !write) {
     throw new DesktopContractError("Native Desktop run retry recovery is unavailable");
   }
-  const saved = await native.readRunRetryRecovery();
-  if (saved !== null && typeof saved !== "string") {
-    throw new DesktopContractError("Native Desktop run retry recovery returned an invalid record");
-  }
-  let value = saved;
+  let value = parseNativeRunRetryRecovery(await read());
+  let poisoned = false;
   return {
-    read: () => value,
+    read: () => {
+      if (poisoned) {
+        throw new DesktopContractError("Native Desktop run retry recovery requires an application restart");
+      }
+      return value;
+    },
     write: async (next) => {
-      await native.writeRunRetryRecovery!(next);
-      value = next;
+      if (poisoned) {
+        throw new DesktopContractError("Native Desktop run retry recovery requires an application restart");
+      }
+      const expectedValue = value;
+      try {
+        await write(next, expectedValue);
+        value = next;
+      } catch (writeError) {
+        let observed: string | null;
+        try {
+          observed = parseNativeRunRetryRecovery(await read());
+        } catch (readError) {
+          poisoned = true;
+          throw new DesktopContractError(
+            "Native Desktop run retry recovery could not reconcile a failed write",
+            { cause: readError },
+          );
+        }
+        if (observed === next) {
+          value = next;
+          return;
+        }
+        if (observed === expectedValue) throw writeError;
+        poisoned = true;
+        throw new DesktopContractError(
+          "Native Desktop run retry recovery changed in another process",
+          { cause: writeError },
+        );
+      }
     },
   };
+}
+
+function parseNativeRunRetryRecovery(value: unknown): string | null {
+  if (value !== null && typeof value !== "string") {
+    throw new DesktopContractError("Native Desktop run retry recovery returned an invalid record");
+  }
+  return value;
 }
 
 function assertReleaseProvider(

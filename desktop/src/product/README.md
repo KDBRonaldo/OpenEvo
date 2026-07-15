@@ -87,20 +87,34 @@ non-monotonic log identities. Renderer request state is tagged with separate
 opaque run ID and nullable current-attempt ID fields, without delimiter or
 sentinel encoding. A transition renders an empty loading state until its own
 request resolves, and superseded requests cannot publish into the new identity.
-Failed-session recovery calls `retryRun` with the failed run's current ETag and
-a stable action ID. While that request is pending, Start and every recovery
-control are disabled. The returned object is contract-validated by the provider,
-and a response that proves one appended attempt is authoritative even when the
-immediately following aggregate snapshot omits or lags that run. A rejected or
-unknown request remains visibly failed, presents the typed error, and retains
-the complete original action ID, stream epoch, and ETag for exact replay while
-the same run has not proved advancement; ETag churn alone does not replace that
-intent. The release provider admits only one unresolved retry intent at a time;
-a retry for another run or with another action ID cannot overwrite it. Before
-transport, the intent is atomically written and fsynced by the Tauri native host,
-not WebView storage. Invalid or unreadable native journal state fails startup
-closed and remains available for diagnosis. Bounded polling starts only after
-the request becomes ambiguous. An aggregate that arrives while the retry
+Failed-session recovery calls `retryRun` with the failed run's current ETag,
+terminal attempt ID, and a stable action ID. The terminal attempt ID comes from
+the durable renderer journal and remains byte-for-byte stable on every replay;
+the sidecar never substitutes a newer attempt observed from Core. While that
+request is pending, Start and every recovery control are disabled. The returned
+object is contract-validated by the provider, and a response that proves one
+appended attempt is authoritative even when the immediately following aggregate
+snapshot omits or lags that run. An ambiguous request remains visibly failed,
+presents the typed error, and retains the complete original action ID, stream
+epoch, ETag, terminal attempt ID, and run snapshot for exact replay while the
+same run has not proved advancement; ETag churn alone does not replace that
+intent. A typed deterministic rejection clears the journal. The release provider
+admits only one unresolved retry intent at a time; the first caller claims that
+authority synchronously, before its first asynchronous write, so a concurrent
+caller cannot cross the persistence boundary. A retry for another run or with
+another action ID cannot overwrite it. Before transport, the intent is atomically
+written and fsynced by the Tauri native host, not WebView storage. Native access
+is serialized by both an in-process mutex and a bounded kernel lock on a private,
+identity-verified persistent lockfile, so separate Desktop processes cannot
+overwrite the journal. Every write is also a compare-and-swap against the exact
+previous journal value observed at startup or after the prior write. A second
+Desktop process with stale authority is rejected without changing the first
+process's record. If native persistence commits but its IPC response is lost,
+the renderer rereads the verified journal and accepts the write only when the
+exact requested value is present; a conflicting value poisons further writes
+until application restart. Invalid or unreadable journal or lock state fails
+startup closed and remains available for diagnosis. Bounded polling starts only
+after the request becomes ambiguous. An aggregate that arrives while the retry
 transport is still in flight cannot reconcile or clear the journal. A later
 fresh snapshot reconciles the pending retry only when it preserves the canonical
 complete original attempt prefix and contains exactly one appended current
@@ -197,7 +211,7 @@ leave an unowned sidecar or publish/reuse their session token. A bounded native
 cleanup failure remains visible as retryable startup failure.
 
 The Local API release digest is
-`07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861`.
+`60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777`.
 The checked-in TypeScript mirror and contract fixtures use that frozen digest.
 The product UI and simulator consume the final Local/Core v1 DTOs directly and
 construct simulator resources through the same strict Zod schemas as release

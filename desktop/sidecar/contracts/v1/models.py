@@ -489,7 +489,9 @@ class ExecutionModeCapabilitiesV1(StrictModel):
         if len(mode_ids) != len(set(mode_ids)):
             raise ValueError("execution mode capabilities must not contain duplicates")
         if set(mode_ids) != {"codex_subscription_transcript", "self-deployed"}:
-            raise ValueError("execution mode capabilities must contain every known mode exactly once")
+            raise ValueError(
+                "execution mode capabilities must contain every known mode exactly once"
+            )
         return self
 
 
@@ -659,9 +661,7 @@ class WorkspaceImportRefV1(StrictModel):
     content_sha256: Digest
     byte_size: int = Field(ge=1_024, le=_core_contract.MAX_WORKSPACE_UPLOAD_BYTES)
     entry_count: int = Field(ge=0, le=_core_contract.MAX_WORKSPACE_ENTRIES)
-    extracted_byte_size: int = Field(
-        ge=0, le=_core_contract.MAX_WORKSPACE_UPLOAD_BYTES
-    )
+    extracted_byte_size: int = Field(ge=0, le=_core_contract.MAX_WORKSPACE_UPLOAD_BYTES)
 
     @model_validator(mode="after")
     def _empty_archive_is_empty(self) -> WorkspaceImportRefV1:
@@ -770,8 +770,7 @@ class RemoteProjectStateV1(StrictModel):
         if self.status == "ready" and (
             self.active_revision is None
             or self.registry_digest is None
-            or self.model_preparation.status
-            is not _core_contract.ModelPreparationStatus.READY
+            or self.model_preparation.status is not _core_contract.ModelPreparationStatus.READY
         ):
             raise ValueError(
                 "ready remote projects require a revision, registry, and prepared model"
@@ -934,6 +933,10 @@ class RunCreateV1(StrictModel):
     project_id: OpaqueId
 
 
+class RunRetryV1(StrictModel):
+    terminal_attempt_id: _core_contract.OpaqueId
+
+
 ServiceV1 = ServiceSummaryV1
 DiagnosticRequestV1 = DiagnosticsRequestV1
 DiagnosticReportV1 = DiagnosticV1
@@ -975,9 +978,7 @@ class HeartbeatEventV1(StrictModel):
 
 
 EventDataV1 = Annotated[
-    StateEventV1
-    | ResourceEventV1
-    | HeartbeatEventV1,
+    StateEventV1 | ResourceEventV1 | HeartbeatEventV1,
     Field(discriminator="kind"),
 ]
 

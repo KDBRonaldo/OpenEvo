@@ -18,6 +18,7 @@ from desktop.sidecar.core_client_v1 import (
     CoreClientLocalErrorCodeV1,
     CoreClientLocalErrorV1,
     CoreControlClientV1,
+    CoreMutationOutcomeUnknownV1,
     CoreProjectBootstrapClientV1,
     CoreProjectBootstrapResultV1,
     CoreSseStreamV1,
@@ -246,6 +247,38 @@ def _run_create(run: v1.RunV1 | None = None) -> v1.RunCreateV1:
         workspace_snapshot=run.workspace_snapshot,
         expected_registry_digest=run.registry_digest,
         required_revision=run.required_revision,
+    )
+
+
+def _failed_run() -> v1.RunV1:
+    error = v1.ApiErrorV1.model_validate_json(json.dumps(_api_error_payload(503)))
+    attempt = v1.AttemptV1(
+        id="attempt-terminal-1",
+        run_id="run-1",
+        number=1,
+        status=v1.RunStatus.FAILED,
+        created_at="2026-07-14T12:00:00Z",
+        updated_at="2026-07-14T12:00:02Z",
+        started_at="2026-07-14T12:00:01Z",
+        finished_at="2026-07-14T12:00:02Z",
+        error=error,
+    )
+    run = _run()
+    return run.model_copy(
+        update={
+            "status": v1.RunStatus.FAILED,
+            "queued_reason": None,
+            "current_attempt_id": attempt.id,
+            "current_attempt": attempt,
+            "attempt_count": 1,
+            "current_error": error,
+            "pinned_revision": run.required_revision.revision,
+            "admitted_at": "2026-07-14T12:00:00Z",
+            "started_at": attempt.started_at,
+            "finished_at": attempt.finished_at,
+            "updated_at": attempt.updated_at,
+            "attempts": [attempt],
+        }
     )
 
 
@@ -1270,6 +1303,210 @@ def test_error_body_is_bounded_before_typed_error_parsing() -> None:
 
     assert stream.read is False
     assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.RESPONSE_TOO_LARGE
+
+
+def test_retry_response_loss_after_send_is_an_unknown_mutation_outcome() -> None:
+    failed = _failed_run()
+
+    class LostCommittedResponse(httpx.SyncByteStream):
+        def __iter__(self):
+            yield failed.model_dump_json().encode("utf-8")
+            raise httpx.ReadError("injected post-commit response loss")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=failed.model_dump(mode="json"))
+        assert request.url.path == "/v1/runs/run-1/retry"
+        return httpx.Response(
+            202,
+            headers={"Content-Type": "application/json"},
+            stream=LostCommittedResponse(),
+        )
+
+    client = _client(handler)
+    client.get_run(failed.id, project_id=PROJECT_ID)
+
+    with pytest.raises(CoreMutationOutcomeUnknownV1) as unknown:
+        client.retry_run(
+            failed.id,
+            v1.RunRetryRequestV1(terminal_attempt_id=failed.current_attempt_id),
+            project_id=PROJECT_ID,
+            if_match=failed.etag,
+            idempotency_key="retry-response-loss-0001",
+        )
+
+    assert unknown.value.code == "core_mutation_outcome_unknown"
+    assert unknown.value.__cause__ is None
+    assert unknown.value.__context__ is None
+
+
+def test_retry_typed_http_rejection_remains_deterministic() -> None:
+    failed = _failed_run()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=failed.model_dump(mode="json"))
+        return httpx.Response(409, json=_api_error_payload())
+
+    client = _client(handler)
+    client.get_run(failed.id, project_id=PROJECT_ID)
+
+    with pytest.raises(CoreClientErrorV1) as rejected:
+        client.retry_run(
+            failed.id,
+            v1.RunRetryRequestV1(terminal_attempt_id=failed.current_attempt_id),
+            project_id=PROJECT_ID,
+            if_match=failed.etag,
+            idempotency_key="retry-typed-rejection-0001",
+        )
+
+    assert isinstance(rejected.value.error, v1.ApiErrorV1)
+    assert rejected.value.status_code == 409
+
+
+@pytest.mark.parametrize("failure", ["send", "parse"])
+def test_retry_send_or_success_parse_failure_is_an_unknown_outcome(failure: str) -> None:
+    failed = _failed_run()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=failed.model_dump(mode="json"))
+        if failure == "send":
+            raise httpx.WriteError("injected retry send failure", request=request)
+        return httpx.Response(
+            202,
+            headers={"Content-Type": "application/json"},
+            content=b"not-json",
+        )
+
+    client = _client(handler)
+    client.get_run(failed.id, project_id=PROJECT_ID)
+
+    with pytest.raises(CoreMutationOutcomeUnknownV1) as unknown:
+        client.retry_run(
+            failed.id,
+            v1.RunRetryRequestV1(terminal_attempt_id=failed.current_attempt_id),
+            project_id=PROJECT_ID,
+            if_match=failed.etag,
+            idempotency_key=f"retry-{failure}-failure-0001",
+        )
+
+    assert unknown.value.code == "core_mutation_outcome_unknown"
+
+
+def test_retry_pre_send_validation_failure_remains_deterministic() -> None:
+    failed = _failed_run()
+    post_called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_called
+        if request.method == "GET":
+            return httpx.Response(200, json=failed.model_dump(mode="json"))
+        post_called = True
+        return httpx.Response(202, json=failed.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.get_run(failed.id, project_id=PROJECT_ID)
+
+    with pytest.raises(CoreClientErrorV1) as rejected:
+        client.retry_run(
+            failed.id,
+            v1.RunCancelRequestV1(reason=v1.RunCancelReason.USER_REQUESTED),  # type: ignore[arg-type]
+            project_id=PROJECT_ID,
+            if_match=failed.etag,
+            idempotency_key="retry-pre-send-invalid-0001",
+        )
+
+    assert post_called is False
+    assert rejected.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+
+
+def test_retry_cross_wired_success_is_an_unknown_outcome() -> None:
+    failed = _failed_run()
+    wrong_attempt = failed.attempts[0].model_copy(update={"run_id": "run-cross-wired"})
+    cross_wired = failed.model_copy(
+        update={
+            "id": "run-cross-wired",
+            "current_attempt": wrong_attempt,
+            "current_attempt_id": wrong_attempt.id,
+            "attempts": [wrong_attempt],
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=failed.model_dump(mode="json"))
+        return httpx.Response(202, json=cross_wired.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.get_run(failed.id, project_id=PROJECT_ID)
+
+    with pytest.raises(CoreMutationOutcomeUnknownV1):
+        client.retry_run(
+            failed.id,
+            v1.RunRetryRequestV1(terminal_attempt_id=failed.current_attempt_id),
+            project_id=PROJECT_ID,
+            if_match=failed.etag,
+            idempotency_key="retry-cross-wired-response-0001",
+        )
+
+
+def test_retry_registration_batch_exit_race_is_an_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
+    failed = _failed_run()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200 if request.method == "GET" else 202, json=failed.model_dump(mode="json")
+        )
+
+    client = _client(handler)
+    client.get_run(failed.id, project_id=PROJECT_ID)
+    original_batch = client._registration_batch
+    transaction_ready = threading.Event()
+    release_transaction = threading.Event()
+    results: list[v1.RunV1] = []
+    errors: list[BaseException] = []
+
+    @contextmanager
+    def pause_before_retry_transaction_exit(*args, **kwargs):
+        with original_batch(*args, **kwargs):
+            yield
+            transaction_ready.set()
+            release_transaction.wait(1)
+
+    def retry() -> None:
+        try:
+            results.append(
+                client.retry_run(
+                    failed.id,
+                    v1.RunRetryRequestV1(terminal_attempt_id=failed.current_attempt_id),
+                    project_id=PROJECT_ID,
+                    if_match=failed.etag,
+                    idempotency_key="retry-batch-exit-race-0001",
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(client, "_registration_batch", pause_before_retry_transaction_exit)
+    request_thread = threading.Thread(target=retry)
+    request_thread.start()
+    assert transaction_ready.wait(1)
+    client.close()
+    release_transaction.set()
+    request_thread.join(1)
+
+    assert not request_thread.is_alive()
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], CoreMutationOutcomeUnknownV1)
+    assert errors[0].__cause__ is None
+    assert errors[0].__context__ is None
 
 
 @pytest.mark.parametrize(

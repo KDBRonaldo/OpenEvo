@@ -703,6 +703,7 @@ export const reachableRequiredRevisionRefV1Schema = z
     if (value.relation === "successor" && value.revision.id === value.reachable_from_revision_id) issue(context, ["reachable_from_revision_id"], "successor must differ from its predecessor");
   });
 export const runCreateV1Schema = z.object({ project_id: opaqueIdSchema }).strict();
+export const runRetryV1Schema = z.object({ terminal_attempt_id: coreOpaqueIdSchema }).strict();
 export const queuedReasonV1Schema = z
   .object({
     code: z.enum(["admission_pending", "capacity", "service_starting", "required_revision_uncommitted"]),
@@ -1334,6 +1335,7 @@ export type LocalLogEntryV1 = z.infer<typeof localLogEntryV1Schema>;
 export type RunSummaryV1 = z.infer<typeof runSummaryV1Schema>;
 export type RunV1 = z.infer<typeof runV1Schema>;
 export type RunCreateV1 = z.input<typeof runCreateV1Schema>;
+export type RunRetryV1 = z.input<typeof runRetryV1Schema>;
 export type TimelineEntryV1 = z.infer<typeof timelineEntryV1Schema>;
 export type LogEntryV1 = z.infer<typeof logEntryV1Schema>;
 export type RunContextV1 = z.infer<typeof runContextV1Schema>;

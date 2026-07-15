@@ -117,6 +117,15 @@ class CoreClientErrorV1(RuntimeError):
         self.error = error
 
 
+class CoreMutationOutcomeUnknownV1(RuntimeError):
+    """A mutation crossed the send boundary without a typed HTTP outcome."""
+
+    code = "core_mutation_outcome_unknown"
+
+    def __init__(self) -> None:
+        super().__init__("OpenEvo Core mutation outcome is unknown.")
+
+
 @dataclass(frozen=True, slots=True)
 class CoreTunnelConnectionV1:
     """One active project session's private loopback tunnel authority."""
@@ -346,6 +355,34 @@ def _generation_bound(method: Callable[MethodP, ResponseT]) -> Callable[MethodP,
                 result = method(*args, **kwargs)
                 client._linearize_generation_result(token.generation, token.deadline)
                 return result
+
+    return wrapped
+
+
+def _retry_generation_bound(
+    method: Callable[MethodP, ResponseT],
+) -> Callable[MethodP, ResponseT]:
+    @wraps(method)
+    def wrapped(*args: MethodP.args, **kwargs: MethodP.kwargs) -> ResponseT:
+        client = args[0]
+        if not isinstance(client, CoreControlClientV1):
+            raise TypeError("generation-bound method requires CoreControlClientV1")
+        mutation_delivered = False
+        delivery_failed = False
+        with client._generation_lease() as token:
+            try:
+                with client._registration_batch(delivery_token=token):
+                    result = method(*args, **kwargs)
+                    mutation_delivered = True
+                    client._linearize_generation_result(token.generation, token.deadline)
+            except CoreClientErrorV1:
+                if mutation_delivered:
+                    delivery_failed = True
+                else:
+                    raise
+            if delivery_failed:
+                raise CoreMutationOutcomeUnknownV1 from None
+            return result
 
     return wrapped
 
@@ -1258,7 +1295,7 @@ class CoreControlClientV1:
         self._register_run(result, expected_id=run_id)
         return result
 
-    @_generation_bound
+    @_retry_generation_bound
     def retry_run(
         self,
         run_id: str,
@@ -1279,8 +1316,12 @@ class CoreControlClientV1:
             if_match=if_match,
             idempotency_key=idempotency_key,
             expected_status=202,
+            unknown_outcome_after_send=True,
         )
-        self._register_run(result, expected_id=run_id)
+        try:
+            self._register_run(result, expected_id=run_id)
+        except CoreClientErrorV1:
+            raise CoreMutationOutcomeUnknownV1 from None
         return result
 
     @_generation_bound
@@ -1788,6 +1829,7 @@ class CoreControlClientV1:
         if_project_match: str | None = None,
         expected_status: int = 200,
         max_request_bytes: int = MAX_CORE_REQUEST_BYTES,
+        unknown_outcome_after_send: bool = False,
     ) -> Any:
         body = _encode_request(request, request_model, max_request_bytes)
         _scan_private_strings(
@@ -1809,6 +1851,7 @@ class CoreControlClientV1:
             content=body,
             headers=headers,
             expected_status=expected_status,
+            unknown_outcome_after_send=unknown_outcome_after_send,
         )
 
     def _no_content_mutation(
@@ -1837,6 +1880,7 @@ class CoreControlClientV1:
         headers: Mapping[str, str] | None = None,
         expected_status: int = 200,
         max_response_bytes: int = MAX_CORE_JSON_RESPONSE_BYTES,
+        unknown_outcome_after_send: bool = False,
     ) -> Any:
         if authenticated:
             self._require_version_authority()
@@ -1859,12 +1903,8 @@ class CoreControlClientV1:
         if headers:
             request_headers.update(headers)
         with self._json_generation_lease() as (session_generation, deadline):
-            transport_error = False
-            release_failed = False
-            response: httpx.Response | None = None
-            registered = False
+            _check_deadline(deadline)
             try:
-                _check_deadline(deadline)
                 request = self._http.build_request(
                     method,
                     path,
@@ -1872,13 +1912,34 @@ class CoreControlClientV1:
                     content=content,
                     headers=request_headers,
                 )
-                response_reservation = _PROCESS_RESOURCE_CLOSER.reserve()
-                if response_reservation is None:
-                    _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+            except (
+                httpx.HTTPError,
+                OSError,
+                TypeError,
+                UnicodeError,
+                RuntimeError,
+                ValueError,
+            ):
+                self._raise_transport_error()
+            response_reservation = _PROCESS_RESOURCE_CLOSER.reserve()
+            if response_reservation is None:
+                _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+            transport_error = False
+            release_failed = False
+            send_started = False
+            response: httpx.Response | None = None
+            registered = False
+
+            def mark_send_started() -> None:
+                nonlocal send_started
+                send_started = True
+
+            try:
                 response = _send_before_deadline(
                     lambda: self._http.send(request, stream=True, follow_redirects=False),
                     deadline,
                     response_reservation,
+                    on_send_started=mark_send_started,
                     late_dispose=lambda late_response, late_reservation: self._schedule_close(
                         late_response.close, late_reservation
                     ),
@@ -1900,6 +1961,8 @@ class CoreControlClientV1:
                 status_code = response.status_code
                 content_type = response.headers.get("content-type")
             except CoreClientErrorV1:
+                if unknown_outcome_after_send and send_started:
+                    raise CoreMutationOutcomeUnknownV1 from None
                 raise
             except (
                 httpx.HTTPError,
@@ -1914,41 +1977,69 @@ class CoreControlClientV1:
                 if registered and response is not None:
                     release_failed = not self._release_response(response)
             if transport_error:
+                if unknown_outcome_after_send and send_started:
+                    raise CoreMutationOutcomeUnknownV1 from None
                 self._raise_transport_error()
             if release_failed:
+                if unknown_outcome_after_send:
+                    raise CoreMutationOutcomeUnknownV1 from None
                 self._raise_transport_error()
-            self._ensure_session_generation(session_generation)
-            if status_code != expected_status:
-                if content_type is None or (
-                    content_type.split(";", 1)[0].strip().lower() != "application/json"
-                ):
-                    _raise_local(CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502)
-                self._raise_http_error(status_code, body, session_generation=session_generation)
-            if expected_status == 204:
-                if body:
-                    _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
-                self._ensure_session_generation(session_generation)
-                return None
-            if (
-                content_type is None
-                or content_type.split(";", 1)[0].strip().lower() != "application/json"
-            ):
-                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
-            decoded = _decode_json_checked(
-                body,
-                self._private_values(),
-                CoreClientLocalErrorCodeV1.INVALID_RESPONSE,
-            )
             try:
-                adapter = TypeAdapter(response_model)
-                if not _json_matches_schema_types(decoded, adapter.json_schema(mode="validation")):
-                    raise ValueError("response scalar does not match the contract schema")
-                result = adapter.validate_json(body)
-            except (ValidationError, ValueError, TypeError, RecursionError):
-                self._ensure_session_generation(session_generation)
+                return self._parse_json_response(
+                    response_model,
+                    expected_status=expected_status,
+                    status_code=status_code,
+                    content_type=content_type,
+                    body=body,
+                    session_generation=session_generation,
+                )
+            except CoreClientErrorV1 as exc:
+                if unknown_outcome_after_send and not isinstance(exc.error, v1.ApiErrorV1):
+                    raise CoreMutationOutcomeUnknownV1 from None
+                raise
+
+    def _parse_json_response(
+        self,
+        response_model: Any,
+        *,
+        expected_status: int,
+        status_code: int,
+        content_type: str | None,
+        body: bytes,
+        session_generation: int,
+    ) -> Any:
+        self._ensure_session_generation(session_generation)
+        if status_code != expected_status:
+            if content_type is None or (
+                content_type.split(";", 1)[0].strip().lower() != "application/json"
+            ):
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502)
+            self._raise_http_error(status_code, body, session_generation=session_generation)
+        if expected_status == 204:
+            if body:
                 _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
             self._ensure_session_generation(session_generation)
-            return result
+            return None
+        if (
+            content_type is None
+            or content_type.split(";", 1)[0].strip().lower() != "application/json"
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        decoded = _decode_json_checked(
+            body,
+            self._private_values(),
+            CoreClientLocalErrorCodeV1.INVALID_RESPONSE,
+        )
+        try:
+            adapter = TypeAdapter(response_model)
+            if not _json_matches_schema_types(decoded, adapter.json_schema(mode="validation")):
+                raise ValueError("response scalar does not match the contract schema")
+            result = adapter.validate_json(body)
+        except (ValidationError, ValueError, TypeError, RecursionError):
+            self._ensure_session_generation(session_generation)
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        self._ensure_session_generation(session_generation)
+        return result
 
     def _raise_http_error(
         self, status_code: int, body: bytes, *, session_generation: int
@@ -3392,6 +3483,7 @@ def _send_before_deadline(
     deadline: float,
     reservation: _CloseReservation,
     *,
+    on_send_started: Callable[[], None] | None = None,
     late_dispose: Callable[[ResponseT, _CloseReservation], object],
 ) -> ResponseT:
     _check_deadline(deadline)
@@ -3399,6 +3491,8 @@ def _send_before_deadline(
     if future is None:
         reservation.release()
         _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+    if on_send_started is not None:
+        on_send_started()
     try:
         return future.result(timeout=max(0.0, deadline - time.monotonic()))
     except FutureTimeoutError:
@@ -3552,6 +3646,7 @@ __all__ = [
     "CoreClientLocalErrorCodeV1",
     "CoreClientLocalErrorV1",
     "CoreControlClientV1",
+    "CoreMutationOutcomeUnknownV1",
     "CoreProjectBootstrapClientV1",
     "CoreProjectBootstrapResultV1",
     "CoreSseStreamV1",
