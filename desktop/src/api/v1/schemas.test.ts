@@ -150,7 +150,17 @@ describe("Desktop Local API v1 schemas", () => {
       execution: { mode: "self-deployed", hf_model: "m" },
       evolution: { targets: { "Text_memory.v1": { enabled: true, method: "Method.v1", config: {} } } },
     } as const;
-    expect(projectCreateV1Schema.parse(base).evolution.targets["Text_memory.v1"]?.method).toBe("Method.v1");
+    const configured = projectCreateV1Schema.parse(base);
+    expect(configured.evolution.targets["Text_memory.v1"]?.method).toBe("Method.v1");
+    expect(configured.evolution_configuration_state).toBe("configured");
+    expect(projectCreateV1Schema.parse({
+      ...base,
+      evolution: { targets: {} },
+      evolution_configuration_state: "pending",
+    }).evolution_configuration_state).toBe("pending");
+    const missingResponseState: Record<string, unknown> = { ...CONTRACT_FIXTURE_V1.project };
+    delete missingResponseState.evolution_configuration_state;
+    expect(() => projectV1Schema.parse(missingResponseState)).toThrow();
     expect(projectCreateV1Schema.parse({ ...base, name: "n".repeat(128) }).name).toHaveLength(128);
     expect(projectCreateV1Schema.parse({ ...base, task: { ...base.task, title: "t".repeat(256) } }).task.title).toHaveLength(256);
     expect(projectCreateV1Schema.parse({ ...base, source: { ...base.source, display_name: "s".repeat(256) } }).source.display_name).toHaveLength(256);

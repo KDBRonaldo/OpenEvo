@@ -4399,6 +4399,54 @@ def test_close_waits_for_blocking_host_adapter_and_prevents_core_calls() -> None
     assert isinstance(activation_result[0], DesktopCoreBridgeErrorV1)
 
 
+def test_cancel_activation_requires_exact_identity_and_rejects_late_success() -> None:
+    local_project = _local_project()
+    bridge, _, fake_core, _ = _bridge(local_project)
+    host = bridge._host_service
+    assert isinstance(host, FakeHostService)
+    host.block = True
+    cancel_event = threading.Event()
+    activation_result: list[object] = []
+
+    def activate() -> None:
+        try:
+            activation_result.append(
+                bridge.activate_project(
+                    local_project,
+                    idempotency_key="cancel-exact-activation-0001",
+                    activation_id="operation-exact-activation-0001",
+                    cancel_event=cancel_event,
+                )
+            )
+        except BaseException as exc:
+            activation_result.append(exc)
+
+    activation_thread = threading.Thread(target=activate)
+    activation_thread.start()
+    assert host.entered.wait(timeout=1)
+
+    assert not bridge.cancel_activation("operation-wrong-activation-0001")
+    assert not cancel_event.is_set()
+    assert bridge.cancel_activation("operation-exact-activation-0001")
+    assert cancel_event.is_set()
+    host.release.set()
+    activation_thread.join(timeout=2)
+
+    assert not activation_thread.is_alive()
+    assert len(activation_result) == 1
+    assert isinstance(activation_result[0], DesktopCoreBridgeErrorV1)
+    assert activation_result[0].error.code == "active_project_session_superseded"
+    assert fake_core.calls == []
+    assert not bridge.cancel_activation("operation-exact-activation-0001")
+
+    host.block = False
+    activation = bridge.activate_project(
+        local_project,
+        idempotency_key="cancel-exact-activation-retry-0002",
+    )
+    assert activation.local_project_id == local_project.project_id
+
+
 def test_close_waits_for_blocking_persistence_commit_before_returning() -> None:
     local_project = _local_project()
     persistence = FakePersistence()

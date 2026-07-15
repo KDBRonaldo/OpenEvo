@@ -728,6 +728,13 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
             raise failure
 
 
+def _close_transport_tunnel(tunnel: SshTunnel | SshCoreTunnel) -> None:
+    try:
+        tunnel.close()
+    except Exception:
+        _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+
+
 class SshRemoteExecutorTransport:
     """Execute SSH operations against one explicitly trusted host-key binding."""
 
@@ -770,12 +777,74 @@ class SshRemoteExecutorTransport:
             str, tuple[StagedCoreBootstrapAssets, CorePythonRuntimeAuthority]
         ] = {}
         self._core_asset_transfer_ownerships: set[_CoreAssetTransferAdmission] = set()
+        self._operation_guard = threading.Lock()
+        self._active_subprocesses: set[_OwnedSubprocessAuthority] = set()
+        self._active_tunnels: set[SshTunnel | SshCoreTunnel] = set()
+        self._closed = False
+
+    def close(self) -> None:
+        """Cancel transport-owned subprocesses and tunnels without waiting on their timeout."""
+
+        with self._operation_guard:
+            if self._closed:
+                return
+            self._closed = True
+            subprocesses = tuple(self._active_subprocesses)
+            tunnels = tuple(self._active_tunnels)
+        for authority in subprocesses:
+            try:
+                authority.request_group_termination()
+            except Exception:
+                _log_transport_failure(SshTransportErrorCode.START_FAILED)
+        for tunnel in tunnels:
+            request_close = getattr(tunnel, "request_close", None)
+            if callable(request_close):
+                try:
+                    request_close()
+                except Exception:
+                    _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+                continue
+            threading.Thread(
+                target=_close_transport_tunnel,
+                args=(tunnel,),
+                name="openevo-ssh-transport-close",
+                daemon=True,
+            ).start()
+
+    def _require_open(self) -> None:
+        with self._operation_guard:
+            if self._closed:
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+
+    def _register_subprocess(self, authority: _OwnedSubprocessAuthority) -> None:
+        with self._operation_guard:
+            if not self._closed:
+                self._active_subprocesses.add(authority)
+                return
+        authority.request_group_termination()
+        raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+
+    def _unregister_subprocess(self, authority: _OwnedSubprocessAuthority) -> None:
+        with self._operation_guard:
+            self._active_subprocesses.discard(authority)
+
+    def _register_tunnel(self, tunnel: SshTunnel | SshCoreTunnel) -> None:
+        with self._operation_guard:
+            self._active_tunnels = {
+                active for active in self._active_tunnels if not active.closed
+            }
+            if not self._closed:
+                self._active_tunnels.add(tunnel)
+                return
+        _close_transport_tunnel(tunnel)
+        raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
 
     def _run_trusted_subprocess(
         self,
         argv_factory: Callable[[Path], list[str]],
         timeout_seconds: float,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        self._require_open()
         trust_lease = self._trusted_host.open_for_spawn(self._profile)
         try:
             known_hosts_file = trust_lease.__enter__()
@@ -793,15 +862,18 @@ class SshRemoteExecutorTransport:
         try:
             argv = argv_factory(known_hosts_file)
             if self._uses_default_runner:
-                return (
-                    _run_subprocess(
-                        argv,
-                        timeout_seconds,
-                        trust_ownership=trust_ownership,
-                    ),
-                    known_hosts_file,
+                completed = _run_subprocess(
+                    argv,
+                    timeout_seconds,
+                    trust_ownership=trust_ownership,
+                    on_start=self._register_subprocess,
+                    on_finish=self._unregister_subprocess,
                 )
-            return self._runner(argv, timeout_seconds), known_hosts_file
+            else:
+                self._require_open()
+                completed = self._runner(argv, timeout_seconds)
+            self._require_open()
+            return completed, known_hosts_file
         finally:
             trust_ownership.release_if_caller_owned()
 
@@ -1516,6 +1588,7 @@ class SshRemoteExecutorTransport:
         if tunnel_failed or tunnel is None:
             _log_transport_failure(SshTransportErrorCode.START_FAILED)
             raise SshTransportError(SshTransportErrorCode.START_FAILED)
+        self._register_tunnel(tunnel)
         if wait_for_ready:
             ready_failure: SshTransportErrorCode | None = None
             try:
@@ -1593,6 +1666,7 @@ class SshRemoteExecutorTransport:
                 raise SshTransportError(SshTransportErrorCode.START_FAILED) from None
             raise
         tunnel = SshCoreTunnel(endpoint)
+        self._register_tunnel(tunnel)
         if wait_for_ready:
             try:
                 endpoint.verify_authority(timeout_seconds=timeout_seconds)
@@ -2169,6 +2243,8 @@ def _run_subprocess(
     *,
     trust_lease: AbstractContextManager[Path] | None = None,
     trust_ownership: _KnownHostsLeaseOwnership | None = None,
+    on_start: Callable[[_OwnedSubprocessAuthority], None] | None = None,
+    on_finish: Callable[[_OwnedSubprocessAuthority], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if trust_lease is not None and trust_ownership is not None:
         raise RuntimeError("known-host lease has multiple ownership sources")
@@ -2184,7 +2260,11 @@ def _run_subprocess(
             raise RuntimeError("subprocess birth has not been observed")
         stdout = b""
         stderr = b""
+        registered = False
         try:
+            if on_start is not None:
+                on_start(authority)
+                registered = True
             authority.initialize_observer()
             assert process.stdout is not None
             assert process.stderr is not None
@@ -2205,6 +2285,8 @@ def _run_subprocess(
                 _log_transport_failure(SshTransportErrorCode.START_FAILED)
             raise
         finally:
+            if registered and on_finish is not None:
+                on_finish(authority)
             try:
                 authority.close_observer()
             except BaseException:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -112,6 +112,10 @@ class ActiveProjectMismatchError(Exception):
         self.operation_id = operation_id
 
 
+class EvolutionConfigurationPendingError(Exception):
+    """The active project has not completed the explicit evolution setup stage."""
+
+
 class InvalidNativeChallengeError(Exception):
     """The native readiness challenge is missing or malformed."""
 
@@ -164,6 +168,19 @@ class _ProjectActivationWork:
     if_match: str
 
 
+@dataclass(slots=True)
+class _ProjectExecution:
+    operation_id: str
+    cancel_event: Event
+    start: Event
+    run: Event
+    running: Event
+    finished: Event
+    interrupt_started: Event
+    interrupt: Callable[[], None]
+    future: Future[None] | None = None
+
+
 class _BoundedProjectExecutor:
     """One serialized project authority queue with a hard admission bound."""
 
@@ -171,6 +188,7 @@ class _BoundedProjectExecutor:
         self._slots = BoundedSemaphore(max_pending)
         self._lock = Lock()
         self._closed = False
+        self._entries: dict[str, _ProjectExecution] = {}
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="openevo-project-runtime",
@@ -178,28 +196,50 @@ class _BoundedProjectExecutor:
 
     def submit(
         self,
-        action: Callable[[], None],
+        operation_id: str,
+        action: Callable[[Event], None],
         *,
         accepted: Callable[[], None],
+        interrupt: Callable[[], None],
     ) -> bool:
         if not self._slots.acquire(blocking=False):
             return False
-        start = Event()
-        run = Event()
+        entry = _ProjectExecution(
+            operation_id=operation_id,
+            cancel_event=Event(),
+            start=Event(),
+            run=Event(),
+            running=Event(),
+            finished=Event(),
+            interrupt_started=Event(),
+            interrupt=interrupt,
+        )
         with self._lock:
-            if self._closed:
+            if self._closed or operation_id in self._entries:
                 self._slots.release()
                 return False
             try:
-                self._executor.submit(self._run, action, start, run)
+                future = self._executor.submit(self._run, entry, action)
             except RuntimeError:
                 self._slots.release()
                 return False
+            entry.future = future
+            self._entries[operation_id] = entry
+            future.add_done_callback(lambda _completed: self._finish(entry))
         try:
             accepted()
-            run.set()
+            entry.run.set()
         finally:
-            start.set()
+            entry.start.set()
+        return True
+
+    def cancel(self, operation_id: str, *, wait_seconds: float = 2.0) -> bool:
+        with self._lock:
+            entry = self._entries.get(operation_id)
+        if entry is None:
+            return False
+        self._cancel_entry(entry)
+        entry.finished.wait(timeout=wait_seconds)
         return True
 
     def close(self) -> None:
@@ -207,15 +247,55 @@ class _BoundedProjectExecutor:
             if self._closed:
                 return
             self._closed = True
-        self._executor.shutdown(wait=True, cancel_futures=False)
+            entries = tuple(self._entries.values())
+        for entry in entries:
+            self._cancel_entry(entry)
+        futures = tuple(entry.future for entry in entries if entry.future is not None)
+        if futures:
+            wait(futures, timeout=2.0)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _run(self, action: Callable[[], None], start: Event, run: Event) -> None:
+    @staticmethod
+    def _run(entry: _ProjectExecution, action: Callable[[Event], None]) -> None:
         try:
-            start.wait()
-            if run.is_set():
-                action()
+            entry.start.wait()
+            if not entry.run.is_set() or entry.cancel_event.is_set():
+                return
+            entry.running.set()
+            if entry.cancel_event.is_set():
+                return
+            action(entry.cancel_event)
         finally:
-            self._slots.release()
+            entry.finished.set()
+
+    def _cancel_entry(self, entry: _ProjectExecution) -> None:
+        entry.cancel_event.set()
+        future = entry.future
+        if future is not None:
+            future.cancel()
+        with self._lock:
+            should_interrupt = (
+                entry.running.is_set()
+                and not entry.finished.is_set()
+                and not entry.interrupt_started.is_set()
+            )
+            if should_interrupt:
+                entry.interrupt_started.set()
+        if should_interrupt:
+            try:
+                entry.interrupt()
+            except Exception:
+                _LOGGER.warning(
+                    "project operation interrupt failed",
+                    extra={"operation_id": entry.operation_id},
+                )
+
+    def _finish(self, entry: _ProjectExecution) -> None:
+        entry.finished.set()
+        with self._lock:
+            if self._entries.get(entry.operation_id) is entry:
+                self._entries.pop(entry.operation_id, None)
+        self._slots.release()
 
 
 class DesktopReleaseProvider:
@@ -280,8 +360,6 @@ class DesktopReleaseProvider:
                 "operation_events",
                 "run_observability",
                 "artifact_inspection",
-                "service_control",
-                "diagnostics",
             )
         self._version = VersionV1(
             openapi_sha256=DESKTOP_OPENAPI_SHA256,
@@ -327,13 +405,9 @@ class DesktopReleaseProvider:
             "getArtifactContent": self._get_artifact_content,
             "getArtifactDiff": self._get_artifact_diff,
             "listServices": self._list_services,
-            "restartService": self._restart_service,
             "getCoreOperation": self._get_core_operation,
             "getCoreLogsByRef": self._get_core_logs_by_ref,
             "listServiceLogs": self._list_service_logs,
-            "createDiagnostic": self._create_diagnostic,
-            "getDiagnostic": self._get_diagnostic,
-            "deleteDiagnostic": self._delete_diagnostic,
             "cleanupCaches": self._cleanup_caches,
             "subscribeDesktopEvents": self._subscribe_events,
         }
@@ -350,14 +424,13 @@ class DesktopReleaseProvider:
                 return
             self._closed = True
         try:
-            if self._core_runtime is not None:
-                self._core_runtime.stop()
-            else:
-                if self._core_bridge is not None:
-                    self._core_bridge.close()
+            self._project_executor.close()
         finally:
             try:
-                self._project_executor.close()
+                if self._core_runtime is not None:
+                    self._core_runtime.stop()
+                elif self._core_bridge is not None:
+                    self._core_bridge.close()
             finally:
                 try:
                     if self._core_runtime is not None:
@@ -593,6 +666,13 @@ class DesktopReleaseProvider:
                 )
         finally:
             self._release_connection_gate(gate_key, gate)
+            try:
+                self.publish_state_changed()
+            except (ProviderStoreError, sqlite3.Error):
+                _LOGGER.exception(
+                    "profile operation terminal transition could not publish invalidation",
+                    extra={"profile_id": profile_id},
+                )
 
     def _execute_connection_action_once(
         self,
@@ -636,6 +716,13 @@ class DesktopReleaseProvider:
         profile = reservation.profile
         if profile is None:
             raise ProviderStoreError("new profile runtime reservation has no profile snapshot")
+        try:
+            self.publish_state_changed()
+        except (ProviderStoreError, sqlite3.Error):
+            _LOGGER.exception(
+                "profile operation start could not publish invalidation",
+                extra={"profile_id": profile_id},
+            )
 
         try:
             if owner_error is not None:
@@ -1092,8 +1179,12 @@ class DesktopReleaseProvider:
             generation.append(self._publish_project_activation_transition(work))
 
         accepted = self._project_executor.submit(
-            lambda: self._execute_project_activation(work, generation[0]),
+            reservation.operation.operation_id,
+            lambda cancel_event: self._execute_project_activation(
+                work, generation[0], cancel_event
+            ),
             accepted=accept,
+            interrupt=lambda: self._interrupt_project_activation(work),
         )
         operation = reservation.operation
         if not accepted:
@@ -1139,6 +1230,7 @@ class DesktopReleaseProvider:
         self,
         work: _ProjectActivationWork,
         session_generation: int,
+        cancel_event: Event,
     ) -> None:
         reservation = work.reservation
         activation: CoreActivationV1 | None = None
@@ -1154,14 +1246,25 @@ class DesktopReleaseProvider:
             )
             if operation.state != "running":
                 return
+            if cancel_event.is_set():
+                return
             project = reservation.project
             if project is None:
                 raise ProviderStoreError(
                     "project activation reservation lost its project snapshot"
                 )
             bridge = self._require_bridge("activateProject")
-            activation = bridge.activate_project(project, idempotency_key=work.key)
+            activation = bridge.activate_project(
+                project,
+                idempotency_key=work.key,
+                activation_id=reservation.operation.operation_id,
+                cancel_event=cancel_event,
+            )
             self._validate_activation_identity(project, activation)
+            if cancel_event.is_set():
+                raise ProviderStoreError(
+                    "project activation was cancelled before Local publication"
+                )
             with self._project_session_lock:
                 with self._connection_state_lock:
                     if not self._owns_core_session_locked(session_generation, project):
@@ -1244,6 +1347,21 @@ class DesktopReleaseProvider:
             )
         finally:
             self.publish_state_changed()
+
+    def _interrupt_project_activation(self, work: _ProjectActivationWork) -> None:
+        project = work.reservation.project
+        if project is None:
+            return
+        bridge = self._core_bridge
+        if bridge is not None:
+            try:
+                bridge.cancel_activation(work.reservation.operation.operation_id)
+            except Exception:
+                _LOGGER.warning(
+                    "could not interrupt the active Core project activation",
+                    extra={"project_id": work.project_id},
+                )
+        self._disconnect_owned_transport(project.profile_id)
 
     def _finalize_project_runtime_failure(
         self,
@@ -1461,8 +1579,11 @@ class DesktopReleaseProvider:
                                 state="disconnected", active_tunnel=False
                             )
                         )
-        if operation.resource.resource_type == "profile":
-            self._disconnect_owned_transport(operation.resource.resource_id)
+        if operation.state in {"queued", "running", "cancelling"}:
+            if operation.operation_kind == "project_activate":
+                self._project_executor.cancel(operation.operation_id)
+            elif operation.resource.resource_type == "profile":
+                self._disconnect_owned_transport(operation.resource.resource_id)
         self.publish_state_changed()
         return cancelled
 
@@ -1483,6 +1604,8 @@ class DesktopReleaseProvider:
                 raise ActiveProjectMismatchError("createRun")
             if not hmac.compare_digest(project.etag, if_match):
                 raise ETagConflictError("project", project.project_id, project.etag)
+            if project.evolution_configuration_state == "pending":
+                raise EvolutionConfigurationPendingError
             return bridge.create_run(
                 project, idempotency_key=cast(str, arguments["idempotency_key"])
             )
@@ -1604,18 +1727,6 @@ class DesktopReleaseProvider:
             lambda bridge, project: bridge.list_services(project, **page),
         )
 
-    def _restart_service(self, arguments: Mapping[str, object]) -> object:
-        return self._invoke_active_core(
-            "restartService",
-            lambda bridge, project: bridge.restart_service(
-                project,
-                cast(str, arguments["service_id"]),
-                if_match=cast(str, arguments["if_match"]),
-                idempotency_key=cast(str, arguments["idempotency_key"]),
-            ),
-            enforce_execution_mode_support=True,
-        )
-
     def _get_core_operation(self, arguments: Mapping[str, object]) -> object:
         return self._invoke_active_core(
             "getCoreOperation",
@@ -1643,36 +1754,6 @@ class DesktopReleaseProvider:
                 **self._page_arguments(arguments),
             ),
         )
-
-    def _create_diagnostic(self, arguments: Mapping[str, object]) -> object:
-        return self._invoke_active_core(
-            "createDiagnostic",
-            lambda bridge, project: bridge.create_diagnostic(
-                project,
-                cast(local_v1.DiagnosticRequestV1, arguments["request"]),
-                idempotency_key=cast(str, arguments["idempotency_key"]),
-            ),
-        )
-
-    def _get_diagnostic(self, arguments: Mapping[str, object]) -> object:
-        return self._invoke_active_core(
-            "getDiagnostic",
-            lambda bridge, project: bridge.get_diagnostic(
-                project, cast(str, arguments["diagnostic_id"])
-            ),
-        )
-
-    def _delete_diagnostic(self, arguments: Mapping[str, object]) -> Response:
-        self._invoke_active_core(
-            "deleteDiagnostic",
-            lambda bridge, project: bridge.delete_diagnostic(
-                project,
-                cast(str, arguments["diagnostic_id"]),
-                if_match=cast(str, arguments["if_match"]),
-                idempotency_key=cast(str, arguments["idempotency_key"]),
-            ),
-        )
-        return Response(status_code=204)
 
     def _cleanup_caches(self, arguments: Mapping[str, object]) -> object:
         return self._invoke_active_core(
@@ -1972,6 +2053,7 @@ class DesktopReleaseProvider:
 __all__ = (
     "ActiveProjectMismatchError",
     "DesktopReleaseProvider",
+    "EvolutionConfigurationPendingError",
     "ExecutionModeReleaseUnavailableError",
     "InvalidNativeChallengeError",
     "NATIVE_SIDECAR_PROTOCOL",

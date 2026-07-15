@@ -37,7 +37,6 @@ import type {
   ArtifactContentV1,
   ArtifactDiffV1,
   ArtifactV1,
-  DiagnosticReportV1,
   ExecutionModeCapabilitiesV1,
   ExecutionModeCapabilityV1,
   LogEntryV1,
@@ -290,7 +289,7 @@ export function DesktopProductApp({
       ? snapshot.activeOperation.resource.resource_id
       : snapshot.state.active_project?.project_id ?? null;
     const setupProject = snapshot.projects.find((item) => item.project_id === setupProjectId);
-    if (!setupProject || Object.keys(setupProject.evolution.targets).length > 0) return;
+    if (!setupProject || setupProject.evolution_configuration_state !== "pending") return;
     if (recoveredProjectSetup.current === setupProject.project_id) return;
     recoveredProjectSetup.current = setupProject.project_id;
     setSelectedProjectId(setupProject.project_id);
@@ -469,17 +468,11 @@ export function DesktopProductApp({
           {workspace === "system" ? (
             <SystemWorkspace
               snapshot={snapshot}
-              project={project}
               profile={profile}
               services={projectServices}
               projectSessionReady={projectSessionReady}
               busy={actionState === "working"}
               onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id, resourceIntent(snapshot, profile.etag)))}
-              onRunDiagnostics={() => project && void act(() => provider.runProjectDiagnostics(project.project_id, resourceIntent(snapshot, project.etag)))}
-              onRestart={(serviceId) => {
-                const service = projectServices.find((item) => item.id === serviceId);
-                if (service) void act(() => provider.restartService(serviceId, resourceIntent(snapshot, service.etag)));
-              }}
               onConfigure={() => setConnectionSettingsOpen(true)}
             />
           ) : null}
@@ -511,12 +504,18 @@ export function DesktopProductApp({
             let pendingSourceOutcome: SaveAttemptResult["pendingSourceOutcome"] = null;
             const result = await act(async () => {
               if (requestProject) {
-                await provider.updateProject(requestProject.project_id, input, resourceIntent(snapshot, requestProject.etag, actionId));
+                await provider.updateProject(
+                  requestProject.project_id,
+                  requestProject.evolution_configuration_state === "pending"
+                    ? { ...input, evolution_configuration_state: "configured" }
+                    : input,
+                  resourceIntent(snapshot, requestProject.etag, actionId),
+                );
                 if (pendingSourceActionId) {
                   await provider.settleProjectSource(pendingSourceActionId, "adopt");
                   pendingSourceOutcome = "adopted";
                 }
-                if (Object.keys(requestProject.evolution.targets).length === 0) {
+                if (requestProject.evolution_configuration_state === "pending") {
                   const afterUpdate = await refresh("mutation");
                   const updated = afterUpdate?.projects.find((item) => item.project_id === requestProject.project_id);
                   if (!afterUpdate || !updated) {
@@ -538,6 +537,7 @@ export function DesktopProductApp({
                     source: input.source ?? { kind: "scratch", display_name: "New workspace" },
                     execution: input.execution ?? subscriptionExecution(DEFAULT_CODEX_MODEL),
                     evolution: input.evolution ?? { targets: {} },
+                    evolution_configuration_state: "pending",
                   }, mutationIntent(snapshot, actionId));
                   pending = { projectId: created.project_id, activationActionId: `${actionId}-activate` };
                   pendingProjectActivation.current = pending;
@@ -941,7 +941,7 @@ function ConnectionGate({
   if (core.state === "online" && core.profile_id === profileId) return null;
   if (!hasProject && core.state === "offline" && core.failure?.code === "core_not_started" && profile?.connection_state === "connected") return null;
   if (core.state === "degraded") {
-    return <InlineNotice tone="warning" title="Remote workspace needs attention" detail={core.failure?.message ?? "Open System to review remote diagnostics."} />;
+    return <InlineNotice tone="warning" title="Remote workspace needs attention" detail={core.failure?.message ?? "Open System to review service status and operation logs."} />;
   }
   if (core.state === "host_key_review" && core.host_key_review && profileId) {
     return (
@@ -1438,7 +1438,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
       ) : orderedArtifacts.length === 0 ? (
         evolutionEnabled
           ? <EmptyState icon={MemoryStick} title="No evolved artifacts yet" detail="Complete a session to create memory, skills, and agent guidance for the next revision." />
-          : <EmptyState icon={Settings} title="Evolution is not configured" detail="Choose evolution targets for future sessions." action="Configure evolution" actionIcon={Settings} onAction={onOpenSettings} />
+          : <EmptyState icon={Settings} title="Evolution is off" detail="No evolution targets are enabled for future sessions." action="Configure evolution" actionIcon={Settings} onAction={onOpenSettings} />
       ) : (
         <div className="artifact-layout">
           <aside className="artifact-list" aria-label="Evolution artifacts">
@@ -1520,13 +1520,11 @@ function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
   );
 }
 
-function SystemWorkspace({ snapshot, project, profile, services, projectSessionReady, busy, onConnect, onRunDiagnostics, onRestart, onConfigure }: { snapshot: DesktopProductSnapshot; project: ProjectV1 | null; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onRunDiagnostics: () => void; onRestart: (serviceId: string) => void; onConfigure: () => void }) {
+function SystemWorkspace({ snapshot, profile, services, projectSessionReady, busy, onConnect, onConfigure }: { snapshot: DesktopProductSnapshot; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onConfigure: () => void }) {
   const core = snapshot.state.core;
-  const diagnostic = projectSessionReady ? snapshot.diagnostic : null;
-  const diagnosticPresentation = diagnostic ? presentDiagnostic(diagnostic) : null;
   return (
     <div className="workspace-stack" data-testid="system-workspace">
-      <div className="workspace-heading"><div><p className="eyebrow">System</p><h1>Remote environment</h1><p>Connection, environment checks, and model availability.</p></div></div>
+      <div className="workspace-heading"><div><p className="eyebrow">System</p><h1>Remote environment</h1><p>Connection, service status, and model availability.</p></div></div>
       <div className="system-grid">
         <section className="product-panel connection-panel">
           <div className="panel-heading"><div><span className="panel-kicker">Connection</span><h2>{profile?.name ?? "No remote workspace"}</h2></div><StatePill state={core.state} /></div>
@@ -1542,18 +1540,11 @@ function SystemWorkspace({ snapshot, project, profile, services, projectSessionR
             {profile && core.state !== "online" ? <button className="secondary-button" type="button" onClick={onConnect} disabled={busy || isConnectionBusy(core.state) || missingCredentialReason(profile) !== null} title={busy ? "A connection action is already running" : missingCredentialReason(profile) ?? "Reconnect remote workspace"}><RefreshCw size={15} /> Reconnect</button> : null}
           </div>
         </section>
-        <section className="product-panel checks-panel">
-          <div className="panel-heading"><div><span className="panel-kicker">Environment checks</span><h2>{diagnosticPresentation?.heading ?? "Ready to check"}</h2></div><button className="icon-button" type="button" aria-label="Run diagnostics" title="Run remote project checks" onClick={onRunDiagnostics} disabled={busy || !projectSessionReady || !project}><RefreshCw className={diagnostic?.status === "queued" || diagnostic?.status === "running" ? "spin" : undefined} size={16} /></button></div>
-          <div className="check-list">
-            {diagnostic?.checks.map((check) => <div className="check-row" key={check.id}>{check.status === "ok" ? <CheckCircle2 className="good" size={18} /> : check.status === "warning" ? <AlertCircle className="warn" size={18} /> : <CircleDot size={18} />}<div><strong>{stateLabel(check.scope)}</strong><span>{check.message}</span></div></div>)}
-            {!diagnostic ? <div className="empty-row">Run checks after the project session is ready.</div> : null}
-          </div>
-        </section>
       </div>
       <section className="services-section">
         <div className="section-heading"><div><Activity size={17} /><h2>Services</h2></div><span>{services.filter((service) => service.status === "running").length} of {services.length} ready</span></div>
         <div className="service-list">
-          {services.map((service) => <ServiceRow key={service.id} service={service} busy={busy} onRestart={() => onRestart(service.id)} />)}
+          {services.map((service) => <ServiceRow key={service.id} service={service} />)}
           {!services.length ? <div className="empty-row">Services are unavailable for this project.</div> : null}
         </div>
       </section>
@@ -1561,13 +1552,13 @@ function SystemWorkspace({ snapshot, project, profile, services, projectSessionR
   );
 }
 
-function ServiceRow({ service, busy, onRestart }: { service: ServiceV1; busy: boolean; onRestart: () => void }) {
+function ServiceRow({ service }: { service: ServiceV1 }) {
   return (
     <div className="service-row">
       <span className={`service-indicator ${service.status}`} />
       <div><strong>{service.display_name}</strong><span>{service.status_message ?? stateLabel(service.status)}</span></div>
       <StatePill state={service.status} />
-      {service.restartable && ["degraded", "failed", "stopped"].includes(service.status) ? <IconButton label={`Restart ${service.display_name}`} onClick={onRestart} disabled={busy}><RefreshCw size={15} /></IconButton> : <span className="service-spacer" />}
+      <span className="service-spacer" />
     </div>
   );
 }
@@ -1766,7 +1757,7 @@ function SettingsDrawer({
     ? mode
     : firstSupportedExecutionMode(executionModeCapabilities)?.mode;
   const modeCapabilities = capabilities && capabilityExecutionMode(capabilities) === mode ? capabilities : null;
-  const incompleteSetup = project !== null && Object.keys(project.evolution.targets).length === 0;
+  const incompleteSetup = project?.evolution_configuration_state === "pending";
   const capabilityMatchesDraft = Boolean(project
     && capability
     && capability.projectId === project.project_id
@@ -1845,8 +1836,7 @@ function SettingsDrawer({
     saveActionId.current = newActionId();
     setDirty(true);
   }, [incompleteSetup, modeCapabilities, rows]);
-  const requiredSetupRows = REQUIRED_EVOLUTION_TARGETS.map((targetId) => rows.find((row) => row.targetId === targetId));
-  const setupReady = !incompleteSetup || (modeCapabilities !== null && requiredSetupRows.every((row) => row?.selection.enabled && row.valid));
+  const setupReady = !incompleteSetup || (modeCapabilities !== null && rows.every((row) => !row.selection.enabled || row.valid));
   const valid = name.trim().length > 0
     && title.trim().length > 0
     && objective.trim().length > 0
@@ -2318,6 +2308,7 @@ function getProjectActivationReason(
 
 function getStartReason(snapshot: DesktopProductSnapshot, project: ProjectV1 | null, profile: RemoteProfileV1 | null, activeRun: RunV1 | null, actionState: AsyncState): string | null {
   if (!project) return "Create or select a project first.";
+  if (project.evolution_configuration_state === "pending") return "Finish evolution setup before starting a session.";
   const modeCapability = executionModeCapability(snapshot.executionModeCapabilities, project.execution.mode);
   if (modeCapability.support_state !== "supported") return modeCapability.message;
   if (snapshot.stream.status !== "fresh") return "Refresh this view before starting a session.";
@@ -2374,18 +2365,6 @@ function connectionLabel(state: DesktopProductSnapshot["state"]["core"]["state"]
 function stateLabel(state: string): string {
   const labels: Record<string, string> = { queued: "Queued", preparing: "Preparing", running: "Running", cancelling: "Cancelling", succeeded: "Complete", failed: "Failed", cancelled: "Cancelled", active: "Active", healthy: "Healthy", degraded: "Needs attention", stopped: "Stopped", unavailable: "Unavailable", starting: "Starting", offline: "Offline", online: "Online", blocked: "Blocked" };
   return labels[state] ?? state.replaceAll("_", " ");
-}
-
-function presentDiagnostic(diagnostic: DiagnosticReportV1): { heading: string; pillState: string } {
-  if (diagnostic.status === "failed") return { heading: "Action required", pillState: "failed" };
-  if (diagnostic.status === "running") return { heading: "Checks in progress", pillState: "running" };
-  if (diagnostic.status === "queued") return { heading: "Checks queued", pillState: "queued" };
-  const nonPassing = diagnostic.checks.filter((check) => check.status !== "ok");
-  if (nonPassing.some((check) => check.status === "blocking" || check.status === "unavailable")) {
-    return { heading: "Checks require attention", pillState: "degraded" };
-  }
-  if (nonPassing.length > 0) return { heading: "Checks completed with warnings", pillState: "degraded" };
-  return { heading: "All checks passed", pillState: "healthy" };
 }
 
 function artifactTypeLabel(type: string): string {

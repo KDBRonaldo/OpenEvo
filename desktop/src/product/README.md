@@ -38,7 +38,7 @@ default selection, and Save/Activate/Start gates consume this single object.
 Missing, duplicate, or unknown mode entries fail state parsing; the renderer has
 no static support table or fixture fallback. The capability describes shipped
 release support and is deliberately separate from remote model/service
-diagnostics. Contract simulator scenarios may supply validated alternate states
+observations. Contract simulator scenarios may supply validated alternate states
 only in test and Vite preview builds.
 
 The first-run renderer exposes one next action at a time. Until a remote profile
@@ -49,8 +49,11 @@ first saves and activates a minimal draft to establish the project tunnel, then
 loads that project's remote capabilities and initializes `text_memory`,
 `skill_bundle`, and `agent_system` from the remote effective defaults. The
 drawer stays open for review and the second save validates and activates the
-configured draft. Refreshing an empty-target prepared draft reopens this stage;
-it cannot appear complete or become runnable with an accidental empty map.
+configured draft. `ProjectV1.evolution_configuration_state` is the durable
+authority for this stage: only `pending` reopens or blocks a run. The three
+targets are independent switches and the explicit second save may configure all
+of them off; `configured` with an empty target map remains complete and runnable.
+Older projects migrate deterministically to `configured`.
 
 `LocalApiDesktopProductProvider` is the release adapter. It aggregates all
 bounded cursor pages, reloads exact run details, and marks artifacts complete
@@ -139,12 +142,12 @@ sync is not exposed by the release provider. Initial folder selection creates a
 real immutable native snapshot used by activation; selecting the folder again
 creates the replacement snapshot when project content changes.
 
-The System view invokes project diagnostics through the active project tunnel
-and exposes service restart only for Core services that declare restart support.
-It does not show local repair controls because the release provider has no repair
-handler. Nonterminal local connect/bootstrap/activation operations expose the
-frozen Local API cancel action and return to the authoritative disconnected or
-draft state before retry.
+The System view exposes connection and read-only service state. It does not show
+diagnostics, service restart, repair, or workspace-sync controls because the
+release provider has no verified handlers for them. Nonterminal local
+connect/bootstrap/activation operations expose the frozen Local API cancel
+action, interrupt their exact transport/process/tunnel authority, and return to
+the authoritative disconnected or draft state before retry.
 
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation
@@ -156,7 +159,7 @@ leave an unowned sidecar or publish/reuse their session token. A bounded native
 cleanup failure remains visible as retryable startup failure.
 
 The Local API release digest is
-`e3bc443ee213eb33de81b82c7f954fb617fab14b8a2c17e154f3d4b980ba441f`.
+`07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861`.
 The checked-in TypeScript mirror and contract fixtures use that frozen digest.
 The product UI and simulator consume the final Local/Core v1 DTOs directly and
 construct simulator resources through the same strict Zod schemas as release
@@ -198,11 +201,12 @@ instead of rewriting a terminal attempt. Service rows consume `ServiceV1.id`,
 model-service projection only when the selected `ProjectV1` exactly matches the
 active project's project ID, profile ID, and ETag and that connection is ready.
 Selecting project B while A is active, or losing A's tunnel, produces an empty
-service view; restart lookup uses that same gated collection and cannot target
-A through B's screen. An active project whose connection is no longer ready
-shows activation again so it can establish a new session. Service restart
-returns the typed Core `OperationV1`; connection, activation, and workspace
-mutations continue to use the separate local `LocalOperationV1` lifecycle. HTTP
+service view. Services are read-only in this release; the frozen restart route
+remains reserved and the release provider returns
+`provider_capability_unavailable` if it is called directly. An active project
+whose connection is no longer ready shows activation again so it can establish
+a new session. Connection and activation mutations use the local
+`LocalOperationV1` lifecycle. HTTP
 409, 410, and 412 responses trigger an
 authoritative snapshot reload; an expired cursor is reset before reload.
 Re-admission is offered only for an allowlisted retryable admission conflict

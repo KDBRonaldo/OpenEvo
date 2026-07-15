@@ -181,6 +181,7 @@
         }
       }
     },
+    "evolution_configuration_state": "configured",
     "execution": {
       "hf_model": "open-models/research-model-fixture-1",
       "mode": "self-deployed"
@@ -222,7 +223,7 @@
     "contract": {
       "compatible": true,
       "core_openapi_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "desktop_openapi_sha256": "e3bc443ee213eb33de81b82c7f954fb617fab14b8a2c17e154f3d4b980ba441f",
+      "desktop_openapi_sha256": "07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861",
       "selected_major": 1
     },
     "core": {

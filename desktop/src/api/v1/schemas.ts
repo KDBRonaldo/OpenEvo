@@ -363,6 +363,7 @@ export const evolutionConfigV1Schema = z
   .object({ targets: evolutionSelectionsV1Schema })
   .strict()
   .refine((value) => utf8ByteLength(JSON.stringify(value)) <= 1_048_576, "evolution config exceeds the aggregate byte budget");
+export const evolutionConfigurationStateV1Schema = z.enum(["pending", "configured"]);
 const projectFields = {
   name: projectDisplayNameSchema,
   profile_id: opaqueIdSchema,
@@ -370,8 +371,12 @@ const projectFields = {
   source: projectSourceV1Schema,
   execution: executionSettingsV1Schema,
   evolution: evolutionConfigV1Schema,
+  evolution_configuration_state: evolutionConfigurationStateV1Schema,
 };
-export const projectCreateV1Schema = z.object(projectFields).strict();
+export const projectCreateV1Schema = z.object({
+  ...projectFields,
+  evolution_configuration_state: evolutionConfigurationStateV1Schema.default("configured"),
+}).strict();
 export const projectPatchV1Schema = z.object(projectFields).partial().strict().refine((value) => Object.keys(value).length > 0, "project patch must not be empty");
 
 export const revisionRefV1Schema = z

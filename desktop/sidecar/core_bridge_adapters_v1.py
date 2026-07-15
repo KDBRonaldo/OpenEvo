@@ -81,6 +81,8 @@ class _CoreTunnelEndpoint(Protocol):
 
 
 class _CoreSshTransport(Protocol):
+    def close(self) -> None: ...
+
     def select_core_python_runtime(
         self, *, timeout_seconds: float
     ) -> CorePythonRuntimeAuthority: ...

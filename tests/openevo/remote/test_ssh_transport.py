@@ -493,6 +493,57 @@ def test_run_maps_remote_nonzero_exit_without_throwing(tmp_path: Path) -> None:
     assert result.stderr == "err"
 
 
+def test_transport_close_interrupts_an_active_default_runner_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=_trusted_binding(tmp_path, profile),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_ssh_argv",
+        lambda _command, _known_hosts: [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+        ],
+    )
+    outcome: list[object] = []
+
+    def run() -> None:
+        try:
+            outcome.append(transport.run("true", timeout_seconds=30))
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    deadline = time.monotonic() + 2
+    while True:
+        with transport._operation_guard:
+            active = bool(transport._active_subprocesses)
+        if active:
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError("transport subprocess did not start")
+        time.sleep(0.01)
+
+    started = time.monotonic()
+    transport.close()
+    elapsed = time.monotonic() - started
+    worker.join(timeout=2)
+
+    assert elapsed < 0.5
+    assert not worker.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], SshTransportError)
+    with transport._operation_guard:
+        assert transport._active_subprocesses == set()
+
+
 def test_run_preserves_verified_remote_exit_255(tmp_path: Path) -> None:
     class Remote255Runner(RecordingRunner):
         def __call__(

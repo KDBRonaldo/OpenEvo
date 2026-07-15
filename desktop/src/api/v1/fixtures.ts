@@ -4,7 +4,7 @@ const C = "c".repeat(64);
 const ETAG_A = `"${A}"`;
 const ETAG_B = `"${B}"`;
 const NOW = "2026-07-14T12:00:00Z";
-const OPENAPI_DIGEST = "e3bc443ee213eb33de81b82c7f954fb617fab14b8a2c17e154f3d4b980ba441f";
+const OPENAPI_DIGEST = "07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861";
 
 export const RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1 = {
   schema_version: "1",
@@ -257,6 +257,7 @@ export const CONTRACT_FIXTURE_V1 = {
         skill_bundle: { enabled: false, method: null, config: {} },
       },
     },
+    evolution_configuration_state: "configured",
     state: "active",
     remote: {
       core_project_id: "project-fixture-1",

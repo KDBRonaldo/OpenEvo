@@ -11,10 +11,8 @@ import {
   type ArtifactContentV1,
   type ArtifactDiffV1,
   type ArtifactV1,
-  type DiagnosticReportV1,
   type LocalOperationV1,
   type LogEntryV1,
-  type OperationV1,
   type PageV1,
   type ProjectCapabilitiesV1,
   type ProjectSourceV1,
@@ -103,7 +101,6 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
   private streamAbort: AbortController | null = null;
   private streamPromise: Promise<void> | null = null;
   private waitingForRefresh = false;
-  private diagnostic: DiagnosticReportV1 | null = null;
 
   constructor(options: LocalApiDesktopProductProviderOptions) {
     this.client = options.client;
@@ -361,43 +358,6 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     return operation;
   }
 
-  async runProjectDiagnostics(
-    projectId: string,
-    intent: ProductResourceMutationIntent,
-  ): Promise<DiagnosticReportV1> {
-    this.assertIntent(intent);
-    const project = this.snapshot?.projects.find((item) => item.project_id === projectId);
-    const coreProjectId = project?.remote?.core_project_id;
-    if (!project || coreProjectId === undefined) {
-      throw new DesktopContractError("Project diagnostics require an active remote project identity");
-    }
-    const diagnostic = await this.client.createDiagnostic({
-      scopes: ["project"],
-      target: { kind: "project", project_id: coreProjectId },
-    }, { idempotencyKey: intent.actionId });
-    if (diagnostic.target.kind !== "project" || diagnostic.target.project_id !== coreProjectId) {
-      throw new DesktopContractError("Project diagnostics returned a report for another project");
-    }
-    this.diagnostic = diagnostic;
-    this.invalidate();
-    return diagnostic;
-  }
-
-  async restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<OperationV1> {
-    this.assertIntent(intent);
-    if (!this.snapshot?.services.some((service) => service.id === serviceId)) {
-      throw new DesktopContractError("Service restart references a service outside the current snapshot");
-    }
-    const operation = await this.client.restartService(serviceId, actionOptions(intent));
-    if (operation.kind !== "service_restart"
-      || operation.request.kind !== "service_restart"
-      || operation.request.service_id !== serviceId) {
-      throw new DesktopContractError("Service restart returned an operation for another service");
-    }
-    this.invalidate();
-    return operation;
-  }
-
   private async loadSnapshot(): Promise<Omit<DesktopProductSnapshot, "stream">> {
     const budget = new RefreshBudget();
     const [state, profiles, projects] = await Promise.all([
@@ -494,18 +454,6 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     }
     const activeOperation = await this.loadActiveOperation(state.pending_operation_ids, budget);
     const { capability, validation } = await this.loadProjectAuthority(state, projects, profiles);
-    let diagnostic = this.diagnostic;
-    const activeCoreProjectId = projects.find(
-      (project) => project.project_id === state.active_project?.project_id,
-    )?.remote?.core_project_id;
-    if (diagnostic?.target.kind === "project" && diagnostic.target.project_id !== activeCoreProjectId) {
-      diagnostic = null;
-      this.diagnostic = null;
-    } else if (diagnostic && !["succeeded", "failed"].includes(diagnostic.status)) {
-      diagnostic = await this.client.getDiagnostic(diagnostic.id);
-      this.diagnostic = diagnostic;
-    }
-
     return {
       state,
       executionModeCapabilities: state.execution_mode_capabilities,
@@ -520,7 +468,6 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
       services,
       capability,
       validation,
-      diagnostic,
       activeOperation,
     };
   }
@@ -884,7 +831,10 @@ function assertProfileFields(
   }
 }
 
-type ProjectFields = Pick<ProjectV1, "name" | "profile_id" | "task" | "source" | "execution" | "evolution">;
+type ProjectFields = Pick<
+  ProjectV1,
+  "name" | "profile_id" | "task" | "source" | "execution" | "evolution" | "evolution_configuration_state"
+>;
 
 function assertProjectFields(
   project: ProjectV1,
@@ -896,7 +846,9 @@ function assertProjectFields(
     || (expected.task !== undefined && !sameJson(project.task, expected.task))
     || (expected.source !== undefined && !sameJson(project.source, expected.source))
     || (expected.execution !== undefined && !sameJson(project.execution, expected.execution))
-    || (expected.evolution !== undefined && !sameJson(project.evolution, expected.evolution))) {
+    || (expected.evolution !== undefined && !sameJson(project.evolution, expected.evolution))
+    || (expected.evolution_configuration_state !== undefined
+      && project.evolution_configuration_state !== expected.evolution_configuration_state)) {
     throw new DesktopContractError(message);
   }
 }

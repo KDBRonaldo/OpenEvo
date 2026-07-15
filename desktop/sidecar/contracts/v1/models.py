@@ -737,6 +737,7 @@ class ProjectCreateV1(StrictModel):
     source: ProjectSourceV1
     execution: ExecutionSettingsV1
     evolution: EvolutionConfigV1
+    evolution_configuration_state: Literal["pending", "configured"] = "configured"
 
 
 class ProjectPatchV1(PatchModel):
@@ -746,6 +747,7 @@ class ProjectPatchV1(PatchModel):
     source: ProjectSourceV1 | None = None
     execution: ExecutionSettingsV1 | None = None
     evolution: EvolutionConfigV1 | None = None
+    evolution_configuration_state: Literal["pending", "configured"] | None = None
 
     @model_validator(mode="after")
     def _not_empty(self) -> ProjectPatchV1:
@@ -791,6 +793,7 @@ class ProjectV1(StrictModel):
     source: ProjectSourceV1
     execution: ExecutionSettingsV1
     evolution: EvolutionConfigV1
+    evolution_configuration_state: Literal["pending", "configured"]
     state: Literal["draft", "active", "archived", "blocked"]
     remote: RemoteProjectStateV1 | None = None
     etag: ETag

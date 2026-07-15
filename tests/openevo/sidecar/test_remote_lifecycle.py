@@ -381,7 +381,13 @@ def test_expired_host_key_persistence_budget_prevents_transport_construction() -
 def test_disconnect_supersedes_a_late_connect_and_closes_its_transport() -> None:
     started = Event()
     release = Event()
-    transport = FakeTransport(started=started, release=release)
+
+    class InterruptibleTransport(FakeTransport):
+        def close(self) -> None:
+            super().close()
+            release.set()
+
+    transport = InterruptibleTransport(started=started, release=release)
     host_keys = FakeHostKeys((_candidate(),), loaded=object())
     lifecycle = DesktopRemoteLifecycle(
         cast(object, host_keys), transport_factory=lambda *_: transport
@@ -398,7 +404,6 @@ def test_disconnect_supersedes_a_late_connect_and_closes_its_transport() -> None
     thread.start()
     assert started.wait(2)
     lifecycle.disconnect("profile-1")
-    release.set()
     thread.join(2)
 
     assert not thread.is_alive()

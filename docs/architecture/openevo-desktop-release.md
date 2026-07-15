@@ -302,6 +302,10 @@ expected digest has one build-time source of truth,
 `DESKTOP_LOCAL_API_OPENAPI_SHA256`; it contains the final frozen Local API v1
 OpenAPI digest. Exact bootstrap and version tests consume that same native
 constant.
+The release contract requires only `remote_profiles`, `project_validation`,
+`operation_events`, `run_observability`, and `artifact_inspection`.
+`service_control` and `diagnostics` remain valid future enum values but are not
+advertised by this release because their Core owners are unavailable.
 Native readiness also requires `GET /openevo-api/desktop/shell` to return 404,
 so the old shell token route cannot remain in a release sidecar inventory.
 It then calls the hidden no-side-effect native session probe with
@@ -613,7 +617,10 @@ current `connecting` owner, and creates a running local operation before
 external work. A process-wide action lock spans that entire sequence, including
 the SSH call and terminal publication, for all profiles and idempotency keys; the
 provider reservation order therefore cannot diverge from lifecycle invocation
-order. The action then either loads an exact profile/host/port/fingerprint trust
+order. The sidecar publishes a state invalidation after that reservation and
+another after terminal publication, so the renderer can observe and cancel the
+running operation while the original connect request is blocked. The action
+then either loads an exact profile/host/port/fingerprint trust
 binding or performs a non-mutating `ssh-keyscan`. A new key is returned only as
 an explicit `host_key_review` state. Acceptance repeats the probe, requires the
 same algorithm and fingerprint, publishes the private known-host binding, and
@@ -621,6 +628,12 @@ runs a bounded SSH connectivity check. Success, failure, and crash cancellation
 update the reserved profile, operation, and idempotency response in one
 transaction, so concurrent capacity consumption and the request's now-stale
 ETag cannot break finalization.
+The lifecycle registers a newly constructed transport as a generation-bound
+candidate before the connectivity command starts. `cancelLocalOperation` or
+disconnect removes that candidate under the lifecycle lock, then closes it
+outside the lock; the close interrupts owned subprocesses and causes the
+superseded connect call to exit without publishing a late connected state.
+Terminal cancel replay does not close the lifecycle a second time.
 Disconnect reservations are non-displacing and do not publish `connecting`; the
 sidecar checks the process lifecycle owner before invoking disconnect, so a
 request for profile B cannot rewrite profile A or close A's transport. A

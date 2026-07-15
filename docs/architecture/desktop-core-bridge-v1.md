@@ -292,6 +292,16 @@ publication. Failed-candidate retirement receives a separate bounded cleanup
 window so resource ownership is not abandoned when the forward deadline
 expires.
 
+Each release activation also binds the exact Local operation ID to a cancellation
+event on its candidate token. Cancelling another ID cannot affect it. Cancelling
+the owner sets that event, cancels queued adapter futures, requests Core client
+and tunnel closure, and disconnects the lifecycle transport outside provider
+locks. The transport sends termination to its owned SSH subprocess groups and
+rejects their late results. The serialized project executor releases the worker
+after a bounded join, so retry and provider shutdown do not wait for the original
+300-second activation deadline. A late adapter success or failure is gated by
+the cancelled generation and cannot publish mapping, activation, or online state.
+
 Potentially blocking Python adapters execute on a fixed-size, bounded daemon
 executor. Deadline expiry stops delivery immediately; unfinished work remains
 owned by the cancelled generation, and successful close/switch waits for it.
@@ -364,10 +374,13 @@ and revision authority without requiring a new Local ETag because it does not
 change the saved Local binding.
 
 Run list/get/cancel/retry/timeline/log/context, artifacts, services, Core
-operations and referenced logs, diagnostics, maintenance, and events delegate
-to `CoreControlClientV1`. Every one of these bridge methods now also accepts the
-complete saved Local `ProjectV1` and verifies it against the active generation
-before transport. The provider holds its project-session transition lock from
+operations and referenced logs, diagnostics, maintenance, and events have
+strict `CoreControlClientV1` bridge methods. Every method accepts the complete
+saved Local `ProjectV1` and verifies it against the active generation before
+transport, but bridge availability alone does not make a release feature. The
+current release provider exposes read-only services and omits diagnostic,
+maintenance, and service-mutation handlers because their Core owners return
+typed unavailable responses. The provider holds its project-session transition lock from
 that Local lookup through result delivery, so an active-project edit cannot
 retire and replace the session while an old request is being returned. Core DTOs
 are returned unchanged. The strict client
@@ -385,8 +398,10 @@ Packaged startup composes `DesktopCoreSshBridgeAdapterV1`,
 `DesktopEventBrokerV1`, and the Core event relay through the single owner in
 `release_runtime.py`. The exact embedded wheel/framework-lock pair is verified
 before construction, and the dedicated bridge state is rooted under the private
-Desktop provider state. The provider advertises all frozen release feature flags
-only when both the owned bridge and broker are present. A missing or invalid
+Desktop provider state. The provider advertises exactly `remote_profiles`,
+`project_validation`, `operation_events`, `run_observability`, and
+`artifact_inspection` when both the owned bridge and broker are present. It does
+not advertise `service_control` or `diagnostics`. A missing or invalid
 asset pair, bridge, broker, or active project fails closed; there is no reduced
 release composition or direct-backend fallback.
 

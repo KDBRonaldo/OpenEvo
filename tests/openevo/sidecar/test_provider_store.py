@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import errno
 import hmac
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -98,6 +99,170 @@ def _project(profile_id: str, *, name: str = "Protein design") -> dict[str, obje
             }
         },
     }
+
+
+def test_project_evolution_configuration_state_is_explicit_and_zero_targets_are_valid(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+
+    legacy_default = store.create_project(
+        {**_project(profile.profile_id), "evolution": {"targets": {}}},
+        idempotency_key="project-configured-default-0001",
+    )
+    pending = store.create_project(
+        {
+            **_project(profile.profile_id, name="Pending setup"),
+            "evolution": {"targets": {}},
+            "evolution_configuration_state": "pending",
+        },
+        idempotency_key="project-pending-setup-0001",
+    )
+
+    assert legacy_default.evolution_configuration_state == "configured"
+    assert pending.evolution_configuration_state == "pending"
+    configured = store.patch_project(
+        pending.project_id,
+        {
+            "evolution": {"targets": {}},
+            "evolution_configuration_state": "configured",
+        },
+        if_match=pending.etag,
+    )
+    assert configured.evolution_configuration_state == "configured"
+    assert configured.evolution.targets.root == {}
+
+    store.close()
+    reopened = DesktopProviderStore(tmp_path / "state")
+    assert reopened.get_project(legacy_default.project_id).evolution_configuration_state == (
+        "configured"
+    )
+    assert reopened.get_project(pending.project_id).evolution_configuration_state == "configured"
+
+
+def test_v5_projects_migrate_to_configured_without_inferring_from_targets(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        {**_project(profile.profile_id), "evolution": {"targets": {}}},
+        idempotency_key="project-v5-migration-0001",
+    )
+    store.close()
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.row_factory = sqlite3.Row
+        for table, _columns in provider_store_module._RECOVERY_USAGE_SPECIFICATIONS:
+            for operation in ("insert", "update", "delete"):
+                connection.execute(f"DROP TRIGGER provider_usage_{table}_{operation}")
+        for trigger_name in (
+            "provider_storage_usage_no_insert",
+            "provider_storage_usage_no_delete",
+            "schema_migrations_no_insert",
+            "schema_migrations_no_update",
+            "schema_migrations_no_delete",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger_name}")
+
+        project_document = json.loads(
+            bytes(
+                connection.execute(
+                    "SELECT document_json FROM projects WHERE project_id = ?",
+                    (project.project_id,),
+                ).fetchone()[0]
+            )
+        )
+        assert project_document.pop("evolution_configuration_state") == "configured"
+        connection.execute(
+            "UPDATE projects SET document_json = ? WHERE project_id = ?",
+            (
+                provider_store_module._canonical_json_bytes(project_document),
+                project.project_id,
+            ),
+        )
+        replay = json.loads(
+            bytes(
+                connection.execute(
+                    """
+                    SELECT response_bytes FROM idempotency_records
+                    WHERE idempotency_key = 'project-v5-migration-0001'
+                    """
+                ).fetchone()[0]
+            )
+        )
+        assert replay.pop("evolution_configuration_state") == "configured"
+        connection.execute(
+            """
+            UPDATE idempotency_records SET response_bytes = ?
+            WHERE idempotency_key = 'project-v5-migration-0001'
+            """,
+            (provider_store_module._canonical_json_bytes(replay),),
+        )
+
+        connection.execute("ALTER TABLE schema_migrations RENAME TO schema_migrations_v6")
+        connection.execute(provider_store_module._SCHEMA_V5[0])
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, applied_at)
+            SELECT version, applied_at FROM schema_migrations_v6 WHERE version <= 5
+            ORDER BY version
+            """
+        )
+        connection.execute("DROP TABLE schema_migrations_v6")
+        connection.execute("DROP TABLE provider_storage_usage")
+        connection.execute(provider_store_module._PROVIDER_STORAGE_USAGE_TABLE_V5)
+        total_rows, total_bytes = DesktopProviderStore._recovery_usage(connection)
+        idempotency_count = connection.execute(
+            "SELECT count(*) FROM idempotency_records"
+        ).fetchone()[0]
+        values = (
+            total_rows,
+            total_bytes,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            idempotency_count,
+            0,
+            0,
+        )
+        authority_tag = hmac.digest(
+            (root / "cursor-signing.key").read_bytes(),
+            provider_store_module._PROVIDER_STORAGE_USAGE_AUTHORITY_DOMAIN
+            + struct.pack(f">{len(values)}Q", *values),
+            "sha256",
+        )
+        connection.execute(
+            "INSERT INTO provider_storage_usage VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*values, authority_tag),
+        )
+        for statement in (
+            *provider_store_module._PROVIDER_USAGE_MAINTENANCE_TRIGGERS_V5,
+            provider_store_module._PROVIDER_USAGE_INSERT_GUARD_V5,
+            provider_store_module._PROVIDER_USAGE_DELETE_GUARD_V5,
+            provider_store_module._SCHEMA_MIGRATION_INSERT_GUARD_V5,
+            provider_store_module._SCHEMA_MIGRATION_UPDATE_GUARD_V5,
+            provider_store_module._SCHEMA_MIGRATION_DELETE_GUARD_V5,
+        ):
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 5")
+
+    migrated = DesktopProviderStore(root)
+    restored = migrated.get_project(project.project_id)
+    assert restored.evolution_configuration_state == "configured"
+    assert restored.evolution.targets.root == {}
+    replayed = migrated.create_project(
+        {**_project(profile.profile_id), "evolution": {"targets": {}}},
+        idempotency_key="project-v5-migration-0001",
+    )
+    assert replayed == restored
 
 
 def _create_profile(
@@ -265,7 +430,7 @@ def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
     }
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in managed_files)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (6,)
     assert tuple(store._connection.execute("PRAGMA journal_mode").fetchone()) == ("delete",)
     assert tuple(store._connection.execute("PRAGMA max_page_count").fetchone()) == (
         store._max_page_count,
@@ -278,13 +443,13 @@ def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,), (4,), (5,)]
+    ] == [(1,), (2,), (3,), (4,), (5,), (6,)]
     assert tuple(
         store._connection.execute(
             "SELECT total_rows, remote_payload_count, remote_payload_bytes, "
             "length(authority_tag) FROM provider_storage_usage"
         ).fetchone()
-    ) == (8, 0, 0, 32)
+    ) == (9, 0, 0, 32)
     assert not (root / "provider.sqlite3-wal").exists()
     assert not (root / "provider.sqlite3-shm").exists()
 
@@ -586,7 +751,7 @@ def test_rejects_unknown_schema_version(tmp_path: Path) -> None:
         DesktopProviderStore(root)
 
 
-def test_migrates_a_canonical_v1_store_to_v5(tmp_path: Path) -> None:
+def test_migrates_a_canonical_v1_store_to_v6(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
     os.chmod(root, 0o700)
@@ -606,18 +771,18 @@ def test_migrates_a_canonical_v1_store_to_v5(tmp_path: Path) -> None:
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (6,)
     assert [
         tuple(row)
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,), (4,), (5,)]
+    ] == [(1,), (2,), (3,), (4,), (5,), (6,)]
     profile = _create_profile(store, key="post-migration-create")
     assert store.get_profile(profile.profile_id) == profile
 
 
-def test_migrates_a_canonical_v2_store_to_v5(tmp_path: Path) -> None:
+def test_migrates_a_canonical_v2_store_to_v6(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
     os.chmod(root, 0o700)
@@ -673,13 +838,13 @@ def test_migrates_a_canonical_v2_store_to_v5(tmp_path: Path) -> None:
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (6,)
     assert [
         tuple(row)
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,), (4,), (5,)]
+    ] == [(1,), (2,), (3,), (4,), (5,), (6,)]
     assert [row[1] for row in store._connection.execute("PRAGMA table_info(projects)")] == [
         "project_id",
         "profile_id",
@@ -772,7 +937,7 @@ def test_migrates_v3_remote_payload_usage_into_provider_authority(
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (6,)
     assert tuple(
         store._connection.execute(
             "SELECT remote_payload_count, remote_payload_bytes, length(authority_tag) "
@@ -926,7 +1091,7 @@ def test_v4_to_v5_migration_validates_final_write_budget_before_seal(
     monkeypatch.setattr(provider_store_module, budget_name, original_budget)
     monkeypatch.setattr(DesktopProviderStore, "_seal_provider_storage_usage", original_seal)
     reopened = DesktopProviderStore(root)
-    assert tuple(reopened._connection.execute("PRAGMA user_version").fetchone()) == (5,)
+    assert tuple(reopened._connection.execute("PRAGMA user_version").fetchone()) == (6,)
 
 
 def test_v3_usage_migration_applies_recovery_budget_before_payload_scan(

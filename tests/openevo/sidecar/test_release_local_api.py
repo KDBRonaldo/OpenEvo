@@ -6,6 +6,7 @@ import hmac
 from pathlib import Path
 import sqlite3
 from threading import Event, Lock, Thread
+import time
 from typing import Any, cast
 from unittest.mock import Mock
 
@@ -34,6 +35,7 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteConnectionFailedError,
     RemoteConnectionResult,
     RemoteLifecycleSnapshot,
+    RemoteLifecycleSupersededError,
 )
 from openevo.deployment.host_keys import HostKeyCandidate
 
@@ -140,6 +142,31 @@ class BlockingRemoteLifecycle(FakeRemoteLifecycle):
         assert self.release.wait(5)
         self.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
         return RemoteConnectionResult(profile.profile_id, "connected")
+
+
+class CancellableBlockingRemoteLifecycle(BlockingRemoteLifecycle):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled = Event()
+
+    def connect(self, profile) -> RemoteConnectionResult:
+        self.connect_calls += 1
+        self.current = RemoteLifecycleSnapshot(profile.profile_id, "connecting")
+        self.started.set()
+        assert self.release.wait(5)
+        if self.cancelled.is_set():
+            raise RemoteLifecycleSupersededError(
+                "The profile connection was cancelled."
+            )
+        self.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+        return RemoteConnectionResult(profile.profile_id, "connected")
+
+    def disconnect(self, profile_id: str | None = None) -> None:
+        self.disconnect_calls += 1
+        assert profile_id is None or self.current.profile_id in {None, profile_id}
+        self.cancelled.set()
+        self.current = RemoteLifecycleSnapshot(None, "disconnected")
+        self.release.set()
 
 
 class ObservedActionLock:
@@ -699,7 +726,84 @@ def test_release_local_operation_cancel_is_wired_and_replayable(
         assert provider._store.get_project(project.project_id).state == "draft"
 
 
-def test_release_execution_mode_gate_rejects_retry_and_restart_before_core(
+def test_running_profile_connect_cancel_interrupts_lifecycle_and_is_replayable(
+    tmp_path: Path,
+) -> None:
+    lifecycle = CancellableBlockingRemoteLifecycle()
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Interruptible connection",
+            key="profile-interruptible-create-0001",
+        ).json()
+        provider = app.state.desktop_release_provider
+        original_publish = provider.publish_state_changed
+        operation_published = Event()
+
+        def publish_state_changed() -> None:
+            original_publish()
+            operation_published.set()
+
+        provider.publish_state_changed = publish_state_changed
+        connect_responses: list[Any] = []
+
+        def connect() -> None:
+            connect_responses.append(
+                client.post(
+                    f"/desktop/v1/profiles/{profile['profile_id']}/connect",
+                    headers={
+                        **SESSION_HEADERS,
+                        "If-Match": profile["etag"],
+                        "Idempotency-Key": "profile-interruptible-connect-0001",
+                    },
+                )
+            )
+
+        thread = Thread(target=connect)
+        thread.start()
+        assert lifecycle.started.wait(2)
+        assert operation_published.wait(1)
+        state = client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()
+        assert len(state["pending_operation_ids"]) == 1
+        operation_id = state["pending_operation_ids"][0]
+        running = client.get(
+            f"/desktop/v1/operations/{operation_id}", headers=SESSION_HEADERS
+        ).json()
+        assert running["state"] == "running"
+        cancel_headers = {
+            **SESSION_HEADERS,
+            "If-Match": running["etag"],
+            "Idempotency-Key": "profile-interruptible-cancel-0001",
+        }
+
+        started = time.monotonic()
+        cancelled = client.post(
+            f"/desktop/v1/operations/{operation_id}/cancel",
+            headers=cancel_headers,
+        )
+        elapsed = time.monotonic() - started
+        replay = client.post(
+            f"/desktop/v1/operations/{operation_id}/cancel",
+            headers=cancel_headers,
+        )
+        thread.join(2)
+
+        assert elapsed < 1.0
+        assert cancelled.status_code == 202
+        assert cancelled.json()["state"] == "cancelled"
+        assert replay.content == cancelled.content
+        assert not thread.is_alive()
+        assert len(connect_responses) == 1
+        assert connect_responses[0].json()["state"] == "cancelled"
+        assert lifecycle.disconnect_calls == 1
+        assert lifecycle.current == RemoteLifecycleSnapshot(None, "disconnected")
+        assert client.get(
+            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+        ).json()["connection_state"] == "disconnected"
+
+
+def test_release_execution_mode_gate_rejects_retry_and_dead_controls_fail_closed(
     tmp_path: Path,
 ) -> None:
     bridge = Mock(spec=DesktopCoreBridgeV1)
@@ -732,19 +836,63 @@ def test_release_execution_mode_gate_rejects_retry_and_restart_before_core(
         retry = client.post("/desktop/v1/runs/run-1/retry", headers=headers)
         retry_replay = client.post("/desktop/v1/runs/run-1/retry", headers=headers)
         restart = client.post("/desktop/v1/services/service-1/restart", headers=headers)
-        restart_replay = client.post(
-            "/desktop/v1/services/service-1/restart", headers=headers
+        diagnostic = client.post(
+            "/desktop/v1/diagnostics",
+            headers={
+                **SESSION_HEADERS,
+                "Idempotency-Key": "unavailable-diagnostic-mutation-0001",
+            },
+            json={
+                "scopes": ["project"],
+                "target": {"kind": "project", "project_id": "core-project-1"},
+            },
         )
 
-        for response, category in (
-            (retry, "run"),
-            (retry_replay, "run"),
-            (restart, "service"),
-            (restart_replay, "service"),
-        ):
+        for response in (retry, retry_replay):
             assert response.status_code == 409
             assert response.json()["code"] == "self_deployed_release_unavailable"
-            assert response.json()["category"] == category
+            assert response.json()["category"] == "run"
+        for response in (restart, diagnostic):
+            assert response.status_code == 503
+            assert response.json()["code"] == "provider_capability_unavailable"
+        assert bridge.method_calls == []
+
+
+def test_create_run_rejects_explicitly_pending_evolution_setup_before_core(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    app = _app(tmp_path / "state", core_bridge=bridge)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Pending setup server",
+            key="pending-setup-profile-create-0001",
+        ).json()
+        request = _project(profile["profile_id"], name="Pending setup project")
+        request["evolution_configuration_state"] = "pending"
+        provider = app.state.desktop_release_provider
+        project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(request),
+            idempotency_key="pending-setup-project-create-0001",
+        )
+        provider._active_project_for_runtime = (  # type: ignore[method-assign]
+            lambda: CoreRuntimeSessionBinding(project=project, generation=1)
+        )
+
+        response = client.post(
+            "/desktop/v1/runs",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": project.etag,
+                "Idempotency-Key": "pending-setup-run-create-0001",
+            },
+            json={"project_id": project.project_id},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "evolution_configuration_pending"
+        assert response.json()["category"] == "project"
         assert bridge.method_calls == []
 
 

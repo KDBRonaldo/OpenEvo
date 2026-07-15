@@ -17,7 +17,7 @@ from desktop.sidecar.core_bridge_v1 import (
     map_project_create_v1,
 )
 from desktop.sidecar.provider_store import DesktopProviderStore
-from desktop.sidecar.release_provider import DesktopReleaseProvider
+from desktop.sidecar.release_provider import DesktopReleaseProvider, _BoundedProjectExecutor
 from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
 from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
 from desktop.sidecar.remote_lifecycle import (
@@ -37,6 +37,12 @@ ETAG_B = '"' + "b" * 64 + '"'
 
 
 class _Lifecycle:
+    def snapshot(self) -> RemoteLifecycleSnapshot:
+        return RemoteLifecycleSnapshot(None, "disconnected")
+
+    def disconnect(self, _profile_id: str | None = None) -> None:
+        return None
+
     def close(self) -> None:
         return None
 
@@ -250,10 +256,14 @@ def test_activation_returns_queued_and_commits_remote_projection(tmp_path: Path)
         assert state.active_project.connection_state == "ready"
         assert state.core.state == "online"
         assert state.pending_operation_ids == ()
-        bridge.activate_project.assert_called_once_with(
-            project,
-            idempotency_key="project-activate-runtime-0001",
+        bridge.activate_project.assert_called_once()
+        activation_call = bridge.activate_project.call_args
+        assert activation_call.args == (project,)
+        assert activation_call.kwargs["idempotency_key"] == (
+            "project-activate-runtime-0001"
         )
+        assert activation_call.kwargs["activation_id"] == operation.operation_id
+        assert isinstance(activation_call.kwargs["cancel_event"], Event)
         bridge.commit_local_activation.assert_called_once()
     finally:
         release.set()
@@ -332,20 +342,32 @@ def test_activation_binding_failure_never_persists_success(tmp_path: Path) -> No
         provider.close()
 
 
-def test_cancel_running_activation_remains_terminal_and_keeps_project_draft(
+@pytest.mark.parametrize("late_failure", [False, True])
+def test_cancel_running_activation_interrupts_bridge_and_releases_executor(
     tmp_path: Path,
+    late_failure: bool,
 ) -> None:
     bridge = Mock(spec=DesktopCoreBridgeV1)
     provider, store, project = _provider(tmp_path, bridge)
     entered = Event()
     release = Event()
+    exited = Event()
+    calls = 0
 
     def activate(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return _activation(project)
         entered.set()
         assert release.wait(timeout=5)
+        exited.set()
+        if late_failure:
+            raise _bridge_error("cancelled_activation_late_failure")
         return _activation(project)
 
     bridge.activate_project.side_effect = activate
+    bridge.cancel_activation.side_effect = lambda _activation_id: release.set()
     try:
         response = provider.invoke("activateProject", _activate_arguments(project))
         assert isinstance(response, JSONResponse)
@@ -362,14 +384,103 @@ def test_cancel_running_activation_remains_terminal_and_keeps_project_draft(
             },
         )
         assert cancelled.state == "cancelled"
-        release.set()
+        replayed_cancel = provider.invoke(
+            "cancelLocalOperation",
+            {
+                "operation_id": running.operation_id,
+                "if_match": running.etag,
+                "idempotency_key": "cancel-project-activation-runtime-replay-0001",
+            },
+        )
+        assert replayed_cancel == cancelled
+        assert exited.wait(timeout=1)
         assert _wait_for_operation(store, operation.operation_id, "cancelled").state == "cancelled"
         assert store.get_project(project.project_id).state == "draft"
         bridge.commit_local_activation.assert_not_called()
-        bridge.deactivate_project.assert_called_once_with(project.project_id)
+
+        retry_response = provider.invoke(
+            "activateProject",
+            {
+                **_activate_arguments(project),
+                "idempotency_key": "project-activate-after-cancel-0001",
+            },
+        )
+        retry = local_v1.LocalOperationV1.model_validate_json(retry_response.body)
+        assert _wait_for_operation(store, retry.operation_id, "succeeded").state == "succeeded"
+        bridge.cancel_activation.assert_called_once_with(operation.operation_id)
+        assert bridge.activate_project.call_count == 2
     finally:
         release.set()
         provider.close()
+
+
+def test_cancel_queued_activation_does_not_interrupt_the_running_operation() -> None:
+    executor = _BoundedProjectExecutor()
+    first_entered = Event()
+    first_release = Event()
+    second_ran = Event()
+    second_interrupted = Event()
+    third_ran = Event()
+
+    def first(_cancel_event: Event) -> None:
+        first_entered.set()
+        assert first_release.wait(timeout=5)
+
+    try:
+        assert executor.submit(
+            "operation-running",
+            first,
+            accepted=lambda: None,
+            interrupt=first_release.set,
+        )
+        assert first_entered.wait(timeout=1)
+        assert executor.submit(
+            "operation-queued",
+            lambda _cancel_event: second_ran.set(),
+            accepted=lambda: None,
+            interrupt=second_interrupted.set,
+        )
+        assert executor.cancel("operation-queued", wait_seconds=1)
+        assert not second_ran.is_set()
+        assert not second_interrupted.is_set()
+
+        first_release.set()
+        assert executor.submit(
+            "operation-after-cancel",
+            lambda _cancel_event: third_ran.set(),
+            accepted=lambda: None,
+            interrupt=lambda: None,
+        )
+        assert third_ran.wait(timeout=1)
+    finally:
+        first_release.set()
+        executor.close()
+
+
+def test_provider_close_interrupts_activation_without_waiting_for_bridge_timeout(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, _store, project = _provider(tmp_path, bridge)
+    entered = Event()
+    release = Event()
+
+    def activate(*_args: object, **_kwargs: object) -> object:
+        entered.set()
+        assert release.wait(timeout=5)
+        return _activation(project)
+
+    bridge.activate_project.side_effect = activate
+    bridge.cancel_activation.side_effect = lambda _activation_id: release.set()
+    provider.invoke("activateProject", _activate_arguments(project))
+    assert entered.wait(timeout=5)
+
+    started = time.monotonic()
+    provider.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    bridge.cancel_activation.assert_called_once()
 
 
 def test_activation_persists_typed_bridge_failure(tmp_path: Path) -> None:

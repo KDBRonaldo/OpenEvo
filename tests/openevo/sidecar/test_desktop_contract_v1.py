@@ -693,7 +693,7 @@ def test_snapshots_are_canonical_and_digests_are_stable() -> None:
     openapi_digest, events_digest = verify_contract_snapshots()
     assert openapi_digest == DESKTOP_OPENAPI_SHA256
     assert events_digest == DESKTOP_EVENTS_SCHEMA_SHA256
-    assert openapi_digest == "e3bc443ee213eb33de81b82c7f954fb617fab14b8a2c17e154f3d4b980ba441f"
+    assert openapi_digest == "07d08e2f9b354517f8caf3ca171c7bef722fefdac6b6889021e70acd86e7a861"
     assert events_digest == "39e485b6c61688832ec0445502d2f1f9e8bd9548e9b81a0a4740bc5997d90936"
     snapshot_root = Path(__file__).parents[3] / "desktop/sidecar/contracts/v1"
     assert (snapshot_root / "openapi.json").read_bytes() == canonical_json_bytes(

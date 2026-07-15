@@ -110,6 +110,8 @@ class _GenerationToken:
     generation: int
     external_lock: threading.RLock
     resource_lock: threading.Lock
+    activation_id: str | None = None
+    cancel_event: threading.Event | None = None
     cancelled: bool = False
     retired: bool = False
     clients: list[Any] | None = None
@@ -206,10 +208,12 @@ class CoreTunnelHandleV1:
         with self._lock:
             return self._close_failure
 
-    def close(self, *, deadline: float, token: _GenerationToken | None = None) -> None:
+    def request_close(self, *, token: _GenerationToken | None = None) -> Future[None]:
         with self._lock:
             if self._closed:
-                return
+                completed: Future[None] = Future()
+                completed.set_result(None)
+                return completed
             future = self._close_future
             if future is None:
                 future = _ADAPTER_EXECUTOR.submit(self._close_callback)
@@ -223,6 +227,10 @@ class CoreTunnelHandleV1:
                 self._close_future = future
                 if token is not None:
                     token.track_future(future)
+            return future
+
+    def close(self, *, deadline: float, token: _GenerationToken | None = None) -> None:
+        future = self.request_close(token=token)
         try:
             wait_timeout = _remaining_seconds(deadline)
         except DesktopCoreBridgeErrorV1:
@@ -784,6 +792,14 @@ class DesktopCoreBridgeV1:
 
     def close(self) -> None:
         deadline = time.monotonic() + self._timeout
+        with self._lock:
+            candidate = self._candidate
+            if candidate is not None:
+                candidate.cancelled = True
+                if candidate.cancel_event is not None:
+                    candidate.cancel_event.set()
+        if candidate is not None:
+            self._request_token_interrupt(candidate)
         self._acquire_transition(deadline)
         try:
             with self._lock:
@@ -804,9 +820,17 @@ class DesktopCoreBridgeV1:
         project: local_v1.ProjectV1,
         *,
         idempotency_key: str,
+        activation_id: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> CoreActivationV1:
+        if (activation_id is None) != (cancel_event is None):
+            raise ValueError("activation cancellation identity and event must appear together")
         deadline = time.monotonic() + self._timeout
-        token = self._begin_activation(deadline)
+        token = self._begin_activation(
+            deadline,
+            activation_id=activation_id,
+            cancel_event=cancel_event,
+        )
         generation = token.generation
         try:
             attachment = self._adapter_external(
@@ -1151,6 +1175,21 @@ class DesktopCoreBridgeV1:
             if isinstance(exc, CoreClientErrorV1):
                 raise _bridge_client_error(exc) from None
             raise
+
+    def cancel_activation(self, activation_id: str) -> bool:
+        """Interrupt exactly one in-flight activation without waiting on its adapter."""
+
+        if not activation_id:
+            raise ValueError("activation identity must not be empty")
+        with self._lock:
+            token = self._candidate
+            if token is None or token.activation_id != activation_id:
+                return False
+            token.cancelled = True
+            if token.cancel_event is not None:
+                token.cancel_event.set()
+        self._request_token_interrupt(token)
+        return True
 
     def commit_local_activation(
         self,
@@ -1615,7 +1654,19 @@ class DesktopCoreBridgeV1:
         session, generation = self._session()
         return _BridgeEventContext(self, session, generation, project, last_event_id)
 
-    def _begin_activation(self, deadline: float) -> _GenerationToken:
+    def _begin_activation(
+        self,
+        deadline: float,
+        *,
+        activation_id: str | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> _GenerationToken:
+        if cancel_event is not None and cancel_event.is_set():
+            raise _bridge_error(
+                "active_project_session_superseded",
+                "The project activation was cancelled before it started.",
+                retryable=True,
+            )
         self._acquire_transition(deadline)
         try:
             with self._lock:
@@ -1633,11 +1684,19 @@ class DesktopCoreBridgeV1:
                         "desktop_core_bridge_closed",
                         "The Desktop Core bridge is closed.",
                     )
+                if cancel_event is not None and cancel_event.is_set():
+                    raise _bridge_error(
+                        "active_project_session_superseded",
+                        "The project activation was cancelled before Core work started.",
+                        retryable=True,
+                    )
                 self._generation += 1
                 token = _GenerationToken(
                     generation=self._generation,
                     external_lock=threading.RLock(),
                     resource_lock=threading.Lock(),
+                    activation_id=activation_id,
+                    cancel_event=cancel_event,
                 )
                 self._candidate = token
                 return token
@@ -1650,6 +1709,10 @@ class DesktopCoreBridgeV1:
                 self._closed
                 or self._close_requested
                 or candidate.token.cancelled
+                or (
+                    candidate.token.cancel_event is not None
+                    and candidate.token.cancel_event.is_set()
+                )
                 or self._candidate is not candidate.token
                 or candidate.generation != self._generation
             ):
@@ -1681,6 +1744,8 @@ class DesktopCoreBridgeV1:
             if token.retired:
                 return
             token.cancelled = True
+            if token.cancel_event is not None:
+                token.cancel_event.set()
         with token.resource_lock:
             clients = tuple(token.clients or ())
         for client in clients:
@@ -1746,6 +1811,7 @@ class DesktopCoreBridgeV1:
                 self._closed
                 or self._close_requested
                 or token.cancelled
+                or (token.cancel_event is not None and token.cancel_event.is_set())
                 or token.retired
                 or current is not token
             ):
@@ -1754,6 +1820,25 @@ class DesktopCoreBridgeV1:
                     "A newer active project session superseded this result.",
                     retryable=True,
                 )
+
+    def _request_token_interrupt(self, token: _GenerationToken) -> None:
+        with token.resource_lock:
+            clients = tuple(token.clients or ())
+            tunnels = tuple(token.tunnels or ())
+            futures = tuple(token.adapter_futures or ())
+        for future in futures:
+            future.cancel()
+        for client in clients:
+            future = _ADAPTER_EXECUTOR.submit(client.close)
+            if future is None:
+                continue
+            token.track_future(future)
+            future.add_done_callback(lambda completed: token.untrack_future(completed))
+        for tunnel in tunnels:
+            try:
+                tunnel.request_close(token=token)
+            except DesktopCoreBridgeErrorV1:
+                pass
 
     def _external_call(
         self,

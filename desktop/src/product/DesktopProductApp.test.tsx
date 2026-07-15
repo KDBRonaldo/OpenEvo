@@ -416,6 +416,11 @@ describe("DesktopProductApp", () => {
     if (prepared.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     const draft = prepared.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
     expect(draft?.evolution.targets).toEqual({});
+    expect(draft?.evolution_configuration_state).toBe("pending");
+
+    for (const toggle of document.querySelectorAll<HTMLInputElement>(".target-toggle input[role='switch']")) {
+      await act(async () => toggle.click());
+    }
 
     await clickButton("Save and activate");
     expect(document.querySelector('[role="dialog"]')).toBeNull();
@@ -424,11 +429,25 @@ describe("DesktopProductApp", () => {
     if (activated.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     const created = activated.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
     expect(created?.execution).toMatchObject({ mode: "codex_subscription_transcript", codex_model: "gpt-5.5" });
+    expect(created?.evolution_configuration_state).toBe("configured");
     expect(created?.evolution.targets).toMatchObject({
-      text_memory: { enabled: true },
-      skill_bundle: { enabled: true },
-      agent_system: { enabled: true },
+      text_memory: { enabled: false },
+      skill_bundle: { enabled: false },
+      agent_system: { enabled: false },
     });
+  });
+
+  it("does not reopen or block a configured project with zero evolution targets", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    provider.clearEvolutionSelections("configured");
+    root = await renderProduct(provider);
+
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(button("Start session").disabled).toBe(false);
+    expect(screenText()).not.toContain("Remote evolution methods are ready");
+    await clickButton("Evolution");
+    expect(screenText()).toContain("Evolution is off");
+    expect(screenText()).not.toContain("Evolution is not configured");
   });
 
   it("offers cancellation while a local connection operation is active", async () => {
@@ -756,7 +775,7 @@ describe("DesktopProductApp", () => {
 
   it("resumes an incomplete evolution setup after refresh and blocks an unsupported saved method", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.clearEvolutionSelections();
+    provider.clearEvolutionSelections("pending");
     root = await renderProduct(provider);
 
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
@@ -1141,7 +1160,7 @@ describe("DesktopProductApp", () => {
 
     const grid = document.querySelector(".system-grid");
     expect(grid).not.toBeNull();
-    expect(grid?.children).toHaveLength(2);
+    expect(grid?.children).toHaveLength(1);
     expect(Array.from(grid?.children ?? []).every((child) => child.classList.contains("product-panel"))).toBe(true);
   });
 
@@ -1214,25 +1233,15 @@ describe("DesktopProductApp", () => {
     expect(artifactTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Changes");
   });
 
-  it("reports completed diagnostics with warnings without claiming all checks passed", async () => {
+  it("keeps services read-only and does not render unavailable diagnostics or restart controls", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-    const runProjectDiagnostics = vi.spyOn(provider, "runProjectDiagnostics");
     root = await renderProduct(provider);
 
     await clickButton("System");
-    expect(screenText()).toContain("Checks completed with warnings");
-    expect(screenText()).not.toContain("All checks passed");
-    expect(screenText()).not.toContain("Repair available");
-    expect(screenText()).not.toContain("Repairable");
     expect(optionalButton("Run diagnostics")).toBeNull();
-    expect(document.querySelector('button[aria-label="Run diagnostics"]')).not.toBeNull();
+    expect(document.querySelector('button[aria-label="Run diagnostics"]')).toBeNull();
+    expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
     expect(screenText()).toContain("Needs attention");
-    await clickAria("Run diagnostics");
-    expect(runProjectDiagnostics).toHaveBeenCalledWith(
-      "project-fixture-1",
-      expect.objectContaining({ etag: expect.any(String) }),
-    );
-    expect(screenText()).toContain("Project authority is ready.");
   });
 
   it("requires explicit activation after a project switch", async () => {

@@ -42,6 +42,7 @@ from desktop.sidecar.provider_store import (
 from desktop.sidecar.release_provider import (
     ActiveProjectMismatchError,
     DesktopReleaseProvider,
+    EvolutionConfigurationPendingError,
     ExecutionModeReleaseUnavailableError,
     InvalidNativeChallengeError,
     ProviderCapabilityUnavailableError,
@@ -413,6 +414,21 @@ def create_release_desktop_local_api_app(
             category="service",
             repair_action="none",
             next_action="Reconnect and activate the saved project.",
+        )
+
+    @app.exception_handler(EvolutionConfigurationPendingError)
+    async def handle_evolution_configuration_pending(
+        request: Request, exc: EvolutionConfigurationPendingError
+    ) -> JSONResponse:
+        del exc
+        return _error_response(
+            request,
+            status_code=409,
+            code="evolution_configuration_pending",
+            message="Evolution setup must be explicitly completed before starting a run.",
+            category="project",
+            repair_action="user_input_required",
+            next_action="Finish or disable the evolution targets, then save the project.",
         )
 
     @app.exception_handler(InvalidNativeChallengeError)

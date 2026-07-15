@@ -270,35 +270,6 @@ describe("LocalApiDesktopProductProvider", () => {
       { idempotencyKey: "renderer-action-start-0001", ifMatch: ETAG_B },
     );
 
-    const refreshedAgain = await provider.refresh();
-    if (refreshedAgain.status !== "fresh") throw new Error("expected a fresh fixture");
-    const operation = await provider.restartService("service-control-fixture-1", {
-      actionId: "renderer-action-restart-0001",
-      streamEpoch: refreshedAgain.snapshot.stream.epoch,
-      etag: ETAG_B,
-    });
-    expect(operation).toEqual(operationV1Schema.parse(CONTRACT_FIXTURE_V1.serviceOperation));
-    expect(client.restartService).toHaveBeenCalledWith("service-control-fixture-1", {
-      idempotencyKey: "renderer-action-restart-0001",
-      ifMatch: ETAG_B,
-    });
-
-    const refreshedForDiagnostic = await provider.refresh();
-    if (refreshedForDiagnostic.status !== "fresh") throw new Error("expected a fresh fixture");
-    const diagnostic = await provider.runProjectDiagnostics("project-fixture-1", {
-      actionId: "renderer-action-diagnostic-0001",
-      streamEpoch: refreshedForDiagnostic.snapshot.stream.epoch,
-      etag: ETAG_B,
-    });
-    expect(diagnostic).toEqual(diagnosticReportV1Schema.parse(CONTRACT_FIXTURE_V1.diagnostic));
-    expect(client.createDiagnostic).toHaveBeenCalledWith(
-      {
-        scopes: ["project"],
-        target: { kind: "project", project_id: "project-fixture-1" },
-      },
-      { idempotencyKey: "renderer-action-diagnostic-0001" },
-    );
-
     const unknown = mockClient();
     unknown.createRun = vi.fn().mockRejectedValue(new TypeError("unknown network outcome"));
     const unknownProvider = createProvider(unknown);
@@ -328,6 +299,11 @@ describe("LocalApiDesktopProductProvider", () => {
 
     client.createProject = vi.fn().mockResolvedValue(project({ name: "Cross-wired project" }));
     await expect(provider.createProject(projectInput(), createIntent)).rejects.toThrow(/does not match the request/i);
+    client.createProject = vi.fn().mockResolvedValue(project({ evolution_configuration_state: "configured" }));
+    await expect(provider.createProject({
+      ...projectInput(),
+      evolution_configuration_state: "pending",
+    }, createIntent)).rejects.toThrow(/does not match the request/i);
     client.updateProject = vi.fn().mockResolvedValue(project({ project_id: "project-cross-wired" }));
     await expect(provider.updateProject("project-fixture-1", { name: "Updated" }, resourceIntent)).rejects.toThrow(/wrong project/i);
 
@@ -355,14 +331,6 @@ describe("LocalApiDesktopProductProvider", () => {
     await expect(provider.activateProject("project-fixture-1", resourceIntent)).rejects.toThrow(/another resource/i);
     client.cancelOperation = vi.fn().mockResolvedValue(localOperation("project_repair", "project", "project-fixture-1", "operation-cross-wired"));
     await expect(provider.cancelOperation("operation-fixture-1", resourceIntent)).rejects.toThrow(/wrong operation/i);
-    client.createDiagnostic = vi.fn().mockResolvedValue(diagnosticReportV1Schema.parse({
-      ...CONTRACT_FIXTURE_V1.diagnostic,
-      target: { kind: "project", project_id: "project-cross-wired" },
-    }));
-    await expect(provider.runProjectDiagnostics("project-fixture-1", resourceIntent)).rejects.toThrow(/another project/i);
-
-    client.restartService = vi.fn().mockResolvedValue(serviceRestartOperation("service-cross-wired"));
-    await expect(provider.restartService("service-control-fixture-1", resourceIntent)).rejects.toThrow(/another service/i);
     client.artifactContent = vi.fn().mockResolvedValue(artifactContentV1Schema.parse({
       ...CONTRACT_FIXTURE_V1.artifactContent,
       artifact_id: "artifact-cross-wired",
@@ -664,6 +632,7 @@ function projectInput() {
     source: value.source,
     execution: value.execution,
     evolution: value.evolution,
+    evolution_configuration_state: value.evolution_configuration_state,
   };
 }
 
@@ -731,16 +700,6 @@ function crossWiredProfileOperationResult() {
     result: { kind: "connection", profile_id: "profile-cross-wired", connection_state: "connected" },
     started_at: NOW,
     finished_at: NOW,
-  });
-}
-
-function serviceRestartOperation(serviceId: string) {
-  return operationV1Schema.parse({
-    ...CONTRACT_FIXTURE_V1.serviceOperation,
-    request: {
-      ...CONTRACT_FIXTURE_V1.serviceOperation.request,
-      service_id: serviceId,
-    },
   });
 }
 

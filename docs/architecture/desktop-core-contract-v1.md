@@ -260,8 +260,8 @@ same OS user: such a process can race pathname checks or modify owner-readable
 state. Desktop relies on the macOS user-account boundary and the owner-only
 state directory for that threat boundary.
 
-Schema v5 has an exact canonical `sqlite_schema` fingerprint and retains exact
-v1-v4 historical fingerprints. Each historical layout and migration ledger is
+Schema v6 has an exact canonical `sqlite_schema` fingerprint and retains exact
+v1-v5 historical fingerprints. Each historical layout and migration ledger is
 validated before the next transactional migration; DDL, ledger, project-copy,
 authority publication, and `user_version` changes share one crash transaction.
 Forged ledgers, near-match schemas, unknown views/triggers/indexes, and partial
@@ -270,14 +270,18 @@ migrations fail closed. Startup performs a database-size-bounded
 complete validation of migration, resource, operation, cursor, canonical
 JSON/blob, duplicated scalar, timestamp, version, and typed idempotency rows.
 
-The v5 `provider_storage_usage` singleton is the normal-transaction authority
+The `provider_storage_usage` singleton introduced in v5 remains the
+normal-transaction authority
 for the complete provider recovery row/byte budget, the 256 KiB per-value and
 16 MiB aggregate remote-state budget, and fixed terminal reservations. It also
 contains exact idempotency/cursor row counts, a generation, and four modular
 remote-content accumulators. Canonical row triggers update it transactionally
 and require exactly one affected authority row; its seal is a domain-separated
-HMAC under the owner-only signing key. The migration ledger becomes immutable at
-v5. The authority singleton rejects every later insert and delete, so `DELETE`
+HMAC under the owner-only signing key. The migration ledger becomes immutable
+after v6 publication. The v5 to v6 migration uses bounded length-guarded reads
+to add `evolution_configuration_state="configured"` to every existing project
+and stored `ProjectV1` replay without inspecting its target map. The authority
+singleton rejects every later insert and delete, so `DELETE`
 followed by insert and `INSERT OR REPLACE` are rejected even when SQLite
 recursive triggers are off. Rollback restores data and authority together.
 
@@ -304,7 +308,8 @@ If either configured limit is lower, open raises
 `ProviderCapacityConfigurationError`, performs no cleanup, and commits no startup
 state. Repeated incompatible opens therefore cannot enter a rollback-only cleanup
 loop. Reopening with each limit at least equal to persisted usage is the recovery
-path; later successful writes can commit bounded cleanup. Startup and v4 -> v5
+path; later successful writes can commit bounded cleanup. Startup and
+v4 -> v5 -> v6
 migration may perform one bounded reconciliation of actual table totals, remote
 lengths/tokens, exact idempotency/cursor counts, and live reservations before any
 remote payload is decoded. After creating the singleton and migration row,
@@ -350,7 +355,10 @@ require reactivation. For a new science project, the renderer keeps this as one
 recoverable drawer workflow: the first activation establishes the project
 tunnel, remote effective defaults initialize all three ordinary evolution
 targets, and the second save validates and activates that configured draft.
-An empty target map remains visibly incomplete and is resumed after refresh.
+The durable closed field `evolution_configuration_state=pending|configured`, not
+the target map, identifies the stage. Only new wizard drafts are `pending`.
+Existing projects migrate to `configured`, and an explicit second save may set
+all targets off or retain an empty map without reopening setup or blocking runs.
 Queued/running/cancelling project operations still block
 the patch. Action idempotency stores
 the exact `LocalOperationV1`; replay resolves its current authoritative
@@ -489,17 +497,13 @@ GET    /desktop/v1/events
 
 Routes in this frozen boundary are not automatically release features. The
 current release composition provides sidecar-owned connection, host-key,
-bootstrap, activation, and operation cancellation, but does not install doctor,
-repair, workspace-sync, or Local operation-log handlers; the renderer hides
-those unavailable controls. These sidecar actions return `LocalOperationV1`.
-Core-owned runs, service
-actions, diagnostics, and cleanup resources retain their Core v1 response
-shape after strict sidecar validation. Service restart and cache cleanup
-return Core `OperationV1`; React observes them through the explicitly
-namespaced `/desktop/v1/core/operations/{operation_id}` endpoint and reads any
-referenced bounded logs through `/desktop/v1/core/logs/{logs_ref}`. The
-sidecar does not synthesize remote progress or replace authoritative Core
-state with a local operation.
+bootstrap, activation, operation cancellation, Core-owned runs, artifact
+inspection, and read-only service observation. It does not install doctor,
+repair, workspace-sync, Local operation-log, service restart, diagnostics, or
+cache-cleanup handlers; the renderer hides those unavailable controls. The
+frozen routes remain schema-only future boundaries and the release provider
+returns `provider_capability_unavailable` if they are called directly. It does
+not synthesize progress or successful diagnostic/service operations.
 
 Activation completion is published under the project-session transition lock.
 The bridge commit and authoritative online project binding happen before the
@@ -968,11 +972,9 @@ digest, and corresponding artifact/content identity; a hunk cannot drop or
 cross-wire its document identity.
 
 Timeline and log records preserve remote sequence, attempt, and service
-identity. Service and diagnostic resources report authoritative status, typed
-error, update/observation times, and strong ETag. Core exposes only restart for
-ordinary service recovery. It deliberately has no service stop action; the
-Desktop Local stop route is therefore not forwardable and should be removed in
-the later Local-contract convergence rather than implemented through SSH.
+identity. Service summaries are authoritative read-only observations in the
+current release. Core diagnostics and service mutation owners are unavailable,
+so Desktop neither advertises those feature flags nor renders their controls.
 
 Inference services carry `model_preparation` if and only if
 `kind=inference`; environment checks carry it if and only if
@@ -981,20 +983,13 @@ target. Global scopes forbid project/run IDs, project scope requires exactly a
 project ID, and run scope requires both project and run IDs. Providers still
 verify that the run belongs to the project.
 
-Environment repair, service restart, and cache cleanup return HTTP 202 with one
-`OperationV1`. The resource is recoverable through
-`GET /v1/operations/{operation_id}`, binds a typed original request and successful
-result, carries a strong ETag and logs reference, and emits
-`operation.updated.v1`. Its descriptor fixes whether the kind is cancellable.
-`environment_repair` is cancellable and may move through
-`cancelling -> cancelled`; cancel uses `If-Match` plus `Idempotency-Key`.
-Service restart and cache cleanup are non-cancellable in v1, and cancel returns
-`409 ApiErrorV1` with code `operation_kind_not_cancellable` rather than implying
-best-effort cancellation. The generic response also preserves the global
-`409 idempotency_key_reused` contract for a conflicting replay. Runs and
-diagnostics remain their own recoverable 202 resources.
-Any bounded `logs_ref` from an error, check, or operation is readable through
-paginated `GET /v1/logs/{logs_ref}`.
+The frozen schema reserves `OperationV1` shapes for environment repair, service
+restart, and cache cleanup, plus recoverable diagnostic resources. A future
+owner must bind those resources to strong ETags, referenced logs, idempotency,
+and the declared cancellation semantics. The current Core release has no such
+owners: every corresponding route returns `provider_capability_unavailable`,
+and Desktop does not advertise or render them. This reserved schema is not
+evidence that repair, restart, diagnostics, or cache cleanup currently works.
 
 Core SSE adds artifact, log, operation, successor-transition, and
 revision-activated events. Every non-heartbeat event carries a replay-stable

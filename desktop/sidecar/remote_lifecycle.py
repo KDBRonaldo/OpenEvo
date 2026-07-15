@@ -65,6 +65,8 @@ class _RemoteTransport(Protocol):
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult: ...
 
+    def close(self) -> None: ...
+
 
 AuthResolver = Callable[[RemoteProfileV1], SSHAuthConfig]
 TransportFactory = Callable[[RemoteProfileConfig, TrustedKnownHostsBinding], _RemoteTransport]
@@ -152,6 +154,7 @@ class DesktopRemoteLifecycle:
         self._snapshot = RemoteLifecycleSnapshot(None, "disconnected")
         self._pending: dict[str, tuple[RemoteProfileConfig, PendingHostKeyProbe]] = {}
         self._active: _ActiveRemote | None = None
+        self._candidate: tuple[int, _ActiveRemote] | None = None
 
     def snapshot(self) -> RemoteLifecycleSnapshot:
         with self._lock:
@@ -167,7 +170,7 @@ class DesktopRemoteLifecycle:
     def connect(self, profile: RemoteProfileV1) -> RemoteConnectionResult:
         deadline = self._deadline()
         generation, displaced = self._begin(profile.profile_id)
-        self._close_remote(displaced)
+        self._close_remotes(displaced)
         try:
             config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
             self._remaining(deadline)
@@ -206,10 +209,11 @@ class DesktopRemoteLifecycle:
                 raise RemoteConnectionFailedError("The pending SSH host key is no longer current.")
             self._generation += 1
             generation = self._generation
-            displaced = self._active
+            displaced = self._owned_remotes_locked()
             self._active = None
+            self._candidate = None
             self._snapshot = RemoteLifecycleSnapshot(profile.profile_id, "connecting")
-        self._close_remote(displaced)
+        self._close_remotes(displaced)
         try:
             config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
             self._remaining(deadline)
@@ -239,20 +243,22 @@ class DesktopRemoteLifecycle:
             if profile_id is not None and self._snapshot.profile_id not in {None, profile_id}:
                 raise RemoteConnectionFailedError("Another remote profile owns the connection.")
             self._generation += 1
-            displaced = self._active
+            displaced = self._owned_remotes_locked()
             self._active = None
+            self._candidate = None
             self._pending.clear()
             self._snapshot = RemoteLifecycleSnapshot(None, "disconnected")
-        self._close_remote(displaced)
+        self._close_remotes(displaced)
 
     close = disconnect
 
-    def _begin(self, profile_id: str) -> tuple[int, _ActiveRemote | None]:
+    def _begin(self, profile_id: str) -> tuple[int, tuple[_ActiveRemote, ...]]:
         with self._lock:
             self._generation += 1
             generation = self._generation
-            displaced = self._active
+            displaced = self._owned_remotes_locked()
             self._active = None
+            self._candidate = None
             self._pending.clear()
             self._snapshot = RemoteLifecycleSnapshot(profile_id, "connecting")
             return generation, displaced
@@ -308,20 +314,46 @@ class DesktopRemoteLifecycle:
     ) -> RemoteConnectionResult:
         self._remaining(deadline)
         transport = self._transport_factory(profile, binding)
+        candidate = _ActiveRemote(profile=profile, binding=binding, transport=transport)
         try:
+            with self._lock:
+                self._require_generation(generation)
+                self._candidate = (generation, candidate)
             result = transport.run("true", timeout_seconds=self._remaining(deadline))
             self._remaining(deadline)
             if not result.ok:
                 raise RemoteConnectionFailedError("The SSH connectivity check failed.")
-            active = _ActiveRemote(profile=profile, binding=binding, transport=transport)
             with self._lock:
                 self._require_generation(generation)
+                bound_candidate = self._candidate
+                if (
+                    bound_candidate is None
+                    or bound_candidate[0] != generation
+                    or bound_candidate[1] is not candidate
+                ):
+                    raise RemoteLifecycleSupersededError(
+                        "A newer remote lifecycle operation superseded this result."
+                    )
+                self._candidate = None
                 self._pending.pop(profile.id, None)
-                self._active = active
+                self._active = candidate
                 self._snapshot = RemoteLifecycleSnapshot(profile.id, "connected")
             return RemoteConnectionResult(profile.id, "connected")
         except BaseException:
+            with self._lock:
+                superseded = generation != self._generation
+                bound_candidate = self._candidate
+                if (
+                    bound_candidate is not None
+                    and bound_candidate[0] == generation
+                    and bound_candidate[1] is candidate
+                ):
+                    self._candidate = None
             self._close_transport(transport)
+            if superseded:
+                raise RemoteLifecycleSupersededError(
+                    "A newer remote lifecycle operation superseded this result."
+                ) from None
             raise
 
     def _deadline(self) -> float:
@@ -350,10 +382,18 @@ class DesktopRemoteLifecycle:
                 "A newer remote lifecycle operation superseded this result."
             )
 
+    def _owned_remotes_locked(self) -> tuple[_ActiveRemote, ...]:
+        remotes: list[_ActiveRemote] = []
+        if self._active is not None:
+            remotes.append(self._active)
+        if self._candidate is not None and self._candidate[1] not in remotes:
+            remotes.append(self._candidate[1])
+        return tuple(remotes)
+
     @classmethod
-    def _close_remote(cls, active: _ActiveRemote | None) -> None:
-        if active is not None:
-            cls._close_transport(active.transport)
+    def _close_remotes(cls, remotes: tuple[_ActiveRemote, ...]) -> None:
+        for remote in remotes:
+            cls._close_transport(remote.transport)
 
     @staticmethod
     def _close_transport(transport: _RemoteTransport) -> None:

@@ -10,10 +10,8 @@ import {
   artifactV1Schema,
   desktopStateV1Schema,
   executionModeCapabilitiesV1Schema,
-  diagnosticReportV1Schema,
   localOperationV1Schema,
   logEntryV1Schema,
-  operationV1Schema,
   projectCapabilitiesV1Schema,
   projectSourceV1Schema,
   projectValidationV1Schema,
@@ -26,11 +24,9 @@ import {
   type ArtifactDiffV1,
   type ArtifactV1,
   type DesktopStateV1,
-  type DiagnosticReportV1,
   type HostKeyAcceptV1,
   type LocalOperationV1,
   type LogEntryV1,
-  type OperationV1,
   type ProfileCreateV1,
   type ProfilePatchV1,
   type ProjectCapabilitiesV1,
@@ -122,7 +118,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private readonly projectCreateActions: string[] = [];
   private readonly projectUpdateActions: string[] = [];
   private readonly projectActivationActions: string[] = [];
-  private diagnostic: DiagnosticReportV1 | null;
   private activeOperation: LocalOperationV1 | null = null;
   private readonly contents = new Map<string, ArtifactContentV1>();
   private readonly diffs = new Map<string, ArtifactDiffV1>();
@@ -159,7 +154,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       ? this.makeValidation(this.projects[0], this.capabilities)
       : null;
     this.services = newUser ? [] : this.makeServices(online, options.degraded ?? false);
-    this.diagnostic = online ? this.makeDiagnostic(options.degraded ?? false) : null;
 
     if (options.seedCompletedRun) {
       this.seedCompletedRun();
@@ -215,7 +209,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       services: this.services,
       capability,
       validation,
-      diagnostic: this.diagnostic,
       activeOperation: this.activeOperation,
       stream: this.stream,
     });
@@ -360,7 +353,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       const activeProject = this.projects[0];
       this.validation = activeProject ? this.makeValidation(activeProject, this.capabilities) : null;
       this.services = this.makeServices(true, false);
-      this.diagnostic = this.makeDiagnostic(false);
       this.emit();
     });
     return structuredClone(this.activeOperation);
@@ -717,32 +709,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(cancelled);
   }
 
-  async runProjectDiagnostics(
-    projectId: string,
-    intent: ProductResourceMutationIntent,
-  ): Promise<DiagnosticReportV1> {
-    const project = this.requireProject(projectId);
-    this.checkIntent(intent, `project:diagnostics:${projectId}`, project.etag);
-    const coreProjectId = project.remote?.core_project_id;
-    if (!coreProjectId) throw new Error("Project diagnostics require an active project.");
-    this.diagnostic = diagnosticReportV1Schema.parse({
-      schema_version: "1",
-      id: "diagnostic-project-fixture-1",
-      status: "succeeded",
-      scopes: ["project"],
-      target: { kind: "project", project_id: coreProjectId },
-      checks: [{ id: "project", scope: "project", status: "ok", message: "Project authority is ready.", repair_action: "unsupported", logs_ref: null }],
-      created_at: NOW,
-      updated_at: NOW,
-      observed_at: NOW,
-      finished_at: NOW,
-      error: null,
-      etag: ETAG_D,
-    });
-    this.emit();
-    return structuredClone(this.diagnostic);
-  }
-
   async getRunLogs(runId: string): Promise<readonly LogEntryV1[]> {
     this.requireRun(runId);
     return structuredClone(this.logs[runId] ?? []);
@@ -758,31 +724,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     const value = this.diffs.get(artifactId);
     if (!value) throw new Error("Artifact changes are unavailable.");
     return structuredClone(value);
-  }
-
-  async restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<OperationV1> {
-    const service = this.services.find((item) => item.id === serviceId);
-    if (!service || !service.restartable) throw new Error("This service cannot be restarted here.");
-    this.checkIntent(intent, `service:restart:${serviceId}`, service.etag);
-    this.services = this.services.map((item) =>
-      item.id === serviceId ? serviceV1Schema.parse({ ...item, status: "starting", status_message: "Restarting." }) : item,
-    );
-    const operation = operationV1Schema.parse({
-      ...structuredClone(CONTRACT_FIXTURE_V1.serviceOperation),
-      id: `operation-service-restart-${serviceId}`,
-      status: "running",
-      request: { kind: "service_restart", service_id: serviceId, request: { schema_version: "1", reason: "Restart requested from OpenEvo Desktop." } },
-      result: null,
-      finished_at: null,
-    });
-    this.emit();
-    this.schedule(1, () => {
-      this.services = this.services.map((item) =>
-        item.id === serviceId ? serviceV1Schema.parse({ ...item, status: "running", status_message: "Ready." }) : item,
-      );
-      this.emit();
-    });
-    return structuredClone(operation);
   }
 
   dispose(): void {
@@ -1304,26 +1245,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       observed_at: NOW,
       etag: ETAG_D,
     }));
-  }
-
-  private makeDiagnostic(degraded: boolean): DiagnosticReportV1 {
-    return diagnosticReportV1Schema.parse({
-      schema_version: "1",
-      id: "diagnostic-fixture-1",
-      status: "succeeded",
-      scopes: ["environment", "services"],
-      target: { kind: "global" },
-      checks: [
-        { id: "environment", scope: "environment", status: degraded ? "warning" : "ok", message: degraded ? "A service should be restarted." : "Required components are available.", repair_action: degraded ? "openevo_can_retry" : "unsupported", logs_ref: null },
-        { id: "services", scope: "services", status: degraded ? "warning" : "ok", message: degraded ? "Model service response is delayed." : "Model service is ready.", repair_action: degraded ? "openevo_can_retry" : "unsupported", logs_ref: null },
-      ],
-      created_at: NOW,
-      updated_at: NOW,
-      observed_at: NOW,
-      finished_at: NOW,
-      error: null,
-      etag: ETAG_D,
-    });
   }
 
   private makeOperation(
@@ -2051,6 +1972,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         hf_model: null,
       },
       evolution: { targets: {} },
+      evolution_configuration_state: "pending" as const,
     } : {};
     const project = projectV1Schema.parse({
       ...base,
@@ -2100,6 +2022,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     if (!project) return;
     const updated = projectV1Schema.parse({
       ...project,
+      evolution_configuration_state: "configured",
       evolution: {
         targets: {
           ...project.evolution.targets,
@@ -2160,10 +2083,14 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.emit();
   }
 
-  clearEvolutionSelections(): void {
+  clearEvolutionSelections(state: "pending" | "configured" = "configured"): void {
     const project = this.projects[0];
     if (!project) return;
-    const updated = projectV1Schema.parse({ ...project, evolution: { targets: {} } });
+    const updated = projectV1Schema.parse({
+      ...project,
+      evolution: { targets: {} },
+      evolution_configuration_state: state,
+    });
     this.projects = [updated, ...this.projects.slice(1)];
     this.validation = this.capabilities ? this.makeValidation(updated, this.capabilities) : null;
     this.emit();

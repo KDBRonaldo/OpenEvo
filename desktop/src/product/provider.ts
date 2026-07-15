@@ -4,11 +4,9 @@ import type {
   ArtifactDiffV1,
   ArtifactV1,
   DesktopStateV1,
-  DiagnosticReportV1,
   HostKeyAcceptV1,
   LocalOperationV1,
   LogEntryV1,
-  OperationV1,
   ProfileCreateV1,
   ProfilePatchV1,
   ProjectCapabilitiesV1,
@@ -84,7 +82,6 @@ export interface DesktopProductSnapshot {
   readonly services: readonly ServiceV1[];
   readonly capability: ProjectCapabilityState | null;
   readonly validation: ProjectValidationState | null;
-  readonly diagnostic: DiagnosticReportV1 | null;
   readonly activeOperation: LocalOperationV1 | null;
   readonly stream: ProductStreamState;
 }
@@ -150,11 +147,9 @@ export interface DesktopProductProvider {
   startRun(intent: ProductRunIntent): Promise<RunV1>;
   cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
   cancelOperation(operationId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
-  runProjectDiagnostics(projectId: string, intent: ProductResourceMutationIntent): Promise<DiagnosticReportV1>;
   getRunLogs(runId: string): Promise<readonly LogEntryV1[]>;
   getArtifactContent(artifactId: string): Promise<ArtifactContentV1>;
   getArtifactDiff(artifactId: string): Promise<ArtifactDiffV1>;
-  restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<OperationV1>;
 }
 
 export class DesktopProductProviderUnavailableError extends Error {
@@ -195,9 +190,7 @@ export const unavailableDesktopProductProvider: DesktopProductProvider = {
   startRun: unavailable,
   cancelRun: unavailable,
   cancelOperation: unavailable,
-  runProjectDiagnostics: unavailable,
   getRunLogs: unavailable,
   getArtifactContent: unavailable,
   getArtifactDiff: unavailable,
-  restartService: unavailable,
 };

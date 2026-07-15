@@ -18,7 +18,10 @@ from desktop.sidecar.event_broker_v1 import (
 )
 from desktop.sidecar.provider_store import DesktopProviderStore, ETagConflictError
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
-from desktop.sidecar.release_provider import DesktopReleaseProvider
+from desktop.sidecar.release_provider import (
+    DesktopReleaseProvider,
+    ProviderCapabilityUnavailableError,
+)
 from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
 from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
 from desktop.sidecar.workspace_imports import WorkspaceImportStore
@@ -165,7 +168,6 @@ def test_release_provider_forwards_core_owned_read_routes(tmp_path: Path) -> Non
         ("listServiceLogs", "service_logs", {"service_id": "service-1", **_page_arguments()}),
         ("getCoreOperation", "get_operation", {"operation_id": "core-operation-1"}),
         ("getCoreLogsByRef", "logs_by_ref", {"logs_ref": "logs-1", **_page_arguments()}),
-        ("getDiagnostic", "get_diagnostic", {"diagnostic_id": "diagnostic-1"}),
     )
     try:
         for operation_id, method_name, arguments in cases:
@@ -195,7 +197,6 @@ def test_release_provider_forwards_core_owned_read_routes(tmp_path: Path) -> Non
         )
         bridge.get_operation.assert_called_once_with(project, "core-operation-1")
         bridge.logs_by_ref.assert_called_once_with(project, "logs-1", **_page_arguments())
-        bridge.get_diagnostic.assert_called_once_with(project, "diagnostic-1")
     finally:
         provider.close()
     bridge.close.assert_called_once_with()
@@ -208,13 +209,7 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
     bridge.create_run.return_value = result
     bridge.cancel_run.return_value = result
     bridge.retry_run.return_value = result
-    bridge.restart_service.return_value = result
-    bridge.create_diagnostic.return_value = result
     bridge.cache_cleanup.return_value = result
-    diagnostic_request = core_v1.DiagnosticsRequestV1(
-        target=core_v1.GlobalDiagnosticTargetV1(kind="global"),
-        scopes=[core_v1.DiagnosticScope.ENVIRONMENT],
-    )
     cache_request = core_v1.CacheCleanupRequestV1(
         scopes=[core_v1.CacheScope.BUILD_ARTIFACTS],
         older_than_days=30,
@@ -255,27 +250,6 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
         )
         assert (
             provider.invoke(
-                "restartService",
-                {
-                    "service_id": "service-1",
-                    "idempotency_key": "service-restart-routing-0001",
-                    "if_match": ETAG_A,
-                },
-            )
-            is result
-        )
-        assert (
-            provider.invoke(
-                "createDiagnostic",
-                {
-                    "request": diagnostic_request,
-                    "idempotency_key": "diagnostic-create-routing-0001",
-                },
-            )
-            is result
-        )
-        assert (
-            provider.invoke(
                 "cleanupCaches",
                 {
                     "request": cache_request,
@@ -286,16 +260,7 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
         )
 
         deleted_run = provider.invoke("deleteRun", {"run_id": "run-1", "if_match": ETAG_A})
-        deleted_diagnostic = provider.invoke(
-            "deleteDiagnostic",
-            {
-                "diagnostic_id": "diagnostic-1",
-                "idempotency_key": "diagnostic-delete-routing-0001",
-                "if_match": ETAG_A,
-            },
-        )
         assert isinstance(deleted_run, Response) and deleted_run.status_code == 204
-        assert isinstance(deleted_diagnostic, Response) and deleted_diagnostic.status_code == 204
 
         bridge.create_run.assert_called_once_with(
             project, idempotency_key="run-create-routing-0001"
@@ -312,72 +277,54 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
             if_match=ETAG_A,
             idempotency_key="run-retry-routing-0001",
         )
-        bridge.restart_service.assert_called_once_with(
-            project,
-            "service-1",
-            if_match=ETAG_A,
-            idempotency_key="service-restart-routing-0001",
-        )
-        bridge.create_diagnostic.assert_called_once_with(
-            project,
-            diagnostic_request,
-            idempotency_key="diagnostic-create-routing-0001",
-        )
         bridge.cache_cleanup.assert_called_once_with(
             project,
             cache_request,
             idempotency_key="cache-cleanup-routing-0001",
         )
         bridge.delete_run.assert_called_once_with(project, "run-1", if_match=ETAG_A)
-        bridge.delete_diagnostic.assert_called_once_with(
-            project,
-            "diagnostic-1",
-            if_match=ETAG_A,
-            idempotency_key="diagnostic-delete-routing-0001",
-        )
     finally:
         provider.close()
 
 
-@pytest.mark.parametrize(
-    ("operation_id", "method_name", "arguments"),
-    (
-        (
+def test_release_provider_allows_supported_subscription_retry(tmp_path: Path) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, _, project = _provider(tmp_path, bridge)
+    result = object()
+    bridge.retry_run.return_value = result
+    try:
+        assert project.execution.mode == "codex_subscription_transcript"
+        assert provider.invoke(
             "retryRun",
-            "retry_run",
             {
                 "run_id": "run-supported-1",
                 "idempotency_key": "run-retry-supported-routing-0001",
                 "if_match": ETAG_A,
             },
-        ),
-        (
-            "restartService",
-            "restart_service",
-            {
-                "service_id": "service-supported-1",
-                "idempotency_key": "service-restart-supported-routing-0001",
-                "if_match": ETAG_A,
-            },
-        ),
-    ),
+        ) is result
+        bridge.retry_run.assert_called_once()
+        assert bridge.retry_run.call_args.args[0] == project
+    finally:
+        provider.close()
+
+
+@pytest.mark.parametrize(
+    "operation_id",
+    ("restartService", "createDiagnostic", "getDiagnostic", "deleteDiagnostic"),
 )
-def test_release_provider_allows_supported_subscription_retry_and_restart(
+def test_release_provider_does_not_install_unavailable_core_handlers(
     tmp_path: Path,
     operation_id: str,
-    method_name: str,
-    arguments: dict[str, object],
 ) -> None:
     bridge = Mock(spec=DesktopCoreBridgeV1)
-    provider, _, project = _provider(tmp_path, bridge)
-    result = object()
-    method = getattr(bridge, method_name)
-    method.return_value = result
+    provider, _, _ = _provider(tmp_path, bridge)
     try:
-        assert project.execution.mode == "codex_subscription_transcript"
-        assert provider.invoke(operation_id, arguments) is result
-        method.assert_called_once()
-        assert method.call_args.args[0] == project
+        with pytest.raises(ProviderCapabilityUnavailableError):
+            provider.invoke(operation_id, {})
+        bridge.restart_service.assert_not_called()
+        bridge.create_diagnostic.assert_not_called()
+        bridge.get_diagnostic.assert_not_called()
+        bridge.delete_diagnostic.assert_not_called()
     finally:
         provider.close()
 
