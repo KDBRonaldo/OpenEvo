@@ -1011,10 +1011,26 @@ def _assert_only_retired_cleanup_record(journal_dir: Path) -> dict:
     records = list(journal_dir.glob("*.json"))
     assert len(records) == 1
     payload = json.loads(records[0].read_text(encoding="utf-8"))
-    assert payload["version"] == 8
+    assert payload["version"] == 9
     assert payload["kind"] == "retired"
+    assert payload["epoch"] >= 0
+    assert payload["epoch_token"]
     assert payload["generation"]
     return payload
+
+
+def _retire_minimal_cleanup_session(
+    manager: GatewayNodeManager,
+    session_dir: Path,
+    session_id: str,
+):
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id=session_id),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    active = manager._persist_cleanup_ownership(manager._cleanup_ownership_for(managed))
+    return manager._retire_cleanup_ownership(active)
 
 
 @pytest.mark.asyncio
@@ -2130,7 +2146,7 @@ async def test_recovery_scrubs_journal_bound_auth_before_cleanup_budget_exhausti
 
     journal_path = next(journal_dir.glob("*.json"))
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert journal["version"] == 8
+    assert journal["version"] == 9
     assert journal["kind"] == "active"
     assert journal["credential_root"]["auth_identity"] == list(auth_identity)
 
@@ -2938,7 +2954,7 @@ def test_cleanup_journal_stale_writer_cannot_regress_terminal_delivery(
 
     journal_path = next(journal_dir.glob("*.json"))
     payload = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert payload["version"] == 8
+    assert payload["version"] == 9
     assert payload["kind"] == "active"
     assert payload["revision"] == delivery.revision
     assert payload["phase"] == "terminal_delivery"
@@ -3023,7 +3039,7 @@ def test_cleanup_journal_retirement_blocks_precreation_stale_writer(
 
     journal_path = next(journal_dir.glob("*.json"))
     tombstone = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert tombstone["version"] == 8
+    assert tombstone["version"] == 9
     assert tombstone["kind"] == "retired"
     assert tombstone["generation"] == delivery.generation
     assert tombstone["revision"] == delivery.revision + 1
@@ -3037,6 +3053,430 @@ def test_cleanup_journal_retirement_blocks_precreation_stale_writer(
     restarted._cleanup_journal_dir = journal_dir
     restarted._load_cleanup_retries()
     assert restarted._cleanup_retries == {}
+
+
+def test_cleanup_journal_compacts_more_than_row_budget_lifecycles_and_restarts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(node_module.os, "fsync", lambda descriptor: None)
+    monkeypatch.setattr(node_module, "_CLEANUP_JOURNAL_COMPACT_AT_ROWS", 64)
+
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+    lifecycle_count = node_module._CLEANUP_JOURNAL_MAX_ROWS + 17
+    for index in range(lifecycle_count):
+        _retire_minimal_cleanup_session(manager, session_dir, f"bounded-life-{index}")
+
+    records = list(journal_dir.glob("*.json"))
+    assert len(records) < node_module._CLEANUP_JOURNAL_MAX_ROWS
+    epoch = json.loads(
+        (journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME).read_text(encoding="utf-8")
+    )
+    assert epoch["epoch"] >= 1
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+    assert restarted._cleanup_retries == {}
+    assert list(journal_dir.glob("*.json")) == []
+
+    _retire_minimal_cleanup_session(restarted, session_dir, "bounded-after-restart")
+    final_restart = _postrun_manager(calls=[])
+    final_restart._cleanup_journal_dir = journal_dir
+    final_restart._load_cleanup_retries()
+    assert final_restart._cleanup_retries == {}
+    final_epoch = json.loads(
+        (journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME).read_text(encoding="utf-8")
+    )
+    assert final_epoch["retired_count"] == lifecycle_count + 1
+    assert final_epoch["retirement_digest"] != (
+        node_module._CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED
+    )
+
+
+def test_cleanup_journal_startup_compacts_legacy_v8_row_budget_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    monkeypatch.setattr(node_module.os, "fsync", lambda descriptor: None)
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+    manager._capture_cleanup_journal_creation_epoch()
+
+    for index in range(node_module._CLEANUP_JOURNAL_MAX_ROWS):
+        session_id = f"legacy-v8-retired-{index}"
+        path = journal_dir / manager._cleanup_journal_name(session_id)
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 8,
+                    "kind": "retired",
+                    "session_id": session_id,
+                    "generation": f"{index:032x}",
+                    "revision": 2,
+                    "terminal_delivery": None,
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+
+    assert restarted._cleanup_retries == {}
+    assert list(journal_dir.glob("*.json")) == []
+    epoch = json.loads(
+        (journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME).read_text(encoding="utf-8")
+    )
+    assert epoch["epoch"] == 1
+    assert epoch["retired_count"] == node_module._CLEANUP_JOURNAL_MAX_ROWS
+
+
+def test_cleanup_journal_legacy_root_seals_epoch_before_v8_compaction(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+    _retire_minimal_cleanup_session(manager, session_dir, "legacy-root-retired")
+
+    record_path = next(journal_dir.glob("*.json"))
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["version"] = 8
+    for key in (
+        "epoch",
+        "epoch_token",
+        "retired_epoch",
+        "retired_epoch_token",
+    ):
+        record.pop(key)
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    record_path.chmod(0o600)
+
+    marker_path = next(journal_dir.parent.glob(".*.root.json"))
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["version"] = 1
+    marker.pop("epoch_required")
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    marker_path.chmod(0o600)
+    (journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME).unlink()
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+
+    assert restarted._cleanup_retries == {}
+    sealed_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert sealed_marker["version"] == 2
+    assert sealed_marker["epoch_required"] is True
+    epoch = json.loads(
+        (journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME).read_text(encoding="utf-8")
+    )
+    assert epoch["epoch"] == 1
+    assert epoch["retired_count"] == 1
+
+
+def test_cleanup_journal_sealed_root_rejects_epoch_reset(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="epoch-reset-active"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    manager._persist_cleanup_ownership(manager._cleanup_ownership_for(managed))
+    active_path = manager._cleanup_journal_path(managed.session_id)
+    (journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME).unlink()
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="epoch authority is missing"):
+        restarted._load_cleanup_retries()
+
+    assert active_path.exists()
+
+
+def test_cleanup_journal_compaction_epoch_permanently_rejects_old_writer(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="compacted-stale-writer"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+
+    stale_writer = _postrun_manager(calls=[])
+    stale_writer._cleanup_journal_dir = journal_dir
+    stale_candidate = stale_writer._cleanup_ownership_for(managed)
+
+    authoritative = _postrun_manager(calls=[])
+    authoritative._cleanup_journal_dir = journal_dir
+    active = authoritative._persist_cleanup_ownership(
+        authoritative._cleanup_ownership_for(managed)
+    )
+    retired = authoritative._retire_cleanup_ownership(active)
+    authoritative._compact_cleanup_journal()
+
+    assert retired.generation == active.generation
+    assert list(journal_dir.glob("*.json")) == []
+    compacted_epoch = json.loads(
+        (journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME).read_text(encoding="utf-8")
+    )
+    assert compacted_epoch["retired_count"] == 1
+    with pytest.raises(RuntimeError, match="cleanup journal creation epoch is stale"):
+        stale_writer._persist_cleanup_ownership(stale_candidate)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+    with pytest.raises(RuntimeError, match="cleanup journal creation epoch is stale"):
+        stale_writer._persist_cleanup_ownership(stale_candidate)
+
+
+def test_cleanup_journal_compaction_rejects_concurrent_precreation_stale_writer(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="concurrent-compaction-stale"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+
+    stale_writer = _postrun_manager(calls=[])
+    stale_writer._cleanup_journal_dir = journal_dir
+    stale_candidate = stale_writer._cleanup_ownership_for(managed)
+    entered = threading.Event()
+    release = threading.Event()
+    original_acquire = stale_writer._acquire_cleanup_journal_lock
+
+    def delay_stale_lock(authority):
+        entered.set()
+        assert release.wait(timeout=2)
+        return original_acquire(authority)
+
+    stale_writer._acquire_cleanup_journal_lock = delay_stale_lock
+    failures: list[BaseException] = []
+
+    def persist_stale() -> None:
+        try:
+            stale_writer._persist_cleanup_ownership(stale_candidate)
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=persist_stale)
+    thread.start()
+    assert entered.wait(timeout=2)
+    try:
+        authoritative = _postrun_manager(calls=[])
+        authoritative._cleanup_journal_dir = journal_dir
+        active = authoritative._persist_cleanup_ownership(
+            authoritative._cleanup_ownership_for(managed)
+        )
+        authoritative._retire_cleanup_ownership(active)
+        authoritative._compact_cleanup_journal()
+    finally:
+        release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], RuntimeError)
+    assert "creation epoch is stale" in str(failures[0])
+    assert list(journal_dir.glob("*.json")) == []
+
+
+def test_cleanup_journal_late_retirement_is_summarized_in_current_epoch(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+
+    old_managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="active-across-epoch"),
+    )
+    old_managed.session_root_identity = capture_session_root_identity(session_dir)
+    old_active = manager._persist_cleanup_ownership(
+        manager._cleanup_ownership_for(old_managed)
+    )
+    _retire_minimal_cleanup_session(manager, session_dir, "epoch-advancer")
+    manager._compact_cleanup_journal()
+
+    assert manager._cleanup_journal_path(old_managed.session_id).exists()
+    manager._retire_cleanup_ownership(old_active)
+    late_tombstone = json.loads(
+        manager._cleanup_journal_path(old_managed.session_id).read_text(encoding="utf-8")
+    )
+    assert late_tombstone["epoch"] == 0
+    assert late_tombstone["retired_epoch"] == 1
+
+    manager._compact_cleanup_journal()
+    epoch = json.loads(
+        (journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME).read_text(encoding="utf-8")
+    )
+    assert epoch["epoch"] == 2
+    assert epoch["retired_count"] == 2
+    assert list(journal_dir.glob("*.json")) == []
+
+
+def test_cleanup_journal_write_backpressure_preserves_active_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(node_module, "_CLEANUP_JOURNAL_MAX_ROWS", 8)
+    monkeypatch.setattr(node_module, "_CLEANUP_JOURNAL_COMPACT_AT_ROWS", 6)
+    monkeypatch.setattr(node_module.os, "fsync", lambda descriptor: None)
+
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+    for index in range(8):
+        managed = _managed_postrun_session(
+            session_dir,
+            _session_result(session_id=f"active-capacity-{index}"),
+        )
+        managed.session_root_identity = capture_session_root_identity(session_dir)
+        manager._persist_cleanup_ownership(manager._cleanup_ownership_for(managed))
+
+    blocked = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="active-capacity-blocked"),
+    )
+    blocked.session_root_identity = capture_session_root_identity(session_dir)
+    with pytest.raises(RuntimeError, match="capacity is occupied by active records"):
+        manager._persist_cleanup_ownership(manager._cleanup_ownership_for(blocked))
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+    assert len(restarted._cleanup_retries) == 8
+    assert blocked.session_id not in restarted._cleanup_retries
+
+
+@pytest.mark.parametrize("version", range(1, 8))
+def test_cleanup_journal_compaction_fails_closed_before_legacy_record_deletion(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+    _retire_minimal_cleanup_session(manager, session_dir, f"retired-before-v{version}")
+    epoch_path = journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME
+    epoch_before = epoch_path.read_bytes()
+
+    legacy_session_id = f"malformed-legacy-v{version}"
+    legacy_path = journal_dir / manager._cleanup_journal_name(legacy_session_id)
+    legacy_path.write_text(
+        json.dumps({"version": version, "session_id": legacy_session_id}),
+        encoding="utf-8",
+    )
+    legacy_path.chmod(0o600)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="cleanup ownership journal is invalid"):
+        restarted._load_cleanup_retries()
+
+    assert epoch_path.read_bytes() == epoch_before
+    assert len(list(journal_dir.glob("*.json"))) == 2
+
+
+class _SimulatedCleanupCompactionCrash(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "epoch_candidate_fsynced",
+        "epoch_replaced",
+        "epoch_directory_fsynced",
+        "tombstone_unlinked",
+        "tombstones_directory_fsynced",
+    ],
+)
+def test_cleanup_journal_compaction_recovers_every_crash_boundary(
+    tmp_path: Path,
+    checkpoint: str,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+
+    stale_managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id=f"stale-at-{checkpoint}"),
+    )
+    stale_managed.session_root_identity = capture_session_root_identity(session_dir)
+    stale_candidate = manager._cleanup_ownership_for(stale_managed)
+    stale_active = manager._persist_cleanup_ownership(stale_candidate)
+    manager._retire_cleanup_ownership(stale_active)
+    _retire_minimal_cleanup_session(manager, session_dir, f"retired-1-at-{checkpoint}")
+    _retire_minimal_cleanup_session(manager, session_dir, f"retired-2-at-{checkpoint}")
+
+    active_managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id=f"active-at-{checkpoint}"),
+    )
+    active_managed.session_root_identity = capture_session_root_identity(session_dir)
+    active = manager._persist_cleanup_ownership(
+        manager._cleanup_ownership_for(active_managed)
+    )
+
+    def crash_at_boundary(label: str) -> None:
+        if label == checkpoint:
+            raise _SimulatedCleanupCompactionCrash(label)
+
+    manager._cleanup_journal_compaction_checkpoint = crash_at_boundary
+    with pytest.raises(_SimulatedCleanupCompactionCrash):
+        manager._compact_cleanup_journal()
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._load_cleanup_retries()
+    assert set(restarted._cleanup_retries) == {active.session_id}
+    recovered = restarted._cleanup_retries[active.session_id]
+    assert recovered.generation == active.generation
+    assert recovered.revision == active.revision
+    assert len(list(journal_dir.glob("*.json"))) == 1
+    recovered_epoch = json.loads(
+        (journal_dir / node_module._CLEANUP_JOURNAL_EPOCH_NAME).read_text(encoding="utf-8")
+    )
+    assert recovered_epoch["retired_count"] == 3
+
+    with pytest.raises(RuntimeError, match="cleanup journal creation epoch is stale"):
+        manager._persist_cleanup_ownership(stale_candidate)
 
 
 def test_cleanup_journal_v7_recovery_retires_with_generation_and_rejects_legacy_writer(
@@ -3059,6 +3499,8 @@ def test_cleanup_journal_v7_recovery_retires_with_generation_and_rejects_legacy_
     legacy_payload["version"] = 7
     legacy_payload.pop("kind")
     legacy_payload.pop("generation")
+    legacy_payload.pop("epoch")
+    legacy_payload.pop("epoch_token")
     journal_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
     journal_path.chmod(0o600)
 
@@ -3070,7 +3512,7 @@ def test_cleanup_journal_v7_recovery_retires_with_generation_and_rejects_legacy_
 
     restarted._retire_cleanup_ownership(legacy)
     tombstone = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert tombstone["version"] == 8
+    assert tombstone["version"] == 9
     assert tombstone["kind"] == "retired"
     assert tombstone["generation"]
 
@@ -3292,7 +3734,7 @@ def test_current_cleanup_journal_requires_explicit_recovery_phase(tmp_path: Path
     assert session_dir.exists()
 
 
-def test_v5_cleanup_journal_remains_readable_after_v8_upgrade(tmp_path: Path) -> None:
+def test_v5_cleanup_journal_remains_readable_after_v9_upgrade(tmp_path: Path) -> None:
     journal_dir = tmp_path / "journal"
     session_dir = tmp_path / "session"
     session_dir.mkdir(mode=0o700)
@@ -3308,6 +3750,8 @@ def test_v5_cleanup_journal_remains_readable_after_v8_upgrade(tmp_path: Path) ->
     journal.pop("revision")
     journal.pop("kind")
     journal.pop("generation")
+    journal.pop("epoch")
+    journal.pop("epoch_token")
     journal_path.write_text(json.dumps(journal), encoding="utf-8")
     journal_path.chmod(0o600)
 
@@ -3431,6 +3875,8 @@ async def test_legacy_journal_without_phase_stops_runtime_but_preserves_roots(
     journal.pop("phase")
     journal.pop("kind")
     journal.pop("generation")
+    journal.pop("epoch")
+    journal.pop("epoch_token")
     journal["terminal_delivery"] = None
     journal_path.write_text(json.dumps(journal), encoding="utf-8")
     journal_path.chmod(0o600)

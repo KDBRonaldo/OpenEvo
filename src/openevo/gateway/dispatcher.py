@@ -94,6 +94,8 @@ class ManagedSession:
     ready_slot_owned: bool = False
     cleanup_journal_revision: int = 0
     cleanup_journal_generation: str | None = None
+    cleanup_journal_epoch: int | None = None
+    cleanup_journal_epoch_token: str | None = None
     stage: SessionStage = SessionStage.INIT
     inflight: bool = False
 

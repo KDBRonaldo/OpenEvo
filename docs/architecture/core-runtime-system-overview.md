@@ -206,8 +206,8 @@ output 或 artifact。scan 在任何写入前完成 per-file、aggregate byte、
 执行 deadline 耗尽后，transcript byte recovery/build 使用独立有界 finalization budget，保留
 timeout/cancel 前已经捕获的输出和原终态。结果发布前还会递归执行一次内存脱敏。失败时
 post-run 先做固定次数的 stop/absence retry，仍失败则释放 stage worker，由运行期周期
-reconciliation 继续。private v8 cleanup journal 为 active session 保存不可复用的 opaque generation、
-单调 revision、runtime/container/session/log/credential
+reconciliation 继续。private v9 cleanup journal 为 active session 保存不可复用的 opaque generation、
+单调 revision、journal creation epoch/token、runtime/container/session/log/credential
 identities 和 exact staged auth identity 外，还保存显式 recovery phase、闭集且已脱敏的
 request/agent terminal/optional result/pending status/timer finalization authority，以及 canonical
 result digest 和单调的 export/callback success proof；agent terminal state 必须先 fsync 该
@@ -232,11 +232,19 @@ journal 的 private parent 另有 immutable root marker，绑定 normalized abso
 逐组件 no-follow 获得的 ancestor device/inode identity chain 和 journal root identity。重启遇到
 root rename/replacement 或 ancestor symlink 必须保留 displaced records 并 fail closed。Recovery
 必须先对完整目录执行 row、filename、metadata、单文件和 aggregate byte budget 预检，之后才能读取
-任意 journal record 内容。cleanup 成功后必须把 exact active generation compare-and-retire 为持久
-v8 tombstone，保存下一 revision 和 terminal proof 摘要，不能 unlink 后允许 session identity 回到
-revision zero；因此在首次创建前已经构造 candidate 的 stale writer 也不能在 cleanup 后重建 authority。
-Startup 验证 tombstone 但不把它加入 reconciliation。历史 v1-v7 active record 仍可读取，并在下一次
-write 或 retirement 时获得 generation；畸形 legacy record fail closed。
+任意 journal record 内容；固定 lock/epoch control row 不占 record row budget，但仍计入 metadata
+预检。cleanup 成功后必须把 exact active generation compare-and-retire 为 v9 tombstone，保存
+creation epoch、retirement epoch、下一 revision 和 terminal proof 摘要。Compaction 必须先在同一
+跨进程锁内 durable rotate 全局 epoch，并把待删除 tombstone 的 exact filename/bytes 加入单调
+retirement count/digest chain，之后才能 unlink 已被该摘要覆盖的 tombstone。epoch candidate fsync、
+replace、directory fsync、逐 tombstone unlink 和最终 directory fsync 任一边界 crash 后，startup
+要么安全放弃尚未 replace 的 candidate，要么按已提交摘要继续删除，不能重复计数或回退 epoch。
+root marker 一次性 seal 为 epoch-required；删除全部历史 record 或 epoch file 不能让 authority 回到
+epoch zero。首次创建前构造的旧 epoch writer 在 tombstone compact 后仍永久拒绝；只有持 exact current
+epoch 且在同一 lock 内触发 compaction 的 writer 才能绑定 rotated epoch。Startup 在完整解析后压缩
+retired record；新 record 写入在 soft limit 触发同一 compaction，若 hard limit 全由 active record
+占用则明确 backpressure。Active、未形成 retired tombstone 的 terminal authority 和历史 v1-v7 active
+record 不得删除；历史 v8 tombstone 迁移到初始 epoch，畸形 v1-v8 record 必须在 rotate/delete 前 fail closed。
 Evolution export 由稳定
 source event identity 去重，callback 带稳定 result digest/idempotency key；响应失败或未知保持
 pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当前 evolution config/client

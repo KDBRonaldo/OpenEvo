@@ -164,11 +164,12 @@ Docker always follows removal with an absence `inspect`, including after
 successful `rm -f`. Subscription teardown retries failed stop/absence checks a
 fixed number of times in the post-run worker. A still-unproven runtime is moved
 to periodic reconciliation instead of occupying that worker indefinitely.
-The private v8 cleanup journal gives each active session an opaque generation and
-monotonic revision. Its active record contains runtime/container and pinned-root
-ownership, the exact staged auth-file identity, an explicit recovery phase, and a redacted, closed finalization
-authority: request identity, agent terminal state, optional terminal result,
-pending status, and timer marks. A terminal agent result is fsynced into that
+The private v9 cleanup journal gives each active session an opaque generation,
+monotonic revision, and the journal creation epoch/token. Its active record
+contains runtime/container and pinned-root ownership, the exact staged auth-file
+identity, an explicit recovery phase, and a redacted, closed finalization authority:
+request identity, agent terminal state, optional terminal result, pending status,
+and timer marks. A terminal agent result is fsynced into that
 authority before it becomes the live in-memory terminal state. Once a result
 exists, the journal also stores its canonical digest and monotonic
 `export_succeeded`/`callback_succeeded` proofs. A required evolution export binds
@@ -196,15 +197,26 @@ The journal directory has a separate immutable root marker in its private parent
 That marker binds the normalized absolute path, every no-follow ancestor
 device/inode identity, and the journal-root identity. Restart therefore rejects a
 renamed/replaced root or symlinked ancestor while retaining displaced records.
-Recovery preflights row count, filename bytes, metadata bytes, per-record size,
+Recovery preflights record count, filename bytes, metadata bytes, per-record size,
 and aggregate record bytes for the complete directory before reading any record
-content. Successful cleanup compare-and-retires the exact active generation to a
-persistent v8 tombstone containing the next revision and terminal proof summary.
-The session ID cannot return to revision zero, so a writer that began before
-creation cannot recreate authority after cleanup. Startup validates tombstones
-but does not schedule them for reconciliation. Historical v1-v7 active records
-remain readable and are assigned a generation on their next write or retirement;
-malformed legacy records fail closed.
+content; the fixed lock and epoch control rows do not consume the record budget.
+Successful cleanup compare-and-retires the exact active generation to a v9
+tombstone containing its creation epoch, retirement epoch, next revision, and
+terminal proof summary. Compaction first atomically rotates the global epoch and
+adds the exact tombstone bytes and filename to a monotonic retirement count and
+digest chain. Only tombstones covered by that durable summary are then unlinked.
+An epoch candidate left before replace is safely aborted; after replace, startup
+finishes partial deletion without rotating or counting the same proof again.
+The root identity marker is sealed to require the epoch file, so deleting records
+cannot reset creation authority to epoch zero. A writer holding an old creation
+epoch can never recreate a compacted session; a new writer is rebound only when
+it entered compaction with the exact current epoch while holding the process lock.
+Startup compacts validated retired records before reconciliation. New-record
+writes compact at a soft row limit and return explicit capacity backpressure when
+the hard limit is occupied by active records. Active records, including legacy
+v1-v7 records and terminal work without a retired tombstone, are never deleted.
+Historical v8 tombstones are assigned to the initial epoch during migration;
+malformed v1-v8 records fail closed before epoch rotation or deletion.
 Evolution export uses the stable session source-event identity, and callbacks
 carry a result-derived `Idempotency-Key` and digest header. A failed or unknown
 response leaves that phase pending; a successful phase is fsynced before the

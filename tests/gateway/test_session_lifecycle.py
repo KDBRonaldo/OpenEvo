@@ -177,8 +177,10 @@ async def test_dispatch_runs_runtime_lifecycle_and_builds_stdout_trajectory(
         records = list(manager._cleanup_journal_dir.glob("*.json"))
         assert len(records) == 1
         retired = json.loads(records[0].read_text(encoding="utf-8"))
-        assert retired["version"] == 8
+        assert retired["version"] == 9
         assert retired["kind"] == "retired"
+        assert retired["epoch"] >= 0
+        assert retired["retired_epoch"] >= retired["epoch"]
         assert list(manager._cleanup_journal_dir.parent.glob(".*.root.json"))
     finally:
         await manager.close()

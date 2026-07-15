@@ -103,7 +103,14 @@ _CLEANUP_JOURNAL_MAX_FILENAME_BYTES = 128
 _CLEANUP_JOURNAL_MAX_METADATA_BYTES = 1024 * 1024
 _CLEANUP_JOURNAL_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _CLEANUP_JOURNAL_ROOT_MARKER_MAX_BYTES = 64 * 1024
+_CLEANUP_JOURNAL_EPOCH_MAX_BYTES = 4096
+_CLEANUP_JOURNAL_COMPACT_AT_ROWS = 3584
 _CLEANUP_JOURNAL_LOCK_NAME = ".journal.lock"
+_CLEANUP_JOURNAL_EPOCH_NAME = ".journal.epoch"
+_CLEANUP_JOURNAL_EPOCH_CANDIDATE_NAME = ".journal.epoch.tmp"
+_CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED = hashlib.sha256(
+    b"openevo-cleanup-retirement-v1"
+).hexdigest()
 _CLEANUP_JOURNAL_LOCK_TIMEOUT_SECONDS = 2.0
 _CLEANUP_JOURNAL_LOCK_POLL_SECONDS = 0.01
 _CLEANUP_JOURNAL_RECORD_RE = re.compile(r"[0-9a-f]{64}\.json")
@@ -195,6 +202,8 @@ class CleanupRetryOwnership:
     phase: str | None
     revision: int = 0
     generation: str | None = None
+    epoch: int | None = None
+    epoch_token: str | None = None
     eval_runtime: BaseRuntime | None = None
     managed: ManagedSession | None = None
     finalize_subscription: bool = False
@@ -207,9 +216,22 @@ class _CleanupJournalTombstone:
     session_id: str
     generation: str
     revision: int
+    epoch: int | None
+    epoch_token: str | None
+    retired_epoch: int | None
+    retired_epoch_token: str | None
     result_digest: str | None
     export_succeeded: bool | None
     callback_succeeded: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupJournalEpoch:
+    epoch: int
+    token: str
+    previous_token: str | None
+    retired_count: int
+    retirement_digest: str
 
 
 @dataclass(slots=True)
@@ -221,6 +243,7 @@ class _CleanupJournalAuthority:
     ancestor_identities: tuple[tuple[int, int, int, int], ...]
     root_fd: int
     root_identity: tuple[int, int, int, int]
+    marker_version: int
 
     def close(self) -> None:
         if self.root_fd >= 0:
@@ -2943,8 +2966,8 @@ class GatewayNodeManager:
             timer_marks=dict(managed.timer._marks),
         )
 
-    @staticmethod
     def _cleanup_ownership_for(
+        self,
         managed: ManagedSession,
         *,
         eval_runtime: BaseRuntime | None = None,
@@ -2952,10 +2975,20 @@ class GatewayNodeManager:
     ) -> CleanupRetryOwnership:
         runtime = managed.runtime
         finalization_state = (
-            GatewayNodeManager._subscription_finalization_state(managed)
+            self._subscription_finalization_state(managed)
             if finalize_subscription
             else None
         )
+        epoch = managed.cleanup_journal_epoch
+        epoch_token = managed.cleanup_journal_epoch_token
+        if (
+            epoch is None
+            and epoch_token is None
+            and getattr(self, "_cleanup_journal_dir", None) is not None
+        ):
+            current_epoch = self._capture_cleanup_journal_creation_epoch()
+            epoch = current_epoch.epoch
+            epoch_token = current_epoch.token
         return CleanupRetryOwnership(
             session_id=managed.session_id,
             session_dir=managed.session_dir,
@@ -2984,6 +3017,8 @@ class GatewayNodeManager:
             ),
             revision=managed.cleanup_journal_revision,
             generation=managed.cleanup_journal_generation,
+            epoch=epoch,
+            epoch_token=epoch_token,
             eval_runtime=eval_runtime,
             managed=managed,
             finalize_subscription=finalize_subscription,
@@ -3007,6 +3042,111 @@ class GatewayNodeManager:
             if written <= 0:
                 raise RuntimeError(f"{label} write made no progress")
             offset += written
+
+    @staticmethod
+    def _cleanup_journal_epoch_payload(epoch: _CleanupJournalEpoch) -> bytes:
+        payload = {
+            "version": 1,
+            "epoch": epoch.epoch,
+            "token": epoch.token,
+            "previous_token": epoch.previous_token,
+            "retired_count": epoch.retired_count,
+            "retirement_digest": epoch.retirement_digest,
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > _CLEANUP_JOURNAL_EPOCH_MAX_BYTES:
+            raise RuntimeError("cleanup journal epoch exceeds its byte limit")
+        return encoded
+
+    @staticmethod
+    def _cleanup_journal_epoch_from_payload(payload: object) -> _CleanupJournalEpoch:
+        if not isinstance(payload, dict) or set(payload) != {
+            "version",
+            "epoch",
+            "token",
+            "previous_token",
+            "retired_count",
+            "retirement_digest",
+        }:
+            raise ValueError("cleanup journal epoch payload is not closed")
+        epoch = payload["epoch"]
+        token = payload["token"]
+        previous_token = payload["previous_token"]
+        retired_count = payload["retired_count"]
+        retirement_digest = payload["retirement_digest"]
+        if (
+            payload["version"] != 1
+            or isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or epoch < 0
+            or not isinstance(token, str)
+            or _CLEANUP_JOURNAL_GENERATION_RE.fullmatch(token) is None
+            or (
+                previous_token is not None
+                and (
+                    not isinstance(previous_token, str)
+                    or _CLEANUP_JOURNAL_GENERATION_RE.fullmatch(previous_token) is None
+                )
+            )
+            or (epoch == 0) != (previous_token is None)
+            or isinstance(retired_count, bool)
+            or not isinstance(retired_count, int)
+            or retired_count < 0
+            or not isinstance(retirement_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", retirement_digest) is None
+            or (
+                retired_count == 0
+                and retirement_digest != _CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED
+            )
+            or (epoch == 0) != (retired_count == 0)
+            or (
+                retired_count > 0
+                and retirement_digest == _CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED
+            )
+        ):
+            raise ValueError("cleanup journal epoch identity is invalid")
+        return _CleanupJournalEpoch(
+            epoch=epoch,
+            token=token,
+            previous_token=previous_token,
+            retired_count=retired_count,
+            retirement_digest=retirement_digest,
+        )
+
+    @staticmethod
+    def _cleanup_journal_root_marker_payload(
+        *,
+        path: Path,
+        ancestor_identities: tuple[tuple[int, int, int, int], ...],
+        root_identity: tuple[int, int, int, int],
+        version: int,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "version": version,
+            "path": str(path),
+            "ancestor_identities": [list(item) for item in ancestor_identities],
+            "root_identity": list(root_identity),
+        }
+        if version == 2:
+            payload["epoch_required"] = True
+        return payload
+
+    @staticmethod
+    def _encode_cleanup_journal_root_marker(payload: dict[str, Any]) -> bytes:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > _CLEANUP_JOURNAL_ROOT_MARKER_MAX_BYTES:
+            raise RuntimeError("cleanup journal root identity marker exceeds its limit")
+        return encoded
 
     @classmethod
     def _read_cleanup_journal_root_marker(
@@ -3139,20 +3279,37 @@ class GatewayNodeManager:
                     or stat.S_IMODE(root_opened.st_mode) != 0o700
                 ):
                     raise RuntimeError("cleanup journal root identity is not private")
-                marker_payload = {
-                    "version": 1,
-                    "path": str(path),
-                    "ancestor_identities": [list(item) for item in ancestor_identities],
-                    "root_identity": list(root_identity),
-                }
-                marker_bytes = json.dumps(
-                    marker_payload,
-                    ensure_ascii=True,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                if len(marker_bytes) > _CLEANUP_JOURNAL_ROOT_MARKER_MAX_BYTES:
-                    raise RuntimeError("cleanup journal root identity marker exceeds its limit")
+                initial_epoch = _CleanupJournalEpoch(
+                    epoch=0,
+                    token=secrets.token_hex(16),
+                    previous_token=None,
+                    retired_count=0,
+                    retirement_digest=_CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED,
+                )
+                epoch_fd = os.open(
+                    _CLEANUP_JOURNAL_EPOCH_NAME,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+                try:
+                    self._write_all(
+                        epoch_fd,
+                        self._cleanup_journal_epoch_payload(initial_epoch),
+                        label="cleanup journal epoch",
+                    )
+                    os.fchmod(epoch_fd, 0o600)
+                    os.fsync(epoch_fd)
+                finally:
+                    os.close(epoch_fd)
+                os.fsync(root_fd)
+                marker_payload = self._cleanup_journal_root_marker_payload(
+                    path=path,
+                    ancestor_identities=tuple(ancestor_identities),
+                    root_identity=root_identity,
+                    version=2,
+                )
+                marker_bytes = self._encode_cleanup_journal_root_marker(marker_payload)
                 marker_fd = os.open(
                     marker_name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -3169,8 +3326,8 @@ class GatewayNodeManager:
                     os.fsync(marker_fd)
                 finally:
                     os.close(marker_fd)
-                os.fsync(root_fd)
                 os.fsync(parent_fd)
+                marker_version = 2
             elif root_before is None or not marker_exists:
                 raise RuntimeError("cleanup journal root identity authority is incomplete")
             else:
@@ -3178,11 +3335,24 @@ class GatewayNodeManager:
                     parent_fd,
                     marker_name,
                 )
+                marker_version = (
+                    marker_payload.get("version")
+                    if isinstance(marker_payload, dict)
+                    else None
+                )
+                expected_marker_keys = {
+                    "version",
+                    "path",
+                    "ancestor_identities",
+                    "root_identity",
+                }
+                if marker_version == 2:
+                    expected_marker_keys.add("epoch_required")
                 if (
                     not isinstance(marker_payload, dict)
-                    or set(marker_payload)
-                    != {"version", "path", "ancestor_identities", "root_identity"}
-                    or marker_payload["version"] != 1
+                    or marker_version not in {1, 2}
+                    or set(marker_payload) != expected_marker_keys
+                    or (marker_version == 2 and marker_payload["epoch_required"] is not True)
                     or marker_payload["path"] != str(path)
                     or marker_payload["ancestor_identities"]
                     != [list(item) for item in ancestor_identities]
@@ -3211,6 +3381,17 @@ class GatewayNodeManager:
                     or stat.S_IMODE(root_opened.st_mode) != 0o700
                 ):
                     raise RuntimeError("cleanup journal root identity is not private")
+                if marker_version == 2:
+                    try:
+                        os.stat(
+                            _CLEANUP_JOURNAL_EPOCH_NAME,
+                            dir_fd=root_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError as exc:
+                        raise RuntimeError(
+                            "cleanup journal epoch authority is missing"
+                        ) from exc
 
             return _CleanupJournalAuthority(
                 path=path,
@@ -3218,6 +3399,7 @@ class GatewayNodeManager:
                 ancestor_identities=tuple(ancestor_identities),
                 root_fd=root_fd,
                 root_identity=root_identity,
+                marker_version=marker_version,
             )
         except Exception:
             if root_fd >= 0:
@@ -3355,6 +3537,150 @@ class GatewayNodeManager:
         ):
             raise RuntimeError("cleanup journal process lock identity changed")
 
+    def _seal_cleanup_journal_epoch_requirement(
+        self,
+        authority: _CleanupJournalAuthority,
+    ) -> None:
+        if authority.marker_version == 2:
+            return
+        parent_fd = authority.ancestor_fds[-1]
+        marker_name = self._cleanup_journal_marker_name(authority.path)
+        candidate_name = f"{marker_name}.v2.tmp"
+        payload = self._cleanup_journal_root_marker_payload(
+            path=authority.path,
+            ancestor_identities=authority.ancestor_identities,
+            root_identity=authority.root_identity,
+            version=2,
+        )
+        encoded = self._encode_cleanup_journal_root_marker(payload)
+        descriptor = -1
+        try:
+            try:
+                descriptor = os.open(
+                    candidate_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                self._write_all(
+                    descriptor,
+                    encoded,
+                    label="cleanup journal epoch root marker",
+                )
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = -1
+            except FileExistsError:
+                existing = self._read_cleanup_journal_root_marker(
+                    parent_fd,
+                    candidate_name,
+                )
+                if existing != payload:
+                    raise RuntimeError(
+                        "cleanup journal epoch root marker candidate is invalid"
+                    )
+            os.replace(
+                candidate_name,
+                marker_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+            authority.marker_version = 2
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _read_cleanup_journal_epoch(
+        self,
+        authority: _CleanupJournalAuthority,
+        name: str = _CLEANUP_JOURNAL_EPOCH_NAME,
+        *,
+        allow_missing: bool = False,
+    ) -> _CleanupJournalEpoch | None:
+        raw = self._read_private_cleanup_file(
+            name,
+            root_fd=authority.root_fd,
+            max_bytes=_CLEANUP_JOURNAL_EPOCH_MAX_BYTES,
+            allow_missing=allow_missing,
+        )
+        if raw is None:
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            return self._cleanup_journal_epoch_from_payload(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("cleanup journal epoch authority is invalid") from exc
+
+    def _ensure_cleanup_journal_epoch(
+        self,
+        authority: _CleanupJournalAuthority,
+    ) -> _CleanupJournalEpoch:
+        current = self._read_cleanup_journal_epoch(authority, allow_missing=True)
+        if current is None:
+            if authority.marker_version == 2:
+                raise RuntimeError("cleanup journal epoch authority is missing")
+            current = _CleanupJournalEpoch(
+                epoch=0,
+                token=secrets.token_hex(16),
+                previous_token=None,
+                retired_count=0,
+                retirement_digest=_CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED,
+            )
+            descriptor = os.open(
+                _CLEANUP_JOURNAL_EPOCH_NAME,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=authority.root_fd,
+            )
+            try:
+                self._write_all(
+                    descriptor,
+                    self._cleanup_journal_epoch_payload(current),
+                    label="cleanup journal epoch",
+                )
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            self._fsync_cleanup_journal_directory(authority.root_fd)
+
+        candidate = self._read_cleanup_journal_epoch(
+            authority,
+            _CLEANUP_JOURNAL_EPOCH_CANDIDATE_NAME,
+            allow_missing=True,
+        )
+        if candidate is not None:
+            if (
+                candidate.epoch != current.epoch + 1
+                or candidate.previous_token != current.token
+                or candidate.retired_count <= current.retired_count
+                or candidate.retirement_digest == current.retirement_digest
+            ):
+                raise RuntimeError("cleanup journal epoch candidate is invalid")
+            os.unlink(_CLEANUP_JOURNAL_EPOCH_CANDIDATE_NAME, dir_fd=authority.root_fd)
+            self._fsync_cleanup_journal_directory(authority.root_fd)
+
+        self._seal_cleanup_journal_epoch_requirement(authority)
+        self._verify_cleanup_journal_authority(authority)
+        return current
+
+    def _capture_cleanup_journal_creation_epoch(self) -> _CleanupJournalEpoch:
+        authority = self._open_cleanup_journal_authority(initialize=True)
+        if authority is None:
+            raise RuntimeError("cleanup journal root identity authority is unavailable")
+        lock_fd = -1
+        try:
+            lock_fd = self._acquire_cleanup_journal_lock(authority)
+            epoch = self._ensure_cleanup_journal_epoch(authority)
+            self._verify_cleanup_journal_lock(authority, lock_fd)
+            return epoch
+        finally:
+            if lock_fd >= 0:
+                self._release_cleanup_journal_lock(lock_fd)
+            authority.close()
+
     def _cleanup_journal_path(self, session_id: str) -> Path:
         return self._cleanup_journal_dir / self._cleanup_journal_name(session_id)
 
@@ -3368,8 +3694,10 @@ class GatewayNodeManager:
         state = ownership.finalization_state
         delivery = ownership.delivery_state
         return {
-            "version": 8,
+            "version": 9,
             "kind": "active",
+            "epoch": ownership.epoch,
+            "epoch_token": ownership.epoch_token,
             "generation": ownership.generation,
             "revision": ownership.revision,
             "session_id": ownership.session_id,
@@ -3456,12 +3784,17 @@ class GatewayNodeManager:
         ownership: CleanupRetryOwnership,
         *,
         generation: str,
+        retirement_epoch: _CleanupJournalEpoch,
     ) -> dict[str, Any]:
         delivery = ownership.delivery_state
         return {
-            "version": 8,
+            "version": 9,
             "kind": "retired",
             "session_id": ownership.session_id,
+            "epoch": ownership.epoch,
+            "epoch_token": ownership.epoch_token,
+            "retired_epoch": retirement_epoch.epoch,
+            "retired_epoch_token": retirement_epoch.token,
             "generation": generation,
             "revision": ownership.revision + 1,
             "terminal_delivery": (
@@ -3511,6 +3844,11 @@ class GatewayNodeManager:
             raise RuntimeError("cleanup journal generation compare-and-swap failed")
         if previous is None and candidate.generation is not None:
             raise RuntimeError("cleanup journal generation cannot precede its authority")
+        if previous is not None and previous.epoch is not None and (
+            candidate.epoch != previous.epoch
+            or candidate.epoch_token != previous.epoch_token
+        ):
+            raise RuntimeError("cleanup journal epoch compare-and-swap failed")
         if candidate.phase not in _RECOVERY_PHASE_ORDER:
             raise RuntimeError("cleanup journal candidate phase is invalid")
         if previous is None:
@@ -3615,6 +3953,7 @@ class GatewayNodeManager:
         destination = self._cleanup_journal_name(ownership.session_id)
         try:
             lock_fd = self._acquire_cleanup_journal_lock(authority)
+            current_epoch = self._ensure_cleanup_journal_epoch(authority)
             previous = self._read_private_cleanup_file(
                 destination,
                 root_fd=authority.root_fd,
@@ -3636,6 +3975,44 @@ class GatewayNodeManager:
                     previous_ownership = previous_record
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                     raise RuntimeError("cleanup ownership journal is invalid") from exc
+            if previous_ownership is None:
+                if (
+                    ownership.epoch != current_epoch.epoch
+                    or ownership.epoch_token != current_epoch.token
+                ):
+                    raise RuntimeError("cleanup journal creation epoch is stale")
+                inventory = self._inventory_cleanup_journal_locked(authority)
+                if len(inventory) >= _CLEANUP_JOURNAL_COMPACT_AT_ROWS:
+                    records = self._parse_cleanup_journal_inventory_locked(
+                        authority,
+                        inventory,
+                    )
+                    current_epoch = self._compact_cleanup_journal_locked(
+                        authority=authority,
+                        lock_fd=lock_fd,
+                        epoch=current_epoch,
+                        records=records,
+                    )
+                    inventory = [
+                        (name, expected)
+                        for name, expected, record in records
+                        if isinstance(record, CleanupRetryOwnership)
+                    ]
+                    ownership = replace(
+                        ownership,
+                        epoch=current_epoch.epoch,
+                        epoch_token=current_epoch.token,
+                    )
+                if len(inventory) >= _CLEANUP_JOURNAL_MAX_ROWS:
+                    raise RuntimeError(
+                        "cleanup journal capacity is occupied by active records"
+                    )
+            elif previous_ownership.epoch is None:
+                ownership = replace(
+                    ownership,
+                    epoch=current_epoch.epoch,
+                    epoch_token=current_epoch.token,
+                )
             ownership = self._merge_cleanup_journal_cancel_authority(
                 previous_ownership,
                 ownership,
@@ -3675,6 +4052,8 @@ class GatewayNodeManager:
             if ownership.managed is not None:
                 ownership.managed.cleanup_journal_revision = ownership.revision
                 ownership.managed.cleanup_journal_generation = ownership.generation
+                ownership.managed.cleanup_journal_epoch = ownership.epoch
+                ownership.managed.cleanup_journal_epoch_token = ownership.epoch_token
             return ownership
         finally:
             if lock_fd >= 0:
@@ -3915,6 +4294,218 @@ class GatewayNodeManager:
         finally:
             os.close(descriptor)
 
+    def _inventory_cleanup_journal_locked(
+        self,
+        authority: _CleanupJournalAuthority,
+    ) -> list[tuple[str, tuple[int, int, int, int, int, int]]]:
+        records: list[tuple[str, tuple[int, int, int, int, int, int]]] = []
+        metadata_bytes = 0
+        total_bytes = 0
+        with os.scandir(authority.root_fd) as entries:
+            for entry in entries:
+                name = entry.name
+                filename_bytes = os.fsencode(name)
+                if len(filename_bytes) > _CLEANUP_JOURNAL_MAX_FILENAME_BYTES:
+                    raise RuntimeError("cleanup ownership journal exceeds the filename budget")
+                metadata_bytes += len(filename_bytes) + 6 * 8
+                if metadata_bytes > _CLEANUP_JOURNAL_MAX_METADATA_BYTES:
+                    raise RuntimeError("cleanup ownership journal exceeds the metadata budget")
+                if name in {_CLEANUP_JOURNAL_LOCK_NAME, _CLEANUP_JOURNAL_EPOCH_NAME}:
+                    continue
+                if name == _CLEANUP_JOURNAL_EPOCH_CANDIDATE_NAME:
+                    raise RuntimeError("cleanup journal has an incomplete epoch rotation")
+                if _CLEANUP_JOURNAL_PENDING_RE.fullmatch(name) is not None:
+                    raise RuntimeError("cleanup ownership journal has an incomplete update")
+                if _CLEANUP_JOURNAL_RECORD_RE.fullmatch(name) is None:
+                    raise RuntimeError("cleanup ownership journal filename metadata is invalid")
+                if len(records) >= _CLEANUP_JOURNAL_MAX_ROWS:
+                    raise RuntimeError("cleanup ownership journal exceeds the row budget")
+                opened = entry.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                    or opened.st_nlink != 1
+                    or stat.S_IMODE(opened.st_mode) != 0o600
+                    or opened.st_size <= 0
+                    or opened.st_size > _CLEANUP_JOURNAL_MAX_BYTES
+                ):
+                    raise RuntimeError("cleanup ownership journal file metadata is invalid")
+                total_bytes += opened.st_size
+                if total_bytes > _CLEANUP_JOURNAL_MAX_TOTAL_BYTES:
+                    raise RuntimeError(
+                        "cleanup ownership journal exceeds the aggregate byte budget"
+                    )
+                records.append(
+                    (
+                        name,
+                        (
+                            opened.st_dev,
+                            opened.st_ino,
+                            opened.st_uid,
+                            opened.st_mode,
+                            opened.st_nlink,
+                            opened.st_size,
+                        ),
+                    )
+                )
+        self._verify_cleanup_journal_authority(authority)
+        return records
+
+    def _parse_cleanup_journal_inventory_locked(
+        self,
+        authority: _CleanupJournalAuthority,
+        inventory: list[tuple[str, tuple[int, int, int, int, int, int]]],
+    ) -> list[
+        tuple[
+            str,
+            tuple[int, int, int, int, int, int],
+            CleanupRetryOwnership | _CleanupJournalTombstone,
+        ]
+    ]:
+        parsed = []
+        session_ids: set[str] = set()
+        for name, expected in sorted(inventory):
+            raw = self._read_cleanup_journal_record(authority, name, expected)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                record = self._cleanup_journal_record_from_payload(
+                    payload,
+                    authority.path / name,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError("cleanup ownership journal is invalid") from exc
+            if record.session_id in session_ids:
+                raise RuntimeError("cleanup ownership journal session identity is duplicated")
+            session_ids.add(record.session_id)
+            parsed.append((name, expected, record))
+        self._verify_cleanup_journal_authority(authority)
+        return parsed
+
+    def _cleanup_journal_compaction_checkpoint(self, label: str) -> None:
+        del label
+
+    def _compact_cleanup_journal_locked(
+        self,
+        *,
+        authority: _CleanupJournalAuthority,
+        lock_fd: int,
+        epoch: _CleanupJournalEpoch,
+        records: list[
+            tuple[
+                str,
+                tuple[int, int, int, int, int, int],
+                CleanupRetryOwnership | _CleanupJournalTombstone,
+            ]
+        ],
+    ) -> _CleanupJournalEpoch:
+        retired = [item for item in records if isinstance(item[2], _CleanupJournalTombstone)]
+        if not retired:
+            return epoch
+        unsummarized = []
+        for item in retired:
+            tombstone = item[2]
+            assert isinstance(tombstone, _CleanupJournalTombstone)
+            retired_epoch = tombstone.retired_epoch
+            if retired_epoch is None:
+                retired_epoch = 0
+            if retired_epoch > epoch.epoch:
+                raise RuntimeError("cleanup tombstone retirement epoch is from the future")
+            if retired_epoch == epoch.epoch:
+                if (
+                    tombstone.retired_epoch_token is not None
+                    and tombstone.retired_epoch_token != epoch.token
+                ):
+                    raise RuntimeError("cleanup tombstone retirement epoch token is invalid")
+                unsummarized.append(item)
+
+        next_epoch = epoch
+        if unsummarized:
+            retirement_digest = epoch.retirement_digest
+            for name, expected, _ in unsummarized:
+                raw = self._read_cleanup_journal_record(authority, name, expected)
+                digest = hashlib.sha256()
+                digest.update(b"openevo-cleanup-retirement-entry-v1\0")
+                digest.update(bytes.fromhex(retirement_digest))
+                encoded_name = name.encode("ascii")
+                digest.update(len(encoded_name).to_bytes(4, "big"))
+                digest.update(encoded_name)
+                digest.update(len(raw).to_bytes(8, "big"))
+                digest.update(raw)
+                retirement_digest = digest.hexdigest()
+            next_epoch = _CleanupJournalEpoch(
+                epoch=epoch.epoch + 1,
+                token=secrets.token_hex(16),
+                previous_token=epoch.token,
+                retired_count=epoch.retired_count + len(unsummarized),
+                retirement_digest=retirement_digest,
+            )
+            descriptor = os.open(
+                _CLEANUP_JOURNAL_EPOCH_CANDIDATE_NAME,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=authority.root_fd,
+            )
+            try:
+                self._write_all(
+                    descriptor,
+                    self._cleanup_journal_epoch_payload(next_epoch),
+                    label="cleanup journal epoch candidate",
+                )
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            self._cleanup_journal_compaction_checkpoint("epoch_candidate_fsynced")
+            os.replace(
+                _CLEANUP_JOURNAL_EPOCH_CANDIDATE_NAME,
+                _CLEANUP_JOURNAL_EPOCH_NAME,
+                src_dir_fd=authority.root_fd,
+                dst_dir_fd=authority.root_fd,
+            )
+            self._cleanup_journal_compaction_checkpoint("epoch_replaced")
+            self._fsync_cleanup_journal_directory(authority.root_fd)
+            self._cleanup_journal_compaction_checkpoint("epoch_directory_fsynced")
+
+        for name, expected, tombstone in retired:
+            raw = self._read_cleanup_journal_record(authority, name, expected)
+            try:
+                current = self._cleanup_journal_record_from_payload(
+                    json.loads(raw.decode("utf-8")),
+                    authority.path / name,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError("cleanup ownership tombstone changed before compaction") from exc
+            if current != tombstone:
+                raise RuntimeError("cleanup ownership tombstone changed before compaction")
+            os.unlink(name, dir_fd=authority.root_fd)
+            self._cleanup_journal_compaction_checkpoint("tombstone_unlinked")
+        self._fsync_cleanup_journal_directory(authority.root_fd)
+        self._cleanup_journal_compaction_checkpoint("tombstones_directory_fsynced")
+        self._verify_cleanup_journal_authority(authority)
+        self._verify_cleanup_journal_lock(authority, lock_fd)
+        return next_epoch
+
+    def _compact_cleanup_journal(self) -> None:
+        authority = self._open_cleanup_journal_authority(initialize=False)
+        if authority is None:
+            return
+        lock_fd = -1
+        try:
+            lock_fd = self._acquire_cleanup_journal_lock(authority)
+            epoch = self._ensure_cleanup_journal_epoch(authority)
+            inventory = self._inventory_cleanup_journal_locked(authority)
+            records = self._parse_cleanup_journal_inventory_locked(authority, inventory)
+            self._compact_cleanup_journal_locked(
+                authority=authority,
+                lock_fd=lock_fd,
+                epoch=epoch,
+                records=records,
+            )
+        finally:
+            if lock_fd >= 0:
+                self._release_cleanup_journal_lock(lock_fd)
+            authority.close()
+
     def _load_cleanup_retries(self) -> None:
         authority = self._open_cleanup_journal_authority(initialize=False)
         if authority is None:
@@ -3922,78 +4513,21 @@ class GatewayNodeManager:
         lock_fd = -1
         try:
             lock_fd = self._acquire_cleanup_journal_lock(authority)
-            records: list[tuple[str, tuple[int, int, int, int, int, int]]] = []
-            row_count = 0
-            metadata_bytes = 0
-            total_bytes = 0
-            with os.scandir(authority.root_fd) as entries:
-                for entry in entries:
-                    row_count += 1
-                    if row_count > _CLEANUP_JOURNAL_MAX_ROWS:
-                        raise RuntimeError("cleanup ownership journal exceeds the row budget")
-                    name = entry.name
-                    filename_bytes = os.fsencode(name)
-                    if len(filename_bytes) > _CLEANUP_JOURNAL_MAX_FILENAME_BYTES:
-                        raise RuntimeError("cleanup ownership journal exceeds the filename budget")
-                    metadata_bytes += len(filename_bytes) + 6 * 8
-                    if metadata_bytes > _CLEANUP_JOURNAL_MAX_METADATA_BYTES:
-                        raise RuntimeError("cleanup ownership journal exceeds the metadata budget")
-                    if name == _CLEANUP_JOURNAL_LOCK_NAME:
-                        continue
-                    if _CLEANUP_JOURNAL_PENDING_RE.fullmatch(name) is not None:
-                        raise RuntimeError("cleanup ownership journal has an incomplete update")
-                    if _CLEANUP_JOURNAL_RECORD_RE.fullmatch(name) is None:
-                        raise RuntimeError(
-                            "cleanup ownership journal filename metadata is invalid"
-                        )
-                    opened = entry.stat(follow_symlinks=False)
-                    if (
-                        not stat.S_ISREG(opened.st_mode)
-                        or opened.st_uid != os.geteuid()
-                        or opened.st_nlink != 1
-                        or stat.S_IMODE(opened.st_mode) != 0o600
-                        or opened.st_size <= 0
-                        or opened.st_size > _CLEANUP_JOURNAL_MAX_BYTES
-                    ):
-                        raise RuntimeError("cleanup ownership journal file metadata is invalid")
-                    total_bytes += opened.st_size
-                    if total_bytes > _CLEANUP_JOURNAL_MAX_TOTAL_BYTES:
-                        raise RuntimeError(
-                            "cleanup ownership journal exceeds the aggregate byte budget"
-                        )
-                    records.append(
-                        (
-                            name,
-                            (
-                                opened.st_dev,
-                                opened.st_ino,
-                                opened.st_uid,
-                                opened.st_mode,
-                                opened.st_nlink,
-                                opened.st_size,
-                            ),
-                        )
-                    )
-
-            self._verify_cleanup_journal_authority(authority)
+            epoch = self._ensure_cleanup_journal_epoch(authority)
+            inventory = self._inventory_cleanup_journal_locked(authority)
+            records = self._parse_cleanup_journal_inventory_locked(authority, inventory)
             recovered: dict[str, CleanupRetryOwnership] = {}
-            recovered_session_ids: set[str] = set()
-            for name, expected in sorted(records):
-                raw = self._read_cleanup_journal_record(authority, name, expected)
-                path = authority.path / name
-                try:
-                    payload = json.loads(raw.decode("utf-8"))
-                    record = self._cleanup_journal_record_from_payload(payload, path)
-                except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                    raise RuntimeError("cleanup ownership journal is invalid") from exc
-                if (
-                    record.session_id in recovered_session_ids
-                    or record.session_id in self._cleanup_retries
-                ):
+            for _, _, record in records:
+                if record.session_id in self._cleanup_retries:
                     raise RuntimeError("cleanup ownership journal session identity is duplicated")
-                recovered_session_ids.add(record.session_id)
                 if isinstance(record, CleanupRetryOwnership):
                     recovered[record.session_id] = record
+            self._compact_cleanup_journal_locked(
+                authority=authority,
+                lock_fd=lock_fd,
+                epoch=epoch,
+                records=records,
+            )
             self._verify_cleanup_journal_authority(authority)
             self._verify_cleanup_journal_lock(authority, lock_fd)
             self._cleanup_retries.update(recovered)
@@ -4009,20 +4543,30 @@ class GatewayNodeManager:
     ) -> CleanupRetryOwnership | _CleanupJournalTombstone:
         if not isinstance(payload, dict):
             raise ValueError("cleanup ownership payload is not closed")
-        if payload.get("version") != 8 or payload.get("kind") != "retired":
+        version = payload.get("version")
+        if version not in {8, 9} or payload.get("kind") != "retired":
             return GatewayNodeManager._cleanup_ownership_from_payload(payload, path)
-        if set(payload) != {
+        expected_keys = {
             "version",
             "kind",
             "session_id",
             "generation",
             "revision",
             "terminal_delivery",
-        }:
+        }
+        if version == 9:
+            expected_keys.update(
+                {"epoch", "epoch_token", "retired_epoch", "retired_epoch_token"}
+            )
+        if set(payload) != expected_keys:
             raise ValueError("cleanup tombstone payload is not closed")
         session_id = payload["session_id"]
         generation = payload["generation"]
         revision = payload["revision"]
+        epoch = payload.get("epoch")
+        epoch_token = payload.get("epoch_token")
+        retired_epoch = payload.get("retired_epoch")
+        retired_epoch_token = payload.get("retired_epoch_token")
         if (
             not isinstance(session_id, str)
             or not isinstance(generation, str)
@@ -4030,6 +4574,21 @@ class GatewayNodeManager:
             or isinstance(revision, bool)
             or not isinstance(revision, int)
             or revision < 1
+            or (
+                version == 9
+                and (
+                    isinstance(epoch, bool)
+                    or not isinstance(epoch, int)
+                    or epoch < 0
+                    or not isinstance(epoch_token, str)
+                    or _CLEANUP_JOURNAL_GENERATION_RE.fullmatch(epoch_token) is None
+                    or isinstance(retired_epoch, bool)
+                    or not isinstance(retired_epoch, int)
+                    or retired_epoch < epoch
+                    or not isinstance(retired_epoch_token, str)
+                    or _CLEANUP_JOURNAL_GENERATION_RE.fullmatch(retired_epoch_token) is None
+                )
+            )
         ):
             raise ValueError("cleanup tombstone identity is invalid")
         expected_name = f"{hashlib.sha256(session_id.encode('utf-8')).hexdigest()}.json"
@@ -4058,6 +4617,10 @@ class GatewayNodeManager:
             session_id=session_id,
             generation=generation,
             revision=revision,
+            epoch=epoch,
+            epoch_token=epoch_token,
+            retired_epoch=retired_epoch,
+            retired_epoch_token=retired_epoch_token,
             result_digest=result_digest,
             export_succeeded=export_succeeded,
             callback_succeeded=callback_succeeded,
@@ -4089,33 +4652,45 @@ class GatewayNodeManager:
             expected_keys.add("phase")
         if version == 7:
             expected_keys.add("revision")
-        if version == 8:
+        if version in {8, 9}:
             expected_keys.update({"kind", "generation", "revision", "phase"})
             expected_keys.update(
                 {"log_root", "subscription_finalization", "terminal_delivery"}
             )
+        if version == 9:
+            expected_keys.update({"epoch", "epoch_token"})
         if set(payload) != expected_keys:
             raise ValueError("cleanup ownership payload is not closed")
-        if version not in {1, 2, 3, 4, 5, 6, 7, 8} or not isinstance(
+        if version not in {1, 2, 3, 4, 5, 6, 7, 8, 9} or not isinstance(
             payload["session_id"], str
         ):
             raise ValueError("cleanup ownership identity is invalid")
         generation = payload.get("generation")
-        if version == 8 and (
+        if version in {8, 9} and (
             payload["kind"] != "active"
             or not isinstance(generation, str)
             or _CLEANUP_JOURNAL_GENERATION_RE.fullmatch(generation) is None
         ):
             raise ValueError("cleanup ownership generation is invalid")
+        epoch = payload.get("epoch")
+        epoch_token = payload.get("epoch_token")
+        if version == 9 and (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or epoch < 0
+            or not isinstance(epoch_token, str)
+            or _CLEANUP_JOURNAL_GENERATION_RE.fullmatch(epoch_token) is None
+        ):
+            raise ValueError("cleanup ownership epoch is invalid")
         revision = payload.get("revision", 0)
-        if version in {7, 8} and (
+        if version in {7, 8, 9} and (
             isinstance(revision, bool) or not isinstance(revision, int) or revision < 1
         ):
             raise ValueError("cleanup ownership revision is invalid")
         phase = payload.get("phase")
-        if version in {5, 6, 7, 8} and phase not in _RECOVERY_PHASES:
+        if version in {5, 6, 7, 8, 9} and phase not in _RECOVERY_PHASES:
             raise ValueError("cleanup recovery phase is invalid")
-        if version not in {5, 6, 7, 8}:
+        if version not in {5, 6, 7, 8, 9}:
             phase = None
         session_id = payload["session_id"]
         expected_name = f"{hashlib.sha256(session_id.encode('utf-8')).hexdigest()}.json"
@@ -4165,7 +4740,7 @@ class GatewayNodeManager:
             credential_identity = None
             credential_auth_identity = None
         else:
-            if version in {6, 7, 8}:
+            if version in {6, 7, 8, 9}:
                 if not isinstance(credential_payload, dict) or set(credential_payload) != {
                     "path",
                     "identity",
@@ -4266,7 +4841,7 @@ class GatewayNodeManager:
                 "callback_required",
                 "callback_succeeded",
             }
-            if version in {5, 6, 7, 8}:
+            if version in {5, 6, 7, 8, 9}:
                 delivery_keys.add("export_authority")
             if (
                 not isinstance(delivery_payload, dict)
@@ -4339,7 +4914,9 @@ class GatewayNodeManager:
             callback_succeeded = delivery_payload["callback_succeeded"]
             if callback_required != (callback_url is not None):
                 raise ValueError("terminal delivery callback authority is invalid")
-            if version in {5, 6, 7, 8} and export_required != (export_authority is not None):
+            if version in {5, 6, 7, 8, 9} and export_required != (
+                export_authority is not None
+            ):
                 raise ValueError("terminal delivery export authority is invalid")
             if (not export_required and not export_succeeded) or (
                 not callback_required and not callback_succeeded
@@ -4394,6 +4971,8 @@ class GatewayNodeManager:
             phase=phase,
             revision=revision,
             generation=generation,
+            epoch=epoch,
+            epoch_token=epoch_token,
             eval_runtime=None,
             finalize_subscription=finalization_state is not None,
             finalization_state=finalization_state,
@@ -4410,6 +4989,10 @@ class GatewayNodeManager:
                 session_id=ownership.session_id,
                 generation=ownership.generation or secrets.token_hex(16),
                 revision=ownership.revision + 1,
+                epoch=ownership.epoch,
+                epoch_token=ownership.epoch_token,
+                retired_epoch=ownership.epoch,
+                retired_epoch_token=ownership.epoch_token,
                 result_digest=None if delivery is None else delivery.result_digest,
                 export_succeeded=None if delivery is None else delivery.export_succeeded,
                 callback_succeeded=None if delivery is None else delivery.callback_succeeded,
@@ -4421,6 +5004,7 @@ class GatewayNodeManager:
         destination = self._cleanup_journal_name(ownership.session_id)
         try:
             lock_fd = self._acquire_cleanup_journal_lock(authority)
+            current_epoch = self._ensure_cleanup_journal_epoch(authority)
             previous = self._read_private_cleanup_file(
                 destination,
                 root_fd=authority.root_fd,
@@ -4444,6 +5028,13 @@ class GatewayNodeManager:
                         expected_generation is not None
                         and record.generation == expected_generation
                         and record.revision == expected_revision
+                        and (
+                            ownership.epoch is None
+                            or (
+                                record.epoch == ownership.epoch
+                                and record.epoch_token == ownership.epoch_token
+                            )
+                        )
                     ):
                         self._verify_cleanup_journal_authority(authority)
                         self._verify_cleanup_journal_lock(authority, lock_fd)
@@ -4452,20 +5043,66 @@ class GatewayNodeManager:
                 authoritative = record
 
             if authoritative is None:
-                if ownership.revision != 0 or ownership.generation is not None:
+                if (
+                    ownership.revision != 0
+                    or ownership.generation is not None
+                    or ownership.epoch != current_epoch.epoch
+                    or ownership.epoch_token != current_epoch.token
+                ):
                     raise RuntimeError("cleanup journal retirement compare-and-swap failed")
+                inventory = self._inventory_cleanup_journal_locked(authority)
+                if len(inventory) >= _CLEANUP_JOURNAL_COMPACT_AT_ROWS:
+                    records = self._parse_cleanup_journal_inventory_locked(
+                        authority,
+                        inventory,
+                    )
+                    current_epoch = self._compact_cleanup_journal_locked(
+                        authority=authority,
+                        lock_fd=lock_fd,
+                        epoch=current_epoch,
+                        records=records,
+                    )
+                    inventory = [
+                        (name, expected)
+                        for name, expected, record in records
+                        if isinstance(record, CleanupRetryOwnership)
+                    ]
+                    ownership = replace(
+                        ownership,
+                        epoch=current_epoch.epoch,
+                        epoch_token=current_epoch.token,
+                    )
+                if len(inventory) >= _CLEANUP_JOURNAL_MAX_ROWS:
+                    raise RuntimeError(
+                        "cleanup journal capacity is occupied by active records"
+                    )
                 authoritative = ownership
             elif (
                 authoritative.session_id != ownership.session_id
                 or authoritative.revision != ownership.revision
                 or authoritative.generation != ownership.generation
+                or (
+                    authoritative.epoch is not None
+                    and (
+                        authoritative.epoch != ownership.epoch
+                        or authoritative.epoch_token != ownership.epoch_token
+                    )
+                )
             ):
                 raise RuntimeError("cleanup journal retirement compare-and-swap failed")
+
+            if authoritative.epoch is None:
+                authoritative = replace(
+                    authoritative,
+                    epoch=current_epoch.epoch,
+                    epoch_token=current_epoch.token,
+                )
 
             generation = authoritative.generation or secrets.token_hex(16)
             tombstone_payload = self._cleanup_tombstone_payload(
                 authoritative,
                 generation=generation,
+                retirement_epoch=current_epoch,
             )
             try:
                 tombstone = self._cleanup_journal_record_from_payload(
@@ -4496,6 +5133,8 @@ class GatewayNodeManager:
             if ownership.managed is not None:
                 ownership.managed.cleanup_journal_revision = tombstone.revision
                 ownership.managed.cleanup_journal_generation = tombstone.generation
+                ownership.managed.cleanup_journal_epoch = tombstone.epoch
+                ownership.managed.cleanup_journal_epoch_token = tombstone.epoch_token
             return tombstone
         finally:
             if lock_fd >= 0:
@@ -4601,6 +5240,8 @@ class GatewayNodeManager:
             cancel_requested=state.cancel_requested,
             cleanup_journal_revision=ownership.revision,
             cleanup_journal_generation=ownership.generation,
+            cleanup_journal_epoch=ownership.epoch,
+            cleanup_journal_epoch_token=ownership.epoch_token,
             stage=SessionStage.POSTRUN,
         )
         if self.session_registry.get(managed.session_id) is None:
