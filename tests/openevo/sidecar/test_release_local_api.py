@@ -655,6 +655,50 @@ def test_supported_subscription_activation_replay_remains_exact_and_local(
         assert lifecycle.disconnect_calls == 0
 
 
+def test_release_local_operation_cancel_is_wired_and_replayable(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path / "state")
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Cancellation server",
+            key="create-profile-cancellation-0001",
+        ).json()
+        provider = app.state.desktop_release_provider
+        project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(
+                _project(profile["profile_id"], name="Cancellable project")
+            ),
+            idempotency_key="seed-cancellable-project-0001",
+        )
+        reservation = provider._store.begin_project_runtime_action(
+            route=f"/desktop/v1/projects/{project.project_id}/activate",
+            operation_kind="project_activate",
+            project_id=project.project_id,
+            key="reserve-cancellable-activation-0001",
+            body={},
+            if_match=project.etag,
+        )
+        operation = reservation.operation
+        route = f"/desktop/v1/operations/{operation.operation_id}/cancel"
+        headers = {
+            **SESSION_HEADERS,
+            "If-Match": operation.etag,
+            "Idempotency-Key": "cancel-local-operation-0001",
+        }
+
+        response = client.post(route, headers=headers)
+        replay = client.post(route, headers=headers)
+
+        assert response.status_code == 202
+        assert response.json()["state"] == "cancelled"
+        assert response.json()["operation_id"] == operation.operation_id
+        assert replay.status_code == 202
+        assert replay.json() == response.json()
+        assert provider._store.get_project(project.project_id).state == "draft"
+
+
 def test_release_execution_mode_gate_rejects_retry_and_restart_before_core(
     tmp_path: Path,
 ) -> None:

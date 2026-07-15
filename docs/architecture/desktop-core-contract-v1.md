@@ -115,9 +115,10 @@ durable bridge store, strict Core bridge, adopted-import source, event broker,
 event relay, and `DesktopReleaseProvider`. Composition is all-or-nothing before
 the Local API advertises the complete release feature set. Project activation
 publishes the generation-bound Core session used by Core-owned routes; missing
-or stale session authority fails those routes closed. Local doctor, repair,
-workspace-sync, and Local operation log/cancellation workflows remain separate
-provider operations and are not inferred from bridge availability.
+or stale session authority fails those routes closed. The release provider
+implements cancellation for active Local connect/bootstrap/activation
+operations. Local doctor, repair, workspace-sync, and Local operation logs are
+not release capabilities and are not inferred from bridge availability.
 
 Core owns durable projects, immutable task/workspace snapshots, capabilities,
 validation, services, runs and attempts, transcript capture, datasets,
@@ -345,7 +346,12 @@ revision use. Ordinary demote/archive transitions preserve the same history.
 Any project intent patch clears both revision and remote state, and demotes
 `active`/`blocked` to `draft`, in the same single-version ETag update. This lets
 Desktop activate to obtain capabilities, save edited evolution intent, and then
-require reactivation. Queued/running/cancelling project operations still block
+require reactivation. For a new science project, the renderer keeps this as one
+recoverable drawer workflow: the first activation establishes the project
+tunnel, remote effective defaults initialize all three ordinary evolution
+targets, and the second save validates and activates that configured draft.
+An empty target map remains visibly incomplete and is resumed after refresh.
+Queued/running/cancelling project operations still block
 the patch. Action idempotency stores
 the exact `LocalOperationV1`; replay resolves its current authoritative
 operation row and cannot return an obsolete connected/active result. Resource,
@@ -425,7 +431,7 @@ token directly from `start_sidecar`. The token never appears in an HTTP
 discovery response. All `/desktop/v1` calls use
 `X-OpenEvo-Desktop-Session`.
 
-The release surface is:
+The frozen Local API v1 boundary is:
 
 ```text
 GET    /desktop/v1/state
@@ -481,8 +487,12 @@ POST   /desktop/v1/maintenance/cache-cleanup
 GET    /desktop/v1/events
 ```
 
-Only sidecar-owned connection, host-key, bootstrap, repair, activation, and
-workspace-sync actions return `LocalOperationV1`. Core-owned runs, service
+Routes in this frozen boundary are not automatically release features. The
+current release composition provides sidecar-owned connection, host-key,
+bootstrap, activation, and operation cancellation, but does not install doctor,
+repair, workspace-sync, or Local operation-log handlers; the renderer hides
+those unavailable controls. These sidecar actions return `LocalOperationV1`.
+Core-owned runs, service
 actions, diagnostics, and cleanup resources retain their Core v1 response
 shape after strict sidecar validation. Service restart and cache cleanup
 return Core `OperationV1`; React observes them through the explicitly
@@ -490,6 +500,13 @@ namespaced `/desktop/v1/core/operations/{operation_id}` endpoint and reads any
 referenced bounded logs through `/desktop/v1/core/logs/{logs_ref}`. The
 sidecar does not synthesize remote progress or replace authoritative Core
 state with a local operation.
+
+Activation completion is published under the project-session transition lock.
+The bridge commit and authoritative online project binding happen before the
+operation becomes `succeeded`; state and operation reads use the same lock, and
+the state invalidation event is emitted only after that combined publication.
+The renderer therefore cannot observe `succeeded` together with a bootstrapping
+or offline Core snapshot.
 
 Local profile responses expose an authentication kind and an opaque native
 credential slot status, never a credential reference or secret. Network proxy

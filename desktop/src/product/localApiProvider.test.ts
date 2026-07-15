@@ -8,6 +8,7 @@ import {
   artifactDiffV1Schema,
   artifactV1Schema,
   desktopStateV1Schema,
+  diagnosticReportV1Schema,
   localOperationV1Schema,
   logEntryV1Schema,
   operationV1Schema,
@@ -282,6 +283,22 @@ describe("LocalApiDesktopProductProvider", () => {
       ifMatch: ETAG_B,
     });
 
+    const refreshedForDiagnostic = await provider.refresh();
+    if (refreshedForDiagnostic.status !== "fresh") throw new Error("expected a fresh fixture");
+    const diagnostic = await provider.runProjectDiagnostics("project-fixture-1", {
+      actionId: "renderer-action-diagnostic-0001",
+      streamEpoch: refreshedForDiagnostic.snapshot.stream.epoch,
+      etag: ETAG_B,
+    });
+    expect(diagnostic).toEqual(diagnosticReportV1Schema.parse(CONTRACT_FIXTURE_V1.diagnostic));
+    expect(client.createDiagnostic).toHaveBeenCalledWith(
+      {
+        scopes: ["project"],
+        target: { kind: "project", project_id: "project-fixture-1" },
+      },
+      { idempotencyKey: "renderer-action-diagnostic-0001" },
+    );
+
     const unknown = mockClient();
     unknown.createRun = vi.fn().mockRejectedValue(new TypeError("unknown network outcome"));
     const unknownProvider = createProvider(unknown);
@@ -336,12 +353,13 @@ describe("LocalApiDesktopProductProvider", () => {
     }, resourceIntent)).rejects.toThrow(/another resource/i);
     client.activateProject = vi.fn().mockResolvedValue(localOperation("project_activate", "project", "project-cross-wired"));
     await expect(provider.activateProject("project-fixture-1", resourceIntent)).rejects.toThrow(/another resource/i);
-    client.syncProjectWorkspace = vi.fn().mockResolvedValue(localOperation("workspace_sync", "project", "project-cross-wired"));
-    await expect(provider.syncProjectWorkspace("project-fixture-1", resourceIntent)).rejects.toThrow(/another resource/i);
-    client.repairProject = vi.fn().mockResolvedValue(localOperation("project_repair", "project", "project-cross-wired"));
-    await expect(provider.repairProject("project-fixture-1", resourceIntent)).rejects.toThrow(/another resource/i);
     client.cancelOperation = vi.fn().mockResolvedValue(localOperation("project_repair", "project", "project-fixture-1", "operation-cross-wired"));
     await expect(provider.cancelOperation("operation-fixture-1", resourceIntent)).rejects.toThrow(/wrong operation/i);
+    client.createDiagnostic = vi.fn().mockResolvedValue(diagnosticReportV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.diagnostic,
+      target: { kind: "project", project_id: "project-cross-wired" },
+    }));
+    await expect(provider.runProjectDiagnostics("project-fixture-1", resourceIntent)).rejects.toThrow(/another project/i);
 
     client.restartService = vi.fn().mockResolvedValue(serviceRestartOperation("service-cross-wired"));
     await expect(provider.restartService("service-control-fixture-1", resourceIntent)).rejects.toThrow(/another service/i);
@@ -539,6 +557,8 @@ function mockClient(): DesktopApiClientV1 & Record<string, ReturnType<typeof vi.
     cancelRun: vi.fn().mockResolvedValue(runV1Schema.parse(CONTRACT_FIXTURE_V1.run)),
     retryRun: vi.fn().mockResolvedValue(runV1Schema.parse(CONTRACT_FIXTURE_V1.run)),
     cancelOperation: vi.fn().mockResolvedValue(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation)),
+    createDiagnostic: vi.fn().mockResolvedValue(diagnosticReportV1Schema.parse(CONTRACT_FIXTURE_V1.diagnostic)),
+    getDiagnostic: vi.fn().mockResolvedValue(diagnosticReportV1Schema.parse(CONTRACT_FIXTURE_V1.diagnostic)),
     artifactContent: vi.fn().mockResolvedValue(CONTRACT_FIXTURE_V1.artifactContent),
     artifactDiff: vi.fn().mockResolvedValue(CONTRACT_FIXTURE_V1.artifactDiff),
     repairProject: vi.fn().mockResolvedValue(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation)),

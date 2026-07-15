@@ -479,8 +479,11 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       },
       updated_at: NOW,
     });
+    const onlineState = this.connectionState("online");
+    this.state = desktopStateV1Schema.parse({ ...this.state, core: onlineState.core });
+    this.updateProfileConnection(project.profile_id, "connected");
     this.projects = this.projects.map((item) => item.project_id === projectId ? activated : item);
-    this.capabilities = this.state.core.state === "online" ? this.makeCapabilities(projectId, activated.execution.mode) : null;
+    this.capabilities = this.makeCapabilities(projectId, activated.execution.mode);
     this.validation = this.capabilities ? this.makeValidation(activated, this.capabilities) : null;
     this.activeOperation = this.makeOperation("project_activate", "succeeded", "Project ready", 1, 1, project.project_id);
     this.state = desktopStateV1Schema.parse({
@@ -489,17 +492,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         project_id: project.project_id,
         project_etag: activated.etag,
         profile_id: project.profile_id,
-        connection_state: this.state.core.state === "online" ? "ready" : "offline",
+        connection_state: "ready",
       },
     });
-    this.emit();
-    return structuredClone(this.activeOperation);
-  }
-
-  async syncProjectWorkspace(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
-    const project = this.requireProject(projectId);
-    this.checkIntent(intent, `project:workspace-sync:${projectId}`, project.etag);
-    this.activeOperation = this.makeOperation("workspace_sync", "succeeded", "Workspace ready", 1, 1, projectId);
     this.emit();
     return structuredClone(this.activeOperation);
   }
@@ -700,6 +695,54 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(cancelled);
   }
 
+  async cancelOperation(
+    operationId: string,
+    intent: ProductResourceMutationIntent,
+  ): Promise<LocalOperationV1> {
+    const operation = this.activeOperation;
+    if (!operation || operation.operation_id !== operationId) {
+      throw new Error("The local operation is no longer active.");
+    }
+    this.checkIntent(intent, `operation:cancel:${operationId}`, operation.etag);
+    const cancelled = localOperationV1Schema.parse({
+      ...operation,
+      state: "cancelled",
+      finished_at: NOW,
+      etag: ETAG_B,
+    });
+    this.activeOperation = null;
+    this.state = this.connectionState("disconnected");
+    this.updateProfileConnection(operation.resource.resource_id, "disconnected");
+    this.emit();
+    return structuredClone(cancelled);
+  }
+
+  async runProjectDiagnostics(
+    projectId: string,
+    intent: ProductResourceMutationIntent,
+  ): Promise<DiagnosticReportV1> {
+    const project = this.requireProject(projectId);
+    this.checkIntent(intent, `project:diagnostics:${projectId}`, project.etag);
+    const coreProjectId = project.remote?.core_project_id;
+    if (!coreProjectId) throw new Error("Project diagnostics require an active project.");
+    this.diagnostic = diagnosticReportV1Schema.parse({
+      schema_version: "1",
+      id: "diagnostic-project-fixture-1",
+      status: "succeeded",
+      scopes: ["project"],
+      target: { kind: "project", project_id: coreProjectId },
+      checks: [{ id: "project", scope: "project", status: "ok", message: "Project authority is ready.", repair_action: "unsupported", logs_ref: null }],
+      created_at: NOW,
+      updated_at: NOW,
+      observed_at: NOW,
+      finished_at: NOW,
+      error: null,
+      etag: ETAG_D,
+    });
+    this.emit();
+    return structuredClone(this.diagnostic);
+  }
+
   async getRunLogs(runId: string): Promise<readonly LogEntryV1[]> {
     this.requireRun(runId);
     return structuredClone(this.logs[runId] ?? []);
@@ -715,21 +758,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     const value = this.diffs.get(artifactId);
     if (!value) throw new Error("Artifact changes are unavailable.");
     return structuredClone(value);
-  }
-
-  async repairProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
-    const project = this.requireProject(projectId);
-    this.checkIntent(intent, `project:repair:${projectId}`, project.etag);
-    this.activeOperation = this.makeOperation("project_repair", "running", "Applying repair", 1, 2, projectId);
-    this.emit();
-    this.schedule(1, () => {
-      this.services = this.makeServices(true, false);
-      this.diagnostic = this.makeDiagnostic(false);
-      this.state = this.connectionState("online");
-      this.activeOperation = null;
-      this.emit();
-    });
-    return structuredClone(this.activeOperation);
   }
 
   async restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<OperationV1> {

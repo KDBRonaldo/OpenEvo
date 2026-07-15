@@ -351,7 +351,8 @@ describe("DesktopProductApp", () => {
     setInput("Objective", "Rank candidates using reproducible evidence.");
     expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
     expect(screenText()).not.toContain("Hugging Face model");
-    await clickButton("Save");
+    await clickButton("Prepare evolution");
+    await clickButton("Save and activate");
     expect(screenText()).toContain("Compare catalyst candidates");
     expect(button("Start session").title).toBe("Start a new research session");
     expect(button("Start session").disabled).toBe(false);
@@ -363,10 +364,7 @@ describe("DesktopProductApp", () => {
     });
 
     await clickButton("Evolution");
-    expect(screenText()).toContain("Evolution is not configured");
-    await clickButton("Configure evolution");
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(screenText()).toContain("Evolution targets");
+    expect(screenText()).not.toContain("Evolution is not configured");
   });
 
   it("shows the authoritative retired state after editing an active project", async () => {
@@ -396,7 +394,7 @@ describe("DesktopProductApp", () => {
     expect(button("Start session").title).toContain("Connect this project's remote workspace");
   });
 
-  it("creates a subscription project without inheriting the selected self-deployed project's capabilities", async () => {
+  it("keeps new-project setup open until remote evolution defaults are saved and activated", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const before = await provider.refresh();
     if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
@@ -407,13 +405,53 @@ describe("DesktopProductApp", () => {
     expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
     setInput("Objective", "Keep subscription defaults scoped to this new project.");
-    await clickButton("Save");
+    await clickButton("Prepare evolution");
 
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const created = refreshed.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(screenText()).toContain("Remote evolution methods are ready");
+    expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
+    expect(button("Save and activate").disabled).toBe(false);
+
+    const prepared = await provider.refresh();
+    if (prepared.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const draft = prepared.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
+    expect(draft?.evolution.targets).toEqual({});
+
+    await clickButton("Save and activate");
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+
+    const activated = await provider.refresh();
+    if (activated.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const created = activated.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
     expect(created?.execution).toMatchObject({ mode: "codex_subscription_transcript", codex_model: "gpt-5.5" });
-    expect(created?.evolution.targets).toEqual({});
+    expect(created?.evolution.targets).toMatchObject({
+      text_memory: { enabled: true },
+      skill_bundle: { enabled: true },
+      agent_system: { enabled: true },
+    });
+  });
+
+  it("offers cancellation while a local connection operation is active", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ newUser: false, stepDelayMs: 10_000 });
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const profile = before.snapshot.profiles[0];
+    if (!profile) throw new Error("Expected a remote profile fixture.");
+    await provider.connectProfile(profile.profile_id, {
+      actionId: "connect-cancellable-operation-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: profile.etag,
+    });
+    const cancelOperation = vi.spyOn(provider, "cancelOperation");
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("Connecting securely");
+    expect(button("Cancel operation").disabled).toBe(false);
+    await clickButton("Cancel operation");
+
+    expect(cancelOperation).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("Remote workspace is offline");
   });
 
   it("uses release capabilities for new-project defaults and keeps unavailable modes visible", async () => {
@@ -472,25 +510,25 @@ describe("DesktopProductApp", () => {
     expect(labelledControl<HTMLInputElement>("Hugging Face model", "input").value).toBe("Qwen/Qwen3-8B");
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
     setInput("Objective", "Keep self-deployed defaults scoped to this new project.");
-    await clickButton("Save");
+    await clickButton("Prepare evolution");
 
     const refreshed = await provider.refresh();
     if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     const created = refreshed.snapshot.projects.find((project) => project.task.objective === "Keep self-deployed defaults scoped to this new project.");
     expect(created?.execution).toMatchObject({ mode: "self-deployed", hf_model: "Qwen/Qwen3-8B" });
     expect(created?.evolution.targets).toEqual({});
+    expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
   });
 
-  it("resets a mounted project drawer before creating and cannot sync the existing project", async () => {
+  it("resets a mounted project drawer before creating and never exposes unavailable snapshot sync", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
-    const syncWorkspace = vi.spyOn(provider, "syncProjectWorkspace");
     root = await renderProduct(provider);
 
     await clickAria("Project settings");
     await clickButton("Folder snapshot");
     await clickButton("Save");
     await clickAria("Project settings");
-    expect(optionalButton("Sync snapshot")).not.toBeNull();
+    expect(optionalButton("Sync snapshot")).toBeNull();
     setInput("Project name", "Stale project A draft");
     setInput("Hugging Face model", "example/stale-a-model");
 
@@ -511,8 +549,7 @@ describe("DesktopProductApp", () => {
     expect(optionalButton("Sync snapshot")).toBeNull();
 
     setInput("Objective", "Create without project A state.");
-    await clickButton("Save");
-    expect(syncWorkspace).not.toHaveBeenCalled();
+    await clickButton("Prepare evolution");
     const refreshed = await provider.refresh();
     if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     const created = refreshed.snapshot.projects.find((project) => project.task.objective === "Create without project A state.");
@@ -717,15 +754,17 @@ describe("DesktopProductApp", () => {
     expect(screenText()).not.toContain("internal refresh details");
   });
 
-  it("shows remote targets for an empty project map and blocks an unsupported saved method", async () => {
+  it("resumes an incomplete evolution setup after refresh and blocks an unsupported saved method", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.clearEvolutionSelections();
     root = await renderProduct(provider);
-    await clickAria("Project settings");
 
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(screenText()).toContain("Remote evolution methods are ready");
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
     expect(screenText()).toContain("Text memory");
     await clickAria("Close settings");
+    await clickButton("Discard changes");
 
     provider.useUnsupportedSavedMethod();
     await flush();
@@ -1069,9 +1108,9 @@ describe("DesktopProductApp", () => {
     await clickButton("Folder snapshot");
     const pendingAction = selectSource.mock.calls[0]?.[0].actionId;
     provider.failNextProjectCreateWithUnknownError();
-    await clickButton("Save");
+    await clickButton("Prepare evolution");
     expect(settleSource).toHaveBeenCalledWith(pendingAction, "discard");
-    await clickButton("Save");
+    await clickButton("Prepare evolution");
     expect(provider.projectCreateActionIds()[0]).toBe(provider.projectCreateActionIds()[1]);
   });
 
@@ -1082,17 +1121,17 @@ describe("DesktopProductApp", () => {
     await clickAria("Create project");
     setInput("Objective", `Activate the authoritative project after ${status}.`);
     provider.failNextProjectActivation(status);
-    await clickButton("Save");
+    await clickButton("Prepare evolution");
 
     expect(provider.projectCreateActionIds()).toHaveLength(1);
     expect(provider.projectActivationActionIds()).toHaveLength(1);
-    await clickButton("Save");
+    await clickButton("Prepare evolution");
 
     expect(provider.projectCreateActionIds()).toHaveLength(1);
     expect(provider.projectActivationActionIds()).toHaveLength(2);
     expect(provider.projectActivationActionIds()[0]).not.toBe(provider.projectActivationActionIds()[1]);
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-    expect(screenText()).toContain(`Activate the authoritative project after ${status}.`);
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(screenText()).toContain("Remote evolution methods are ready");
   });
 
   it("uses a single-column bounded System layout at the 760px minimum window", async () => {
@@ -1177,13 +1216,23 @@ describe("DesktopProductApp", () => {
 
   it("reports completed diagnostics with warnings without claiming all checks passed", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+    const runProjectDiagnostics = vi.spyOn(provider, "runProjectDiagnostics");
     root = await renderProduct(provider);
 
     await clickButton("System");
     expect(screenText()).toContain("Checks completed with warnings");
     expect(screenText()).not.toContain("All checks passed");
-    expect(screenText()).toContain("Repair available");
+    expect(screenText()).not.toContain("Repair available");
+    expect(screenText()).not.toContain("Repairable");
+    expect(optionalButton("Run diagnostics")).toBeNull();
+    expect(document.querySelector('button[aria-label="Run diagnostics"]')).not.toBeNull();
     expect(screenText()).toContain("Needs attention");
+    await clickAria("Run diagnostics");
+    expect(runProjectDiagnostics).toHaveBeenCalledWith(
+      "project-fixture-1",
+      expect.objectContaining({ etag: expect.any(String) }),
+    );
+    expect(screenText()).toContain("Project authority is ready.");
   });
 
   it("requires explicit activation after a project switch", async () => {
@@ -1282,28 +1331,14 @@ describe("DesktopProductApp", () => {
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
 
     setInput("Objective", "Updated project B objective.");
-    await clickButton("Save");
-    expect(updateProject).toHaveBeenCalledWith(
-      "project-fixture-2",
-      expect.objectContaining({
-        name: "Second research project",
-        execution: expect.objectContaining({ mode: "codex_subscription_transcript", codex_model: "gpt-5.5" }),
-        evolution: { targets: {} },
-      }),
-      expect.anything(),
-    );
+    expect(button("Save and activate").disabled).toBe(true);
+    expect(updateProject).not.toHaveBeenCalled();
     const refreshed = await provider.refresh();
     if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(refreshed.snapshot.projects.find((project) => project.project_id === "project-fixture-1")?.name).toBe(projectA.name);
-    expect(refreshed.snapshot.projects.find((project) => project.project_id === "project-fixture-2")).toMatchObject({
-      name: "Second research project",
-      task: { title: "Second research task", objective: "Updated project B objective." },
-      execution: { mode: "codex_subscription_transcript", codex_model: "gpt-5.5" },
-      evolution: { targets: {} },
-    });
+    expect(refreshed.snapshot.projects.find((item) => item.project_id === "project-fixture-1")?.name).toBe(projectA.name);
   });
 
-  it("selects and syncs a native folder through opaque source references", async () => {
+  it("selects a native folder through an opaque snapshot reference without fake sync", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     const selectSource = vi.spyOn(provider, "selectProjectSource");
     const settleSource = vi.spyOn(provider, "settleProjectSource");
@@ -1320,7 +1355,7 @@ describe("DesktopProductApp", () => {
       "adopt",
     );
     await clickAria("Project settings");
-    await clickButton("Sync snapshot");
+    expect(optionalButton("Sync snapshot")).toBeNull();
     await clickAria("Close settings");
 
     const refreshed = await provider.refresh();
@@ -1415,7 +1450,6 @@ describe("DesktopProductApp", () => {
     expect(button("Scratch").disabled).toBe(true);
     expect(folderButton.disabled).toBe(true);
     expect(button("Save").disabled).toBe(true);
-    expect(button("Sync snapshot").disabled).toBe(true);
     expect(button("Undo").disabled).toBe(true);
 
     await act(async () => pending.resolve({ ...initialSource, display_name: "Replacement research folder" }));

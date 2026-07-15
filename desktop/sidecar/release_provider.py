@@ -312,6 +312,7 @@ class DesktopReleaseProvider:
             "getProjectCapabilities": self._get_project_capabilities,
             "validateProject": self._validate_project,
             "getLocalOperation": self._get_local_operation,
+            "cancelLocalOperation": self._cancel_local_operation,
             "listRuns": self._list_runs,
             "createRun": self._create_run,
             "getRun": self._get_run,
@@ -401,10 +402,15 @@ class DesktopReleaseProvider:
 
     def _get_state(self, arguments: Mapping[str, object]) -> DesktopStateV1:
         del arguments
-        active_projects = self._store.list_projects(limit=2, filters={"state": "active"}).items
-        with self._connection_state_lock:
-            core_state = self._core_state
-            core_binding = self._core_session_binding
+        with self._project_session_lock:
+            active_projects = self._store.list_projects(
+                limit=2, filters={"state": "active"}
+            ).items
+            with self._connection_state_lock:
+                core_state = self._core_state
+                core_binding = self._core_session_binding
+                session_generation = self._session_generation
+            pending_operation_ids = self._store.pending_operation_ids()
         active_project = None
         if active_projects:
             project = active_projects[0]
@@ -415,7 +421,7 @@ class DesktopReleaseProvider:
                 and core_binding.project.project_id == project.project_id
                 and core_binding.project.profile_id == project.profile_id
                 and core_binding.project.etag == project.etag
-                and core_binding.generation == self._session_generation
+                and core_binding.generation == session_generation
                 and project.remote is not None
             ):
                 connection_state = "ready"
@@ -452,7 +458,7 @@ class DesktopReleaseProvider:
             execution_mode_capabilities=self._execution_mode_capabilities,
             core=core_state,
             active_project=active_project,
-            pending_operation_ids=self._store.pending_operation_ids(),
+            pending_operation_ids=pending_operation_ids,
         )
 
     def _list_profiles(self, arguments: Mapping[str, object]) -> object:
@@ -1171,11 +1177,13 @@ class DesktopReleaseProvider:
                     body={},
                     if_match=work.if_match,
                     remote_state=self._remote_project_state(activation),
+                    activation_precommit=lambda active: bridge.commit_local_activation(
+                        active, activation=activation
+                    ),
                 )
                 if operation.state != "succeeded":
                     raise ProviderStoreError("project activation did not reach succeeded state")
                 active_project = self._store.get_project(work.project_id)
-                bridge.commit_local_activation(active_project, activation=activation)
                 with self._connection_state_lock:
                     if self._owns_core_session_locked(session_generation, active_project):
                         self._core_session_binding = CoreRuntimeSessionBinding(
@@ -1199,7 +1207,7 @@ class DesktopReleaseProvider:
                     session_generation,
                     reservation.project,
                 )
-            if activation is not None and owns_session:
+            if activation is not None and (owns_session or operation.state == "cancelled"):
                 try:
                     with self._project_session_lock:
                         self._require_bridge("activateProject").deactivate_project(
@@ -1424,7 +1432,39 @@ class DesktopReleaseProvider:
         )
 
     def _get_local_operation(self, arguments: Mapping[str, object]) -> LocalOperationV1:
-        return self._store.get_local_operation(cast(str, arguments["operation_id"]))
+        with self._project_session_lock:
+            return self._store.get_local_operation(cast(str, arguments["operation_id"]))
+
+    def _cancel_local_operation(self, arguments: Mapping[str, object]) -> LocalOperationV1:
+        operation_id = cast(str, arguments["operation_id"])
+        with self._project_session_lock:
+            operation = self._store.get_local_operation(operation_id)
+            cancelled = self._store.cancel_local_operation(
+                operation_id,
+                if_match=cast(str, arguments["if_match"]),
+            )
+            if operation.state in {"queued", "running", "cancelling"}:
+                with self._connection_state_lock:
+                    self._session_generation += 1
+                    if operation.resource.resource_type == "profile":
+                        self._connection_owner = None
+                        self._core_state = CoreConnectionStateV1(
+                            state="disconnected", active_tunnel=False
+                        )
+                    elif operation.operation_kind == "project_activate":
+                        profile_id = self._core_state.profile_id
+                        self._core_session_binding = None
+                        self._core_state = (
+                            self._core_not_started_state(profile_id)
+                            if profile_id is not None
+                            else CoreConnectionStateV1(
+                                state="disconnected", active_tunnel=False
+                            )
+                        )
+        if operation.resource.resource_type == "profile":
+            self._disconnect_owned_transport(operation.resource.resource_id)
+        self.publish_state_changed()
+        return cancelled
 
     def _list_runs(self, arguments: Mapping[str, object]) -> object:
         return self._invoke_active_core(

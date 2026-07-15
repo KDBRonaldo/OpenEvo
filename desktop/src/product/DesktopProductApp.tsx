@@ -75,6 +75,7 @@ type RevisionRefV1 = NonNullable<NonNullable<ProjectV1["remote"]>["active_revisi
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_HF_MODEL = "Qwen/Qwen3-8B";
 const ACTIVE_RUN_REFRESH_INTERVAL_MS = 1_000;
+const REQUIRED_EVOLUTION_TARGETS = ["text_memory", "skill_bundle", "agent_system"] as const;
 
 type Workspace = "research" | "evolution" | "system";
 type AsyncState = "idle" | "working";
@@ -148,6 +149,8 @@ export function DesktopProductApp({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
   const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
+  const recoveredProjectSetup = useRef<string | null>(null);
+  const [cancellingOperation, setCancellingOperation] = useState(false);
   const refreshCoordinator = useRef<SnapshotRefreshCoordinator | null>(null);
   if (refreshCoordinator.current === null) refreshCoordinator.current = new SnapshotRefreshCoordinator();
 
@@ -281,6 +284,20 @@ export function DesktopProductApp({
 
   useActiveRunPolling(runPollingIdentity, refresh);
 
+  useEffect(() => {
+    if (!snapshot) return;
+    const setupProjectId = snapshot.activeOperation?.operation_kind === "project_activate"
+      ? snapshot.activeOperation.resource.resource_id
+      : snapshot.state.active_project?.project_id ?? null;
+    const setupProject = snapshot.projects.find((item) => item.project_id === setupProjectId);
+    if (!setupProject || Object.keys(setupProject.evolution.targets).length > 0) return;
+    if (recoveredProjectSetup.current === setupProject.project_id) return;
+    recoveredProjectSetup.current = setupProject.project_id;
+    setSelectedProjectId(setupProject.project_id);
+    setCreatingProject(false);
+    setSettingsOpen(true);
+  }, [snapshot]);
+
   if (!snapshot) {
     return (
       <div className="product-boot" data-testid="product-loading">
@@ -310,6 +327,25 @@ export function DesktopProductApp({
   const activationReason = getProjectActivationReason(snapshot, project, profile, actionState);
   const startReason = getStartReason(snapshot, project, profile, activeRun, actionState);
   const canStart = startReason === null;
+
+  const cancelActiveOperation = async () => {
+    const operation = snapshot.activeOperation;
+    if (!operation || cancellingOperation) return;
+    setCancellingOperation(true);
+    setActionError(null);
+    try {
+      await provider.cancelOperation(
+        operation.operation_id,
+        resourceIntent(snapshot, operation.etag),
+      );
+      await refresh("mutation");
+    } catch (error) {
+      setActionError(userMessage(error));
+      await refresh("mutation");
+    } finally {
+      setCancellingOperation(false);
+    }
+  };
 
   return (
     <div className="product-shell">
@@ -368,6 +404,12 @@ export function DesktopProductApp({
               ? () => void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), actionRecovery)
               : undefined}
           /> : null}
+          {snapshot.activeOperation && !["succeeded", "failed", "cancelled"].includes(snapshot.activeOperation.state) ? (
+            <section className="operation-cancel-bar" aria-live="polite">
+              <div><LoaderCircle className="spin" size={17} /><span>{snapshot.activeOperation.progress?.label ?? "Local operation in progress"}</span></div>
+              <button className="secondary-button" type="button" onClick={() => void cancelActiveOperation()} disabled={cancellingOperation}><Square size={14} /> {cancellingOperation ? "Cancelling..." : "Cancel operation"}</button>
+            </section>
+          ) : null}
           <ConnectionGate
             snapshot={snapshot}
             profile={profile}
@@ -386,7 +428,6 @@ export function DesktopProductApp({
               busy={actionState === "working"}
               disabledReason={activationReason}
               onActivate={() => void act(() => provider.activateProject(project.project_id, resourceIntent(snapshot, project.etag)))}
-              onRepair={() => void act(() => provider.repairProject(project.project_id, resourceIntent(snapshot, project.etag)))}
             />
           ) : null}
 
@@ -434,7 +475,7 @@ export function DesktopProductApp({
               projectSessionReady={projectSessionReady}
               busy={actionState === "working"}
               onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id, resourceIntent(snapshot, profile.etag)))}
-              onRepair={() => project && void act(() => provider.repairProject(project.project_id, resourceIntent(snapshot, project.etag)))}
+              onRunDiagnostics={() => project && void act(() => provider.runProjectDiagnostics(project.project_id, resourceIntent(snapshot, project.etag)))}
               onRestart={(serviceId) => {
                 const service = projectServices.find((item) => item.id === serviceId);
                 if (service) void act(() => provider.restartService(serviceId, resourceIntent(snapshot, service.etag)));
@@ -475,6 +516,17 @@ export function DesktopProductApp({
                   await provider.settleProjectSource(pendingSourceActionId, "adopt");
                   pendingSourceOutcome = "adopted";
                 }
+                if (Object.keys(requestProject.evolution.targets).length === 0) {
+                  const afterUpdate = await refresh("mutation");
+                  const updated = afterUpdate?.projects.find((item) => item.project_id === requestProject.project_id);
+                  if (!afterUpdate || !updated) {
+                    throw new DesktopProductUserError("The prepared project is not available for activation. Refresh and try again.");
+                  }
+                  await provider.activateProject(
+                    updated.project_id,
+                    resourceIntent(afterUpdate, updated.etag, `${actionId}-activate`),
+                  );
+                }
               } else {
                 if (!profile) throw new DesktopProductUserError("Add a remote workspace before creating a project.");
                 let pending = pendingProjectActivation.current;
@@ -505,6 +557,7 @@ export function DesktopProductApp({
                 );
                 pendingProjectActivation.current = null;
                 setSelectedProjectId(current.project_id);
+                setCreatingProject(false);
               }
             });
             if (!result.saved
@@ -524,7 +577,7 @@ export function DesktopProductApp({
                 // The native host retains failed settles for retry or startup recovery.
               }
             }
-            if (result.saved) setSettingsOpen(false);
+            if (result.saved && requestProject !== null) setSettingsOpen(false);
             return {
               saved: result.saved,
               replaceActionId: requestPreconditionChanged(result, requestEpoch, requestProject ? { kind: "project", id: requestProject.project_id, etag: requestProject.etag } : null),
@@ -538,7 +591,6 @@ export function DesktopProductApp({
           })}
           onCancelSource={(actionId) => provider.cancelProjectSource(actionId)}
           onSettleSource={(actionId, outcome) => provider.settleProjectSource(actionId, outcome)}
-          onSyncSource={settingsProject?.source.kind === "native_folder_snapshot" ? () => act(() => provider.syncProjectWorkspace(settingsProject.project_id, resourceIntent(snapshot, settingsProject.etag))).then((result) => result.saved) : undefined}
         />
       ) : null}
       {connectionSettingsOpen ? (
@@ -889,7 +941,7 @@ function ConnectionGate({
   if (core.state === "online" && core.profile_id === profileId) return null;
   if (!hasProject && core.state === "offline" && core.failure?.code === "core_not_started" && profile?.connection_state === "connected") return null;
   if (core.state === "degraded") {
-    return <InlineNotice tone="warning" title="Remote workspace needs attention" detail={core.failure?.message ?? "Open System to review available repairs."} />;
+    return <InlineNotice tone="warning" title="Remote workspace needs attention" detail={core.failure?.message ?? "Open System to review remote diagnostics."} />;
   }
   if (core.state === "host_key_review" && core.host_key_review && profileId) {
     return (
@@ -942,13 +994,11 @@ function ProjectActivationGate({
   busy,
   disabledReason,
   onActivate,
-  onRepair,
 }: {
   project: ProjectV1;
   busy: boolean;
   disabledReason: string | null;
   onActivate: () => void;
-  onRepair: () => void;
 }) {
   const blocked = project.state === "blocked";
   return (
@@ -956,11 +1006,9 @@ function ProjectActivationGate({
       <div className="gate-icon"><FolderOpen size={21} /></div>
       <div className="gate-copy">
         <h2>{blocked ? "Project needs attention" : "Activate this project"}</h2>
-        <p>{blocked ? "Repair this project before it can use its assigned remote workspace." : "Activation binds this project to its own profile and tunnel."}</p>
+        <p>{blocked ? "This project cannot be activated by this Desktop release. Review the remote Core state before retrying." : "Activation binds this project to its own profile and tunnel."}</p>
       </div>
-      <button className="primary-button" type="button" onClick={blocked ? onRepair : onActivate} disabled={busy || disabledReason !== null} title={disabledReason ?? (blocked ? "Repair this project" : "Activate this project")}>
-        {blocked ? <Wrench size={16} /> : <ArrowRight size={16} />} {blocked ? "Repair project" : "Activate project"}
-      </button>
+      {!blocked ? <button className="primary-button" type="button" onClick={onActivate} disabled={busy || disabledReason !== null} title={disabledReason ?? "Activate this project"}><ArrowRight size={16} /> Activate project</button> : null}
     </section>
   );
 }
@@ -1472,14 +1520,13 @@ function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
   );
 }
 
-function SystemWorkspace({ snapshot, project, profile, services, projectSessionReady, busy, onConnect, onRepair, onRestart, onConfigure }: { snapshot: DesktopProductSnapshot; project: ProjectV1 | null; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onRepair: () => void; onRestart: (serviceId: string) => void; onConfigure: () => void }) {
+function SystemWorkspace({ snapshot, project, profile, services, projectSessionReady, busy, onConnect, onRunDiagnostics, onRestart, onConfigure }: { snapshot: DesktopProductSnapshot; project: ProjectV1 | null; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onRunDiagnostics: () => void; onRestart: (serviceId: string) => void; onConfigure: () => void }) {
   const core = snapshot.state.core;
   const diagnostic = projectSessionReady ? snapshot.diagnostic : null;
   const diagnosticPresentation = diagnostic ? presentDiagnostic(diagnostic) : null;
-  const actionable = diagnostic?.checks.some((check) => check.repair_action === "openevo_can_retry") ?? false;
   return (
     <div className="workspace-stack" data-testid="system-workspace">
-      <div className="workspace-heading"><div><p className="eyebrow">System</p><h1>Remote environment</h1><p>Connection, environment checks, and model availability.</p></div>{actionable ? <button className="primary-button" type="button" onClick={onRepair} disabled={busy || !project} title={busy ? "A repair is already running" : "Apply available repairs"}><Wrench size={16} /> Repair available</button> : null}</div>
+      <div className="workspace-heading"><div><p className="eyebrow">System</p><h1>Remote environment</h1><p>Connection, environment checks, and model availability.</p></div></div>
       <div className="system-grid">
         <section className="product-panel connection-panel">
           <div className="panel-heading"><div><span className="panel-kicker">Connection</span><h2>{profile?.name ?? "No remote workspace"}</h2></div><StatePill state={core.state} /></div>
@@ -1496,10 +1543,10 @@ function SystemWorkspace({ snapshot, project, profile, services, projectSessionR
           </div>
         </section>
         <section className="product-panel checks-panel">
-          <div className="panel-heading"><div><span className="panel-kicker">Environment checks</span><h2>{diagnosticPresentation?.heading ?? "Waiting for connection"}</h2></div>{diagnosticPresentation ? <StatePill state={diagnosticPresentation.pillState} /> : null}</div>
+          <div className="panel-heading"><div><span className="panel-kicker">Environment checks</span><h2>{diagnosticPresentation?.heading ?? "Ready to check"}</h2></div><button className="icon-button" type="button" aria-label="Run diagnostics" title="Run remote project checks" onClick={onRunDiagnostics} disabled={busy || !projectSessionReady || !project}><RefreshCw className={diagnostic?.status === "queued" || diagnostic?.status === "running" ? "spin" : undefined} size={16} /></button></div>
           <div className="check-list">
-            {diagnostic?.checks.map((check) => <div className="check-row" key={check.id}>{check.status === "ok" ? <CheckCircle2 className="good" size={18} /> : check.status === "warning" ? <AlertCircle className="warn" size={18} /> : <CircleDot size={18} />}<div><strong>{stateLabel(check.scope)}</strong><span>{check.message}</span></div>{check.repair_action === "openevo_can_retry" ? <span className="repair-tag">Repairable</span> : null}</div>)}
-            {!diagnostic ? <div className="empty-row">Checks run after the remote workspace connects.</div> : null}
+            {diagnostic?.checks.map((check) => <div className="check-row" key={check.id}>{check.status === "ok" ? <CheckCircle2 className="good" size={18} /> : check.status === "warning" ? <AlertCircle className="warn" size={18} /> : <CircleDot size={18} />}<div><strong>{stateLabel(check.scope)}</strong><span>{check.message}</span></div></div>)}
+            {!diagnostic ? <div className="empty-row">Run checks after the project session is ready.</div> : null}
           </div>
         </section>
       </div>
@@ -1640,7 +1687,6 @@ function SettingsDrawer({
   onSelectSource,
   onCancelSource,
   onSettleSource,
-  onSyncSource,
 }: {
   project: ProjectV1 | null;
   profileId: string | null;
@@ -1658,7 +1704,6 @@ function SettingsDrawer({
   onSelectSource: (actionId: string) => Promise<ProjectSourceV1>;
   onCancelSource: (actionId: string) => Promise<void>;
   onSettleSource: (actionId: string, outcome: "adopt" | "discard") => Promise<void>;
-  onSyncSource?: () => Promise<boolean>;
 }) {
   const [name, setName] = useState(project?.name ?? "New research project");
   const [title, setTitle] = useState(project?.task.title ?? "Research task");
@@ -1675,6 +1720,7 @@ function SettingsDrawer({
   const [evolution, setEvolution] = useState<ProductEvolutionTargets>(project?.evolution.targets ?? {});
   const [dirty, setDirty] = useState(false);
   const [retryingCapabilities, setRetryingCapabilities] = useState(false);
+  const setupDefaultsApplied = useRef(false);
   const sourceSelectionGeneration = useRef(0);
   const sourceSelectionInFlight = useRef(false);
   const sourceSelectionMounted = useRef(true);
@@ -1720,6 +1766,7 @@ function SettingsDrawer({
     ? mode
     : firstSupportedExecutionMode(executionModeCapabilities)?.mode;
   const modeCapabilities = capabilities && capabilityExecutionMode(capabilities) === mode ? capabilities : null;
+  const incompleteSetup = project !== null && Object.keys(project.evolution.targets).length === 0;
   const capabilityMatchesDraft = Boolean(project
     && capability
     && capability.projectId === project.project_id
@@ -1789,12 +1836,24 @@ function SettingsDrawer({
     };
   }, [takePendingSourceAction]);
   const rows = evolutionTargetRows(modeCapabilities, evolution);
+  useEffect(() => {
+    if (!incompleteSetup || !modeCapabilities || setupDefaultsApplied.current) return;
+    const requiredRows = REQUIRED_EVOLUTION_TARGETS.map((targetId) => rows.find((row) => row.targetId === targetId));
+    if (requiredRows.some((row) => !row?.canEnable)) return;
+    setupDefaultsApplied.current = true;
+    setEvolution(Object.fromEntries(requiredRows.map((row) => [row!.targetId, enableTarget(row!)])));
+    saveActionId.current = newActionId();
+    setDirty(true);
+  }, [incompleteSetup, modeCapabilities, rows]);
+  const requiredSetupRows = REQUIRED_EVOLUTION_TARGETS.map((targetId) => rows.find((row) => row.targetId === targetId));
+  const setupReady = !incompleteSetup || (modeCapabilities !== null && requiredSetupRows.every((row) => row?.selection.enabled && row.valid));
   const valid = name.trim().length > 0
     && title.trim().length > 0
     && objective.trim().length > 0
     && activeModel.trim().length > 0
     && activeModeCapability.support_state === "supported"
     && profileId !== null
+    && setupReady
     && (!modeCapabilities || rows.every((row) => !row.selection.enabled || row.valid));
   const retryCapabilities = async () => {
     setRetryingCapabilities(true);
@@ -1830,7 +1889,6 @@ function SettingsDrawer({
             </div>
             <div className="source-summary"><FolderOpen size={17} /><span><strong>{source.display_name}</strong><small>{source.kind === "scratch" ? "A new managed workspace will be created." : "A native snapshot reference is ready."}</small></span></div>
             {sourceError ? <p className="form-error" role="alert">{sourceError}</p> : null}
-            {source.kind === "native_folder_snapshot" && onSyncSource ? <button type="button" className="secondary-button" disabled={busy || selectingSource} onClick={() => { invalidateSourceSelection(); void onSyncSource(); }}><RefreshCw size={15} /> Sync snapshot</button> : null}
           </section>
           <section className="form-section">
             <h3>Model mode</h3>
@@ -1854,7 +1912,8 @@ function SettingsDrawer({
           </section>
           <section className="form-section">
             <h3>Evolution targets</h3>
-            {!modeCapabilities ? <div className="capability-unavailable" role="status"><p className="form-help">{capabilityMatchesDraft && capability?.status === "loading" ? "Capabilities are loading for this project and mode." : "Capabilities are unavailable for this project and mode."}</p>{capabilityRetryable ? <button type="button" className="secondary-button" onClick={() => void retryCapabilities()} disabled={retryingCapabilities || busy}><RefreshCw className={retryingCapabilities ? "spin" : undefined} size={14} /> Retry capabilities</button> : null}</div> : null}
+            {incompleteSetup && modeCapabilities ? <div className="capability-ready" role="status"><CheckCircle2 size={15} /><p className="form-help">Remote evolution methods are ready. Review the defaults, then save and activate.</p></div> : null}
+            {!modeCapabilities ? <div className="capability-unavailable" role="status"><p className="form-help">{project === null ? "Remote methods will be loaded after the project session is prepared." : capabilityMatchesDraft && capability?.status === "loading" ? "Capabilities are loading for this project and mode." : "Capabilities are unavailable for this project and mode."}</p>{capabilityRetryable ? <button type="button" className="secondary-button" onClick={() => void retryCapabilities()} disabled={retryingCapabilities || busy}><RefreshCw className={retryingCapabilities ? "spin" : undefined} size={14} /> Retry capabilities</button> : null}</div> : null}
             <div className="target-list">{rows.map((row) => (
               <div className={`target-toggle ${row.valid ? "" : "invalid"}`} data-target-id={row.targetId} key={row.targetId}>
                 <label>
@@ -1869,7 +1928,7 @@ function SettingsDrawer({
                 <select aria-label={`${row.displayName} method`} value={row.selection.method ?? ""} disabled={!row.capability || !row.selection.enabled} onChange={(event) => {
                   const selected = row.choices.find((choice) => choice.id === event.currentTarget.value);
                   if (!selected?.selectable) return;
-                  setEvolution((current) => ({ ...current, [row.targetId]: { enabled: row.selection.enabled, method: selected.id, config: {} } }));
+                  setEvolution((current) => ({ ...current, [row.targetId]: { enabled: row.selection.enabled, method: selected.id, config: selected.defaultConfig as OpenEvoJsonObject } }));
                   markDirty();
                 }}>
                   {row.choices.map((choice) => <option key={`${choice.kind}-${choice.id}`} value={choice.id ?? ""} disabled={!choice.selectable}>{choice.label}{choice.supported ? "" : " (unavailable)"}</option>)}
@@ -1905,7 +1964,7 @@ function SettingsDrawer({
               setSource(project?.source ?? { kind: "scratch", display_name: "New workspace", import_ref: null });
             }
           }
-        }); }}><Save size={15} /> {busy ? "Saving..." : "Save"}</button></div>
+        }); }}><Save size={15} /> {busy ? "Saving..." : project === null ? "Prepare evolution" : incompleteSetup ? "Save and activate" : "Save"}</button></div>
       </aside>
     </div>
   );
@@ -2087,7 +2146,7 @@ function enableTarget(row: EvolutionTargetConfigRow): ProductEvolutionTargets[st
   if (selected?.supported && row.selection.method !== null) return { ...row.selection, enabled: true };
   const defaultChoice = row.choices.find((choice) => choice.id === row.capability?.effective_default_method_id && choice.kind === "method" && choice.supported);
   if (!defaultChoice?.id) return row.selection;
-  return { enabled: true, method: defaultChoice.id, config: {} };
+  return { enabled: true, method: defaultChoice.id, config: defaultChoice.defaultConfig as OpenEvoJsonObject };
 }
 
 function selfDeployedExecution(hfModel: string): ProjectV1["execution"] {

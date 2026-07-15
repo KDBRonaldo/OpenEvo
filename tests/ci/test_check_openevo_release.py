@@ -13,6 +13,10 @@ from zipfile import ZipFile
 
 import pytest
 
+from desktop.sidecar.release_capabilities import (
+    RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
+)
+
 
 RELEASE_CONTRACT = json.loads(
     (Path(__file__).resolve().parents[2] / "desktop/release-contract.json").read_text(
@@ -1639,6 +1643,9 @@ def _desktop_state_payload() -> dict[str, object]:
             "core_openapi_sha256": None,
             "compatible": True,
         },
+        "execution_mode_capabilities": (
+            RELEASE_EXECUTION_MODE_CAPABILITIES_V1.model_dump(mode="json")
+        ),
         "core": {
             "state": "disconnected",
             "profile_id": None,

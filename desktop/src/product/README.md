@@ -44,10 +44,13 @@ only in test and Vite preview builds.
 The first-run renderer exposes one next action at a time. Until a remote profile
 exists, the Research workspace owns the `Add workspace` action and project
 creation is disabled. Once a profile is present, project creation becomes
-available. A project with no enabled evolution target remains runnable, but its
-Evolution view offers `Configure evolution`; that action opens the normal
-project drawer and still derives every target, method, schema, and default from
-the active remote capability payload.
+available. New-project setup is one recoverable two-stage drawer flow: Desktop
+first saves and activates a minimal draft to establish the project tunnel, then
+loads that project's remote capabilities and initializes `text_memory`,
+`skill_bundle`, and `agent_system` from the remote effective defaults. The
+drawer stays open for review and the second save validates and activates the
+configured draft. Refreshing an empty-target prepared draft reopens this stage;
+it cannot appear complete or become runnable with an accidental empty map.
 
 `LocalApiDesktopProductProvider` is the release adapter. It aggregates all
 bounded cursor pages, reloads exact run details, and marks artifacts complete
@@ -122,6 +125,9 @@ Core-owned Codex subscription transcript profile and its release-tested
 `gpt-5.5` model default. They save an empty evolution target
 map until the created and activated project has remote capabilities for its own
 identity and execution mode; another project or mode can never provide defaults.
+This empty map is an intermediate persisted draft, not a completed user choice.
+Failures leave the same draft and mutation intent recoverable in the open drawer,
+and closing then refreshing resumes setup from authoritative project state.
 `Self-deployed` remains visible with the exact release reason but is disabled in
 the current composition. A saved Self-deployed project is never rewritten: it
 remains visible, blocks Save/Activate/Start, and can be switched to Subscription.
@@ -129,7 +135,16 @@ remains visible, blocks Save/Activate/Start, and can be switched to Subscription
 The project drawer is keyed by the explicit form identity (`create` or exact
 project ID). Changing that identity discards the previous component-local draft
 and pending capability UI before rendering the new form. Project-only workspace
-sync is exposed only when the drawer is editing that exact saved project.
+sync is not exposed by the release provider. Initial folder selection creates a
+real immutable native snapshot used by activation; selecting the folder again
+creates the replacement snapshot when project content changes.
+
+The System view invokes project diagnostics through the active project tunnel
+and exposes service restart only for Core services that declare restart support.
+It does not show local repair controls because the release provider has no repair
+handler. Nonterminal local connect/bootstrap/activation operations expose the
+frozen Local API cancel action and return to the authoritative disconnected or
+draft state before retry.
 
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation

@@ -260,6 +260,118 @@ def test_activation_returns_queued_and_commits_remote_projection(tmp_path: Path)
         provider.close()
 
 
+def test_activation_success_is_not_visible_before_local_binding_commit(tmp_path: Path) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    activation = _activation(project)
+    commit_entered = Event()
+    release_commit = Event()
+
+    bridge.activate_project.return_value = activation
+
+    def commit(*args: object, **kwargs: object) -> None:
+        commit_entered.set()
+        assert release_commit.wait(timeout=5)
+
+    bridge.commit_local_activation.side_effect = commit
+    try:
+        response = provider.invoke("activateProject", _activate_arguments(project))
+        assert isinstance(response, JSONResponse)
+        operation_id = local_v1.LocalOperationV1.model_validate_json(
+            response.body
+        ).operation_id
+        assert commit_entered.wait(timeout=5)
+
+        observations: list[tuple[local_v1.LocalOperationV1, local_v1.DesktopStateV1]] = []
+        observed = Event()
+
+        def observe() -> None:
+            operation = provider.invoke(
+                "getLocalOperation", {"operation_id": operation_id}
+            )
+            state = provider.invoke("getDesktopState", {})
+            observations.append((operation, state))
+            observed.set()
+
+        thread = Thread(target=observe)
+        thread.start()
+        assert not observed.wait(timeout=0.1)
+        release_commit.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        operation, state = observations[0]
+        assert operation.state == "succeeded"
+        assert state.core.state == "online"
+        assert state.active_project is not None
+        assert state.active_project.connection_state == "ready"
+    finally:
+        release_commit.set()
+        provider.close()
+
+
+def test_activation_binding_failure_never_persists_success(tmp_path: Path) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    bridge.activate_project.return_value = _activation(project)
+    bridge.commit_local_activation.side_effect = RuntimeError("binding commit failed")
+    try:
+        response = provider.invoke("activateProject", _activate_arguments(project))
+        assert isinstance(response, JSONResponse)
+        operation_id = local_v1.LocalOperationV1.model_validate_json(
+            response.body
+        ).operation_id
+
+        operation = _wait_for_operation(store, operation_id, "failed")
+
+        assert operation.state == "failed"
+        assert store.get_project(project.project_id).state == "draft"
+        state = provider.invoke("getDesktopState", {})
+        assert state.core.state == "offline"
+        assert state.active_project is None
+    finally:
+        provider.close()
+
+
+def test_cancel_running_activation_remains_terminal_and_keeps_project_draft(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    entered = Event()
+    release = Event()
+
+    def activate(*args: object, **kwargs: object) -> object:
+        entered.set()
+        assert release.wait(timeout=5)
+        return _activation(project)
+
+    bridge.activate_project.side_effect = activate
+    try:
+        response = provider.invoke("activateProject", _activate_arguments(project))
+        assert isinstance(response, JSONResponse)
+        operation = local_v1.LocalOperationV1.model_validate_json(response.body)
+        assert entered.wait(timeout=5)
+        running = _wait_for_operation(store, operation.operation_id, "running")
+
+        cancelled = provider.invoke(
+            "cancelLocalOperation",
+            {
+                "operation_id": running.operation_id,
+                "if_match": running.etag,
+                "idempotency_key": "cancel-project-activation-runtime-0001",
+            },
+        )
+        assert cancelled.state == "cancelled"
+        release.set()
+        assert _wait_for_operation(store, operation.operation_id, "cancelled").state == "cancelled"
+        assert store.get_project(project.project_id).state == "draft"
+        bridge.commit_local_activation.assert_not_called()
+        bridge.deactivate_project.assert_called_once_with(project.project_id)
+    finally:
+        release.set()
+        provider.close()
+
+
 def test_activation_persists_typed_bridge_failure(tmp_path: Path) -> None:
     bridge = Mock(spec=DesktopCoreBridgeV1)
     provider, store, project = _provider(tmp_path, bridge)

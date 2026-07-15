@@ -12,9 +12,12 @@
 5. Desktop runs remote checks, provisions the supported Python runtime when
    needed, installs the bundled OpenEvo Core release, and starts the remote
    backend. Project creation remains disabled until the workspace is connected.
-6. Create and activate a research project. An existing project that loses its
-   tunnel remains visible, but activation and runs stay disabled until its
-   assigned workspace reconnects.
+6. Create a research project and choose `Prepare evolution`. Desktop saves a
+   minimal draft, establishes its remote session, and returns to the same drawer
+   with remote methods for text memory, skills, and the agent system. Review the
+   defaults, then choose `Save and activate`. Closing or refreshing after the
+   first stage resumes the incomplete setup instead of treating an empty target
+   map as finished.
 7. Use the default Codex subscription transcript mode. Self-deployed remains
    visible but unavailable in this release; Desktop explains the release reason
    and lets an older saved project switch back to Subscription.
@@ -22,7 +25,14 @@
 
 The System view distinguishes passing checks from completed checks that contain
 warnings or require attention. A warning state never appears as "All checks
-passed"; follow the visible repair or reconnect action before starting a run.
+passed". Project diagnostics and supported service restart actions call the
+remote Core through the active project tunnel. Local repair and workspace-sync
+buttons are intentionally absent because this release has no handlers for them.
+To update a folder snapshot, select the folder again in project settings.
+
+Long-running local connection and project activation show `Cancel operation`.
+Cancellation returns the workspace or project to its authoritative retryable
+state; a late background completion cannot reactivate the cancelled session.
 
 Project and artifact mode controls use manual tab activation: Left and Right,
 or Home and End, move focus without starting an action; Enter or Space activates

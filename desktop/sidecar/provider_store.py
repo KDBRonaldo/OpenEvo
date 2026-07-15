@@ -3348,6 +3348,34 @@ class DesktopProviderStore:
         with self._transaction(write=False) as connection:
             return self._operation_from_row(self._require_operation_row(connection, operation_id))
 
+    def cancel_local_operation(
+        self,
+        operation_id: str,
+        *,
+        if_match: str,
+    ) -> LocalOperationV1:
+        """Cancel one durable local operation while preserving its action authority."""
+
+        self._validate_resource_id(operation_id)
+        self._validate_if_match(if_match)
+        with self._transaction(write=True) as connection:
+            row = self._require_operation_row(connection, operation_id)
+            operation = self._operation_from_row(row)
+            if operation.state in {"succeeded", "failed", "cancelled"}:
+                return operation
+            self._require_etag("operation", operation_id, row, if_match)
+            if operation.resource.resource_type == "profile":
+                connection.execute(
+                    """
+                    UPDATE remote_profiles
+                    SET connection_state = 'disconnected', host_key_fingerprint = NULL,
+                        resource_version = resource_version + 1, updated_at = ?
+                    WHERE profile_id = ?
+                    """,
+                    (self._timestamp(), operation.resource.resource_id),
+                )
+            return self._cancel_operation_with_authority(connection, row)
+
     def pending_operation_ids(self) -> tuple[str, ...]:
         """Return the bounded, stable set of operations that may still make progress."""
 
@@ -3970,6 +3998,7 @@ class DesktopProviderStore:
         body: BaseModel | Mapping[str, object],
         if_match: str,
         remote_state: RemoteProjectStateV1 | None,
+        activation_precommit: Callable[[ProjectV1], None] | None = None,
     ) -> LocalOperationV1:
         validated_remote: RemoteProjectStateV1 | None = None
         if operation_kind == "project_activate":
@@ -3987,6 +4016,10 @@ class DesktopProviderStore:
         elif remote_state is not None:
             raise ContractValidationError(
                 "non-activation project completion cannot publish remote project state"
+            )
+        elif activation_precommit is not None:
+            raise ContractValidationError(
+                "non-activation project completion cannot use an activation precommit"
             )
         identity = self._project_action_identity(
             route=route,
@@ -4024,6 +4057,8 @@ class DesktopProviderStore:
                     project_etag=active.etag,
                     active=True,
                 )
+                if activation_precommit is not None:
+                    activation_precommit(active)
             return self._finish_reserved_project_action(
                 connection,
                 identity,

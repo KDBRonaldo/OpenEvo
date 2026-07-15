@@ -144,16 +144,16 @@ export interface DesktopProductProvider {
   createProject(input: ProjectCreateV1, intent: ProductMutationIntent): Promise<ProjectV1>;
   updateProject(projectId: string, input: ProjectPatchV1, intent: ProductResourceMutationIntent): Promise<ProjectV1>;
   activateProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
-  syncProjectWorkspace(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
   cancelProjectSource(actionId: string): Promise<void>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
   startRun(intent: ProductRunIntent): Promise<RunV1>;
   cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
+  cancelOperation(operationId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
+  runProjectDiagnostics(projectId: string, intent: ProductResourceMutationIntent): Promise<DiagnosticReportV1>;
   getRunLogs(runId: string): Promise<readonly LogEntryV1[]>;
   getArtifactContent(artifactId: string): Promise<ArtifactContentV1>;
   getArtifactDiff(artifactId: string): Promise<ArtifactDiffV1>;
-  repairProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<OperationV1>;
 }
 
@@ -189,15 +189,15 @@ export const unavailableDesktopProductProvider: DesktopProductProvider = {
   createProject: unavailable,
   updateProject: unavailable,
   activateProject: unavailable,
-  syncProjectWorkspace: unavailable,
   selectProjectSource: unavailable,
   cancelProjectSource: unavailable,
   settleProjectSource: unavailable,
   startRun: unavailable,
   cancelRun: unavailable,
+  cancelOperation: unavailable,
+  runProjectDiagnostics: unavailable,
   getRunLogs: unavailable,
   getArtifactContent: unavailable,
   getArtifactDiff: unavailable,
-  repairProject: unavailable,
   restartService: unavailable,
 };

@@ -474,8 +474,12 @@ through the same authority-bound callback used by ordinary calls. The renderer
 reloads authoritative resources through the frozen Local API after each
 invalidation.
 
-Local doctor/repair/workspace-sync operations and Local operation
-logs/cancellation remain outside this composition slice. A successful SSH check
+Local doctor/repair/workspace-sync operations and Local operation logs remain
+outside this release composition. The renderer therefore does not advertise
+those controls. Cancellation is implemented for an existing nonterminal Local
+connect/bootstrap/activation operation through its operation ID and strong ETag;
+it advances the session generation, retires the operation's connection or
+project binding, and ignores any late worker completion. A successful SSH check
 alone still reports Core as `offline` with `core_not_started`; only project
 activation can publish an online project-bound tunnel.
 

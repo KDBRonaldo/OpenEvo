@@ -11,6 +11,7 @@ import {
   type ArtifactContentV1,
   type ArtifactDiffV1,
   type ArtifactV1,
+  type DiagnosticReportV1,
   type LocalOperationV1,
   type LogEntryV1,
   type OperationV1,
@@ -102,6 +103,7 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
   private streamAbort: AbortController | null = null;
   private streamPromise: Promise<void> | null = null;
   private waitingForRefresh = false;
+  private diagnostic: DiagnosticReportV1 | null = null;
 
   constructor(options: LocalApiDesktopProductProviderOptions) {
     this.client = options.client;
@@ -249,14 +251,6 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     return operation;
   }
 
-  async syncProjectWorkspace(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
-    this.assertIntent(intent);
-    const operation = await this.client.syncProjectWorkspace(projectId, actionOptions(intent));
-    assertLocalOperation(operation, "workspace_sync", "project", projectId);
-    this.invalidate();
-    return operation;
-  }
-
   async selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1> {
     this.assertIntent(intent);
     const source = projectSourceV1Schema.parse(await this.native.selectProjectSource(intent));
@@ -357,14 +351,6 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     return diff;
   }
 
-  async repairProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
-    this.assertIntent(intent);
-    const operation = await this.client.repairProject(projectId, actionOptions(intent));
-    assertLocalOperation(operation, "project_repair", "project", projectId);
-    this.invalidate();
-    return operation;
-  }
-
   async cancelOperation(operationId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
     this.assertIntent(intent);
     const operation = await this.client.cancelOperation(operationId, actionOptions(intent));
@@ -373,6 +359,28 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     }
     this.invalidate();
     return operation;
+  }
+
+  async runProjectDiagnostics(
+    projectId: string,
+    intent: ProductResourceMutationIntent,
+  ): Promise<DiagnosticReportV1> {
+    this.assertIntent(intent);
+    const project = this.snapshot?.projects.find((item) => item.project_id === projectId);
+    const coreProjectId = project?.remote?.core_project_id;
+    if (!project || coreProjectId === undefined) {
+      throw new DesktopContractError("Project diagnostics require an active remote project identity");
+    }
+    const diagnostic = await this.client.createDiagnostic({
+      scopes: ["project"],
+      target: { kind: "project", project_id: coreProjectId },
+    }, { idempotencyKey: intent.actionId });
+    if (diagnostic.target.kind !== "project" || diagnostic.target.project_id !== coreProjectId) {
+      throw new DesktopContractError("Project diagnostics returned a report for another project");
+    }
+    this.diagnostic = diagnostic;
+    this.invalidate();
+    return diagnostic;
   }
 
   async restartService(serviceId: string, intent: ProductResourceMutationIntent): Promise<OperationV1> {
@@ -486,6 +494,17 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     }
     const activeOperation = await this.loadActiveOperation(state.pending_operation_ids, budget);
     const { capability, validation } = await this.loadProjectAuthority(state, projects, profiles);
+    let diagnostic = this.diagnostic;
+    const activeCoreProjectId = projects.find(
+      (project) => project.project_id === state.active_project?.project_id,
+    )?.remote?.core_project_id;
+    if (diagnostic?.target.kind === "project" && diagnostic.target.project_id !== activeCoreProjectId) {
+      diagnostic = null;
+      this.diagnostic = null;
+    } else if (diagnostic && !["succeeded", "failed"].includes(diagnostic.status)) {
+      diagnostic = await this.client.getDiagnostic(diagnostic.id);
+      this.diagnostic = diagnostic;
+    }
 
     return {
       state,
@@ -501,7 +520,7 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
       services,
       capability,
       validation,
-      diagnostic: null,
+      diagnostic,
       activeOperation,
     };
   }
