@@ -3,10 +3,12 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ProjectSourceV1, RunV1 } from "../api/v1/schemas";
+import { DesktopApiError } from "../api/v1/client";
+import { apiErrorV1Schema, type ProjectSourceV1, type RunV1 } from "../api/v1/schemas";
 import { DesktopProductApp } from "./DesktopProductApp";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./fixtureProvider";
 import {
+  DesktopProductAmbiguousMutationError,
   DesktopProductUserError,
   type DesktopProductSnapshot,
   type ProductResourceMutationIntent,
@@ -1045,7 +1047,7 @@ describe("DesktopProductApp", () => {
 
     await clickButton("Retry session");
     expect(retryRun).toHaveBeenCalledTimes(2);
-    expect(retryRun.mock.calls[1]?.[1].actionId).toBe(retryRun.mock.calls[0]?.[1].actionId);
+    expect(retryRun.mock.calls[1]?.[1].actionId).not.toBe(retryRun.mock.calls[0]?.[1].actionId);
     expect(startRun).not.toHaveBeenCalled();
   });
 
@@ -1088,7 +1090,7 @@ describe("DesktopProductApp", () => {
     if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     const advanced = withAdvancedRetry(before.snapshot);
     const retryRun = vi.fn(async () => {
-      throw new DesktopProductUserError("The retry response was lost.");
+      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
     });
     Object.assign(provider, { retryRun });
     root = await renderProduct(provider);
@@ -1136,6 +1138,11 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("The retry was admitted.");
     expect(screenText()).not.toContain("Action could not be completed");
     expect(optionalButton("Retry session")).toBeNull();
+
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+    expect(screenText()).toContain("The retry was admitted.");
+    expect(optionalButton("Retry session")).toBeNull();
   });
 
   it("polls after an unknown retry until a later authoritative refresh proves advancement", async () => {
@@ -1143,7 +1150,7 @@ describe("DesktopProductApp", () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
     const retryRun = vi.fn(async () => {
-      throw new DesktopProductUserError("The retry response was lost.");
+      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
     });
     Object.assign(provider, { retryRun });
     root = await renderProduct(provider);
@@ -1170,7 +1177,7 @@ describe("DesktopProductApp", () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
     const retryRun = vi.fn(async () => {
-      throw new DesktopProductUserError("The retry response was lost.");
+      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
     });
     Object.assign(provider, { retryRun });
     root = await renderProduct(provider);
@@ -1206,7 +1213,7 @@ describe("DesktopProductApp", () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
     const retryRun = vi.fn(async () => {
-      throw new DesktopProductUserError("The retry response was lost.");
+      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
     });
     Object.assign(provider, { retryRun });
     root = await renderProduct(provider);
@@ -1243,7 +1250,7 @@ describe("DesktopProductApp", () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
     const retryRun = vi.fn(async () => {
-      throw new DesktopProductUserError("The retry response was lost.");
+      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
     });
     Object.assign(provider, { retryRun });
     root = await renderProduct(provider);
@@ -1278,7 +1285,7 @@ describe("DesktopProductApp", () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
     const retryRun = vi.fn(async () => {
-      throw new DesktopProductUserError("The retry response was lost.");
+      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
     });
     Object.assign(provider, { retryRun });
     root = await renderProduct(provider);
@@ -1320,7 +1327,7 @@ describe("DesktopProductApp", () => {
     expect(refresh).toHaveBeenCalledTimes(refreshesWhileRequestStarted);
 
     await act(async () => {
-      retryRequest.reject(new DesktopProductUserError("The retry response was lost."));
+      retryRequest.reject(new DesktopProductAmbiguousMutationError("The retry response was lost."));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -1328,6 +1335,43 @@ describe("DesktopProductApp", () => {
     const refreshesAfterAmbiguousResult = refresh.mock.calls.length;
     await advance(1_005);
     expect(refresh.mock.calls.length).toBeGreaterThan(refreshesAfterAmbiguousResult);
+  });
+
+  it("does not poll after a deterministic retry rejection", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({
+      startOnline: true,
+      seedFailedRun: true,
+      releaseExecutionModes: true,
+      projectExecutionMode: "codex_subscription_transcript",
+    });
+    const retryRun = vi.fn(async () => {
+      throw new DesktopApiError(apiErrorV1Schema.parse({
+        schema_version: "1",
+        request_id: "request-retry-rejected-1",
+        http_status: 409,
+        code: "run_retry_rejected",
+        message: "The failed session cannot be retried yet.",
+        severity: "warning",
+        category: "run",
+        retryable: true,
+        repair_action: "openevo_can_retry",
+        next_action: "Try again after the current remote operation finishes.",
+        details: {},
+      }));
+    });
+    Object.assign(provider, { retryRun });
+    root = await renderProduct(provider);
+
+    const refresh = vi.spyOn(provider, "refresh");
+    await clickButton("Retry session");
+    await flush();
+    await advance(1_005);
+    const refreshesAfterSettledWork = refresh.mock.calls.length;
+    await advance(5_005);
+
+    expect(refresh).toHaveBeenCalledTimes(refreshesAfterSettledWork);
+    expect(screenText()).toContain("The failed session cannot be retried yet.");
   });
 
   it("does not let retry completion clear a newer operation error", async () => {

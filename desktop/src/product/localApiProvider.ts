@@ -22,6 +22,7 @@ import {
 } from "../api/v1/schemas";
 import { parseEventStreamFailure, parseSseFrame } from "../api/v1/sse";
 import {
+  DesktopProductAmbiguousMutationError,
   DesktopProductUserError,
   ProductRefreshOrder,
   type DesktopProductSnapshot,
@@ -97,6 +98,7 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
   private streamAbort: AbortController | null = null;
   private streamPromise: Promise<void> | null = null;
   private waitingForRefresh = false;
+  private retryReplay: { readonly runId: string; readonly intent: ProductResourceMutationIntent } | null = null;
 
   constructor(options: LocalApiDesktopProductProviderOptions) {
     this.client = options.client;
@@ -302,11 +304,31 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
   }
 
   async retryRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1> {
-    this.assertIntent(intent);
-    const run = await this.client.retryRun(runId, actionOptions(intent));
-    this.assertKnownRunResponse(run, runId, "Run retry returned the wrong run");
-    this.invalidate();
-    return run;
+    const exactReplay = this.retryReplay?.runId === runId
+      && sameResourceIntent(this.retryReplay.intent, intent);
+    if (!exactReplay) {
+      this.assertIntent(intent);
+      this.retryReplay = { runId, intent: { ...intent } };
+    }
+    try {
+      const run = await this.client.retryRun(runId, actionOptions(intent));
+      this.assertKnownRunResponse(run, runId, "Run retry returned the wrong run");
+      if (this.retryReplay?.runId === runId && sameResourceIntent(this.retryReplay.intent, intent)) {
+        this.retryReplay = null;
+      }
+      this.invalidate();
+      return run;
+    } catch (error) {
+      if (error instanceof DesktopApiError) {
+        if (this.retryReplay?.runId === runId && sameResourceIntent(this.retryReplay.intent, intent)) {
+          this.retryReplay = null;
+        }
+        throw error;
+      }
+      throw error instanceof DesktopProductAmbiguousMutationError
+        ? error
+        : new DesktopProductAmbiguousMutationError(undefined, error);
+    }
   }
 
   async getArtifactContent(artifactId: string): Promise<ArtifactContentV1> {
@@ -781,6 +803,15 @@ async function mapLimited<T, R>(
 
 function actionOptions(intent: ProductResourceMutationIntent) {
   return { idempotencyKey: intent.actionId, ifMatch: intent.etag };
+}
+
+function sameResourceIntent(
+  left: ProductResourceMutationIntent,
+  right: ProductResourceMutationIntent,
+): boolean {
+  return left.actionId === right.actionId
+    && left.streamEpoch === right.streamEpoch
+    && left.etag === right.etag;
 }
 
 function validationIdempotencyKey(project: ProjectV1): string {

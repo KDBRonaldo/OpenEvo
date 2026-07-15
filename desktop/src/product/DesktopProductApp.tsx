@@ -50,6 +50,7 @@ import type {
   ServiceV1,
 } from "../api/v1/schemas";
 import {
+  DesktopProductAmbiguousMutationError,
   DesktopProductProviderUnavailableError,
   DesktopProductUserError,
   type DesktopProductProvider,
@@ -99,6 +100,7 @@ type PendingRunRetry = {
   readonly originalAttemptIds: readonly string[];
   readonly originalAttemptSnapshots: readonly string[];
   readonly originalCurrentAttemptId: string | null;
+  acceptedRun: RunV1 | null;
   reconciled: boolean;
 };
 type SaveAttemptResult = {
@@ -190,6 +192,12 @@ export function DesktopProductApp({
     clearActionError(pending.errorOwner);
   }, [clearActionError]);
 
+  const abandonPendingRetry = useCallback((pending: PendingRunRetry): void => {
+    if (pendingRunRetry.current !== pending) return;
+    pendingRunRetry.current = null;
+    setPendingRetryPoll((current) => current === pending ? null : current);
+  }, []);
+
   const publishRefresh = useCallback((publication: SnapshotRefreshPublication): void => {
     if (publication.kind === "pending") {
       setSnapshot((current) => current ? {
@@ -216,10 +224,12 @@ export function DesktopProductApp({
       if (result.status === "error") setLoadError(userMessage(result.stream.error));
       return;
     }
-    const next = result.snapshot;
+    let next = result.snapshot;
     const pendingRetry = pendingRunRetry.current;
     if (pendingRetry && retryAdvancedInSnapshot(next, pendingRetry)) {
       clearPendingRetry(pendingRetry);
+    } else if (pendingRetry?.acceptedRun) {
+      next = mergeAuthoritativeRetryRun(next, pendingRetry.acceptedRun, pendingRetry);
     }
     setSnapshot(next);
     setLoadError(null);
@@ -442,7 +452,7 @@ export function DesktopProductApp({
     const intent = sameUnprovenRetry
       ? existing.intent
       : resourceIntent(snapshot, run.etag);
-    const pending = {
+    const pending: PendingRunRetry = {
       runId: run.id,
       intent,
       errorOwner,
@@ -452,6 +462,7 @@ export function DesktopProductApp({
         ? existing.originalAttemptSnapshots
         : run.attempts.map(canonicalJsonSnapshot),
       originalCurrentAttemptId: sameUnprovenRetry ? existing.originalCurrentAttemptId : run.current_attempt_id,
+      acceptedRun: null,
       reconciled: false,
     };
     pendingRunRetry.current = pending;
@@ -472,12 +483,16 @@ export function DesktopProductApp({
       }
       const acceptedRetryResponse = retryResponse;
       if (acceptedRetryResponse && retryAdvancedRun(acceptedRetryResponse, pending)) {
+        pending.acceptedRun = acceptedRetryResponse;
         setSnapshot((current) => current ? mergeAuthoritativeRetryRun(current, acceptedRetryResponse, pending) : current);
-        clearPendingRetry(pending);
+        setPendingRetryPoll(null);
+        clearActionError(pending.errorOwner);
       } else if (result.refreshedSnapshot && retryAdvancedInSnapshot(result.refreshedSnapshot, pending)) {
         clearPendingRetry(pending);
-      } else {
+      } else if (result.error === null || isAmbiguousRetryOutcome(result.error)) {
         setPendingRetryPoll(pending);
+      } else {
+        abandonPendingRetry(pending);
       }
     });
   };
@@ -2672,8 +2687,16 @@ function requestPreconditionChanged(
 function userMessage(error: unknown): string {
   if (error instanceof DesktopProductProviderUnavailableError) return "The local Desktop service is not ready. Restart OpenEvo Desktop and try again.";
   if (error instanceof DesktopApiError) return error.apiError.message;
+  if (error instanceof DesktopProductAmbiguousMutationError) return error.userMessage;
   if (error instanceof DesktopProductUserError) return error.userMessage;
   return "The request could not be completed.";
+}
+
+function isAmbiguousRetryOutcome(error: unknown): boolean {
+  return error instanceof DesktopProductAmbiguousMutationError
+    || (!(error instanceof DesktopApiError)
+      && !(error instanceof DesktopProductProviderUnavailableError)
+      && !(error instanceof DesktopProductUserError));
 }
 
 function isWorkspaceSelectionCancelled(error: unknown): boolean {

@@ -963,14 +963,20 @@ Retry creates a new attempt; it never rewrites a terminal attempt.
 After an ambiguous retry response, the renderer retains the complete original
 mutation intent: idempotency key, observed stream epoch, and ETag. ETag or status
 churn without advancement cannot replace that intent; an explicit retry replays
-it exactly. Bounded authoritative polling starts only after the mutation has
-become ambiguous. Reconciliation succeeds only when the same run preserves the
-canonical complete original attempt prefix and contains exactly one appended
-current attempt. A missing run, a rewritten terminal attempt, multiple appended
-attempts, or ETag/status churn without that one append is not success and cannot
-clear the retry error. A validated retry response carrying the same proof is
-authoritative for the run and remains visible even when the immediately
-following aggregate snapshot omits or lags it.
+it exactly, even if later refreshes have advanced the renderer epoch. This is a
+single-run exact-replay exception in the release provider; a new intent or an
+intent for another run must satisfy the current snapshot preconditions. Bounded
+authoritative polling starts only after the mutation has become ambiguous. A
+typed API rejection is deterministic, clears the exact-replay authority, and
+does not start that polling. Reconciliation succeeds only when the same run
+preserves the canonical complete original attempt prefix and contains exactly
+one appended current attempt. A missing run, a rewritten terminal attempt,
+multiple appended attempts, or ETag/status churn without that one append is not
+success and cannot clear the retry error. A validated retry response carrying
+the same proof is authoritative for the run. The renderer overlays that response
+over every lagging or omitting aggregate snapshot until a fresh Core aggregate
+independently proves the same append; one later stale aggregate cannot erase the
+accepted retry or expose a duplicate action.
 
 Evolution is cross-session. A successful task seals its dataset, runs every
 enabled target, validates and materializes all outputs, and then atomically

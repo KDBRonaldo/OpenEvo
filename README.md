@@ -169,6 +169,15 @@ canonical v2 schema fingerprint is the only accepted v2 authority: the
 unreleased intermediate branch-private v2 layout is rejected at startup without
 migration. Terminal reservations become eligible for ordinary retention cleanup.
 
+Run retry recovery also preserves one exact mutation intent across an ambiguous
+transport or response-validation outcome. The release provider may replay that
+same run ID, idempotency key, ETag, and observed renderer epoch after later
+refreshes advance the view; a new or cross-wired intent must pass the current
+snapshot checks. A typed API rejection ends this replay authority immediately
+and does not start reconciliation polling. When a validated retry response
+proves one appended attempt, Desktop keeps that run visible until a fresh Core
+aggregate independently contains the same canonical attempt prefix and append.
+
 Current release smoke checks are pre-External-Beta maintainer checks. They
 validate Core Backend wheel identity and Desktop asset packaging, but they do
 not publish GitHub Release assets, PyPI artifacts, or a release-ready `.dmg`.

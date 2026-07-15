@@ -170,6 +170,19 @@ export class DesktopProductUserError extends Error {
   }
 }
 
+export class DesktopProductAmbiguousMutationError extends Error {
+  readonly cause: unknown;
+
+  constructor(
+    readonly userMessage = "The retry outcome is not yet confirmed. OpenEvo will keep checking the remote session.",
+    cause: unknown = null,
+  ) {
+    super(userMessage);
+    this.name = "DesktopProductAmbiguousMutationError";
+    this.cause = cause;
+  }
+}
+
 const unavailable = async (): Promise<never> => {
   throw new DesktopProductProviderUnavailableError();
 };

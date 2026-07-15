@@ -24,6 +24,7 @@ import {
   type LocalOperationV1,
 } from "../api/v1/schemas";
 import { LocalApiDesktopProductProvider } from "./localApiProvider";
+import { DesktopProductAmbiguousMutationError } from "./provider";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -298,6 +299,64 @@ describe("LocalApiDesktopProductProvider", () => {
     expect(unknown.createRun).toHaveBeenCalledTimes(1);
   });
 
+  it("replays an ambiguous run retry with its exact stale renderer intent", async () => {
+    const client = mockClient();
+    const accepted = runV1Schema.parse(CONTRACT_FIXTURE_V1.run);
+    client.retryRun = vi.fn()
+      .mockRejectedValueOnce(new TypeError("retry response was lost"))
+      .mockResolvedValueOnce(accepted);
+    const provider = createProvider(client);
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    const intent = {
+      actionId: "renderer-action-retry-ambiguous-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: ETAG_A,
+    };
+
+    await expect(provider.retryRun("run-fixture-1", intent))
+      .rejects.toBeInstanceOf(DesktopProductAmbiguousMutationError);
+    const afterUnknown = await provider.refresh();
+    if (afterUnknown.status !== "fresh") throw new Error("expected a fresh fixture after ambiguity");
+    expect(afterUnknown.snapshot.stream.epoch).toBeGreaterThan(intent.streamEpoch);
+
+    await expect(provider.retryRun("run-fixture-1", intent)).resolves.toEqual(accepted);
+    expect(client.retryRun).toHaveBeenNthCalledWith(1, "run-fixture-1", {
+      idempotencyKey: intent.actionId,
+      ifMatch: intent.etag,
+    });
+    expect(client.retryRun).toHaveBeenNthCalledWith(2, "run-fixture-1", {
+      idempotencyKey: intent.actionId,
+      ifMatch: intent.etag,
+    });
+  });
+
+  it("does not retain exact replay authority after a deterministic retry rejection", async () => {
+    const client = mockClient();
+    client.retryRun = vi.fn().mockRejectedValue(new DesktopApiError(apiErrorV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.error,
+      code: "run_retry_rejected",
+      message: "The failed run cannot be retried.",
+      category: "run",
+      retryable: false,
+      repair_action: "user_action_required",
+      details: {},
+    })));
+    const provider = createProvider(client);
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    const intent = {
+      actionId: "renderer-action-retry-rejected-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: ETAG_A,
+    };
+
+    await expect(provider.retryRun("run-fixture-1", intent)).rejects.toBeInstanceOf(DesktopApiError);
+    await provider.refresh();
+    await expect(provider.retryRun("run-fixture-1", intent)).rejects.toThrow(/refresh/i);
+    expect(client.retryRun).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects schema-valid cross-wired mutation, action, content, and diff responses", async () => {
     const client = mockClient();
     const provider = createProvider(client);
@@ -328,9 +387,15 @@ describe("LocalApiDesktopProductProvider", () => {
     client.cancelRun = vi.fn().mockResolvedValue(runForProject("project-cross-wired"));
     await expect(provider.cancelRun("run-fixture-1", resourceIntent)).rejects.toThrow(/wrong run/i);
     client.retryRun = vi.fn().mockResolvedValue(runWithId("run-cross-wired"));
-    await expect(provider.retryRun("run-fixture-1", resourceIntent)).rejects.toThrow(/wrong run/i);
+    await expect(provider.retryRun("run-fixture-1", resourceIntent)).rejects.toMatchObject({
+      name: "DesktopProductAmbiguousMutationError",
+      cause: expect.objectContaining({ message: expect.stringMatching(/wrong run/i) }),
+    });
     client.retryRun = vi.fn().mockResolvedValue(runForProject("project-cross-wired"));
-    await expect(provider.retryRun("run-fixture-1", resourceIntent)).rejects.toThrow(/wrong run/i);
+    await expect(provider.retryRun("run-fixture-1", resourceIntent)).rejects.toMatchObject({
+      name: "DesktopProductAmbiguousMutationError",
+      cause: expect.objectContaining({ message: expect.stringMatching(/wrong run/i) }),
+    });
 
     client.connectProfile = vi.fn().mockResolvedValue(localOperation("profile_connect", "profile", "profile-cross-wired"));
     await expect(provider.connectProfile("profile-fixture-1", resourceIntent)).rejects.toThrow(/another resource/i);
