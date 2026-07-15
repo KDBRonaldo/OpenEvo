@@ -88,7 +88,10 @@ control are disabled. The returned object is contract-validated by the provider,
 but the renderer waits for the authoritative refresh before changing run or
 attempt state. A rejected or unknown request remains visibly failed, presents
 the typed error, and retains the action ID for an exact retry while the same run
-and ETag remain authoritative.
+and ETag remain authoritative. Every later fresh snapshot also reconciles that
+pending retry, so an SSE or polling observation of a new attempt clears only
+the error owned by that retry. Errors from newer or concurrent actions are not
+cleared by an older reconciliation.
 The Research view renders at most the latest 200
 matching records and separates agent, evolution, and system streams; SSE
 snapshot epochs trigger an authoritative output refresh while a session runs.

@@ -83,7 +83,9 @@ type ActionAttemptResult = {
   readonly saved: boolean;
   readonly error: unknown | null;
   readonly refreshedSnapshot: DesktopProductSnapshot | null;
+  readonly errorOwner: number;
 };
+type ActionErrorState = { readonly owner: number; readonly message: string };
 type PendingProjectActivation = {
   readonly projectId: string;
   readonly activationActionId: string;
@@ -92,6 +94,8 @@ type PendingRunRetry = {
   readonly runId: string;
   readonly runEtag: string;
   readonly actionId: string;
+  readonly errorOwner: number;
+  reconciled: boolean;
 };
 type SaveAttemptResult = {
   readonly saved: boolean;
@@ -150,14 +154,28 @@ export function DesktopProductApp({
   const [connectionSettingsOpen, setConnectionSettingsOpen] = useState(false);
   const [creatingProject, setCreatingProject] = useState(false);
   const [actionState, setActionState] = useState<AsyncState>("idle");
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<ActionErrorState | null>(null);
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
+  const actionErrorGeneration = useRef(0);
+  const actionStateGeneration = useRef(0);
   const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
   const pendingRunRetry = useRef<PendingRunRetry | null>(null);
   const recoveredProjectSetup = useRef<string | null>(null);
   const [cancellingOperation, setCancellingOperation] = useState(false);
   const refreshCoordinator = useRef<SnapshotRefreshCoordinator | null>(null);
   if (refreshCoordinator.current === null) refreshCoordinator.current = new SnapshotRefreshCoordinator();
+
+  const reserveActionErrorOwner = useCallback((): number => {
+    const owner = actionErrorGeneration.current + 1;
+    actionErrorGeneration.current = owner;
+    setActionError(null);
+    setActionRecovery(null);
+    return owner;
+  }, []);
+
+  const clearActionError = useCallback((owner: number): void => {
+    setActionError((current) => current?.owner === owner ? null : current);
+  }, []);
 
   const publishRefresh = useCallback((publication: SnapshotRefreshPublication): void => {
     if (publication.kind === "pending") {
@@ -186,13 +204,19 @@ export function DesktopProductApp({
       return;
     }
     const next = result.snapshot;
+    const pendingRetry = pendingRunRetry.current;
+    if (pendingRetry && retryAdvancedInSnapshot(next, pendingRetry)) {
+      pendingRetry.reconciled = true;
+      pendingRunRetry.current = null;
+      clearActionError(pendingRetry.errorOwner);
+    }
     setSnapshot(next);
     setLoadError(null);
     setSelectedProjectId((current) => {
       if (current && next.projects.some((project) => project.project_id === current)) return current;
       return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
     });
-  }, []);
+  }, [clearActionError]);
 
   useLayoutEffect(() => {
     const coordinator = refreshCoordinator.current!;
@@ -259,14 +283,21 @@ export function DesktopProductApp({
     ],
   );
 
-  const act = useCallback(async (action: () => Promise<unknown>, conflictRecovery: ActionRecovery = null, refreshOnUnknown = false): Promise<ActionAttemptResult> => {
+  const act = useCallback(async (
+    action: () => Promise<unknown>,
+    conflictRecovery: ActionRecovery = null,
+    refreshOnUnknown = false,
+    reservedErrorOwner?: number,
+  ): Promise<ActionAttemptResult> => {
+    const errorOwner = reservedErrorOwner ?? reserveActionErrorOwner();
+    const stateOwner = actionStateGeneration.current + 1;
+    actionStateGeneration.current = stateOwner;
     setActionState("working");
-    setActionError(null);
     setActionRecovery(null);
     try {
       await action();
       const refreshedSnapshot = await refresh("mutation");
-      return { saved: true, error: null, refreshedSnapshot };
+      return { saved: true, error: null, refreshedSnapshot, errorOwner };
     } catch (error) {
       let refreshedSnapshot: DesktopProductSnapshot | null = null;
       if (error instanceof DesktopApiError && [409, 410, 412].includes(error.apiError.http_status)) {
@@ -274,18 +305,22 @@ export function DesktopProductApp({
           setSnapshot((current) => current ? { ...current, stream: { status: "cursor_reset", epoch: current.stream.epoch, resumeFromEventId: null } } : current);
         }
         refreshedSnapshot = await refresh("mutation");
-        if (conflictRecovery && canReadmitRun(error.apiError, refreshedSnapshot, conflictRecovery.projectId)) {
+        if (conflictRecovery
+          && actionErrorGeneration.current === errorOwner
+          && canReadmitRun(error.apiError, refreshedSnapshot, conflictRecovery.projectId)) {
           setActionRecovery(conflictRecovery);
         }
       } else if (refreshOnUnknown) {
         refreshedSnapshot = await refresh("mutation");
       }
-      setActionError(userMessage(error));
-      return { saved: false, error, refreshedSnapshot };
+      if (actionErrorGeneration.current === errorOwner) {
+        setActionError({ owner: errorOwner, message: userMessage(error) });
+      }
+      return { saved: false, error, refreshedSnapshot, errorOwner };
     } finally {
-      setActionState("idle");
+      if (actionStateGeneration.current === stateOwner) setActionState("idle");
     }
-  }, [refresh]);
+  }, [refresh, reserveActionErrorOwner]);
 
   useActiveRunPolling(runPollingIdentity, refresh);
 
@@ -336,8 +371,8 @@ export function DesktopProductApp({
   const cancelActiveOperation = async () => {
     const operation = snapshot.activeOperation;
     if (!operation || cancellingOperation) return;
+    const errorOwner = reserveActionErrorOwner();
     setCancellingOperation(true);
-    setActionError(null);
     try {
       await provider.cancelOperation(
         operation.operation_id,
@@ -345,7 +380,9 @@ export function DesktopProductApp({
       );
       await refresh("mutation");
     } catch (error) {
-      setActionError(userMessage(error));
+      if (actionErrorGeneration.current === errorOwner) {
+        setActionError({ owner: errorOwner, message: userMessage(error) });
+      }
       await refresh("mutation");
     } finally {
       setCancellingOperation(false);
@@ -360,22 +397,31 @@ export function DesktopProductApp({
       return;
     }
     const existing = pendingRunRetry.current;
-    const pending = existing?.runId === run.id && existing.runEtag === run.etag
-      ? existing
-      : { runId: run.id, runEtag: run.etag, actionId: newActionId() };
+    const errorOwner = reserveActionErrorOwner();
+    const pending = {
+      runId: run.id,
+      runEtag: run.etag,
+      actionId: existing?.runId === run.id && existing.runEtag === run.etag
+        ? existing.actionId
+        : newActionId(),
+      errorOwner,
+      reconciled: false,
+    };
     pendingRunRetry.current = pending;
     void act(
       () => retryRun.call(provider, run.id, resourceIntent(snapshot, run.etag, pending.actionId)),
       null,
       true,
+      errorOwner,
     ).then((result) => {
-      if (pendingRunRetry.current !== pending) return;
-      const refreshedRun = result.refreshedSnapshot?.runs.find((item) => item.id === run.id);
+      if (pendingRunRetry.current !== pending) {
+        if (pending.reconciled) clearActionError(errorOwner);
+        return;
+      }
       if (result.saved
-        || (result.refreshedSnapshot?.stream.status === "fresh" && !refreshedRun)
-        || (refreshedRun && (refreshedRun.etag !== run.etag || refreshedRun.status !== "failed"))) {
+        || (result.refreshedSnapshot && retryAdvancedInSnapshot(result.refreshedSnapshot, pending))) {
         pendingRunRetry.current = null;
-        setActionError(null);
+        clearActionError(errorOwner);
       }
     });
   };
@@ -430,7 +476,7 @@ export function DesktopProductApp({
           {actionError ? <InlineNotice
             tone="error"
             title="Action could not be completed"
-            detail={actionError}
+            detail={actionError.message}
             onDismiss={() => { setActionError(null); setActionRecovery(null); }}
             actionLabel={actionRecovery?.kind === "readmit_run" ? "Re-admit session" : undefined}
             onAction={actionRecovery?.kind === "readmit_run" && project && actionRecovery.projectId === project.project_id
@@ -2428,6 +2474,15 @@ function formatTime(timestamp: string): string {
 
 function isTerminal(state: RunV1["status"]): boolean {
   return state === "succeeded" || state === "failed" || state === "cancelled";
+}
+
+function retryAdvancedInSnapshot(
+  snapshot: DesktopProductSnapshot,
+  pending: PendingRunRetry,
+): boolean {
+  if (snapshot.stream.status !== "fresh") return false;
+  const run = snapshot.runs.find((item) => item.id === pending.runId);
+  return !run || run.etag !== pending.runEtag || run.status !== "failed";
 }
 
 function canReadmitRun(

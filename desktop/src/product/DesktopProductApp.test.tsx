@@ -1003,35 +1003,7 @@ describe("DesktopProductApp", () => {
     provider.useRunStateReviewScenario();
     const before = await provider.refresh();
     if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const failedRun = before.snapshot.runs.find((run) => run.id === "run-failed-model");
-    if (!failedRun?.current_attempt) throw new Error("Expected the failed fixture run.");
-    const queuedRun: RunV1 = {
-      ...failedRun,
-      status: "queued",
-      queued_reason: {
-        code: "admission_pending",
-        summary: "The retry was admitted.",
-        retry_after_seconds: null,
-      },
-      current_attempt_id: "attempt-run-failed-model-retry",
-      current_attempt: {
-        ...failedRun.current_attempt,
-        id: "attempt-run-failed-model-retry",
-        status: "queued",
-        queued_reason: {
-          code: "admission_pending",
-          summary: "The retry was admitted.",
-          retry_after_seconds: null,
-        },
-        error: null,
-        started_at: null,
-        finished_at: null,
-      },
-      current_error: null,
-      started_at: null,
-      finished_at: null,
-      etag: `"${"e".repeat(64)}"`,
-    };
+    const advanced = withAdvancedRetry(before.snapshot);
     const retryRun = vi.fn(async () => {
       throw new DesktopProductUserError("The retry response was lost.");
     });
@@ -1041,10 +1013,7 @@ describe("DesktopProductApp", () => {
     await clickButton("Cancel session");
     vi.spyOn(provider, "refresh").mockResolvedValueOnce({
       status: "fresh",
-      snapshot: {
-        ...before.snapshot,
-        runs: before.snapshot.runs.map((run) => run.id === queuedRun.id ? queuedRun : run),
-      },
+      snapshot: advanced,
     });
 
     await clickButton("Retry session");
@@ -1054,6 +1023,78 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("The retry was admitted.");
     expect(screenText()).not.toContain("Action could not be completed");
     expect(screenText()).not.toContain("The retry response was lost.");
+  });
+
+  it("clears an unknown retry error when a later authoritative refresh proves advancement", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    const retryRun = vi.fn(async () => {
+      throw new DesktopProductUserError("The retry response was lost.");
+    });
+    Object.assign(provider, { retryRun });
+    root = await renderProduct(provider);
+
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    await clickButton("Retry session");
+    await flush();
+    expect(screenText()).toContain("Action could not be completed");
+
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: withAdvancedRetry(failed.snapshot),
+    });
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+
+    expect(screenText()).toContain("The retry was admitted.");
+    expect(screenText()).not.toContain("Action could not be completed");
+    expect(screenText()).not.toContain("The retry response was lost.");
+  });
+
+  it("does not let retry completion clear a newer operation error", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, stepDelayMs: 10_000 });
+    provider.useRunStateReviewScenario();
+    root = await renderProduct(provider);
+    await clickButton("Cancel session");
+    const beforeConnect = await provider.refresh();
+    if (beforeConnect.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const profile = beforeConnect.snapshot.profiles[0];
+    const failedRun = beforeConnect.snapshot.runs.find((run) => run.id === "run-failed-model");
+    if (!profile || !failedRun) throw new Error("Expected profile and failed run fixtures.");
+    await act(async () => {
+      await provider?.connectProfile(profile.profile_id, {
+        actionId: "connect-during-retry-0001",
+        streamEpoch: beforeConnect.snapshot.stream.epoch,
+        etag: profile.etag,
+      });
+    });
+    await flush();
+
+    const retryRequest = deferred<RunV1>();
+    const retryRun = vi.fn(() => retryRequest.promise);
+    Object.assign(provider, { retryRun });
+    vi.spyOn(provider, "cancelOperation").mockRejectedValueOnce(
+      new DesktopProductUserError("The connection operation could not be cancelled."),
+    );
+
+    await act(async () => {
+      button("Retry session").click();
+      await Promise.resolve();
+    });
+    await clickButton("Cancel operation");
+    expect(screenText()).toContain("The connection operation could not be cancelled.");
+
+    await act(async () => {
+      retryRequest.resolve(failedRun);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await flush();
+
+    expect(screenText()).toContain("Action could not be completed");
+    expect(screenText()).toContain("The connection operation could not be cancelled.");
   });
 
   it("shows every selected revision member, including multiple artifacts for one target, in stable order", async () => {
@@ -1836,6 +1877,39 @@ function labelledControl<T extends HTMLElement>(text: string, selector: string):
 
 function screenText(): string {
   return document.body.textContent ?? "";
+}
+
+function withAdvancedRetry(snapshot: DesktopProductSnapshot): DesktopProductSnapshot {
+  const failedRun = snapshot.runs.find((run) => run.id === "run-failed-model");
+  if (!failedRun?.current_attempt) throw new Error("Expected the failed fixture run.");
+  const queuedReason = {
+    code: "admission_pending" as const,
+    summary: "The retry was admitted.",
+    retry_after_seconds: null,
+  };
+  const queuedRun: RunV1 = {
+    ...failedRun,
+    status: "queued",
+    queued_reason: queuedReason,
+    current_attempt_id: "attempt-run-failed-model-retry",
+    current_attempt: {
+      ...failedRun.current_attempt,
+      id: "attempt-run-failed-model-retry",
+      status: "queued",
+      queued_reason: queuedReason,
+      error: null,
+      started_at: null,
+      finished_at: null,
+    },
+    current_error: null,
+    started_at: null,
+    finished_at: null,
+    etag: `"${"e".repeat(64)}"`,
+  };
+  return {
+    ...snapshot,
+    runs: snapshot.runs.map((run) => run.id === queuedRun.id ? queuedRun : run),
+  };
 }
 
 function withRunOutputIdentity(
