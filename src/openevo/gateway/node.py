@@ -879,38 +879,80 @@ class GatewayNodeManager:
                 raise GatewayReadinessError(
                     "gateway dispatcher was not ready for admission"
                 ) from exc
-        except BaseException:
+        except BaseException as admission_error:
             try:
                 self.storage.delete_session(session_id)
+            except Exception as exc:
+                self._log_credential_safe_exception(
+                    managed,
+                    "Failed to roll back session storage",
+                    exc,
+                    session_id=session_id,
+                    level=logging.WARNING,
+                )
+            try:
                 self.session_registry.remove(session_id)
             except Exception as exc:
                 self._log_credential_safe_exception(
                     managed,
-                    "Failed to roll back session registration",
+                    "Failed to roll back session registry",
                     exc,
                     session_id=session_id,
                     level=logging.WARNING,
                 )
             cleanup_complete = True
             if session_dir is not None:
-                cleanup_complete = await self._remove_session_dir_best_effort(
-                    session_dir,
-                    session_id,
-                    session_root_identity,
-                ) and cleanup_complete
+                try:
+                    cleaned = await self._remove_session_dir_best_effort(
+                        session_dir,
+                        session_id,
+                        session_root_identity,
+                    )
+                except Exception as exc:
+                    cleaned = False
+                    self._log_credential_safe_exception(
+                        managed,
+                        "Failed to roll back session root",
+                        exc,
+                        session_id=session_id,
+                        level=logging.WARNING,
+                    )
+                cleanup_complete = cleaned and cleanup_complete
             if log_authority_dir is not None:
-                cleanup_complete = await self._remove_log_authority_best_effort(
-                    log_authority_dir,
-                    session_id,
-                    log_authority_identity,
-                ) and cleanup_complete
+                try:
+                    cleaned = await self._remove_log_authority_best_effort(
+                        log_authority_dir,
+                        session_id,
+                        log_authority_identity,
+                    )
+                except Exception as exc:
+                    cleaned = False
+                    self._log_credential_safe_exception(
+                        managed,
+                        "Failed to roll back log authority",
+                        exc,
+                        session_id=session_id,
+                        level=logging.WARNING,
+                    )
+                cleanup_complete = cleaned and cleanup_complete
             if managed is not None and managed.credential_dir is not None:
-                cleanup_complete = await self._remove_credential_dir_best_effort(
-                    managed.credential_dir,
-                    session_id,
-                    managed.credential_root_identity,
-                    managed.credential_auth_identity,
-                ) and cleanup_complete
+                try:
+                    cleaned = await self._remove_credential_dir_best_effort(
+                        managed.credential_dir,
+                        session_id,
+                        managed.credential_root_identity,
+                        managed.credential_auth_identity,
+                    )
+                except Exception as exc:
+                    cleaned = False
+                    self._log_credential_safe_exception(
+                        managed,
+                        "Failed to roll back credential authority",
+                        exc,
+                        session_id=session_id,
+                        level=logging.WARNING,
+                    )
+                cleanup_complete = cleaned and cleanup_complete
             if managed is not None and cleanup_complete:
                 try:
                     self._retire_cleanup_ownership(self._cleanup_ownership_for(managed))
@@ -921,6 +963,14 @@ class GatewayNodeManager:
                         exc,
                         level=logging.WARNING,
                     )
+            if isinstance(admission_error, asyncio.CancelledError):
+                raise
+            if isinstance(admission_error, GatewayReadinessError):
+                raise
+            if isinstance(admission_error, Exception):
+                raise GatewayReadinessError(
+                    "gateway session publication was not ready for admission"
+                ) from admission_error
             raise
         finally:
             if dispatcher_admission is not None:

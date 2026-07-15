@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from openevo.gateway.dispatcher import ManagedSession, SessionDispatcher, SessionStage
-from openevo.gateway import session_files
+from openevo.gateway import node as node_module, session_files
 from openevo.gateway.node import GatewayNodeManager, GatewayReadinessError
 from openevo.gateway.session import SessionRegistry
 from openevo.gateway.session_files import CredentialRedactor, HeldCodexCredentialAuthority
@@ -426,6 +426,128 @@ async def test_subscription_publication_failure_rolls_back_session_side_effects(
             for record in journal_records
         )
     finally:
+        await manager._client.aclose()
+        authority.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_point",
+    ["session_root", "log_authority", "registry", "storage", "journal"],
+)
+async def test_admission_publication_failures_are_typed_and_fully_rolled_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    secret = f"{failure_point}-private-publication-detail"
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"publication-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    manager = GatewayNodeManager(
+        node_id=f"publication-{failure_point}",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
+    )
+    manager._dispatcher._started = True
+    manager._dispatcher._accepting = True
+
+    def fail(*_args, **_kwargs):
+        raise OSError(secret)
+
+    if failure_point == "session_root":
+        monkeypatch.setattr(node_module, "mkdtemp", fail)
+    elif failure_point == "log_authority":
+        monkeypatch.setattr(node_module, "create_session_log_authority", fail)
+    elif failure_point == "registry":
+        monkeypatch.setattr(manager.session_registry, "register", fail)
+    elif failure_point == "storage":
+        monkeypatch.setattr(manager.storage, "ensure_session", fail)
+    else:
+        monkeypatch.setattr(manager, "_persist_cleanup_ownership", fail)
+
+    session_id = f"publication-{failure_point}"
+    try:
+        with pytest.raises(GatewayReadinessError) as raised:
+            await manager.dispatch(_subscription_dispatch_request(session_id))
+        assert secret not in str(raised.value)
+        assert manager.session_registry.get(session_id) is None
+        assert manager.storage.get_session_metadata(session_id) is None
+        assert manager._dispatcher._admission_tokens == set()
+        assert (await manager._dispatcher.snapshot()).active_count == 0
+        assert list(tmp_path.glob(f"session-{session_id[:8]}-*")) == []
+        assert list(tmp_path.glob(f"credentials-{session_id[:8]}-*")) == []
+    finally:
+        manager._dispatcher._started = False
+        manager._dispatcher._accepting = False
+        await manager._client.aclose()
+        authority.close()
+
+
+@pytest.mark.asyncio
+async def test_admission_rollback_attempts_registry_after_storage_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"rollback-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    manager = GatewayNodeManager(
+        node_id="independent-rollback",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+        managed_image_authority_verifier=_accept_managed_image_authority,
+    )
+    manager._dispatcher._started = True
+    manager._dispatcher._accepting = True
+    removed: list[str] = []
+    real_remove = manager.session_registry.remove
+
+    def fail_journal(*_args, **_kwargs) -> None:
+        raise OSError("journal publication failed")
+
+    def fail_storage_cleanup(_session_id: str) -> int:
+        raise OSError("storage cleanup failed")
+
+    def record_registry_cleanup(session_id: str) -> None:
+        removed.append(session_id)
+        real_remove(session_id)
+
+    monkeypatch.setattr(manager, "_persist_cleanup_ownership", fail_journal)
+    monkeypatch.setattr(manager.storage, "delete_session", fail_storage_cleanup)
+    monkeypatch.setattr(manager.session_registry, "remove", record_registry_cleanup)
+    try:
+        with pytest.raises(GatewayReadinessError):
+            await manager.dispatch(_subscription_dispatch_request("independent-rollback"))
+        assert removed == ["independent-rollback"]
+        assert manager.session_registry.get("independent-rollback") is None
+        assert manager._dispatcher._admission_tokens == set()
+        assert list(tmp_path.glob("session-independ-*")) == []
+        assert list(tmp_path.glob("credentials-independ-*")) == []
+    finally:
+        manager._dispatcher._started = False
+        manager._dispatcher._accepting = False
         await manager._client.aclose()
         authority.close()
 

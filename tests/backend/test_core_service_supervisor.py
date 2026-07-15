@@ -1980,17 +1980,53 @@ def test_local_probe_rejects_empty_unbounded_or_malformed_codex_version(
     assert runner.calls == [("codex", "--version")]
 
 
-def test_local_probe_accepts_stderr_only_version_and_binds_exact_evidence(
+def test_local_probe_rejects_stderr_only_version(
     tmp_path: Path,
 ) -> None:
     auth = tmp_path / "auth.json"
     auth.write_text('{"tokens":{"access_token":"private"}}', encoding="utf-8")
     auth.chmod(0o600)
 
-    def readiness_for(version: bytes) -> ManagedScienceRuntimeReadiness:
+    runner = FakeProbeCommandRunner(
+        results={
+            ("codex", "--version"): ProbeCommandResult(
+                0,
+                b"",
+                b"codex-cli 1.2.3\n",
+            ),
+        }
+    )
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE
+    assert runner.calls == [("codex", "--version")]
+
+
+def test_local_probe_retains_bounded_stderr_as_non_authoritative_evidence(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":{"access_token":"private"}}', encoding="utf-8")
+    auth.chmod(0o600)
+
+    def readiness_for(stderr: bytes) -> ManagedScienceRuntimeReadiness:
         runner = FakeProbeCommandRunner(
             results={
-                ("codex", "--version"): ProbeCommandResult(0, b"", version),
+                ("codex", "--version"): ProbeCommandResult(
+                    0,
+                    b"codex-cli 1.2.3\n",
+                    stderr,
+                ),
             }
         )
         return LocalManagedScienceRuntimeProbe(
@@ -2004,8 +2040,8 @@ def test_local_probe_accepts_stderr_only_version_and_binds_exact_evidence(
             time.monotonic() + 1,
         )
 
-    first = readiness_for(b"codex-cli 1.2.3\n")
-    second = readiness_for(b"codex-cli 1.2.4\n")
+    first = readiness_for(b"diagnostic one\n")
+    second = readiness_for(b"diagnostic two\n")
     try:
         assert first.ready is True
         assert second.ready is True

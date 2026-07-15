@@ -34,6 +34,8 @@ def validate_runtime_session_target(value: str, *, label: str) -> str:
 class ExecInput(BaseModel):
     """Command specification for runtime execution."""
 
+    model_config = ConfigDict(extra="forbid")
+
     command: str
     cwd: str | None = None
     env: dict[str, str] | None = None
@@ -44,6 +46,8 @@ class PrepareAction(BaseModel):
 
     Interleaves uploads and shell commands in exact order needed by the task.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     type: Literal["upload_file", "upload_dir", "exec"]
     source: str | None = None

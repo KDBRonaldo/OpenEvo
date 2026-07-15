@@ -775,7 +775,7 @@ async def test_credential_create_reconciliation_log_omits_traceback_canary(
 
 
 @pytest.mark.asyncio
-async def test_managed_image_admission_checks_alias_and_exact_immutable_reference(
+async def test_managed_image_admission_checks_only_exact_immutable_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     release = MANAGED_RUNTIME_RELEASES["managed_science"]
@@ -800,12 +800,12 @@ async def test_managed_image_admission_checks_alias_and_exact_immutable_referenc
 
     await verify_managed_runtime_image_admission(spec)
 
-    assert inspected == [release.trusted_digest, release.image]
+    assert inspected == [release.trusted_digest]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["replaced", "deleted"])
-async def test_managed_image_tag_mutation_fails_synchronous_admission(
+async def test_managed_image_tag_mutation_does_not_affect_synchronous_admission(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
@@ -838,10 +838,9 @@ async def test_managed_image_tag_mutation_fails_synchronous_admission(
         container_user="host",
     )
 
-    with pytest.raises(RuntimeError):
-        await verify_managed_runtime_image_admission(spec)
+    await verify_managed_runtime_image_admission(spec)
 
-    assert inspected == [release.trusted_digest, release.image]
+    assert inspected == [release.trusted_digest]
 
 
 @pytest.mark.asyncio

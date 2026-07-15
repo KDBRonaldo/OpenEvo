@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 import httpx
 from fastapi import FastAPI
+import pytest
 
 from openevo.evolution.server import create_app
 from openevo.gateway import server as gateway_server
@@ -437,9 +438,86 @@ def test_rollout_endpoint_admits_only_defaulted_canonical_task_request(monkeypat
         assert denied.json()["error"]["code"] == "run_admission_denied"
         assert len(manager.requests) == 1
         assert rejecting.checks[0].payload_sha256 == canonical.payload_sha256
+
+        verifier_checks = len(rejecting.checks)
+        unknown = client.post(
+            "/rollout/task/submit",
+            headers=identity.request_headers(),
+            json={
+                **raw,
+                "agent": {"harness": "codex", "unknown": "must reject"},
+            },
+        )
+        assert unknown.status_code == 422
+        assert len(manager.requests) == 1
+        assert len(rejecting.checks) == verifier_checks
     finally:
         rollout_server._internal_identity = None
         rollout_server._run_admission_verifier = None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "task_id": "closed-agent",
+            "instruction": "reject nested extras",
+            "agent": {"harness": "codex", "unknown": True},
+        },
+        {
+            "task_id": "closed-mcp",
+            "instruction": "reject nested extras",
+            "agent": {
+                "harness": "codex",
+                "mcp_servers": [
+                    {
+                        "name": "probe",
+                        "transport": "stdio",
+                        "command": "probe",
+                        "unknown": True,
+                    }
+                ],
+            },
+        },
+        {
+            "task_id": "closed-runtime-action",
+            "instruction": "reject nested extras",
+            "agent": {"harness": "codex"},
+            "runtime": {
+                "image": "runtime:latest",
+                "prepare": [
+                    {"type": "exec", "command": "true", "unknown": True}
+                ],
+            },
+        },
+        {
+            "task_id": "closed-shell",
+            "instruction": "reject nested extras",
+            "agent": {
+                "harness": "shell",
+                "custom_shell": {"command": "true", "unknown": True},
+            },
+        },
+        {
+            "task_id": "closed-builder",
+            "instruction": "reject nested extras",
+            "agent": {"harness": "codex"},
+            "builder": {"strategy": "per_request", "unknown": True},
+        },
+        {
+            "task_id": "closed-evaluator",
+            "instruction": "reject nested extras",
+            "agent": {"harness": "codex"},
+            "evaluator": {"strategy": "noop", "unknown": True},
+        },
+    ],
+    ids=["agent", "mcp", "prepare", "exec", "builder", "evaluator"],
+)
+def test_task_request_canonicalizer_rejects_unknown_nested_fields(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        canonicalize_task_request(payload)
 
 
 def test_release_gateway_session_create_and_dispatch_require_run_admission(

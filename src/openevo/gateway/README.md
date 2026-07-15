@@ -72,24 +72,25 @@ artifact, or log tree.
 Supervisor readiness pins every component from the absolute filesystem anchor
 to the remote user's `~/.codex/auth.json`, opens the leaf with `O_NOFOLLOW`, and
 requires a user-owned, link-count-one regular file with private permissions and
-a bounded size. It copies only from that held FD into an anonymous memfd,
-rechecks the descriptor, digest, and current pathname authority before and after
-the copy, validates bounded auth bytes, and write-seals the memfd. This final
-source-authority check commits the generation snapshot and is the credential
-point of no return. Replacement before or during that commit rejects readiness.
-Replacement afterward is permitted: login evidence and Gateway sessions both
-consume the sealed bytes and do not require the external pathname to remain
-unchanged. Gateway inherits only that CLOEXEC-safe snapshot FD and clones it
-before any session registry, storage, directory, cleanup journal, or queue
-mutation.
+a bounded size. A Linux inotify generation is bound to the exact auth directory
+entry before the leaf is opened. Core copies only from that held FD into an
+anonymous memfd, rechecks the descriptor, digest, pathname authority, and
+mutation generation before and after the copy, validates bounded auth bytes,
+and write-seals the memfd. Replace/restore ABA during the copy is therefore
+rejected. This final source-authority check commits the generation snapshot and
+is the credential point of no return. Replacement before or during that commit
+rejects readiness. Replacement afterward is permitted: login evidence and
+Gateway sessions both consume the sealed bytes and do not require the external
+pathname to remain unchanged. Gateway inherits only that CLOEXEC-safe snapshot
+FD and clones it before any session registry, storage, directory, cleanup
+journal, or queue mutation.
 
-For each subscription dispatch, Gateway then synchronously verifies the exact
-immutable managed image digest and label and finally verifies that the release
-tag still maps to that authority. The compiler-supplied `RuntimeSpec` contains
-only the immutable digest/reference, so tag replacement after this check cannot
-change the admitted run. Digest, label, tag, credential, or dispatcher readiness
-failure returns the stable typed retryable `gateway_readiness_failed` 503 before
-session registration or HTTP `REGISTERED`.
+For each subscription dispatch, Gateway then synchronously verifies only the
+exact immutable managed image digest/reference and label carried by the
+compiler-supplied `RuntimeSpec`. Mutable release tags are not consulted, so tag
+deletion or drift cannot change or block the admitted run. Exact-image, label,
+credential, or dispatcher readiness failure returns the stable typed retryable
+`gateway_readiness_failed` 503 before session registration or HTTP `REGISTERED`.
 
 Dispatch then creates and durably journals the private credential root and
 synchronously copies only from the sealed snapshot into a random `0700`
@@ -98,8 +99,12 @@ chains are verified there. Linux `renameat2(RENAME_NOREPLACE)` publishes the
 complete `0600` inode as the credential root's final `auth.json`. The empty
 staging inode's device/inode is journaled before secret bytes are copied; after
 publication, its final full identity is recorded before dispatch registers or
-queues the session and before HTTP can return `REGISTERED`. Publication failure
-is also a stable retryable 503 and rolls back all newly owned session state.
+queues the session and before HTTP can return `REGISTERED`. Every session/temp,
+registry, storage, journal, credential, and enqueue publication failure is
+mapped to the same static retryable 503 without exception text. Rollback attempts
+each owned resource independently; a failed cleanup cannot suppress later
+cleanup attempts, and incomplete durable cleanup remains recoverable through the
+journal.
 Before those mutations Gateway reserves an admission token from the dispatcher.
 Shutdown first sets `accepting=false` and waits for outstanding tokens; enqueue
 still requires `accepting=true`, publishes registry and the unbounded INIT queue

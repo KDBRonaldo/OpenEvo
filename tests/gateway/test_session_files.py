@@ -95,6 +95,40 @@ def test_committed_snapshot_survives_later_auth_path_replacement(tmp_path: Path)
         authority.close()
 
 
+def test_credential_snapshot_rejects_directory_entry_replace_restore_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_auth(tmp_path, '{"access_token":"readiness-secret"}\n')
+    before_fds = len(os.listdir("/proc/self/fd"))
+    authority = HeldCodexCredentialAuthority.open(source)
+    original_copy = session_files._copy_exact
+
+    def replace_and_restore(source_fd: int, target_fd: int, size: int) -> None:
+        original_copy(source_fd, target_fd, size)
+        displaced = source.with_name("auth.original")
+        replacement = source.with_name("auth.replacement")
+        os.replace(source, displaced)
+        replacement.write_text('{"access_token":"replacement"}\n', encoding="utf-8")
+        replacement.chmod(0o600)
+        os.replace(replacement, source)
+        source.unlink()
+        os.replace(displaced, source)
+
+    monkeypatch.setattr(session_files, "_copy_exact", replace_and_restore)
+    try:
+        with pytest.raises(SessionFileSecurityError, match="directory entry changed"):
+            authority.prepare_snapshot()
+        assert source.read_text(encoding="utf-8") == (
+            '{"access_token":"readiness-secret"}\n'
+        )
+        with pytest.raises(SessionFileSecurityError, match="directory entry changed"):
+            authority.verify()
+    finally:
+        authority.close()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
 def test_sealed_snapshot_inheritance_preserves_cloexec_and_exact_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

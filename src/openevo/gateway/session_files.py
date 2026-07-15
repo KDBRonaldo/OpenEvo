@@ -10,6 +10,7 @@ import json
 import os
 import secrets
 import stat
+import struct
 import sys
 import threading
 from dataclasses import dataclass
@@ -50,6 +51,31 @@ _F_SEAL_WRITE: Final[int] = 0x0008
 _CREDENTIAL_SNAPSHOT_SEALS: Final[int] = (
     _F_SEAL_SEAL | _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE
 )
+_IN_NONBLOCK: Final[int] = os.O_NONBLOCK
+_IN_CLOEXEC: Final[int] = os.O_CLOEXEC
+_IN_MODIFY: Final[int] = 0x00000002
+_IN_ATTRIB: Final[int] = 0x00000004
+_IN_CLOSE_WRITE: Final[int] = 0x00000008
+_IN_MOVED_FROM: Final[int] = 0x00000040
+_IN_MOVED_TO: Final[int] = 0x00000080
+_IN_CREATE: Final[int] = 0x00000100
+_IN_DELETE: Final[int] = 0x00000200
+_IN_DELETE_SELF: Final[int] = 0x00000400
+_IN_MOVE_SELF: Final[int] = 0x00000800
+_IN_Q_OVERFLOW: Final[int] = 0x00004000
+_IN_IGNORED: Final[int] = 0x00008000
+_IN_ENTRY_MUTATION_MASK: Final[int] = (
+    _IN_MODIFY
+    | _IN_ATTRIB
+    | _IN_CLOSE_WRITE
+    | _IN_MOVED_FROM
+    | _IN_MOVED_TO
+    | _IN_CREATE
+    | _IN_DELETE
+    | _IN_DELETE_SELF
+    | _IN_MOVE_SELF
+)
+_INOTIFY_EVENT_HEADER: Final[struct.Struct] = struct.Struct("iIII")
 CODEX_CREDENTIAL_AUTHORITY_FD_ENV: Final[str] = "OPENEVO_CODEX_CREDENTIAL_AUTHORITY_FD"
 CODEX_CREDENTIAL_SNAPSHOT_FD_ENV: Final[str] = "OPENEVO_CODEX_CREDENTIAL_SNAPSHOT_FD"
 
@@ -66,6 +92,8 @@ class HeldCodexCredentialAuthority:
         "_content_sha256",
         "_descriptor",
         "_identity",
+        "_entry_generation",
+        "_entry_watch",
         "_lock",
         "_path",
         "_pin",
@@ -77,12 +105,16 @@ class HeldCodexCredentialAuthority:
         path: Path,
         descriptor: int,
         pin: _AbsoluteDirectoryPin,
+        entry_watch: _DirectoryEntryMutationWatch,
+        entry_generation: int,
         identity: CredentialFileIdentity,
         content_sha256: str,
     ) -> None:
         self._path = path
         self._descriptor = descriptor
         self._pin = pin
+        self._entry_watch = entry_watch
+        self._entry_generation = entry_generation
         self._identity = identity
         self._content_sha256 = content_sha256
         self._lock = threading.RLock()
@@ -94,8 +126,14 @@ class HeldCodexCredentialAuthority:
         if absolute.name in {"", ".", ".."}:
             raise SessionFileSecurityError("Codex subscription auth path is invalid")
         pin = _pin_absolute_directory(absolute.parent)
+        entry_watch: _DirectoryEntryMutationWatch | None = None
         descriptor = -1
         try:
+            entry_watch = _DirectoryEntryMutationWatch.open(
+                pin.descriptor,
+                absolute.name,
+            )
+            entry_generation = entry_watch.generation()
             pin.verify(label="Codex subscription auth source")
             before = os.stat(absolute.name, dir_fd=pin.descriptor, follow_symlinks=False)
             _require_private_auth(before)
@@ -114,6 +152,8 @@ class HeldCodexCredentialAuthority:
                 path=absolute,
                 descriptor=descriptor,
                 pin=pin,
+                entry_watch=entry_watch,
+                entry_generation=entry_generation,
                 identity=_auth_identity(opened),
                 content_sha256=_digest_fd(descriptor, opened.st_size),
             )
@@ -122,6 +162,8 @@ class HeldCodexCredentialAuthority:
         except Exception:
             if descriptor >= 0:
                 os.close(descriptor)
+            if entry_watch is not None:
+                entry_watch.close()
             pin.close()
             raise
 
@@ -140,6 +182,8 @@ class HeldCodexCredentialAuthority:
                 )
             return None
         descriptor = -1
+        pin: _AbsoluteDirectoryPin | None = None
+        entry_watch: _DirectoryEntryMutationWatch | None = None
         try:
             descriptor = int(raw_descriptor)
             if descriptor < 3 or str(descriptor) != raw_descriptor:
@@ -149,28 +193,35 @@ class HeldCodexCredentialAuthority:
             _require_private_auth(opened)
             absolute = Path(os.path.abspath(os.fspath(path)))
             pin = _pin_absolute_directory(absolute.parent)
-        except (OSError, ValueError, SessionFileSecurityError) as exc:
+            entry_watch = _DirectoryEntryMutationWatch.open(
+                pin.descriptor,
+                absolute.name,
+            )
+            entry_generation = entry_watch.generation()
+            authority = cls(
+                path=absolute,
+                descriptor=descriptor,
+                pin=pin,
+                entry_watch=entry_watch,
+                entry_generation=entry_generation,
+                identity=_auth_identity(opened),
+                content_sha256=_digest_fd(descriptor, opened.st_size),
+            )
+            authority.verify()
+            return authority
+        except Exception as exc:
             if descriptor >= 3:
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
+            if entry_watch is not None:
+                entry_watch.close()
+            if pin is not None:
+                pin.close()
             raise SessionFileSecurityError(
                 "inherited Codex credential authority is invalid"
             ) from exc
-        authority = cls(
-            path=absolute,
-            descriptor=descriptor,
-            pin=pin,
-            identity=_auth_identity(opened),
-            content_sha256=_digest_fd(descriptor, opened.st_size),
-        )
-        try:
-            authority.verify()
-        except Exception:
-            authority.close()
-            raise
-        return authority
 
     @property
     def identity(self) -> CredentialFileIdentity:
@@ -203,6 +254,7 @@ class HeldCodexCredentialAuthority:
             if self._closed:
                 raise SessionFileSecurityError("held Codex credential authority is closed")
             try:
+                self._entry_watch.require_generation(self._entry_generation)
                 self._pin.verify(label="Codex subscription auth source")
                 held = os.fstat(self._descriptor)
                 if _auth_identity(held) != self._identity:
@@ -221,6 +273,7 @@ class HeldCodexCredentialAuthority:
                     )
                 _require_private_auth(current)
                 self._pin.verify(label="Codex subscription auth source")
+                self._entry_watch.require_generation(self._entry_generation)
             except SessionFileSecurityError:
                 raise
             except OSError as exc:
@@ -282,7 +335,10 @@ class HeldCodexCredentialAuthority:
             try:
                 os.close(self._descriptor)
             finally:
-                self._pin.close()
+                try:
+                    self._entry_watch.close()
+                finally:
+                    self._pin.close()
 
 
 class PreparedCodexCredentialSnapshot:
@@ -497,6 +553,110 @@ class _AbsoluteDirectoryPin:
     def close(self) -> None:
         while self.descriptors:
             os.close(self.descriptors.pop())
+
+
+class _DirectoryEntryMutationWatch:
+    """Linux generation authority for one entry in a held directory inode."""
+
+    __slots__ = ("_closed", "_descriptor", "_generation", "_name", "_watch")
+
+    def __init__(self, *, descriptor: int, watch: int, name: bytes) -> None:
+        self._descriptor = descriptor
+        self._watch = watch
+        self._name = name
+        self._generation = 0
+        self._closed = False
+
+    @classmethod
+    def open(cls, directory_fd: int, name: str) -> _DirectoryEntryMutationWatch:
+        if sys.platform != "linux":
+            raise SessionFileSecurityError(
+                "Codex subscription auth mutation authority requires Linux"
+            )
+        libc = ctypes.CDLL(None, use_errno=True)
+        init = libc.inotify_init1
+        init.argtypes = [ctypes.c_int]
+        init.restype = ctypes.c_int
+        add_watch = libc.inotify_add_watch
+        add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add_watch.restype = ctypes.c_int
+        descriptor = init(_IN_NONBLOCK | _IN_CLOEXEC)
+        if descriptor < 0:
+            error = ctypes.get_errno()
+            raise SessionFileSecurityError(
+                "Codex subscription auth mutation authority is unavailable"
+            ) from OSError(error, os.strerror(error))
+        try:
+            watch = add_watch(
+                descriptor,
+                os.fsencode(f"/proc/self/fd/{directory_fd}"),
+                _IN_ENTRY_MUTATION_MASK,
+            )
+            if watch < 0:
+                error = ctypes.get_errno()
+                raise SessionFileSecurityError(
+                    "Codex subscription auth mutation authority is unavailable"
+                ) from OSError(error, os.strerror(error))
+            return cls(descriptor=descriptor, watch=watch, name=os.fsencode(name))
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def generation(self) -> int:
+        if self._closed:
+            raise SessionFileSecurityError(
+                "Codex subscription auth mutation authority is closed"
+            )
+        while True:
+            try:
+                payload = os.read(self._descriptor, 64 * 1024)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                raise SessionFileSecurityError(
+                    "Codex subscription auth mutation authority is unavailable"
+                ) from exc
+            if not payload:
+                raise SessionFileSecurityError(
+                    "Codex subscription auth mutation authority is unavailable"
+                )
+            offset = 0
+            while offset < len(payload):
+                if len(payload) - offset < _INOTIFY_EVENT_HEADER.size:
+                    raise SessionFileSecurityError(
+                        "Codex subscription auth mutation evidence is malformed"
+                    )
+                watch, mask, _cookie, name_size = _INOTIFY_EVENT_HEADER.unpack_from(
+                    payload,
+                    offset,
+                )
+                offset += _INOTIFY_EVENT_HEADER.size
+                end = offset + name_size
+                if end > len(payload):
+                    raise SessionFileSecurityError(
+                        "Codex subscription auth mutation evidence is malformed"
+                    )
+                event_name = payload[offset:end].split(b"\0", 1)[0]
+                offset = end
+                if (
+                    mask & (_IN_Q_OVERFLOW | _IN_IGNORED | _IN_DELETE_SELF | _IN_MOVE_SELF)
+                    or watch != self._watch
+                    or event_name == self._name
+                ):
+                    self._generation += 1
+        return self._generation
+
+    def require_generation(self, expected: int) -> None:
+        if self.generation() != expected:
+            raise SessionFileSecurityError(
+                "Codex subscription auth directory entry changed"
+            )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        os.close(self._descriptor)
 
 
 class CredentialRedactor:

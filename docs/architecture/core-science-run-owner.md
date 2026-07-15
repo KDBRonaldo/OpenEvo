@@ -111,9 +111,11 @@ supervisor exceptions, command output, authentication status, and runtime paths
 are not used as public error text; the provider retains the same static mapping
 if a run-control implementation propagates a supervisor failure directly.
 
-The rollout task payload is first validated by the closed `TaskRequest` model,
-including all defaults, then serialized once by the shared canonicalizer. The
-run owner binds that exact payload to the current service generation, registry
+The rollout task payload is first validated by the closed `TaskRequest` graph,
+including typed agent, MCP, runtime action, shell command, builder, and evaluator
+nodes plus all defaults, then serialized once by the shared canonicalizer. An
+unknown field at any typed node is rejected instead of being omitted from the
+canonical digest. The run owner binds that exact payload to the current service generation, registry
 digest, framework-lock digest, task ID, and run and sends the same payload on the
 wire. The rollout endpoint applies the same canonicalizer before admission, so
 an omitted default cannot produce a different digest from its materialized wire

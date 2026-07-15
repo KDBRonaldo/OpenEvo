@@ -146,17 +146,20 @@ is spawned, `ManagedScienceRuntimeProbe` revalidates the pre-Core bootstrap
 boundary under the same total deadline. The default local probe resolves Codex
 once, opens the regular executable no-follow, hashes and records its exact inode
 and bytes, and invokes both version and login checks through that held FD. The
-version check must return zero and exactly one bounded UTF-8 `codex`/`codex-cli`
-semantic-version line on stdout or stderr. Its complete canonical stdout,
-stderr, and exit evidence plus the executable identity enter the runtime
-identity digest. Empty, malformed, multi-line, or oversized output fails closed.
+version check must return zero and stdout must contain exactly one bounded UTF-8
+`codex`/`codex-cli` strict semantic-version line. Stderr is retained only as
+bounded non-authoritative evidence; stderr-only, empty, malformed, multi-line,
+or oversized version output fails closed. Complete canonical stdout, stderr,
+and exit evidence plus the executable identity enter the runtime identity digest.
 
 The probe opens `~/.codex/auth.json` no-follow before login, requires a
-link-count-one owner-owned `0600` bounded file, and copies only from that held FD
-into a write-sealed anonymous snapshot. It rechecks held inode/content and the
-source pathname authority before and after the copy. That final check is the
-credential point of no return: replacement before or during it rejects
-readiness; replacement afterward is irrelevant to this generation. The probe
+link-count-one owner-owned `0600` bounded file, binds a Linux inotify generation
+to that exact directory entry, and copies only from the held FD into a
+write-sealed anonymous snapshot. It rechecks held inode/content, source pathname,
+and the mutation generation before and after the copy. Directory-entry
+replace/restore ABA during that interval therefore rejects readiness even when
+the original inode is restored. The final check is the credential point of no
+return; replacement afterward is irrelevant to this generation. The probe
 publishes those sealed bytes into a temporary private `CODEX_HOME`, runs the
 exact held Codex executable's `login status` against that home, and removes the
 temporary tree on every normal, error, timeout, or cancellation exit. Login
@@ -296,10 +299,12 @@ It does not receive the credential, raw instruction, runtime, environment, or an
 open request object. Request fields such as `run_ready` or `admission` have no
 authority and are excluded by validation before the canonical digest is built.
 For rollout submission, one shared `TaskRequest` canonicalizer rejects extra
-fields, materializes every default, and serializes with one fixed inclusion
-policy. The run owner registers and sends that exact payload; the rollout
-endpoint canonicalizes the validated model with the same helper before checking
-admission or invoking its manager.
+fields throughout its typed `agent`, MCP, runtime action, shell command, builder,
+and evaluator graph, materializes every default, and serializes with one fixed
+inclusion policy. Explicitly open config/settings/metadata values remain data
+fields, not extensions to the wire model. The run owner registers and sends that
+exact payload; the rollout endpoint canonicalizes the validated model with the
+same helper before checking admission or invoking its manager.
 
 The supervisor now binds each release child to the host-global Core daemon's
 fixed loopback-only private verifier endpoint. Rollout and Gateway forward only
@@ -371,11 +376,12 @@ process-group termination and stale-owner recovery probes. No test downloads a m
 
 Residual integration risks remain explicit:
 
-- the managed image alias is synchronously checked against the full release
-  digest and managed-runtime label before Gateway session side effects, and the
-  immutable authority is checked again by Docker before create. This is not a
-  daemon-level image lease: deletion of the exact local image between those two
-  checks fails INIT rather than changing execution back to the mutable tag;
+- Gateway synchronously checks only the compiler-carried immutable image
+  authority and managed-runtime label before session side effects, and Docker
+  checks that same authority again before create. Normal release-tag deletion or
+  drift is irrelevant after readiness. This is not a daemon-level image lease:
+  deletion of the exact local image between those two checks fails INIT rather
+  than changing execution back to a mutable tag;
 - this slice does not add signed container image provenance; release bootstrap
   remains responsible for preparing the expected image;
 - Linux `/proc` and parent-death behavior are the release-host process identity

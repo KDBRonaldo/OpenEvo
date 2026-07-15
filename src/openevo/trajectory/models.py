@@ -15,12 +15,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class StrategySpec(BaseModel):
     """Identifies a builder or evaluator strategy with optional per-request config."""
 
+    model_config = ConfigDict(extra="forbid")
+
     strategy: str
     config: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvaluatorSpec(BaseModel):
     """Evaluator configuration for a rollout session."""
+
+    model_config = ConfigDict(extra="forbid")
 
     strategy: str
     config: dict[str, Any] = Field(default_factory=dict)

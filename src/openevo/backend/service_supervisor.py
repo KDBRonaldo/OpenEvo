@@ -733,20 +733,14 @@ def _digest_probe_executable(descriptor: int, expected_size: int) -> str:
 def _valid_codex_version(result: ProbeCommandResult) -> bool:
     if result.returncode != 0 or len(result.stdout) + len(result.stderr) > _CODEX_VERSION_MAX_BYTES:
         return False
-    candidates: list[str] = []
     try:
-        for payload in (result.stdout, result.stderr):
-            if not payload:
-                continue
-            decoded = payload.decode("utf-8")
-            line = decoded.removesuffix("\r\n").removesuffix("\n")
-            if decoded not in {line, f"{line}\n", f"{line}\r\n"}:
-                return False
-            if line:
-                candidates.append(line)
+        stdout = result.stdout.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    return len(candidates) == 1 and _CODEX_VERSION_RE.fullmatch(candidates[0]) is not None
+    line = stdout.removesuffix("\r\n").removesuffix("\n")
+    if stdout not in {line, f"{line}\n", f"{line}\r\n"}:
+        return False
+    return bool(line) and _CODEX_VERSION_RE.fullmatch(line) is not None
 
 
 def _command_evidence(result: ProbeCommandResult) -> dict[str, object]:

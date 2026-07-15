@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openevo.runtime.models import ExecInput
 
 
 class MCPServerSpec(BaseModel):
     """MCP server definition passed to harnesses that support tool servers."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     transport: Literal["stdio", "sse", "streamable-http"]
@@ -31,6 +33,8 @@ class MCPServerSpec(BaseModel):
 
 class AgentSpec(BaseModel):
     """Agent execution specification."""
+
+    model_config = ConfigDict(extra="forbid")
 
     harness: str | None = None
     import_path: str | None = None

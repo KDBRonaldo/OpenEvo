@@ -49,22 +49,15 @@ _OwnershipState = Literal[
 
 
 async def verify_managed_runtime_image_admission(spec: RuntimeSpec) -> None:
-    """Synchronously bind a managed request to its release alias and exact image."""
+    """Synchronously verify the exact image authority carried by a managed request."""
 
-    release = require_immutable_managed_runtime_image(
+    require_immutable_managed_runtime_image(
         profile=spec.profile,
         image=spec.image,
     )
     await _inspect_managed_runtime_image(
         profile=spec.profile,
         requested_image=spec.image,
-    )
-    # The alias check is last. Once it maps to the already-verified immutable
-    # authority, later tag changes are irrelevant because the runtime request
-    # contains only the immutable reference.
-    await _inspect_managed_runtime_image(
-        profile=spec.profile,
-        requested_image=release.image,
     )
 
 
