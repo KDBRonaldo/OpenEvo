@@ -32,6 +32,8 @@ from openevo.backend.science_run_store import (
 from openevo.backend.service_supervisor import (
     CoreServiceSupervisor,
     ServiceExecutionMode,
+    ServiceGroupSnapshot,
+    ServiceRunReadinessCode,
     ServiceRunBinding,
 )
 from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
@@ -69,7 +71,7 @@ class _ServiceOwner(Protocol):
         codex_model: str | None = None,
         runtime_image: str | None = None,
         total_timeout: float | None = None,
-    ) -> object: ...
+    ) -> ServiceGroupSnapshot: ...
 
     def run_binding(self) -> ServiceRunBinding: ...
 
@@ -240,6 +242,7 @@ class CoreScienceRunOwner:
         request = cast(m.RunCreateV1, arguments["request"])
         idempotency_key = cast(str, arguments["idempotency_key"])
         project = self._validate_create_request(request)
+        self._ensure_services(project)
         input_context = self._ledger.revision_context(
             request.project_id,
             request.required_revision.revision.id,
@@ -829,20 +832,32 @@ class CoreScienceRunOwner:
 
         return wait_for_job
 
-    def _ensure_services(self, project: m.ProjectV1) -> None:
+    def _ensure_services(self, project: m.ProjectV1) -> ServiceGroupSnapshot:
         image = MANAGED_RUNTIME_IMAGES["managed_science"]
         if project.spec.execution_mode is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
-            self._services.ensure(
+            execution_mode = ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+            snapshot = self._services.ensure(
                 ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
                 codex_model=project.spec.agent_model_ref,
                 runtime_image=image,
             )
         else:
-            self._services.ensure(
+            execution_mode = ServiceExecutionMode.SELF_DEPLOYED
+            snapshot = self._services.ensure(
                 ServiceExecutionMode.SELF_DEPLOYED,
                 model_ref=project.spec.agent_model_ref,
                 runtime_image=image,
             )
+        if snapshot.execution_mode is not execution_mode:
+            raise _owner_error(
+                "run_service_mode_mismatch",
+                "Managed services do not match the saved project execution mode.",
+                503,
+                True,
+            )
+        if not snapshot.run_ready:
+            raise _readiness_error(snapshot.run_readiness_code)
+        return snapshot
 
     def _validate_create_request(self, request: m.RunCreateV1) -> m.ProjectV1:
         try:
@@ -1524,6 +1539,37 @@ def _api_error(code: str, message: str, *, retryable: bool) -> m.ApiErrorV1:
 
 def _owner_error(code: str, message: str, status: int, retryable: bool) -> CoreRunControlError:
     return CoreRunControlError(code, message, http_status=status, retryable=retryable)
+
+
+def _readiness_error(code: ServiceRunReadinessCode) -> CoreRunControlError:
+    messages = {
+        ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE: (
+            "Codex CLI is unavailable on the remote Core host."
+        ),
+        ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE: (
+            "Codex subscription login is unavailable on the remote Core host."
+        ),
+        ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE: (
+            "The managed Science runtime executable is unavailable."
+        ),
+        ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE: (
+            "The managed Science runtime image is unavailable."
+        ),
+        ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID: (
+            "Managed Science runtime evidence is invalid."
+        ),
+        ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE: (
+            "Required Core services are unavailable."
+        ),
+        ServiceRunReadinessCode.RUN_ADMISSION_UNAVAILABLE: (
+            "The generation-bound science run admission owner is unavailable."
+        ),
+        ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE: (
+            "Self-deployed Science execution is unavailable."
+        ),
+    }
+    message = messages.get(code, "Managed Science run readiness is unavailable.")
+    return _owner_error(f"run_{code.value}", message, 503, True)
 
 
 def _admission_denied() -> RunAdmissionError:

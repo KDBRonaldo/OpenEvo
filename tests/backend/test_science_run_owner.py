@@ -17,7 +17,12 @@ from openevo.backend.run_control import CoreRunControlError
 import openevo.backend.science_run_owner as owner_module
 from openevo.backend.science_run_owner import CoreScienceRunOwner
 from openevo.backend.science_run_store import ScienceRunStore
-from openevo.backend.service_supervisor import ServiceRunBinding
+from openevo.backend.service_supervisor import (
+    ServiceExecutionMode,
+    ServiceGroupSnapshot,
+    ServiceRunBinding,
+    ServiceRunReadinessCode,
+)
 from openevo.internal_auth import (
     GenerationBoundRunAdmissionCheck,
     InternalServiceIdentity,
@@ -33,20 +38,39 @@ _PAYLOAD_DIGEST = "d" * 64
 
 
 class _FakeServiceOwner:
-    def __init__(self, binding: ServiceRunBinding) -> None:
+    def __init__(
+        self,
+        binding: ServiceRunBinding,
+        *,
+        readiness_code: ServiceRunReadinessCode = ServiceRunReadinessCode.READY,
+    ) -> None:
         self.binding = binding
+        ready = readiness_code is ServiceRunReadinessCode.READY
+        self.snapshot = ServiceGroupSnapshot(
+            execution_mode=binding.execution_mode,
+            services_available=ready,
+            run_ready=ready,
+            run_readiness_code=readiness_code,
+            generation_digest=binding.generation_digest,
+            services=(),
+            runtime_identity_digest=(binding.runtime_identity_digest if ready else None),
+            status_message=None if ready else "secret probe output must not escape",
+        )
         self.ensure_entered = threading.Event()
         self.ensure_allowed = threading.Event()
         self.ensure_allowed.set()
         self.ensure_calls = 0
 
-    def ensure(self, *args: object, **kwargs: object) -> object:
+    def ensure(self, *args: object, **kwargs: object) -> ServiceGroupSnapshot:
         del args, kwargs
         self.ensure_calls += 1
         self.ensure_entered.set()
-        if not self.ensure_allowed.wait(5):
+        if (
+            threading.current_thread().name == "openevo-science-run-owner"
+            and not self.ensure_allowed.wait(5)
+        ):
             raise TimeoutError("test did not release service preparation")
-        return object()
+        return self.snapshot
 
     def run_binding(self) -> ServiceRunBinding:
         return self.binding
@@ -148,6 +172,9 @@ def _binding(registry: object) -> ServiceRunBinding:
         credential="private-science-owner-test-credential-0123456789",
     )
     return ServiceRunBinding(
+        execution_mode=ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+        runtime_image="openevo/science-runtime:0.1.0",
+        runtime_identity_digest="f" * 64,
         generation_digest=identity.generation_digest,
         registry_digest=identity.registry_digest,
         framework_lock_digest=identity.framework_lock_digest,
@@ -378,6 +405,48 @@ def test_create_is_idempotent_and_rejects_a_valid_mismatched_reuse(
         store.close()
 
 
+@pytest.mark.parametrize(
+    "readiness_code",
+    [
+        ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
+        ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
+        ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
+        ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
+    ],
+)
+def test_create_fails_before_persistence_when_subscription_prerequisite_is_missing(
+    tmp_path: Path,
+    registry: object,
+    readiness_code: ServiceRunReadinessCode,
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(
+        _binding(registry),
+        readiness_code=readiness_code,
+    )
+    runner_calls: list[object] = []
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        lambda config, **_kwargs: runner_calls.append(config) or _completed_result(),
+    )
+    try:
+        with pytest.raises(CoreRunControlError) as error:
+            _invoke_create(owner, _run_request(project), f"missing-{readiness_code.value}")
+
+        assert error.value.code == f"run_{readiness_code.value}"
+        assert "secret probe output" not in str(error.value)
+        assert owner._ledger.list_runs() == []
+        assert runner_calls == []
+        assert services.ensure_calls == 1
+    finally:
+        owner.close()
+        store.close()
+
+
 def test_run_transitions_queued_preparing_running_succeeded_with_ordered_evidence(
     tmp_path: Path, registry: object
 ) -> None:
@@ -397,6 +466,7 @@ def test_run_transitions_queued_preparing_running_succeeded_with_ordered_evidenc
     try:
         queued = _invoke_create(owner, _run_request(project), "lifecycle")
         assert queued.status is m.RunStatus.QUEUED
+        assert services.ensure_calls >= 1
         preparing = _wait_for_status(owner, queued.id, m.RunStatus.PREPARING)
         assert preparing.pinned_revision == project.active_revision
         services.ensure_allowed.set()

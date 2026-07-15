@@ -138,6 +138,18 @@ class ServiceExecutionMode(StrEnum):
     SELF_DEPLOYED = "self-deployed"
 
 
+class ServiceRunReadinessCode(StrEnum):
+    READY = "ready"
+    CODEX_CLI_UNAVAILABLE = "codex_cli_unavailable"
+    CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE = "codex_subscription_auth_unavailable"
+    RUNTIME_EXECUTABLE_UNAVAILABLE = "runtime_executable_unavailable"
+    RUNTIME_IMAGE_UNAVAILABLE = "runtime_image_unavailable"
+    RUNTIME_EVIDENCE_INVALID = "runtime_evidence_invalid"
+    SERVICE_GROUP_UNAVAILABLE = "service_group_unavailable"
+    RUN_ADMISSION_UNAVAILABLE = "run_admission_unavailable"
+    SELF_DEPLOYED_UNAVAILABLE = "self_deployed_unavailable"
+
+
 class ServiceLaunchMode(StrEnum):
     RELEASE = "release"
     DEVELOPMENT_TEST = "development_test"
@@ -290,10 +302,13 @@ class ManagedScienceRuntimeRequest:
 @dataclass(frozen=True, slots=True)
 class ManagedScienceRuntimeReadiness:
     ready: bool
+    code: ServiceRunReadinessCode
     identity_digest: str | None
     message: str
 
     def __post_init__(self) -> None:
+        if self.ready != (self.code is ServiceRunReadinessCode.READY):
+            raise ValueError("managed runtime readiness code does not match ready state")
         if self.ready != (self.identity_digest is not None):
             raise ValueError("ready managed runtime evidence requires an identity digest")
         if self.identity_digest is not None:
@@ -482,8 +497,18 @@ class BoundedProbeCommandRunner:
                 pass
 
 
+def _is_chatgpt_subscription_status(stdout: bytes, stderr: bytes) -> bool:
+    try:
+        statuses = [
+            decoded for payload in (stdout, stderr) if (decoded := payload.decode("utf-8").strip())
+        ]
+    except UnicodeDecodeError:
+        return False
+    return statuses == ["Logged in using ChatGPT"]
+
+
 class LocalManagedScienceRuntimeProbe:
-    """Verify the managed image and Codex auth produced by existing bootstrap."""
+    """Verify the runtime, managed image, and Codex subscription bootstrap."""
 
     def __init__(
         self,
@@ -504,22 +529,49 @@ class LocalManagedScienceRuntimeProbe:
         if codex.returncode != 0:
             return ManagedScienceRuntimeReadiness(
                 ready=False,
+                code=ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
                 identity_digest=None,
                 message="Codex CLI is unavailable at the managed Science bootstrap boundary.",
             )
-        docker = self._command_runner.run(
+        auth = self._command_runner.run(("codex", "login", "status"), deadline, cancellation)
+        if auth.returncode != 0 or not _is_chatgpt_subscription_status(auth.stdout, auth.stderr):
+            return ManagedScienceRuntimeReadiness(
+                ready=False,
+                code=ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
+                identity_digest=None,
+                message="Codex subscription login is unavailable on the remote Core host.",
+            )
+        try:
+            auth_identity = _private_file_metadata_identity(self._codex_auth_path)
+        except (OSError, SupervisorStateError, ValueError):
+            return ManagedScienceRuntimeReadiness(
+                ready=False,
+                code=ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
+                identity_digest=None,
+                message="Codex subscription login evidence is invalid on the remote Core host.",
+            )
+        runtime = self._command_runner.run(("docker", "--version"), deadline, cancellation)
+        if runtime.returncode != 0:
+            return ManagedScienceRuntimeReadiness(
+                ready=False,
+                code=ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
+                identity_digest=None,
+                message="The managed Science runtime executable is unavailable.",
+            )
+        image_result = self._command_runner.run(
             ("docker", "image", "inspect", request.runtime_image),
             deadline,
             cancellation,
         )
-        if docker.returncode != 0:
+        if image_result.returncode != 0:
             return ManagedScienceRuntimeReadiness(
                 ready=False,
+                code=ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
                 identity_digest=None,
                 message="Managed Science runtime image is not prepared.",
             )
         try:
-            image_payload = json.loads(docker.stdout.decode("utf-8"))
+            image_payload = json.loads(image_result.stdout.decode("utf-8"))
             if not isinstance(image_payload, list) or len(image_payload) != 1:
                 raise ValueError("Docker inspect returned an unexpected image set")
             image = image_payload[0]
@@ -535,26 +587,26 @@ class LocalManagedScienceRuntimeProbe:
                 or labels.get("io.openevo.managed-runtime") != "true"
             ):
                 raise ValueError("Docker image lacks managed runtime identity")
-            auth_identity = _private_file_metadata_identity(self._codex_auth_path)
         except (
-            OSError,
             UnicodeDecodeError,
             json.JSONDecodeError,
-            SupervisorStateError,
             ValueError,
-        ) as exc:
+        ):
             return ManagedScienceRuntimeReadiness(
                 ready=False,
+                code=ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
                 identity_digest=None,
-                message=_safe_message("Managed Science bootstrap evidence is invalid", exc),
+                message="Managed Science bootstrap evidence is invalid.",
             )
         return ManagedScienceRuntimeReadiness(
             ready=True,
+            code=ServiceRunReadinessCode.READY,
             identity_digest=_digest_json(
                 {
                     "auth_identity": auth_identity,
                     "codex_model": request.codex_model,
                     "codex_version_output_digest": hashlib.sha256(codex.stdout).hexdigest(),
+                    "runtime_version_output_digest": hashlib.sha256(runtime.stdout).hexdigest(),
                     "runtime_image": request.runtime_image,
                     "runtime_image_id": image_id,
                 }
@@ -654,11 +706,19 @@ class ServiceGroupSnapshot:
     execution_mode: ServiceExecutionMode
     services_available: bool
     run_ready: bool
-    run_readiness_code: str
+    run_readiness_code: ServiceRunReadinessCode
     generation_digest: str
     services: tuple[SupervisorServiceSummary, ...]
     runtime_identity_digest: str | None
     status_message: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.run_ready != (self.run_readiness_code is ServiceRunReadinessCode.READY):
+            raise ValueError("service run readiness code does not match ready state")
+        if self.run_ready and (
+            not self.services_available or self.runtime_identity_digest is None
+        ):
+            raise ValueError("run-ready service group lacks runtime evidence")
 
     def service(self, service_id: str) -> SupervisorServiceSummary:
         for service in self.services:
@@ -671,6 +731,9 @@ class ServiceGroupSnapshot:
 class ServiceRunBinding:
     """Ephemeral trusted connection from the run owner to one service generation."""
 
+    execution_mode: ServiceExecutionMode
+    runtime_image: str
+    runtime_identity_digest: str
     generation_digest: str
     registry_digest: str
     framework_lock_digest: str
@@ -678,6 +741,13 @@ class ServiceRunBinding:
     evolution_backend_url: str
     gateway_url: str
     _identity: InternalServiceIdentity = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.execution_mode, ServiceExecutionMode):
+            raise ValueError("service run binding execution mode is invalid")
+        if self.runtime_image not in set(MANAGED_RUNTIME_IMAGES.values()):
+            raise ValueError("service run binding image is not Core-managed")
+        _require_digest(self.runtime_identity_digest, "runtime_identity_digest")
 
     def request_headers(self) -> dict[str, str]:
         return self._identity.request_headers()
@@ -766,6 +836,7 @@ class _Ledger(_StrictStateModel):
     execution_mode: ServiceExecutionMode | None = None
     generation_digest: str | None = None
     runtime_identity_digest: str | None = None
+    runtime_readiness_code: ServiceRunReadinessCode | None = None
     group_status_message: str | None = Field(default=None, max_length=256)
     services: list[_LedgerService] = Field(default_factory=list, max_length=16)
 
@@ -790,6 +861,11 @@ class _Ledger(_StrictStateModel):
     @classmethod
     def _mode_from_canonical_text(cls, value: object) -> object:
         return ServiceExecutionMode(value) if isinstance(value, str) else value
+
+    @field_validator("runtime_readiness_code", mode="before")
+    @classmethod
+    def _readiness_from_canonical_text(cls, value: object) -> object:
+        return ServiceRunReadinessCode(value) if isinstance(value, str) else value
 
 
 @dataclass(slots=True)
@@ -1700,6 +1776,7 @@ class CoreServiceSupervisor:
                         generation_digest,
                         specs,
                         runtime_identity_digest=None,
+                        runtime_readiness_code=runtime.code,
                         group_status_message=_sanitize(runtime.message),
                     )
                     for record in self._ledger.services:
@@ -1717,6 +1794,7 @@ class CoreServiceSupervisor:
                 generation_digest,
                 specs,
                 runtime_identity_digest=runtime.identity_digest,
+                runtime_readiness_code=runtime.code,
                 group_status_message=None,
             )
             self._root.ensure_directory("evolution")
@@ -1823,7 +1901,14 @@ class CoreServiceSupervisor:
             self._refresh_process_state()
             snapshot = self._group_snapshot()
             credential = self._active_credential
-            if not snapshot.services_available or credential is None:
+            runtime_request = self._active_runtime_request
+            runtime_identity = snapshot.runtime_identity_digest
+            if (
+                not snapshot.run_ready
+                or credential is None
+                or runtime_request is None
+                or runtime_identity is None
+            ):
                 raise SupervisorStateError("managed service group is not ready for a run")
             specs = self._specs
             required = {"evolution-backend", "rollout", "gateway"}
@@ -1840,6 +1925,9 @@ class CoreServiceSupervisor:
                 credential=credential,
             )
             return ServiceRunBinding(
+                execution_mode=snapshot.execution_mode,
+                runtime_image=runtime_request.runtime_image,
+                runtime_identity_digest=runtime_identity,
                 generation_digest=snapshot.generation_digest,
                 registry_digest=self._release_identity.registry_digest,
                 framework_lock_digest=self._framework_lock_digest,
@@ -2202,6 +2290,7 @@ class CoreServiceSupervisor:
         self._ledger.execution_mode = ServiceExecutionMode.SELF_DEPLOYED
         self._ledger.generation_digest = identity
         self._ledger.runtime_identity_digest = None
+        self._ledger.runtime_readiness_code = ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE
         self._ledger.group_status_message = (
             "Self-deployed model preparation is unavailable in this release slice."
         )
@@ -2282,12 +2371,14 @@ class CoreServiceSupervisor:
         specs: Sequence[ServiceProcessSpec],
         *,
         runtime_identity_digest: str | None,
+        runtime_readiness_code: ServiceRunReadinessCode,
         group_status_message: str | None,
     ) -> None:
         now = _timestamp()
         self._ledger.execution_mode = execution_mode
         self._ledger.generation_digest = generation_digest
         self._ledger.runtime_identity_digest = runtime_identity_digest
+        self._ledger.runtime_readiness_code = runtime_readiness_code
         self._ledger.group_status_message = group_status_message
         self._ledger.services = [
             _LedgerService(
@@ -2559,17 +2650,37 @@ class CoreServiceSupervisor:
         services_available = bool(services) and all(
             service.status is ServiceStatus.RUNNING for service in services
         )
-        message = (
-            None
-            if services_available
-            else self._ledger.group_status_message
-            or "One or more required Core services are not ready."
-        )
+        runtime_code = self._ledger.runtime_readiness_code
+        if (
+            services_available
+            and self._ledger.runtime_identity_digest is not None
+            and runtime_code is ServiceRunReadinessCode.READY
+            and self._run_admission_url is not None
+        ):
+            run_ready = True
+            readiness_code = ServiceRunReadinessCode.READY
+            message = None
+        elif runtime_code not in {None, ServiceRunReadinessCode.READY}:
+            run_ready = False
+            readiness_code = runtime_code
+            message = self._ledger.group_status_message or (
+                "Managed Science runtime prerequisites are unavailable."
+            )
+        elif services_available and self._run_admission_url is None:
+            run_ready = False
+            readiness_code = ServiceRunReadinessCode.RUN_ADMISSION_UNAVAILABLE
+            message = "The generation-bound science run admission owner is unavailable."
+        else:
+            run_ready = False
+            readiness_code = ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE
+            message = self._ledger.group_status_message or (
+                "One or more required Core services are not ready."
+            )
         return ServiceGroupSnapshot(
             execution_mode=execution_mode,
             services_available=services_available,
-            run_ready=False,
-            run_readiness_code="admission_pinned_run_owner_unavailable",
+            run_ready=run_ready,
+            run_readiness_code=readiness_code,
             generation_digest=generation,
             services=services,
             runtime_identity_digest=self._ledger.runtime_identity_digest,
@@ -2646,7 +2757,10 @@ class CoreServiceSupervisor:
         if ledger.release != expected_release:
             raise SupervisorStateError("service ledger release identity does not match Core")
         if ledger.execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
-            if ledger.runtime_identity_digest is not None:
+            if ledger.runtime_identity_digest is not None or ledger.runtime_readiness_code not in {
+                None,
+                ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE,
+            }:
                 raise SupervisorStateError("self-deployed unavailable state has runtime evidence")
         elif ledger.execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
             has_running_state = any(
@@ -2660,7 +2774,19 @@ class CoreServiceSupervisor:
             )
             if has_running_state and ledger.runtime_identity_digest is None:
                 raise SupervisorStateError("subscription service state lacks runtime evidence")
-        elif ledger.runtime_identity_digest is not None:
+            if (
+                ledger.runtime_identity_digest is not None
+                and ledger.runtime_readiness_code not in {None, ServiceRunReadinessCode.READY}
+            ) or (
+                ledger.runtime_identity_digest is None
+                and ledger.runtime_readiness_code is ServiceRunReadinessCode.READY
+            ):
+                raise SupervisorStateError(
+                    "subscription runtime readiness evidence is inconsistent"
+                )
+        elif (
+            ledger.runtime_identity_digest is not None or ledger.runtime_readiness_code is not None
+        ):
             raise SupervisorStateError("unbound service ledger has runtime evidence")
         service_ids = [record.service_id for record in ledger.services]
         if len(service_ids) != len(set(service_ids)):
@@ -3357,6 +3483,7 @@ __all__ = [
     "ServiceExecutionMode",
     "ServiceLaunchMode",
     "ServiceGroupSnapshot",
+    "ServiceRunReadinessCode",
     "ServiceRunBinding",
     "ServiceHealthProbe",
     "ServiceProcessSpec",

@@ -6,13 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openevo.backend.contracts.v1 import models as m
-from openevo.backend.service_supervisor import ServiceRunBinding
+from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.evolution.framework import EvolutionExecutionProfile
 from openevo.experiments.models import ExperimentConfig
-from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import MANAGED_HOME, MANAGED_PATH, MANAGED_RUNTIME_IMAGES
 
 
 _RUNTIME_WORKDIR = "/openevo/session/workspace"
+_MANAGED_PROXY_CODEX_HOME = f"{MANAGED_HOME}/.codex"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,16 @@ def compile_science_execution(
         project.spec.execution_mode
         is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
     )
+    expected_service_mode = (
+        ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+        if subscription
+        else ServiceExecutionMode.SELF_DEPLOYED
+    )
+    if binding.execution_mode is not expected_service_mode:
+        raise ValueError("project and verified service execution modes differ")
+    expected_image = MANAGED_RUNTIME_IMAGES["managed_science"]
+    if binding.runtime_image != expected_image:
+        raise ValueError("verified service runtime image differs from the Science runtime")
     capture_mode = project.spec.capture_mode
     if subscription and capture_mode is not m.CaptureMode.TRANSCRIPT:
         raise ValueError("subscription science execution requires transcript capture")
@@ -54,8 +65,9 @@ def compile_science_execution(
             "auth_mode": "subscription" if subscription else "proxy",
             "capture_mode": capture_mode.value,
         },
+        "env": {} if subscription else {"CODEX_HOME": _MANAGED_PROXY_CODEX_HOME},
     }
-    runtime_env = {}
+    runtime_env = {"HOME": MANAGED_HOME, "PATH": MANAGED_PATH}
     if not subscription:
         runtime_env["OPENEVO_MANAGED_HF_MODEL"] = project.spec.agent_model_ref
     config = ExperimentConfig.model_validate(
@@ -81,10 +93,21 @@ def compile_science_execution(
                 }
             ],
             "runtime": {
+                "profile": "managed_science",
                 "kind": "docker",
-                "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+                "image": binding.runtime_image,
+                "container_user": "host",
                 "workdir": _RUNTIME_WORKDIR,
                 "env": runtime_env,
+                "prepare": [
+                    {
+                        "type": "exec",
+                        "command": (
+                            f"mkdir -p {MANAGED_HOME}/.codex {_RUNTIME_WORKDIR} && "
+                            f"chmod 700 {MANAGED_HOME} {MANAGED_HOME}/.codex"
+                        ),
+                    }
+                ],
             },
             "rollout": {"url": binding.rollout_url},
             "evolution": {

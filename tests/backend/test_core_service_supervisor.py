@@ -30,6 +30,7 @@ from openevo.backend.service_supervisor import (
     ServiceLaunchMode,
     ServiceProcessSpec,
     ServiceReleaseIdentity,
+    ServiceRunReadinessCode,
     ServiceStatus,
     SupervisorBusyError,
     SupervisorStateError,
@@ -187,6 +188,11 @@ class FakeManagedScienceRuntimeProbe:
         self.requests.append(request)
         return ManagedScienceRuntimeReadiness(
             ready=self.ready,
+            code=(
+                ServiceRunReadinessCode.READY
+                if self.ready
+                else ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE
+            ),
             identity_digest="f" * 64 if self.ready else None,
             message=(
                 "Managed Science runtime bootstrap is verified."
@@ -207,6 +213,7 @@ class BlockingManagedScienceRuntimeProbe(FakeManagedScienceRuntimeProbe):
             if cancellation is not None and cancellation.wait(0.005):
                 return ManagedScienceRuntimeReadiness(
                     ready=False,
+                    code=ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE,
                     identity_digest=None,
                     message="Managed Science runtime probe was cancelled.",
                 )
@@ -214,16 +221,28 @@ class BlockingManagedScienceRuntimeProbe(FakeManagedScienceRuntimeProbe):
 
 
 class FakeProbeCommandRunner:
-    def __init__(self, image_id: str = "1" * 64) -> None:
+    def __init__(
+        self,
+        image_id: str = "1" * 64,
+        *,
+        results: dict[tuple[str, ...], ProbeCommandResult] | None = None,
+    ) -> None:
         self.image_id = image_id
+        self.results = results or {}
         self.calls: list[tuple[str, ...]] = []
 
     def run(self, argv, deadline, cancellation=None) -> ProbeCommandResult:
         assert time.monotonic() < deadline
         assert cancellation is None or not cancellation.is_set()
         self.calls.append(argv)
+        if argv in self.results:
+            return self.results[argv]
         if argv == ("codex", "--version"):
             return ProbeCommandResult(0, b"codex-cli 1.2.3\n", b"")
+        if argv == ("codex", "login", "status"):
+            return ProbeCommandResult(0, b"", b"Logged in using ChatGPT\n")
+        if argv == ("docker", "--version"):
+            return ProbeCommandResult(0, b"Docker version 27.0.1\n", b"")
         payload = [
             {
                 "Id": f"sha256:{self.image_id}",
@@ -254,6 +273,9 @@ def _supervisor(
     max_log_bytes: int = 32_768,
     runtime_probe: FakeManagedScienceRuntimeProbe | None = None,
     max_restart_operations: int = 256,
+    run_admission_url: str | None = (
+        "http://127.0.0.1:19000/internal/v1/run-admissions/verify"
+    ),
 ) -> tuple[
     CoreServiceSupervisor,
     FakeProcessBackend,
@@ -275,9 +297,7 @@ def _supervisor(
         health_checker=health,
         port_probe=ports or FakePortProbe(),
         managed_runtime_probe=runtime_probe,
-        run_admission_url=(
-            "http://127.0.0.1:19000/internal/v1/run-admissions/verify"
-        ),
+        run_admission_url=run_admission_url,
         startup_timeout=startup_timeout,
         stop_timeout=stop_timeout,
         max_log_entries=max_log_entries,
@@ -307,8 +327,8 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
     try:
         snapshot = _ensure_subscription(supervisor)
         assert snapshot.services_available is True
-        assert snapshot.run_ready is False
-        assert snapshot.run_readiness_code == "admission_pinned_run_owner_unavailable"
+        assert snapshot.run_ready is True
+        assert snapshot.run_readiness_code is ServiceRunReadinessCode.READY
         assert [service.id for service in snapshot.services] == [
             "evolution-backend",
             "rollout",
@@ -348,6 +368,9 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
             for spec in backend.spawned
         )
         binding = supervisor.run_binding()
+        assert binding.execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+        assert binding.runtime_image == "openevo/science-runtime:0.1.0"
+        assert binding.runtime_identity_digest == snapshot.runtime_identity_digest
         assert binding.generation_digest == snapshot.generation_digest
         assert binding.registry_digest == REGISTRY_DIGEST
         assert binding.rollout_url.startswith("http://127.0.0.1:")
@@ -374,6 +397,27 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         supervisor.close()
 
 
+def test_live_service_group_without_run_admission_owner_is_not_run_ready(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, _, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        run_admission_url=None,
+    )
+    try:
+        snapshot = _ensure_subscription(supervisor)
+
+        assert snapshot.services_available is True
+        assert snapshot.run_ready is False
+        assert snapshot.run_readiness_code is ServiceRunReadinessCode.RUN_ADMISSION_UNAVAILABLE
+        with pytest.raises(SupervisorStateError, match="not ready for a run"):
+            supervisor.run_binding()
+    finally:
+        supervisor.close()
+
+
 def test_spawn_success_without_health_is_rolled_back(
     tmp_path: Path,
     framework_lock: Path,
@@ -384,6 +428,8 @@ def test_spawn_success_without_health_is_rolled_back(
     try:
         snapshot = _ensure_subscription(supervisor)
         assert snapshot.services_available is False
+        assert snapshot.run_ready is False
+        assert snapshot.run_readiness_code is ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE
         assert snapshot.service("gateway").status is ServiceStatus.FAILED
         assert backend.terminated == ["gateway", "rollout", "evolution-backend"]
         assert snapshot.service("evolution-worker").status is ServiceStatus.STOPPED
@@ -1536,6 +1582,8 @@ def test_subscription_runtime_bootstrap_failure_is_unavailable_without_spawn(
     try:
         snapshot = _ensure_subscription(supervisor)
         assert snapshot.services_available is False
+        assert snapshot.run_ready is False
+        assert snapshot.run_readiness_code is ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE
         assert backend.spawned == []
         assert all(service.status is ServiceStatus.UNAVAILABLE for service in snapshot.services)
         assert snapshot.runtime_identity_digest is None
@@ -1565,12 +1613,76 @@ def test_local_managed_runtime_probe_binds_image_codex_and_private_auth(
     readiness = probe.verify(request, time.monotonic() + 1)
 
     assert readiness.ready is True
+    assert readiness.code is ServiceRunReadinessCode.READY
     assert readiness.identity_digest is not None
     assert command_runner.calls == [
         ("codex", "--version"),
+        ("codex", "login", "status"),
+        ("docker", "--version"),
         ("docker", "image", "inspect", "openevo/science-runtime:0.1.0"),
     ]
     assert "not-read-by-probe" not in readiness.message
+
+
+@pytest.mark.parametrize(
+    ("failed_command", "result", "expected_code"),
+    [
+        (
+            ("codex", "--version"),
+            ProbeCommandResult(127, b"", b"codex: not found"),
+            ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
+        ),
+        (
+            ("codex", "login", "status"),
+            ProbeCommandResult(1, b"", b"refresh-token=do-not-report"),
+            ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
+        ),
+        (
+            ("codex", "login", "status"),
+            ProbeCommandResult(0, b"Logged in using an API key\n", b""),
+            ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
+        ),
+        (
+            ("docker", "--version"),
+            ProbeCommandResult(127, b"", b"docker: not found"),
+            ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
+        ),
+        (
+            ("docker", "image", "inspect", "openevo/science-runtime:0.1.0"),
+            ProbeCommandResult(1, b"", b"No such image"),
+            ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
+        ),
+    ],
+)
+def test_local_managed_runtime_probe_reports_typed_prerequisite_failures_without_output(
+    tmp_path: Path,
+    failed_command: tuple[str, ...],
+    result: ProbeCommandResult,
+    expected_code: ServiceRunReadinessCode,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":"private-auth-material"}', encoding="utf-8")
+    auth.chmod(0o600)
+    runner = FakeProbeCommandRunner(results={failed_command: result})
+    probe = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+    )
+
+    readiness = probe.verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is expected_code
+    assert readiness.identity_digest is None
+    assert "refresh-token" not in readiness.message
+    assert "do-not-report" not in readiness.message
+    assert "private-auth-material" not in readiness.message
 
 
 def test_local_managed_runtime_probe_rejects_symlinked_auth(
@@ -1595,8 +1707,31 @@ def test_local_managed_runtime_probe_rejects_symlinked_auth(
     )
 
     assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE
     assert readiness.identity_digest is None
-    assert "symlink" in readiness.message
+    assert readiness.message == (
+        "Codex subscription login evidence is invalid on the remote Core host."
+    )
+
+
+def test_local_managed_runtime_probe_rejects_missing_auth_evidence(tmp_path: Path) -> None:
+    runner = FakeProbeCommandRunner()
+    probe = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=tmp_path / "missing-auth.json",
+    )
+
+    readiness = probe.verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE
+    assert runner.calls == [("codex", "--version"), ("codex", "login", "status")]
 
 
 def test_real_probe_command_is_cancelled_and_reaped_within_bound() -> None:

@@ -24,8 +24,16 @@ Desktop-specific method table or run API.
 
 ## Lifecycle
 
-Core persists a run before acknowledging HTTP 202. The normal state sequence
-is:
+Before it persists a new run or acknowledges HTTP 202, Core asks the service
+supervisor to prepare and verify the saved project's execution mode. This is
+automatic; a prepared remote needs no separate Desktop service action. Missing
+Codex CLI, ChatGPT subscription login, runtime executable, or managed image
+returns a typed 503 and leaves no durable run. Fixed public messages are selected
+from the closed readiness code, so command output and authentication material
+cannot enter the response.
+
+After that admission preparation, Core persists the run before acknowledging
+HTTP 202. The normal state sequence is:
 
 ```text
 queued -> preparing -> running -> succeeded
@@ -49,7 +57,8 @@ and ordering remain Core-owned rather than Desktop-owned.
 ## Execution
 
 Before execution, Core revalidates the exact saved project and active revision,
-then asks `CoreServiceSupervisor` for the matching release mode:
+then asks `CoreServiceSupervisor` for the matching release mode again. This
+second probe closes the gap between HTTP admission and worker dispatch:
 
 - `codex_subscription_transcript` uses the remote machine's logged-in Codex
   subscription and explicit transcript capture;
@@ -62,6 +71,14 @@ initial context from the pinned revision, and a managed worker callback. This
 is orchestration only: evolution method descriptors, method invocation, output
 selection, and promotion semantics remain owned by the existing evolution
 framework and algorithms.
+
+`ProjectStatus.READY` remains the immutable project preparation contract: its
+config, workspace snapshot, registry, model reference, and active revision are
+complete. It is not evidence that the current host can run Codex. Host run
+readiness is the supervisor snapshot described above, and both run creation and
+execution require it. The compiler also requires a service binding whose
+execution mode and managed image match the project; it does not reconstruct
+runtime readiness from project fields.
 
 The rollout task payload is hashed before submission and bound to the current
 service generation, registry digest, framework-lock digest, task ID, and run.

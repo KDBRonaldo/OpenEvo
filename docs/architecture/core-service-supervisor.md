@@ -144,15 +144,25 @@ Each subscription ensure request also carries the bounded Codex model and one of
 the existing Core-owned managed Science runtime image tags. Before any service
 is spawned, `ManagedScienceRuntimeProbe` revalidates the pre-Core bootstrap
 boundary under the same total deadline. The default local probe uses controlled
-argv, never a shell, to check `codex --version` and `docker image inspect`; the
-image must have a SHA-256 image ID and the
+argv, never a shell, to check `codex --version`, `codex login status`,
+`docker --version`, and `docker image inspect`. Login status must report a
+ChatGPT subscription login; an absent login, failed status command, malformed
+output, or API-key login fails closed. The image must have a SHA-256 image ID and the
 `io.openevo.managed-runtime=true` label produced by the managed Science
 Dockerfile. It opens `~/.codex/auth.json` no-follow, requires a link-count-one
 owner-owned `0600` file, and hashes only file metadata. It never reads or
-persists auth content. Probe stdout and stderr are drained concurrently without
+persists auth content or the login-status output. Probe stdout and stderr are drained concurrently without
 `communicate()`. One hard aggregate byte budget covers both streams; crossing it
 immediately kills the complete probe process group and performs a bounded leader
 reap. Cancellation and deadline paths use the same group-wide bounded cleanup.
+
+The probe returns a closed `ServiceRunReadinessCode`: `ready`,
+`codex_cli_unavailable`, `codex_subscription_auth_unavailable`,
+`runtime_executable_unavailable`, `runtime_image_unavailable`, or
+`runtime_evidence_invalid`. Probe output is never used as a readiness message.
+The code and non-secret runtime identity are retained in the private service
+ledger so a missing executable cannot be reported as a missing image and a
+failed auth check cannot be presented as a ready generation.
 
 The resulting non-secret runtime evidence digest, exact managed image tag, and
 Codex model are bound into the service generation. The Codex model is also the
@@ -171,7 +181,7 @@ cover the managed image/Codex/private-auth evidence contract. This is a
 revalidation boundary for the existing bootstrap result, not a second image
 builder or a return to Desktop-owned post-attach service commands.
 
-The Codex subscription is consumed only by the harness during a future
+The Codex subscription is consumed only by the harness during an
 admission-owned transcript-mode session. The supervisor does not start a Codex
 API client, expose a direct model API, or claim token-level capture. Gateway
 health explicitly reports `capture_mode=transcript`,
@@ -224,17 +234,18 @@ beside an unkillable child.
 ## Service Availability Versus Run Readiness
 
 `ServiceGroupSnapshot.services_available` means only that the authenticated
-internal service graph above is live. `run_ready` is always false in this slice,
-with `run_readiness_code=admission_pinned_run_owner_unavailable`. No service
-generation, promoted artifact, legacy context result, or successful health
-probe can turn that into a runnable task.
+internal service graph above is live. `run_ready` additionally requires typed
+runtime readiness evidence and the private generation-bound run-admission
+endpoint installed by the release launcher. Otherwise `run_readiness_code`
+names the closed prerequisite or service/admission failure. `run_binding()`
+requires that stronger state and carries the exact execution mode, managed image,
+and runtime evidence digest to the science execution compiler.
 
-A later run owner must provide and revalidate the exact admission pin, immutable
-revision, execution snapshot, materialized context, and artifact set before
-dispatch. Evolution outputs apply only to a later session after the revision
-contract commits. Provider injection, tunnel-only transport, durable operation
-records, and the run-owner admission path remain explicit downstream
-dependencies; this branch does not fabricate run success while they are absent.
+The run owner still revalidates the exact project snapshots, immutable revision,
+registry, and generation before dispatch. Evolution outputs apply only to a
+later session after the revision contract commits. A promoted artifact, legacy
+context result, or caller-provided readiness field cannot make a generation
+runnable.
 
 Internal bearer authentication is not run admission. In a release-owned service
 generation, `POST /rollout/task/submit` and both forms of gateway `POST /sessions`

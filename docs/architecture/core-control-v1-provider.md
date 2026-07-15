@@ -424,4 +424,8 @@ The run owner's science execution projection preserves the exact project
 profile. Subscription execution accepts only transcript capture. Self-deployed
 token-level execution uses proxy auth and a token-level profile, while a
 self-deployed transcript project remains transcript; neither mode is silently
-rewritten.
+rewritten. Both execution modes project the Core-owned `managed_science`
+profile, exact managed image, host-user container binding, managed `HOME`/`PATH`,
+and private runtime-directory preparation into `ExperimentConfig`; proxy mode
+also binds the managed Codex home. This keeps the project-to-run bridge inside
+the same validated runtime contract as the standalone science compiler.
