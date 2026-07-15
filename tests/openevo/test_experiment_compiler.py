@@ -24,7 +24,7 @@ from openevo.evolution.framework.builtins import (
     _target_descriptors,
     build_builtin_registry,
 )
-from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 
 ExperimentConfig = experiments.ExperimentConfig
 _compile_experiment = experiments.compile_experiment
@@ -191,7 +191,9 @@ def _config(**overrides: object) -> ExperimentConfig:
         payload["runtime"].update(
             {
                 "profile": "managed_science",
-                "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+                "image": MANAGED_RUNTIME_RELEASES[
+                    "managed_science"
+                ].immutable_reference,
                 "container_user": "host",
             }
         )
