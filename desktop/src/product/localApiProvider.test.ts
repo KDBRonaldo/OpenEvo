@@ -270,6 +270,20 @@ describe("LocalApiDesktopProductProvider", () => {
       { idempotencyKey: "renderer-action-start-0001", ifMatch: ETAG_B },
     );
 
+    const afterStart = await provider.refresh();
+    if (afterStart.status !== "fresh") throw new Error("expected a fresh fixture after starting a run");
+    const retried = await provider.retryRun("run-fixture-1", {
+      actionId: "renderer-action-retry-0001",
+      streamEpoch: afterStart.snapshot.stream.epoch,
+      etag: ETAG_A,
+    });
+    expect(retried.id).toBe("run-fixture-1");
+    expect(client.retryRun).toHaveBeenCalledWith(
+      "run-fixture-1",
+      { idempotencyKey: "renderer-action-retry-0001", ifMatch: ETAG_A },
+    );
+    expect(client.createRun).toHaveBeenCalledTimes(1);
+
     const unknown = mockClient();
     unknown.createRun = vi.fn().mockRejectedValue(new TypeError("unknown network outcome"));
     const unknownProvider = createProvider(unknown);

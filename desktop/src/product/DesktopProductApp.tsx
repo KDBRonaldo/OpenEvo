@@ -88,6 +88,11 @@ type PendingProjectActivation = {
   readonly projectId: string;
   readonly activationActionId: string;
 };
+type PendingRunRetry = {
+  readonly runId: string;
+  readonly runEtag: string;
+  readonly actionId: string;
+};
 type SaveAttemptResult = {
   readonly saved: boolean;
   readonly replaceActionId: boolean;
@@ -148,6 +153,7 @@ export function DesktopProductApp({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
   const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
+  const pendingRunRetry = useRef<PendingRunRetry | null>(null);
   const recoveredProjectSetup = useRef<string | null>(null);
   const [cancellingOperation, setCancellingOperation] = useState(false);
   const refreshCoordinator = useRef<SnapshotRefreshCoordinator | null>(null);
@@ -346,6 +352,33 @@ export function DesktopProductApp({
     }
   };
 
+  const retryFailedRun = (run: RunV1): void => {
+    if (actionState === "working") return;
+    const retryRun = provider.retryRun;
+    if (!retryRun) {
+      void act(() => Promise.reject(new DesktopProductProviderUnavailableError()));
+      return;
+    }
+    const existing = pendingRunRetry.current;
+    const pending = existing?.runId === run.id && existing.runEtag === run.etag
+      ? existing
+      : { runId: run.id, runEtag: run.etag, actionId: newActionId() };
+    pendingRunRetry.current = pending;
+    void act(
+      () => retryRun.call(provider, run.id, resourceIntent(snapshot, run.etag, pending.actionId)),
+      null,
+      true,
+    ).then((result) => {
+      if (pendingRunRetry.current !== pending) return;
+      const refreshedRun = result.refreshedSnapshot?.runs.find((item) => item.id === run.id);
+      if (result.saved
+        || (result.refreshedSnapshot?.stream.status === "fresh" && !refreshedRun)
+        || (refreshedRun && (refreshedRun.etag !== run.etag || refreshedRun.status !== "failed"))) {
+        pendingRunRetry.current = null;
+      }
+    });
+  };
+
   return (
     <div className="product-shell">
       <aside className="product-sidebar" aria-label="Primary navigation">
@@ -446,6 +479,7 @@ export function DesktopProductApp({
               startReason={startReason}
               busy={actionState === "working"}
               onStart={() => project && void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), { kind: "readmit_run", projectId: project.project_id })}
+              onRetry={retryFailedRun}
               onCancel={() => activeRun && void act(() => provider.cancelRun(activeRun.id, resourceIntent(snapshot, activeRun.etag)))}
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
               onOpenConnection={() => setConnectionSettingsOpen(true)}
@@ -1028,6 +1062,7 @@ function ResearchWorkspace({
   startReason,
   busy,
   onStart,
+  onRetry,
   onCancel,
   onOpenSettings,
   onOpenConnection,
@@ -1049,6 +1084,7 @@ function ResearchWorkspace({
   startReason: string | null;
   busy: boolean;
   onStart: () => void;
+  onRetry: (run: RunV1) => void;
   onCancel: () => void;
   onOpenSettings: () => void;
   onOpenConnection: () => void;
@@ -1065,9 +1101,10 @@ function ResearchWorkspace({
   const outputRun = activeRun ?? latestTerminal ?? null;
   const recover = (run: RunV1) => {
     const action = run.current_error?.repair_action;
-    if (action === "openevo_can_install" || action === "openevo_can_reconfigure" || action === "unsupported") return { label: "Open System", onClick: onOpenSystem };
-    if (action === "user_action_required") return { label: "Edit project", onClick: onOpenSettings };
-    return { label: "Retry session", onClick: onStart };
+    const disabled = busy || activeRun !== null;
+    if (action === "openevo_can_install" || action === "openevo_can_reconfigure" || action === "unsupported") return { label: "Open System", onClick: onOpenSystem, disabled };
+    if (action === "user_action_required") return { label: "Edit project", onClick: onOpenSettings, disabled };
+    return { label: "Retry session", onClick: () => onRetry(run), disabled };
   };
   return (
     <div className="workspace-stack" data-testid="research-workspace">
@@ -1304,7 +1341,7 @@ function SessionTable({
   activeRun: RunV1 | null;
   modelService: ServiceV1 | null;
   onRefresh: () => void;
-  onRecover: (run: RunV1) => { label: string; onClick: () => void };
+  onRecover: (run: RunV1) => { label: string; onClick: () => void; disabled: boolean };
 }) {
   return (
     <div className="session-table" role="table" aria-label="Session history">
@@ -1318,7 +1355,7 @@ function SessionTable({
           <span role="cell" className="session-detail">
             <RunStatusText run={run} modelService={modelService} />
             {run.status === "queued" ? <button type="button" className="text-button" onClick={onRefresh}><RefreshCw size={13} /> Refresh status</button> : null}
-            {run.status === "failed" ? <button type="button" className="text-button" onClick={recovery.onClick} disabled={activeRun !== null}>{recovery.label === "Retry session" ? <RotateCcw size={13} /> : <Wrench size={13} />} {recovery.label}</button> : null}
+            {run.status === "failed" ? <button type="button" className="text-button" onClick={recovery.onClick} disabled={recovery.disabled}>{recovery.label === "Retry session" ? <RotateCcw size={13} /> : <Wrench size={13} />} {recovery.label}</button> : null}
           </span>
           <span role="cell">{run.pinned_revision ? `Revision ${run.pinned_revision.generation}` : "Pending"}</span>
           <span role="cell">{run.revision_transition ? `Revision ${run.revision_transition.successor_revision.generation}` : "Unknown"}</span>
@@ -1362,14 +1399,14 @@ function queuedReasonLabel(code: NonNullable<RunV1["queued_reason"]>["code"], mo
   return modelService?.status === "starting" ? "Model preparation" : "Service preparation";
 }
 
-function RunOutcomeSummary({ run, onOpenEvolution, recovery }: { run: RunV1; onOpenEvolution: () => void; recovery: { label: string; onClick: () => void } }) {
+function RunOutcomeSummary({ run, onOpenEvolution, recovery }: { run: RunV1; onOpenEvolution: () => void; recovery: { label: string; onClick: () => void; disabled?: boolean } }) {
   const succeeded = run.status === "succeeded";
   return (
     <div className={`completed-summary ${run.status}`}>
       {succeeded ? <CheckCircle2 size={25} /> : run.status === "failed" ? <XCircle size={25} /> : <Square size={22} />}
       <div><strong>{succeeded ? "Latest session complete" : run.status === "failed" ? "Latest session failed" : "Latest session cancelled"}</strong><RunStatusText run={run} modelService={null} /></div>
       {succeeded && run.revision_transition?.state === "active" ? <button className="text-button" type="button" onClick={onOpenEvolution}>View changes <ArrowRight size={14} /></button> : null}
-      {run.status === "failed" ? <button className="text-button" type="button" onClick={recovery.onClick}>{recovery.label === "Retry session" ? <RotateCcw size={14} /> : <Wrench size={14} />} {recovery.label}</button> : null}
+      {run.status === "failed" ? <button className="text-button" type="button" onClick={recovery.onClick} disabled={recovery.disabled}>{recovery.label === "Retry session" ? <RotateCcw size={14} /> : <Wrench size={14} />} {recovery.label}</button> : null}
     </div>
   );
 }

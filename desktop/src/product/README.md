@@ -5,6 +5,11 @@ renderer-observed stream epoch, resource ETag, and a stable action identity.
 `startRun` intentionally carries only project identity and intent metadata; the
 Local API owner must perform project snapshot, capability, validation, and
 revision handshakes.
+`retryRun` is a separate release mutation for an existing failed run. It carries
+that run's identity and ETag and must use
+`POST /desktop/v1/runs/{run_id}/retry`; retry never falls back to `startRun` or
+creates a replacement run. Non-release fixtures may omit the mutation, but
+release provider construction fails closed unless the adapter implements it.
 
 Release startup has one entry point: `createReleaseDesktopProductProvider`.
 It accepts a provider only after the Tauri bootstrap and `DesktopApiClientV1`
@@ -77,6 +82,13 @@ non-monotonic log identities. Renderer request state is tagged with separate
 opaque run ID and nullable current-attempt ID fields, without delimiter or
 sentinel encoding. A transition renders an empty loading state until its own
 request resolves, and superseded requests cannot publish into the new identity.
+Failed-session recovery calls `retryRun` with the failed run's current ETag and
+a stable action ID. While that request is pending, Start and every recovery
+control are disabled. The returned object is contract-validated by the provider,
+but the renderer waits for the authoritative refresh before changing run or
+attempt state. A rejected or unknown request remains visibly failed, presents
+the typed error, and retains the action ID for an exact retry while the same run
+and ETag remain authoritative.
 The Research view renders at most the latest 200
 matching records and separates agent, evolution, and system streams; SSE
 snapshot epochs trigger an authoritative output refresh while a session runs.

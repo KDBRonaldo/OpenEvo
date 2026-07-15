@@ -3,10 +3,14 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ProjectSourceV1 } from "../api/v1/schemas";
+import type { ProjectSourceV1, RunV1 } from "../api/v1/schemas";
 import { DesktopProductApp } from "./DesktopProductApp";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./fixtureProvider";
-import type { DesktopProductSnapshot } from "./provider";
+import {
+  DesktopProductUserError,
+  type DesktopProductSnapshot,
+  type ProductResourceMutationIntent,
+} from "./provider";
 import { sameSessionOutputIdentity } from "./sessionOutputIdentity";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -944,6 +948,10 @@ describe("DesktopProductApp", () => {
   it("renders typed queued, succeeded, failed, and cancelled run outcomes with recovery", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
+    const retryRequest = deferred<RunV1>();
+    const retryRun = vi.fn((_runId: string, _intent: ProductResourceMutationIntent) => retryRequest.promise);
+    Object.assign(provider, { retryRun });
+    const startRun = vi.spyOn(provider, "startRun");
     root = await renderProduct(provider);
 
     expect(screenText()).toContain("Model preparation");
@@ -957,8 +965,37 @@ describe("DesktopProductApp", () => {
 
     await clickButton("Cancel session");
     expect(button("Retry session").disabled).toBe(false);
+    await act(async () => {
+      button("Retry session").click();
+      await Promise.resolve();
+    });
+
+    expect(retryRun).toHaveBeenCalledWith("run-failed-model", expect.objectContaining({
+      actionId: expect.any(String),
+      streamEpoch: expect.any(Number),
+      etag: expect.any(String),
+    }));
+    expect(startRun).not.toHaveBeenCalled();
+    expect(button("Start session").disabled).toBe(true);
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+      .filter((item) => item.textContent?.trim() === "Retry session")
+      .every((item) => item.disabled)).toBe(true);
+
+    await act(async () => {
+      retryRequest.reject(new DesktopProductUserError("The failed session could not be retried."));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await flush();
+
+    expect(screenText()).toContain("Action could not be completed");
+    expect(screenText()).toContain("The failed session could not be retried.");
+    expect(button("Retry session").disabled).toBe(false);
+
     await clickButton("Retry session");
-    expect(screenText()).toContain("Preparing the remote workspace.");
+    expect(retryRun).toHaveBeenCalledTimes(2);
+    expect(retryRun.mock.calls[1]?.[1].actionId).toBe(retryRun.mock.calls[0]?.[1].actionId);
+    expect(startRun).not.toHaveBeenCalled();
   });
 
   it("shows every selected revision member, including multiple artifacts for one target, in stable order", async () => {

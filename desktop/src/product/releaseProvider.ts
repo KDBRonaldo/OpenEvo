@@ -7,7 +7,11 @@ import {
   type ProjectSourceV1,
 } from "../api/v1/schemas";
 import { createLocalApiDesktopProductProvider } from "./localApiProvider";
-import { type DesktopProductProvider, type ProjectSourceSelectionIntent } from "./provider";
+import {
+  type DesktopProductProvider,
+  type ProjectSourceSelectionIntent,
+  type ReleaseDesktopProductProvider,
+} from "./provider";
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 
 export interface ReleaseNativeBridge {
@@ -60,7 +64,7 @@ export async function reportReleaseDesktopReady(): Promise<void> {
 
 export async function createReleaseDesktopProductProvider(
   dependencies: ReleaseProviderFactoryDependencies = {},
-): Promise<DesktopProductProvider> {
+): Promise<ReleaseDesktopProductProvider> {
   const native = dependencies.native ?? tauriNativeBridge;
   const client = createDesktopApiClient({
     fetch: dependencies.fetch ?? globalThis.fetch.bind(globalThis),
@@ -98,8 +102,17 @@ export async function createReleaseDesktopProductProvider(
   const provider = dependencies.adapterFactory
     ? await dependencies.adapterFactory(context)
     : createLocalApiDesktopProductProvider({ client, native: context.native, fetch: dependencies.fetch });
+  assertReleaseProvider(provider);
+  return provider;
+}
+
+function assertReleaseProvider(
+  provider: DesktopProductProvider,
+): asserts provider is ReleaseDesktopProductProvider {
   if (provider.providerKind !== "desktop_sidecar") {
     throw new DesktopContractError("Release provider adapter reported a forbidden provider kind");
   }
-  return provider;
+  if (typeof provider.retryRun !== "function") {
+    throw new DesktopContractError("Release provider adapter is missing the run retry contract");
+  }
 }

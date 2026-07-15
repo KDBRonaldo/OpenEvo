@@ -144,11 +144,16 @@ export interface DesktopProductProvider {
   cancelProjectSource(actionId: string): Promise<void>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
   startRun(intent: ProductRunIntent): Promise<RunV1>;
+  retryRun?(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
   cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
   cancelOperation(operationId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   getRunLogs(runId: string): Promise<readonly LogEntryV1[]>;
   getArtifactContent(artifactId: string): Promise<ArtifactContentV1>;
   getArtifactDiff(artifactId: string): Promise<ArtifactDiffV1>;
+}
+
+export interface ReleaseDesktopProductProvider extends DesktopProductProvider {
+  retryRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
 }
 
 export class DesktopProductProviderUnavailableError extends Error {
@@ -186,6 +191,7 @@ export const unavailableDesktopProductProvider: DesktopProductProvider = {
   cancelProjectSource: unavailable,
   settleProjectSource: unavailable,
   startRun: unavailable,
+  retryRun: unavailable,
   cancelRun: unavailable,
   cancelOperation: unavailable,
   getRunLogs: unavailable,

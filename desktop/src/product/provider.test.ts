@@ -51,6 +51,14 @@ describe("Desktop product provider boundary", () => {
     });
   });
 
+  it("fails closed when run retry is unavailable", async () => {
+    await expect(unavailableDesktopProductProvider.retryRun!("run-fixture-1", {
+      actionId: "renderer-action-retry-0001",
+      streamEpoch: 7,
+      etag: '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
+    })).rejects.toThrow("local service");
+  });
+
   it("negotiates the native bootstrap, checked-in digest, provider kind, and feature set before exposing an adapter", async () => {
     const contract = DESKTOP_PRODUCT_RELEASE_CONTRACT;
     const digest = contract.acceptedOpenApiDigests[0];
@@ -200,6 +208,22 @@ describe("Desktop product provider boundary", () => {
       adapterFactory,
     })).rejects.toThrow(/missing required release features/i);
     expect(adapterFactory).not.toHaveBeenCalled();
+  });
+
+  it("rejects a release adapter without the run retry contract", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native: {
+        bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
+        selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
+        settleProjectSource: vi.fn(),
+      },
+      adapterFactory: () => ({ ...unavailableDesktopProductProvider, retryRun: undefined }),
+    })).rejects.toThrow(/run retry contract/i);
   });
 
   it("rejects native source responses outside ProjectSourceV1 or cross-wired to another source kind", async () => {

@@ -24,7 +24,6 @@ import { parseEventStreamFailure, parseSseFrame } from "../api/v1/sse";
 import {
   DesktopProductUserError,
   ProductRefreshOrder,
-  type DesktopProductProvider,
   type DesktopProductSnapshot,
   type ProductMutationIntent,
   type ProductRefreshResult,
@@ -35,6 +34,7 @@ import {
   type ProjectCapabilityState,
   type ProjectSourceSelectionIntent,
   type ProjectValidationState,
+  type ReleaseDesktopProductProvider,
 } from "./provider";
 
 const PAGE_LIMIT = 100;
@@ -81,7 +81,7 @@ class RefreshBudget {
   }
 }
 
-export class LocalApiDesktopProductProvider implements DesktopProductProvider {
+export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProvider {
   readonly providerKind = "desktop_sidecar" as const;
 
   private readonly client: DesktopApiClientV1;
@@ -727,7 +727,7 @@ function hasReadableCoreCollections(
 
 export function createLocalApiDesktopProductProvider(
   options: LocalApiDesktopProductProviderOptions,
-): DesktopProductProvider {
+): ReleaseDesktopProductProvider {
   return new LocalApiDesktopProductProvider(options);
 }
 
