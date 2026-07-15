@@ -115,6 +115,10 @@ deterministic local failure. Any changed value, including the exact requested
 value, poisons further reads and writes until application restart because
 visibility does not prove the directory fsync completed. Invalid or unreadable
 journal or lock state fails startup closed and remains available for diagnosis.
+Any recovery-store write failure also latches the provider unavailable for the
+rest of its lifetime. Every Core retry transport, including a cached exact
+replay, checks that latch; persisting an accepted response or clearing a rejected
+retry therefore cannot be bypassed without restarting Desktop.
 Bounded polling starts only
 after the request becomes ambiguous. An aggregate that arrives while the retry
 transport is still in flight cannot reconcile or clear the journal. A later

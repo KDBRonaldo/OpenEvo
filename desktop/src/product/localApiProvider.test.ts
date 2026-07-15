@@ -670,6 +670,77 @@ describe("LocalApiDesktopProductProvider", () => {
     expect(client.retryRun).not.toHaveBeenCalled();
   });
 
+  it("blocks exact replay after persisting an accepted retry becomes uncertain", async () => {
+    const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    const accepted = advancedRetryRun(retrySource);
+    let durable: string | null = null;
+    let writes = 0;
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    client.retryRun = vi.fn().mockResolvedValue(accepted);
+    const provider = createProvider(client, undefined, {
+      read: () => durable,
+      write: async (next) => {
+        writes += 1;
+        durable = next;
+        if (writes === 2) throw new Error("accepted recovery response was lost");
+      },
+    });
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    const intent = {
+      actionId: "renderer-action-retry-accepted-storage-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    };
+
+    await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/restart/i);
+    expect(client.retryRun).toHaveBeenCalledTimes(1);
+    expect((await provider.refresh()).status).toBe("fresh");
+    await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/restart/i);
+    expect(client.retryRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks exact replay after clearing a rejected retry becomes uncertain", async () => {
+    const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    let durable: string | null = null;
+    let writes = 0;
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    client.retryRun = vi.fn().mockRejectedValue(new DesktopApiError(apiErrorV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.error,
+      code: "run_retry_rejected",
+      message: "The failed run cannot be retried.",
+      category: "run",
+      retryable: false,
+      repair_action: "user_action_required",
+      details: {},
+    })));
+    const provider = createProvider(client, undefined, {
+      read: () => durable,
+      write: async (next) => {
+        writes += 1;
+        durable = next;
+        if (writes === 2) throw new Error("clear recovery response was lost");
+      },
+    });
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    const intent = {
+      actionId: "renderer-action-retry-clear-storage-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    };
+
+    await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/restart/i);
+    expect(client.retryRun).toHaveBeenCalledTimes(1);
+    expect((await provider.refresh()).status).toBe("fresh");
+    await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/restart/i);
+    expect(client.retryRun).toHaveBeenCalledTimes(1);
+  });
+
   it("does not retain exact replay authority after a deterministic retry rejection", async () => {
     const client = mockClient();
     client.retryRun = vi.fn().mockRejectedValue(new DesktopApiError(apiErrorV1Schema.parse({

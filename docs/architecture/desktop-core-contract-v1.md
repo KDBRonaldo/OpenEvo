@@ -979,6 +979,11 @@ same verified native path only to classify local state. Unchanged prior bytes
 preserve the deterministic local failure. Any changed value, including the exact
 requested bytes, poisons the renderer store until application restart because
 post-rename visibility alone cannot prove that the directory fsync completed.
+Any recovery-store write failure also sets a provider-lifetime uncertainty
+latch. Every Core retry transport, including a cached exact replay, checks that
+latch immediately before dispatch. Failure to persist an accepted response or
+clear a deterministic rejection therefore requires application restart and
+cannot reuse stale in-memory authority to contact Core.
 Schema-invalid, oversized, identity-inconsistent, unreadable, or unsafe persisted
 data remains in place and fails startup closed; it is never silently treated as
 an absent retry. This persistence lets a

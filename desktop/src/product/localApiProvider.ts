@@ -56,6 +56,7 @@ const MAX_COLLECTION_PAGES = 100;
 const MAX_CONCURRENCY = 6;
 const MAX_SSE_BUFFER_BYTES = 1_048_576 + 4;
 const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
+const RETRY_RECOVERY_RESTART_MESSAGE = "OpenEvo could not save local retry recovery state. Restart Desktop and try again.";
 
 export interface LocalApiNativeBridge {
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
@@ -113,6 +114,7 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
   private readonly retryRecoveryStore: ProductRunRetryRecoveryStore | null;
   private retryReplay: ProductRunRetryRecovery | null;
   private retryRequestInFlight: ProductRunRetryRecovery | null = null;
+  private retryRecoveryUncertain = false;
 
   constructor(options: LocalApiDesktopProductProviderOptions) {
     this.client = options.client;
@@ -337,6 +339,7 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
   }
 
   async retryRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1> {
+    this.assertRunRetryRecoveryHealthy();
     const exactReplay = this.retryReplay?.runId === runId
       && sameRunRetryIntent(this.retryReplay.intent, intent);
     if (this.retryReplay && !exactReplay) {
@@ -374,6 +377,7 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
       }
     }
     try {
+      this.assertRunRetryRecoveryHealthy();
       const run = await this.client.retryRun(
         runId,
         { terminal_attempt_id: terminalAttemptId },
@@ -392,6 +396,11 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
       this.invalidate();
       return run;
     } catch (error) {
+      if (this.retryRecoveryUncertain) {
+        throw error instanceof DesktopProductUserError
+          ? error
+          : new DesktopProductUserError(RETRY_RECOVERY_RESTART_MESSAGE);
+      }
       if (error instanceof DesktopApiError) {
         if (error.apiError.code === "core_mutation_outcome_unknown") {
           throw new DesktopProductAmbiguousMutationError(undefined, error);
@@ -698,9 +707,16 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
     try {
       await this.retryRecoveryStore?.write(recovery === null ? null : serializeRunRetryRecovery(recovery));
     } catch {
-      throw new DesktopProductUserError("OpenEvo could not save local retry recovery state. Restart Desktop and try again.");
+      this.retryRecoveryUncertain = true;
+      throw new DesktopProductUserError(RETRY_RECOVERY_RESTART_MESSAGE);
     }
     this.retryReplay = recovery;
+  }
+
+  private assertRunRetryRecoveryHealthy(): void {
+    if (this.retryRecoveryUncertain) {
+      throw new DesktopProductUserError(RETRY_RECOVERY_RESTART_MESSAGE);
+    }
   }
 
   private invalidate(): void {
