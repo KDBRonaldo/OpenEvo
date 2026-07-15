@@ -100,6 +100,7 @@ type ProfileSaveIntent = {
 };
 type ProfileSaveAttemptResult = { readonly saved: boolean; readonly pendingIntent: ProfileSaveIntent | null };
 type SnapshotRefreshGuard = () => boolean;
+type SnapshotRefreshSource = "mutation" | "reconcile" | "manual" | "lifecycle" | "sse" | "poll";
 type RunPollingIdentity = {
   readonly provider: DesktopProductProvider;
   readonly desktopProjectId: string;
@@ -112,11 +113,14 @@ type RunPollingIdentity = {
   readonly activeProfileId: string;
 };
 type SnapshotRefreshWaiter = {
+  readonly source: SnapshotRefreshSource;
+  readonly watermark: number;
   readonly isRelevant: SnapshotRefreshGuard;
   readonly resolve: (snapshot: DesktopProductSnapshot | null) => void;
 };
 type SnapshotRefreshBatch = {
   readonly provider: DesktopProductProvider;
+  readonly throughWatermark: number;
   readonly waiters: SnapshotRefreshWaiter[];
 };
 type SnapshotRefreshPublication =
@@ -187,28 +191,29 @@ export function DesktopProductApp({
   }, [provider, publishRefresh]);
 
   const refresh = useCallback(
-    (isRelevant: SnapshotRefreshGuard = () => true) => refreshCoordinator.current!.request(provider, isRelevant),
+    (source: SnapshotRefreshSource, isRelevant: SnapshotRefreshGuard = () => true) =>
+      refreshCoordinator.current!.request(provider, source, isRelevant),
     [provider],
   );
 
   useEffect(() => {
     let active = true;
-    const load = async () => {
+    const load = async (source: "lifecycle" | "sse") => {
       if (!active) return;
-      await refresh(() => active);
+      await refresh(source, () => active);
     };
-    void load();
+    void load("lifecycle");
     const unsubscribe = provider.subscribe((signal) => {
       if (signal.kind === "snapshot_changed") {
         setSnapshot((current) => current ? { ...current, stream: { status: "stale", epoch: current.stream.epoch, reason: "refresh_pending" } } : current);
-        void load();
+        void load("sse");
       } else if (signal.kind === "stream_stale") {
         setSnapshot((current) => current ? { ...current, stream: { status: "stale", epoch: current.stream.epoch, reason: signal.reason } } : current);
       } else if (signal.kind === "stream_error") {
         setSnapshot((current) => current ? { ...current, stream: { status: "error", epoch: current.stream.epoch, error: signal.error } } : current);
       } else {
         setSnapshot((current) => current ? { ...current, stream: { status: "cursor_reset", epoch: current.stream.epoch, resumeFromEventId: null } } : current);
-        void load();
+        void load("sse");
       }
     });
     return () => {
@@ -250,7 +255,7 @@ export function DesktopProductApp({
     setActionRecovery(null);
     try {
       await action();
-      const refreshedSnapshot = await refresh();
+      const refreshedSnapshot = await refresh("mutation");
       return { saved: true, error: null, refreshedSnapshot };
     } catch (error) {
       let refreshedSnapshot: DesktopProductSnapshot | null = null;
@@ -258,12 +263,12 @@ export function DesktopProductApp({
         if (error.apiError.http_status === 410) {
           setSnapshot((current) => current ? { ...current, stream: { status: "cursor_reset", epoch: current.stream.epoch, resumeFromEventId: null } } : current);
         }
-        refreshedSnapshot = await refresh();
+        refreshedSnapshot = await refresh("mutation");
         if (conflictRecovery && canReadmitRun(error.apiError, refreshedSnapshot, conflictRecovery.projectId)) {
           setActionRecovery(conflictRecovery);
         }
       } else if (refreshOnUnknown) {
-        refreshedSnapshot = await refresh();
+        refreshedSnapshot = await refresh("mutation");
       }
       setActionError(userMessage(error));
       return { saved: false, error, refreshedSnapshot };
@@ -282,7 +287,7 @@ export function DesktopProductApp({
             title="OpenEvo Desktop is unavailable"
             detail={loadError}
             actionLabel="Try again"
-            onAction={() => void refresh()}
+            onAction={() => void refresh("manual")}
           />
         ) : (
           <div className="product-loading-row"><LoaderCircle className="spin" size={18} /> Loading workspace...</div>
@@ -403,7 +408,7 @@ export function DesktopProductApp({
               onOpenConnection={() => setConnectionSettingsOpen(true)}
               onOpenEvolution={() => setWorkspace("evolution")}
               onOpenSystem={() => setWorkspace("system")}
-              onRefresh={() => void refresh()}
+              onRefresh={() => void refresh("manual")}
             />
           ) : null}
           {workspace === "evolution" ? (
@@ -413,7 +418,7 @@ export function DesktopProductApp({
               artifacts={snapshot.artifacts.filter((artifact) => artifact.project_id === coreProjectId)}
               artifactCollection={snapshot.artifactCollection}
               provider={provider}
-              onRefresh={() => void refresh()}
+              onRefresh={() => void refresh("manual")}
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
             />
           ) : null}
@@ -454,7 +459,7 @@ export function DesktopProductApp({
             }
             setSettingsOpen(false);
           }}
-          onRetryCapabilities={() => refresh()}
+          onRetryCapabilities={() => refresh("manual")}
           onSave={async (input, actionId, pendingSourceActionId) => {
             const requestEpoch = snapshot.stream.epoch;
             const requestProject = settingsProject;
@@ -485,7 +490,7 @@ export function DesktopProductApp({
                     pendingSourceOutcome = "adopted";
                   }
                 }
-                const afterCreate = await refresh();
+                const afterCreate = await refresh("mutation");
                 const current = afterCreate?.projects.find((item) => item.project_id === pending.projectId);
                 if (!afterCreate || !current) {
                   throw new DesktopProductUserError("The new project is not available for activation. Refresh and try again.");
@@ -578,7 +583,8 @@ class SnapshotRefreshCoordinator {
   private publish: ((publication: SnapshotRefreshPublication) => void) | null = null;
   private mounted = false;
   private running = false;
-  private readonly queue: SnapshotRefreshBatch[] = [];
+  private nextWatermark = 0;
+  private trailing: SnapshotRefreshBatch | null = null;
 
   mount(
     provider: DesktopProductProvider,
@@ -595,36 +601,43 @@ class SnapshotRefreshCoordinator {
     this.mounted = false;
     this.provider = null;
     this.publish = null;
-    this.clearQueued();
+    this.clearTrailing();
   }
 
   request(
     provider: DesktopProductProvider,
+    source: SnapshotRefreshSource,
     isRelevant: SnapshotRefreshGuard,
   ): Promise<DesktopProductSnapshot | null> {
     if (!this.mounted || this.provider !== provider) return Promise.resolve(null);
+    this.nextWatermark += 1;
+    const watermark = this.nextWatermark;
     return new Promise((resolve) => {
-      this.queuedBatch(provider).waiters.push({ isRelevant, resolve });
+      this.queuedBatch(provider, watermark).waiters.push({ source, watermark, isRelevant, resolve });
       this.pump();
     });
   }
 
-  private queuedBatch(provider: DesktopProductProvider): SnapshotRefreshBatch {
-    const pending = this.queue.at(-1);
-    if (pending?.provider === provider) return pending;
-    const batch: SnapshotRefreshBatch = { provider, waiters: [] };
-    this.queue.push(batch);
+  private queuedBatch(provider: DesktopProductProvider, watermark: number): SnapshotRefreshBatch {
+    if (this.trailing?.provider === provider) {
+      this.trailing = { ...this.trailing, throughWatermark: watermark };
+      return this.trailing;
+    }
+    const batch: SnapshotRefreshBatch = { provider, throughWatermark: watermark, waiters: [] };
+    this.trailing = batch;
     return batch;
   }
 
   private pump(): void {
     if (this.running) return;
     if (!this.mounted) {
-      this.clearQueued();
+      this.clearTrailing();
       return;
     }
-    const batch = this.queue.shift();
+    const batch = this.trailing;
+    this.trailing = null;
     if (!batch) return;
+    // Detaching the batch freezes its dispatch watermark; later requests can only enter the tail.
     if (batch.provider !== this.provider) {
       this.resolveBatch(batch, null);
       this.pump();
@@ -653,35 +666,64 @@ class SnapshotRefreshCoordinator {
       return;
     }
 
-    const trailing = this.queue.find((candidate) => candidate.provider === batch.provider);
-    if (trailing) {
-      trailing.waiters.unshift(...batch.waiters);
-      this.publish({ kind: "pending", epoch: refreshPublicationEpoch(publication) });
-      return;
-    }
-
     const relevance = batch.waiters.map((waiter) => safeRefreshGuard(waiter.isRelevant));
     if (!relevance.some(Boolean)) {
       this.resolveBatch(batch, null);
       this.publish({ kind: "pending", epoch: refreshPublicationEpoch(publication) });
-      this.queuedBatch(batch.provider).waiters.push({
-        isRelevant: () => this.mounted && this.provider === batch.provider,
-        resolve: () => undefined,
-      });
+      this.ensureReconciliation(batch.provider);
       return;
     }
 
     this.publish(publication);
-    batch.waiters.forEach((waiter, index) => waiter.resolve(relevance[index] ? freshSnapshot : null));
+    // The dispatched batch owns these waiters even when a higher-watermark tail already exists.
+    for (const waiter of orderedRefreshWaiters(batch.waiters)) {
+      const index = batch.waiters.indexOf(waiter);
+      waiter.resolve(relevance[index] ? freshSnapshot : null);
+    }
+    if (this.hasTrailingAfter(batch)) {
+      this.publish({ kind: "pending", epoch: refreshPublicationEpoch(publication) });
+    }
+  }
+
+  private hasTrailingAfter(batch: SnapshotRefreshBatch): boolean {
+    return this.trailing?.provider === batch.provider
+      && this.trailing.throughWatermark > batch.throughWatermark;
+  }
+
+  private ensureReconciliation(provider: DesktopProductProvider): void {
+    if (this.trailing?.provider === provider) return;
+    void this.request(
+      provider,
+      "reconcile",
+      () => this.mounted && this.provider === provider,
+    );
   }
 
   private resolveBatch(batch: SnapshotRefreshBatch, snapshot: DesktopProductSnapshot | null): void {
     for (const waiter of batch.waiters) waiter.resolve(snapshot);
   }
 
-  private clearQueued(): void {
-    for (const batch of this.queue.splice(0)) this.resolveBatch(batch, null);
+  private clearTrailing(): void {
+    if (!this.trailing) return;
+    this.resolveBatch(this.trailing, null);
+    this.trailing = null;
   }
+}
+
+const SNAPSHOT_REFRESH_SOURCE_PRIORITY: Readonly<Record<SnapshotRefreshSource, number>> = {
+  mutation: 6,
+  reconcile: 5,
+  manual: 4,
+  lifecycle: 3,
+  sse: 2,
+  poll: 1,
+};
+
+function orderedRefreshWaiters(waiters: readonly SnapshotRefreshWaiter[]): SnapshotRefreshWaiter[] {
+  return [...waiters].sort((left, right) =>
+    SNAPSHOT_REFRESH_SOURCE_PRIORITY[right.source] - SNAPSHOT_REFRESH_SOURCE_PRIORITY[left.source]
+      || left.watermark - right.watermark,
+  );
 }
 
 function refreshPublicationEpoch(publication: SnapshotRefreshPublication): number | null {
@@ -701,7 +743,7 @@ function safeRefreshGuard(isRelevant: SnapshotRefreshGuard): boolean {
 
 function useActiveRunPolling(
   identity: RunPollingIdentity | null,
-  refresh: (isRelevant?: SnapshotRefreshGuard) => Promise<DesktopProductSnapshot | null>,
+  refresh: (source: SnapshotRefreshSource, isRelevant?: SnapshotRefreshGuard) => Promise<DesktopProductSnapshot | null>,
 ): void {
   const currentIdentity = useRef(identity);
 
@@ -724,7 +766,7 @@ function useActiveRunPolling(
     };
     const poll = async () => {
       if (!isCurrent()) return;
-      const next = await refresh(isCurrent);
+      const next = await refresh("poll", isCurrent);
       if (!isCurrent()) return;
       if (next && !snapshotHasRunPollingIdentity(next, identity)) return;
       schedule();

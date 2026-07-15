@@ -3,7 +3,7 @@
 import { StrictMode, act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DesktopApiClientV1 } from "../api/v1/client";
+import type { DesktopApiClientV1, FetchLike } from "../api/v1/client";
 import { CONTRACT_FIXTURE_V1 } from "../api/v1/fixtures";
 import {
   desktopStateV1Schema,
@@ -21,7 +21,7 @@ import {
 } from "../api/v1/schemas";
 import { DesktopProductApp } from "./DesktopProductApp";
 import { LocalApiDesktopProductProvider } from "./localApiProvider";
-import type { DesktopProductProvider, ProductRefreshResult, ProductSubscriptionSignal } from "./provider";
+import type { DesktopProductProvider, ProductRefreshResult } from "./provider";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -46,24 +46,31 @@ describe("DesktopProductApp production run polling", () => {
     document.body.innerHTML = "";
   });
 
-  it("serializes a poll with mutation and SSE refreshes and returns the trailing mutation snapshot", async () => {
+  it("keeps a preexisting poll separate from the real cancel invalidation and mutation refresh", async () => {
     const harness = productionHarness();
     root = await renderProduct(harness.provider);
+    expect(harness.activeEventStreams()).toBe(1);
 
     const pendingPoll = harness.deferNextState();
     await advance(1_005);
     expect(harness.refreshesInFlight()).toBe(1);
 
-    harness.emit({ kind: "snapshot_changed" });
     await act(async () => {
       button("Cancel session").click();
       await Promise.resolve();
       await Promise.resolve();
     });
     expect(harness.client.cancelRun).toHaveBeenCalledTimes(1);
+    const mutationRefresh = harness.deferNextState();
 
     await act(async () => {
       pendingPoll.resolve(harness.state);
+      await settlePromises();
+    });
+    expect(harness.refreshesInFlight()).toBe(1);
+
+    await act(async () => {
+      mutationRefresh.resolve(harness.state);
       await settlePromises();
     });
 
@@ -73,6 +80,73 @@ describe("DesktopProductApp production run polling", () => {
     const terminalRefreshCount = harness.refreshCount();
     await advance(3_000);
     expect(harness.refreshCount()).toBe(terminalRefreshCount);
+  });
+
+  it("publishes and resolves a mutation refresh within one batch during a continuous SSE storm", async () => {
+    const harness = productionHarness();
+    root = await renderProduct(harness.provider);
+    const invalidationRefresh = harness.deferNextState();
+
+    await act(async () => {
+      button("Cancel session").click();
+      await settlePromises();
+    });
+    expect(harness.client.cancelRun).toHaveBeenCalledTimes(1);
+    const mutationRefresh = harness.deferNextState();
+
+    await act(async () => {
+      invalidationRefresh.resolve(harness.state);
+      await settlePromises();
+    });
+    expect(harness.refreshesInFlight()).toBe(1);
+
+    await harness.emitEvents(32);
+    const firstStormTail = harness.deferNextState();
+    await act(async () => {
+      mutationRefresh.resolve(harness.state);
+      await settlePromises();
+    });
+
+    expect(screenText()).toContain("Latest session cancelled");
+    expect(screenText()).not.toContain("Action could not be completed");
+    expect(harness.refreshesInFlight()).toBe(1);
+    expect(harness.maxRefreshesInFlight()).toBe(1);
+
+    await harness.emitEvents(32);
+    const secondStormTail = harness.deferNextState();
+    await act(async () => {
+      firstStormTail.resolve(harness.state);
+      await settlePromises();
+    });
+    expect(harness.refreshesInFlight()).toBe(1);
+
+    await act(async () => {
+      secondStormTail.resolve(harness.state);
+      await settlePromises();
+    });
+    expect(harness.refreshesInFlight()).toBe(0);
+    expect(harness.refreshCount()).toBe(5);
+  });
+
+  it("uses the LocalApi cancelRun invalidation without a synthetic renderer signal", async () => {
+    const harness = productionHarness();
+    root = await renderProduct(harness.provider);
+    const refreshBeforeCancel = harness.refreshCount();
+    const invalidationRefresh = harness.deferNextState();
+
+    await act(async () => {
+      button("Cancel session").click();
+      await settlePromises();
+    });
+    expect(harness.client.cancelRun).toHaveBeenCalledTimes(1);
+    expect(harness.refreshCount()).toBe(refreshBeforeCancel + 1);
+
+    await act(async () => {
+      invalidationRefresh.resolve(harness.state);
+      await settlePromises();
+    });
+    expect(harness.refreshCount()).toBe(refreshBeforeCancel + 2);
+    expect(screenText()).toContain("Latest session cancelled");
   });
 
   it.each(["resolve", "reject"] as const)(
@@ -108,6 +182,9 @@ describe("DesktopProductApp production run polling", () => {
     async (outcome) => {
       const harness = productionHarness();
       root = await renderProduct(harness.provider, true);
+      expect(harness.subscribeCount()).toBeGreaterThanOrEqual(2);
+      expect(harness.eventStreamCount()).toBe(1);
+      expect(harness.activeEventStreams()).toBe(1);
       const pendingPoll = harness.deferNextState();
       await advance(1_005);
       const inFlightRefreshCount = harness.refreshCount();
@@ -124,6 +201,8 @@ describe("DesktopProductApp production run polling", () => {
 
       expect(harness.maxRefreshesInFlight()).toBe(1);
       expect(harness.refreshCount()).toBe(inFlightRefreshCount);
+      expect(harness.activeEventStreams()).toBe(0);
+      expect(harness.abortedEventStreams()).toBe(harness.eventStreamCount());
     },
   );
 });
@@ -144,6 +223,9 @@ function productionHarness(options: { readonly includeSecondProject?: boolean } 
   const state = desktopStateV1Schema.parse({ ...CONTRACT_FIXTURE_V1.state, pending_operation_ids: [] });
   let currentRun = runV1Schema.parse(CONTRACT_FIXTURE_V1.run);
   const stateResponses: Array<Deferred<DesktopStateV1>> = [];
+  const eventStreams: ControllableEventStream[] = [];
+  let eventSequence = 0;
+  let abortedEventStreams = 0;
 
   const client = {
     state: vi.fn(() => stateResponses.shift()?.promise ?? Promise.resolve(state)),
@@ -169,6 +251,27 @@ function productionHarness(options: { readonly includeSecondProject?: boolean } 
     })),
     eventStreamRequest: vi.fn().mockResolvedValue({ url: "http://127.0.0.1/events", headers: {} }),
   } as unknown as DesktopApiClientV1 & Record<string, ReturnType<typeof vi.fn>>;
+  const fetch = vi.fn<FetchLike>(async (_input, init) => {
+    const signal = init?.signal;
+    if (!signal) throw new Error("production SSE request omitted its abort signal");
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const observed: ControllableEventStream = { signal, enqueue: () => undefined, aborted: false };
+    const stream = new ReadableStream<Uint8Array>({
+      start(nextController) {
+        controller = nextController;
+        observed.enqueue = (value) => controller.enqueue(new TextEncoder().encode(value));
+        signal.addEventListener("abort", () => {
+          if (observed.aborted) return;
+          observed.aborted = true;
+          abortedEventStreams += 1;
+          controller.error(new DOMException("Aborted", "AbortError"));
+        }, { once: true });
+      },
+    });
+    eventStreams.push(observed);
+    return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  });
   const provider = new LocalApiDesktopProductProvider({
     client,
     native: {
@@ -177,15 +280,10 @@ function productionHarness(options: { readonly includeSecondProject?: boolean } 
       settleProjectSource: vi.fn(),
       configureCredential: vi.fn(),
     },
+    fetch,
     reconnectDelaysMs: [],
   });
-  let listener: ((signal: ProductSubscriptionSignal) => void) | null = null;
-  vi.spyOn(provider, "subscribe").mockImplementation((next) => {
-    listener = next;
-    return () => {
-      if (listener === next) listener = null;
-    };
-  });
+  const subscribe = vi.spyOn(provider, "subscribe");
   const originalRefresh = provider.refresh.bind(provider);
   let refreshCount = 0;
   let refreshesInFlight = 0;
@@ -210,11 +308,53 @@ function productionHarness(options: { readonly includeSecondProject?: boolean } 
       stateResponses.push(pending);
       return pending;
     },
-    emit: (signal: ProductSubscriptionSignal) => listener?.(signal),
+    emitEvents: async (count: number) => {
+      let active: ControllableEventStream | undefined;
+      for (let index = eventStreams.length - 1; index >= 0; index -= 1) {
+        if (!eventStreams[index]!.aborted) {
+          active = eventStreams[index];
+          break;
+        }
+      }
+      if (!active) throw new Error("production SSE stream is not active");
+      let frames = "";
+      for (let index = 0; index < count; index += 1) {
+        eventSequence += 1;
+        frames += eventFrame(eventSequence);
+      }
+      await act(async () => {
+        active.enqueue(frames);
+        await settlePromises();
+      });
+    },
     refreshCount: () => refreshCount,
     refreshesInFlight: () => refreshesInFlight,
     maxRefreshesInFlight: () => maxRefreshesInFlight,
+    eventStreamCount: () => eventStreams.length,
+    activeEventStreams: () => eventStreams.filter((stream) => !stream.aborted).length,
+    abortedEventStreams: () => abortedEventStreams,
+    subscribeCount: () => subscribe.mock.calls.length,
   };
+}
+
+function eventFrame(sequence: number): string {
+  const eventId = `event-production-${sequence}`;
+  return `id: ${eventId}\nevent: desktop.v1.resource.changed\ndata: ${JSON.stringify({
+    schema_version: "1",
+    event_id: eventId,
+    event_name: "desktop.v1.resource.changed",
+    occurred_at: NOW,
+    sequence,
+    data: {
+      kind: "resource_changed",
+      authority: "core",
+      resource: { resource_type: "run", resource_id: CONTRACT_FIXTURE_V1.run.id },
+      change: "updated",
+      change_id: `change-production-${sequence}`,
+      resource_etag: ETAG_C,
+      content_sha256: null,
+    },
+  })}\n\n`;
 }
 
 function cancelledRun(run: RunV1): RunV1 {
@@ -308,4 +448,10 @@ type Deferred<T> = {
   readonly promise: Promise<T>;
   readonly resolve: (value: T) => void;
   readonly reject: (reason?: unknown) => void;
+};
+
+type ControllableEventStream = {
+  readonly signal: AbortSignal;
+  enqueue: (value: string) => void;
+  aborted: boolean;
 };

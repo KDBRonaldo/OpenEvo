@@ -71,13 +71,17 @@ session, and run ID; a project or session change rejects a late response. The
 next timeout is armed only after the current request settles, transient failures
 remain retryable, and terminal, offline, switched-project, and unmounted states
 stop polling. Poll, SSE, manual, lifecycle, and mutation-dependent refreshes all
-use one serial renderer owner. Calls arriving during an active refresh coalesce
-into one trailing refresh, and existing waiters move to that trailing result so
-a poll cannot supersede mutation recovery. A completion whose polling identity
-is no longer current is not rendered; the renderer adopts its authoritative
-epoch as stale and performs a serial reconciliation before mutations are enabled
-again. SSE invalidations remain the immediate refresh path without creating
-parallel snapshot loads.
+use one serial renderer owner. Every request receives a monotonic watermark.
+Calls above the running batch's dispatch watermark coalesce into one bounded
+trailing refresh; they never capture or delay waiters already owned by the
+running batch. A fresh completion is published immediately and resolves its
+mutation-dependent waiters before a higher-watermark tail marks that snapshot
+stale. Within a coalesced batch, waiter completion priority is mutation,
+reconciliation, manual, lifecycle, SSE, then poll. A completion whose polling
+identity is no longer current is not rendered; the renderer adopts its
+authoritative epoch as stale and performs a serial reconciliation before
+mutations are enabled again. SSE invalidations remain the immediate refresh path
+without creating parallel snapshot loads.
 
 The release adapter deliberately has no fallback for those native calls. The
 Rust host implements `select_project_source` with the operating-system folder
