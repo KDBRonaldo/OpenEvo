@@ -71,7 +71,9 @@ jobs:
 
       - name: Exercise macOS SSH agent relay and fixed executable authority
         run: |
-          uv run python -m pytest \
+          unset SSH_AUTH_SOCK
+          umask 077
+          uv run python -m pytest --basetemp="$RUNNER_TEMP/oe-candidate-ssh" \
             tests/openevo/remote/test_system_executables.py \
             tests/openevo/remote/test_host_keys.py \
             tests/openevo/remote/test_ssh_transport.py \

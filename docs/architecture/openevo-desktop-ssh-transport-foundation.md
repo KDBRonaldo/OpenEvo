@@ -297,8 +297,14 @@ release capability.
 
 Release process launches use fixed `/usr/bin/ssh`, `/usr/bin/ssh-keyscan`, and
 `/usr/bin/rsync` identities after root-owner, mode, type, ancestor, and pathname
-binding verification. The exact main executable is invoked through its held FD;
-the ordinary environment is empty. In agent mode the original host
+binding verification. Linux invokes the exact main executable through its held
+FD. macOS does not support the same Mach-O `/dev/fd` execution contract, so the
+isolated birth child for top-level SSH/rsync revalidates the held FD against the
+fixed root-owned, non-writable ancestor/path binding immediately before
+executing that system path. The parent repeats the binding check after process
+birth. On macOS, ssh-keyscan instead has the same path/FD binding verified before
+launch and after completion. The ordinary environment is empty. In agent mode
+the original host
 `SSH_AUTH_SOCK` pathname never enters child env or argv. Before each command,
 rsync, or tunnel spawn, the parent holds every upstream directory identity,
 connects one upstream FD, and revalidates the socket pathname/inode after
@@ -317,10 +323,14 @@ inode identities; uncertain cleanup is retained in bounded retry ownership and
 never deletes a replacement pathname.
 
 For rsync, the remote-shell string names the verified SSH authority as
-`/dev/fd/<ssh-fd>`. That FD is included in `pass_fds`, remains inherited through
-the held rsync exec and its nested SSH exec, and both executable identities are
-verified immediately before and after rsync process birth. There is no
-`/usr/bin/ssh` pathname fallback in the nested command.
+`/dev/fd/<ssh-fd>` on Linux. On macOS it names the same fixed `/usr/bin/ssh`
+path whose root-owned, non-writable chain and held FD identity were verified;
+Darwin cannot execute that Mach-O image through `/dev/fd`. The SSH FD remains
+in the inherited descriptor set on both platforms, and both executable
+identities are verified immediately before and after rsync process birth.
+The Darwin nested SSH exec itself is path-based; concurrent privileged
+replacement of the root-owned `/usr/bin` chain is outside this unsigned Desktop
+threat boundary.
 
 ## Command Execution
 
@@ -385,11 +395,14 @@ accidental `waitpid(WNOHANG)` from consuming the leader status before group
 cleanup.
 If no non-reaping observer is available, closed capture pipes or the operation
 deadline initiate cleanup conservatively. Error and cancellation cleanup keeps
-the direct child unreaped while that PID fixes the group identity, sends
-`SIGTERM`, and then escalates to `SIGKILL`. Successful signals do not mark group
-cleanup confirmed. A bounded observer enumerates process state through Linux
-`/proc` or portable `ps`, requires the pinned leader to remain observable, and
-requires every member of that PGID to be dead or a zombie. Only then may the
+the direct child unreaped while that PID fixes the group identity. It enumerates
+the exact PGID before each signal, sends `SIGTERM` only while a live member
+remains, and then escalates to `SIGKILL`. A Darwin `EPERM` signal result is
+re-observed: it is accepted only if every member is now dead or zombie;
+otherwise cleanup remains failed and owned. Successful signals do not mark
+group cleanup confirmed. A bounded observer enumerates process state through
+Linux `/proc` or portable `ps`, requires the pinned leader to remain observable,
+and requires every member of that PGID to be dead or a zombie. Only then may the
 owner wait/reap the direct child; it subsequently requires the exact PGID to be
 absent before closing its birth-record FD, removing the registry entry,
 releasing capacity, and closing the known-host lease. Any group signal,

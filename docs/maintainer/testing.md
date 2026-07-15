@@ -38,6 +38,21 @@ PYTHONPATH=src:. python -m pytest \
   -q
 ```
 
+The Core CI regression step runs with `umask 077` so security-boundary tests
+create provider, store, and session state with owner-private permissions. Its
+test dependencies explicitly include `wheel`, which is required by regression
+coverage that invokes `python -m build --no-isolation`.
+
+The dedicated macOS anonymous Core transport job clears the runner's ambient
+`SSH_AUTH_SOCK` and runs the exact anonymous socketpair metadata, identity,
+FD-transfer, cancellation, fail-closed, and real child-relay nodes. The full SSH
+transport suite remains in the Linux Core job and also runs in the Desktop
+macOS native smoke with a short pytest base directory, private umask, and no
+ambient runner agent. The focused macOS job must retain the real relay node and
+must not be reduced to metadata-only tests. The stable-only Desktop candidate
+gate runs the complete macOS SSH suite under the same private, agent-free,
+short-path environment before packaging a DMG.
+
 Run relevant module suites when touching shared behavior:
 
 ```bash

@@ -2343,6 +2343,16 @@ def test_core_connection_authority_passes_birth_and_peer_fds_to_exact_ssh_child(
     assert authority.release() is True
 
 
+def test_source_birth_launcher_uses_platform_bound_execution_target() -> None:
+    launcher = ssh_module._SUBPROCESS_BIRTH_LAUNCHER
+
+    assert "os.stat(argv[0], follow_symlinks=True)" in launcher
+    assert 'if sys.platform == "darwin":\n    execution_path = argv[0]' in launcher
+    assert 'elif sys.platform.startswith("linux"):' in launcher
+    assert "execution_path = f\"/dev/fd/{executable_fd}\"" in launcher
+    assert "os.execve(execution_path, argv, environment)" in launcher
+
+
 def test_owned_ssh_spawn_exposes_only_private_agent_proxy_and_cleans_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2514,7 +2524,7 @@ def test_agent_proxy_is_closed_when_spawn_fails_or_is_cancelled(
             authority.release()
 
 
-def test_rsync_nested_ssh_executes_held_fd_and_inherits_pass_fd(
+def test_rsync_nested_ssh_uses_verified_platform_target_and_inherits_fd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2552,12 +2562,41 @@ def test_rsync_nested_ssh_executes_held_fd_and_inherits_pass_fd(
     spawned_argv = actual_argv[marker_index + 3 :]
     assert spawned_argv[0] == ssh_module.RSYNC_EXECUTABLE
     remote_shell = shlex.split(spawned_argv[spawned_argv.index("-e") + 1])
-    assert remote_shell[0].startswith("/dev/fd/")
-    nested_ssh_fd = int(remote_shell[0].removeprefix("/dev/fd/"))
     pass_fds = kwargs["pass_fds"]
     assert isinstance(pass_fds, tuple)
-    assert nested_ssh_fd in pass_fds
+    assert len(pass_fds) == 3
+    assert len(set(pass_fds)) == 3
+    if sys.platform == "darwin":
+        assert remote_shell[0] == ssh_module.SSH_EXECUTABLE
+    else:
+        assert remote_shell[0].startswith("/dev/fd/")
+        nested_ssh_fd = int(remote_shell[0].removeprefix("/dev/fd/"))
+        assert nested_ssh_fd in pass_fds
     assert int(actual_argv[marker_index + 2]) in pass_fds
+
+
+def test_darwin_rsync_nested_ssh_uses_revalidated_fixed_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ssh_module.sys, "platform", "darwin")
+    executable, nested, spawn_argv = ssh_module._prepare_verified_spawn(
+        [
+            ssh_module.RSYNC_EXECUTABLE,
+            "-e",
+            f"{ssh_module.SSH_EXECUTABLE} -V",
+            "/tmp/source",
+            "host:/tmp/target",
+        ]
+    )
+    try:
+        remote_shell = shlex.split(spawn_argv[spawn_argv.index("-e") + 1])
+        assert remote_shell[0] == ssh_module.SSH_EXECUTABLE
+        assert len(nested) == 1
+        nested[0].verify_path_binding()
+    finally:
+        for authority in reversed(nested):
+            authority.close()
+        executable.close()
 
 
 def test_core_connection_subprocess_bridges_a_real_parent_owned_af_unix_stream() -> None:
@@ -3615,6 +3654,77 @@ def test_secret_runner_retains_lease_until_group_termination_is_observed(
         )
         if authority is not None and id(authority) in ssh_module._ORPHANED_SUBPROCESSES:
             authority.cleanup()
+
+
+def test_group_signal_skips_kill_when_only_zombie_members_remain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = os.getpid() + 100_000
+
+    process = Process()
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        ssh_module,
+        "_observe_owned_process_group_states",
+        lambda _process, *, process_group_id: {process_group_id: "Z"},
+    )
+    monkeypatch.setattr(
+        ssh_module.os,
+        "killpg",
+        lambda process_group_id, signal_number: signals.append(
+            (process_group_id, signal_number)
+        ),
+    )
+
+    ssh_module._signal_owned_process_group(
+        process,
+        process_group_id=process.pid,
+        signal_number=signal.SIGTERM,
+    )
+
+    assert signals == []
+
+
+@pytest.mark.parametrize("live_after_permission_error", [False, True])
+def test_group_signal_permission_error_requires_state_recheck(
+    monkeypatch: pytest.MonkeyPatch,
+    live_after_permission_error: bool,
+) -> None:
+    class Process:
+        pid = os.getpid() + 100_001
+
+    process = Process()
+    observations = iter(
+        (
+            {process.pid: "S"},
+            {process.pid: "S" if live_after_permission_error else "Z"},
+        )
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_observe_owned_process_group_states",
+        lambda _process, *, process_group_id: next(observations),
+    )
+
+    def deny_signal(_process_group_id: int, _signal_number: int) -> None:
+        raise PermissionError(errno.EPERM, "injected signal race")
+
+    monkeypatch.setattr(ssh_module.os, "killpg", deny_signal)
+
+    if live_after_permission_error:
+        with pytest.raises(PermissionError, match="signal race"):
+            ssh_module._signal_owned_process_group(
+                process,
+                process_group_id=process.pid,
+                signal_number=signal.SIGTERM,
+            )
+    else:
+        ssh_module._signal_owned_process_group(
+            process,
+            process_group_id=process.pid,
+            signal_number=signal.SIGTERM,
+        )
 
 
 def test_group_signal_failure_retains_slot_registry_and_trust_lease(

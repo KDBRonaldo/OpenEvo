@@ -95,6 +95,8 @@ if sys.argv[1] != "--openevo-owned-subprocess-birth-v1":
 birth_fd = int(sys.argv[2])
 executable_fd = int(sys.argv[3])
 argv = sys.argv[4:]
+if not argv:
+    raise SystemExit(126)
 try:
     os.fchmod(birth_fd, 0o600)
     os.ftruncate(birth_fd, 0)
@@ -106,12 +108,34 @@ try:
     os.fsync(birth_fd)
 finally:
     os.close(birth_fd)
+identity_fields = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_uid",
+    "st_nlink",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+opened_identity = os.fstat(executable_fd)
+path_identity = os.stat(argv[0], follow_symlinks=True)
+if tuple(getattr(opened_identity, field) for field in identity_fields) != tuple(
+    getattr(path_identity, field) for field in identity_fields
+):
+    raise SystemExit(126)
 os.set_inheritable(executable_fd, False)
 environment = {}
 agent_socket = os.environ.get("SSH_AUTH_SOCK")
 if agent_socket is not None:
     environment["SSH_AUTH_SOCK"] = agent_socket
-os.execve(f"/dev/fd/{executable_fd}", argv, environment)
+if sys.platform == "darwin":
+    execution_path = argv[0]
+elif sys.platform.startswith("linux"):
+    execution_path = f"/dev/fd/{executable_fd}"
+else:
+    raise SystemExit(126)
+os.execve(execution_path, argv, environment)
 """
 
 
@@ -2756,10 +2780,23 @@ def _signal_owned_process_group(
         or process_group_id == os.getpgrp()
     ):
         raise RuntimeError("subprocess process-group ownership is invalid")
+    states = _observe_owned_process_group_states(
+        process,
+        process_group_id=process_group_id,
+    )
+    if not any(state not in {"X", "Z"} for state in states.values()):
+        return
     try:
         os.killpg(process_group_id, signal_number)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        states = _observe_owned_process_group_states(
+            process,
+            process_group_id=process_group_id,
+        )
+        if any(state not in {"X", "Z"} for state in states.values()):
+            raise
 
 
 def _confirm_owned_process_group_terminated(

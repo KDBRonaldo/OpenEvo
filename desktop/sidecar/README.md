@@ -86,6 +86,12 @@ ancestor/root/marker/xattr replacement is detected while the separate key
 remains confidential and unmodified and the owner-only state directory has
 retained its integrity.
 
+Extended attributes are accessed only through verified file descriptors. Linux
+uses Python's descriptor xattr API; macOS binds libc `fgetxattr`, `fsetxattr`,
+and `fremovexattr` directly, with no pathname or `/dev/fd` fallback. Reads and
+writes are bounded, and native errno values remain available to store recovery
+logic.
+
 The store root and import directories are mode `0700`; archive and closed
 metadata files are mode `0600` and link-count one. The store normally creates a
 random opaque import ID. The native route instead supplies an action-derived,

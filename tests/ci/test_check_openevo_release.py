@@ -1260,6 +1260,17 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     ):
         assert marker in text
 
+    candidate_ssh_step = text.split(
+        "      - name: Exercise macOS SSH agent relay and fixed executable authority\n",
+        maxsplit=1,
+    )[1].split(
+        "      - name: Resolve exact product version and runner architecture\n",
+        maxsplit=1,
+    )[0]
+    assert "unset SSH_AUTH_SOCK" in candidate_ssh_step
+    assert "umask 077" in candidate_ssh_step
+    assert '--basetemp="$RUNNER_TEMP/oe-candidate-ssh"' in candidate_ssh_step
+
     for marker in (
         "unsigned and not notarized",
         "## Supported Workflows",

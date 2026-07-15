@@ -6,14 +6,19 @@ on:
     paths:
       - ".github/workflows/openevo-desktop.yml"
       - ".github/workflows/openevo-desktop-candidate.yml"
+      - ".github/workflows/openevo-python.yml"
       - "pyproject.toml"
       - "uv.lock"
       - "desktop/**"
+      - "src/openevo/deployment/**"
       - "scripts/ci/smoke_openevo_desktop_bundle.py"
       - "scripts/ci/smoke_openevo_desktop_sidecar.py"
       - "scripts/ci/write_sha256.py"
       - "tests/ci/test_build_sidecar.py"
       - "tests/ci/test_check_openevo_release.py"
+      - "tests/ci/test_openevo_python_workflow.py"
+      - "tests/openevo/remote/**"
+      - "tests/openevo/sidecar/test_fd_xattrs.py"
       - "tests/openevo/sidecar/test_native_workspace.py"
       - "tests/openevo/sidecar/test_workspace_import_lifecycle.py"
       - "tests/openevo/sidecar/test_workspace_imports.py"
@@ -141,7 +146,9 @@ jobs:
 
       - name: Exercise macOS APFS workspace ingest and store lifecycle
         run: |
-          uv run python -m pytest \
+          umask 077
+          uv run python -m pytest --basetemp="$RUNNER_TEMP/oe-workspace" \
+            tests/openevo/sidecar/test_fd_xattrs.py \
             tests/openevo/sidecar/test_native_workspace.py \
             tests/openevo/sidecar/test_workspace_imports.py \
             tests/openevo/sidecar/test_workspace_import_lifecycle.py \
@@ -149,7 +156,9 @@ jobs:
 
       - name: Exercise macOS fixed SSH executable and process authority
         run: |
-          uv run python -m pytest \
+          unset SSH_AUTH_SOCK
+          umask 077
+          uv run python -m pytest --basetemp="$RUNNER_TEMP/oe-ssh" \
             tests/openevo/remote/test_system_executables.py \
             tests/openevo/remote/test_host_keys.py \
             tests/openevo/remote/test_ssh_transport.py \

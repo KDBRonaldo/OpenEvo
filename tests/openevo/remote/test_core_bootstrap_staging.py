@@ -1609,6 +1609,13 @@ def test_core_python_runtime_bootstraps_verified_uv_when_python_and_uv_are_absen
         f"home = {str(home)!r}",
         1,
     )
+    system_prefixes = 'for prefix in ("/usr/local/bin", "/usr/bin", home + "/.local/bin"):'
+    assert script.count(system_prefixes) == 1
+    script = script.replace(
+        system_prefixes,
+        f"for prefix in ({str(empty_path)!r},):",
+        1,
+    )
     script = script.replace(
         "https://github.com/astral-sh/uv/releases/download/0.11.28/uv-x86_64-unknown-linux-gnu.tar.gz",
         archive_path.as_uri(),

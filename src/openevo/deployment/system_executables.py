@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import ctypes
+import errno
 import os
 from pathlib import Path
 import secrets
@@ -172,7 +173,7 @@ class VerifiedSystemExecutable:
 
     @property
     def execution_path(self) -> str:
-        return f"/dev/fd/{self._descriptor}"
+        return _verified_execution_path(self._path, self._descriptor)
 
     @property
     def display_path(self) -> str:
@@ -1247,11 +1248,20 @@ def run_packaged_owned_subprocess_birth(arguments: list[str]) -> None:
     agent_socket = os.environ.get("SSH_AUTH_SOCK")
     if agent_socket is not None:
         environment["SSH_AUTH_SOCK"] = agent_socket
+    execution_path = _verified_execution_path(payload[2], executable_descriptor)
     os.execve(
-        f"/dev/fd/{executable_descriptor}",
+        execution_path,
         payload[2:],
         environment,
     )
+
+
+def _verified_execution_path(path: str, descriptor: int) -> str:
+    if sys.platform.startswith("linux"):
+        return f"/dev/fd/{descriptor}"
+    if sys.platform == "darwin":
+        return path
+    raise OSError(errno.ENOTSUP, "verified system execution is unsupported")
 
 
 def _canonical_descriptor(value: str) -> int:

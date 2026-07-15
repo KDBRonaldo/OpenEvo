@@ -1141,7 +1141,7 @@ def test_reconcile_preserves_import_on_transient_filesystem_errors(
 
         monkeypatch.setattr(workspace_imports_module.os, "read", fail_metadata_read)
     else:
-        real_operation = workspace_imports_module.os.getxattr
+        real_operation = workspace_imports_module._xattrs.getxattr
 
         def fail_archive_xattr(
             descriptor: int,
@@ -1153,7 +1153,7 @@ def test_reconcile_preserves_import_on_transient_filesystem_errors(
                 raise OSError(errno.EIO, "injected archive xattr failure")
             return real_operation(descriptor, attribute)
 
-        monkeypatch.setattr(workspace_imports_module.os, "getxattr", fail_archive_xattr)
+        monkeypatch.setattr(workspace_imports_module._xattrs, "getxattr", fail_archive_xattr)
 
     with pytest.raises((OSError, WorkspaceImportIntegrityError)):
         WorkspaceImportStore(root)
@@ -1166,7 +1166,7 @@ def test_reconcile_preserves_import_on_transient_filesystem_errors(
     elif fault == "metadata_read":
         monkeypatch.setattr(workspace_imports_module.os, "read", real_operation)
     else:
-        monkeypatch.setattr(workspace_imports_module.os, "getxattr", real_operation)
+        monkeypatch.setattr(workspace_imports_module._xattrs, "getxattr", real_operation)
     store.reconcile()
     with store.resolve(import_ref, ownership=_ownership(import_ref)) as stream:
         assert stream.read() == _simple_archive()
@@ -1282,11 +1282,15 @@ def test_restart_rejects_forged_root_marker_and_xattr_after_offline_replacement(
         encoding="ascii",
     )
     os.chmod(marker_path, 0o600)
-    os.setxattr(
-        root,
-        workspace_imports_module._ROOT_TOKEN_XATTR,
-        bytes.fromhex(marker["store_token"]),
-    )
+    root_descriptor = os.open(root, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        workspace_imports_module._xattrs.setxattr(
+            root_descriptor,
+            workspace_imports_module._ROOT_TOKEN_XATTR,
+            bytes.fromhex(marker["store_token"]),
+        )
+    finally:
+        os.close(root_descriptor)
 
     with pytest.raises(
         WorkspaceImportStoreConfigurationError,

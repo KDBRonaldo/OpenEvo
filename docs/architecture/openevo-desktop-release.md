@@ -614,15 +614,20 @@ are likewise reserved and unavailable; HTTP(S) proxy URLs without user-info
 remain supported.
 
 Release SSH, ssh-keyscan, and rsync calls use platform-fixed allowlisted absolute
-binaries. The launcher verifies root ownership, regular-file type, executable
-mode, link count one, non-group/world-writable ancestors and file metadata, and
-holds the executable identity through process birth. The original host
+binaries. Core verifies root ownership, regular-file type, executable mode, link
+count one, non-group/world-writable ancestors and file metadata. Linux launches
+through the held executable FD. On macOS, the top-level SSH/rsync birth child
+compares that FD with the fixed system path immediately before execution;
+ssh-keyscan is verified before launch and again after completion. The original host
 `SSH_AUTH_SOCK` path is never supplied to OpenSSH. Every SSH/rsync/tunnel spawn
 first connects and revalidates the held upstream socket, then exposes only a
 fresh owner-private one-shot relay. Kernel peer PID, the owned child session and
 process group, and the held SSH executable vnode jointly authorize its sole
-downstream connection. Rsync names that held SSH FD in `-e` and inherits it
-through the nested exec. Relay buffers, accept lifetime, cleanup retries, and
+downstream connection. Rsync names the held SSH FD in `-e` on Linux; on macOS it
+uses the fixed root-owned `/usr/bin/ssh` path while inheriting the verified FD as
+the parent-side identity authority. Concurrent privileged replacement of
+`/usr/bin` is outside the unsigned Desktop threat boundary. Relay buffers,
+accept lifetime, cleanup retries, and
 retained cleanup authorities are bounded; uncertain path cleanup never removes
 a replacement. Process-group birth and cleanup authority is retained across
 cancellation. Linux/macOS externalBin combination smokes cover this native

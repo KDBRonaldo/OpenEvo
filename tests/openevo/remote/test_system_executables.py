@@ -6,6 +6,7 @@ from pathlib import Path
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -67,7 +68,35 @@ def test_fixed_system_executable_holds_verified_root_owned_identity(path: str) -
         assert metadata.st_nlink == 1
         assert stat.S_IMODE(metadata.st_mode) & 0o022 == 0
         assert authority.display_path == path
-        assert authority.execution_path == f"/dev/fd/{authority.descriptor}"
+        assert authority.execution_path == (
+            path if sys.platform == "darwin" else f"/dev/fd/{authority.descriptor}"
+        )
+
+
+def test_darwin_system_executable_uses_revalidated_root_owned_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(executables.sys, "platform", "darwin")
+
+    with executables.VerifiedSystemExecutable.open(
+        executables.SSH_EXECUTABLE
+    ) as authority:
+        authority.verify_path_binding()
+        assert authority.execution_path == executables.SSH_EXECUTABLE
+
+
+def test_system_executable_rejects_unsupported_execution_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(executables.sys, "platform", "win32")
+
+    with executables.VerifiedSystemExecutable.open(
+        executables.SSH_EXECUTABLE
+    ) as authority:
+        with pytest.raises(OSError) as caught:
+            _ = authority.execution_path
+
+    assert caught.value.errno == errno.ENOTSUP
 
 
 @pytest.mark.parametrize(
@@ -723,6 +752,66 @@ def test_packaged_sidecar_dispatches_owned_subprocess_birth_to_held_executable()
     assert len(fields) == 3
     assert all(field.isdigit() for field in fields)
     assert fields[0] == fields[1] == fields[2]
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected_path_kind"),
+    [("linux", "descriptor"), ("darwin", "verified_path")],
+)
+def test_owned_subprocess_birth_uses_platform_execution_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    expected_path_kind: str,
+) -> None:
+    observed: list[tuple[str | int, list[str], dict[str, str]]] = []
+
+    def execve(
+        path: str | int,
+        argv: list[str],
+        environment: dict[str, str],
+    ) -> None:
+        observed.append((path, argv, environment))
+
+    monkeypatch.setattr(executables.sys, "platform", platform)
+    monkeypatch.setattr(executables.os, "execve", execve)
+    birth_path = tmp_path / "birth-record"
+    birth_path.touch(mode=0o600)
+
+    with executables.VerifiedSystemExecutable.open(
+        executables.SSH_EXECUTABLE
+    ) as executable:
+        with birth_path.open("r+b", buffering=0) as birth_record:
+            inherited_birth_fd = os.dup(birth_record.fileno())
+            try:
+                executables.run_packaged_owned_subprocess_birth(
+                    [
+                        executables.OWNED_SUBPROCESS_BIRTH_ARGUMENT,
+                        str(inherited_birth_fd),
+                        str(executable.descriptor),
+                        executables.SSH_EXECUTABLE,
+                        "-V",
+                    ]
+                )
+            finally:
+                try:
+                    os.close(inherited_birth_fd)
+                except OSError:
+                    pass
+
+        expected_path = (
+            f"/dev/fd/{executable.descriptor}"
+            if expected_path_kind == "descriptor"
+            else executables.SSH_EXECUTABLE
+        )
+        assert observed == [
+            (
+                expected_path,
+                [executables.SSH_EXECUTABLE, "-V"],
+                {},
+            )
+        ]
+        executable.verify_path_binding()
 
 
 def test_packaged_birth_dispatch_rejects_non_file_birth_authority() -> None:
