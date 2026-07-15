@@ -103,22 +103,29 @@ to the event loop.
 Custom target directories, non-Linux Core hosts, and third-party runtimes keep
 the ordinary two-argument backend download behavior. Gateway ignores backend
 return metadata and confines the destination below a held `0700` temporary root.
-On Linux destinations, an event ledger cumulatively charges create and closed
-write work, including entries later deleted; scanner credit is available only
+On Linux destinations, Core creates and watches the empty destination before the
+backend starts. An event ledger cumulatively charges create and closed write
+work, including entries later deleted; scanner credit is available only
 while the surviving pathname still binds the charged inode. Event loss,
 inspection errors, public download failure, and unprovable byte work exhaust the
-same non-refundable budget. Immediately after download, a runtime-private
+same non-refundable budget. Directories authorized by the injection file plan
+are created and recursively watched before download. Any other directory created
+during download is rejected because mutations inside it can precede installation
+of its watch. Immediately after download, a runtime-private
 no-follow scanner performs two stable enumerations and streamed hashing against
 the remaining 4096-file, 16384-node, and 64-MiB authority; agent-system readback
 receives only its remainder. Non-Linux compatibility retains the final bounded
 scanner but does not claim Linux event-generation evidence.
 
 The temporary root itself and every recursive cleanup entry use the same random
-no-replace quarantine protocol. Cancellation gives a public downloader one
-second to join. A downloader still running after that bound loses its original
-pathname through root quarantine; Core reports the unresolved ownership and
-defers cleanup until the downloader task actually exits. This path does not use
-the evolution payload scanner's 256-file/16-GiB defaults.
+no-replace quarantine protocol. Built-in backends return an internal download
+operation whose termination waits for their real subprocess completion. A
+legacy downloader has no equivalent authority: after cancellation, an asyncio
+task becoming `cancelled` does not prove that hidden `to_thread` or subprocess
+work ended. Core therefore quarantines its root and retains that isolation for
+the process lifetime. An authoritative operation that exceeds the one-second
+join bound remains quarantined until its real termination operation completes.
+This path does not use the evolution payload scanner's 256-file/16-GiB defaults.
 
 ## Docker vs Apptainer
 

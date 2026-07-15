@@ -16,7 +16,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Any, Coroutine, Final, Sequence
 
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
@@ -981,6 +981,9 @@ class _RuntimeDownloadAccounting:
     @property
     def max_bytes(self) -> int:
         return self._budget.max_bytes
+
+    def exhaust(self) -> None:
+        self._budget.exhaust()
 
     def _receipt_path(self, relative_path: str) -> str:
         if not relative_path:
@@ -1969,6 +1972,7 @@ def _create_runtime_readback_temporary_root(
 
 
 _RUNTIME_READBACK_CLEANUP_TASKS: set[asyncio.Task[object]] = set()
+_PERMANENT_RUNTIME_READBACK_ISOLATIONS: list[_RuntimeReadbackTemporaryRoot] = []
 
 
 def _schedule_runtime_readback_root_cleanup(
@@ -2115,6 +2119,14 @@ class BaseRuntime(ABC):
     @abstractmethod
     async def download_dir(self, remote_path: str, local_path: str) -> None:
         """Copy a directory tree from inside the runtime to the host."""
+
+    def _start_download_dir_operation(
+        self, remote_path: str, local_path: str
+    ) -> RuntimeDownloadOperation | None:
+        """Return real termination authority when the backend can provide it."""
+
+        del remote_path, local_path
+        return None
 
     def resolve_host_path(self, runtime_path: str) -> Path | None:
         """Map a runtime path back to a host path via the session bind mount."""
@@ -2765,6 +2777,28 @@ class _RuntimeDownloadQuotaExceeded(RuntimePathSecurityError):
     pass
 
 
+class RuntimeDownloadOperation:
+    """Backend-owned proof that cancellation joins the real download worker."""
+
+    def __init__(self, awaitable: Coroutine[Any, Any, None]) -> None:
+        self.task = asyncio.create_task(awaitable)
+
+    async def terminate(self) -> None:
+        self.task.cancel()
+        while not self.task.done():
+            try:
+                await asyncio.shield(self.task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if not self.task.cancelled():
+            try:
+                self.task.result()
+            except BaseException:
+                pass
+
+
 @dataclass(slots=True)
 class _RuntimeDownloadWatch:
     descriptor: int
@@ -2821,6 +2855,7 @@ class _RuntimeDownloadEventMonitor:
         self._closed = False
         try:
             self._add_watch(parent_fd, relative_path=None)
+            self._attach_target(parent_fd)
         except BaseException:
             self.close()
             raise
@@ -2983,21 +3018,11 @@ class _RuntimeDownloadEventMonitor:
             observed=observed,
         )
         if is_directory:
-            child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=watch.descriptor)
-            try:
-                if _readback_object_identity(os.fstat(child_fd)) != (
-                    _readback_object_identity(observed)
-                ):
-                    raise RuntimePathSecurityError(
-                        "runtime compatibility download directory changed while opening"
-                    )
-                self._observe_existing_directory(
-                    child_fd,
-                    relative_path=relative_path,
-                    depth=0,
-                )
-            finally:
-                os.close(child_fd)
+            self._accounting.exhaust()
+            raise RuntimePathSecurityError(
+                "runtime compatibility download created a directory with an "
+                "unobservable mutation window"
+            )
 
     def _handle_event(self, watch_id: int, mask: int, name: str) -> None:
         watch = self._watches.get(watch_id)
@@ -3447,23 +3472,31 @@ def _scan_runtime_download_sync(
 
 
 async def _stop_runtime_download_tasks(
-    download: asyncio.Task[object],
+    download: asyncio.Task[None],
     monitor: asyncio.Task[None],
     stop: threading.Event,
     temporary_root: _RuntimeReadbackTemporaryRoot,
+    operation: RuntimeDownloadOperation | None,
 ) -> bool:
     stop.set()
     quarantined = False
+    cancellation_requested = not download.done()
+    termination: asyncio.Task[None] | None = None
     if not download.done():
         temporary_root.quarantine_for_worker()
         quarantined = True
-        download.cancel()
+        if operation is None:
+            download.cancel()
+        else:
+            termination = asyncio.create_task(operation.terminate())
     deadline = asyncio.get_running_loop().time() + _DOWNLOAD_JOIN_SECONDS
-    pending: set[asyncio.Task[object]] = {
-        task for task in (download, monitor) if not task.done()
+    pending: set[asyncio.Task[None]] = {
+        task
+        for task in (download, monitor, termination)
+        if task is not None and not task.done()
     }
-    for completed in (download, monitor):
-        if completed.done() and not completed.cancelled():
+    for completed in (download, monitor, termination):
+        if completed is not None and completed.done() and not completed.cancelled():
             completed.exception()
     while pending:
         remaining = deadline - asyncio.get_running_loop().time()
@@ -3476,12 +3509,17 @@ async def _stop_runtime_download_tasks(
         for completed in done:
             if not completed.cancelled():
                 completed.exception()
-    if pending:
+    joined = not pending and (operation is not None or not cancellation_requested)
+    if not joined:
         if not quarantined:
             temporary_root.quarantine_for_worker()
+            quarantined = True
+        if operation is None:
+            _PERMANENT_RUNTIME_READBACK_ISOLATIONS.append(temporary_root)
+            return False
         remaining_tasks = set(pending)
 
-        def release(completed: asyncio.Task[object]) -> None:
+        def release(completed: asyncio.Task[None]) -> None:
             if not completed.cancelled():
                 completed.exception()
             remaining_tasks.discard(completed)
@@ -3505,6 +3543,7 @@ async def _bounded_public_runtime_readback(
     budget: RuntimeReadbackBudget,
     relative_prefix: str,
     temporary_root: _RuntimeReadbackTemporaryRoot,
+    expected_directories: Sequence[str] = (),
 ) -> RuntimeReadback:
     if not isinstance(budget, RuntimeReadbackBudget):
         raise TypeError("runtime compatibility readback requires the closed budget authority")
@@ -3545,6 +3584,49 @@ async def _bounded_public_runtime_readback(
             raise RuntimePathSecurityError(
                 "runtime compatibility readback target already exists"
             )
+        os.mkdir(target_name, mode=0o700, dir_fd=parent_pin.descriptor)
+        target_fd = os.open(target_name, _DIRECTORY_FLAGS, dir_fd=parent_pin.descriptor)
+        try:
+            directories: set[tuple[str, ...]] = set()
+            if len(expected_directories) > RUNTIME_READBACK_MAX_NODES:
+                raise RuntimePathSecurityError(
+                    "runtime compatibility download directory authority exceeds its bound"
+                )
+            for value in expected_directories:
+                if (
+                    not isinstance(value, str)
+                    or not value
+                    or value.startswith("/")
+                    or "\x00" in value
+                ):
+                    raise RuntimePathSecurityError(
+                        "runtime compatibility download directory authority is invalid"
+                    )
+                parts = tuple(value.split("/"))
+                if (
+                    len(parts) > _COPY_MAX_DEPTH
+                    or any(part in {"", ".", ".."} for part in parts)
+                ):
+                    raise RuntimePathSecurityError(
+                        "runtime compatibility download directory authority is invalid"
+                    )
+                directories.add(parts)
+            for parts in sorted(directories, key=lambda item: (len(item), item)):
+                pin = _open_relative_directories(
+                    target_fd,
+                    parts,
+                    create=True,
+                    expected_owner=os.geteuid(),
+                )
+                try:
+                    pin.verify(
+                        target_fd,
+                        label="runtime compatibility download directory authority",
+                    )
+                finally:
+                    pin.close()
+        finally:
+            os.close(target_fd)
         download_method = getattr(runtime, "download_dir", None)
         if not callable(download_method):
             raise TypeError("runtime does not implement the public download contract")
@@ -3566,19 +3648,27 @@ async def _bounded_public_runtime_readback(
                 accounting,
             )
         )
-
-        async def invoke_download() -> object:
-            await start_download.wait()
-            return await download_method(remote_path, str(local_path))
-
-        start_download = asyncio.Event()
-        download = asyncio.create_task(invoke_download())
+        download: asyncio.Task[None] | None = None
+        operation: RuntimeDownloadOperation | None = None
         try:
             while not ready.is_set():
                 if monitor.done():
                     monitor.result()
                 await asyncio.sleep(0)
-            start_download.set()
+            operation_method = getattr(runtime, "_start_download_dir_operation", None)
+            if callable(operation_method):
+                operation = operation_method(remote_path, str(local_path))
+                if operation is not None and not isinstance(
+                    operation, RuntimeDownloadOperation
+                ):
+                    raise RuntimePathSecurityError(
+                        "runtime download operation authority is invalid"
+                    )
+            download = (
+                operation.task
+                if operation is not None
+                else asyncio.create_task(download_method(remote_path, str(local_path)))
+            )
             done, _pending = await asyncio.wait(
                 {download, monitor},
                 return_when=asyncio.FIRST_COMPLETED,
@@ -3594,12 +3684,26 @@ async def _bounded_public_runtime_readback(
             await monitor
         except BaseException as exc:
             budget.exhaust()
-            joined = await _stop_runtime_download_tasks(
-                download,
-                monitor,
-                stop,
-                temporary_root,
-            )
+            if download is None:
+                stop.set()
+                while not monitor.done():
+                    try:
+                        await asyncio.shield(monitor)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                if not monitor.cancelled():
+                    monitor.exception()
+                joined = True
+            else:
+                joined = await _stop_runtime_download_tasks(
+                    download,
+                    monitor,
+                    stop,
+                    temporary_root,
+                    operation,
+                )
             if not joined:
                 raise RuntimePathSecurityError(
                     "runtime compatibility download remains active after its hard join bound"

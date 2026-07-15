@@ -156,20 +156,29 @@ session to succeed.
 For a custom target directory, non-Linux Core host, or third-party runtime,
 Gateway preserves the public backend download path. It ignores backend-returned
 inventory and downloads below a held private temporary root with a concurrent
-logical file/node/byte quota. On Linux destinations, a cumulative event ledger
+logical file/node/byte quota. On Linux, Core creates and watches the empty target
+before invoking the backend. A cumulative event ledger
 charges created files/nodes and closed-write bytes even when the entry is later
 deleted. A surviving entry gives the scanner credit only while pathname and
 inode still match, so download and scan share one non-refundable accounting
 authority without double charging the same receipt object. Download failure,
 event loss, monitor/inspection errors, and unprovable work exhaust that
 authority before agent-system target readback can run.
+Directories authorized by the injection file plan are created and recursively
+watched before download. Any other child directory is rejected because work
+inside it can occur between its creation event and installation of a recursive
+watch; allowing that window would make cumulative accounting unverifiable.
 
 A runtime-private no-follow scanner then performs the exact receipt walk with
 the same 4096-file, 16384-node, and 64-MiB limits. The temporary root and every
 recursive child are removed only through FD-bound random quarantine. A public
-downloader that does not accept cancellation has a one-second hard join bound;
-afterward Core quarantines its root, reports unresolved ownership, and schedules
-cleanup only after the task exits. Non-Linux compatibility retains the final
+download operation carries backend-owned completion and termination authority.
+Built-in Docker and Apptainer operations cancel and join their real subprocess.
+Legacy downloaders do not gain authority when an asyncio wrapper becomes
+`cancelled`, because hidden `to_thread` or subprocess work may still be active;
+their root is permanently isolated for the process lifetime. An authoritative
+operation that exceeds the one-second join bound remains quarantined until its
+termination operation completes. Non-Linux compatibility retains the final
 bounded scanner but does not assert Linux event-generation evidence. This path
 does not reuse the evolution payload scanner's 256-file and 16-GiB defaults.
 

@@ -106,6 +106,15 @@ def test_public_download_contract_remains_abstract_two_argument_none_api() -> No
     assert DockerRuntime.download_dir is not BaseRuntime.download_dir
     assert ApptainerRuntime.download_file is not BaseRuntime.download_file
     assert ApptainerRuntime.download_dir is not BaseRuntime.download_dir
+    assert (
+        DockerRuntime._start_download_dir_operation
+        is not BaseRuntime._start_download_dir_operation
+    )
+    assert (
+        ApptainerRuntime._start_download_dir_operation
+        is not BaseRuntime._start_download_dir_operation
+    )
+    assert not hasattr(runtime_api, "RuntimeDownloadOperation")
     assert not hasattr(runtime_api, "RuntimeReadback")
     assert not hasattr(runtime_api, "RuntimeReadbackBudget")
     assert not hasattr(runtime_api, "RuntimeReadbackFile")
@@ -146,7 +155,7 @@ async def test_compatibility_readback_accepts_257_files_with_receipt_budget(
     class PublicDownloadRuntime:
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             for index in range(257):
                 (target / f"file-{index:03d}.txt").write_bytes(b"x")
 
@@ -171,7 +180,7 @@ async def test_compatibility_readback_rejects_more_than_4096_files(
     class PublicDownloadRuntime:
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             for index in range(runtime_base.RUNTIME_READBACK_MAX_FILES + 1):
                 (target / f"file-{index:04d}.txt").touch()
 
@@ -200,7 +209,7 @@ async def test_compatibility_download_quota_cancels_public_download_before_compl
 
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             try:
                 for index in range(10_000):
                     (target / f"file-{index:05d}.txt").touch()
@@ -211,6 +220,13 @@ async def test_compatibility_download_quota_cancels_public_download_before_compl
                 self.cancelled = True
                 raise
             self.completed = True
+
+        def _start_download_dir_operation(
+            self, remote_path: str, local_path: str
+        ) -> runtime_base.RuntimeDownloadOperation:
+            return runtime_base.RuntimeDownloadOperation(
+                self.download_dir(remote_path, local_path)
+            )
 
     budget = RuntimeReadbackBudget()
     runtime = PublicDownloadRuntime()
@@ -237,7 +253,7 @@ async def test_compatibility_readback_rejects_more_than_64_mib(
     class PublicDownloadRuntime:
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             oversized = target / "oversized.bin"
             with oversized.open("wb") as stream:
                 stream.truncate(runtime_base.RUNTIME_READBACK_MAX_BYTES + 1)
@@ -265,7 +281,7 @@ async def test_compatibility_download_accounts_create_unlink_churn(
 
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             await asyncio.sleep(0.05)
             churn = target / "churn.tmp"
             for _index in range(5_000):
@@ -292,7 +308,7 @@ async def test_compatibility_download_accounts_write_unlink_byte_churn(
     class ChurningRuntime:
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             await asyncio.sleep(0.05)
             for index in range(65):
                 churn = target / f"churn-{index:02d}.bin"
@@ -312,13 +328,38 @@ async def test_compatibility_download_accounts_write_unlink_byte_churn(
 
 
 @pytest.mark.asyncio
+async def test_compatibility_download_rejects_new_directory_watch_window(
+    tmp_path: Path,
+) -> None:
+    class NestedChurningRuntime:
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir(exist_ok=True)
+            nested = target / "created-during-download"
+            nested.mkdir()
+            churn = nested / "gone-before-watch.tmp"
+            for _index in range(5_000):
+                churn.touch()
+                churn.unlink()
+
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimePathSecurityError, match="directory.*window"):
+        await _compatibility_readback(NestedChurningRuntime(), tmp_path, budget=budget)
+
+    assert budget.files_consumed >= budget.max_files
+    assert budget.nodes_consumed >= budget.max_nodes
+    assert budget.bytes_consumed >= budget.max_bytes
+
+
+@pytest.mark.asyncio
 async def test_compatibility_download_failure_exhausts_shared_budget(
     tmp_path: Path,
 ) -> None:
     class FailingRuntime:
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             (target / "partial.txt").write_text("partial", encoding="utf-8")
             raise RuntimeError("injected public download failure")
 
@@ -340,7 +381,7 @@ async def test_compatibility_monitor_oserror_exhausts_shared_budget(
     class PublicDownloadRuntime:
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             (target / "result.txt").write_text("result", encoding="utf-8")
 
     def fail_quota_inspection(*_args: object, **_kwargs: object) -> None:
@@ -372,7 +413,7 @@ async def test_compatibility_download_refusing_cancellation_has_hard_join_bound(
 
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             (target / "result.txt").write_text("result", encoding="utf-8")
             self.started.set()
             while not self.release.is_set():
@@ -402,11 +443,50 @@ async def test_compatibility_download_refusing_cancellation_has_hard_join_bound(
         assert budget.bytes_consumed >= budget.max_bytes
     finally:
         runtime.release.set()
-        deadline = asyncio.get_running_loop().time() + 2
-        while list(tmp_path.glob(".openevo-readback-quarantine-*")):
-            if asyncio.get_running_loop().time() >= deadline:
-                pytest.fail("deferred runtime readback cleanup did not complete")
-            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        assert list(tmp_path.glob(".openevo-readback-quarantine-*"))
+
+
+@pytest.mark.asyncio
+async def test_cancelled_to_thread_download_is_permanently_isolated(
+    tmp_path: Path,
+) -> None:
+    class ThreadedRuntime:
+        started = threading.Event()
+        release = threading.Event()
+
+        @classmethod
+        def blocking_download(cls, local_path: str) -> None:
+            target = Path(local_path)
+            target.mkdir(exist_ok=True)
+            (target / "partial.txt").write_text("partial", encoding="utf-8")
+            cls.started.set()
+            cls.release.wait(5)
+
+        async def download_dir(self, _remote_path: str, local_path: str) -> None:
+            await asyncio.to_thread(self.blocking_download, local_path)
+
+    runtime = ThreadedRuntime()
+    budget = RuntimeReadbackBudget()
+    task = asyncio.create_task(_compatibility_readback(runtime, tmp_path, budget=budget))
+    deadline = asyncio.get_running_loop().time() + 1
+    while not runtime.started.is_set():
+        if asyncio.get_running_loop().time() >= deadline:
+            pytest.fail("threaded downloader did not start")
+        await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(RuntimePathSecurityError, match="hard join bound"):
+        await asyncio.wait_for(task, timeout=2)
+
+    quarantines = list(tmp_path.glob(".openevo-readback-quarantine-*"))
+    assert len(quarantines) == 1
+    runtime.release.set()
+    await asyncio.sleep(0.1)
+    assert quarantines[0].exists()
+    assert budget.files_consumed >= budget.max_files
+    assert budget.nodes_consumed >= budget.max_nodes
+    assert budget.bytes_consumed >= budget.max_bytes
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@ import shlex
 import shutil
 from pathlib import Path
 
-from openevo.runtime.base import BaseRuntime
+from openevo.runtime.base import BaseRuntime, RuntimeDownloadOperation
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
 logger = logging.getLogger(__name__)
@@ -190,6 +190,11 @@ class ApptainerRuntime(BaseRuntime):
             raise RuntimeError(
                 f"apptainer download_dir failed with exit code {rc}"
             )
+
+    def _start_download_dir_operation(
+        self, remote_path: str, local_path: str
+    ) -> RuntimeDownloadOperation:
+        return RuntimeDownloadOperation(self.download_dir(remote_path, local_path))
 
     @staticmethod
     def _resolve_binary() -> str:

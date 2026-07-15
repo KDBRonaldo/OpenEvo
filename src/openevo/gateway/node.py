@@ -1326,6 +1326,17 @@ async def _runtime_injection_receipt_from_readback(
                 for entry in readback.files
             ]
         else:
+            expected_directories: set[str] = set()
+            authority_files = plan.authority.get("files")
+            if not isinstance(authority_files, list):
+                raise ValueError("runtime injection file authority is invalid")
+            for item in authority_files:
+                path = item.get("relative_path") if isinstance(item, dict) else None
+                if not isinstance(path, str) or not path.startswith("evolution/"):
+                    continue
+                parts = path.removeprefix("evolution/").split("/")[:-1]
+                for depth in range(1, len(parts) + 1):
+                    expected_directories.add("/".join(parts[:depth]))
             readback = await _bounded_public_runtime_readback(
                 runtime,
                 target_dir,
@@ -1333,6 +1344,7 @@ async def _runtime_injection_receipt_from_readback(
                 budget=budget,
                 relative_prefix="evolution",
                 temporary_root=temporary,
+                expected_directories=tuple(sorted(expected_directories)),
             )
             files = [
                 {

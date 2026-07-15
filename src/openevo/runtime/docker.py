@@ -16,7 +16,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Final, Literal
 
-from openevo.runtime.base import BaseRuntime
+from openevo.runtime.base import BaseRuntime, RuntimeDownloadOperation
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     ManagedCredentialMount,
@@ -1418,3 +1418,8 @@ class DockerRuntime(BaseRuntime):
         )
         if rc != 0:
             raise RuntimeError(f"docker cp download_dir failed with exit code {rc}")
+
+    def _start_download_dir_operation(
+        self, remote_path: str, local_path: str
+    ) -> RuntimeDownloadOperation:
+        return RuntimeDownloadOperation(self.download_dir(remote_path, local_path))

@@ -4602,7 +4602,7 @@ async def test_gateway_runtime_receipt_ignores_plugin_reported_inventory(
             del kwargs
             self.called = True
             destination = Path(str(args[1]))
-            destination.mkdir(parents=True)
+            destination.mkdir(parents=True, exist_ok=True)
             (destination / "forged.txt").write_text("forged", encoding="utf-8")
             return {"files": "plugin-controlled"}
 
@@ -4735,7 +4735,7 @@ async def test_gateway_deadline_is_bounded_when_public_download_refuses_cancel(
 
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             (target / "partial.txt").write_text("partial", encoding="utf-8")
             self.started.set()
             while not self.release.is_set():
@@ -4764,11 +4764,8 @@ async def test_gateway_deadline_is_bounded_when_public_download_refuses_cancel(
         assert list(tmp_path.glob(".openevo-readback-quarantine-*"))
     finally:
         runtime.release.set()
-        deadline = asyncio.get_running_loop().time() + 2
-        while list(tmp_path.glob(".openevo-readback-quarantine-*")):
-            if asyncio.get_running_loop().time() >= deadline:
-                pytest.fail("deferred Gateway readback cleanup did not complete")
-            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        assert list(tmp_path.glob(".openevo-readback-quarantine-*"))
 
 
 @pytest.mark.asyncio
@@ -4783,7 +4780,7 @@ async def test_gateway_compatibility_readback_shares_budget_with_agent_system(
     class PublicDownloadRuntime:
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
             target = Path(local_path)
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             for index in range(257):
                 (target / f"file-{index:03d}.txt").write_bytes(b"x")
 
@@ -4828,12 +4825,12 @@ async def test_gateway_compatibility_readback_shares_budget_with_agent_system(
         plan=injection.staged.injection_plan,
     )
 
-    assert observed["before"] == (257, 514, 257)
+    assert observed["before"] == (257, 518, 257)
     assert observed["sealed"] is False
     budget = observed["budget"]
     assert isinstance(budget, RuntimeReadbackBudget)
     assert budget.files_consumed == 258
-    assert budget.nodes_consumed == 516
+    assert budget.nodes_consumed == 520
     assert budget.bytes_consumed == 258
     assert len(receipt["files"]) == 258
 
