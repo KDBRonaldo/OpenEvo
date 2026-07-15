@@ -115,15 +115,16 @@ local inference.
 
 ## Limitations
 
-This foundation still does not include:
+This foundation layer still does not own:
 
-- local credential vault or keychain integration;
+- the Desktop native credential vault and Keychain broker, which are supplied by
+  the release native-host/sidecar composition;
 - host-wide remote dependency installation or repair beyond bootstrap's
   user-site `openevo` package and `huggingface_hub` installs;
 - Docker daemon or Compose lifecycle management;
 - vLLM/model-serving lifecycle management;
 - remote OpenEvo backend startup;
-- Desktop UI.
+- Desktop UI composition.
 
 The bootstrap layer adds run-directory preparation and process-scoped model
 download attempts. Full lifecycle managers can be added behind these protocols

@@ -24,6 +24,7 @@ import {
   Sparkles,
   Square,
   TerminalSquare,
+  Trash2,
   Wrench,
   X,
   XCircle,
@@ -627,6 +628,32 @@ export function DesktopProductApp({
             setActionError(null);
             setConnectionSettingsOpen(false);
             setSelectedProjectId((current) => current ?? snapshot.projects.find((item) => item.profile_id === observedProfile.profile_id)?.project_id ?? null);
+          }}
+          onConfigureCredential={async (slotKind) => {
+            if (!profile) return false;
+            const result = await act(
+              () => provider.configureCredential(
+                profile.profile_id,
+                slotKind,
+                resourceIntent(snapshot, profile.etag),
+              ),
+              null,
+              true,
+            );
+            return result.saved;
+          }}
+          onClearCredential={async (slotKind) => {
+            if (!profile) return false;
+            const result = await act(
+              () => provider.clearCredential(
+                profile.profile_id,
+                slotKind,
+                resourceIntent(snapshot, profile.etag),
+              ),
+              null,
+              true,
+            );
+            return result.saved;
           }}
         />
       ) : null}
@@ -1572,6 +1599,8 @@ function RemoteWorkspaceDrawer({
   createSaveIntent,
   onSave,
   onCreateObserved,
+  onConfigureCredential,
+  onClearCredential,
 }: {
   profile: RemoteProfileV1 | null;
   observedProfiles: readonly RemoteProfileV1[];
@@ -1581,6 +1610,8 @@ function RemoteWorkspaceDrawer({
   createSaveIntent: (input: ProfileCreateV1) => ProfileSaveIntent;
   onSave: (intent: ProfileSaveIntent) => Promise<ProfileSaveAttemptResult>;
   onCreateObserved: (profile: RemoteProfileV1) => void;
+  onConfigureCredential: (slotKind: RemoteProfileV1["credential_slots"][number]["kind"]) => Promise<boolean>;
+  onClearCredential: (slotKind: RemoteProfileV1["credential_slots"][number]["kind"]) => Promise<boolean>;
 }) {
   const [name, setName] = useState(profile?.name ?? "Research server");
   const [host, setHost] = useState(profile?.host ?? "");
@@ -1589,7 +1620,8 @@ function RemoteWorkspaceDrawer({
   const [httpProxy, setHttpProxy] = useState(profile?.proxy.http_url ?? "");
   const [httpsProxy, setHttpsProxy] = useState(profile?.proxy.https_url ?? "");
   const [noProxy, setNoProxy] = useState(profile?.proxy.no_proxy.join(", ") ?? "");
-  const [dirty, setDirty] = useState(profile !== null && profile.authentication_kind !== "ssh_agent");
+  const [authenticationKind, setAuthenticationKind] = useState<RemoteProfileV1["authentication_kind"]>(profile?.authentication_kind ?? "ssh_agent");
+  const [dirty, setDirty] = useState(false);
   const guardedClose = useGuardedDrawerClose(dirty, onClose);
   const dialogRef = useDialogFocus(guardedClose.requestClose);
   const pendingSaveIntent = useRef<ProfileSaveIntent | null>(null);
@@ -1627,8 +1659,15 @@ function RemoteWorkspaceDrawer({
           </section>
           <section className="form-section">
             <h3>Authentication</h3>
-            <div className="agent-note"><ShieldCheck size={17} /><span>SSH agent</span></div>
-            {profile && profile.authentication_kind !== "ssh_agent" ? <p className="form-error" role="alert">The saved authentication method is unavailable in this release. Save this workspace to use SSH agent.</p> : null}
+            <div className="segmented-control wide" role="tablist" aria-label="SSH authentication" onKeyDown={handleTablistKeyDown}>
+              {(["ssh_agent", "native_password", "native_private_key"] as const).map((kind) => <button key={kind} type="button" role="tab" aria-selected={authenticationKind === kind} tabIndex={authenticationKind === kind ? 0 : -1} className={authenticationKind === kind ? "active" : ""} onClick={() => { setAuthenticationKind(kind); markDirty(); }}>{authenticationKindLabel(kind)}</button>)}
+            </div>
+            {authenticationKind === "ssh_agent" ? <div className="agent-note"><ShieldCheck size={17} /><span>Uses identities already loaded on this Mac</span></div> : null}
+            {profile && profile.authentication_kind === authenticationKind && authenticationKind !== "ssh_agent" ? (
+              <div className="credential-editor">
+                {profile.credential_slots.map((slot) => <div className="credential-editor-row" key={slot.kind}><CredentialStatus slot={slot} /><div className="credential-editor-actions"><button className="secondary-button" type="button" disabled={busy} onClick={() => { void onConfigureCredential(slot.kind); }}>{slot.status === "stored" ? "Replace" : "Configure"}</button>{slot.status === "stored" ? <IconButton label={`Remove ${credentialLabel(slot.kind)}`} disabled={busy} onClick={() => { void onClearCredential(slot.kind); }}><Trash2 size={15} /></IconButton> : null}</div></div>)}
+              </div>
+            ) : null}
           </section>
           <section className="form-section">
             <h3>Network proxy</h3>
@@ -1644,7 +1683,7 @@ function RemoteWorkspaceDrawer({
             host: host.trim(),
             port: parsedPort,
             user: user.trim(),
-            authentication_kind: "ssh_agent",
+            authentication_kind: authenticationKind,
             proxy: {
               http_url: httpProxy.trim() || null,
               https_url: httpsProxy.trim() || null,
@@ -2602,9 +2641,23 @@ function useDialogFocus(onClose: () => void) {
 }
 
 function missingCredentialReason(profile: RemoteProfileV1): string | null {
-  return profile.authentication_kind === "ssh_agent"
+  const requiredKind = profile.authentication_kind === "native_password"
+    ? "ssh_password"
+    : profile.authentication_kind === "native_private_key"
+      ? "ssh_private_key"
+      : null;
+  if (requiredKind === null) return null;
+  return profile.credential_slots.some((slot) => slot.kind === requiredKind && slot.status === "stored")
     ? null
-    : "Switch this remote workspace to SSH agent authentication before connecting.";
+    : `Configure the ${credentialLabel(requiredKind).toLowerCase()} before connecting.`;
+}
+
+function authenticationKindLabel(kind: RemoteProfileV1["authentication_kind"]): string {
+  return {
+    ssh_agent: "SSH agent",
+    native_password: "Password",
+    native_private_key: "Private key",
+  }[kind];
 }
 
 function credentialLabel(kind: RemoteProfileV1["credential_slots"][number]["kind"]): string {

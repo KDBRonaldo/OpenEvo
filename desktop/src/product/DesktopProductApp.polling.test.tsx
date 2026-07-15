@@ -286,6 +286,7 @@ function productionHarness(options: { readonly includeSecondProject?: boolean } 
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
       configureCredential: vi.fn(),
+      clearCredential: vi.fn(),
     },
     fetch,
     reconnectDelaysMs: [],

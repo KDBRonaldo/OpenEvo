@@ -73,6 +73,7 @@ describe("Desktop product provider boundary", () => {
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
       configureCredential: vi.fn(),
+      clearCredential: vi.fn(),
     };
     const fetchMock = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(version));
     const adapterFactory = vi.fn(async ({ native: bridge }) => {
@@ -101,6 +102,7 @@ describe("Desktop product provider boundary", () => {
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
+        clearCredential: vi.fn(),
       },
     });
     expect(provider.providerKind).toBe("desktop_sidecar");
@@ -186,6 +188,7 @@ describe("Desktop product provider boundary", () => {
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
+        clearCredential: vi.fn(),
       },
       adapterFactory,
     })).rejects.toThrow(/forbidden provider kind/i);
@@ -200,6 +203,7 @@ describe("Desktop product provider boundary", () => {
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
+        clearCredential: vi.fn(),
       },
       adapterFactory,
     })).rejects.toThrow(/missing required release features/i);
@@ -229,6 +233,7 @@ describe("Desktop product provider boundary", () => {
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
+        clearCredential: vi.fn(),
       },
       adapterFactory: async ({ native }) => {
         await native.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0002", streamEpoch: 1 });
@@ -249,6 +254,7 @@ describe("Desktop product provider boundary", () => {
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
+        clearCredential: vi.fn(),
       },
       adapterFactory: async ({ native }) => {
         await native.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0003", streamEpoch: 1 });
@@ -273,6 +279,7 @@ describe("Desktop product provider boundary", () => {
           profile_id: "profile-cross-wired",
           credential_slots: [{ kind: "ssh_password", status: "stored", updated_at: "2026-07-14T12:00:00Z" }],
         }),
+        clearCredential: vi.fn(),
       },
       adapterFactory: async ({ native }) => {
         await native.configureCredential(
@@ -286,15 +293,19 @@ describe("Desktop product provider boundary", () => {
     })).rejects.toThrow(/profile slot/i);
   });
 
-  it("fails closed without invoking an unavailable native credential command", async () => {
+  it("routes credential collection through the native command", async () => {
     const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
     const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "start_sidecar") return releaseBootstrap(digest, flags);
+      if (command === "configure_credential") return {
+        ...CONTRACT_FIXTURE_V1.profile,
+        credential_slots: [{ kind: "ssh_private_key", status: "stored", updated_at: "2026-07-14T12:00:00Z" }],
+      };
       throw new Error(`Unexpected Tauri command: ${command}`);
     });
 
-    await expect(createReleaseDesktopProductProvider({
+    await createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
       adapterFactory: async ({ native }) => {
         await native.configureCredential(
@@ -305,8 +316,8 @@ describe("Desktop product provider boundary", () => {
         );
         return unavailableDesktopProductProvider;
       },
-    })).rejects.toThrow(/SSH agent is the only supported authentication method/i);
-    expect(invokeMock.mock.calls.some(([command]) => command === "configure_credential")).toBe(false);
+    });
+    expect(invokeMock.mock.calls.some(([command]) => command === "configure_credential")).toBe(true);
   });
 
   it("rejects an older refresh result after a newer refresh has started", () => {

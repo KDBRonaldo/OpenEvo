@@ -116,12 +116,14 @@ before guarded discard, so the renderer never owns recovery authority. Source
 replacement, reset, stale completion, and failed save paths discard, while a
 successful create/patch settles as adopted only after the sidecar has durably
 committed the project reference. Only the opaque source reference enters the
-renderer DTO or public Desktop Local API. The
-release UI exposes only SSH agent authentication. Password, private-key, and
-proxy-secret credential brokers remain contract extension points, but the
-default native bridge rejects those calls without invoking a nonexistent Tauri
-command. They must not appear as usable release controls until the native broker
-is implemented and reviewed.
+renderer DTO or public Desktop Local API. The release UI exposes SSH agent,
+password, and private-key authentication. Password and passphrase controls
+invoke an operating-system secure prompt; the key control invokes the native
+file picker. React receives only the updated `RemoteProfileV1` slot status and
+never receives a password, private-key byte, passphrase, selected host path,
+Keychain account, or handoff token. An empty required slot remains visible and
+blocks connect until the user configures it. Proxy-secret credential brokers
+remain outside this implementation.
 
 New projects default to the first release-supported mode, currently the
 Core-owned Codex subscription transcript profile and its release-tested

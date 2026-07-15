@@ -515,6 +515,12 @@ or offline Core snapshot.
 Local profile responses expose an authentication kind and an opaque native
 credential slot status, never a credential reference or secret. Network proxy
 URLs must not contain user information; proxy credentials use native slots.
+For SSH password/private-key profiles, Tauri owns the secure prompt or file
+picker, macOS Keychain account references, and private native registry. The
+sidecar receives complete credential bundles only through its process-owned
+native handoff route and keeps them in bounded memory for SSH adapter creation.
+Renderer DTOs contain only `empty`/`stored` slot status; selected paths and
+secret/recovery material are not renderer or public Local API fields.
 An optional `hugging_face_token` slot supports gated self-deployed models. It is
 read from macOS Keychain only for the bounded remote model-preparation action
 and is never returned to React or stored in project/Core configuration.

@@ -662,14 +662,35 @@ nonterminal reservations, writing
 their cancelled operation and idempotency response together. SSH success alone
 reports `core_not_started`, not an online Core.
 
-This phase does not implement a macOS Keychain secret broker. The production
-resolver therefore supports `ssh_agent` only; native private-key and password
-profiles fail closed with a typed credential-unavailable response. Secret
-material, local key paths, raw SSH commands, and trust-store paths never enter
-the Local API models, idempotency envelope, error response, or renderer state.
-The native command surface exposes no placeholder Keychain operation. These
-native-host changes and Linux/macOS externalBin combination smokes do not prove
-code signing, notarization, closure of the same-UID pathname TOCTOU described
+The native host implements the SSH credential broker. On macOS, password and
+passphrase create, update, existence, read, and delete operations use Generic
+Password items in Keychain service `org.openevo.desktop.ssh`; random account IDs
+are private native references. A private `0700` registry with a `0600` atomic
+JSON file persists only profile/authentication bindings, Keychain account IDs,
+and the path selected by the native private-key picker. It never stores secret
+bytes, and Desktop never creates a plaintext private-key copy. Linux production
+builds fail closed; Linux tests use a strict in-memory fake that preserves
+create-before-update and delete semantics.
+
+Tauri secure prompts and the native file picker collect credential input. React
+receives only credential-slot status. Tauri sends a complete profile credential
+bundle through the hidden `/openevo-native/credentials` route, authenticated by
+the per-sidecar native handoff credential. The route is absent from OpenAPI,
+accepts a closed and bounded request, rejects replay identity conflicts, and
+returns only a validated public profile projection. The sidecar keeps bytes in
+a bounded mutable-memory vault, resets persisted slot status at startup, and is
+rehydrated from the private native registry after every sidecar start. Missing
+or authentication-changed profiles remove stale native registry and Keychain
+entries. Profile authentication changes, deletion, sidecar replacement, and
+sidecar stop clear corresponding sidecar buffers.
+
+Password and passphrase delivery to OpenSSH uses forced one-shot askpass IPC;
+private keys use a session-scoped `ssh-agent` and `ssh-add -` stdin. Secrets are
+not placed in argv, environment values, logs, errors, API resources, or status.
+Local key paths, raw SSH commands, and trust-store paths likewise remain outside
+Local API models, idempotency envelopes, error responses, and renderer state.
+These native-host changes and Linux/macOS externalBin combination smokes do not
+prove code signing, notarization, closure of the same-UID pathname TOCTOU described
 above, mounted/copied macOS application launch, first-run
 remote bootstrap, or downloaded artifact identity, and do not make the DMG
 release-ready. ACL contract tests cover inherited/mutating entries, unknown

@@ -283,24 +283,20 @@ Supported:
   clears default identities with `IdentityFile=none`, sets `IdentitiesOnly=yes`,
   and disables agent use with `IdentityAgent=none`.
 
-Unsupported in this slice:
+The generic Core transport also accepts `password_ref` and `passphrase_ref` only
+when its owner supplies a `SshProcessCredentialAdapter`. The Desktop sidecar
+resolves those internal references from its process-memory native vault. A
+password adapter forces one prompt through an owner-only, same-UID, one-shot Unix
+socket askpass exchange. A private-key adapter starts a session-scoped
+`ssh-agent`, sends the selected key to `ssh-add -` over stdin, and uses the same
+askpass IPC for an optional passphrase. Secret bytes never enter argv,
+environment values, process output, or OpenSSH configuration, and the adapter
+interrupts pending prompts and clears mutable buffers on close. The selected
+private key is never copied to a new plaintext file.
 
-- `password_ref`
-- `passphrase_ref`
-
-Those fields are references, not secrets. OpenEvo Desktop needs a credential
-vault before it can safely resolve them. Until that vault exists, the SSH
-transport rejects these auth modes with actionable errors instead of prompting,
-logging, or guessing.
-
-When Desktop is served with `--transport ssh`, `GET /openevo-api/desktop/shell`
-reports `sidecar.transport.supports_password_ref=false` and
-`sidecar.transport.supports_passphrase_ref=false`. The packaged Desktop UI uses
-those capability flags to preserve saved config round-tripping but disable
-workspace sync, bootstrap, and run launch until the active profile uses
-`ssh_agent` or a private key without a secret reference. The sidecar API applies
-the same guard to direct mutating requests and returns `409` before constructing
-the SSH transport.
+Callers that provide a reference without an adapter still fail closed. The
+legacy developer shell capability route is not part of the packaged Desktop
+contract and does not advertise native credential availability.
 
 ## Command Execution
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 from html.parser import HTMLParser
@@ -522,6 +523,144 @@ def test_create_app_launcher_accepts_config_root_override(tmp_path: Path) -> Non
     assert (
         config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY / "provider.sqlite3"
     ).is_file()
+
+
+def test_native_credential_route_is_private_bounded_and_returns_only_slot_status(
+    tmp_path: Path,
+) -> None:
+    config_root = tmp_path / "config"
+    session_token = "7c" * 32
+    handoff_token = "8d" * 32
+    session_headers = {desktop_launcher.NATIVE_SESSION_HEADER: session_token}
+    handoff_headers = {desktop_launcher.NATIVE_HANDOFF_HEADER: handoff_token}
+    app = create_app(
+        static_root=_static_root(tmp_path),
+        desktop_config_root=config_root,
+        native_frame=desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token=session_token,
+            handoff_token=handoff_token,
+        ),
+        source_commit="89baeb26",
+        build_channel="test",
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/desktop/v1/profiles",
+            headers={**session_headers, "Idempotency-Key": "native-password-profile-0001"},
+            json={
+                "name": "Password server",
+                "host": "compute.example.org",
+                "port": 22,
+                "user": "researcher",
+                "authentication_kind": "native_password",
+            },
+        )
+        assert created.status_code == 201
+        profile = created.json()
+        assert profile["credential_slots"] == [
+            {"kind": "ssh_password", "status": "empty", "updated_at": None}
+        ]
+        request = {
+            "schema_version": "1",
+            "delivery_id": "ab" * 16,
+            "profile_id": profile["profile_id"],
+            "expected_etag": profile["etag"],
+            "operation": "replace",
+            "authentication_kind": "native_password",
+            "slot_kind": None,
+            "password_b64": base64.b64encode(b"canary-password").decode("ascii"),
+            "private_key_b64": None,
+            "passphrase_b64": None,
+        }
+
+        assert client.post("/openevo-native/credentials", json=request).status_code == 403
+        oversized = client.post(
+            "/openevo-native/credentials",
+            headers={**handoff_headers, "Content-Type": "application/json"},
+            content=b"x" * (desktop_launcher._NATIVE_CREDENTIAL_REQUEST_MAX_BYTES + 1),
+        )
+        assert oversized.status_code == 409
+        delivered = client.post(
+            "/openevo-native/credentials",
+            headers=handoff_headers,
+            json=request,
+        )
+
+        assert delivered.status_code == 200
+        assert delivered.json()["credential_slots"] == [
+            {"kind": "ssh_password", "status": "stored", "updated_at": None}
+        ]
+        assert "canary-password" not in delivered.text
+        assert "password_b64" not in delivered.text
+        assert "/openevo-native/credentials" not in client.get("/openapi.json").text
+        replayed = client.post(
+            "/openevo-native/credentials",
+            headers=handoff_headers,
+            json=request,
+        )
+        conflicted = client.post(
+            "/openevo-native/credentials",
+            headers=handoff_headers,
+            json={
+                **request,
+                "password_b64": base64.b64encode(b"different-password").decode("ascii"),
+            },
+        )
+        assert replayed.status_code == 200
+        assert replayed.json() == delivered.json()
+        assert conflicted.status_code == 409
+        assert "different-password" not in conflicted.text
+
+        deleted = client.post(
+            "/openevo-native/credentials",
+            headers=handoff_headers,
+            json={
+                **request,
+                "delivery_id": "cd" * 16,
+                "expected_etag": delivered.json()["etag"],
+                "operation": "delete",
+                "slot_kind": "ssh_password",
+                "password_b64": None,
+            },
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["credential_slots"][0]["status"] == "empty"
+
+        replaced = client.post(
+            "/openevo-native/credentials",
+            headers=handoff_headers,
+            json={
+                **request,
+                "delivery_id": "ef" * 16,
+                "expected_etag": deleted.json()["etag"],
+            },
+        )
+        assert replaced.status_code == 200
+        secret_buffer = app.state.native_credentials._test_secret_buffers(
+            profile["profile_id"]
+        )[0]
+        switched = client.patch(
+            f"/desktop/v1/profiles/{profile['profile_id']}",
+            headers={**session_headers, "If-Match": replaced.json()["etag"]},
+            json={"authentication_kind": "ssh_agent"},
+        )
+        assert switched.status_code == 200
+        assert switched.json()["credential_slots"] == []
+        assert secret_buffer == bytearray(b"\x00" * len(b"canary-password"))
+        stale_delivery = client.post(
+            "/openevo-native/credentials",
+            headers=handoff_headers,
+            json={
+                **request,
+                "delivery_id": "12" * 16,
+                "expected_etag": switched.json()["etag"],
+            },
+        )
+        assert stale_delivery.status_code == 410
+        assert "canary-password" not in stale_delivery.text
 
 
 def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path: Path) -> None:

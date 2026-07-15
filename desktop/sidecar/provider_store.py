@@ -163,6 +163,24 @@ _PERSISTENCE_DENIED_CONFIG_KEYS = {
     "workingdirectory",
     "workdir",
 }
+
+
+def _empty_credential_slots(
+    authentication_kind: str,
+) -> tuple[CredentialSlotStatusV1, ...]:
+    if authentication_kind == "ssh_agent":
+        return ()
+    if authentication_kind == "native_password":
+        return (CredentialSlotStatusV1(kind="ssh_password", status="empty"),)
+    if authentication_kind == "native_private_key":
+        return (
+            CredentialSlotStatusV1(kind="ssh_private_key", status="empty"),
+            CredentialSlotStatusV1(
+                kind="ssh_private_key_passphrase",
+                status="empty",
+            ),
+        )
+    raise ContractValidationError("profile authentication kind is invalid")
 _PERSISTENCE_DENIED_CONFIG_SUFFIXES = tuple(sorted(_PERSISTENCE_DENIED_CONFIG_KEYS))
 _ALLOWED_PROJECT_CONFIG_PATH_KEYS = {"targetpath"}
 _SECRET_KEY_SUFFIXES = (
@@ -1429,7 +1447,19 @@ class ProviderMutation:
                 created_at, updated_at
             ) VALUES (?, ?, ?, 'disconnected', ?, NULL, 1, ?, ?)
             """,
-            (profile_id, request.name, document, b"[]", timestamp, timestamp),
+            (
+                profile_id,
+                request.name,
+                document,
+                _canonical_json_bytes(
+                    [
+                        slot.model_dump(mode="json")
+                        for slot in _empty_credential_slots(request.authentication_kind)
+                    ]
+                ),
+                timestamp,
+                timestamp,
+            ),
         )
         return self._store._profile_from_row(
             self._store._require_profile_row(self._connection, profile_id)
@@ -3473,26 +3503,112 @@ class DesktopProviderStore:
                 validated_patch.model_fields_set & protected_connection_fields
             ):
                 raise ResourceInUseError("profile", profile_id)
+            previous = self._profile_from_row(row)
             current = _decode_json_object(bytes(row["document_json"]), label="profile")
             current.update(validated_patch.model_dump(mode="json", exclude_unset=True))
             validated = _validate_json_model(RemoteProfileCreateV1, current)
+            credential_slots = (
+                previous.credential_slots
+                if validated.authentication_kind == previous.authentication_kind
+                else _empty_credential_slots(validated.authentication_kind)
+            )
             version = cast(int, row["resource_version"]) + 1
             timestamp = self._timestamp()
             connection.execute(
                 """
                 UPDATE remote_profiles
-                SET name = ?, document_json = ?, resource_version = ?, updated_at = ?
+                SET name = ?, document_json = ?, credential_slots_json = ?,
+                    resource_version = ?, updated_at = ?
                 WHERE profile_id = ?
                 """,
                 (
                     validated.name,
                     _canonical_json_bytes(validated.model_dump(mode="json")),
+                    _canonical_json_bytes(
+                        [slot.model_dump(mode="json") for slot in credential_slots]
+                    ),
                     version,
                     timestamp,
                     profile_id,
                 ),
             )
             return self._profile_from_row(self._require_profile_row(connection, profile_id))
+
+    def set_native_profile_credential_slots(
+        self,
+        profile_id: str,
+        credential_slots: tuple[CredentialSlotStatusV1, ...],
+        *,
+        expected_etag: str | None = None,
+    ) -> RemoteProfileV1:
+        """Persist only native credential availability metadata for one profile."""
+
+        self._validate_resource_id(profile_id)
+        if expected_etag is not None:
+            self._validate_if_match(expected_etag)
+        with self._transaction(write=True) as connection:
+            row = self._require_profile_row(connection, profile_id)
+            if expected_etag is not None:
+                self._require_etag("profile", profile_id, row, expected_etag)
+            current = self._profile_from_row(row)
+            expected_kinds = tuple(
+                slot.kind for slot in _empty_credential_slots(current.authentication_kind)
+            )
+            if tuple(slot.kind for slot in credential_slots) != expected_kinds:
+                raise ContractValidationError(
+                    "native credential slots do not match profile authentication"
+                )
+            if any(slot.status == "unavailable" for slot in credential_slots):
+                raise ContractValidationError(
+                    "native credential custody cannot persist unavailable status"
+                )
+            if current.credential_slots == credential_slots:
+                return current
+            timestamp = self._timestamp()
+            connection.execute(
+                """
+                UPDATE remote_profiles
+                SET credential_slots_json = ?, resource_version = resource_version + 1,
+                    updated_at = ?
+                WHERE profile_id = ?
+                """,
+                (
+                    _canonical_json_bytes(
+                        [slot.model_dump(mode="json") for slot in credential_slots]
+                    ),
+                    timestamp,
+                    profile_id,
+                ),
+            )
+            return self._profile_from_row(self._require_profile_row(connection, profile_id))
+
+    def reset_native_profile_credential_slots(self) -> None:
+        """Drop stale process-memory availability during sidecar startup."""
+
+        with self._transaction(write=True) as connection:
+            rows = connection.execute(
+                "SELECT * FROM remote_profiles ORDER BY profile_id"
+            ).fetchall()
+            for row in rows:
+                current = self._profile_from_row(row)
+                expected = _empty_credential_slots(current.authentication_kind)
+                if current.credential_slots == expected:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE remote_profiles
+                    SET credential_slots_json = ?, resource_version = resource_version + 1,
+                        updated_at = ?
+                    WHERE profile_id = ?
+                    """,
+                    (
+                        _canonical_json_bytes(
+                            [slot.model_dump(mode="json") for slot in expected]
+                        ),
+                        self._timestamp(),
+                        current.profile_id,
+                    ),
+                )
 
     def delete_profile(self, profile_id: str, *, if_match: str) -> None:
         self._validate_resource_id(profile_id)

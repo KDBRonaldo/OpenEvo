@@ -114,6 +114,22 @@ class RecordingCoreConnectionStarter:
         return process
 
 
+class RecordingCredentialAdapter:
+    def __init__(self) -> None:
+        self.closed = False
+        self.environment_calls = 0
+
+    def ssh_options(self) -> list[str]:
+        return ["-o", "PreferredAuthentications=password"]
+
+    def prepare_process_environment(self) -> dict[str, str]:
+        self.environment_calls += 1
+        return {"SSH_ASKPASS": "/private/helper", "DISPLAY": "openevo-native"}
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeTunnelProcess:
     def __init__(self) -> None:
         self.terminated = False
@@ -879,6 +895,26 @@ def test_password_ref_auth_is_not_supported_without_vault() -> None:
 
     assert exc_info.value.code is SshTransportErrorCode.INVALID_REQUEST
     assert "secret-id" not in str(exc_info.value)
+
+
+def test_password_ref_uses_only_a_trusted_process_adapter(tmp_path: Path) -> None:
+    profile = _profile(auth={"method": "password_ref", "password_ref": "secret-id"})
+    adapter = RecordingCredentialAdapter()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=_trusted_binding(tmp_path, profile),
+        credential_adapter=adapter,
+    )
+
+    argv = transport._ssh_base_argv(tmp_path / "known-hosts")
+    environment = transport._process_environment()
+
+    assert "PreferredAuthentications=password" in argv
+    assert "BatchMode=no" in argv
+    assert "secret-id" not in repr((argv, environment))
+    assert adapter.environment_calls == 1
+    transport.close()
+    assert adapter.closed
 
 
 def test_passphrase_ref_is_not_supported_without_vault(tmp_path: Path) -> None:

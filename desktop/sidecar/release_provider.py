@@ -23,6 +23,7 @@ from desktop.sidecar.contracts.v1.models import (
     ConnectionFailureV1,
     ContractNegotiationV1,
     CoreConnectionStateV1,
+    CredentialSlotStatusV1,
     DesktopStateV1,
     ExecutionModeCapabilitiesV1,
     ExecutionModeCapabilityV1,
@@ -49,6 +50,7 @@ from desktop.sidecar.core_bridge_v1 import (
 )
 from desktop.sidecar.core_client_v1 import CORE_OPENAPI_SHA256
 from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError, DesktopEventBrokerV1
+from desktop.sidecar.native_credentials import NativeCredentialVault
 from desktop.sidecar.provider_store import (
     DesktopProviderStore,
     ETagConflictError,
@@ -313,6 +315,7 @@ class DesktopReleaseProvider:
         readiness_key: bytes,
         execution_mode_capabilities: ExecutionModeCapabilitiesV1,
         remote_lifecycle: DesktopRemoteLifecycle,
+        native_credentials: NativeCredentialVault | None = None,
         core_runtime: DesktopCoreRuntimeOwnerV1 | None = None,
         core_bridge: DesktopCoreBridgeV1 | None = None,
         event_broker: DesktopEventBrokerV1 | None = None,
@@ -327,6 +330,7 @@ class DesktopReleaseProvider:
         self._store = store
         self._workspace_import_store = workspace_import_store
         self._remote_lifecycle = remote_lifecycle
+        self._native_credentials = native_credentials
         self._core_runtime = core_runtime
         self._core_bridge = core_runtime.core_bridge if core_runtime is not None else core_bridge
         self._event_broker = (
@@ -442,13 +446,33 @@ class DesktopReleaseProvider:
                         self._remote_lifecycle.close()
                     finally:
                         try:
-                            self._store.close()
+                            if self._native_credentials is not None:
+                                self._native_credentials.close()
                         finally:
-                            self._workspace_import_store.close()
+                            try:
+                                self._store.close()
+                            finally:
+                                self._workspace_import_store.close()
 
     @property
     def workspace_import_store(self) -> WorkspaceImportStore:
         return self._workspace_import_store
+
+    def native_credential_profile(self, profile_id: str) -> RemoteProfileV1:
+        return self._store.get_profile(profile_id)
+
+    def set_native_credential_slots(
+        self,
+        profile_id: str,
+        credential_slots: tuple[CredentialSlotStatusV1, ...],
+        *,
+        expected_etag: str | None,
+    ) -> RemoteProfileV1:
+        return self._store.set_native_profile_credential_slots(
+            profile_id,
+            credential_slots,
+            expected_etag=expected_etag,
+        )
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handler = self._handlers.get(operation_id)
@@ -554,20 +578,30 @@ class DesktopReleaseProvider:
         return self._resource_response(profile)
 
     def _update_profile(self, arguments: Mapping[str, object]) -> Response:
-        self._require_profile_not_connected(cast(str, arguments["profile_id"]))
+        profile_id = cast(str, arguments["profile_id"])
+        self._require_profile_not_connected(profile_id)
+        previous = self._store.get_profile(profile_id)
         profile = self._store.patch_profile(
-            cast(str, arguments["profile_id"]),
+            profile_id,
             cast(RemoteProfilePatchV1, arguments["request"]),
             if_match=cast(str, arguments["if_match"]),
         )
+        if (
+            self._native_credentials is not None
+            and profile.authentication_kind != previous.authentication_kind
+        ):
+            self._native_credentials.remove_profile(profile_id)
         return self._resource_response(profile)
 
     def _delete_profile(self, arguments: Mapping[str, object]) -> Response:
-        self._require_profile_not_connected(cast(str, arguments["profile_id"]))
+        profile_id = cast(str, arguments["profile_id"])
+        self._require_profile_not_connected(profile_id)
         self._store.delete_profile(
-            cast(str, arguments["profile_id"]),
+            profile_id,
             if_match=cast(str, arguments["if_match"]),
         )
+        if self._native_credentials is not None:
+            self._native_credentials.remove_profile(profile_id)
         return Response(status_code=204)
 
     def _connect_profile(self, arguments: Mapping[str, object]) -> Response:

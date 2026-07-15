@@ -58,6 +58,13 @@ def _load_packaged_build_metadata() -> _PackagedBuildMetadata:
 
 
 if __name__ == "__main__":
+    from desktop.sidecar.ssh_credentials import (
+        is_native_askpass_invocation,
+        native_askpass_main,
+    )
+
+    if is_native_askpass_invocation():
+        raise SystemExit(native_askpass_main())
     if os.environ.pop(NATIVE_LISTENER_FD_ENV, None) != "3":
         raise ValueError("invalid packaged native listener handoff")
     if os.environ.pop(NATIVE_EXECUTABLE_FD_ENV, None) != "4":

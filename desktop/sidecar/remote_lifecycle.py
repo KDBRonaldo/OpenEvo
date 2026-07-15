@@ -2,11 +2,21 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
+import sys
 from threading import Lock
 import time
 from typing import Literal, Protocol
 
 from desktop.sidecar.contracts.v1.models import HostKeyAcceptV1, RemoteProfileV1
+from desktop.sidecar.native_credentials import (
+    NativeCredentialUnavailableError as NativeVaultCredentialUnavailableError,
+    NativeCredentialVault,
+)
+from desktop.sidecar.ssh_credentials import (
+    PasswordAskpassCredentialAdapter,
+    SshAgentCredentialAdapter,
+)
 from openevo.deployment.host_keys import (
     HostKeyCandidate,
     HostKeyAlgorithm,
@@ -101,6 +111,106 @@ def ssh_auth_from_native_credentials(profile: RemoteProfileV1) -> SSHAuthConfig:
             "The selected SSH authentication mode requires the native credential broker."
         )
     return SSHAuthConfig(method="ssh_agent")
+
+
+class NativeCredentialSshResolver:
+    """Adapt the private sidecar vault to the existing SSH lifecycle contract."""
+
+    def __init__(
+        self,
+        vault: NativeCredentialVault,
+        *,
+        helper_executable: Path | str | None = None,
+    ) -> None:
+        self._vault = vault
+        self._helper_executable = Path(helper_executable or sys.executable)
+
+    def auth_for_profile(self, profile: RemoteProfileV1) -> SSHAuthConfig:
+        if profile.authentication_kind == "ssh_agent":
+            return SSHAuthConfig(method="ssh_agent")
+        try:
+            material = self._vault.material_for(profile.profile_id)
+        except NativeVaultCredentialUnavailableError as exc:
+            raise RemoteCredentialUnavailableError(
+                "The selected SSH credential is not available."
+            ) from exc
+        try:
+            if material.authentication_kind != profile.authentication_kind:
+                raise RemoteCredentialUnavailableError(
+                    "The selected SSH credential no longer matches this profile."
+                )
+            if material.authentication_kind == "native_password":
+                return SSHAuthConfig(
+                    method="password_ref",
+                    password_ref=f"native-profile:{profile.profile_id}",
+                )
+            return SSHAuthConfig(
+                method="private_key",
+                private_key_path="/openevo/native-private-key",
+                passphrase_ref=(
+                    f"native-profile:{profile.profile_id}"
+                    if material.passphrase is not None
+                    else None
+                ),
+            )
+        finally:
+            material.clear()
+
+    def transport_for(
+        self,
+        profile: RemoteProfileConfig,
+        binding: TrustedKnownHostsBinding,
+    ) -> _RemoteTransport:
+        if profile.auth.method == "ssh_agent":
+            return SshRemoteExecutorTransport(profile, trusted_host=binding)
+        try:
+            material = self._vault.material_for(profile.id)
+        except NativeVaultCredentialUnavailableError as exc:
+            raise RemoteCredentialUnavailableError(
+                "The selected SSH credential is not available."
+            ) from exc
+        adapter = None
+        try:
+            if profile.auth.method == "password_ref":
+                if material.password is None:
+                    raise RemoteCredentialUnavailableError(
+                        "The selected SSH password is not available."
+                    )
+                password = material.password
+                material.password = None
+                adapter = PasswordAskpassCredentialAdapter(
+                    password,
+                    helper_executable=self._helper_executable,
+                )
+            elif profile.auth.method == "private_key":
+                if material.private_key is None:
+                    raise RemoteCredentialUnavailableError(
+                        "The selected SSH private key is not available."
+                    )
+                private_key = material.private_key
+                passphrase = material.passphrase
+                material.private_key = None
+                material.passphrase = None
+                adapter = SshAgentCredentialAdapter(
+                    private_key,
+                    passphrase,
+                    helper_executable=self._helper_executable,
+                )
+            else:
+                raise RemoteCredentialUnavailableError(
+                    "The selected SSH credential is unsupported."
+                )
+            return SshRemoteExecutorTransport(
+                profile,
+                trusted_host=binding,
+                credential_adapter=adapter,
+            )
+        except BaseException:
+            if adapter is not None:
+                adapter.close()
+            raise
+        finally:
+            material.clear()
 
 
 def remote_profile_config(
@@ -407,6 +517,7 @@ class DesktopRemoteLifecycle:
 
 __all__ = (
     "DesktopRemoteLifecycle",
+    "NativeCredentialSshResolver",
     "RemoteConnectionFailedError",
     "RemoteConnectionResult",
     "RemoteCredentialUnavailableError",

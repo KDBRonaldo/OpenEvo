@@ -53,6 +53,7 @@ export interface LocalApiNativeBridge {
   cancelProjectSource(actionId: string): Promise<unknown>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
   configureCredential(profileId: string, slotKind: CredentialSlotKind, etag: string, actionId: string): Promise<unknown>;
+  clearCredential(profileId: string, slotKind: CredentialSlotKind, etag: string, actionId: string): Promise<unknown>;
 }
 
 export interface LocalApiDesktopProductProviderOptions {
@@ -190,6 +191,22 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     }
     if (!profile.credential_slots.some((slot) => slot.kind === slotKind)) {
       throw new DesktopContractError("Native credential response omitted the configured credential slot");
+    }
+    this.invalidate();
+    return profile;
+  }
+
+  async clearCredential(
+    profileId: string,
+    slotKind: CredentialSlotKind,
+    intent: ProductResourceMutationIntent,
+  ): Promise<RemoteProfileV1> {
+    this.assertIntent(intent);
+    const profile = remoteProfileV1Schema.parse(
+      await this.native.clearCredential(profileId, slotKind, intent.etag, intent.actionId),
+    );
+    if (profile.profile_id !== profileId) {
+      throw new DesktopContractError("Native credential response returned the wrong profile");
     }
     this.invalidate();
     return profile;

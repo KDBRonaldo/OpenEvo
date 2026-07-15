@@ -9,7 +9,7 @@ import {
   type RemoteProfileV1,
 } from "../api/v1/schemas";
 import { createLocalApiDesktopProductProvider } from "./localApiProvider";
-import { DesktopProductUserError, type DesktopProductProvider, type ProjectSourceSelectionIntent } from "./provider";
+import type { DesktopProductProvider, ProjectSourceSelectionIntent } from "./provider";
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 
 export interface ReleaseNativeBridge {
@@ -24,6 +24,12 @@ export interface ReleaseNativeBridge {
     etag: string,
     actionId: string,
   ): Promise<unknown>;
+  clearCredential(
+    profileId: string,
+    slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
+    etag: string,
+    actionId: string,
+  ): Promise<unknown>;
 }
 
 export interface ReleaseProviderAdapterContext {
@@ -33,6 +39,12 @@ export interface ReleaseProviderAdapterContext {
     cancelProjectSource(actionId: string): Promise<void>;
     settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
     configureCredential(
+      profileId: string,
+      slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
+      etag: string,
+      actionId: string,
+    ): Promise<RemoteProfileV1>;
+    clearCredential(
       profileId: string,
       slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
       etag: string,
@@ -60,9 +72,18 @@ const tauriNativeBridge: ReleaseNativeBridge = {
     actionId,
     outcome,
   }),
-  configureCredential: async () => {
-    throw new DesktopProductUserError("SSH agent is the only supported authentication method in this release.");
-  },
+  configureCredential: (profileId, slotKind, etag, actionId) => invoke("configure_credential", {
+    profileId,
+    slotKind,
+    etag,
+    actionId,
+  }),
+  clearCredential: (profileId, slotKind, etag, actionId) => invoke("clear_credential", {
+    profileId,
+    slotKind,
+    etag,
+    actionId,
+  }),
 };
 
 export async function stopReleaseDesktopProductProvider(): Promise<void> {
@@ -117,6 +138,15 @@ export async function createReleaseDesktopProductProvider(
         if (profile.profile_id !== profileId
           || !profile.credential_slots.some((slot) => slot.kind === slotKind)) {
           throw new DesktopContractError("Native credential response does not match the requested profile slot");
+        }
+        return profile;
+      },
+      clearCredential: async (profileId, slotKind, etag, actionId) => {
+        const profile = remoteProfileV1Schema.parse(
+          await native.clearCredential(profileId, slotKind, etag, actionId),
+        );
+        if (profile.profile_id !== profileId) {
+          throw new DesktopContractError("Native credential response does not match the requested profile");
         }
         return profile;
       },

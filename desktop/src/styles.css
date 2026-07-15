@@ -1809,6 +1809,36 @@ pre.json {
   display: block;
 }
 
+.credential-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.credential-editor-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 50px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+
+.credential-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.credential-editor-actions .secondary-button {
+  min-height: 30px;
+  padding: 5px 9px;
+}
+
 .credential-status strong {
   color: var(--ink);
   font-size: 11px;

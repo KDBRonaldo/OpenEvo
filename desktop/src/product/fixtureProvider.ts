@@ -307,6 +307,24 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     return structuredClone(updated);
   }
 
+  async clearCredential(
+    profileId: string,
+    slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
+    intent: ProductResourceMutationIntent,
+  ): Promise<RemoteProfileV1> {
+    const current = this.requireProfile(profileId);
+    this.checkIntent(intent, `profile:credential-clear:${profileId}:${slotKind}`, current.etag);
+    const updated = remoteProfileV1Schema.parse({
+      ...current,
+      credential_slots: current.credential_slots.map((item) => item.kind === slotKind ? { ...item, status: "empty", updated_at: NOW } : item),
+      updated_at: NOW,
+      etag: ETAG_D,
+    });
+    this.profiles = this.profiles.map((profile) => profile.profile_id === profileId ? updated : profile);
+    this.emit();
+    return structuredClone(updated);
+  }
+
   async connectProfile(profileId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
     const profile = this.requireProfile(profileId);
     this.checkIntent(intent, `profile:connect:${profileId}`, profile.etag);

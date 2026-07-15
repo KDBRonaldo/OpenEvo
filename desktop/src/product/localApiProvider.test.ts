@@ -351,6 +351,7 @@ describe("LocalApiDesktopProductProvider", () => {
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
       configureCredential: vi.fn().mockResolvedValue(profile()),
+      clearCredential: vi.fn().mockResolvedValue(profile()),
     };
     const provider = new LocalApiDesktopProductProvider({ client, native, fetch: vi.fn<FetchLike>() });
     const refreshed = await provider.refresh();
@@ -542,6 +543,7 @@ function createProvider(client: DesktopApiClientV1, fetch: FetchLike = vi.fn<Fet
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
       configureCredential: vi.fn(),
+      clearCredential: vi.fn(),
     },
     fetch,
     reconnectDelaysMs: [],
