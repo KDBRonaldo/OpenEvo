@@ -814,6 +814,8 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "uv run python desktop/packaging/build_sidecar.py" in macos_job
     assert 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' in macos_job
     assert 'test "$RUNNER_ENVIRONMENT" = "github-hosted"' in macos_job
+    assert "macOS packaging + exact Core pair publication" in macos_job
+    assert "APFS held-FD cleanup" not in macos_job
     assert '--core-wheel-output-dir "$RUNNER_TEMP/openevo-release-inputs"' in macos_job
     assert "scripts/ci/smoke_openevo_desktop_sidecar.py" in macos_job
     assert text.count("desktop/packaging/build_sidecar.py") == 1

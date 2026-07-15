@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   macos-packaging-smoke:
-    name: macOS packaging + APFS held-FD cleanup
+    name: macOS packaging + exact Core pair publication
     runs-on: macos-14
     outputs:
       manifest_sha256: ${{ steps.release_inputs.outputs.manifest_sha256 }}
