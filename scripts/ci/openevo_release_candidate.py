@@ -222,6 +222,28 @@ def write_draft_release_body(
     _write_new(path, body.encode("utf-8"))
 
 
+def assert_release_tag_absent(inventory_path: Path, *, expected_tag: str) -> None:
+    if not expected_tag or "\n" in expected_tag or "\r" in expected_tag:
+        raise CandidateError("Expected release tag is invalid")
+    try:
+        lines = inventory_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CandidateError("GitHub release inventory is unreadable") from exc
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            tag = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CandidateError(
+                f"GitHub release inventory line {line_number} is invalid"
+            ) from exc
+        if type(tag) is not str or not tag:
+            raise CandidateError(
+                f"GitHub release inventory line {line_number} is not a tag name"
+            )
+        if tag == expected_tag:
+            raise CandidateError(f"GitHub release already exists: {expected_tag}")
+
+
 def _single_match(root: Path, pattern: str, subject: str) -> Path:
     matches = sorted(root.glob(pattern))
     if len(matches) != 1 or not _is_regular_file(matches[0]):
@@ -867,6 +889,9 @@ def main(argv: list[str] | None = None) -> int:
     write_draft_body.add_argument("output", type=Path)
     write_draft_body.add_argument("--release-notes", type=Path, required=True)
     write_draft_body.add_argument("--ownership-token", required=True)
+    assert_release_absent = subparsers.add_parser("assert-release-absent")
+    assert_release_absent.add_argument("inventory", type=Path)
+    assert_release_absent.add_argument("--expected-tag", required=True)
     create = subparsers.add_parser("create")
     create.add_argument("candidate_root", type=Path)
     create.add_argument("--source-commit", required=True)
@@ -904,6 +929,13 @@ def main(argv: list[str] | None = None) -> int:
                 ownership_token=args.ownership_token,
             )
             print(args.output)
+            return 0
+        if args.command == "assert-release-absent":
+            assert_release_tag_absent(
+                args.inventory,
+                expected_tag=args.expected_tag,
+            )
+            print(f"GitHub release tag is absent: {args.expected_tag}")
             return 0
         if args.command == "create":
             path = create_candidate_manifest(

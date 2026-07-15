@@ -148,10 +148,12 @@ outputs, downloads every asset into a clean directory, and verifies:
   files are present.
 
 Before creation, the workflow validates the exact candidate tag name as a Git
-ref and requires both a same-name release and remote Git tag to be absent. If
-creation, upload, redownload, metadata validation, or verification-record upload
-fails or is cancelled, an `always()` cleanup deletes only a draft whose complete
-metadata and random ownership marker still match this workflow attempt. It does
+ref and uses the authenticated, paginated release inventory so private drafts
+are included when requiring both a same-name release and remote Git tag to be
+absent. If creation, upload, redownload, metadata validation, or
+verification-record upload fails or is cancelled, an `always()` cleanup deletes
+only a draft whose complete metadata and random ownership marker still match
+this workflow attempt. It does
 not delete Git tags, and it fails unless both the owned draft and any same-name
 remote Git tag are absent afterward. A successful run leaves the draft for
 review but proves that no real Git tag exists; the draft's `tagName` is release

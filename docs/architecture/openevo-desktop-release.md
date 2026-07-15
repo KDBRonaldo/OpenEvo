@@ -729,8 +729,9 @@ The replacement workflow must:
    executable and sidecar with `file -b` and `lipo -archs`, then require the raw
    and copied observations to match the declared candidate architecture;
 6. exercise first-run through a descriptor-matched remote Core health check;
-7. require the candidate release and real Git tag to be absent, create a draft
-   GitHub prerelease with a per-attempt random ownership marker, upload all
+7. use the authenticated paginated release inventory to require the candidate
+   release, including a private draft, and real Git tag to be absent; create a
+   draft GitHub prerelease with a per-attempt random ownership marker; upload all
    required assets, download them into a clean directory, and revalidate names,
    versions, commits, checksums, title, tag name, target commit, body, draft
    state, prerelease state, and ownership at a discrete API read;

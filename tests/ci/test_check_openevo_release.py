@@ -1234,6 +1234,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "retention-days: 14",
         "openevo_release_candidate.py write-notes",
         "openevo_release_candidate.py write-draft-body",
+        "openevo_release_candidate.py assert-release-absent",
         "permissions:\n      contents: write",
         "gh release create",
         "--draft",
@@ -1245,6 +1246,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "--expected-owner",
         "--expected-repository",
         "gh release view",
+        "gh api --paginate",
+        ".tag_name | @json",
         "secrets.token_hex(16)",
         "git check-ref-format",
         "steps.verified.outputs.complete != 'true'",
@@ -1298,6 +1301,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     )[1]
     assert cleanup.index("validate-draft") < cleanup.index("gh release delete")
     assert "--cleanup-tag" not in cleanup
+    assert "/releases/tags/" not in text
+    assert text.count("assert-release-absent") >= 2
     assert text.count("git ls-remote --exit-code --tags origin") >= 3
     assert text.index("Verify every draft asset and review-facing field") < text.index(
         "Mark draft roundtrip complete"

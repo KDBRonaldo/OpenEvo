@@ -90,6 +90,38 @@ def test_draft_body_rejects_invalid_ownership_token(ownership_token: str) -> Non
         )
 
 
+def test_release_inventory_proves_draft_aware_tag_absence(tmp_path: Path) -> None:
+    candidate = _load_module()
+    inventory = tmp_path / "release-tags.jsonl"
+    inventory.write_text('"unrelated-draft"\n', encoding="utf-8")
+    arguments = [
+        "assert-release-absent",
+        str(inventory),
+        "--expected-tag",
+        "openevo-desktop-v0.1.0-exhibition.123.2",
+    ]
+
+    assert candidate.main(arguments) == 0
+    inventory.write_text(
+        '"unrelated-draft"\n"openevo-desktop-v0.1.0-exhibition.123.2"\n',
+        encoding="utf-8",
+    )
+    assert candidate.main(arguments) == 1
+
+
+@pytest.mark.parametrize("payload", ["not-json\n", "null\n", '""\n'])
+def test_release_inventory_rejects_untrusted_output(
+    tmp_path: Path,
+    payload: str,
+) -> None:
+    candidate = _load_module()
+    inventory = tmp_path / "release-tags.jsonl"
+    inventory.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(candidate.CandidateError, match="release inventory line"):
+        candidate.assert_release_tag_absent(inventory, expected_tag="candidate-tag")
+
+
 def test_candidate_manifest_rejects_extra_or_contradictory_release_claims(
     tmp_path: Path,
 ) -> None:

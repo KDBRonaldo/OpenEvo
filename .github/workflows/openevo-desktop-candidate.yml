@@ -437,20 +437,13 @@ jobs:
           owner="$(python -c 'import secrets; print(secrets.token_hex(16))')"
           git check-ref-format "refs/tags/$tag"
 
-          release_status="$(curl --silent --show-error --output /dev/null \
-            --write-out '%{http_code}' \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
-          if [ "$release_status" = "200" ]; then
-            echo "Draft release already exists: $tag" >&2
-            exit 1
-          fi
-          if [ "$release_status" != "404" ]; then
-            echo "Could not prove draft release absence (HTTP $release_status)" >&2
-            exit 1
-          fi
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[].tag_name | @json' \
+            > "$RUNNER_TEMP/releases-before-candidate.jsonl"
+          python scripts/ci/openevo_release_candidate.py assert-release-absent \
+            "$RUNNER_TEMP/releases-before-candidate.jsonl" \
+            --expected-tag "$tag"
 
           set +e
           git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1
@@ -550,16 +543,17 @@ jobs:
           RELEASE_TITLE: ${{ steps.release.outputs.title }}
           RELEASE_OWNER: ${{ steps.release.outputs.owner }}
         run: |
-          release_status="$(curl --silent --show-error --output /dev/null \
-            --write-out '%{http_code}' \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
-          if [ "$release_status" = "200" ]; then
-            gh release view "$RELEASE_TAG" \
+          release_found=false
+          for attempt in 1 2 3; do
+            if gh release view "$RELEASE_TAG" \
               --json body,isDraft,isPrerelease,name,tagName,targetCommitish,url \
-              > "$RUNNER_TEMP/cleanup-draft-release.json"
+              > "$RUNNER_TEMP/cleanup-draft-release.json"; then
+              release_found=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$release_found" = "true" ]; then
             if ! python scripts/ci/openevo_release_candidate.py validate-draft \
               "$RUNNER_TEMP/cleanup-draft-release.json" \
               --release-notes candidate-artifacts/release-notes.md \
@@ -577,23 +571,24 @@ jobs:
               fi
               sleep "$attempt"
             done
-          elif [ "$release_status" != "404" ]; then
-            echo "Could not determine unverified draft ownership (HTTP $release_status)" >&2
-            exit 1
           fi
 
-          release_status="$(curl --silent --show-error --output /dev/null \
-            --write-out '%{http_code}' \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
-          if [ "$release_status" = "200" ]; then
-            echo "Unverified draft still exists: $RELEASE_TAG" >&2
-            exit 1
-          fi
-          if [ "$release_status" != "404" ]; then
-            echo "Could not prove unverified draft absence (HTTP $release_status)" >&2
+          release_absent=false
+          for attempt in 1 2 3; do
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[].tag_name | @json' \
+              > "$RUNNER_TEMP/releases-after-cleanup.jsonl"
+            if python scripts/ci/openevo_release_candidate.py assert-release-absent \
+              "$RUNNER_TEMP/releases-after-cleanup.jsonl" \
+              --expected-tag "$RELEASE_TAG"; then
+              release_absent=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$release_absent" != "true" ]; then
+            echo "Could not prove unverified draft absence: $RELEASE_TAG" >&2
             exit 1
           fi
 

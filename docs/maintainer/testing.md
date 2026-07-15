@@ -157,13 +157,15 @@ flag. Its HTTPS review URL must belong to the expected repository; GitHub uses
 an opaque `untagged-*` URL slug for drafts, so the separately validated
 `tagName` remains the candidate tag-name authority. The body must contain the
 canonical notes followed only by the 128-bit random ownership marker generated
-for that workflow attempt. It stores that
-discrete, point-in-time record as a run-attempt-qualified immutable Actions
+for that workflow attempt. It stores that discrete, point-in-time record as a
+run-attempt-qualified immutable Actions
 artifact; this does not make an atomic claim about workflow completion. The
 GitHub draft itself remains administratively mutable, so any post-run edit
 invalidates it. Tests require exact Git-ref validation, pre-creation release/tag
 absence, ownership-bound cleanup, and real-tag absence after both success and
-failure. Cleanup never deletes a Git tag.
+failure. Release absence comes from the authenticated paginated inventory,
+because GitHub's single-release-by-tag REST endpoint returns `404` for private
+drafts. Cleanup never deletes a Git tag.
 
 Remote capability discovery has an additional artifact-level gate. In a clean
 environment containing the exact Core wheel, run
