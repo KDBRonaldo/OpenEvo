@@ -519,11 +519,14 @@ def _validate_draft_release_metadata(
     if type(url) is not str:
         raise CandidateError("Draft release URL is invalid")
     parsed_url = urlsplit(url)
-    expected_path = f"/{expected_repository}/releases/tag/{expected_tag}"
+    expected_prefix = f"/{expected_repository}/releases/tag/"
+    release_slug = parsed_url.path[len(expected_prefix) :]
     if (
         parsed_url.scheme != "https"
         or parsed_url.netloc.casefold() != "github.com"
-        or parsed_url.path != expected_path
+        or not parsed_url.path.startswith(expected_prefix)
+        or not release_slug
+        or "/" in release_slug
         or parsed_url.query
         or parsed_url.fragment
     ):

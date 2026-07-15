@@ -123,7 +123,7 @@ def _draft_release_metadata(*, body: str) -> dict[str, object]:
         "targetCommitish": "8e45af371eef49a86530a849041f7dcf047620ec",
         "url": (
             "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/"
-            "openevo-desktop-v0.1.0-exhibition.123.2"
+            "untagged-7a9ca728f876fa16a90d"
         ),
     }
 
@@ -187,6 +187,14 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         ("tagName", "edited-tag"),
         ("targetCommitish", "f" * 40),
         ("url", "https://github.com/attacker/unrelated/releases/tag/forged"),
+        (
+            "url",
+            "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/untagged/x",
+        ),
+        (
+            "url",
+            "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/untagged?view=1",
+        ),
     ],
 )
 def test_draft_release_metadata_rejects_review_surface_mutation(
