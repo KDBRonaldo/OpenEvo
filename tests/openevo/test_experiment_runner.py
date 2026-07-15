@@ -49,6 +49,8 @@ _EXECUTION_PROFILE = EvolutionExecutionProfile(
         "trainer",
     ),
 )
+
+
 class _FakeExecutableRegistry:
     def __init__(self, snapshot, method_handles) -> None:
         self.snapshot = snapshot
@@ -240,9 +242,7 @@ def test_dry_run_shows_multi_round_context_placeholders() -> None:
 
     round_1 = plan["tasks"][0]["rounds"][1]
 
-    assert round_1["rollout_payload"]["metadata"]["evolution"][
-        "context_artifact_ids"
-    ] == [
+    assert round_1["rollout_payload"]["metadata"]["evolution"]["context_artifact_ids"] == [
         "<text_memory_artifact:component-extraction-train:round-0>",
         "<skill_bundle_artifact:component-extraction-train:round-0>",
         "<agent_system_artifact:component-extraction-train:round-0>",
@@ -274,23 +274,21 @@ def test_dry_run_tracks_dynamic_artifact_type_without_dataset_rollout_context() 
 
     rounds = plan["tasks"][0]["rounds"]
     assert rounds[0]["evolution_jobs"][0]["target_id"] == "quality_notes"
-    assert rounds[1]["rollout_payload"]["metadata"]["evolution"][
-        "context_artifact_ids"
-    ] == ["<research_note_artifact:component-extraction-train:round-0>"]
+    assert rounds[1]["rollout_payload"]["metadata"]["evolution"]["context_artifact_ids"] == [
+        "<research_note_artifact:component-extraction-train:round-0>"
+    ]
     assert rounds[1]["evolution_jobs"][0]["input_bindings"] == [
         {
             "binding_id": "current",
-            "artifact_ids": [
-                "<dataset_artifact:component-extraction-train:round-1>"
-            ],
+            "artifact_ids": ["<dataset_artifact:component-extraction-train:round-1>"],
         },
         {
             "binding_id": "prior_notes",
-            "artifact_ids": [
-                "<research_note_artifact:component-extraction-train:round-0>"
-            ],
+            "artifact_ids": ["<research_note_artifact:component-extraction-train:round-0>"],
         },
     ]
+
+
 def test_dry_run_tracks_parametric_memory_placeholders_when_enabled() -> None:
     plan = dry_run_experiment(
         _config(
@@ -322,9 +320,7 @@ def test_dry_run_tracks_parametric_memory_placeholders_when_enabled() -> None:
         "text_memory_reflector",
         "parametric_memory_register",
     ]
-    assert round_1["rollout_payload"]["metadata"]["evolution"][
-        "context_artifact_ids"
-    ] == [
+    assert round_1["rollout_payload"]["metadata"]["evolution"]["context_artifact_ids"] == [
         "<text_memory_artifact:component-extraction-train:round-0>",
         "<parametric_memory_artifact:component-extraction-train:round-0>",
     ]
@@ -386,9 +382,7 @@ def test_live_runner_calls_services_and_worker_in_order(tmp_path: Path) -> None:
 
     assert result["status"] == "completed"
     policy_version = rollout.submitted[0]["metadata"]["policy_version"]
-    assert policy_version.startswith(
-        "openevo:biology-components:component-extraction-train:run-"
-    )
+    assert policy_version.startswith("openevo:biology-components:component-extraction-train:run-")
     assert policy_version.endswith(":round-0")
     assert evolution.datasets[0]["query"]["policy_version"] == policy_version
     assert [job["method"] for job in evolution.jobs] == [
@@ -516,8 +510,7 @@ def test_live_runner_scopes_evolution_plans_to_each_task(tmp_path: Path) -> None
     assert len(evolution.datasets) == 2
     assert len(evolution.jobs) == 6
     plan_ids_by_task = [
-        {job["plan"]["plan_id"] for job in evolution.jobs[start : start + 3]}
-        for start in (0, 3)
+        {job["plan"]["plan_id"] for job in evolution.jobs[start : start + 3]} for start in (0, 3)
     ]
     assert all(len(plan_ids) == 1 for plan_ids in plan_ids_by_task)
     assert plan_ids_by_task[0] != plan_ids_by_task[1]
@@ -681,12 +674,7 @@ def test_live_runner_default_output_dir_is_run_scoped(
 
     assert result["run_id"]
     assert summary_path == (
-        tmp_path
-        / ".openevo"
-        / "runs"
-        / "biology-components"
-        / result["run_id"]
-        / "summary.json"
+        tmp_path / ".openevo" / "runs" / "biology-components" / result["run_id"] / "summary.json"
     )
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["summary_path"] == result["summary_path"]
@@ -1000,18 +988,16 @@ def test_live_runner_tracks_latest_parametric_memory_artifacts(tmp_path: Path) -
         max_poll_attempts=1,
     )
 
-    second_context = rollout.submitted[1]["metadata"]["evolution"][
-        "context_artifact_ids"
-    ]
+    second_context = rollout.submitted[1]["metadata"]["evolution"]["context_artifact_ids"]
 
     assert result["status"] == "completed"
     assert second_context == [
         "text_memory_reflector-artifact-1",
         "parametric_memory_register-artifact-1",
     ]
-    assert result["tasks"][0]["rounds"][0]["artifact_ids"][
-        "parametric_memory"
-    ] == ["parametric_memory_register-artifact-1"]
+    assert result["tasks"][0]["rounds"][0]["artifact_ids"]["parametric_memory"] == [
+        "parametric_memory_register-artifact-1"
+    ]
 
 
 def test_live_runner_snapshots_round_artifact_ids(tmp_path: Path) -> None:
@@ -1053,9 +1039,7 @@ def test_live_runner_fails_when_worker_produces_no_artifact(tmp_path: Path) -> N
     )
 
     assert result["status"] == "failed"
-    assert result["tasks"][0]["rounds"][0]["jobs"][0]["worker_status"] == (
-        "missing_artifacts"
-    )
+    assert result["tasks"][0]["rounds"][0]["jobs"][0]["worker_status"] == ("missing_artifacts")
 
 
 def test_live_runner_reports_expected_worker_failure(tmp_path: Path) -> None:
@@ -1447,9 +1431,7 @@ def test_llm_promotion_gate_redacts_credential_bearing_artifact_uris(
 
     assert "secret" not in packet_text
     assert "user:pass" not in packet_text
-    assert reviewer_packets[0]["artifact"]["uri"] == (
-        "https://example.test/memory.md?<redacted>"
-    )
+    assert reviewer_packets[0]["artifact"]["uri"] == ("https://example.test/memory.md?<redacted>")
     assert reviewer_packets[0]["artifact_content"]["source_uri"] == (
         "https://example.test/memory.md?<redacted>"
     )
@@ -1525,12 +1507,8 @@ def test_llm_promotion_gate_redacts_nested_manifest_artifact_uris(
     assert "nested-secret" not in packet_text
     assert "list-secret" not in packet_text
     assert "adapter-secret" not in packet_text
-    assert manifest["source_dataset_uri"] == (
-        "https://datasets.example/records.jsonl?<redacted>"
-    )
-    assert manifest["source_dataset_uris"] == [
-        "s3://dataset-bucket/records.jsonl?<redacted>"
-    ]
+    assert manifest["source_dataset_uri"] == ("https://datasets.example/records.jsonl?<redacted>")
+    assert manifest["source_dataset_uris"] == ["s3://dataset-bucket/records.jsonl?<redacted>"]
     assert manifest["adapter_reference"]["source_uri"] == "adapter.bin?<redacted>"
     assert packet["artifact"]["uri"] == "[LOCAL_ARTIFACT_URI]"
     assert packet["artifact_content"]["source_uri"] == "[LOCAL_ARTIFACT_URI]"
@@ -1587,8 +1565,10 @@ def test_promotion_gate_redacts_job_payload_and_support_in_review_packet(
         },
         artifacts=[artifact],
         output_root=tmp_path / "run",
-        reviewer=lambda packet: reviewer_packets.append(packet)
-        or {"approved": False, "score": 0.1, "rationale": "reject"},
+        reviewer=lambda packet: (
+            reviewer_packets.append(packet)
+            or {"approved": False, "score": 0.1, "rationale": "reject"}
+        ),
     )
 
     assert result["status"] == "rejected"
@@ -1613,9 +1593,7 @@ def test_promotion_gate_redacts_job_payload_and_support_in_review_packet(
     assert packet["job"]["payload"]["config"]["source_uri"] == (
         "s3://bucket/records.jsonl?<redacted>"
     )
-    assert packet["job"]["payload"]["config"]["artifact_path"] == (
-        "[LOCAL_ARTIFACT_PATH]"
-    )
+    assert packet["job"]["payload"]["config"]["artifact_path"] == ("[LOCAL_ARTIFACT_PATH]")
     assert "https://example.test/job-key?<redacted>" in packet_text
     assert "[LOCAL_ARTIFACT_PATH]" in packet_text
     assert "memory.md?<redacted>" in packet_text
@@ -1753,9 +1731,7 @@ def test_llm_promotion_gate_redacts_relative_artifact_uri_queries(
     assert "relative-secret" not in packet_text
     assert "local-fragment" not in packet_text
     assert reviewer_packets[0]["artifact"]["uri"] == "memory.md?<redacted>"
-    assert reviewer_packets[0]["artifact_content"]["source_uri"] == (
-        "memory.md?<redacted>"
-    )
+    assert reviewer_packets[0]["artifact_content"]["source_uri"] == ("memory.md?<redacted>")
 
 
 def test_promotion_gate_does_not_read_artifact_content_outside_artifact_root(
@@ -2219,9 +2195,7 @@ def test_human_promotion_gate_creates_backend_review_request_when_supported(
     assert review_requests
     assert review_requests[0]["review_type"] == "promotion"
     assert review_requests[0]["artifact_ids"] == ["artifact-text-memory"]
-    assert review_requests[0]["artifact_hashes"]["artifact-text-memory"].startswith(
-        "sha256:"
-    )
+    assert review_requests[0]["artifact_hashes"]["artifact-text-memory"].startswith("sha256:")
     assert review_requests[0]["packet"]["promotion_support"]["trajectory_findings"]
     assert job["promotion_reviews"][0]["review_id"] == "rev_backend"
     assert job["promotion_reviews"][0]["packet_hash"] == "sha256:packet"
@@ -2426,10 +2400,7 @@ def test_review_packet_hash_matches_backend_normalized_packet_hash() -> None:
         sort_keys=True,
         allow_nan=False,
     )
-    expected_hash = (
-        "sha256:"
-        + hashlib.sha256(backend_canonical_json.encode("utf-8")).hexdigest()
-    )
+    expected_hash = "sha256:" + hashlib.sha256(backend_canonical_json.encode("utf-8")).hexdigest()
 
     assert openevo_promotion.review_packet_hash(packet) == expected_hash
     assert openevo_promotion.review_request_payload_from_packet(packet)["packet"] == (
@@ -2453,9 +2424,9 @@ def test_review_packet_hash_and_payload_omit_local_review_paths() -> None:
     assert openevo_promotion.review_packet_hash(packet_with_paths) == (
         openevo_promotion.review_packet_hash(packet)
     )
-    backend_packet = openevo_promotion.review_request_payload_from_packet(
-        packet_with_paths
-    )["packet"]
+    backend_packet = openevo_promotion.review_request_payload_from_packet(packet_with_paths)[
+        "packet"
+    ]
     assert "review_path" not in backend_packet
     assert "decision_path" not in backend_packet
 
@@ -2509,18 +2480,14 @@ def test_human_promotion_gate_resumes_from_backend_feedback(tmp_path: Path) -> N
                 }
             ]
 
-    evolution = ReviewResumeEvolutionClient(
-        artifacts={"artifact-text-memory": current_artifact}
-    )
+    evolution = ReviewResumeEvolutionClient(artifacts={"artifact-text-memory": current_artifact})
 
     result = openevo_promotion.resume_promotion_from_review_feedback(
         gate_config={"mode": "human", "artifact_types": ["text_memory"]},
         artifact_type="text_memory",
         artifacts=[evolution.artifacts["artifact-text-memory"]],
         review_requests=evolution.list_review_requests(),
-        feedback_by_review={
-            "rev_backend": evolution.list_human_feedback(review_id="rev_backend")
-        },
+        feedback_by_review={"rev_backend": evolution.list_human_feedback(review_id="rev_backend")},
     )
 
     assert result["status"] == "approved"
@@ -2573,9 +2540,7 @@ def test_human_promotion_resume_hash_matches_runner_packet_with_excerpts(
         content_roots=[tmp_path / "run" / "artifacts"],
     )
     packet = json.loads(
-        (tmp_path / "reviews" / pending["reviews"][0]["review_path"]).read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "reviews" / pending["reviews"][0]["review_path"]).read_text(encoding="utf-8")
     )
     assert packet["artifact_content"]["available"] is True
     assert packet["artifact_content"]["content_sha256"].startswith("sha256:")
@@ -4135,6 +4100,66 @@ def test_runner_fails_closed_without_algorithm_promoted_target(
     assert result["tasks"][0]["rounds"][0]["artifact_ids"]["agent_system"] == []
 
 
+def test_core_authoritative_successor_selects_target_output_without_rewriting_promotion(
+    tmp_path: Path,
+) -> None:
+    artifacts = {
+        "candidate-agent-system": {
+            "artifact_id": "candidate-agent-system",
+            "type": "agent_system",
+            "promoted": False,
+        },
+        "agent-system-search-report": {
+            "artifact_id": "agent-system-search-report",
+            "type": "report",
+            "promoted": False,
+        },
+    }
+    evolution = FakeEvolutionClient(artifacts=artifacts)
+
+    def multi_output_worker(**kwargs: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "claimed": True,
+                "job_id": kwargs["expected_job_id"],
+                "artifact_ids": list(artifacts),
+            }
+        ]
+
+    rollout = FakeRolloutClient()
+    result = run_experiment(
+        _config(
+            evolution={
+                "targets": {
+                    "text_memory": {"enabled": False},
+                    "skill_bundle": {"enabled": False},
+                    "agent_system": {
+                        "enabled": True,
+                        "method": "agent_system_gepa_reflector",
+                    },
+                }
+            }
+        ),
+        rounds_override=2,
+        core_authoritative_successor=True,
+        output_dir=tmp_path / "run",
+        rollout_client=rollout,
+        evolution_client=evolution,
+        worker_runner=multi_output_worker,
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    assert result["status"] == "completed"
+    first_job = result["tasks"][0]["rounds"][0]["jobs"][0]
+    assert first_job["promotion_status"] == "core_selected"
+    assert first_job["approved_artifact_ids"] == ["candidate-agent-system"]
+    assert artifacts["candidate-agent-system"]["promoted"] is False
+    assert rollout.submitted[1]["metadata"]["evolution"]["context_artifact_ids"] == [
+        "candidate-agent-system"
+    ]
+
+
 def test_local_worker_runner_returns_recorded_failures(
     tmp_path: Path,
     monkeypatch,
@@ -4163,10 +4188,7 @@ def test_fake_evolution_client_infers_agent_system_and_parametric_memory_types()
     client = FakeEvolutionClient()
 
     assert client.get_artifact("artifact-agent-system")["type"] == "agent_system"
-    assert (
-        client.get_artifact("artifact-parametric-memory")["type"]
-        == "parametric_memory"
-    )
+    assert client.get_artifact("artifact-parametric-memory")["type"] == "parametric_memory"
 
 
 class FakeRolloutClient:

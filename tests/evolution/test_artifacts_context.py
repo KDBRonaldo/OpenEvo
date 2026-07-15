@@ -89,7 +89,8 @@ def test_register_artifact_persists_manifest(tmp_path):
 def test_update_artifact_promotion_controls_context_selection(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
-    memory_path = tmp_path / "memory.md"
+    memory_path = tmp_path / "artifacts" / "payloads" / "memory.md"
+    memory_path.parent.mkdir(parents=True)
     memory_path.write_text("remember this", encoding="utf-8")
 
     artifact = store.register_artifact(
@@ -375,7 +376,17 @@ def test_register_agent_system_rejects_unsafe_target_path(tmp_path, target_path)
 def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
-    memory_file = tmp_path / "memory.md"
+    payload_root = tmp_path / "artifacts" / "payloads"
+    skill_dir = payload_root / "skills" / "parser"
+    incompatible_skill_dir = payload_root / "skills" / "sorting"
+    adapter_dir = payload_root / "adapters" / "parser"
+    skill_dir.mkdir(parents=True)
+    incompatible_skill_dir.mkdir(parents=True)
+    adapter_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("Use parser tools.", encoding="utf-8")
+    (incompatible_skill_dir / "SKILL.md").write_text("Use sorting tools.", encoding="utf-8")
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    memory_file = payload_root / "memory.md"
     memory_file.write_text("Use recursive descent for parser tasks.", encoding="utf-8")
     memory = store.register_artifact(
         ArtifactRegisterRequest(
@@ -392,14 +403,14 @@ def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
         ArtifactRegisterRequest(
             type=ArtifactType.SKILL_BUNDLE,
             name="parser skill",
-            uri="file:///tmp/skills/parser",
+            uri=skill_dir.as_uri(),
             compatibility={"task_tags": ["calculator"]},
             scores={"quality": 0.8},
             tags=["calculator"],
             promoted=True,
         )
     )
-    agent_system_file = tmp_path / "AGENTS.md"
+    agent_system_file = payload_root / "AGENTS.md"
     agent_system_file.write_text(
         "Always inspect the repository conventions before changing code.",
         encoding="utf-8",
@@ -420,7 +431,7 @@ def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
         ArtifactRegisterRequest(
             type=ArtifactType.PARAMETRIC_MEMORY,
             name="Qwen parser LoRA adapter",
-            uri="file:///tmp/adapters/parser",
+            uri=adapter_dir.as_uri(),
             manifest={
                 "adapter_id": "parser-memory",
                 "adapter_format": "lora",
@@ -447,7 +458,7 @@ def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
         ArtifactRegisterRequest(
             type=ArtifactType.SKILL_BUNDLE,
             name="sorting skill",
-            uri="file:///tmp/skills/sorting",
+            uri=incompatible_skill_dir.as_uri(),
             compatibility={"task_tags": ["sorting"]},
             scores={"quality": 1.0},
             tags=["sorting"],
@@ -497,7 +508,9 @@ def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
 def test_context_resolver_honors_explicit_context_artifact_ids(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
-    old_memory_file = tmp_path / "old-memory.md"
+    payload_root = tmp_path / "artifacts" / "payloads"
+    payload_root.mkdir(parents=True)
+    old_memory_file = payload_root / "old-memory.md"
     old_memory_file.write_text("Old round advice.", encoding="utf-8")
     old_memory = store.register_artifact(
         ArtifactRegisterRequest(
@@ -509,7 +522,7 @@ def test_context_resolver_honors_explicit_context_artifact_ids(tmp_path):
             promoted=True,
         )
     )
-    latest_memory_file = tmp_path / "latest-memory.md"
+    latest_memory_file = payload_root / "latest-memory.md"
     latest_memory_file.write_text("Latest round advice.", encoding="utf-8")
     latest_memory = store.register_artifact(
         ArtifactRegisterRequest(
@@ -521,8 +534,9 @@ def test_context_resolver_honors_explicit_context_artifact_ids(tmp_path):
             promoted=True,
         )
     )
-    adapter_dir = tmp_path / "adapter"
+    adapter_dir = payload_root / "adapter"
     adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
     adapter = store.register_artifact(
         ArtifactRegisterRequest(
             type=ArtifactType.PARAMETRIC_MEMORY,
@@ -646,7 +660,11 @@ def test_context_resolver_skips_unreadable_text_memory(tmp_path):
 def test_context_resolver_requires_declared_base_model_and_harness(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
-    memory_file = tmp_path / "harness-memory.md"
+    payload_root = tmp_path / "artifacts" / "payloads"
+    adapter_dir = payload_root / "adapters" / "qwen-parser"
+    adapter_dir.mkdir(parents=True)
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    memory_file = payload_root / "harness-memory.md"
     memory_file.write_text("Use codex-specific parser heuristics.", encoding="utf-8")
     harness_memory = store.register_artifact(
         ArtifactRegisterRequest(
@@ -663,7 +681,7 @@ def test_context_resolver_requires_declared_base_model_and_harness(tmp_path):
         ArtifactRegisterRequest(
             type=ArtifactType.PARAMETRIC_MEMORY,
             name="qwen parser lora",
-            uri="file:///tmp/adapters/qwen-parser",
+            uri=adapter_dir.as_uri(),
             manifest={"adapter_format": "lora", "base_model": "Qwen/Qwen3.6-27B"},
             compatibility={"base_model": "Qwen/Qwen3.6-27B", "task_tags": ["calculator"]},
             scores={"heldout_reward_delta": 0.2},
@@ -735,19 +753,20 @@ def test_context_resolver_requires_declared_base_model_and_harness(tmp_path):
         )
     )
 
-    assert adapter.artifact_id in unknown_subscription_alias_context.selection[
-        "artifact_ids"
-    ]
-    assert unknown_subscription_alias_context.adapter_merge_spec.adapters[0][
-        "artifact_id"
-    ] == adapter.artifact_id
+    assert adapter.artifact_id in unknown_subscription_alias_context.selection["artifact_ids"]
+    assert (
+        unknown_subscription_alias_context.adapter_merge_spec.adapters[0]["artifact_id"]
+        == adapter.artifact_id
+    )
 
 
 def test_context_resolver_counts_memory_separators_against_limit(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
-    first_file = tmp_path / "first-memory.md"
-    second_file = tmp_path / "second-memory.md"
+    payload_root = tmp_path / "artifacts" / "payloads"
+    payload_root.mkdir(parents=True)
+    first_file = payload_root / "first-memory.md"
+    second_file = payload_root / "second-memory.md"
     first_file.write_text("AAAA", encoding="utf-8")
     second_file.write_text("BBBB", encoding="utf-8")
     first_memory = store.register_artifact(

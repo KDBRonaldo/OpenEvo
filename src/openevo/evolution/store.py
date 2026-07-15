@@ -20,7 +20,6 @@ from openevo.evolution.context import (
     artifact_manifest,
     artifact_matches,
     artifact_type,
-    read_file_uri_text,
     requested_context_artifact_ids,
     request_uses_subscription_auth,
     sort_candidates,
@@ -4009,6 +4008,37 @@ class EvolutionStore:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def _requested_context_artifact_rows(
+        self,
+        artifact_ids: set[str],
+    ) -> list[dict[str, object]]:
+        if not artifact_ids:
+            return []
+        if len(artifact_ids) > 256 or any(
+            not artifact_id or len(artifact_id.encode("utf-8")) > 256
+            for artifact_id in artifact_ids
+        ):
+            raise ValueError("requested context artifact inventory is invalid")
+        ordered = tuple(sorted(artifact_ids))
+        placeholders = ", ".join("?" for _ in ordered)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM artifacts
+                WHERE state IN (?, ?)
+                  AND artifact_id IN ({placeholders})
+                """,  # noqa: S608 - placeholders bind every artifact identity.
+                (
+                    str(ArtifactState.ACTIVE),
+                    str(ArtifactState.EXPERIMENTAL),
+                    *ordered,
+                ),
+            ).fetchall()
+        values = [dict(row) for row in rows]
+        if {str(row["artifact_id"]) for row in values} != artifact_ids:
+            raise ValueError("requested context artifact is unavailable")
+        return values
+
     def resolve_context_projections(
         self,
         request: ContextProjectionResolveRequest,
@@ -5591,11 +5621,21 @@ class EvolutionStore:
         _validate_finite_floats(raw_payload, "request")
 
         requested_artifact_ids = requested_context_artifact_ids(request)
+        rows = (
+            self._promoted_artifact_rows()
+            if requested_artifact_ids is None
+            else self._requested_context_artifact_rows(requested_artifact_ids)
+        )
         rows = [
             row
-            for row in self._promoted_artifact_rows()
+            for row in rows
             if _artifact_id_allowed(row, requested_artifact_ids) and artifact_matches(request, row)
         ]
+        if (
+            requested_artifact_ids is not None
+            and {str(row["artifact_id"]) for row in rows} != requested_artifact_ids
+        ):
+            raise ValueError("requested context artifact is incompatible")
         rows = sort_candidates(rows)
 
         selected_memory: list[dict[str, object]] = []
@@ -5607,84 +5647,142 @@ class EvolutionStore:
         skills: list[dict[str, object]] = []
         adapters: list[dict[str, object]] = []
         selected_ids: list[str] = []
+        selected_inventory: list[dict[str, object]] = []
 
-        for row in rows:
-            kind = artifact_type(row)
-            artifact_id = str(row["artifact_id"])
-            if kind == ArtifactType.TEXT_MEMORY and memory_chars < request.limits.max_memory_chars:
-                text = read_file_uri_text(str(row["uri"]))
-                separator_chars = 2 if rendered_parts else 0
-                remaining = request.limits.max_memory_chars - memory_chars - separator_chars
-                if not text or remaining <= 0:
-                    continue
-                clipped = text[:remaining]
-                rendered_parts.append(clipped)
-                memory_chars += separator_chars + len(clipped)
-                selected_memory.append({"artifact_id": artifact_id, "name": row["name"]})
-                selected_ids.append(artifact_id)
-            elif (
-                kind == ArtifactType.AGENT_SYSTEM
-                and agent_system_chars < request.limits.max_agent_system_chars
-            ):
-                text = read_file_uri_text(str(row["uri"]))
-                separator_chars = 2 if agent_system_parts else 0
-                remaining = (
-                    request.limits.max_agent_system_chars - agent_system_chars - separator_chars
-                )
-                if not text or remaining <= 0:
-                    continue
-                clipped = text[:remaining]
+        with ArtifactPayloadService(self.files.root) as payloads:
+            for row in rows:
+                kind = artifact_type(row)
+                artifact_id = str(row["artifact_id"])
                 manifest = artifact_manifest(row)
                 try:
-                    target_path = normalize_agent_system_target_path(manifest.get("target_path"))
-                except ValueError:
+                    snapshot = payloads.issue_snapshot(
+                        artifact_id=artifact_id,
+                        artifact_type=str(kind),
+                        name=str(row["name"]),
+                        uri=str(row["uri"]),
+                        manifest=manifest,
+                        scores=_context_artifact_scores(row),
+                        rank_index=0,
+                    )
+                except (OSError, ValueError):
+                    if requested_artifact_ids is not None:
+                        raise ValueError("requested context artifact payload is invalid")
                     continue
-                agent_system_parts.append(clipped)
-                agent_system_chars += separator_chars + len(clipped)
-                selected_agent_system.append(
-                    {
-                        "artifact_id": artifact_id,
-                        "name": row["name"],
-                        "target_path": target_path,
-                        "rendered_text": clipped,
-                    }
-                )
-                selected_ids.append(artifact_id)
-            elif (
-                kind == ArtifactType.SKILL_BUNDLE
-                and len(skills) < request.limits.max_skill_bundles
-            ):
-                skills.append(
-                    {
-                        "artifact_id": artifact_id,
-                        "name": row["name"],
-                        "uri": row["uri"],
-                    }
-                )
-                selected_ids.append(artifact_id)
-            elif (
-                kind == ArtifactType.PARAMETRIC_MEMORY
-                and len(adapters) < request.limits.max_adapters
-            ):
-                if request_uses_subscription_auth(request):
-                    continue
-                manifest = artifact_manifest(row)
-                adapter_format = manifest.get("adapter_format")
-                if not isinstance(adapter_format, str) or not adapter_format:
-                    adapter_format = "lora"
-                adapter_id = manifest.get("adapter_id")
-                if not isinstance(adapter_id, str) or not adapter_id.strip():
-                    adapter_id = row["name"]
-                adapters.append(
-                    {
-                        "artifact_id": artifact_id,
-                        "adapter_id": adapter_id,
-                        "uri": row["uri"],
-                        "weight": 1.0,
-                        "format": adapter_format,
-                    }
-                )
-                selected_ids.append(artifact_id)
+                inventory = {
+                    "artifact_id": artifact_id,
+                    "artifact_type": str(kind),
+                    "content_sha256": snapshot.payload_manifest_digest,
+                    "payload_entries": [
+                        entry.model_dump(mode="json") for entry in snapshot.payload_entries
+                    ],
+                }
+                selected = False
+                if (
+                    kind == ArtifactType.TEXT_MEMORY
+                    and memory_chars < request.limits.max_memory_chars
+                ):
+                    separator_chars = 2 if rendered_parts else 0
+                    remaining = request.limits.max_memory_chars - memory_chars - separator_chars
+                    if remaining > 0:
+                        text = _read_context_payload_text(
+                            payloads,
+                            snapshot,
+                            manifest,
+                            max_chars=remaining,
+                        )
+                        if text:
+                            rendered_parts.append(text)
+                            memory_chars += separator_chars + len(text)
+                            selected_memory.append(
+                                {
+                                    "artifact_id": artifact_id,
+                                    "name": row["name"],
+                                    "rendered_text": text,
+                                }
+                            )
+                            selected = True
+                elif (
+                    kind == ArtifactType.AGENT_SYSTEM
+                    and agent_system_chars < request.limits.max_agent_system_chars
+                ):
+                    separator_chars = 2 if agent_system_parts else 0
+                    remaining = (
+                        request.limits.max_agent_system_chars
+                        - agent_system_chars
+                        - separator_chars
+                    )
+                    if remaining > 0:
+                        text = _read_context_payload_text(
+                            payloads,
+                            snapshot,
+                            manifest,
+                            max_chars=remaining,
+                        )
+                        try:
+                            target_path = normalize_agent_system_target_path(
+                                manifest.get("target_path")
+                            )
+                        except ValueError:
+                            if requested_artifact_ids is not None:
+                                raise ValueError("requested agent-system target is invalid")
+                        else:
+                            if text:
+                                agent_system_parts.append(text)
+                                agent_system_chars += separator_chars + len(text)
+                                selected_agent_system.append(
+                                    {
+                                        "artifact_id": artifact_id,
+                                        "name": row["name"],
+                                        "target_path": target_path,
+                                        "rendered_text": text,
+                                    }
+                                )
+                                selected = True
+                elif (
+                    kind == ArtifactType.SKILL_BUNDLE
+                    and len(skills) < request.limits.max_skill_bundles
+                ):
+                    if not any(
+                        entry.relative_path == "SKILL.md" for entry in snapshot.payload_entries
+                    ):
+                        if requested_artifact_ids is not None:
+                            raise ValueError("requested skill bundle has no root SKILL.md")
+                    else:
+                        skills.append(
+                            {
+                                "artifact_id": artifact_id,
+                                "name": row["name"],
+                                "uri": row["uri"],
+                            }
+                        )
+                        selected = True
+                elif (
+                    kind == ArtifactType.PARAMETRIC_MEMORY
+                    and len(adapters) < request.limits.max_adapters
+                    and not request_uses_subscription_auth(request)
+                ):
+                    adapter_format = manifest.get("adapter_format")
+                    if not isinstance(adapter_format, str) or not adapter_format:
+                        adapter_format = "lora"
+                    adapter_id = manifest.get("adapter_id")
+                    if not isinstance(adapter_id, str) or not adapter_id.strip():
+                        adapter_id = row["name"]
+                    adapters.append(
+                        {
+                            "artifact_id": artifact_id,
+                            "adapter_id": adapter_id,
+                            "uri": row["uri"],
+                            "weight": 1.0,
+                            "format": adapter_format,
+                        }
+                    )
+                    selected = True
+                if selected:
+                    selected_ids.append(artifact_id)
+                    selected_inventory.append(inventory)
+
+        if requested_artifact_ids is not None and set(selected_ids) != requested_artifact_ids:
+            raise ValueError("requested context artifact was not selected exactly")
 
         for _ in range(MAX_CONTEXT_ID_ATTEMPTS):
             context_id = new_id("ctx")
@@ -5693,6 +5791,7 @@ class EvolutionStore:
                 memory={
                     "artifact_ids": [str(item["artifact_id"]) for item in selected_memory],
                     "rendered_text": "\n\n".join(rendered_parts),
+                    "items": selected_memory,
                 },
                 agent_system={
                     "artifact_ids": [str(item["artifact_id"]) for item in selected_agent_system],
@@ -5712,6 +5811,7 @@ class EvolutionStore:
                 ),
                 selection={
                     "artifact_ids": selected_ids,
+                    "artifacts": selected_inventory,
                     "reasons": [
                         "matched requested promoted compatible artifacts"
                         if requested_artifact_ids is not None
@@ -7461,6 +7561,44 @@ def _artifact_id_allowed(
         return True
     artifact_id = row.get("artifact_id")
     return isinstance(artifact_id, str) and artifact_id in requested_artifact_ids
+
+
+def _context_artifact_scores(row: dict[str, object]) -> dict[str, object]:
+    try:
+        value = json.loads(str(row["scores_json"]))
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("context artifact scores are invalid") from exc
+    if not isinstance(value, dict):
+        raise ValueError("context artifact scores must be an object")
+    return value
+
+
+def _read_context_payload_text(
+    payloads: ArtifactPayloadService,
+    snapshot: object,
+    manifest: dict[str, Any],
+    *,
+    max_chars: int,
+) -> str:
+    payload_entries = getattr(snapshot, "payload_entries", ())
+    payload_handle = getattr(snapshot, "payload_handle", None)
+    paths = [entry.relative_path for entry in payload_entries]
+    content_path = manifest.get("content_path")
+    if isinstance(content_path, str) and content_path in paths:
+        selected_path = content_path
+    elif len(paths) == 1:
+        selected_path = paths[0]
+    else:
+        raise ValueError("text artifact payload has no unambiguous content path")
+    if not isinstance(payload_handle, str):
+        raise ValueError("text artifact payload handle is invalid")
+    bounded_chars = min(max_chars, 1_048_576)
+    return payloads.read_utf8_prefix(
+        payload_handle,
+        selected_path,
+        max_chars=bounded_chars,
+        max_bytes=1_048_576,
+    )
 
 
 def _internal_job_output_object(

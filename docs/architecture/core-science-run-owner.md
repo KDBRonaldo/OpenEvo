@@ -96,9 +96,11 @@ included.
 Core compiles the project through `compile_science_execution()` and invokes the
 existing experiment runner. The runner accepts a Core-owned run ID, an exact
 initial context from the pinned revision, and a managed worker callback. This
-is orchestration only: evolution method descriptors, method invocation, output
-selection, and promotion semantics remain owned by the existing evolution
-framework and algorithms.
+is orchestration only: evolution method descriptors, method invocation, and
+algorithm promotion semantics remain owned by the existing evolution framework
+and algorithms. For product runs, Core separately records which typed target
+outputs are members of the direct successor; that membership is the authority
+for the next session and does not rewrite an output's `promoted` field.
 
 `ProjectStatus.READY` remains the immutable project preparation contract: its
 config, workspace snapshot, registry, model reference, and active revision are
@@ -125,6 +127,15 @@ value.
 Gateway, rollout, and evolution private requests are accepted only through the
 generation-bound admission verifier. Core never exposes the private credential
 or service URLs through the Desktop contract.
+
+For a run with pinned context artifacts, Gateway emits a closed runtime
+injection receipt only after exact context resolution and staging. It binds the
+context/revision, final instruction digest, staged-tree digest, and source/staged
+digest for each artifact. The rollout wrapper, not the experiment runner,
+captures that receipt. Before publishing success, Core checks its exact artifact
+membership, types, and source content digests against the input revision's
+durable artifact authority. Missing, extra, changed, or runner-supplied receipts
+fail closed.
 
 ## Cross-Session Evolution
 

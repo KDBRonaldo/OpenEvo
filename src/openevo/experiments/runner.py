@@ -84,9 +84,7 @@ def compiled_experiment_plan(compiled: CompiledExperiment) -> dict[str, Any]:
                 history_context_artifact_ids.setdefault(spec.artifact_type, []).append(
                     artifact_placeholder
                 )
-                next_rollout_context_artifact_ids[spec.artifact_type] = [
-                    artifact_placeholder
-                ]
+                next_rollout_context_artifact_ids[spec.artifact_type] = [artifact_placeholder]
             history_context_artifact_ids["dataset"].append(dataset_placeholder)
             rollout_context_artifact_ids = next_rollout_context_artifact_ids
         tasks.append({"task_id": task.task_id, "rounds": rounds})
@@ -119,6 +117,7 @@ def run_experiment(
     task_ids: Sequence[str] | None = None,
     rounds_override: int | None = None,
     initial_context_artifact_ids: Mapping[str, Sequence[str]] | None = None,
+    core_authoritative_successor: bool = False,
     managed_worker: bool = False,
     output_dir: Path | None = None,
     artifact_root: Path | None = None,
@@ -169,6 +168,7 @@ def run_experiment(
             max_poll_attempts=max_poll_attempts,
             executable_registry=executable_registry,
             initial_context_artifact_ids=initial_context_artifact_ids,
+            core_authoritative_successor=core_authoritative_successor,
             managed_worker=managed_worker,
         )
     finally:
@@ -200,18 +200,17 @@ def _run_compiled_experiment(
     max_poll_attempts: int,
     executable_registry: VerifiedExecutableRegistry,
     initial_context_artifact_ids: Mapping[str, Sequence[str]] | None,
+    core_authoritative_successor: bool,
     managed_worker: bool,
 ) -> dict[str, Any]:
     task_results: list[dict[str, Any]] = []
     any_failure = False
     any_pending_review = False
     run_id = compiled.run_id or uuid4().hex
-    initial_context = _validated_initial_context_artifact_ids(
-        initial_context_artifact_ids
-    )
+    initial_context = _validated_initial_context_artifact_ids(initial_context_artifact_ids)
     for task in compiled.tasks:
         history_context_artifact_ids = _snapshot_context_artifact_ids(initial_context)
-        rollout_context_artifact_ids = _snapshot_context_artifact_ids(initial_context)
+        rollout_context_artifact_ids = _runtime_context_artifact_ids(initial_context)
         round_results: list[dict[str, Any]] = []
         for round_index in range(compiled.round_count):
             rollout_payload = task.rollout_payload_for_round(
@@ -233,9 +232,7 @@ def _run_compiled_experiment(
                 "dataset": None,
                 "dataset_status": None,
                 "jobs": [],
-                "artifact_ids": _snapshot_context_artifact_ids(
-                    history_context_artifact_ids
-                ),
+                "artifact_ids": _snapshot_context_artifact_ids(history_context_artifact_ids),
             }
             if rollout_result.get("status") != "completed":
                 any_failure = True
@@ -318,8 +315,7 @@ def _run_compiled_experiment(
                 )
                 if worker_status == "succeeded":
                     artifacts = [
-                        evolution_client.get_artifact(artifact_id)
-                        for artifact_id in artifact_ids
+                        evolution_client.get_artifact(artifact_id) for artifact_id in artifact_ids
                     ]
                     for expected_artifact_id, artifact in zip(
                         artifact_ids,
@@ -368,9 +364,7 @@ def _run_compiled_experiment(
                             content_roots=[artifact_root],
                             reviewer=promotion_reviewer,
                         )
-                        approved_artifact_ids = list(
-                            promotion_result["approved_artifact_ids"]
-                        )
+                        approved_artifact_ids = list(promotion_result["approved_artifact_ids"])
                         promotion_status = str(promotion_result["status"])
                         promotion_reviews = list(promotion_result["reviews"])
                         _create_backend_promotion_reviews(
@@ -390,17 +384,23 @@ def _run_compiled_experiment(
                             any_failure = True
                             round_failed = True
                     else:
-                        approved_artifact_ids = [
-                            _required_text(
-                                artifact,
-                                "artifact_id",
-                                "artifact response",
-                            )
-                            for artifact in target_artifacts
-                            if artifact.get("promoted") is True
-                        ]
+                        approved_artifact_ids = (
+                            list(target_artifact_ids)
+                            if core_authoritative_successor
+                            else [
+                                _required_text(
+                                    artifact,
+                                    "artifact_id",
+                                    "artifact response",
+                                )
+                                for artifact in target_artifacts
+                                if artifact.get("promoted") is True
+                            ]
+                        )
                         if approved_artifact_ids:
-                            promotion_status = "skipped"
+                            promotion_status = (
+                                "core_selected" if core_authoritative_successor else "skipped"
+                            )
                         else:
                             promotion_status = "missing_promoted_target_artifact"
                             any_failure = True
@@ -447,11 +447,7 @@ def _run_compiled_experiment(
     return {
         "mode": "run",
         "status": (
-            "failed"
-            if any_failure
-            else "pending_review"
-            if any_pending_review
-            else "completed"
+            "failed" if any_failure else "pending_review" if any_pending_review else "completed"
         ),
         "experiment_id": compiled.experiment_id,
         "experiment_name": compiled.experiment_name,
@@ -506,6 +502,14 @@ def _snapshot_context_artifact_ids(
     }
 
 
+def _runtime_context_artifact_ids(
+    context_artifact_ids: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    runtime_context = _snapshot_context_artifact_ids(context_artifact_ids)
+    runtime_context["dataset"] = []
+    return runtime_context
+
+
 def _validated_initial_context_artifact_ids(
     value: Mapping[str, Sequence[str]] | None,
 ) -> dict[str, list[str]]:
@@ -516,11 +520,7 @@ def _validated_initial_context_artifact_ids(
         raise ValueError("initial context has too many artifact types")
     total = 0
     for artifact_type, artifact_ids in value.items():
-        if (
-            not isinstance(artifact_type, str)
-            or not artifact_type
-            or len(artifact_type) > 128
-        ):
+        if not isinstance(artifact_type, str) or not artifact_type or len(artifact_type) > 128:
             raise ValueError("initial context artifact type is invalid")
         if isinstance(artifact_ids, str) or not isinstance(artifact_ids, Sequence):
             raise TypeError("initial context artifact IDs must be a sequence")
@@ -677,9 +677,7 @@ def _plan_bound_job_payload(
             raise ValueError(
                 f"compiled evolution job changed normalized method config field {key!r}"
             )
-    core_config = {
-        key: value for key, value in legacy_config.items() if key not in user_config
-    }
+    core_config = {key: value for key, value in legacy_config.items() if key not in user_config}
     return {
         "plan": spec.plan.model_dump(mode="json"),
         "target_id": spec.target_id,
@@ -815,9 +813,7 @@ def _required_text(payload: dict[str, Any], key: str, source: str) -> str:
 
 
 def _dataset_has_trajectories(dataset: dict[str, Any]) -> bool:
-    return _positive_int(dataset.get("event_count")) and _positive_int(
-        dataset.get("trace_count")
-    )
+    return _positive_int(dataset.get("event_count")) and _positive_int(dataset.get("trace_count"))
 
 
 def _positive_int(value: object) -> bool:

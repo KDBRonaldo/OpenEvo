@@ -159,7 +159,7 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
             "target_id": target_id,
             "produced_revision": successor,
             "selected": True,
-            "promoted": True,
+            "promoted": False,
             "release_enabled": True,
             "lineage": {"source_artifact_ids": []},
         }
@@ -170,25 +170,19 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
             "id": f"artifact-session-2-{target_id}",
             "target_id": target_id,
             "produced_revision": _revision("revision-2", 2),
-            "lineage": {
-                "source_artifact_ids": [f"artifact-session-1-{target_id}"]
-            },
+            "lineage": {"source_artifact_ids": [f"artifact-session-1-{target_id}"]},
         }
         for target_id in module.REQUIRED_TARGET_IDS
     )
-    receipt = {
-        "schema_version": "1",
-        "context_injected": True,
-        "context_artifact_ids": sorted(
-            artifact["id"] for artifact in first_artifacts
-        ),
-    }
+    receipt_sha256 = "f" * 64
     first = module.SessionObservation(
         evidence={},
         run={"pinned_revision": predecessor},
         context={},
         artifacts=first_artifacts,
-        document_sha256_by_target={target_id: "1" * 64 for target_id in module.REQUIRED_TARGET_IDS},
+        document_sha256_by_target={
+            target_id: "1" * 64 for target_id in module.REQUIRED_TARGET_IDS
+        },
         runtime_context_receipt_sha256=None,
     )
     second = module.SessionObservation(
@@ -209,8 +203,10 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
             ]
         },
         artifacts=second_artifacts,
-        document_sha256_by_target={target_id: "2" * 64 for target_id in module.REQUIRED_TARGET_IDS},
-        runtime_context_receipt_sha256=module._canonical_object_sha256(receipt),
+        document_sha256_by_target={
+            target_id: "2" * 64 for target_id in module.REQUIRED_TARGET_IDS
+        },
+        runtime_context_receipt_sha256=receipt_sha256,
     )
 
     reuse = workflow._assert_successor_reuse(first, second)
@@ -218,6 +214,7 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
     assert reuse["session_2_pinned_session_1_successor"] is True
     assert reuse["session_1_artifacts_reused"] is True
     assert reuse["session_2_runtime_injection_verified"] is True
+    assert reuse["runtime_context_receipt_sha256"] == receipt_sha256
     second.run["pinned_revision"] = _revision("revision-2", 2)
     with pytest.raises(module.E2EFailure, match="second_session_did_not_pin_successor"):
         workflow._assert_successor_reuse(first, second)
@@ -277,7 +274,9 @@ def test_closed_evidence_schema_accepts_runtime_receipt_shape() -> None:
     payload = {
         "project": {
             "target_ids": list(module.REQUIRED_TARGET_IDS),
-            "method_ids": {target_id: f"method_{target_id}" for target_id in module.REQUIRED_TARGET_IDS},
+            "method_ids": {
+                target_id: f"method_{target_id}" for target_id in module.REQUIRED_TARGET_IDS
+            },
             "registry_digest": digest,
         },
         "sessions": [
@@ -329,28 +328,72 @@ def test_capability_selection_enables_all_three_remote_supported_methods() -> No
                     "capabilities": {
                         "registry_digest": "a" * 64,
                         "targets": [
-                            {
-                                "target_id": target_id,
-                                "effective_default_method_id": f"remote-{target_id}",
-                                "methods": [
-                                    {
-                                        "method_id": f"remote-{target_id}",
-                                        "maturity": "experimental"
-                                        if target_id == "text_memory"
-                                        else "stable",
-                                        "support": {"overall": "supported"},
-                                        "implementation_identity_digest": "b" * 64,
-                                        "default_config_json": '{"limit":1}',
-                                    },
-                                    {
-                                        "method_id": f"experimental-{target_id}",
-                                        "maturity": "experimental",
-                                        "support": {"overall": "supported"},
-                                        "implementation_identity_digest": "c" * 64,
-                                        "default_config_json": "{}",
-                                    },
-                                ],
-                            }
+                            (
+                                {
+                                    "target_id": target_id,
+                                    "effective_default_method_id": f"remote-{target_id}",
+                                    "methods": [
+                                        {
+                                            "method_id": f"remote-{target_id}",
+                                            "maturity": "experimental"
+                                            if target_id == "text_memory"
+                                            else "stable",
+                                            "support": {"overall": "supported"},
+                                            "implementation_identity_digest": "b" * 64,
+                                            "default_config_json": '{"limit":1}',
+                                        },
+                                        {
+                                            "method_id": f"experimental-{target_id}",
+                                            "maturity": "experimental",
+                                            "support": {"overall": "supported"},
+                                            "implementation_identity_digest": "c" * 64,
+                                            "default_config_json": "{}",
+                                        },
+                                    ],
+                                    "accepted_methods": [
+                                        {
+                                            "method_id": "remote-agent_system",
+                                            "support": {"overall": "supported"},
+                                            "implementation_identity_digest": "b" * 64,
+                                        }
+                                    ],
+                                    "selection_resolvers": [
+                                        {
+                                            "selection_value": "auto",
+                                            "resolved_methods": [
+                                                {
+                                                    "method_id": "remote-agent_system",
+                                                    "support": {"overall": "supported"},
+                                                    "implementation_identity_digest": "b" * 64,
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                }
+                                if target_id == "agent_system"
+                                else {
+                                    "target_id": target_id,
+                                    "effective_default_method_id": f"remote-{target_id}",
+                                    "methods": [
+                                        {
+                                            "method_id": f"remote-{target_id}",
+                                            "maturity": "experimental"
+                                            if target_id == "text_memory"
+                                            else "stable",
+                                            "support": {"overall": "supported"},
+                                            "implementation_identity_digest": "b" * 64,
+                                            "default_config_json": '{"limit":1}',
+                                        },
+                                        {
+                                            "method_id": f"experimental-{target_id}",
+                                            "maturity": "experimental",
+                                            "support": {"overall": "supported"},
+                                            "implementation_identity_digest": "c" * 64,
+                                            "default_config_json": "{}",
+                                        },
+                                    ],
+                                }
+                            )
                             for target_id in module.REQUIRED_TARGET_IDS
                         ],
                     },
@@ -375,11 +418,65 @@ def test_capability_selection_enables_all_three_remote_supported_methods() -> No
     targets = api.patched["evolution"]["targets"]  # type: ignore[index]
     assert set(targets) == set(module.REQUIRED_TARGET_IDS)
     for target_id, selection in targets.items():
+        if target_id == "agent_system":
+            assert selection == {
+                "enabled": True,
+                "method": "auto",
+                "config": {},
+            }
+            continue
         assert selection == {
             "enabled": True,
             "method": f"remote-{target_id}",
             "config": {"limit": 1},
         }
+
+
+def test_capability_selection_rejects_unsupported_agent_system_auto() -> None:
+    module = _load_runner()
+    project = {"etag": '"' + "1" * 64 + '"'}
+
+    class FakeApi:
+        def request(self, _method: str, route: str, **_kwargs: object):
+            assert route.endswith("/capabilities")
+            return {
+                "project_etag": project["etag"],
+                "capabilities": {
+                    "registry_digest": "a" * 64,
+                    "targets": [
+                        {
+                            "target_id": "agent_system",
+                            "methods": [],
+                            "accepted_methods": [
+                                {
+                                    "method_id": "agent-system-concrete",
+                                    "support": {"overall": "unsupported"},
+                                    "implementation_identity_digest": "b" * 64,
+                                }
+                            ],
+                            "selection_resolvers": [
+                                {
+                                    "selection_value": "auto",
+                                    "resolved_methods": [
+                                        {
+                                            "method_id": "agent-system-concrete",
+                                            "support": {"overall": "unsupported"},
+                                            "implementation_identity_digest": "b" * 64,
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+
+    workflow = _workflow(module)
+    workflow._api = FakeApi()
+    workflow.project_id = "project-real-e2e"
+
+    with pytest.raises(module.E2EFailure, match="agent_system_auto_not_supported"):
+        workflow._select_and_activate_targets(project)
 
 
 def test_release_negotiation_matches_native_host_contract() -> None:
@@ -427,6 +524,7 @@ def test_release_negotiation_matches_native_host_contract() -> None:
         ({"openapi_sha256": "0" * 64}, "desktop_contract_invalid"),
         ({"provider_kind": "contract_simulator"}, "not_release_desktop_sidecar"),
         ({"feature_flags": ["remote_profiles"]}, "desktop_contract_invalid"),
+        ({"unknown_field": True}, "desktop_contract_invalid"),
     ],
 )
 def test_release_negotiation_rejects_non_native_contract(
@@ -466,7 +564,7 @@ def test_timeout_arguments_require_finite_positive_values(value: str) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_process_group_cleanup_kills_descendant_after_leader_exit() -> None:
+def test_build_process_group_cleanup_kills_descendant_after_leader_exit() -> None:
     module = _load_runner()
     code = """
 import os, signal, sys, time
@@ -488,12 +586,13 @@ os._exit(0)
     assert process.stdout is not None
     child_pid = int(process.stdout.readline().strip())
     process.stdout.close()
-    assert module._wait_exited_without_reap(process, timeout_seconds=2)
-
-    assert module._terminate_process_group(
-        process,
-        process_group_id=process.pid,
-        graceful_timeout_seconds=0.1,
+    assert (
+        module._wait_for_build_process_group(
+            process,
+            process_group_id=process.pid,
+            timeout_seconds=2,
+        )
+        == 0
     )
 
     deadline = time.monotonic() + 2

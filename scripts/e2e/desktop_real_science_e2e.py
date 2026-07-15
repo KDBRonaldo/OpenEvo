@@ -50,7 +50,7 @@ MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 128 * 1024
 MAX_EVIDENCE_ITEMS = 64
 REQUIRED_TARGET_IDS = ("agent_system", "skill_bundle", "text_memory")
-RUNTIME_CONTEXT_RECEIPT_PREFIX = "Runtime context receipt v1: "
+RUNTIME_CONTEXT_RECEIPT_PREFIX = "Runtime context receipt v2: "
 CONTEXT_CANARY_INSTRUCTION = (
     "\n\nOpenEvo E2E context canary v1: when OPENEVO_MEMORY_FILE, "
     "OPENEVO_SKILLS_DIR, and OPENEVO_AGENT_SYSTEM_FILE are set, read the memory file, "
@@ -89,33 +89,106 @@ FORBIDDEN_EVIDENCE_KEYS = frozenset(
 )
 EVIDENCE_ALLOWED_KEYS = frozenset(
     {
-        "schema_version", "kind", "issue", "real_process_boundary", "outcome",
-        "started_at", "finished_at", "release_assets", "sidecar", "core_wheel",
-        "framework_lock", "sha256", "byte_size", "filename", "distribution",
-        "version", "distribution_digest", "exact_embedded_assets_verified", "desktop",
-        "source_commit", "build_version", "openapi_sha256", "provider_kind",
-        "build_channel", "feature_flags", "legacy_route_rejected",
-        "authenticated_session_probe", "unauthenticated_session_rejected", "remote",
-        "host_sha256", "port", "user_sha256", "host_key_fingerprint_sha256",
-        "project", "project_id_sha256", "execution_mode", "capture_mode",
-        "token_level_metrics_available", "target_ids", "method_ids", "registry_digest",
-        "validation_check_count", "sessions", "ordinal", "run_id_sha256", "status",
-        "required_relation", "required_revision", "pinned_revision", "id_sha256",
-        "generation", "manifest_sha256", "timeline", "logs", "count",
-        "content_sha256", "evidence_truncated", "phase_values", "status_values",
-        "stream_values", "level_values", "artifacts", "artifact_id_sha256",
-        "artifact_type", "target_id", "selected", "promoted", "produced_revision",
-        "release_enabled", "source_artifact_count", "artifact_count",
+        "schema_version",
+        "kind",
+        "issue",
+        "real_process_boundary",
+        "outcome",
+        "started_at",
+        "finished_at",
+        "release_assets",
+        "sidecar",
+        "core_wheel",
+        "framework_lock",
+        "sha256",
+        "byte_size",
+        "filename",
+        "distribution",
+        "version",
+        "distribution_digest",
+        "exact_embedded_assets_verified",
+        "desktop",
+        "source_commit",
+        "build_version",
+        "openapi_sha256",
+        "provider_kind",
+        "build_channel",
+        "feature_flags",
+        "legacy_route_rejected",
+        "authenticated_session_probe",
+        "unauthenticated_session_rejected",
+        "remote",
+        "host_sha256",
+        "port",
+        "user_sha256",
+        "host_key_fingerprint_sha256",
+        "project",
+        "project_id_sha256",
+        "execution_mode",
+        "capture_mode",
+        "token_level_metrics_available",
+        "target_ids",
+        "method_ids",
+        "registry_digest",
+        "validation_check_count",
+        "sessions",
+        "ordinal",
+        "run_id_sha256",
+        "status",
+        "required_relation",
+        "required_revision",
+        "pinned_revision",
+        "id_sha256",
+        "generation",
+        "manifest_sha256",
+        "timeline",
+        "logs",
+        "count",
+        "content_sha256",
+        "evidence_truncated",
+        "phase_values",
+        "status_values",
+        "stream_values",
+        "level_values",
+        "artifacts",
+        "artifact_id_sha256",
+        "artifact_type",
+        "target_id",
+        "selected",
+        "promoted",
+        "produced_revision",
+        "release_enabled",
+        "source_artifact_count",
+        "artifact_count",
         "artifact_evidence_truncated",
-        "artifact_inspections", "document_count", "total_documents", "total_utf8_bytes",
-        "truncated", "runtime_document_sha256", "runtime_context_receipt_sha256",
-        "context", "adapter_count", "reuse", "successor_generation_delta",
-        "session_2_pinned_session_1_successor", "session_1_artifacts_reused",
-        "session_2_runtime_injection_verified", "session_2_lineage_verified",
-        "reused_artifact_count", "successor_revision", "cleanup",
-        "desktop_disconnect_succeeded", "sidecar_shutdown_succeeded",
-        "core_ownership_release_requested", "failure", "stage", "code", "http_status",
-        "agent_system", "skill_bundle", "text_memory",
+        "artifact_inspections",
+        "document_count",
+        "total_documents",
+        "total_utf8_bytes",
+        "truncated",
+        "runtime_document_sha256",
+        "runtime_context_receipt_sha256",
+        "context",
+        "adapter_count",
+        "reuse",
+        "successor_generation_delta",
+        "session_2_pinned_session_1_successor",
+        "session_1_artifacts_reused",
+        "session_2_runtime_injection_verified",
+        "session_2_lineage_verified",
+        "reused_artifact_count",
+        "successor_revision",
+        "cleanup",
+        "desktop_disconnect_succeeded",
+        "sidecar_shutdown_succeeded",
+        "core_ownership_release_requested",
+        "failure",
+        "stage",
+        "code",
+        "http_status",
+        "agent_system",
+        "skill_bundle",
+        "text_memory",
     }
 )
 ABSOLUTE_WINDOWS_PATH = re.compile(r"^[A-Za-z]:[\\/]")
@@ -362,9 +435,7 @@ class DesktopScienceWorkflow:
                 "host_sha256": _digest_text(self._host),
                 "port": self._port,
                 "user_sha256": _digest_text(self._user),
-                "host_key_fingerprint_sha256": _digest_text(
-                    self._expected_host_key_fingerprint
-                ),
+                "host_key_fingerprint_sha256": _digest_text(self._expected_host_key_fingerprint),
             },
             "project": {
                 "project_id_sha256": _digest_text(self.project_id or ""),
@@ -543,9 +614,7 @@ class DesktopScienceWorkflow:
         remote = project.get("remote")
         if project.get("state") != "active" or not isinstance(remote, dict):
             raise E2EFailure(stage, "project_not_active")
-        if remote.get("status") != "ready" or not isinstance(
-            remote.get("active_revision"), dict
-        ):
+        if remote.get("status") != "ready" or not isinstance(remote.get("active_revision"), dict):
             raise E2EFailure(stage, "remote_project_not_ready")
         return project
 
@@ -564,14 +633,63 @@ class DesktopScienceWorkflow:
             raise E2EFailure("project_capabilities", "invalid_target_inventory")
         if capabilities.get("project_etag") != project.get("etag"):
             raise E2EFailure("project_capabilities", "project_etag_mismatch")
-        target_map = {
-            item.get("target_id"): item for item in targets if isinstance(item, dict)
-        }
+        target_map = {item.get("target_id"): item for item in targets if isinstance(item, dict)}
         selections: dict[str, dict[str, object]] = {}
         for target_id in REQUIRED_TARGET_IDS:
             target = target_map.get(target_id)
             if not isinstance(target, dict):
                 raise E2EFailure("project_capabilities", "required_target_not_supported")
+            if target_id == "agent_system":
+                resolvers = target.get("selection_resolvers")
+                auto_resolvers = (
+                    [
+                        resolver
+                        for resolver in resolvers
+                        if isinstance(resolver, dict) and resolver.get("selection_value") == "auto"
+                    ]
+                    if isinstance(resolvers, list)
+                    else []
+                )
+                if len(auto_resolvers) != 1:
+                    raise E2EFailure("project_capabilities", "agent_system_auto_not_supported")
+                resolved_methods = auto_resolvers[0].get("resolved_methods")
+                accepted_methods = target.get("accepted_methods")
+                accepted_by_id = (
+                    {
+                        method.get("method_id"): method
+                        for method in accepted_methods
+                        if isinstance(method, dict) and isinstance(method.get("method_id"), str)
+                    }
+                    if isinstance(accepted_methods, list)
+                    else {}
+                )
+                if (
+                    not isinstance(resolved_methods, list)
+                    or not resolved_methods
+                    or any(
+                        not isinstance(method, dict)
+                        or not isinstance(method.get("method_id"), str)
+                        or not _is_sha256(method.get("implementation_identity_digest"))
+                        or not isinstance(method.get("support"), dict)
+                        or method["support"].get("overall") != "supported"
+                        or not isinstance(
+                            (accepted_method := accepted_by_id.get(method["method_id"])),
+                            dict,
+                        )
+                        or accepted_method.get("implementation_identity_digest")
+                        != method["implementation_identity_digest"]
+                        or accepted_method.get("support") != method["support"]
+                        for method in resolved_methods
+                    )
+                ):
+                    raise E2EFailure("project_capabilities", "agent_system_auto_not_supported")
+                self._method_ids[target_id] = "auto"
+                selections[target_id] = {
+                    "enabled": True,
+                    "method": "auto",
+                    "config": {},
+                }
+                continue
             visible_methods = target.get("methods")
             if not isinstance(visible_methods, list):
                 raise E2EFailure("project_capabilities", "invalid_method_inventory")
@@ -584,35 +702,26 @@ class DesktopScienceWorkflow:
                 and isinstance(method.get("method_id"), str)
                 and _is_sha256(method.get("implementation_identity_digest"))
             ]
-            stable = [
-                method for method in supported if method.get("maturity") == "stable"
-            ]
+            stable = [method for method in supported if method.get("maturity") == "stable"]
             effective_default = target.get("effective_default_method_id")
             selected = next(
-                (method for method in stable if method["method_id"] == effective_default),
-                min(stable, key=lambda method: method["method_id"], default=None),
+                (method for method in supported if method["method_id"] == effective_default),
+                None,
             )
             if selected is None:
-                selected = next(
-                    (
-                        method
-                        for method in supported
-                        if method["method_id"] == effective_default
-                    ),
-                    None,
+                selected = min(
+                    stable or supported,
+                    key=lambda method: method["method_id"],
+                    default=None,
                 )
             if selected is None:
                 raise E2EFailure("project_capabilities", "stable_method_not_supported")
             try:
                 default_config = json.loads(selected["default_config_json"])
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
-                raise E2EFailure(
-                    "project_capabilities", "invalid_method_default_config"
-                ) from exc
+                raise E2EFailure("project_capabilities", "invalid_method_default_config") from exc
             if not isinstance(default_config, dict):
-                raise E2EFailure(
-                    "project_capabilities", "invalid_method_default_config"
-                )
+                raise E2EFailure("project_capabilities", "invalid_method_default_config")
             method_id = str(selected["method_id"])
             self._method_ids[target_id] = method_id
             selections[target_id] = {
@@ -759,9 +868,7 @@ class DesktopScienceWorkflow:
             and _is_sha256(message.removeprefix(RUNTIME_CONTEXT_RECEIPT_PREFIX))
         ]
         if len(receipt_digests) > 1:
-            raise E2EFailure(
-                f"session_{ordinal}_logs", "multiple_runtime_context_receipts"
-            )
+            raise E2EFailure(f"session_{ordinal}_logs", "multiple_runtime_context_receipts")
         runtime_context_receipt_sha256 = receipt_digests[0] if receipt_digests else None
 
         evidence = {
@@ -790,9 +897,7 @@ class DesktopScienceWorkflow:
             "context": {
                 "status": context.get("status"),
                 "capture_mode": context.get("capture_mode"),
-                "token_level_metrics_available": context.get(
-                    "token_level_metrics_available"
-                ),
+                "token_level_metrics_available": context.get("token_level_metrics_available"),
                 "artifact_count": len(context.get("artifacts", []))
                 if isinstance(context.get("artifacts"), list)
                 else -1,
@@ -823,9 +928,10 @@ class DesktopScienceWorkflow:
             raise E2EFailure(f"session_{ordinal}_terminal", _safe_code(code))
         if not isinstance(run.get("pinned_revision"), dict):
             raise E2EFailure(f"session_{ordinal}_terminal", "revision_not_pinned")
-        if observation.context.get("capture_mode") != "transcript" or observation.context.get(
-            "token_level_metrics_available"
-        ) is not False:
+        if (
+            observation.context.get("capture_mode") != "transcript"
+            or observation.context.get("token_level_metrics_available") is not False
+        ):
             raise E2EFailure(f"session_{ordinal}_context", "capture_contract_mismatch")
         timeline_evidence = observation.evidence.get("timeline")
         phases = (
@@ -851,18 +957,14 @@ class DesktopScienceWorkflow:
                 f"session_{ordinal}_artifacts", "required_target_artifact_set_invalid"
             )
         if set(observation.document_sha256_by_target) != set(REQUIRED_TARGET_IDS):
-            raise E2EFailure(
-                f"session_{ordinal}_artifacts", "artifact_inspection_incomplete"
-            )
+            raise E2EFailure(f"session_{ordinal}_artifacts", "artifact_inspection_incomplete")
         revisions = {
             json.dumps(artifact.get("produced_revision"), sort_keys=True)
             for items in artifacts_by_target.values()
             for artifact in items
         }
         if len(revisions) != 1:
-            raise E2EFailure(
-                f"session_{ordinal}_artifacts", "output_revision_inconsistent"
-            )
+            raise E2EFailure(f"session_{ordinal}_artifacts", "output_revision_inconsistent")
 
     def _assert_successor_reuse(
         self,
@@ -889,14 +991,11 @@ class DesktopScienceWorkflow:
             "reuse_successor_revision",
         )
         if any(
-            artifact.get("produced_revision") != successor
-            for artifact in first_outputs.values()
+            artifact.get("produced_revision") != successor for artifact in first_outputs.values()
         ):
             raise E2EFailure("successor_reuse", "output_revision_inconsistent")
         if any(
-            artifact.get("selected") is not True
-            or artifact.get("promoted") is not True
-            or artifact.get("release_enabled") is not True
+            artifact.get("selected") is not True or artifact.get("release_enabled") is not True
             for artifact in first_outputs.values()
         ):
             raise E2EFailure("successor_reuse", "successor_artifact_not_selected")
@@ -948,13 +1047,8 @@ class DesktopScienceWorkflow:
                 or first_artifact_ids[target_id] not in source_artifact_ids
             ):
                 raise E2EFailure("successor_reuse", "successor_lineage_missing")
-        expected_receipt = {
-            "schema_version": "1",
-            "context_injected": True,
-            "context_artifact_ids": sorted(first_artifact_ids.values()),
-        }
-        expected_receipt_sha256 = _canonical_object_sha256(expected_receipt)
-        if second.runtime_context_receipt_sha256 != expected_receipt_sha256:
+        receipt_sha256 = second.runtime_context_receipt_sha256
+        if not _is_sha256(receipt_sha256):
             raise E2EFailure("successor_reuse", "runtime_context_receipt_mismatch")
         return {
             "successor_generation_delta": 1,
@@ -962,7 +1056,7 @@ class DesktopScienceWorkflow:
             "session_1_artifacts_reused": True,
             "session_2_runtime_injection_verified": True,
             "session_2_lineage_verified": True,
-            "runtime_context_receipt_sha256": expected_receipt_sha256,
+            "runtime_context_receipt_sha256": receipt_sha256,
             "reused_artifact_count": len(reused),
             "successor_revision": _revision_evidence(successor, "successor_reuse"),
         }
@@ -1038,15 +1132,11 @@ def _build_assets(root: Path, *, timeout_seconds: float) -> ReleaseAssets:
                 graceful_timeout_seconds=0,
             )
             raise E2EFailure("release_assets", "build_process_group_invalid")
-        try:
-            returncode = process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            _terminate_process_group(
-                process,
-                process_group_id=process_group_id,
-                graceful_timeout_seconds=0,
-            )
-            raise E2EFailure("release_assets", "sidecar_build_timeout") from exc
+        returncode = _wait_for_build_process_group(
+            process,
+            process_group_id=process_group_id,
+            timeout_seconds=timeout_seconds,
+        )
         if returncode != 0:
             raise E2EFailure("release_assets", "sidecar_build_failed")
         build_log.seek(0)
@@ -1277,9 +1367,9 @@ def _wait_sidecar_ready(native: NativeSidecar) -> None:
             time.sleep(0.25)
             continue
         assert health is not None
-        domain = (
-            f"{NATIVE_PROTOCOL}\0{native.credentials.instance_id}\0{challenge}"
-        ).encode("ascii")
+        domain = (f"{NATIVE_PROTOCOL}\0{native.credentials.instance_id}\0{challenge}").encode(
+            "ascii"
+        )
         expected = hmac.new(
             native.credentials.readiness_key,
             domain,
@@ -1300,9 +1390,7 @@ def _wait_sidecar_ready(native: NativeSidecar) -> None:
 def _release_identity(api: LocalApi) -> dict[str, object]:
     try:
         release_contract = json.loads(
-            (REPOSITORY_ROOT / "desktop/release-contract.json").read_text(
-                encoding="utf-8"
-            )
+            (REPOSITORY_ROOT / "desktop/release-contract.json").read_text(encoding="utf-8")
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise E2EFailure("desktop_version", "release_contract_unreadable") from exc
@@ -1322,8 +1410,7 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
         or not _is_sha256(release_contract["accepted_openapi_digests"][0])
         or not isinstance(release_contract.get("required_feature_flags"), list)
         or not all(
-            isinstance(flag, str) and flag
-            for flag in release_contract["required_feature_flags"]
+            isinstance(flag, str) and flag for flag in release_contract["required_feature_flags"]
         )
     ):
         raise E2EFailure("desktop_version", "release_contract_invalid")
@@ -1334,6 +1421,19 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
         authenticated=False,
     )
     assert version is not None
+    if set(version) != {
+        "schema_version",
+        "api_name",
+        "preferred_major",
+        "supported_majors",
+        "openapi_sha256",
+        "build_version",
+        "source_commit",
+        "build_channel",
+        "provider_kind",
+        "feature_flags",
+    }:
+        raise E2EFailure("desktop_version", "desktop_contract_invalid")
     required = {
         "schema_version": "1",
         "api_name": "openevo-desktop-local-api",
@@ -1345,8 +1445,7 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
         raise E2EFailure("desktop_version", "not_release_desktop_sidecar")
     if (
         version.get("supported_majors") != [1]
-        or version.get("openapi_sha256")
-        != release_contract["accepted_openapi_digests"][0]
+        or version.get("openapi_sha256") != release_contract["accepted_openapi_digests"][0]
         or version.get("feature_flags") != release_contract["required_feature_flags"]
     ):
         raise E2EFailure("desktop_version", "desktop_contract_invalid")
@@ -1438,8 +1537,13 @@ def _audit_evidence(value: object, *, private_values: Sequence[str]) -> None:
                     or any(
                         fragment in lowered
                         for fragment in (
-                            "bearer", "credential", "mutation_token", "password",
-                            "passphrase", "private_key", "ssh_auth_sock",
+                            "bearer",
+                            "credential",
+                            "mutation_token",
+                            "password",
+                            "passphrase",
+                            "private_key",
+                            "ssh_auth_sock",
                         )
                     )
                 ):
@@ -1448,8 +1552,7 @@ def _audit_evidence(value: object, *, private_values: Sequence[str]) -> None:
                     raise E2EFailure("evidence", "evidence_field_not_allowlisted")
                 if lowered.endswith("sha256") and child is not None:
                     valid_digest = _is_sha256(child) or (
-                        isinstance(child, list)
-                        and all(_is_sha256(digest) for digest in child)
+                        isinstance(child, list) and all(_is_sha256(digest) for digest in child)
                     )
                     if not valid_digest:
                         raise E2EFailure("evidence", "invalid_evidence_digest")
@@ -1534,20 +1637,14 @@ def _event_inventory(
     }
     for field_name in categorical_fields:
         evidence[f"{field_name}_values"] = sorted(
-            {
-                str(item[field_name])
-                for item in items
-                if isinstance(item.get(field_name), str)
-            }
+            {str(item[field_name]) for item in items if isinstance(item.get(field_name), str)}
         )
     return evidence
 
 
 def _artifact_evidence(artifact: Mapping[str, object], stage: str) -> dict[str, object]:
     lineage = artifact.get("lineage")
-    source_artifact_ids = (
-        lineage.get("source_artifact_ids") if isinstance(lineage, dict) else None
-    )
+    source_artifact_ids = lineage.get("source_artifact_ids") if isinstance(lineage, dict) else None
     return {
         "artifact_id_sha256": _digest_text(_text(artifact, "id", stage)),
         "artifact_type": artifact.get("artifact_type"),
@@ -1560,9 +1657,7 @@ def _artifact_evidence(artifact: Mapping[str, object], stage: str) -> dict[str, 
         "source_artifact_count": len(source_artifact_ids)
         if isinstance(source_artifact_ids, list)
         else -1,
-        "produced_revision": _revision_evidence(
-            artifact.get("produced_revision"), stage
-        ),
+        "produced_revision": _revision_evidence(artifact.get("produced_revision"), stage),
     }
 
 
@@ -1680,8 +1775,7 @@ def _read_bounded(stream: Any) -> bytes:
 
 def _canonical_json(payload: object) -> bytes:
     return (
-        json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-        + "\n"
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode("utf-8")
 
 
@@ -1778,17 +1872,37 @@ def _wait_exited_without_reap(
     return True
 
 
+def _wait_for_build_process_group(
+    process: subprocess.Popen[Any],
+    *,
+    process_group_id: int,
+    timeout_seconds: float,
+) -> int:
+    if not _wait_exited_without_reap(process, timeout_seconds=timeout_seconds):
+        _terminate_process_group(
+            process,
+            process_group_id=process_group_id,
+            graceful_timeout_seconds=0,
+        )
+        raise E2EFailure("release_assets", "sidecar_build_timeout")
+    if not _terminate_process_group(
+        process,
+        process_group_id=process_group_id,
+        graceful_timeout_seconds=0,
+    ):
+        raise E2EFailure("release_assets", "build_process_group_cleanup_failed")
+    if process.returncode is None:
+        raise E2EFailure("release_assets", "build_process_status_missing")
+    return process.returncode
+
+
 def _terminate_process_group(
     process: subprocess.Popen[Any],
     *,
     process_group_id: int,
     graceful_timeout_seconds: float,
 ) -> bool:
-    if (
-        process_group_id <= 0
-        or process_group_id != process.pid
-        or process.returncode is not None
-    ):
+    if process_group_id <= 0 or process_group_id != process.pid or process.returncode is not None:
         return False
     try:
         os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
@@ -1973,9 +2087,7 @@ def main(argv: list[str] | None = None) -> int:
         root = Path(temporary)
         try:
             if args.sidecar is None:
-                assets = _build_assets(
-                    root / "build", timeout_seconds=args.build_timeout_seconds
-                )
+                assets = _build_assets(root / "build", timeout_seconds=args.build_timeout_seconds)
             else:
                 assets = _inspect_release_assets(
                     args.sidecar,
@@ -2054,11 +2166,7 @@ def main(argv: list[str] | None = None) -> int:
 def _utc_now() -> str:
     from datetime import datetime, timezone
 
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="microseconds")
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 if __name__ == "__main__":

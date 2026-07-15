@@ -677,6 +677,7 @@ class CoreScienceRunOwner:
                     task_ids=[compiled.task_id],
                     rounds_override=1,
                     initial_context_artifact_ids=self._ledger.input_context(run_id),
+                    core_authoritative_successor=True,
                     managed_worker=True,
                     output_dir=output_dir,
                     artifact_root=output_dir / "worker-artifacts",
@@ -689,6 +690,7 @@ class CoreScienceRunOwner:
                     execution_profile=compiled.execution_profile,
                 )
                 runtime_context_receipt = rollout.runtime_context_receipt
+                result.pop("runtime_context_receipt", None)
                 if runtime_context_receipt is not None:
                     result["runtime_context_receipt"] = runtime_context_receipt
             finally:
@@ -752,6 +754,12 @@ class CoreScienceRunOwner:
                 raise ScienceRunConflict("only a running task can publish its result")
             request = self._ledger.request_for_run(run_id)
             context = _result_context(result)
+            runtime_context_receipt = _runtime_context_receipt(result)
+            _verify_runtime_context_receipt(
+                runtime_context_receipt,
+                revision_id=request.required_revision.revision.id,
+                artifacts=_runtime_context_artifact_authority(self._ledger, run_id),
+            )
             project = self._project_store.get_project(run.project_id)
             predecessor = request.required_revision.revision
             active_revision = project.active_revision
@@ -794,7 +802,6 @@ class CoreScienceRunOwner:
             self._ledger.store_artifacts(run_id, successor.revision, artifacts)
             self._ledger.set_revision_context(run.project_id, successor.revision.id, context)
             artifact_ids = [artifact.id for artifact in artifacts]
-            runtime_context_receipt = _runtime_context_receipt(result)
             log_builders = [
                 lambda terminal, sequence: self._log_entry(
                     terminal,
@@ -812,7 +819,7 @@ class CoreScienceRunOwner:
                         terminal,
                         sequence,
                         m.LogLevel.INFO,
-                        f"Runtime context receipt v1: {digest}",
+                        f"Runtime context receipt v2: {digest}",
                     )
                 )
             self._ledger.mutate_run_with_evidence(
@@ -1211,6 +1218,8 @@ class _AdmittingRolloutClient:
         self._cancellation = cancellation
         self._runtime_context_receipt: dict[str, object] | None = None
         self._expected_context_artifact_ids: tuple[str, ...] = ()
+        self._expected_revision_id: str | None = None
+        self._expected_context_artifacts: dict[str, dict[str, str]] = {}
 
     @property
     def runtime_context_receipt(self) -> dict[str, object] | None:
@@ -1225,21 +1234,45 @@ class _AdmittingRolloutClient:
         task_id = canonical.request.task_id
         payload_metadata = canonical.request.metadata
         evolution_metadata = (
-            payload_metadata.get("evolution")
-            if isinstance(payload_metadata, dict)
-            else None
+            payload_metadata.get("evolution") if isinstance(payload_metadata, dict) else None
         )
         context_artifact_ids = (
             evolution_metadata.get("context_artifact_ids")
             if isinstance(evolution_metadata, dict)
             else []
         )
-        if not isinstance(context_artifact_ids, list) or not all(
-            isinstance(artifact_id, str) and artifact_id
-            for artifact_id in context_artifact_ids
+        if (
+            not isinstance(context_artifact_ids, list)
+            or not all(
+                isinstance(artifact_id, str) and artifact_id
+                for artifact_id in context_artifact_ids
+            )
+            or len(context_artifact_ids) != len(set(context_artifact_ids))
         ):
             raise ValueError("rollout payload has invalid context artifact identity")
         self._expected_context_artifact_ids = tuple(sorted(context_artifact_ids))
+        authoritative = _runtime_context_artifact_authority(
+            self._owner._ledger,
+            self._run_id,
+        )
+        if set(self._expected_context_artifact_ids) != set(authoritative):
+            raise ValueError("rollout payload context differs from revision authority")
+        openevo_metadata = (
+            payload_metadata.get("openevo") if isinstance(payload_metadata, dict) else None
+        )
+        revision_id = (
+            openevo_metadata.get("revision_id") if isinstance(openevo_metadata, dict) else None
+        )
+        required_revision_id = self._owner._ledger.request_for_run(
+            self._run_id
+        ).required_revision.revision.id
+        if self._expected_context_artifact_ids:
+            if revision_id != required_revision_id:
+                raise ValueError("rollout payload revision differs from run authority")
+            self._expected_revision_id = required_revision_id
+        elif revision_id is not None and revision_id != required_revision_id:
+            raise ValueError("rollout payload revision differs from run authority")
+        self._expected_context_artifacts = authoritative
         accepted = self._owner._ledger.register_admission(
             run_id=self._run_id,
             operation=RunAdmissionOperation.ROLLOUT_TASK_SUBMIT.value,
@@ -1264,12 +1297,13 @@ class _AdmittingRolloutClient:
         result = self._client.get_task(task_id)
         if self._cancellation.is_set():
             raise _RunCancelled()
-        if result.get("status") == "completed" and self._expected_context_artifact_ids:
+        if result.get("status") == "completed":
             receipt = _rollout_runtime_context_receipt(result)
-            if receipt is None or tuple(receipt["context_artifact_ids"]) != (
-                self._expected_context_artifact_ids
-            ):
-                raise RuntimeError("rollout runtime context receipt does not match admission")
+            _verify_runtime_context_receipt(
+                receipt,
+                revision_id=self._expected_revision_id,
+                artifacts=self._expected_context_artifacts,
+            )
             if (
                 self._runtime_context_receipt is not None
                 and self._runtime_context_receipt != receipt
@@ -1491,27 +1525,25 @@ def _rollout_runtime_context_receipt(
     evolution = metadata.get("evolution") if isinstance(metadata, dict) else None
     if not isinstance(evolution, dict):
         raise ValueError("science rollout has no evolution runtime metadata")
-    artifact_ids = evolution.get("context_artifact_ids")
-    if not isinstance(artifact_ids, list):
-        raise ValueError("science rollout context artifact identity is invalid")
-    if not artifact_ids:
-        return None
+    context_artifact_ids = evolution.get("context_artifact_ids")
     if (
-        evolution.get("context_injected") is not True
-        or len(artifact_ids) > 256
-        or not all(
-            isinstance(artifact_id, str)
-            and 0 < len(artifact_id.encode("utf-8")) <= 256
-            for artifact_id in artifact_ids
-        )
-        or len(artifact_ids) != len(set(artifact_ids))
+        not isinstance(context_artifact_ids, list)
+        or len(context_artifact_ids) > 256
+        or not all(_bounded_identity(artifact_id) for artifact_id in context_artifact_ids)
+        or len(context_artifact_ids) != len(set(context_artifact_ids))
     ):
+        raise ValueError("science rollout context artifact identity is invalid")
+    value = evolution.get("runtime_injection_receipt")
+    if not context_artifact_ids and value is None:
+        return None
+    if evolution.get("context_injected") is not True:
         raise ValueError("science rollout context was not injected exactly")
-    return {
-        "schema_version": "1",
-        "context_injected": True,
-        "context_artifact_ids": sorted(artifact_ids),
-    }
+    receipt = _validate_runtime_context_receipt(value)
+    if tuple(item["artifact_id"] for item in receipt["artifacts"]) != tuple(
+        sorted(context_artifact_ids)
+    ):
+        raise ValueError("science rollout receipt differs from runtime metadata")
+    return receipt
 
 
 def _runtime_context_receipt(
@@ -1520,18 +1552,115 @@ def _runtime_context_receipt(
     value = result.get("runtime_context_receipt")
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {
-        "schema_version",
-        "context_injected",
-        "context_artifact_ids",
-    }:
-        raise ValueError("science result runtime context receipt is invalid")
-    validated = _rollout_runtime_context_receipt(
-        {"results": [{"metadata": {"evolution": value}}]}
-    )
+    validated = _validate_runtime_context_receipt(value)
     if validated != value:
         raise ValueError("science result runtime context receipt is not canonical")
     return validated
+
+
+def _validate_runtime_context_receipt(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "context_id",
+        "revision_id",
+        "instruction_sha256",
+        "staged_tree_sha256",
+        "artifacts",
+    }:
+        raise ValueError("science runtime context receipt is invalid")
+    artifacts = value.get("artifacts")
+    if (
+        value.get("schema_version") != "2"
+        or not _bounded_identity(value.get("context_id"))
+        or not _bounded_identity(value.get("revision_id"))
+        or not _sha256(value.get("instruction_sha256"))
+        or not _sha256(value.get("staged_tree_sha256"))
+        or not isinstance(artifacts, list)
+        or not 0 < len(artifacts) <= 256
+    ):
+        raise ValueError("science runtime context receipt is invalid")
+    validated_artifacts: list[dict[str, str]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {
+            "artifact_id",
+            "artifact_type",
+            "content_sha256",
+            "staged_sha256",
+        }:
+            raise ValueError("science runtime context artifact receipt is invalid")
+        artifact_id = artifact.get("artifact_id")
+        artifact_type = artifact.get("artifact_type")
+        if (
+            not _bounded_identity(artifact_id)
+            or artifact_type not in _CONTEXT_TYPES
+            or artifact_type == "dataset"
+            or not _sha256(artifact.get("content_sha256"))
+            or not _sha256(artifact.get("staged_sha256"))
+        ):
+            raise ValueError("science runtime context artifact receipt is invalid")
+        validated_artifacts.append(cast(dict[str, str], dict(artifact)))
+    if len({item["artifact_id"] for item in validated_artifacts}) != len(
+        validated_artifacts
+    ) or validated_artifacts != sorted(validated_artifacts, key=lambda item: item["artifact_id"]):
+        raise ValueError("science runtime context artifact receipt is not canonical")
+    return {
+        "schema_version": "2",
+        "context_id": value["context_id"],
+        "revision_id": value["revision_id"],
+        "instruction_sha256": value["instruction_sha256"],
+        "staged_tree_sha256": value["staged_tree_sha256"],
+        "artifacts": validated_artifacts,
+    }
+
+
+def _runtime_context_artifact_authority(
+    ledger: ScienceRunStore,
+    run_id: str,
+) -> dict[str, dict[str, str]]:
+    context = ledger.input_context(run_id)
+    expected_types: dict[str, str] = {}
+    for artifact_type, artifact_ids in context.items():
+        if artifact_type == "dataset":
+            continue
+        for artifact_id in artifact_ids:
+            if artifact_id in expected_types:
+                raise ValueError("science revision context artifact identity is duplicated")
+            expected_types[artifact_id] = artifact_type
+    artifacts = ledger.artifacts_by_ids(list(expected_types))
+    authority: dict[str, dict[str, str]] = {}
+    for artifact in artifacts:
+        artifact_type = artifact.artifact_type.value
+        if expected_types.get(artifact.id) != artifact_type:
+            raise ValueError("science revision context artifact type is invalid")
+        authority[artifact.id] = {
+            "artifact_type": artifact_type,
+            "content_sha256": artifact.content_sha256,
+        }
+    return authority
+
+
+def _verify_runtime_context_receipt(
+    receipt: dict[str, object] | None,
+    *,
+    revision_id: str | None,
+    artifacts: Mapping[str, Mapping[str, str]],
+) -> None:
+    if not artifacts:
+        if receipt is not None:
+            raise ValueError("science run produced an unexpected runtime context receipt")
+        return
+    if receipt is None or receipt.get("revision_id") != revision_id:
+        raise ValueError("science runtime context receipt revision is invalid")
+    received = cast(list[dict[str, str]], receipt["artifacts"])
+    if {item["artifact_id"] for item in received} != set(artifacts):
+        raise ValueError("science runtime context receipt membership is invalid")
+    for item in received:
+        expected = artifacts[item["artifact_id"]]
+        if (
+            item["artifact_type"] != expected["artifact_type"]
+            or item["content_sha256"] != expected["content_sha256"]
+        ):
+            raise ValueError("science runtime context receipt content authority is invalid")
 
 
 def _project_artifacts(
@@ -1542,6 +1671,11 @@ def _project_artifacts(
     revision: m.RevisionRefV1,
 ) -> list[m.ArtifactSummaryV1]:
     outputs = _worker_output_records(result)
+    selected_artifact_ids = {
+        artifact_id
+        for artifact_ids in _result_context(result).values()
+        for artifact_id in artifact_ids
+    }
     if len(outputs) > 1024:
         raise ValueError("science result has too many artifact outputs")
     projected: list[m.ArtifactSummaryV1] = []
@@ -1605,7 +1739,7 @@ def _project_artifacts(
             "produced_revision": revision,
             "membership_revisions": [revision],
             "content_sha256": digest,
-            "selected": bool(output.get("promoted")),
+            "selected": artifact_id in selected_artifact_ids,
             "promoted": bool(output.get("promoted")),
             "release_enabled": artifact_type is not m.ArtifactType.PARAMETRIC_MEMORY,
             "compatibility": m.ArtifactCompatibilityV1(
@@ -1818,6 +1952,18 @@ def _canonical_bytes(value: object) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _bounded_identity(value: object) -> bool:
+    return isinstance(value, str) and 0 < len(value.encode("utf-8")) <= 256
 
 
 __all__ = ["CoreScienceRunOwner"]

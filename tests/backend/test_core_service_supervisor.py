@@ -336,9 +336,7 @@ def _supervisor(
     max_log_bytes: int = 32_768,
     runtime_probe: FakeManagedScienceRuntimeProbe | None = None,
     max_restart_operations: int = 256,
-    run_admission_url: str | None = (
-        "http://127.0.0.1:19000/internal/v1/run-admissions/verify"
-    ),
+    run_admission_url: str | None = ("http://127.0.0.1:19000/internal/v1/run-admissions/verify"),
 ) -> tuple[
     CoreServiceSupervisor,
     FakeProcessBackend,
@@ -427,11 +425,28 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         assert all(service.identity_digest for service in snapshot.services)
         topology = json.loads((tmp_path / "core-services" / "topology.json").read_text())
         parsed_topology = TopologyConfig.load(tmp_path / "core-services" / "topology.json")
-        assert "evolution" not in topology
+        assert topology["evolution"] == {
+            "enabled": True,
+            "backend_url": (f"http://127.0.0.1:{snapshot.service('evolution-backend').port}"),
+            "context": {
+                "target_dir": "/openevo/session/evolution",
+                "timeout_seconds": 10,
+                "fail_open": False,
+            },
+            "event_export": {
+                "enabled": True,
+                "timeout_seconds": 10,
+                "fail_open": False,
+            },
+        }
         assert topology["gateway"]["nodes"][0]["port"] > 0
         assert topology["gateway"]["nodes"][0]["model_served"] == "gpt-5.1-codex-mini"
         assert topology["rollout"]["port"] > 0
         assert parsed_topology.gateway.nodes[0].default_runtime is None
+        assert parsed_topology.evolution is not None
+        assert parsed_topology.evolution.enabled is True
+        assert parsed_topology.evolution.context.fail_open is False
+        assert parsed_topology.evolution.event_export.fail_open is False
         assert runtime_probe.requests == [
             ManagedScienceRuntimeRequest(
                 runtime_image="openevo/science-runtime:0.1.0",
@@ -1007,7 +1022,7 @@ def test_structured_unknown_field_names_retain_scalar_uri_sanitization() -> None
         (
             'worker --password "unterminated secret with quote tail --model gpt-5',
             "worker --password <redacted>",
-            ("unterminated", "quote tail", "--model", 'gpt-5'),
+            ("unterminated", "quote tail", "--model", "gpt-5"),
         ),
         (
             "OPENAI_API_KEY 'unterminated env secret worker ready",
@@ -1049,9 +1064,7 @@ def test_quoted_secret_redaction_is_chunk_utf8_and_eof_invariant(
     expected = supervisor_module._sanitize(message).encode("utf-8") + b"\n"
 
     for chunk_size in (1, 2, 3, 5, 13, len(payload) + 1):
-        redactor = supervisor_module._BoundedLogStreamRedactor(
-            "supervisor-credential-secret"
-        )
+        redactor = supervisor_module._BoundedLogStreamRedactor("supervisor-credential-secret")
         rendered = bytearray()
         for offset in range(0, len(payload), chunk_size):
             rendered.extend(redactor.feed(payload[offset : offset + chunk_size]))

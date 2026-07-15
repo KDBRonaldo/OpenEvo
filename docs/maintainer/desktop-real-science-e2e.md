@@ -46,12 +46,12 @@ exact embedded wheel/lock pair. That mode uses
 signing, DMG copy smoke, or clean-machine rehearsal.
 
 The runner always enables `text_memory`, `skill_bundle`, and `agent_system`.
-There is no target or method override. For each target it selects the remote
-effective default when that method is visible, stable, and supported; otherwise
-it deterministically selects the first visible stable supported method. Because
-the current three built-ins are marked experimental, a release with no stable
-choice may use only its explicit visible, supported effective default; the
-runner never chooses another experimental method. Its remote default config is
+There is no target or method override. `agent_system` must expose the Core-owned
+`method=auto` resolver, and every concrete method reachable from that resolver
+must match a supported accepted-method identity. This preserves Core's recorded
+requested/resolved method decision. For the other targets, the remote effective
+default is used only when it is supported; fallback remains within visible
+supported methods and prefers stable methods. Remote default config is
 preserved. Missing support fails closed before the first run.
 
 ## Product-boundary flow
@@ -60,8 +60,9 @@ The runner performs these actions only through Desktop Local API v1:
 
 1. Start the real packaged sidecar with an inherited loopback listener,
    inherited executable descriptor, and one native credential frame on stdin.
-   Negotiate the exact frozen Desktop OpenAPI digest, provider kind, and feature
-   flags; require the legacy shell route to return 404; and require authenticated
+   Negotiate the exact checked-in release-contract schema, frozen Desktop OpenAPI
+   digest, provider kind, and feature flags against a strict closed `/version`
+   response; require the legacy shell route to return 404; and require authenticated
    and unauthenticated native session probes to return 204 and 403 respectively.
 2. Create an SSH-agent profile, connect, compare the candidate host key with
    the expected identity, and confirm it.
@@ -79,16 +80,21 @@ The runner performs these actions only through Desktop Local API v1:
    generation-adjacent revision produced by session 1. Require all three
    session-1 artifacts in session 2's pinned context, require each session-2
    artifact lineage to reference its matching predecessor, and verify the Core
-   runtime-context receipt digest. The receipt is derived from the real terminal
-   session metadata only after Gateway successfully injects the exact three
-   admitted artifact IDs; no Codex transcript or artifact content is retained.
+   runtime-context receipt digest. Gateway creates the v2 receipt only after it
+   resolves and stages the exact admitted artifact set. The receipt binds the
+   pinned revision and context, final instruction SHA-256, staged-tree SHA-256,
+   and each artifact's type, authoritative content SHA-256, and staged SHA-256.
+   Core compares it with the revision-owned artifact summaries before success;
+   runner-returned metadata cannot supply the receipt. No Codex transcript or
+   artifact content is retained in evidence.
 7. Request profile disconnect, then terminate and wait for the sidecar process
    group. Sidecar shutdown owns tunnel and Core attachment release.
 
 All polling, activation, run, HTTP, build, and shutdown waits are finite and
 positive. The build timeout is configurable with `--build-timeout-seconds`.
-Sidecar cleanup retains the unreaped process-group leader as PGID authority
-until descendants have been signalled and the leader can be reaped.
+Sidecar and local-build cleanup retain the unreaped process-group leader as PGID
+authority until descendants have been signalled and the leader can be reaped,
+including the race where the leader exits before its descendants.
 
 Any missing product state fails the run. The script does not read a remote DB,
 invoke SSH commands directly after startup, call Core Control directly, or

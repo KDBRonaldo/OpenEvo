@@ -95,6 +95,7 @@ from openevo.trajectory.builder.agent_transcript import AgentTranscriptBuilder
 from openevo.trajectory.registry import StrategyRegistry
 from openevo.evolution.agent_system import normalize_agent_system_target_path
 from openevo.evolution.client import EvolutionClient
+from openevo.evolution.framework.handlers import PayloadManifestEntry, payload_tree_digest
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,7 @@ _RECOVERY_PHASE_ORDER = {
     _RECOVERY_PHASE_TERMINAL_DELIVERY: 2,
 }
 _UNSET = object()
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class GatewayExecutionTimeout(TimeoutError):
@@ -173,6 +175,29 @@ class EvolutionExportAuthority:
     timeout_seconds: float
     fail_open: bool
     identity_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedEvolutionArtifact:
+    artifact_id: str
+    artifact_type: str
+    content_sha256: str
+    staged_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectedEvolutionArtifact:
+    artifact_id: str
+    artifact_type: str
+    content_sha256: str
+    payload_entries: tuple[PayloadManifestEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _EvolutionStagingResult:
+    env: dict[str, str]
+    artifacts: tuple[_StagedEvolutionArtifact, ...]
+    staged_tree_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,7 +296,42 @@ async def write_evolution_context_files(
     host_dir: Path,
     target_dir: str,
 ) -> dict[str, str]:
+    staged = await _stage_evolution_context_files(
+        runtime=runtime,
+        context=context,
+        host_dir=host_dir,
+        target_dir=target_dir,
+        expected_artifact_ids=None,
+    )
+    return dict(staged.env)
+
+
+async def _stage_evolution_context_files(
+    *,
+    runtime: BaseRuntime,
+    context: dict,
+    host_dir: Path,
+    target_dir: str,
+    expected_artifact_ids: tuple[str, ...] | None,
+) -> _EvolutionStagingResult:
     del host_dir  # Staging must stay outside the agent-writable session bind.
+    selected = _selected_evolution_artifacts(
+        context,
+        expected_artifact_ids=expected_artifact_ids,
+    )
+    selected_by_id = {item.artifact_id: item for item in selected}
+    memory_items = _selected_text_items(
+        context,
+        "memory",
+        "text_memory",
+        selected_by_id=selected_by_id,
+    )
+    agent_system_items = _selected_text_items(
+        context,
+        "agent_system",
+        "agent_system",
+        selected_by_id=selected_by_id,
+    )
     with TemporaryDirectory(prefix="openevo-evolution-upload-") as temporary:
         evolution_dir = Path(temporary)
         skills_dir = evolution_dir / "skills"
@@ -283,7 +343,11 @@ async def write_evolution_context_files(
         agent_system_path = evolution_dir / "agent_system.md"
         adapters_path = evolution_dir / "adapters.json"
 
-        _stage_evolution_skill_bundles(context, skills_dir)
+        skill_digests = _stage_evolution_skill_bundles(
+            context,
+            skills_dir,
+            selected_by_id=selected_by_id,
+        )
         agent_system_text = _agent_system_rendered_text(context)
         agent_system_env: dict[str, str] = {}
         if agent_system_text:
@@ -297,12 +361,13 @@ async def write_evolution_context_files(
                 )
             )
 
+        memory_text = _memory_rendered_text(context)
         context_path.write_text(
-            json.dumps(context, indent=2, sort_keys=True),
+            json.dumps(_runtime_context_document(context), indent=2, sort_keys=True),
             encoding="utf-8",
         )
         memory_path.write_text(
-            str((context.get("memory") or {}).get("rendered_text") or ""),
+            memory_text,
             encoding="utf-8",
         )
         agent_system_path.write_text(
@@ -335,39 +400,261 @@ async def write_evolution_context_files(
         "OPENEVO_ADAPTER_MERGE_SPEC": f"{target_dir}/adapters.json",
     }
     env.update(agent_system_env)
-    return env
+    staged_artifacts: list[_StagedEvolutionArtifact] = []
+    for item in selected:
+        if item.artifact_type == "text_memory":
+            staged_sha256 = _sha256_text(memory_items[item.artifact_id])
+        elif item.artifact_type == "agent_system":
+            staged_sha256 = _sha256_text(agent_system_items[item.artifact_id])
+        elif item.artifact_type == "skill_bundle":
+            staged_sha256 = skill_digests[item.artifact_id]
+        elif item.artifact_type == "parametric_memory":
+            staged_sha256 = _sha256_text(
+                json.dumps(
+                    context.get("adapter_merge_spec") or {},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            raise ValueError("selected evolution artifact type is unsupported")
+        staged_artifacts.append(
+            _StagedEvolutionArtifact(
+                artifact_id=item.artifact_id,
+                artifact_type=item.artifact_type,
+                content_sha256=item.content_sha256,
+                staged_sha256=staged_sha256,
+            )
+        )
+    staged_artifacts.sort(key=lambda item: item.artifact_id)
+    staged_tree_sha256 = _canonical_sha256(
+        {
+            "artifacts": [
+                {
+                    "artifact_id": item.artifact_id,
+                    "artifact_type": item.artifact_type,
+                    "content_sha256": item.content_sha256,
+                    "staged_sha256": item.staged_sha256,
+                }
+                for item in staged_artifacts
+            ],
+            "canonical_files": {
+                "agent_system_sha256": _sha256_text(agent_system_text),
+                "memory_sha256": _sha256_text(memory_text),
+            },
+        }
+    )
+    return _EvolutionStagingResult(
+        env=env,
+        artifacts=tuple(staged_artifacts),
+        staged_tree_sha256=staged_tree_sha256,
+    )
 
 
-def _stage_evolution_skill_bundles(context: dict, skills_dir: Path) -> None:
+def _selected_evolution_artifacts(
+    context: dict,
+    *,
+    expected_artifact_ids: tuple[str, ...] | None,
+) -> tuple[_SelectedEvolutionArtifact, ...]:
+    selection = context.get("selection")
+    if expected_artifact_ids is None and selection in (None, {}):
+        return ()
+    if not isinstance(selection, dict) or set(selection) != {
+        "artifact_ids",
+        "artifacts",
+        "reasons",
+    }:
+        raise ValueError("evolution context selection contract is invalid")
+    artifact_ids = selection.get("artifact_ids")
+    artifacts = selection.get("artifacts")
+    reasons = selection.get("reasons")
+    if (
+        not isinstance(artifact_ids, list)
+        or not isinstance(artifacts, list)
+        or not isinstance(reasons, list)
+        or not all(isinstance(reason, str) for reason in reasons)
+        or len(artifact_ids) > 256
+        or not all(
+            isinstance(artifact_id, str) and 0 < len(artifact_id.encode("utf-8")) <= 256
+            for artifact_id in artifact_ids
+        )
+        or len(artifact_ids) != len(set(artifact_ids))
+    ):
+        raise ValueError("evolution context selection identity is invalid")
+    if expected_artifact_ids is not None and tuple(sorted(artifact_ids)) != tuple(
+        sorted(expected_artifact_ids)
+    ):
+        raise ValueError("resolved evolution context differs from admission")
+    selected: list[_SelectedEvolutionArtifact] = []
+    for value in artifacts:
+        if not isinstance(value, dict) or set(value) != {
+            "artifact_id",
+            "artifact_type",
+            "content_sha256",
+            "payload_entries",
+        }:
+            raise ValueError("evolution context artifact inventory is invalid")
+        artifact_id = value.get("artifact_id")
+        artifact_type = value.get("artifact_type")
+        content_sha256 = value.get("content_sha256")
+        raw_entries = value.get("payload_entries")
+        if (
+            not isinstance(artifact_id, str)
+            or not isinstance(artifact_type, str)
+            or artifact_type
+            not in {"agent_system", "parametric_memory", "skill_bundle", "text_memory"}
+            or not isinstance(content_sha256, str)
+            or _SHA256_RE.fullmatch(content_sha256) is None
+            or not isinstance(raw_entries, list)
+            or not raw_entries
+        ):
+            raise ValueError("evolution context artifact inventory is invalid")
+        entries = tuple(PayloadManifestEntry.model_validate(entry) for entry in raw_entries)
+        if payload_tree_digest(entries) != content_sha256:
+            raise ValueError("evolution context artifact digest is invalid")
+        selected.append(
+            _SelectedEvolutionArtifact(
+                artifact_id=artifact_id,
+                artifact_type=artifact_type,
+                content_sha256=content_sha256,
+                payload_entries=entries,
+            )
+        )
+    if (
+        len(selected) != len(artifact_ids)
+        or len({item.artifact_id for item in selected}) != len(selected)
+        or {item.artifact_id for item in selected} != set(artifact_ids)
+    ):
+        raise ValueError("evolution context artifact inventory is incomplete")
+    return tuple(sorted(selected, key=lambda item: item.artifact_id))
+
+
+def _selected_text_items(
+    context: dict,
+    section_name: str,
+    artifact_type: str,
+    *,
+    selected_by_id: dict[str, _SelectedEvolutionArtifact],
+) -> dict[str, str]:
+    expected_ids = {
+        artifact_id
+        for artifact_id, item in selected_by_id.items()
+        if item.artifact_type == artifact_type
+    }
+    if not expected_ids:
+        return {}
+    section = context.get(section_name)
+    if not isinstance(section, dict):
+        raise ValueError(f"evolution {section_name} selection is invalid")
+    artifact_ids = section.get("artifact_ids")
+    item_key = "targets" if section_name == "agent_system" else "items"
+    values = section.get(item_key)
+    rendered = section.get("rendered_text")
+    if (
+        not isinstance(artifact_ids, list)
+        or set(artifact_ids) != expected_ids
+        or len(artifact_ids) != len(expected_ids)
+        or not isinstance(values, list)
+        or not isinstance(rendered, str)
+    ):
+        raise ValueError(f"evolution {section_name} selection is incomplete")
+    text_by_id: dict[str, str] = {}
+    ordered_parts: list[str] = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise ValueError(f"evolution {section_name} item is invalid")
+        artifact_id = value.get("artifact_id")
+        text = value.get("rendered_text")
+        if (
+            not isinstance(artifact_id, str)
+            or artifact_id not in expected_ids
+            or artifact_id in text_by_id
+            or not isinstance(text, str)
+            or not text
+        ):
+            raise ValueError(f"evolution {section_name} item is invalid")
+        text_by_id[artifact_id] = text
+        ordered_parts.append(text)
+    if set(text_by_id) != expected_ids or "\n\n".join(ordered_parts) != rendered:
+        raise ValueError(f"evolution {section_name} rendered content is inconsistent")
+    return text_by_id
+
+
+def _memory_rendered_text(context: dict) -> str:
+    memory = context.get("memory") or {}
+    if not isinstance(memory, dict):
+        raise ValueError("evolution memory context must be an object")
+    rendered = memory.get("rendered_text") or ""
+    if not isinstance(rendered, str):
+        raise ValueError("evolution memory content must be text")
+    return rendered
+
+
+def _runtime_context_document(context: dict) -> dict[str, Any]:
+    document = json.loads(json.dumps(context, ensure_ascii=True, allow_nan=False))
+    for skill in document.get("skills", []):
+        if isinstance(skill, dict):
+            skill.pop("uri", None)
+    adapter_spec = document.get("adapter_merge_spec")
+    if isinstance(adapter_spec, dict):
+        for adapter in adapter_spec.get("adapters", []):
+            if isinstance(adapter, dict):
+                adapter.pop("uri", None)
+    return cast(dict[str, Any], document)
+
+
+def _stage_evolution_skill_bundles(
+    context: dict,
+    skills_dir: Path,
+    *,
+    selected_by_id: dict[str, _SelectedEvolutionArtifact],
+) -> dict[str, str]:
     skills = context.get("skills") or []
     if not isinstance(skills, list):
-        return
+        raise ValueError("evolution skill selection must be a list")
+    staged: dict[str, str] = {}
     for index, skill in enumerate(skills):
         if not isinstance(skill, dict):
-            continue
-        try:
-            source = _artifact_file_uri_path(skill.get("uri"))
-            if source is None:
-                raise ValueError("skill artifact URI is not a file:// URI")
-            if not source.exists():
-                raise FileNotFoundError(f"skill artifact path does not exist: {source}")
-            dest = skills_dir / _safe_skill_dir_name(skill, index)
-            if source.is_dir():
-                shutil.copytree(source, dest)
-            else:
-                dest.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, dest / source.name)
-            (dest / "artifact.json").write_text(
-                json.dumps(skill, indent=2, sort_keys=True),
-                encoding="utf-8",
+            raise ValueError("evolution skill selection entry must be an object")
+        artifact_id = skill.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise ValueError("evolution skill selection has no artifact identity")
+        selected = selected_by_id.get(artifact_id)
+        if selected_by_id and (selected is None or selected.artifact_type != "skill_bundle"):
+            raise ValueError("evolution skill selection differs from context inventory")
+        source = _artifact_file_uri_path(skill.get("uri"))
+        if source is None:
+            raise ValueError("skill artifact URI is not a file:// URI")
+        _require_regular_payload_tree(source)
+        dest = skills_dir / _safe_skill_dir_name(skill, index)
+        if source.is_dir():
+            shutil.copytree(source, dest, symlinks=True)
+        else:
+            dest.mkdir(parents=True, exist_ok=False)
+            relative_target = (
+                selected.payload_entries[0].relative_path
+                if selected is not None and len(selected.payload_entries) == 1
+                else source.name
             )
-        except Exception as exc:
-            warning = (
-                "Skipped evolution skill artifact "
-                f"{skill.get('artifact_id') or skill.get('name') or index}: {exc}"
-            )
-            logger.warning(warning)
-            context.setdefault("warnings", []).append(warning)
+            target = dest / Path(*PurePosixPath(relative_target).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        if selected is not None:
+            digest = _verify_staged_payload(dest, selected.payload_entries)
+            if digest != selected.content_sha256:
+                raise ValueError("staged skill payload digest differs from context authority")
+        else:
+            digest = _directory_content_sha256(dest)
+        staged[artifact_id] = digest
+    expected_skill_ids = {
+        artifact_id
+        for artifact_id, item in selected_by_id.items()
+        if item.artifact_type == "skill_bundle"
+    }
+    if set(staged) != expected_skill_ids and selected_by_id:
+        raise ValueError("evolution skill payload was not staged exactly")
+    return staged
 
 
 async def _stage_evolution_agent_system(
@@ -385,16 +672,8 @@ async def _stage_evolution_agent_system(
     target_root = _agent_system_target_root(runtime)
     remote_targets: list[str] = []
     agents_md_target: str | None = None
-    for index, spec in enumerate(target_specs):
-        try:
-            target_path = PurePosixPath(
-                normalize_agent_system_target_path(spec.get("target_path"))
-            )
-        except ValueError as exc:
-            warning = f"Skipped evolution agent system target {index}: {exc}"
-            logger.warning(warning)
-            context.setdefault("warnings", []).append(warning)
-            continue
+    for spec in target_specs:
+        target_path = PurePosixPath(normalize_agent_system_target_path(spec.get("target_path")))
 
         target_text = str(spec.get("rendered_text") or rendered)
         local_target = targets_dir / Path(*PurePosixPath(target_path).parts)
@@ -444,7 +723,7 @@ def _agent_system_target_specs(
         grouped: dict[str, list[str]] = {}
         for target in targets:
             if not isinstance(target, dict):
-                continue
+                raise ValueError("evolution agent-system target must be an object")
             target_path = (
                 target.get("target_path") or agent_system.get("target_path") or "AGENTS.md"
             )
@@ -481,6 +760,91 @@ def _safe_skill_dir_name(skill: dict, index: int) -> str:
     return normalized or f"skill-{index}"
 
 
+def _require_regular_payload_tree(path: Path) -> None:
+    try:
+        root_stat = path.lstat()
+    except OSError as exc:
+        raise ValueError("evolution payload is unavailable") from exc
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise ValueError("evolution payload must not contain symlinks")
+    if stat.S_ISREG(root_stat.st_mode):
+        return
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError("evolution payload root must be a regular file or directory")
+    for root, directories, files in os.walk(path, followlinks=False):
+        for name in [*directories, *files]:
+            item = Path(root) / name
+            item_stat = item.lstat()
+            if stat.S_ISLNK(item_stat.st_mode):
+                raise ValueError("evolution payload must not contain symlinks")
+            if name in files and not stat.S_ISREG(item_stat.st_mode):
+                raise ValueError("evolution payload contains a non-regular file")
+
+
+def _verify_staged_payload(
+    root: Path,
+    expected_entries: tuple[PayloadManifestEntry, ...],
+) -> str:
+    _require_regular_payload_tree(root)
+    expected = {entry.relative_path: entry for entry in expected_entries}
+    observed_paths = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    if observed_paths != set(expected):
+        raise ValueError("staged evolution payload inventory differs from context authority")
+    observed: list[PayloadManifestEntry] = []
+    for relative_path in sorted(observed_paths):
+        path = root / Path(*PurePosixPath(relative_path).parts)
+        payload = path.read_bytes()
+        authority = expected[relative_path]
+        digest = hashlib.sha256(payload).hexdigest()
+        if len(payload) != authority.size_bytes or digest != authority.sha256:
+            raise ValueError("staged evolution payload content differs from context authority")
+        observed.append(
+            PayloadManifestEntry(
+                relative_path=relative_path,
+                media_type=authority.media_type,
+                size_bytes=len(payload),
+                sha256=digest,
+            )
+        )
+    return payload_tree_digest(tuple(observed))
+
+
+def _directory_content_sha256(root: Path) -> str:
+    _require_regular_payload_tree(root)
+    inventory = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        payload = path.read_bytes()
+        inventory.append(
+            {
+                "relative_path": path.relative_to(root).as_posix(),
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    if not inventory:
+        raise ValueError("staged evolution payload is empty")
+    return _canonical_sha256({"entries": inventory})
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _instruction_with_evolution_context(instruction: str, context: dict) -> str:
     agent_system = str((context.get("agent_system") or {}).get("rendered_text") or "").strip()
     memory = str((context.get("memory") or {}).get("rendered_text") or "").strip()
@@ -502,6 +866,79 @@ def _existing_evolution_metadata(metadata: dict) -> dict:
     if isinstance(existing, dict):
         return dict(existing)
     return {}
+
+
+def _admitted_context_artifact_ids(
+    metadata: dict[str, object],
+) -> tuple[str, ...] | None:
+    evolution = metadata.get("evolution")
+    if not isinstance(evolution, dict) or "context_artifact_ids" not in evolution:
+        return None
+    artifact_ids = evolution.get("context_artifact_ids")
+    if (
+        not isinstance(artifact_ids, list)
+        or len(artifact_ids) > 256
+        or not all(
+            isinstance(artifact_id, str) and 0 < len(artifact_id.encode("utf-8")) <= 256
+            for artifact_id in artifact_ids
+        )
+        or len(artifact_ids) != len(set(artifact_ids))
+    ):
+        raise ValueError("admitted evolution context artifact identity is invalid")
+    return tuple(sorted(artifact_ids))
+
+
+def _admitted_revision_id(
+    metadata: dict[str, object],
+    *,
+    required: bool,
+) -> str | None:
+    openevo = metadata.get("openevo")
+    revision_id = openevo.get("revision_id") if isinstance(openevo, dict) else None
+    if revision_id is None and not required:
+        return None
+    if (
+        not isinstance(revision_id, str)
+        or not revision_id
+        or len(revision_id.encode("utf-8")) > 256
+    ):
+        raise ValueError("admitted evolution revision identity is invalid")
+    return revision_id
+
+
+def _runtime_injection_receipt(
+    *,
+    context: dict[str, Any],
+    revision_id: str,
+    instruction: str,
+    staged: _EvolutionStagingResult,
+    expected_artifact_ids: tuple[str, ...],
+) -> dict[str, object]:
+    context_id = context.get("context_id")
+    if (
+        not isinstance(context_id, str)
+        or not context_id
+        or len(context_id.encode("utf-8")) > 256
+        or tuple(item.artifact_id for item in staged.artifacts)
+        != tuple(sorted(expected_artifact_ids))
+    ):
+        raise ValueError("runtime injection receipt authority is incomplete")
+    return {
+        "schema_version": "2",
+        "context_id": context_id,
+        "revision_id": revision_id,
+        "instruction_sha256": _sha256_text(instruction),
+        "staged_tree_sha256": staged.staged_tree_sha256,
+        "artifacts": [
+            {
+                "artifact_id": item.artifact_id,
+                "artifact_type": item.artifact_type,
+                "content_sha256": item.content_sha256,
+                "staged_sha256": item.staged_sha256,
+            }
+            for item in staged.artifacts
+        ],
+    }
 
 
 def build_evolution_session_event(result: SessionResult) -> dict:
@@ -1492,6 +1929,11 @@ class GatewayNodeManager:
             return {}
         if managed.runtime is None:
             return {}
+        expected_artifact_ids = _admitted_context_artifact_ids(request.metadata)
+        revision_id = _admitted_revision_id(
+            request.metadata,
+            required=bool(expected_artifact_ids),
+        )
         payload = {
             "task_id": request.task_id,
             "instruction": request.instruction,
@@ -1506,12 +1948,13 @@ class GatewayNodeManager:
                 self.evolution_client.resolve_context(payload),
                 managed,
             )
-            env = await self._await_with_budget(
-                write_evolution_context_files(
+            staged = await self._await_with_budget(
+                _stage_evolution_context_files(
                     runtime=managed.runtime,
                     context=context,
                     host_dir=managed.session_dir,
                     target_dir=self.evolution.context.target_dir,
+                    expected_artifact_ids=expected_artifact_ids,
                 ),
                 managed,
             )
@@ -1519,6 +1962,16 @@ class GatewayNodeManager:
                 request.instruction,
                 context,
             )
+            runtime_injection_receipt = None
+            if expected_artifact_ids:
+                assert revision_id is not None
+                runtime_injection_receipt = _runtime_injection_receipt(
+                    context=context,
+                    revision_id=revision_id,
+                    instruction=request.instruction,
+                    staged=staged,
+                    expected_artifact_ids=expected_artifact_ids,
+                )
             adapter_merge_spec = context.get("adapter_merge_spec")
             if isinstance(adapter_merge_spec, dict):
                 request.metadata["adapter_merge_spec"] = adapter_merge_spec
@@ -1527,6 +1980,8 @@ class GatewayNodeManager:
                 "context_id": context.get("context_id"),
                 "context_injected": True,
             }
+            if runtime_injection_receipt is not None:
+                evolution_metadata["runtime_injection_receipt"] = runtime_injection_receipt
             request.metadata["evolution"] = evolution_metadata
             registry_metadata: dict[str, Any] = {"evolution": evolution_metadata}
             if isinstance(adapter_merge_spec, dict):
@@ -1537,14 +1992,14 @@ class GatewayNodeManager:
                     request.session_id,
                     registry_metadata,
                 )
-            return env
+            return dict(staged.env)
         except Exception as exc:
             if not self.evolution.context.fail_open:
                 raise
             request.metadata["evolution"] = {
                 **_existing_evolution_metadata(request.metadata),
                 "context_injected": False,
-                "error": str(exc),
+                "error": "context_resolution_failed",
             }
             self._log_credential_safe_exception(
                 managed,
@@ -3184,9 +3639,7 @@ class GatewayNodeManager:
     ) -> CleanupRetryOwnership:
         runtime = managed.runtime
         finalization_state = (
-            self._subscription_finalization_state(managed)
-            if finalize_subscription
-            else None
+            self._subscription_finalization_state(managed) if finalize_subscription else None
         )
         epoch = managed.cleanup_journal_epoch
         epoch_token = managed.cleanup_journal_epoch_token
@@ -3309,14 +3762,10 @@ class GatewayNodeManager:
             or not isinstance(retirement_digest, str)
             or re.fullmatch(r"[0-9a-f]{64}", retirement_digest) is None
             or (
-                retired_count == 0
-                and retirement_digest != _CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED
+                retired_count == 0 and retirement_digest != _CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED
             )
             or (epoch == 0) != (retired_count == 0)
-            or (
-                retired_count > 0
-                and retirement_digest == _CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED
-            )
+            or (retired_count > 0 and retirement_digest == _CLEANUP_JOURNAL_RETIREMENT_DIGEST_SEED)
         ):
             raise ValueError("cleanup journal epoch identity is invalid")
         return _CleanupJournalEpoch(
@@ -3545,9 +3994,7 @@ class GatewayNodeManager:
                     marker_name,
                 )
                 marker_version = (
-                    marker_payload.get("version")
-                    if isinstance(marker_payload, dict)
-                    else None
+                    marker_payload.get("version") if isinstance(marker_payload, dict) else None
                 )
                 expected_marker_keys = {
                     "version",
@@ -3598,9 +4045,7 @@ class GatewayNodeManager:
                             follow_symlinks=False,
                         )
                     except FileNotFoundError as exc:
-                        raise RuntimeError(
-                            "cleanup journal epoch authority is missing"
-                        ) from exc
+                        raise RuntimeError("cleanup journal epoch authority is missing") from exc
 
             return _CleanupJournalAuthority(
                 path=path,
@@ -3741,8 +4186,7 @@ class GatewayNodeManager:
             or opened.st_uid != os.geteuid()
             or opened.st_nlink != 1
             or stat.S_IMODE(opened.st_mode) != 0o600
-            or self._cleanup_journal_identity(opened)
-            != self._cleanup_journal_identity(rebound)
+            or self._cleanup_journal_identity(opened) != self._cleanup_journal_identity(rebound)
         ):
             raise RuntimeError("cleanup journal process lock identity changed")
 
@@ -3786,9 +4230,7 @@ class GatewayNodeManager:
                     candidate_name,
                 )
                 if existing != payload:
-                    raise RuntimeError(
-                        "cleanup journal epoch root marker candidate is invalid"
-                    )
+                    raise RuntimeError("cleanup journal epoch root marker candidate is invalid")
             os.replace(
                 candidate_name,
                 marker_name,
@@ -4053,9 +4495,12 @@ class GatewayNodeManager:
             raise RuntimeError("cleanup journal generation compare-and-swap failed")
         if previous is None and candidate.generation is not None:
             raise RuntimeError("cleanup journal generation cannot precede its authority")
-        if previous is not None and previous.epoch is not None and (
-            candidate.epoch != previous.epoch
-            or candidate.epoch_token != previous.epoch_token
+        if (
+            previous is not None
+            and previous.epoch is not None
+            and (
+                candidate.epoch != previous.epoch or candidate.epoch_token != previous.epoch_token
+            )
         ):
             raise RuntimeError("cleanup journal epoch compare-and-swap failed")
         if candidate.phase not in _RECOVERY_PHASE_ORDER:
@@ -4087,10 +4532,15 @@ class GatewayNodeManager:
         candidate_delivery = candidate.delivery_state
         if previous_finalization is not None:
             if candidate_finalization is None:
-                raise RuntimeError("cleanup journal transition cannot discard finalization authority")
+                raise RuntimeError(
+                    "cleanup journal transition cannot discard finalization authority"
+                )
             if previous_finalization.request != candidate_finalization.request:
                 raise RuntimeError("cleanup journal finalization request identity changed")
-            if previous_finalization.cancel_requested and not candidate_finalization.cancel_requested:
+            if (
+                previous_finalization.cancel_requested
+                and not candidate_finalization.cancel_requested
+            ):
                 raise RuntimeError("cleanup journal transition cannot discard cancel authority")
             for label, old, new in (
                 (
@@ -4178,9 +4628,7 @@ class GatewayNodeManager:
                         Path(destination),
                     )
                     if isinstance(previous_record, _CleanupJournalTombstone):
-                        raise RuntimeError(
-                            "cleanup ownership generation is already retired"
-                        )
+                        raise RuntimeError("cleanup ownership generation is already retired")
                     previous_ownership = previous_record
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                     raise RuntimeError("cleanup ownership journal is invalid") from exc
@@ -4213,9 +4661,7 @@ class GatewayNodeManager:
                         epoch_token=current_epoch.token,
                     )
                 if len(inventory) >= _CLEANUP_JOURNAL_MAX_ROWS:
-                    raise RuntimeError(
-                        "cleanup journal capacity is occupied by active records"
-                    )
+                    raise RuntimeError("cleanup journal capacity is occupied by active records")
             elif previous_ownership.epoch is None:
                 ownership = replace(
                     ownership,
@@ -4683,7 +5129,9 @@ class GatewayNodeManager:
                     authority.path / name,
                 )
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                raise RuntimeError("cleanup ownership tombstone changed before compaction") from exc
+                raise RuntimeError(
+                    "cleanup ownership tombstone changed before compaction"
+                ) from exc
             if current != tombstone:
                 raise RuntimeError("cleanup ownership tombstone changed before compaction")
             os.unlink(name, dir_fd=authority.root_fd)
@@ -4764,9 +5212,7 @@ class GatewayNodeManager:
             "terminal_delivery",
         }
         if version == 9:
-            expected_keys.update(
-                {"epoch", "epoch_token", "retired_epoch", "retired_epoch_token"}
-            )
+            expected_keys.update({"epoch", "epoch_token", "retired_epoch", "retired_epoch_token"})
         if set(payload) != expected_keys:
             raise ValueError("cleanup tombstone payload is not closed")
         session_id = payload["session_id"]
@@ -4811,8 +5257,7 @@ class GatewayNodeManager:
         else:
             if (
                 not isinstance(delivery, dict)
-                or set(delivery)
-                != {"result_digest", "export_succeeded", "callback_succeeded"}
+                or set(delivery) != {"result_digest", "export_succeeded", "callback_succeeded"}
                 or not isinstance(delivery["result_digest"], str)
                 or re.fullmatch(r"[0-9a-f]{64}", delivery["result_digest"]) is None
                 or delivery["export_succeeded"] is not True
@@ -4863,9 +5308,7 @@ class GatewayNodeManager:
             expected_keys.add("revision")
         if version in {8, 9}:
             expected_keys.update({"kind", "generation", "revision", "phase"})
-            expected_keys.update(
-                {"log_root", "subscription_finalization", "terminal_delivery"}
-            )
+            expected_keys.update({"log_root", "subscription_finalization", "terminal_delivery"})
         if version == 9:
             expected_keys.update({"epoch", "epoch_token"})
         if set(payload) != expected_keys:
@@ -5123,9 +5566,7 @@ class GatewayNodeManager:
             callback_succeeded = delivery_payload["callback_succeeded"]
             if callback_required != (callback_url is not None):
                 raise ValueError("terminal delivery callback authority is invalid")
-            if version in {5, 6, 7, 8, 9} and export_required != (
-                export_authority is not None
-            ):
+            if version in {5, 6, 7, 8, 9} and export_required != (export_authority is not None):
                 raise ValueError("terminal delivery export authority is invalid")
             if (not export_required and not export_succeeded) or (
                 not callback_required and not callback_succeeded
@@ -5282,9 +5723,7 @@ class GatewayNodeManager:
                         epoch_token=current_epoch.token,
                     )
                 if len(inventory) >= _CLEANUP_JOURNAL_MAX_ROWS:
-                    raise RuntimeError(
-                        "cleanup journal capacity is occupied by active records"
-                    )
+                    raise RuntimeError("cleanup journal capacity is occupied by active records")
                 authoritative = ownership
             elif (
                 authoritative.session_id != ownership.session_id

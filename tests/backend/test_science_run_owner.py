@@ -42,7 +42,45 @@ _FRAMEWORK_LOCK_DIGEST = "c" * 64
 _PAYLOAD_DIGEST = "d" * 64
 
 
+def _runtime_receipt(
+    *,
+    revision_id: str,
+    artifacts: list[dict[str, str]],
+) -> dict[str, object]:
+    return {
+        "schema_version": "2",
+        "context_id": "context-verified",
+        "revision_id": revision_id,
+        "instruction_sha256": "1" * 64,
+        "staged_tree_sha256": "2" * 64,
+        "artifacts": sorted(artifacts, key=lambda item: item["artifact_id"]),
+    }
+
+
 def test_rollout_runtime_context_receipt_is_closed_and_canonical() -> None:
+    expected = _runtime_receipt(
+        revision_id="revision-1",
+        artifacts=[
+            {
+                "artifact_id": "skill-1",
+                "artifact_type": "skill_bundle",
+                "content_sha256": "3" * 64,
+                "staged_sha256": "4" * 64,
+            },
+            {
+                "artifact_id": "memory-1",
+                "artifact_type": "text_memory",
+                "content_sha256": "5" * 64,
+                "staged_sha256": "6" * 64,
+            },
+            {
+                "artifact_id": "agent-1",
+                "artifact_type": "agent_system",
+                "content_sha256": "7" * 64,
+                "staged_sha256": "8" * 64,
+            },
+        ],
+    )
     receipt = owner_module._rollout_runtime_context_receipt(
         {
             "results": [
@@ -50,8 +88,8 @@ def test_rollout_runtime_context_receipt_is_closed_and_canonical() -> None:
                     "metadata": {
                         "evolution": {
                             "context_injected": True,
-                            "context_id": "not-persisted-in-receipt",
                             "context_artifact_ids": ["skill-1", "memory-1", "agent-1"],
+                            "runtime_injection_receipt": expected,
                         }
                     }
                 }
@@ -59,14 +97,8 @@ def test_rollout_runtime_context_receipt_is_closed_and_canonical() -> None:
         }
     )
 
-    assert receipt == {
-        "schema_version": "1",
-        "context_injected": True,
-        "context_artifact_ids": ["agent-1", "memory-1", "skill-1"],
-    }
-    assert owner_module._runtime_context_receipt(
-        {"runtime_context_receipt": receipt}
-    ) == receipt
+    assert receipt == expected
+    assert owner_module._runtime_context_receipt({"runtime_context_receipt": receipt}) == receipt
 
 
 @pytest.mark.parametrize(
@@ -83,6 +115,56 @@ def test_rollout_runtime_context_receipt_rejects_unproven_context(
     with pytest.raises(ValueError, match="context"):
         owner_module._rollout_runtime_context_receipt(
             {"results": [{"metadata": {"evolution": evolution}}]}
+        )
+
+
+def test_runtime_context_receipt_rejects_wrong_revision_content_and_membership() -> None:
+    receipt = _runtime_receipt(
+        revision_id="revision-1",
+        artifacts=[
+            {
+                "artifact_id": "memory-1",
+                "artifact_type": "text_memory",
+                "content_sha256": "3" * 64,
+                "staged_sha256": "4" * 64,
+            }
+        ],
+    )
+    authority = {
+        "memory-1": {
+            "artifact_type": "text_memory",
+            "content_sha256": "3" * 64,
+        }
+    }
+
+    with pytest.raises(ValueError, match="revision"):
+        owner_module._verify_runtime_context_receipt(
+            receipt,
+            revision_id="revision-2",
+            artifacts=authority,
+        )
+    with pytest.raises(ValueError, match="content authority"):
+        owner_module._verify_runtime_context_receipt(
+            receipt,
+            revision_id="revision-1",
+            artifacts={
+                "memory-1": {
+                    "artifact_type": "text_memory",
+                    "content_sha256": "9" * 64,
+                }
+            },
+        )
+    with pytest.raises(ValueError, match="membership"):
+        owner_module._verify_runtime_context_receipt(
+            receipt,
+            revision_id="revision-1",
+            artifacts={
+                **authority,
+                "skill-1": {
+                    "artifact_type": "skill_bundle",
+                    "content_sha256": "5" * 64,
+                },
+            },
         )
 
 
@@ -162,6 +244,42 @@ class _FakeRolloutClient:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _ReceiptRolloutClient(_FakeRolloutClient):
+    def get_task(self, task_id: str) -> dict[str, Any]:
+        payload = self.submissions[-1]
+        metadata = payload["metadata"]
+        evolution = metadata["evolution"]
+        artifact_ids = evolution["context_artifact_ids"]
+        revision_id = metadata["openevo"]["revision_id"]
+        receipt = _runtime_receipt(
+            revision_id=revision_id,
+            artifacts=[
+                {
+                    "artifact_id": artifact_id,
+                    "artifact_type": "text_memory",
+                    "content_sha256": "e" * 64,
+                    "staged_sha256": "f" * 64,
+                }
+                for artifact_id in artifact_ids
+            ],
+        )
+        return {
+            "task_id": task_id,
+            "status": "completed",
+            "results": [
+                {
+                    "metadata": {
+                        "evolution": {
+                            "context_injected": True,
+                            "context_artifact_ids": artifact_ids,
+                            "runtime_injection_receipt": receipt,
+                        }
+                    }
+                }
+            ],
+        }
 
 
 class _FakeEvolutionClient:
@@ -271,6 +389,7 @@ def _owner(
     registry: object,
     services: _FakeServiceOwner,
     runner: Callable[..., dict[str, Any]],
+    rollout_factory: Callable[[ServiceRunBinding], object] | None = None,
 ) -> CoreScienceRunOwner:
     return CoreScienceRunOwner(
         state_root=state_root,
@@ -278,7 +397,7 @@ def _owner(
         service_supervisor=services,
         executable_registry=registry,
         experiment_runner=runner,
-        rollout_factory=lambda _binding: _FakeRolloutClient(),
+        rollout_factory=rollout_factory or (lambda _binding: _FakeRolloutClient()),
         evolution_factory=lambda _binding: _FakeEvolutionClient(),
         poll_interval_seconds=0,
         max_poll_attempts=10,
@@ -290,6 +409,7 @@ def _completed_result(
     artifact_id: str = "memory-artifact-1",
     include_output: bool = True,
     output_type: str = "text_memory",
+    promoted: bool = True,
 ) -> dict[str, Any]:
     output = {
         "artifact_id": artifact_id,
@@ -305,7 +425,7 @@ def _completed_result(
             }
         },
         "scores": {"quality": 0.75},
-        "promoted": True,
+        "promoted": promoted,
         "created_at": "2026-07-14T00:00:01Z",
         "payload_byte_size": 12,
         "payload_file_count": 1,
@@ -1082,6 +1202,44 @@ def test_timeline_and_log_sequence_allocation_is_concurrency_safe(
         store.close()
 
 
+def test_runner_cannot_supply_its_own_runtime_context_receipt(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+
+    def runner(_config: object, **_kwargs: object) -> dict[str, Any]:
+        result = _completed_result()
+        result["runtime_context_receipt"] = _runtime_receipt(
+            revision_id=project.active_revision.id,
+            artifacts=[
+                {
+                    "artifact_id": "runner-forged",
+                    "artifact_type": "text_memory",
+                    "content_sha256": "3" * 64,
+                    "staged_sha256": "4" * 64,
+                }
+            ],
+        )
+        return result
+
+    owner = _owner(tmp_path / "owner", store, registry, services, runner)
+    try:
+        created = _invoke_create(owner, _run_request(project), "forged-receipt")
+        completed = _wait_for_status(owner, created.id, m.RunStatus.SUCCEEDED)
+        stored = owner._ledger.result_for_run(completed.id)
+        assert stored is not None
+        assert "runtime_context_receipt" not in stored
+        assert not any(
+            item.message.startswith("Runtime context receipt")
+            for item in owner._ledger.logs(completed.id)
+        )
+    finally:
+        owner.close()
+        store.close()
+
+
 def test_successor_context_is_pinned_into_the_next_session(
     tmp_path: Path, registry: object
 ) -> None:
@@ -1089,20 +1247,52 @@ def test_successor_context_is_pinned_into_the_next_session(
     project = _project(store, registry)
     services = _FakeServiceOwner(_binding(registry))
 
-    def first(**_kwargs: object) -> dict[str, Any]:
-        return _completed_result(artifact_id="memory-for-next-session")
+    successor_revision_id: list[str] = []
 
-    def second(**_kwargs: object) -> dict[str, Any]:
+    def first(**_kwargs: object) -> dict[str, Any]:
+        return _completed_result(
+            artifact_id="memory-for-next-session",
+            promoted=False,
+        )
+
+    def second(**kwargs: Any) -> dict[str, Any]:
+        task_id = str(kwargs["task_ids"][0])
+        rollout = kwargs["rollout_client"]
+        assert (
+            rollout.submit_task(
+                {
+                    "task_id": task_id,
+                    "metadata": {
+                        "openevo": {"revision_id": successor_revision_id[0]},
+                        "evolution": {"context_artifact_ids": ["memory-for-next-session"]},
+                    },
+                }
+            )
+            == task_id
+        )
+        assert rollout.get_task(task_id)["status"] == "completed"
         return _completed_result(artifact_id="memory-second-session")
 
     runner = _RunnerSequence(first, second)
-    owner = _owner(tmp_path / "owner", store, registry, services, runner)
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        runner,
+        rollout_factory=lambda _binding: _ReceiptRolloutClient(),
+    )
     try:
         first_run = _invoke_create(owner, _run_request(project), "session-one")
         _wait_for_status(owner, first_run.id, m.RunStatus.SUCCEEDED)
         successor_project = store.get_project(project.id)
         assert successor_project.active_revision is not None
         assert successor_project.active_revision.generation == 1
+        successor_revision_id.append(successor_project.active_revision.id)
+        first_artifacts = owner._ledger.artifacts_for_run(first_run.id)
+        assert len(first_artifacts) == 1
+        assert first_artifacts[0].selected is True
+        assert first_artifacts[0].promoted is False
 
         second_run = _invoke_create(owner, _run_request(successor_project), "session-two")
         _wait_for_status(owner, second_run.id, m.RunStatus.SUCCEEDED)
@@ -1119,6 +1309,10 @@ def test_successor_context_is_pinned_into_the_next_session(
         context = m.RunContextV1.model_validate_json(context_response.body)
         assert [item.artifact_id for item in context.artifacts] == ["memory-for-next-session"]
         assert context.artifacts[0].revision.generation == 1
+        assert any(
+            item.message.startswith("Runtime context receipt v2: ")
+            for item in owner._ledger.logs(second_run.id)
+        )
     finally:
         owner.close()
         store.close()

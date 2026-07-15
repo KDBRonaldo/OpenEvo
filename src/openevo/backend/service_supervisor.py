@@ -2634,6 +2634,20 @@ class CoreServiceSupervisor:
                 "public_url": rollout_url,
                 "save_dir": os.fspath(root / "rollout"),
             },
+            "evolution": {
+                "enabled": True,
+                "backend_url": evolution_url,
+                "context": {
+                    "target_dir": "/openevo/session/evolution",
+                    "timeout_seconds": 10,
+                    "fail_open": False,
+                },
+                "event_export": {
+                    "enabled": True,
+                    "timeout_seconds": 10,
+                    "fail_open": False,
+                },
+            },
         }
         base_env = _controlled_environment()
         if self._run_admission_url is not None:

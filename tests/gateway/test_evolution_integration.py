@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import hashlib
 import json
 import multiprocessing
 import os
@@ -1941,9 +1942,7 @@ def test_cleanup_journal_update_uses_held_root_when_path_is_replaced(
     monkeypatch.setattr(node_module.os, "open", replace_root_before_pending_open)
 
     with pytest.raises(RuntimeError, match="journal root identity"):
-        manager._persist_cleanup_ownership(
-            manager._cleanup_retries[managed.session_id]
-        )
+        manager._persist_cleanup_ownership(manager._cleanup_retries[managed.session_id])
 
     assert replaced is True
     assert list(journal_dir.iterdir()) == []
@@ -3324,9 +3323,7 @@ def test_cleanup_journal_late_retirement_is_summarized_in_current_epoch(
         _session_result(session_id="active-across-epoch"),
     )
     old_managed.session_root_identity = capture_session_root_identity(session_dir)
-    old_active = manager._persist_cleanup_ownership(
-        manager._cleanup_ownership_for(old_managed)
-    )
+    old_active = manager._persist_cleanup_ownership(manager._cleanup_ownership_for(old_managed))
     _retire_minimal_cleanup_session(manager, session_dir, "epoch-advancer")
     manager._compact_cleanup_journal()
 
@@ -3454,9 +3451,7 @@ def test_cleanup_journal_compaction_recovers_every_crash_boundary(
         _session_result(session_id=f"active-at-{checkpoint}"),
     )
     active_managed.session_root_identity = capture_session_root_identity(session_dir)
-    active = manager._persist_cleanup_ownership(
-        manager._cleanup_ownership_for(active_managed)
-    )
+    active = manager._persist_cleanup_ownership(manager._cleanup_ownership_for(active_managed))
 
     def crash_at_boundary(label: str) -> None:
         if label == checkpoint:
@@ -4146,20 +4141,21 @@ async def test_resolved_store_context_stages_all_text_artifacts(tmp_path):
     agent_system_text = "Inspect repository conventions before editing."
     skill_text = "---\nname: parser-probe\n---\nUse recursive descent.\n"
 
-    memory_source = tmp_path / "sources" / "memory.md"
-    agent_system_source = tmp_path / "sources" / "AGENTS.md"
-    skill_source = tmp_path / "sources" / "parser-skill"
+    artifact_root = tmp_path / "artifacts"
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=artifact_root,
+    )
+    store.initialize()
+    memory_source = artifact_root / "sources" / "memory.md"
+    agent_system_source = artifact_root / "sources" / "AGENTS.md"
+    skill_source = artifact_root / "sources" / "parser-skill"
     memory_source.parent.mkdir()
     skill_source.mkdir()
     memory_source.write_text(memory_text, encoding="utf-8")
     agent_system_source.write_text(agent_system_text, encoding="utf-8")
     (skill_source / "SKILL.md").write_text(skill_text, encoding="utf-8")
 
-    store = EvolutionStore(
-        db_path=tmp_path / "evolution.db",
-        artifact_root=tmp_path / "artifacts",
-    )
-    store.initialize()
     memory = store.register_artifact(
         ArtifactRegisterRequest(
             type=ArtifactType.TEXT_MEMORY,
@@ -4226,6 +4222,182 @@ async def test_resolved_store_context_stages_all_text_artifacts(tmp_path):
     assert env["OPENEVO_AGENT_SYSTEM_FILE"] == ("/openevo/session/evolution/agent_system.md")
     assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == "/openevo/session/AGENTS.md"
     assert env["OPENEVO_AGENTS_MD"] == "/openevo/session/AGENTS.md"
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_receipt_binds_three_selected_artifacts(tmp_path: Path) -> None:
+    memory_text = "Remember the verified parser precedence."
+    agent_system_text = "Read the repository instructions before editing."
+    skill_text = "---\nname: verified-parser\n---\nUse recursive descent.\n"
+    artifact_root = tmp_path / "receipt-artifacts"
+    store = EvolutionStore(
+        db_path=tmp_path / "receipt-evolution.db",
+        artifact_root=artifact_root,
+    )
+    store.initialize()
+    sources = artifact_root / "receipt-sources"
+    skill_source = sources / "parser-skill"
+    skill_source.mkdir(parents=True)
+    memory_source = sources / "memory.md"
+    agent_source = sources / "AGENTS.md"
+    memory_source.write_text(memory_text, encoding="utf-8")
+    agent_source.write_text(agent_system_text, encoding="utf-8")
+    (skill_source / "SKILL.md").write_text(skill_text, encoding="utf-8")
+
+    registered = [
+        store.register_artifact(
+            ArtifactRegisterRequest(
+                type=ArtifactType.TEXT_MEMORY,
+                name="verified memory",
+                uri=memory_source.as_uri(),
+                compatibility={"task_tags": ["parser"], "agent_harness": ["codex"]},
+                scores={"quality": 0.9},
+                promoted=False,
+            )
+        ),
+        store.register_artifact(
+            ArtifactRegisterRequest(
+                type=ArtifactType.SKILL_BUNDLE,
+                name="verified skill",
+                uri=skill_source.as_uri(),
+                compatibility={"task_tags": ["parser"], "agent_harness": ["codex"]},
+                scores={"quality": 0.8},
+                promoted=False,
+            )
+        ),
+        store.register_artifact(
+            ArtifactRegisterRequest(
+                type=ArtifactType.AGENT_SYSTEM,
+                name="verified agent system",
+                uri=agent_source.as_uri(),
+                manifest={"target_path": "AGENTS.md"},
+                compatibility={"task_tags": ["parser"], "agent_harness": ["codex"]},
+                scores={"quality": 0.85},
+                promoted=False,
+            )
+        ),
+    ]
+    artifact_ids = sorted(item.artifact_id for item in registered)
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="receipt-task",
+            instruction="Fix parser precedence.",
+            agent={"harness": "codex"},
+            metadata={
+                "task_tags": ["parser"],
+                "evolution": {"context_artifact_ids": artifact_ids},
+            },
+        )
+    ).model_dump(mode="json")
+    runtime = FakeRuntime()
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(enabled=True, context={"fail_open": False})
+    manager.evolution_client = FakeEvolutionClient(context=context)
+    manager.model_served = "served-model"
+    request = SessionDispatchRequest(
+        session_id="session-receipt",
+        task_id="receipt-task",
+        instruction="Fix parser precedence.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(harness="fake"),
+        metadata={
+            "openevo": {"revision_id": "revision-verified"},
+            "evolution": {"context_artifact_ids": artifact_ids},
+        },
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "session-artifacts",
+        runtime=runtime,
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    await manager._resolve_and_inject_evolution_context(managed, FakeHarness())
+
+    receipt = request.metadata["evolution"]["runtime_injection_receipt"]
+    assert receipt["schema_version"] == "2"
+    assert receipt["context_id"] == context["context_id"]
+    assert receipt["revision_id"] == "revision-verified"
+    assert (
+        receipt["instruction_sha256"]
+        == hashlib.sha256(request.instruction.encode("utf-8")).hexdigest()
+    )
+    assert len(receipt["staged_tree_sha256"]) == 64
+    inventory = {item["artifact_id"]: item for item in context["selection"]["artifacts"]}
+    received = {item["artifact_id"]: item for item in receipt["artifacts"]}
+    assert set(received) == set(artifact_ids)
+    for artifact_id, item in received.items():
+        assert item["artifact_type"] == inventory[artifact_id]["artifact_type"]
+        assert item["content_sha256"] == inventory[artifact_id]["content_sha256"]
+        assert len(item["staged_sha256"]) == 64
+    assert {item["artifact_type"] for item in receipt["artifacts"]} == {
+        "agent_system",
+        "skill_bundle",
+        "text_memory",
+    }
+    assert "file://" not in runtime.uploads["/openevo/session/evolution/context.json"]
+    assert str(tmp_path) not in runtime.uploads["/openevo/session/evolution/context.json"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_receipt_rejects_forged_selection_digest(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "forged-artifacts"
+    store = EvolutionStore(
+        db_path=tmp_path / "forged-evolution.db",
+        artifact_root=artifact_root,
+    )
+    store.initialize()
+    source = artifact_root / "memory.md"
+    source.write_text("Verified memory.", encoding="utf-8")
+    artifact = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="verified memory",
+            uri=source.as_uri(),
+            promoted=False,
+        )
+    )
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task",
+            instruction="Work.",
+            agent={},
+            metadata={"evolution": {"context_artifact_ids": [artifact.artifact_id]}},
+        )
+    ).model_dump(mode="json")
+    context["selection"]["artifacts"][0]["content_sha256"] = "0" * 64
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(enabled=True, context={"fail_open": False})
+    manager.evolution_client = FakeEvolutionClient(context=context)
+    manager.model_served = "served-model"
+    request = SessionDispatchRequest(
+        session_id="session-forged",
+        task_id="task",
+        instruction="Work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(harness="fake"),
+        metadata={
+            "openevo": {"revision_id": "revision-verified"},
+            "evolution": {"context_artifact_ids": [artifact.artifact_id]},
+        },
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "session-artifacts",
+        runtime=FakeRuntime(),
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    with pytest.raises(ValueError, match="artifact digest"):
+        await manager._resolve_and_inject_evolution_context(managed, FakeHarness())
+
+    assert "runtime_injection_receipt" not in request.metadata["evolution"]
 
 
 @pytest.mark.asyncio
@@ -4300,7 +4472,7 @@ async def test_write_evolution_context_files_avoids_bind_mount_same_file(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_write_evolution_context_files_skips_unsafe_agent_system_target_but_uploads_canonical(
+async def test_write_evolution_context_files_rejects_unsafe_agent_system_target(
     tmp_path,
 ):
     runtime = FakeRuntime()
@@ -4312,21 +4484,15 @@ async def test_write_evolution_context_files_skips_unsafe_agent_system_target_bu
         },
     }
 
-    env = await write_evolution_context_files(
-        runtime=runtime,
-        context=context,
-        host_dir=tmp_path,
-        target_dir="/openevo/session/evolution",
-    )
+    with pytest.raises(ValueError, match="supported harness instruction path"):
+        await write_evolution_context_files(
+            runtime=runtime,
+            context=context,
+            host_dir=tmp_path,
+            target_dir="/openevo/session/evolution",
+        )
 
-    assert runtime.uploads["/openevo/session/evolution/agent_system.md"] == (
-        "Do not overwrite project config."
-    )
-    assert "/openevo/session/pyproject.toml" not in runtime.uploads
-    assert env["OPENEVO_AGENT_SYSTEM_FILE"] == "/openevo/session/evolution/agent_system.md"
-    assert "OPENEVO_AGENT_SYSTEM_TARGET" not in env
-    assert "OPENEVO_AGENT_SYSTEM_TARGETS" not in env
-    assert "warnings" in json.loads(runtime.uploads["/openevo/session/evolution/context.json"])
+    assert runtime.uploads == {}
 
 
 @pytest.mark.asyncio
@@ -4360,13 +4526,11 @@ async def test_write_evolution_context_files_stages_skill_bundle_artifacts(tmp_p
     assert (staged_skill / "SKILL.md").read_text(encoding="utf-8") == (
         "---\nname: parser-memory\n---\nRemember parser precedence."
     )
-    manifest = json.loads((staged_skill / "artifact.json").read_text(encoding="utf-8"))
-    assert manifest["artifact_id"] == "artifact skill/1"
-    assert manifest["uri"] == skill_source.as_uri()
+    assert sorted(path.name for path in staged_skill.iterdir()) == ["SKILL.md"]
 
 
 @pytest.mark.asyncio
-async def test_write_evolution_context_files_skips_bad_skill_without_dropping_memory(
+async def test_write_evolution_context_files_rejects_bad_skill_without_partial_staging(
     tmp_path,
 ):
     runtime = BindMountRuntime(tmp_path)
@@ -4387,23 +4551,15 @@ async def test_write_evolution_context_files_skips_bad_skill_without_dropping_me
         },
     }
 
-    await write_evolution_context_files(
-        runtime=runtime,
-        context=context,
-        host_dir=tmp_path,
-        target_dir="/openevo/session/evolution",
-    )
+    with pytest.raises(ValueError, match="file://"):
+        await write_evolution_context_files(
+            runtime=runtime,
+            context=context,
+            host_dir=tmp_path,
+            target_dir="/openevo/session/evolution",
+        )
 
-    assert (tmp_path / "evolution" / "memory.md").read_text(encoding="utf-8") == (
-        "Remember parser precedence."
-    )
-    assert (
-        json.loads((tmp_path / "evolution" / "adapters.json").read_text())["merge_mode"]
-        == "runtime_lora"
-    )
-    written_context = json.loads((tmp_path / "evolution" / "context.json").read_text())
-    assert "warnings" in written_context
-    assert "bad_skill" in written_context["warnings"][0]
+    assert not (tmp_path / "evolution").exists()
 
 
 @pytest.mark.asyncio
@@ -4537,7 +4693,7 @@ async def test_resolve_and_inject_evolution_context_fail_open_records_error(tmp_
     assert env == {}
     assert request.metadata["evolution"] == {
         "context_injected": False,
-        "error": "backend down",
+        "error": "context_resolution_failed",
     }
 
 
@@ -4574,7 +4730,7 @@ async def test_resolve_and_inject_evolution_context_fail_open_replaces_non_dict_
     assert env == {}
     assert request.metadata["evolution"] == {
         "context_injected": False,
-        "error": "backend down",
+        "error": "context_resolution_failed",
     }
 
 
