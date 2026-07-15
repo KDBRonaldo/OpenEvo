@@ -1846,6 +1846,43 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.diffs.set(current.id, this.makeDiff(current, wrongPrevious, generation));
   }
 
+  useDocumentLevelArtifactDiff(): void {
+    const current = this.activeSelectedArtifacts()[0];
+    const previousId = current?.lineage.source_artifact_ids[0];
+    const previous = this.artifacts.find((artifact) => artifact.id === previousId);
+    if (!current || !previous) return;
+    const oldDocument = (relativePath: string, contentSha256: string) => ({
+      artifact_id: previous.id,
+      artifact_content_sha256: previous.content_sha256,
+      document_id: `old-${relativePath}`,
+      relative_path: relativePath,
+      content_sha256: contentSha256,
+    });
+    const newDocument = (relativePath: string, contentSha256: string) => ({
+      artifact_id: current.id,
+      artifact_content_sha256: current.content_sha256,
+      document_id: `new-${relativePath}`,
+      relative_path: relativePath,
+      content_sha256: contentSha256,
+    });
+    this.diffs.set(current.id, artifactDiffV1Schema.parse({
+      schema_version: "1",
+      artifact_id: current.id,
+      artifact_content_sha256: current.content_sha256,
+      previous_artifact_id: previous.id,
+      previous_artifact_content_sha256: previous.content_sha256,
+      document_changes: [
+        { kind: "renamed", old_document: oldDocument("notes.md", A), new_document: newDocument("evidence.md", A), hunks: [] },
+        { kind: "added", new_document: newDocument("empty-added.md", B), hunks: [] },
+        { kind: "removed", old_document: oldDocument("empty-removed.md", B), hunks: [] },
+      ],
+      total_document_changes: 3,
+      total_hunks: 0,
+      total_lines: 0,
+      truncated: false,
+    }));
+  }
+
   failNextProjectSaveWithStatus(status: 412): void {
     this.nextProjectSaveStatus = status;
   }

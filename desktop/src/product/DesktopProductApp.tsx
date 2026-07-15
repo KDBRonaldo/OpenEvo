@@ -1441,21 +1441,27 @@ function ArtifactContent({ content }: { content: ArtifactContentV1 }) {
 }
 
 function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
-  const hunks = diff.document_changes.flatMap((change, changeIndex) => change.hunks.map((hunk, hunkIndex) => ({
-    hunk,
-    key: `${change.kind}-${changeIndex}-${hunkIndex}`,
-    heading: ("new_document" in change ? change.new_document.relative_path : change.old_document.relative_path),
-  })));
-  if (hunks.length === 0) return <div className="quiet-empty"><FileDiff size={22} /><p>No textual changes are available for this revision.</p></div>;
+  if (diff.document_changes.length === 0) return <div className="quiet-empty"><FileDiff size={22} /><p>No document changes are available for this revision.</p></div>;
   return (
     <div className="diff-view">
       {diff.truncated ? <InlineNotice tone="warning" title="Change preview is truncated" detail="Some changes are not shown in this preview." /> : null}
-      {hunks.map(({ hunk, key, heading }) => (
-        <section key={key} className="diff-hunk">
-          <h3>{heading}</h3>
-          {hunk.lines.map((line, index) => <div key={`${key}-${index}`} className={`diff-line ${line.kind}`}><span>{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}</span><code>{line.text}</code></div>)}
+      {diff.document_changes.map((change, changeIndex) => {
+        const oldPath = "old_document" in change ? change.old_document.relative_path : null;
+        const newPath = "new_document" in change ? change.new_document.relative_path : null;
+        const heading = change.kind === "renamed" ? `${oldPath} to ${newPath}` : (newPath ?? oldPath);
+        const emptyMessage = change.kind === "renamed"
+          ? "Renamed without content changes."
+          : change.kind === "added"
+            ? "Empty document added."
+            : change.kind === "removed"
+              ? "Empty document removed."
+              : "Content identity changed without line changes.";
+        return <section key={`${change.kind}-${changeIndex}`} className="diff-hunk">
+          <div className="diff-document-heading"><span>{change.kind}</span><h3>{heading}</h3></div>
+          {change.hunks.map((hunk, hunkIndex) => hunk.lines.map((line, lineIndex) => <div key={`${change.kind}-${changeIndex}-${hunkIndex}-${lineIndex}`} className={`diff-line ${line.kind}`}><span>{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}</span><code>{line.text}</code></div>))}
+          {change.hunks.length === 0 ? <p className="diff-document-empty">{emptyMessage}</p> : null}
         </section>
-      ))}
+      })}
     </div>
   );
 }

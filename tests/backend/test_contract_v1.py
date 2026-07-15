@@ -95,9 +95,9 @@ EXPECTED_OPERATIONS = {
     ("GET", "/v1/runs/{run_id}/logs"),
     ("GET", "/v1/runs/{run_id}/context"),
     ("GET", "/v1/runs/{run_id}/artifacts"),
-    ("GET", "/v1/artifacts/{artifact_id}"),
-    ("GET", "/v1/artifacts/{artifact_id}/content"),
-    ("GET", "/v1/artifacts/{artifact_id}/diff"),
+    ("GET", "/v1/projects/{project_id}/artifacts/{artifact_id}"),
+    ("GET", "/v1/projects/{project_id}/artifacts/{artifact_id}/content"),
+    ("GET", "/v1/projects/{project_id}/artifacts/{artifact_id}/diff"),
     ("GET", "/v1/services"),
     ("GET", "/v1/services/{service_id}"),
     ("POST", "/v1/services/{service_id}/restart"),
@@ -130,9 +130,10 @@ def test_provider_route_iteration_recurses_deferred_included_router() -> None:
 
     routes = [app.routes[-1], DeferredIncludedRouter()]
 
-    assert {
-        route.operation_id for route in contract_app_module._iter_api_routes(routes)
-    } == {"topLevelOperation", "nestedOperation"}
+    assert {route.operation_id for route in contract_app_module._iter_api_routes(routes)} == {
+        "topLevelOperation",
+        "nestedOperation",
+    }
 
 
 def test_provider_binding_preserves_frozen_endpoint_signatures() -> None:
@@ -143,9 +144,7 @@ def test_provider_binding_preserves_frozen_endpoint_signatures() -> None:
         def invoke(self, _operation_id: str, _arguments: dict[str, object]) -> object:
             raise AssertionError("sync provider dispatch is not used")
 
-        async def invoke_async(
-            self, _operation_id: str, _arguments: dict[str, object]
-        ) -> object:
+        async def invoke_async(self, _operation_id: str, _arguments: dict[str, object]) -> object:
             raise AssertionError("provider dispatch is not part of this test")
 
     contract_app = create_core_control_contract_app()
@@ -344,7 +343,7 @@ def test_openapi_snapshot_is_exactly_rebuildable() -> None:
     rebuilt = canonical_json_bytes(build_openapi_document())
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
-    assert openapi_sha256() == ("315dc90907f14347d07f7903d360009b271372302b38a1e4adca5bc14486497a")
+    assert openapi_sha256() == ("006fbe0ad33497329912280d9836bd1dce44f49f26fb018a9d9ba6bdf33b62ed")
 
 
 def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
@@ -683,33 +682,33 @@ def test_workspace_archive_format_and_extraction_policy_are_frozen() -> None:
 
     schema = build_openapi_document()["components"]["schemas"]
     assert schema["WorkspaceArchivePolicyV1"]["additionalProperties"] is False
-    assert "dot-dot" in schema["WorkspaceArchivePolicyV1"]["properties"]["path_policy"][
-        "description"
-    ]
-    assert "rightmost" in schema["WorkspaceArchivePolicyV1"]["properties"]["path_policy"][
-        "description"
-    ]
-    assert "0000644\\0" in schema["WorkspaceArchivePolicyV1"]["properties"]["header_policy"][
-        "description"
-    ]
-    assert "six octal digits" in schema["WorkspaceArchivePolicyV1"]["properties"][
-        "header_policy"
-    ]["description"]
-    assert "regular-file and directory" in schema["WorkspaceArchivePolicyV1"][
-        "properties"
-    ]["entry_types"]["description"]
-    assert schema["WorkspaceArchivePolicyV1"]["properties"]["max_path_depth"][
-        "const"
-    ] == 32
+    assert (
+        "dot-dot" in schema["WorkspaceArchivePolicyV1"]["properties"]["path_policy"]["description"]
+    )
+    assert (
+        "rightmost"
+        in schema["WorkspaceArchivePolicyV1"]["properties"]["path_policy"]["description"]
+    )
+    assert (
+        "0000644\\0"
+        in schema["WorkspaceArchivePolicyV1"]["properties"]["header_policy"]["description"]
+    )
+    assert (
+        "six octal digits"
+        in schema["WorkspaceArchivePolicyV1"]["properties"]["header_policy"]["description"]
+    )
+    assert (
+        "regular-file and directory"
+        in schema["WorkspaceArchivePolicyV1"]["properties"]["entry_types"]["description"]
+    )
+    assert schema["WorkspaceArchivePolicyV1"]["properties"]["max_path_depth"]["const"] == 32
     assert set(schema["WorkspaceUploadCreateV1"]["properties"]) == {
         "schema_version",
         "archive",
         "base_workspace_snapshot",
         "project_snapshot",
     }
-    assert "content_id" not in json.dumps(
-        schema["WorkspaceUploadCreateV1"], sort_keys=True
-    )
+    assert "content_id" not in json.dumps(schema["WorkspaceUploadCreateV1"], sort_keys=True)
 
 
 def test_workspace_finalize_closes_upload_and_project_cas() -> None:
@@ -742,12 +741,8 @@ def test_workspace_finalize_closes_upload_and_project_cas() -> None:
     assert _response_schema_name(finalize) == "WorkspaceUploadFinalizeResponseV1"
     finalize_request = openapi["components"]["schemas"]["WorkspaceUploadFinalizeV1"]
     assert set(finalize_request["properties"]) == {"schema_version", "content_sha256"}
-    response_schema = openapi["components"]["schemas"][
-        "WorkspaceUploadFinalizeResponseV1"
-    ]
-    assert {"project", "upload", "publication"} <= set(
-        response_schema["properties"]
-    )
+    response_schema = openapi["components"]["schemas"]["WorkspaceUploadFinalizeResponseV1"]
+    assert {"project", "upload", "publication"} <= set(response_schema["properties"])
     assert WorkspaceUploadFinalizeResponseV1 is not None
 
     workspace_snapshot = _snapshot_ref("workspace", "workspace-snapshot-2", "6")
@@ -822,9 +817,7 @@ def test_workspace_finalize_closes_upload_and_project_cas() -> None:
         "publication": publication,
         "project": project,
     }
-    assert _json_model(WorkspaceUploadFinalizeResponseV1, response).project.etag == project[
-        "etag"
-    ]
+    assert _json_model(WorkspaceUploadFinalizeResponseV1, response).project.etag == project["etag"]
 
     stale = json.loads(json.dumps(response))
     stale["project"]["current_project_snapshot"] = upload["project_snapshot"]
@@ -896,14 +889,20 @@ def test_openapi_object_models_are_closed_and_collections_are_bounded() -> None:
     ],
 )
 def test_every_page_has_more_iff_next_cursor_is_present(page_model: type[Any]) -> None:
-    assert _json_model(
-        page_model,
-        {"schema_version": "1", "items": [], "next_cursor": None, "has_more": False},
-    ).has_more is False
-    assert _json_model(
-        page_model,
-        {"schema_version": "1", "items": [], "next_cursor": "next", "has_more": True},
-    ).has_more is True
+    assert (
+        _json_model(
+            page_model,
+            {"schema_version": "1", "items": [], "next_cursor": None, "has_more": False},
+        ).has_more
+        is False
+    )
+    assert (
+        _json_model(
+            page_model,
+            {"schema_version": "1", "items": [], "next_cursor": "next", "has_more": True},
+        ).has_more
+        is True
+    )
     for next_cursor, has_more in ((None, True), ("next", False)):
         with pytest.raises(ValidationError, match="if and only if"):
             _json_model(
@@ -1020,9 +1019,7 @@ def test_run_state_shape_enforces_queue_and_terminal_invariants() -> None:
 
 
 def test_run_list_shape_contains_current_attempt_error_and_transition() -> None:
-    properties = build_openapi_document()["components"]["schemas"]["RunSummaryV1"][
-        "properties"
-    ]
+    properties = build_openapi_document()["components"]["schemas"]["RunSummaryV1"]["properties"]
     assert {
         "current_attempt",
         "current_error",
@@ -1034,9 +1031,12 @@ def test_run_list_shape_contains_current_attempt_error_and_transition() -> None:
         "etag",
     } <= set(properties)
     assert properties["attempt_count"]["maximum"] == 100
-    assert build_openapi_document()["components"]["schemas"]["AttemptV1"]["properties"][
-        "number"
-    ]["maximum"] == 100
+    assert (
+        build_openapi_document()["components"]["schemas"]["AttemptV1"]["properties"]["number"][
+            "maximum"
+        ]
+        == 100
+    )
 
 
 def test_run_detail_closes_attempt_order_status_and_revision_identity() -> None:
@@ -1479,9 +1479,7 @@ def test_artifact_diff_is_bounded_structured_data() -> None:
 
     wrong_side = json.loads(json.dumps(payload))
     wrong_side["document_changes"][0]["old_document"]["artifact_id"] = "artifact-2"
-    wrong_side["document_changes"][0]["hunks"][0]["old_document"]["artifact_id"] = (
-        "artifact-2"
-    )
+    wrong_side["document_changes"][0]["hunks"][0]["old_document"]["artifact_id"] = "artifact-2"
     with pytest.raises(ValidationError, match="old document"):
         _json_model(ArtifactDiffV1, wrong_side)
 
@@ -1747,9 +1745,7 @@ def test_each_sse_event_validator_rejects_a_mismatched_change_resource() -> None
         "workspace_kind": "scratch",
         "current_project_snapshot": _snapshot_ref("project", "project-snapshot-1", "1"),
         "current_task_snapshot": _snapshot_ref("task", "task-snapshot-1", "2"),
-        "current_workspace_snapshot": _snapshot_ref(
-            "workspace", "workspace-snapshot-1", "3"
-        ),
+        "current_workspace_snapshot": _snapshot_ref("workspace", "workspace-snapshot-1", "3"),
         "active_revision": None,
         "registry_digest": None,
         "model_preparation": {
@@ -1868,7 +1864,16 @@ def test_each_sse_event_validator_rejects_a_mismatched_change_resource() -> None
     }
 
     cases = [
-        ("run.updated.v1", "run", "run-1", "project", "project-1", etag, None, _valid_run_summary()),
+        (
+            "run.updated.v1",
+            "run",
+            "run-1",
+            "project",
+            "project-1",
+            etag,
+            None,
+            _valid_run_summary(),
+        ),
         (
             "run.timeline_appended.v1",
             "timeline_entry",
@@ -1970,9 +1975,11 @@ def _response_schema_name(operation: dict[str, Any]) -> str | None:
     for status in ("200", "201", "202"):
         response = operation["responses"].get(status)
         if response is not None:
-            return response["content"]["application/json"]["schema"].get("$ref", "").rsplit(
-                "/", 1
-            )[-1]
+            return (
+                response["content"]["application/json"]["schema"]
+                .get("$ref", "")
+                .rsplit("/", 1)[-1]
+            )
     return None
 
 
@@ -1990,9 +1997,10 @@ def test_async_core_actions_are_recoverable_operations() -> None:
     get_operation = openapi["paths"]["/v1/operations/{operation_id}"]["get"]
     assert _response_schema_name(get_operation) == "OperationV1"
     assert "etag" in openapi["components"]["schemas"]["OperationV1"]["properties"]
-    assert openapi["components"]["schemas"]["ReferencedLogPageV1"]["properties"][
-        "items"
-    ]["maxItems"] == 100
+    assert (
+        openapi["components"]["schemas"]["ReferencedLogPageV1"]["properties"]["items"]["maxItems"]
+        == 100
+    )
     assert OperationV1 is not None
 
     cancel = openapi["paths"]["/v1/operations/{operation_id}/cancel"]["post"]
@@ -2049,9 +2057,7 @@ def test_environment_repair_operation_binds_request_result_and_cancellation() ->
     assert _json_model(OperationV1, cancelling).status.value == "cancelling"
 
     cancelled = json.loads(json.dumps(cancelling))
-    cancelled.update(
-        {"status": "cancelled", "finished_at": "2026-07-14T00:00:02Z"}
-    )
+    cancelled.update({"status": "cancelled", "finished_at": "2026-07-14T00:00:02Z"})
     assert _json_model(OperationV1, cancelled).status.value == "cancelled"
 
     succeeded = json.loads(json.dumps(operation))
@@ -2079,9 +2085,7 @@ def test_environment_repair_operation_binds_request_result_and_cancellation() ->
     assert _json_model(OperationV1, succeeded).result is not None
 
     mismatched_result = json.loads(json.dumps(succeeded))
-    mismatched_result["result"]["response"]["results"][0]["action"] = (
-        "restart_model_service"
-    )
+    mismatched_result["result"]["response"]["results"][0]["action"] = "restart_model_service"
     with pytest.raises(ValidationError, match="requested actions"):
         _json_model(OperationV1, mismatched_result)
 
@@ -2155,7 +2159,9 @@ def test_every_if_match_resource_has_the_same_strict_etag_on_read_or_action() ->
             read_name = _response_schema_name(read_operation) if read_operation else None
             candidate_names = {name for name in (response_name, read_name) if name}
             assert candidate_names, (method, path)
-            assert any("etag" in schemas[name].get("properties", {}) for name in candidate_names), (
+            assert any(
+                "etag" in schemas[name].get("properties", {}) for name in candidate_names
+            ), (
                 method,
                 path,
                 candidate_names,
@@ -2199,9 +2205,7 @@ def test_every_if_match_resource_has_the_same_strict_etag_on_read_or_action() ->
 
 def test_revision_surface_is_read_only_and_mutation_status_codes_are_exact() -> None:
     openapi = build_openapi_document()
-    revision_paths = {
-        path: item for path, item in openapi["paths"].items() if "revision" in path
-    }
+    revision_paths = {path: item for path, item in openapi["paths"].items() if "revision" in path}
     assert revision_paths
     assert all(set(item) <= {"get"} for item in revision_paths.values())
     assert not any("activate" in path or "promote" in path for path in openapi["paths"])

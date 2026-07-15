@@ -151,7 +151,7 @@ by explicit development and test builds.
 
 The Desktop release Core client accepts only `provider_kind=openevo_core`,
 `build_channel=release`, and the frozen Core Control API v1 OpenAPI digest
-`315dc90907f14347d07f7903d360009b271372302b38a1e4adca5bc14486497a`.
+`006fbe0ad33497329912280d9836bd1dce44f49f26fb018a9d9ba6bdf33b62ed`.
 It pins the complete first accepted version response. Every bearer-authenticated
 `/v1` request requires that pin and fails before transport without it.
 
@@ -721,9 +721,9 @@ GET    /v1/runs/{run_id}/timeline
 GET    /v1/runs/{run_id}/logs
 GET    /v1/runs/{run_id}/context
 GET    /v1/runs/{run_id}/artifacts
-GET    /v1/artifacts/{artifact_id}
-GET    /v1/artifacts/{artifact_id}/content
-GET    /v1/artifacts/{artifact_id}/diff
+GET    /v1/projects/{project_id}/artifacts/{artifact_id}
+GET    /v1/projects/{project_id}/artifacts/{artifact_id}/content
+GET    /v1/projects/{project_id}/artifacts/{artifact_id}/diff
 
 GET    /v1/services
 GET    /v1/services/{service_id}
@@ -738,6 +738,20 @@ DELETE /v1/diagnostics/{diagnostic_id}
 POST   /v1/maintenance/cache-cleanup
 GET    /v1/events
 ```
+
+The sidecar derives `project_id` only from the active project session and sends
+it in every Core artifact read path. Core authorizes metadata, content, and diff
+against the live project's signed active revision and its durable typed artifact
+authority; bearer possession and an opaque artifact ID are insufficient.
+Historical artifacts are available only as a current artifact's verified diff
+lineage predecessor. Revision authority is independent of seven-day
+idempotency retention, and project deletion cascades it with the revision
+ledger.
+
+`ArtifactDiffV1.document_changes` is the document-level authority; `hunks` may
+be empty. Desktop therefore renders rename operations and empty-document
+additions/removals from the change object itself instead of treating zero hunks
+as no change.
 
 Project specifications carry evolution choices only as
 `evolution.targets.<target_id> = {enabled, method, config}` and use Core's

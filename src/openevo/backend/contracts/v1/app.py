@@ -153,6 +153,7 @@ _ERROR_RESPONSES = {
         "model": m.ContractOnlyResponseV1,
         "description": "The schema-only contract app has no business provider.",
     },
+    503: {"model": m.ApiErrorV1, "description": "Required Core authority is unavailable."},
 }
 
 IdempotencyKey = Annotated[
@@ -634,33 +635,34 @@ def create_core_control_contract_app(
         return _not_implemented()
 
     @router.get(
-        "/artifacts/{artifact_id}",
+        "/projects/{project_id}/artifacts/{artifact_id}",
         operation_id="getCoreArtifactV1",
         response_model=m.ArtifactSummaryV1,
         responses=_ERROR_RESPONSES,
         tags=["artifacts"],
     )
-    async def get_artifact(artifact_id: ResourceId) -> Response:
+    async def get_artifact(project_id: ResourceId, artifact_id: ResourceId) -> Response:
         return _not_implemented()
 
     @router.get(
-        "/artifacts/{artifact_id}/content",
+        "/projects/{project_id}/artifacts/{artifact_id}/content",
         operation_id="getCoreArtifactContentV1",
         response_model=m.ArtifactContentV1,
         responses=_ERROR_RESPONSES,
         tags=["artifacts"],
     )
-    async def artifact_content(artifact_id: ResourceId) -> Response:
+    async def artifact_content(project_id: ResourceId, artifact_id: ResourceId) -> Response:
         return _not_implemented()
 
     @router.get(
-        "/artifacts/{artifact_id}/diff",
+        "/projects/{project_id}/artifacts/{artifact_id}/diff",
         operation_id="getCoreArtifactDiffV1",
         response_model=m.ArtifactDiffV1,
         responses=_ERROR_RESPONSES,
         tags=["artifacts"],
     )
     async def artifact_diff(
+        project_id: ResourceId,
         artifact_id: ResourceId,
         previous_artifact_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     ) -> Response:

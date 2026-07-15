@@ -1391,12 +1391,33 @@ pre.json {
   margin-top: 12px;
 }
 
-.diff-hunk h3 {
-  margin: 0;
+.diff-document-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 8px 11px;
   border-bottom: 1px solid var(--line);
-  color: var(--muted);
   background: var(--surface-soft);
+}
+
+.diff-document-heading span {
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.diff-document-heading h3 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.diff-document-empty {
+  margin: 0;
+  padding: 10px 11px;
+  color: var(--muted);
   font-size: 11px;
 }
 

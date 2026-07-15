@@ -584,6 +584,22 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Added for Revision 2");
   });
 
+  it("shows rename and empty-file document changes without line hunks", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useDocumentLevelArtifactDiff();
+    root = await renderProduct(provider);
+
+    await clickButton("Evolution");
+    await clickButton("Changes");
+    await flush();
+
+    expect(screenText()).toContain("notes.md to evidence.md");
+    expect(screenText()).toContain("Renamed without content changes.");
+    expect(screenText()).toContain("Empty document added.");
+    expect(screenText()).toContain("Empty document removed.");
+    expect(document.querySelectorAll(".diff-hunk")).toHaveLength(3);
+  });
+
   it("refuses content and changes cross-wired to another selected artifact", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useCrossWiredArtifactPayloads();

@@ -121,9 +121,9 @@ GET  /v1/runs/{run_id}/context
 GET  /v1/runs/{run_id}/timeline
 GET  /v1/runs/{run_id}/logs
 GET  /v1/runs/{run_id}/artifacts
-GET  /v1/artifacts/{artifact_id}
-GET  /v1/artifacts/{artifact_id}/content
-GET  /v1/artifacts/{artifact_id}/diff
+GET  /v1/projects/{project_id}/artifacts/{artifact_id}
+GET  /v1/projects/{project_id}/artifacts/{artifact_id}/content
+GET  /v1/projects/{project_id}/artifacts/{artifact_id}/diff
 POST /v1/diagnostics
 GET  /v1/diagnostics/{diagnostic_id}
 DELETE /v1/diagnostics/{diagnostic_id}
@@ -133,6 +133,19 @@ POST /v1/services/{service_id}/restart
 POST /v1/services/{service_id}/stop
 POST /v1/maintenance/cache-cleanup
 ```
+
+Artifact inspection is explicitly project-scoped. Core first verifies the live
+project and its signed active revision, then requires the artifact to appear in
+that revision's durable typed artifact authority. A predecessor artifact is not
+directly readable after it leaves the current head; diff may resolve it only
+when the current artifact's authoritative lineage names it. The authority is
+revision-owned and survives idempotency replay-record retention.
+
+Content inspection uses a separate small no-follow scanner budget before
+hashing, verifies digest, size, complete inventory, and UTF-8 for every returned
+document, and never returns artifact URI, scanner handle, or host path. Diff
+applies line and comparison budgets before its bounded matcher. Unavailable
+managed authority uses the declared HTTP 503 error contract.
 
 ## Version
 

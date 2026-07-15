@@ -928,7 +928,7 @@ Environment proxy discovery and redirects are disabled. Discovery calls are
 unauthenticated, while every `/v1` request attaches the bearer only to the
 fixed origin. The client first validates and pins one release `openevo_core`
 `/version` response whose OpenAPI digest is exactly
-`315dc90907f14347d07f7903d360009b271372302b38a1e4adca5bc14486497a`.
+`006fbe0ad33497329912280d9836bd1dce44f49f26fb018a9d9ba6bdf33b62ed`.
 Every authenticated `/v1` call fails before transport until that negotiation
 succeeds; simulator, scaffold, dry-run, development, and changed release
 identities are rejected. Mutations require their contract-declared idempotency

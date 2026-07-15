@@ -12,6 +12,7 @@ import pytest
 from openevo.evolution import artifact_payloads
 from openevo.evolution.artifact_payloads import (
     ArtifactPayloadBudgetExceeded,
+    ArtifactPayloadLimits,
     ArtifactPayloadService,
 )
 from openevo.evolution.framework import (
@@ -528,6 +529,33 @@ def test_payload_entry_and_total_byte_limits_are_enforced(
     with ArtifactPayloadService(tmp_path) as service:
         with pytest.raises(ValueError, match="total bytes"):
             _issue(service, payload)
+
+
+def test_explicit_inspection_limit_rejects_stat_size_before_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "sparse.bin"
+    with payload.open("wb") as stream:
+        stream.truncate(4 * 1024 * 1024 * 1024)
+
+    def unexpected_hash(_fd: int):
+        raise AssertionError("oversize inspection payload was hashed")
+
+    monkeypatch.setattr(artifact_payloads, "_stream_fd_chunks", unexpected_hash)
+    limits = ArtifactPayloadLimits(
+        max_nodes=8,
+        max_files=2,
+        max_entry_bytes=1024,
+        max_total_bytes=2048,
+        max_attempted_nodes=32,
+        max_attempted_files=6,
+        max_attempted_bytes=4096,
+    )
+    with ArtifactPayloadService(tmp_path, limits=limits) as service:
+        with pytest.raises(ArtifactPayloadBudgetExceeded, match="total bytes|entry bytes"):
+            _issue(service, payload)
+        assert service._attempted_bytes == 0
 
 
 def test_service_enforces_aggregate_snapshot_byte_budget(

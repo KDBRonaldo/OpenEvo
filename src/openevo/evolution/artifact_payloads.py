@@ -74,6 +74,39 @@ class ArtifactPayloadBudgetExceeded(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactPayloadLimits:
+    """Closed limits for one payload service lifetime.
+
+    Structural limits may only tighten the framework scanner bounds. Attempt
+    limits cover up to three scan/reread/inventory passes and remain explicit.
+    """
+
+    max_nodes: int = _MAX_PAYLOAD_NODES
+    max_files: int = MAX_PAYLOAD_ENTRIES
+    max_entry_bytes: int = MAX_PAYLOAD_ENTRY_BYTES
+    max_total_bytes: int = MAX_PAYLOAD_TOTAL_BYTES
+    max_attempted_nodes: int = _MAX_PAYLOAD_NODES
+    max_attempted_files: int = MAX_PAYLOAD_ENTRIES
+    max_attempted_bytes: int = MAX_PAYLOAD_TOTAL_BYTES
+
+    def __post_init__(self) -> None:
+        bounds = (
+            (self.max_nodes, _MAX_PAYLOAD_NODES),
+            (self.max_files, MAX_PAYLOAD_ENTRIES),
+            (self.max_entry_bytes, MAX_PAYLOAD_ENTRY_BYTES),
+            (self.max_total_bytes, MAX_PAYLOAD_TOTAL_BYTES),
+            (self.max_attempted_nodes, 3 * _MAX_PAYLOAD_NODES),
+            (self.max_attempted_files, 3 * MAX_PAYLOAD_ENTRIES),
+            (self.max_attempted_bytes, 3 * MAX_PAYLOAD_TOTAL_BYTES),
+        )
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > maximum
+            for value, maximum in bounds
+        ):
+            raise ValueError("artifact payload limits must tighten the framework bounds")
+
+
+@dataclass(frozen=True, slots=True)
 class _FileIdentity:
     device: int
     inode: int
@@ -224,7 +257,12 @@ class ArtifactPayloadService:
     must revalidate identity, size, and digest against the issued inventory.
     """
 
-    def __init__(self, allowed_root: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        allowed_root: str | os.PathLike[str],
+        *,
+        limits: ArtifactPayloadLimits | None = None,
+    ) -> None:
         if _O_PATH is None:
             raise RuntimeError("artifact payload scanning requires Linux O_PATH support")
         try:
@@ -233,6 +271,17 @@ class ArtifactPayloadService:
             raise ValueError("allowed root must be a filesystem path") from exc
         if not isinstance(raw_root, str) or "\x00" in raw_root:
             raise ValueError("allowed root must be a NUL-free text path")
+        active_limits = limits or ArtifactPayloadLimits(
+            max_nodes=_MAX_PAYLOAD_NODES,
+            max_files=MAX_PAYLOAD_ENTRIES,
+            max_entry_bytes=MAX_PAYLOAD_ENTRY_BYTES,
+            max_total_bytes=MAX_PAYLOAD_TOTAL_BYTES,
+            max_attempted_nodes=_MAX_PAYLOAD_NODES,
+            max_attempted_files=MAX_PAYLOAD_ENTRIES,
+            max_attempted_bytes=MAX_PAYLOAD_TOTAL_BYTES,
+        )
+        if not isinstance(active_limits, ArtifactPayloadLimits):
+            raise ValueError("artifact payload limits have the wrong type")
         absolute_root = os.path.abspath(raw_root)
         root_parts = PurePosixPath(absolute_root).parts
         if not root_parts or root_parts[0] != "/":
@@ -287,6 +336,7 @@ class ArtifactPayloadService:
             self._anchor_binding = anchor_binding
             self._root_fd = root_fd
             self._root_binding = _directory_binding(root_stat)
+            self._limits = active_limits
             self._handles: dict[str, _HandleRecord] = {}
             self._attempted_nodes = 0
             self._attempted_files = 0
@@ -396,8 +446,8 @@ class ArtifactPayloadService:
                 raise ValueError("payload root must not be a symlink")
             if stat.S_ISDIR(mode):
                 budget.nodes += 1
-                if budget.nodes > _MAX_PAYLOAD_NODES:
-                    raise ValueError("payload exceeds maximum node budget")
+                if budget.nodes > self._limits.max_nodes:
+                    raise ArtifactPayloadBudgetExceeded("payload exceeds maximum node budget")
                 self._require_attempted_budget()
                 root_components = path_components
                 self._scan_directory(
@@ -413,12 +463,12 @@ class ArtifactPayloadService:
                 budget.files += 1
                 budget.total_bytes += node_identity.size
                 self._record_attempted(files=1)
-                if budget.nodes > _MAX_PAYLOAD_NODES:
-                    raise ValueError("payload exceeds maximum node budget")
-                if budget.files > MAX_PAYLOAD_ENTRIES:
-                    raise ValueError("payload exceeds maximum entries")
-                if budget.total_bytes > MAX_PAYLOAD_TOTAL_BYTES:
-                    raise ValueError("payload exceeds maximum total bytes")
+                if budget.nodes > self._limits.max_nodes:
+                    raise ArtifactPayloadBudgetExceeded("payload exceeds maximum node budget")
+                if budget.files > self._limits.max_files:
+                    raise ArtifactPayloadBudgetExceeded("payload exceeds maximum entries")
+                if budget.total_bytes > self._limits.max_total_bytes:
+                    raise ArtifactPayloadBudgetExceeded("payload exceeds maximum total bytes")
                 self._require_attempted_budget()
                 content_path = manifest.get("content_path")
                 if content_path is None:
@@ -438,7 +488,7 @@ class ArtifactPayloadService:
                         ) from exc
                 logical_components = tuple(PurePosixPath(logical_path).parts)
                 if len(logical_components) > MAX_PAYLOAD_TREE_DEPTH:
-                    raise ValueError("payload exceeds maximum tree depth")
+                    raise ArtifactPayloadBudgetExceeded("payload exceeds maximum tree depth")
                 if len(logical_components) > len(path_components):
                     raise ValueError("manifest content_path cannot reconstruct payload root")
                 root_components = path_components[: len(path_components) - len(logical_components)]
@@ -452,8 +502,8 @@ class ArtifactPayloadService:
 
         if not records:
             raise ValueError("payload must contain at least one regular file")
-        if sum(record.size_bytes for record in records) > MAX_PAYLOAD_TOTAL_BYTES:
-            raise ValueError("payload exceeds maximum total bytes")
+        if sum(record.size_bytes for record in records) > self._limits.max_total_bytes:
+            raise ArtifactPayloadBudgetExceeded("payload exceeds maximum total bytes")
         # This stability pass rejects observed scan-time churn. It is not a byte
         # lease: later reads/materialization still revalidate the issued digest.
         self._verify_path_identity(path_components, node_identity, mutation_label="payload root")
@@ -855,11 +905,11 @@ class ArtifactPayloadService:
         self._attempted_bytes += total_bytes
 
     def _require_attempted_budget(self) -> None:
-        if self._attempted_nodes > _MAX_PAYLOAD_NODES:
+        if self._attempted_nodes > self._limits.max_attempted_nodes:
             raise ArtifactPayloadBudgetExceeded("payload service exceeds aggregate node budget")
-        if self._attempted_files > MAX_PAYLOAD_ENTRIES:
+        if self._attempted_files > self._limits.max_attempted_files:
             raise ArtifactPayloadBudgetExceeded("payload service exceeds aggregate entries")
-        if self._attempted_bytes > MAX_PAYLOAD_TOTAL_BYTES:
+        if self._attempted_bytes > self._limits.max_attempted_bytes:
             raise ArtifactPayloadBudgetExceeded("payload service exceeds aggregate total bytes")
 
     def _allocate_handle(self) -> str:
@@ -1004,8 +1054,10 @@ class ArtifactPayloadService:
                 for entry in entries:
                     budget.nodes += 1
                     self._record_attempted(nodes=1)
-                    if budget.nodes > _MAX_PAYLOAD_NODES:
-                        raise ValueError("payload exceeds maximum nodes or entries")
+                    if budget.nodes > self._limits.max_nodes:
+                        raise ArtifactPayloadBudgetExceeded(
+                            "payload exceeds maximum nodes or entries"
+                        )
                     self._require_attempted_budget()
                     names.append(entry.name)
         except OSError as exc:
@@ -1018,7 +1070,7 @@ class ArtifactPayloadService:
             except ValueError as exc:
                 raise ValueError("payload contains a non-canonical entry path") from exc
             if len(relative_parts) > MAX_PAYLOAD_TREE_DEPTH:
-                raise ValueError("payload exceeds maximum tree depth")
+                raise ArtifactPayloadBudgetExceeded("payload exceeds maximum tree depth")
             before = _stat_at(name, directory_fd)
             if stat.S_ISLNK(before.st_mode):
                 raise ValueError("payload must not contain a descendant symlink")
@@ -1049,14 +1101,14 @@ class ArtifactPayloadService:
             elif stat.S_ISREG(before.st_mode):
                 budget.files += 1
                 self._record_attempted(files=1)
-                if budget.files > MAX_PAYLOAD_ENTRIES:
-                    raise ValueError("payload exceeds maximum entries")
+                if budget.files > self._limits.max_files:
+                    raise ArtifactPayloadBudgetExceeded("payload exceeds maximum entries")
                 self._require_attempted_budget()
-                if before.st_size > MAX_PAYLOAD_ENTRY_BYTES:
-                    raise ValueError("payload file exceeds maximum entry bytes")
+                if before.st_size > self._limits.max_entry_bytes:
+                    raise ArtifactPayloadBudgetExceeded("payload file exceeds maximum entry bytes")
                 budget.total_bytes += before.st_size
-                if budget.total_bytes > MAX_PAYLOAD_TOTAL_BYTES:
-                    raise ValueError("payload exceeds maximum total bytes")
+                if budget.total_bytes > self._limits.max_total_bytes:
+                    raise ArtifactPayloadBudgetExceeded("payload exceeds maximum total bytes")
                 child_fd = self._open_child(directory_fd, name, before_identity, directory=False)
                 try:
                     record = self._scan_open_file(child_fd, relative_path, before_identity)
@@ -1096,7 +1148,7 @@ class ArtifactPayloadService:
             except ValueError as exc:
                 raise ValueError("payload inventory contains a non-canonical path") from exc
             if len(relative_parts) > MAX_PAYLOAD_TREE_DEPTH:
-                raise ValueError("payload inventory exceeds maximum tree depth")
+                raise ArtifactPayloadBudgetExceeded("payload inventory exceeds maximum tree depth")
 
             before = _stat_at(name, directory_fd)
             if stat.S_ISLNK(before.st_mode):
@@ -1221,8 +1273,8 @@ class ArtifactPayloadService:
         relative_path: str,
         initial_identity: _FileIdentity,
     ) -> _FileRecord:
-        if initial_identity.size > MAX_PAYLOAD_ENTRY_BYTES:
-            raise ValueError("payload file exceeds maximum entry bytes")
+        if initial_identity.size > self._limits.max_entry_bytes:
+            raise ArtifactPayloadBudgetExceeded("payload file exceeds maximum entry bytes")
         digest = hashlib.sha256()
         size = 0
         for chunk in _stream_fd_chunks(fd):
@@ -1231,8 +1283,8 @@ class ArtifactPayloadService:
             size += len(chunk)
             if size > initial_identity.size:
                 raise ValueError("payload file mutated during scan")
-            if size > MAX_PAYLOAD_ENTRY_BYTES:
-                raise ValueError("payload file exceeds maximum entry bytes")
+            if size > self._limits.max_entry_bytes:
+                raise ArtifactPayloadBudgetExceeded("payload file exceeds maximum entry bytes")
         after = _identity(os.fstat(fd))
         if after != initial_identity or size != initial_identity.size:
             raise ValueError("payload file mutated during scan")
@@ -1258,6 +1310,7 @@ class ArtifactPayloadService:
 
 __all__ = [
     "ArtifactPayloadBudgetExceeded",
+    "ArtifactPayloadLimits",
     "ArtifactPayloadService",
     "VerifiedFileCopyReceipt",
 ]

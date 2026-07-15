@@ -1073,9 +1073,7 @@ def test_version_pin_rejects_a_changed_release_identity() -> None:
     )
     client = CoreControlClientV1(
         _connection(),
-        transport=httpx.MockTransport(
-            lambda _request: httpx.Response(200, json=next(responses))
-        ),
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=next(responses))),
     )
     try:
         assert client.version().openapi_sha256 == CORE_OPENAPI_SHA256
@@ -1370,11 +1368,7 @@ def test_response_is_owned_when_deadline_expires_immediately_after_send(
     client = _client(
         lambda _request: httpx.Response(
             200,
-            headers={
-                "Content-Type": (
-                    "text/event-stream" if use_sse else "application/json"
-                )
-            },
+            headers={"Content-Type": ("text/event-stream" if use_sse else "application/json")},
             stream=TrackingBody(),
         )
     )
@@ -1389,9 +1383,7 @@ def test_response_is_owned_when_deadline_expires_immediately_after_send(
 
     def controlled_check(deadline: float) -> None:
         if expire_after_send.is_set():
-            core_client_module._raise_local(
-                CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503
-            )
+            core_client_module._raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
         original_check(deadline)
 
     monkeypatch.setattr(core_client_module, "_send_before_deadline", tracked_send)
@@ -1997,7 +1989,7 @@ def test_major_read_route_mapping_matches_final_core_app() -> None:
         ),
         (
             lambda: client.get_artifact("artifact/one", project_id=PROJECT_ID),
-            "/v1/artifacts/artifact%2Fone",
+            "/v1/projects/project%2Factive%3Fone/artifacts/artifact%2Fone",
         ),
         (lambda: client.list_services(), "/v1/services"),
         (lambda: client.get_service("service/one"), "/v1/services/service%2Fone"),
@@ -2033,11 +2025,11 @@ def test_artifact_diff_uses_final_document_changes_union() -> None:
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/artifacts/artifact-current":
+        if request.url.path == f"/v1/projects/{PROJECT_ID}/artifacts/artifact-current":
             return httpx.Response(
                 200, json=_artifact("artifact-current", digest="a" * 64).model_dump(mode="json")
             )
-        if request.url.path == "/v1/artifacts/artifact-previous":
+        if request.url.path == f"/v1/projects/{PROJECT_ID}/artifacts/artifact-previous":
             return httpx.Response(
                 200, json=_artifact("artifact-previous", digest="b" * 64).model_dump(mode="json")
             )
@@ -2415,10 +2407,10 @@ def test_nested_artifact_diff_cannot_hold_close_past_deadline(monkeypatch) -> No
     release_nested_request = threading.Event()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/artifacts/artifact-current":
+        if request.url.path == f"/v1/projects/{PROJECT_ID}/artifacts/artifact-current":
             artifact = _artifact("artifact-current", digest="a" * 64)
             return httpx.Response(200, json=artifact.model_dump(mode="json"))
-        if request.url.path == "/v1/artifacts/artifact-previous":
+        if request.url.path == f"/v1/projects/{PROJECT_ID}/artifacts/artifact-previous":
             nested_request_started.set()
             release_nested_request.wait(1)
             artifact = _artifact("artifact-previous", digest="b" * 64)
@@ -2942,6 +2934,7 @@ def test_sse_next_exit_rejects_frame_after_final_delivery_check(monkeypatch) -> 
 
     monkeypatch.setattr(client, "_linearize_generation_result", pause_after_final_check)
     with client.events() as stream:
+
         def read_frame() -> None:
             try:
                 frames.append(next(iter(stream)))
@@ -2999,6 +2992,7 @@ def test_close_seals_sse_in_post_lease_cache_transaction_window(monkeypatch) -> 
 
     monkeypatch.setattr(client, "_registration_batch", pause_before_outer_transaction_exit)
     with client.events() as stream:
+
         def read_frame() -> None:
             try:
                 frames.append(next(stream))
@@ -3783,9 +3777,7 @@ def test_close_rolls_back_persisted_workspace_abort_authority_before_delivery(
             "etag": '"' + ("8" * 64) + '"',
         }
     )
-    client = _client(
-        lambda _request: httpx.Response(200, json=aborted.model_dump(mode="json"))
-    )
+    client = _client(lambda _request: httpx.Response(200, json=aborted.model_dump(mode="json")))
     original_batch = client._registration_batch
     transaction_ready = threading.Event()
     release_transaction = threading.Event()
@@ -4226,8 +4218,8 @@ def test_run_child_and_artifact_content_bind_requested_parent_ids() -> None:
     responses: dict[str, object] = {
         "/v1/runs/run-1": run.model_dump(mode="json"),
         "/v1/runs/run-1/timeline": _page([wrong_timeline]),
-        "/v1/artifacts/artifact-1": artifact.model_dump(mode="json"),
-        "/v1/artifacts/artifact-1/content": {
+        f"/v1/projects/{PROJECT_ID}/artifacts/artifact-1": artifact.model_dump(mode="json"),
+        f"/v1/projects/{PROJECT_ID}/artifacts/artifact-1/content": {
             "schema_version": "1",
             "artifact_id": "artifact-other",
             "artifact_type": "skill_bundle",

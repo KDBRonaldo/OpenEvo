@@ -45,7 +45,7 @@ MAX_CORE_CLOSE_QUEUE_SIZE = 256
 CORE_CLOSE_WORKER_COUNT = 4
 CORE_BLOCKING_IO_WORKER_COUNT = 8
 MAX_CORE_REQUEST_DEADLINE_SECONDS = 300.0
-CORE_OPENAPI_SHA256 = "315dc90907f14347d07f7903d360009b271372302b38a1e4adca5bc14486497a"
+CORE_OPENAPI_SHA256 = "006fbe0ad33497329912280d9836bd1dce44f49f26fb018a9d9ba6bdf33b62ed"
 
 _BEARER = re.compile(r"[A-Za-z0-9._~+/\-]{43,510}={0,2}\Z", re.ASCII)
 _ETAG = re.compile(r'"[0-9a-f]{64}"\Z', re.ASCII)
@@ -204,9 +204,7 @@ class CoreBootstrapTunnelConnectionV1:
 
     def _temporary_binding(self) -> CoreTunnelConnectionV1:
         try:
-            seed = f"openevo-core-bootstrap-v1\0{self.endpoint}\0{self.session_id}".encode(
-                "utf-8"
-            )
+            seed = f"openevo-core-bootstrap-v1\0{self.endpoint}\0{self.session_id}".encode("utf-8")
         except UnicodeEncodeError:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 400)
         digest = hashlib.sha256(seed).hexdigest()
@@ -524,9 +522,7 @@ class CoreControlClientV1:
         self._generation_local = threading.local()
         self._close_tasks_pending = 0
         self._close_failed = False
-        self._retained_close_actions: list[
-            tuple[Callable[[], None], _CloseReservation]
-        ] = []
+        self._retained_close_actions: list[tuple[Callable[[], None], _CloseReservation]] = []
         self._leases = 0
         self._lease_owners: dict[int, int] = {}
         self._active_responses: dict[httpx.Response, _CloseReservation] = {}
@@ -610,9 +606,7 @@ class CoreControlClientV1:
                 close_actions = tuple(
                     (response.close, reservation)
                     for response, reservation in self._active_responses.items()
-                ) + (
-                    (self._http.close, self._transport_close_reservation),
-                )
+                ) + ((self._http.close, self._transport_close_reservation),)
                 self._active_responses.clear()
 
         for close_action, reservation in close_actions:
@@ -1399,7 +1393,11 @@ class CoreControlClientV1:
     @_generation_bound
     def get_artifact(self, artifact_id: str, *, project_id: str) -> v1.ArtifactSummaryV1:
         self._ensure_active_project(project_id)
-        result = self._json("GET", f"/v1/artifacts/{_segment(artifact_id)}", v1.ArtifactSummaryV1)
+        result = self._json(
+            "GET",
+            f"/v1/projects/{_segment(project_id)}/artifacts/{_segment(artifact_id)}",
+            v1.ArtifactSummaryV1,
+        )
         self._register_artifact(result, expected_id=artifact_id)
         return result
 
@@ -1409,7 +1407,7 @@ class CoreControlClientV1:
         self._require_member(v1.ResourceChangeType.ARTIFACT, artifact_id)
         result = self._json(
             "GET",
-            f"/v1/artifacts/{_segment(artifact_id)}/content",
+            f"/v1/projects/{_segment(project_id)}/artifacts/{_segment(artifact_id)}/content",
             v1.ArtifactContentV1,
             max_response_bytes=MAX_CORE_ARTIFACT_RESPONSE_BYTES,
         )
@@ -1437,7 +1435,7 @@ class CoreControlClientV1:
             params = {"previous_artifact_id": _opaque_request(previous_artifact_id)}
         result = self._json(
             "GET",
-            f"/v1/artifacts/{_segment(artifact_id)}/diff",
+            f"/v1/projects/{_segment(project_id)}/artifacts/{_segment(artifact_id)}/diff",
             v1.ArtifactDiffV1,
             params=params,
             max_response_bytes=MAX_CORE_ARTIFACT_RESPONSE_BYTES,
@@ -1701,9 +1699,7 @@ class CoreControlClientV1:
                         late_response.close, late_reservation
                     ),
                 )
-                self._register_response(
-                    response, session_generation, response_reservation
-                )
+                self._register_response(response, session_generation, response_reservation)
                 registered = True
                 _check_deadline(deadline)
                 self._ensure_session_generation(session_generation)
@@ -1749,9 +1745,7 @@ class CoreControlClientV1:
                     session_guard=lambda: self._linearize_generation_result(
                         session_generation, deadline
                     ),
-                    delivery_lease=lambda: self._sse_delivery_lease(
-                        session_generation, deadline
-                    ),
+                    delivery_lease=lambda: self._sse_delivery_lease(session_generation, deadline),
                     deadline=deadline,
                 )
             except CoreClientErrorV1:
@@ -1881,9 +1875,7 @@ class CoreControlClientV1:
                         late_response.close, late_reservation
                     ),
                 )
-                self._register_response(
-                    response, session_generation, response_reservation
-                )
+                self._register_response(response, session_generation, response_reservation)
                 registered = True
                 _check_deadline(deadline)
                 self._ensure_session_generation(session_generation)
@@ -2012,10 +2004,7 @@ class CoreControlClientV1:
         with self._state:
             if self._closing or self._closed or self._close_failed:
                 _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
-            if (
-                expected_generation is not None
-                and expected_generation != self._session_generation
-            ):
+            if expected_generation is not None and expected_generation != self._session_generation:
                 _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
             if self._close_tasks_pending + self._leases >= MAX_CORE_CLOSE_QUEUE_SIZE - 1:
                 _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
@@ -2039,10 +2028,7 @@ class CoreControlClientV1:
         with self._state:
             if self._closing or self._closed or self._close_failed:
                 _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
-            if (
-                expected_generation is not None
-                and expected_generation != self._session_generation
-            ):
+            if expected_generation is not None and expected_generation != self._session_generation:
                 _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
             if self._close_tasks_pending + self._leases >= MAX_CORE_CLOSE_QUEUE_SIZE - 1:
                 _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
@@ -2808,9 +2794,9 @@ class CoreProjectBootstrapClientV1:
         deadline = time.monotonic() + self._client._request_deadline_seconds
         _encode_request(request, v1.ProjectCreateV1, MAX_CORE_REQUEST_BYTES)
         # Validate the header even for a local exact-success replay or rejected retry.
-        normalized_key = self._client._mutation_headers(
-            idempotency_key=idempotency_key
-        )["Idempotency-Key"]
+        normalized_key = self._client._mutation_headers(idempotency_key=idempotency_key)[
+            "Idempotency-Key"
+        ]
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not self._create_lock.acquire(timeout=remaining):
             _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
@@ -3378,6 +3364,7 @@ def _call_before_deadline(
     except FutureTimeoutError:
         cancelled = future.cancel()
         if not cancelled and late_dispose is not None:
+
             def dispose_completed(completed: Future[ResponseT]) -> None:
                 try:
                     value = completed.result()
@@ -3410,6 +3397,7 @@ def _send_before_deadline(
         if future.cancel():
             reservation.release()
         else:
+
             def dispose_completed(completed: Future[ResponseT]) -> None:
                 try:
                     value = completed.result()

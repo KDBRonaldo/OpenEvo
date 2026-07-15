@@ -35,6 +35,7 @@ _RecoveryTableName = Literal[
     "projects",
     "project_revisions",
     "revision_activation_bindings",
+    "revision_artifact_authorities",
     "workspace_uploads",
     "workspace_publication_owners",
     "idempotency_records",
@@ -97,14 +98,37 @@ class _EvolutionRevisionActivationRequest(BaseModel):
             self.context_artifact_ids
         ):
             raise ValueError("evolution revision context is not canonical")
-        if (
-            not 1 <= len(self.run_id.encode("utf-8")) <= 128
-            or any(
-                ord(character) < 0x21 or ord(character) == 0x7F
-                for character in self.run_id
-            )
+        if not 1 <= len(self.run_id.encode("utf-8")) <= 128 or any(
+            ord(character) < 0x21 or ord(character) == 0x7F for character in self.run_id
         ):
             raise ValueError("evolution revision run identity is invalid")
+        return self
+
+
+class _RevisionArtifactAuthorityEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["1"] = "1"
+    revision: m.RevisionRefV1
+    producing_run_id: str | None = None
+    context_artifact_ids: dict[str, list[str]]
+
+    @model_validator(mode="after")
+    def _closed_authority(self) -> _RevisionArtifactAuthorityEnvelope:
+        if _normalized_evolution_context_ids(self.context_artifact_ids) != (
+            self.context_artifact_ids
+        ):
+            raise ValueError("revision artifact authority is not canonical")
+        if self.producing_run_id is not None and (
+            not 1 <= len(self.producing_run_id.encode("utf-8")) <= 128
+            or any(
+                ord(character) < 0x21 or ord(character) == 0x7F
+                for character in self.producing_run_id
+            )
+        ):
+            raise ValueError("revision artifact authority run identity is invalid")
+        if self.context_artifact_ids and self.producing_run_id is None:
+            raise ValueError("revision artifact authority has no producing run")
         return self
 
 
@@ -466,13 +490,25 @@ _REVISION_ACTIVATION_BINDINGS_SCHEMA = """
             ) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
     ) STRICT
 """
+_REVISION_ARTIFACT_AUTHORITIES_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS revision_artifact_authorities (
+        revision_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        authority_digest TEXT NOT NULL CHECK (length(authority_digest) = 64),
+        identity_hmac TEXT NOT NULL,
+        authority_json BLOB NOT NULL,
+        FOREIGN KEY (revision_id) REFERENCES project_revisions(revision_id)
+            ON DELETE CASCADE
+    ) STRICT
+"""
 _PREVIOUS_SCHEMA = (_STORE_IDENTITY_SCHEMA, *_LEGACY_SCHEMA)
 _REVISION_LEDGER_V1_SCHEMA = (*_PREVIOUS_SCHEMA, _PROJECT_REVISIONS_SCHEMA_V1)
-_SCHEMA = (
+_ARTIFACT_INSPECTION_V1_SCHEMA = (
     *_PREVIOUS_SCHEMA,
     _PROJECT_REVISIONS_SCHEMA,
     _REVISION_ACTIVATION_BINDINGS_SCHEMA,
 )
+_SCHEMA = (*_ARTIFACT_INSPECTION_V1_SCHEMA, _REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
 
 
 class CoreControlStoreV1:
@@ -643,9 +679,7 @@ class CoreControlStoreV1:
                     dir_fd=self._workspace_root_fd,
                 )
             except OSError as exc:
-                raise StoreCorruptionError(
-                    "workspace snapshot directory is unavailable"
-                ) from exc
+                raise StoreCorruptionError("workspace snapshot directory is unavailable") from exc
             try:
                 metadata = os.fstat(fd)
                 _require_private_directory_metadata(metadata)
@@ -785,95 +819,84 @@ class CoreControlStoreV1:
             self._verify_lifecycle_storage()
             return revision
 
-    def artifact_reachability(self, artifact_id: str) -> list[ArtifactReachability]:
-        """Return every signed revision activation that makes an artifact reachable."""
+    def artifact_reachability(
+        self,
+        project_id: str,
+        artifact_id: str,
+        *,
+        require_current: bool,
+    ) -> list[ArtifactReachability]:
+        """Return project-scoped producer authorities for a current or lineage artifact."""
 
+        if not _is_managed_resource_id(project_id, "project"):
+            raise ValueError("project ID is outside the Core Control identity policy")
         if (
             not isinstance(artifact_id, str)
             or not 1 <= len(artifact_id.encode("utf-8")) <= 128
             or any(ord(character) < 0x21 or ord(character) == 0x7F for character in artifact_id)
         ):
             raise ValueError("artifact ID is outside the Core Control identity policy")
-        operation_id = "activateCoreEvolutionRevisionInternalV1"
         needle = _canonical_bytes(artifact_id)
         with self._mutex:
             self._verify_lifecycle_storage()
             self._connection.execute("BEGIN")
             try:
-                cursor = self._connection.execute(
-                    "SELECT bindings.* FROM revision_activation_bindings AS bindings "
-                    "JOIN project_revisions AS revisions "
-                    "ON revisions.revision_id = bindings.revision_id "
-                    "JOIN idempotency_records AS records "
-                    "ON records.operation_id = bindings.operation_id "
-                    "AND records.resource_scope = bindings.resource_scope "
-                    "AND records.idempotency_key = bindings.idempotency_key "
-                    "WHERE bindings.operation_id = ? "
-                    "AND instr(CAST(records.request_json AS BLOB), ?) > 0 "
-                    "ORDER BY revisions.generation ASC, bindings.revision_id ASC LIMIT ?",
-                    (operation_id, needle, _MAX_ARTIFACT_REACHABILITY_ROWS + 1),
+                _project_row, project = self._project_row(project_id)
+                if project.status is not m.ProjectStatus.READY or project.active_revision is None:
+                    raise ResourceNotFoundError("project", project_id)
+                active_revision = self._revision_row(project.active_revision.id)
+                if active_revision.revision != project.active_revision:
+                    raise StoreCorruptionError("project revision head binding is invalid")
+                active_authority_row = self._connection.execute(
+                    "SELECT * FROM revision_artifact_authorities WHERE revision_id = ?",
+                    (active_revision.revision.id,),
+                ).fetchone()
+                if active_authority_row is None:
+                    raise StoreCorruptionError("active revision artifact authority is missing")
+                active_authority = self._validated_revision_artifact_authority_row(
+                    active_authority_row,
+                    revision=active_revision,
                 )
-                binding_rows = cursor.fetchmany(_MAX_ARTIFACT_REACHABILITY_ROWS + 1)
-                if cursor.fetchone() is not None or len(binding_rows) > _MAX_ARTIFACT_REACHABILITY_ROWS:
+                current_types = _artifact_authority_types(active_authority, artifact_id)
+                if require_current and not current_types:
+                    self._connection.execute("COMMIT")
+                    self._verify_database_transaction_boundary()
+                    return []
+                if len(current_types) > 1:
+                    raise StoreCorruptionError(
+                        "current artifact is reachable under more than one typed context"
+                    )
+
+                cursor = self._connection.execute(
+                    "SELECT authorities.*, revisions.generation "
+                    "FROM revision_artifact_authorities AS authorities "
+                    "JOIN project_revisions AS revisions "
+                    "ON revisions.revision_id = authorities.revision_id "
+                    "WHERE authorities.project_id = ? "
+                    "AND instr(CAST(authorities.authority_json AS BLOB), ?) > 0 "
+                    "ORDER BY revisions.generation ASC, authorities.revision_id ASC LIMIT ?",
+                    (project_id, needle, _MAX_ARTIFACT_REACHABILITY_ROWS + 1),
+                )
+                authority_rows = cursor.fetchmany(_MAX_ARTIFACT_REACHABILITY_ROWS + 1)
+                if cursor.fetchone() is not None or len(authority_rows) > (
+                    _MAX_ARTIFACT_REACHABILITY_ROWS
+                ):
                     raise StoreCorruptionError(
                         "artifact reachability exceeds its closed revision bound"
                     )
                 reachable: list[ArtifactReachability] = []
-                for binding_row in binding_rows:
-                    self._validate_revision_activation_binding_row(binding_row)
-                    revision_row = self._connection.execute(
-                        "SELECT * FROM project_revisions WHERE revision_id = ?",
-                        (binding_row["revision_id"],),
-                    ).fetchone()
-                    record_row = self._connection.execute(
-                        "SELECT * FROM idempotency_records WHERE operation_id = ? "
-                        "AND resource_scope = ? AND idempotency_key = ?",
-                        (
-                            binding_row["operation_id"],
-                            binding_row["resource_scope"],
-                            binding_row["idempotency_key"],
-                        ),
-                    ).fetchone()
-                    if revision_row is None or record_row is None:
-                        raise StoreCorruptionError(
-                            "artifact reachability authority is incomplete"
-                        )
-                    revision = self._validated_revision_row(revision_row)
-                    model = _validate_idempotency_row(
-                        record_row,
-                        signing_key=self._signing_key,
-                        publication_owner_lookup=self._publication_owner_for_snapshot,
+                for authority_row in authority_rows:
+                    revision = self._revision_row(authority_row["revision_id"])
+                    authority = self._validated_revision_artifact_authority_row(
+                        authority_row,
+                        revision=revision,
                     )
-                    request, _headers = _validate_idempotency_request_envelope(record_row)
-                    self._validate_idempotency_revision_request(record_row, model)
-                    if not isinstance(request, _EvolutionRevisionActivationRequest):
-                        raise StoreCorruptionError(
-                            "artifact reachability request has the wrong type"
-                        )
-                    if (
-                        not isinstance(model, m.ProjectV1)
-                        or model.active_revision != revision.revision
-                        or request.project_id != revision.revision.project_id
-                        or request.predecessor != revision.predecessor_revision
-                        or request.run_id != binding_row["idempotency_key"]
-                        or binding_row["project_id"] != request.project_id
-                        or binding_row["request_digest"] != record_row["request_digest"]
-                        or revision_row["activation_request_digest"]
-                        != record_row["request_digest"]
-                    ):
-                        raise StoreCorruptionError(
-                            "artifact reachability revision closure is invalid"
-                        )
-                    artifact_types = [
-                        artifact_type
-                        for artifact_type, artifact_ids in request.context_artifact_ids.items()
-                        if artifact_id in artifact_ids
-                    ]
+                    artifact_types = _artifact_authority_types(authority, artifact_id)
                     if not artifact_types:
                         continue
-                    if len(artifact_types) != 1:
+                    if len(artifact_types) != 1 or authority.producing_run_id is None:
                         raise StoreCorruptionError(
-                            "artifact is reachable under more than one typed context"
+                            "artifact is reachable under an invalid typed authority"
                         )
                     try:
                         artifact_type = m.ArtifactType(artifact_types[0])
@@ -881,12 +904,16 @@ class CoreControlStoreV1:
                         raise StoreCorruptionError(
                             "artifact reachability uses an unsupported type"
                         ) from exc
+                    if current_types and artifact_types != current_types:
+                        raise StoreCorruptionError(
+                            "artifact type changes across project revision authority"
+                        )
                     reachable.append(
                         ArtifactReachability(
                             artifact_id=artifact_id,
                             artifact_type=artifact_type,
-                            project_id=request.project_id,
-                            run_id=request.run_id,
+                            project_id=project_id,
+                            run_id=authority.producing_run_id,
                             revision=revision.revision,
                         )
                     )
@@ -963,9 +990,7 @@ class CoreControlStoreV1:
                     raise StoreCorruptionError("evolution revision replay has no revision")
                 revision = self._revision_row(active_revision.id)
                 if revision.predecessor_revision != predecessor:
-                    raise StoreCorruptionError(
-                        "evolution revision replay predecessor is invalid"
-                    )
+                    raise StoreCorruptionError("evolution revision replay predecessor is invalid")
                 return revision
 
             row, current = self._project_row(project_id)
@@ -1006,6 +1031,8 @@ class CoreControlStoreV1:
                 resource_scope=project_id,
                 idempotency_key=run_id,
                 activation_request_digest=envelope.digest,
+                producing_run_id=run_id,
+                context_artifact_ids=normalized_context,
             )
             self._append_project_event(updated, now=now)
             self._append_revision_activated_event(revision, now=now)
@@ -2267,6 +2294,8 @@ class CoreControlStoreV1:
         resource_scope: str,
         idempotency_key: str,
         activation_request_digest: str,
+        producing_run_id: str | None = None,
+        context_artifact_ids: Mapping[str, list[str]] | None = None,
     ) -> None:
         if not _is_sha256(activation_request_digest):
             raise StoreCorruptionError("revision activation request digest is invalid")
@@ -2314,6 +2343,28 @@ class CoreControlStoreV1:
                     idempotency_key,
                     activation_request_digest,
                     self._revision_activation_binding_hmac(binding_values),
+                ),
+            )
+            authority = _RevisionArtifactAuthorityEnvelope(
+                revision=revision.revision,
+                producing_run_id=producing_run_id,
+                context_artifact_ids=_normalized_evolution_context_ids(context_artifact_ids or {}),
+            )
+            authority_json = _model_bytes(authority)
+            authority_digest = hashlib.sha256(authority_json).hexdigest()
+            self._connection.execute(
+                "INSERT INTO revision_artifact_authorities(revision_id, project_id, "
+                "authority_digest, identity_hmac, authority_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    revision.revision.id,
+                    revision.revision.project_id,
+                    authority_digest,
+                    self._revision_artifact_authority_hmac(
+                        revision.revision.id,
+                        revision.revision.project_id,
+                        authority_digest,
+                    ),
+                    authority_json,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -2396,6 +2447,37 @@ class CoreControlStoreV1:
             predecessor=predecessor_revision,
         )
         return revision
+
+    def _validated_revision_artifact_authority_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        revision: m.RevisionV1,
+    ) -> _RevisionArtifactAuthorityEnvelope:
+        authority = _validate_bytes(
+            _RevisionArtifactAuthorityEnvelope,
+            row["authority_json"],
+        )
+        authority_json = _model_bytes(authority)
+        authority_digest = hashlib.sha256(authority_json).hexdigest()
+        if (
+            authority.revision != revision.revision
+            or bytes(row["authority_json"]) != authority_json
+            or row["revision_id"] != revision.revision.id
+            or row["project_id"] != revision.revision.project_id
+            or not _is_sha256(row["authority_digest"])
+            or not hmac.compare_digest(row["authority_digest"], authority_digest)
+            or not hmac.compare_digest(
+                row["identity_hmac"],
+                self._revision_artifact_authority_hmac(
+                    revision.revision.id,
+                    revision.revision.project_id,
+                    authority_digest,
+                ),
+            )
+        ):
+            raise StoreCorruptionError("revision artifact authority row is invalid")
+        return authority
 
     def _validate_finalize_preconditions(
         self,
@@ -2550,9 +2632,7 @@ class CoreControlStoreV1:
             activation_request_digest = request_digest
         if binding_row is None:
             if not legacy_activation_binding:
-                raise StoreCorruptionError(
-                    "idempotency revision request binding is missing"
-                )
+                raise StoreCorruptionError("idempotency revision request binding is missing")
             binding_values = {
                 "idempotency_key": row["idempotency_key"],
                 "operation_id": row["operation_id"],
@@ -2594,16 +2674,14 @@ class CoreControlStoreV1:
         project_id = row["project_id"]
         scope = row["resource_scope"]
         valid_scope = (
-            operation_id == "createCoreProjectV1" and scope == "projects"
-        ) or (
-            operation_id == "patchCoreProjectV1" and scope == project_id
-        ) or (
-            operation_id == "activateCoreEvolutionRevisionInternalV1"
-            and scope == project_id
-        ) or (
-            operation_id == "finalizeCoreWorkspaceUploadV1"
-            and isinstance(scope, str)
-            and scope.startswith(f"{project_id}:upload-")
+            (operation_id == "createCoreProjectV1" and scope == "projects")
+            or (operation_id == "patchCoreProjectV1" and scope == project_id)
+            or (operation_id == "activateCoreEvolutionRevisionInternalV1" and scope == project_id)
+            or (
+                operation_id == "finalizeCoreWorkspaceUploadV1"
+                and isinstance(scope, str)
+                and scope.startswith(f"{project_id}:upload-")
+            )
         )
         if (
             not _is_managed_resource_id(row["revision_id"], "revision")
@@ -3202,6 +3280,17 @@ class CoreControlStoreV1:
                 _MAX_REVISIONS,
             ),
             _RecoveryTableSpec(
+                "revision_artifact_authorities",
+                (
+                    "revision_id",
+                    "project_id",
+                    "authority_digest",
+                    "identity_hmac",
+                    "authority_json",
+                ),
+                _MAX_REVISIONS,
+            ),
+            _RecoveryTableSpec(
                 "workspace_uploads",
                 (
                     "upload_id",
@@ -3279,9 +3368,7 @@ class CoreControlStoreV1:
             row_count = int(aggregate[0])
             blob_bytes = sum(int(aggregate[index]) for index in range(1, len(aggregate)))
             if row_count > spec.max_rows or blob_bytes > _MAX_STARTUP_BLOB_BYTES:
-                raise StoreCorruptionError(
-                    f"Core Control {spec.table} recovery quota is exceeded"
-                )
+                raise StoreCorruptionError(f"Core Control {spec.table} recovery quota is exceeded")
             for column in spec.bounded_columns:
                 oversized = self._connection.execute(
                     f"SELECT 1 FROM {spec.table} WHERE {column} IS NOT NULL AND "
@@ -3294,13 +3381,8 @@ class CoreControlStoreV1:
                     )
             total_rows += row_count
             total_bytes += blob_bytes
-            if (
-                total_rows > _MAX_STARTUP_ROWS
-                or total_bytes > _MAX_STARTUP_BLOB_BYTES
-            ):
-                raise StoreCorruptionError(
-                    "Core Control aggregate startup quota is exceeded"
-                )
+            if total_rows > _MAX_STARTUP_ROWS or total_bytes > _MAX_STARTUP_BLOB_BYTES:
+                raise StoreCorruptionError("Core Control aggregate startup quota is exceeded")
             tables[spec.table] = _RecoveryTableUsage(row_count, blob_bytes)
         return _RecoveryBudgetSnapshot(total_rows, total_bytes, tables)
 
@@ -3557,12 +3639,34 @@ class CoreControlStoreV1:
                 revision = revisions_by_id.get(row["revision_id"])
                 if revision is not None and (
                     revision.revision.project_id != row["project_id"]
-                    or row["request_digest"]
-                    != revision_request_digests[revision.revision.id]
+                    or row["request_digest"] != revision_request_digests[revision.revision.id]
                 ):
                     raise StoreCorruptionError(
                         "revision activation binding does not match the ledger"
                     )
+            authority_revision_ids: set[str] = set()
+            for row in self._recovery_rows(
+                "revision_artifact_authorities",
+                columns=(
+                    "revision_id",
+                    "project_id",
+                    "authority_digest",
+                    "identity_hmac",
+                    "authority_json",
+                ),
+            ):
+                revision = revisions_by_id.get(row["revision_id"])
+                if revision is None:
+                    raise StoreCorruptionError("revision artifact authority owner is missing")
+                self._validated_revision_artifact_authority_row(
+                    row,
+                    revision=revision,
+                )
+                if row["revision_id"] in authority_revision_ids:
+                    raise StoreCorruptionError("revision artifact authority is ambiguous")
+                authority_revision_ids.add(row["revision_id"])
+            if authority_revision_ids != set(revisions_by_id):
+                raise StoreCorruptionError("revision artifact authority ledger is incomplete")
             referenced_files: set[str] = set()
             snapshot_sources: dict[str, tuple[m.WorkspacePublicationV1, str, str]] = {}
             for row in self._recovery_rows(
@@ -4150,9 +4254,7 @@ class CoreControlStoreV1:
                 workspace_identity = os.fstat(self._workspace_root_fd)
                 _require_private_directory_metadata(upload_identity)
                 _require_private_directory_metadata(workspace_identity)
-                _require_same_identity(
-                    upload_identity, self._upload_root_identity, "upload root"
-                )
+                _require_same_identity(upload_identity, self._upload_root_identity, "upload root")
                 _require_same_identity(
                     workspace_identity, self._workspace_root_identity, "workspace root"
                 )
@@ -4283,9 +4385,7 @@ class CoreControlStoreV1:
             )
             self._upload_root_identity = os.fstat(self._upload_root_fd)
             _require_private_directory_metadata(self._upload_root_identity)
-            _require_entry_binding(
-                self._root_fd, "workspace-uploads", self._upload_root_identity
-            )
+            _require_entry_binding(self._root_fd, "workspace-uploads", self._upload_root_identity)
             self._workspace_root_fd = os.open(
                 "workspace-snapshots", directory_flags, dir_fd=self._root_fd
             )
@@ -4309,6 +4409,9 @@ class CoreControlStoreV1:
         legacy_fingerprint = _expected_schema_fingerprint(_LEGACY_SCHEMA)
         previous_fingerprint = _expected_schema_fingerprint(_PREVIOUS_SCHEMA)
         revision_ledger_v1_fingerprint = _expected_schema_fingerprint(_REVISION_LEDGER_V1_SCHEMA)
+        artifact_inspection_v1_fingerprint = _expected_schema_fingerprint(
+            _ARTIFACT_INSPECTION_V1_SCHEMA
+        )
         current_fingerprint = _expected_schema_fingerprint(_SCHEMA)
         if fingerprint == empty_fingerprint:
             if hasattr(self, "_marker_fd"):
@@ -4339,13 +4442,23 @@ class CoreControlStoreV1:
             with self._transaction():
                 self._connection.execute(_PROJECT_REVISIONS_SCHEMA)
                 self._connection.execute(_REVISION_ACTIVATION_BINDINGS_SCHEMA)
+                self._connection.execute(_REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
         elif fingerprint == revision_ledger_v1_fingerprint:
             row = self._read_store_identity_row()
             self._require_store_identity_root(row)
             self._store_id = row["store_id"]
             if row["binding_state"] == "bound":
                 self._verify_bound_store_identity(row)
+            self._signing_key = self._load_or_create_signing_key()
             self._migrate_revision_ledger_v1_schema()
+        elif fingerprint == artifact_inspection_v1_fingerprint:
+            row = self._read_store_identity_row()
+            self._require_store_identity_root(row)
+            self._store_id = row["store_id"]
+            if row["binding_state"] == "bound":
+                self._verify_bound_store_identity(row)
+            self._signing_key = self._load_or_create_signing_key()
+            self._migrate_revision_artifact_authority_schema()
         elif fingerprint != current_fingerprint:
             raise StoreCorruptionError(
                 "Core Control schema fingerprint is incompatible with an allowed migration"
@@ -4397,7 +4510,85 @@ class CoreControlStoreV1:
             )
             self._connection.execute("DROP TABLE project_revisions_v1")
             self._connection.execute(_REVISION_ACTIVATION_BINDINGS_SCHEMA)
+            self._connection.execute(_REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
+            self._backfill_revision_artifact_authorities()
             self._verify_schema_fingerprint()
+
+    def _migrate_revision_artifact_authority_schema(self) -> None:
+        with self._transaction():
+            self._connection.execute(_REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
+            self._backfill_revision_artifact_authorities()
+            self._verify_schema_fingerprint()
+
+    def _backfill_revision_artifact_authorities(self) -> None:
+        revision_rows = self._connection.execute(
+            "SELECT * FROM project_revisions ORDER BY project_id, generation"
+        ).fetchall()
+        if len(revision_rows) > _MAX_REVISIONS:
+            raise StoreCorruptionError("project revision recovery quota is exceeded")
+        for revision_row in revision_rows:
+            revision = self._validated_revision_row(revision_row)
+            producing_run_id: str | None = None
+            context_artifact_ids: dict[str, list[str]] = {}
+            binding_row = self._connection.execute(
+                "SELECT * FROM revision_activation_bindings WHERE revision_id = ?",
+                (revision.revision.id,),
+            ).fetchone()
+            if (
+                binding_row is not None
+                and binding_row["operation_id"] == "activateCoreEvolutionRevisionInternalV1"
+            ):
+                self._validate_revision_activation_binding_row(binding_row)
+                record_row = self._connection.execute(
+                    "SELECT * FROM idempotency_records WHERE operation_id = ? "
+                    "AND resource_scope = ? AND idempotency_key = ?",
+                    (
+                        binding_row["operation_id"],
+                        binding_row["resource_scope"],
+                        binding_row["idempotency_key"],
+                    ),
+                ).fetchone()
+                if record_row is not None:
+                    request, _headers = _validate_idempotency_request_envelope(record_row)
+                    if not isinstance(request, _EvolutionRevisionActivationRequest):
+                        raise StoreCorruptionError(
+                            "revision artifact authority migration request is invalid"
+                        )
+                    if (
+                        request.project_id != revision.revision.project_id
+                        or request.predecessor != revision.predecessor_revision
+                        or request.run_id != binding_row["idempotency_key"]
+                        or binding_row["request_digest"] != record_row["request_digest"]
+                        or revision_row["activation_request_digest"]
+                        != record_row["request_digest"]
+                    ):
+                        raise StoreCorruptionError(
+                            "revision artifact authority migration closure is invalid"
+                        )
+                    producing_run_id = request.run_id
+                    context_artifact_ids = request.context_artifact_ids
+            authority = _RevisionArtifactAuthorityEnvelope(
+                revision=revision.revision,
+                producing_run_id=producing_run_id,
+                context_artifact_ids=context_artifact_ids,
+            )
+            authority_json = _model_bytes(authority)
+            authority_digest = hashlib.sha256(authority_json).hexdigest()
+            self._connection.execute(
+                "INSERT INTO revision_artifact_authorities(revision_id, project_id, "
+                "authority_digest, identity_hmac, authority_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    revision.revision.id,
+                    revision.revision.project_id,
+                    authority_digest,
+                    self._revision_artifact_authority_hmac(
+                        revision.revision.id,
+                        revision.revision.project_id,
+                        authority_digest,
+                    ),
+                    authority_json,
+                ),
+            )
 
     def _create_pending_store_identity(self, *, include_base_schema: bool) -> None:
         store_id = secrets.token_hex(_STORE_ID_BYTES)
@@ -4409,6 +4600,7 @@ class CoreControlStoreV1:
                     _STORE_IDENTITY_SCHEMA,
                     _PROJECT_REVISIONS_SCHEMA,
                     _REVISION_ACTIVATION_BINDINGS_SCHEMA,
+                    _REVISION_ARTIFACT_AUTHORITIES_SCHEMA,
                 )
             )
             for statement in statements:
@@ -4486,10 +4678,7 @@ class CoreControlStoreV1:
             temporary_name = f".{_STORE_IDENTITY_MARKER}.{secrets.token_hex(16)}.tmp"
             marker_fd = os.open(
                 temporary_name,
-                os.O_RDWR
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
                 dir_fd=self._root_fd,
             )
@@ -4499,18 +4688,14 @@ class CoreControlStoreV1:
                 os.fsync(marker_fd)
                 marker_identity = os.fstat(marker_fd)
                 _require_private_regular_metadata(marker_identity)
-                _require_entry_binding(
-                    self._root_fd, temporary_name, marker_identity
-                )
+                _require_entry_binding(self._root_fd, temporary_name, marker_identity)
                 _rename_noreplace(
                     temporary_name,
                     _STORE_IDENTITY_MARKER,
                     directory_fd=self._root_fd,
                 )
                 os.fsync(self._root_fd)
-                _require_entry_binding(
-                    self._root_fd, _STORE_IDENTITY_MARKER, marker_identity
-                )
+                _require_entry_binding(self._root_fd, _STORE_IDENTITY_MARKER, marker_identity)
             except Exception:
                 os.close(marker_fd)
                 raise
@@ -4521,9 +4706,7 @@ class CoreControlStoreV1:
 
     def _verify_bound_store_identity(self, row: sqlite3.Row) -> None:
         if row["binding_state"] != "bound" or not hasattr(self, "_marker_fd"):
-            raise StoreCorruptionError(
-                "Core Control bound store identity marker is missing"
-            )
+            raise StoreCorruptionError("Core Control bound store identity marker is missing")
         if (row["marker_dev"], row["marker_ino"]) != (
             self._marker_identity.st_dev,
             self._marker_identity.st_ino,
@@ -4541,7 +4724,10 @@ class CoreControlStoreV1:
         _require_private_regular_metadata(before)
         _require_same_identity(before, self._marker_identity, "store identity marker")
         _require_entry_binding(self._root_fd, _STORE_IDENTITY_MARKER, self._marker_identity)
-        if before.st_size != len(expected) or os.pread(marker_fd, len(expected) + 1, 0) != expected:
+        if (
+            before.st_size != len(expected)
+            or os.pread(marker_fd, len(expected) + 1, 0) != expected
+        ):
             raise StoreCorruptionError("Core Control store identity marker content is invalid")
         after = os.fstat(marker_fd)
         _require_same_file_state(after, before, "store identity marker")
@@ -4585,11 +4771,15 @@ class CoreControlStoreV1:
         for optional_table in (
             "project_revisions",
             "revision_activation_bindings",
+            "revision_artifact_authorities",
         ):
-            if self._connection.execute(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
-                (optional_table,),
-            ).fetchone() is not None:
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+                    (optional_table,),
+                ).fetchone()
+                is not None
+            ):
                 tables.append(optional_table)
         for table in tables:
             row = self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
@@ -4731,9 +4921,7 @@ class CoreControlStoreV1:
                 or stat.S_IMODE(current.st_mode) != 0o600
                 or current.st_nlink != 0
             ):
-                raise StoreCorruptionError(
-                    "Core Control rollback journal consumption is invalid"
-                )
+                raise StoreCorruptionError("Core Control rollback journal consumption is invalid")
             self._consumed_database_sidecars.add(name)
             return
         if not _same_identity(path_identity, expected):
@@ -4743,9 +4931,7 @@ class CoreControlStoreV1:
         _require_private_regular_metadata(current)
         _require_entry_binding(self._root_fd, name, expected)
 
-    def _verify_consumed_database_sidecar(
-        self, name: str, current: os.stat_result
-    ) -> None:
+    def _verify_consumed_database_sidecar(self, name: str, current: os.stat_result) -> None:
         expected = self._database_identities[name]
         _require_same_identity(current, expected, f"consumed database {name}")
         if (
@@ -4754,9 +4940,7 @@ class CoreControlStoreV1:
             or stat.S_IMODE(current.st_mode) != 0o600
             or current.st_nlink != 0
         ):
-            raise StoreCorruptionError(
-                "Core Control consumed rollback journal inode is unsafe"
-            )
+            raise StoreCorruptionError("Core Control consumed rollback journal inode is unsafe")
         try:
             os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -4822,6 +5006,25 @@ class CoreControlStoreV1:
             hashlib.sha256,
         ).hexdigest()
 
+    def _revision_artifact_authority_hmac(
+        self,
+        revision_id: str,
+        project_id: str,
+        authority_digest: str,
+    ) -> str:
+        return hmac.new(
+            self._signing_key,
+            _canonical_bytes(
+                {
+                    "authority_digest": authority_digest,
+                    "domain": "revision-artifact-authority.v1",
+                    "project_id": project_id,
+                    "revision_id": revision_id,
+                }
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+
     def _open_database_connection(self) -> sqlite3.Connection:
         authority_fd = self._database_fds.get("provider.sqlite3")
         if authority_fd is None:
@@ -4866,16 +5069,13 @@ class CoreControlStoreV1:
                 schema_row = connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
                 _after_sqlite_recovery()
                 self._reconcile_rollback_journal_authority()
-                if (
-                    schema_row is not None
-                    and _schema_fingerprint(connection)
-                    not in {
-                        _expected_schema_fingerprint(_LEGACY_SCHEMA),
-                        _expected_schema_fingerprint(_PREVIOUS_SCHEMA),
-                        _expected_schema_fingerprint(_REVISION_LEDGER_V1_SCHEMA),
-                        _expected_schema_fingerprint(_SCHEMA),
-                    }
-                ):
+                if schema_row is not None and _schema_fingerprint(connection) not in {
+                    _expected_schema_fingerprint(_LEGACY_SCHEMA),
+                    _expected_schema_fingerprint(_PREVIOUS_SCHEMA),
+                    _expected_schema_fingerprint(_REVISION_LEDGER_V1_SCHEMA),
+                    _expected_schema_fingerprint(_ARTIFACT_INSPECTION_V1_SCHEMA),
+                    _expected_schema_fingerprint(_SCHEMA),
+                }:
                     raise StoreCorruptionError(
                         "Core Control schema fingerprint is incompatible; "
                         "no allowed migration matches"
@@ -5508,6 +5708,17 @@ def _normalized_evolution_context_ids(
     return normalized
 
 
+def _artifact_authority_types(
+    authority: _RevisionArtifactAuthorityEnvelope,
+    artifact_id: str,
+) -> list[str]:
+    return [
+        artifact_type
+        for artifact_type, artifact_ids in authority.context_artifact_ids.items()
+        if artifact_id in artifact_ids
+    ]
+
+
 def _canonical_bytes(value: object) -> bytes:
     return json.dumps(
         _json_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -5630,7 +5841,8 @@ def _validate_response_core_owned_ids(
             if (
                 model.status is m.ProjectStatus.READY
                 and active.generation == 0
-                and active != _revision_ref(
+                and active
+                != _revision_ref(
                     signing_key,
                     model,
                     generation=0,
@@ -5974,13 +6186,8 @@ def _validate_idempotency_response_semantics(
 def _project_response_has_core_identity(project: m.ProjectV1) -> bool:
     ready = _project_revision_ready(project)
     active = project.active_revision
-    valid_state = (
-        project.status is m.ProjectStatus.READY
-        and ready
-        and active is not None
-    ) or (
-        project.status is m.ProjectStatus.DRAFT
-        and (active is None or not ready)
+    valid_state = (project.status is m.ProjectStatus.READY and ready and active is not None) or (
+        project.status is m.ProjectStatus.DRAFT and (active is None or not ready)
     )
     return (
         _is_managed_resource_id(project.id, "project")

@@ -27,6 +27,7 @@ from openevo.backend.run_control import (
 )
 from openevo.evolution.artifact_payloads import (
     ArtifactPayloadBudgetExceeded,
+    ArtifactPayloadLimits,
     ArtifactPayloadService,
 )
 from openevo.evolution.framework.contracts import MAX_CONTRIBUTION_TEXT
@@ -93,7 +94,20 @@ _RUN_MUTATION_OPERATION_IDS = frozenset(
 _RUN_MUTATION_SINGLEFLIGHT_CAPACITY = 256
 _RUN_MUTATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 30.0
 _ARTIFACT_PAGE_LIMIT = 100
+_MAX_ARTIFACT_PAGES_PER_RUN = 11
 _MAX_ARTIFACT_SOURCE_REVISIONS = 128
+_MAX_ARTIFACT_DIFF_INPUT_LINES = 8_192
+_MAX_ARTIFACT_DIFF_SEQUENCE_LINES = 2_048
+_MAX_ARTIFACT_DIFF_COMPARISONS = 1_000_000
+_ARTIFACT_INSPECTION_LIMITS = ArtifactPayloadLimits(
+    max_nodes=1_024,
+    max_files=m.MAX_ARTIFACT_PREVIEW_DOCUMENTS,
+    max_entry_bytes=MAX_CONTRIBUTION_TEXT,
+    max_total_bytes=m.MAX_ARTIFACT_PREVIEW_UTF8_BYTES,
+    max_attempted_nodes=20_000,
+    max_attempted_files=3 * m.MAX_ARTIFACT_PREVIEW_DOCUMENTS,
+    max_attempted_bytes=2 * m.MAX_ARTIFACT_PREVIEW_UTF8_BYTES,
+)
 _TEXT_ARTIFACT_TYPES = frozenset(
     {
         m.ArtifactType.TEXT_MEMORY,
@@ -210,9 +224,7 @@ class _RunMutationSingleFlight:
             raise ValueError("run mutation single-flight capacity must be positive")
         self._capacity = capacity
         self._lock = threading.Lock()
-        self._entries: OrderedDict[tuple[str, str, str], _RunMutationFlight] = (
-            OrderedDict()
-        )
+        self._entries: OrderedDict[tuple[str, str, str], _RunMutationFlight] = OrderedDict()
         self._retired: set[_RunMutationFlight] = set()
         self._closing = False
 
@@ -315,9 +327,7 @@ class _RunMutationSingleFlight:
                 (
                     identity
                     for identity, entry in self._entries.items()
-                    if not entry.owner_active
-                    and entry.waiters == 0
-                    and entry.future.done()
+                    if not entry.owner_active and entry.waiters == 0 and entry.future.done()
                 ),
                 None,
             )
@@ -362,9 +372,7 @@ class CoreControlProviderV1:
         )
         self._close_lock = threading.Lock()
         self._closed = False
-        self._run_mutations = _RunMutationSingleFlight(
-            _RUN_MUTATION_SINGLEFLIGHT_CAPACITY
-        )
+        self._run_mutations = _RunMutationSingleFlight(_RUN_MUTATION_SINGLEFLIGHT_CAPACITY)
         self._run_mutation_drain: tuple[Future[None], ...] | None = None
         self._authorization = b"Bearer " + token_bytes
         self._registry = evolution_registry
@@ -428,9 +436,7 @@ class CoreControlProviderV1:
                 timeout=_RUN_MUTATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
             )
             if pending_run_mutations:
-                raise RuntimeError(
-                    "admitted run mutations did not drain before shutdown timeout"
-                )
+                raise RuntimeError("admitted run mutations did not drain before shutdown timeout")
             if self._run_control is not None:
                 self._run_control.close()
                 self._run_control = None
@@ -726,11 +732,19 @@ class CoreControlProviderV1:
         return _model_response(revision, etag=revision.etag)
 
     def _get_artifact(self, arguments: Mapping[str, object]) -> m.ArtifactSummaryV1:
-        return self._artifact_summary(cast(str, arguments["artifact_id"]))
+        return self._artifact_summary(
+            cast(str, arguments["project_id"]),
+            cast(str, arguments["artifact_id"]),
+            require_current=True,
+        )
 
     def _get_artifact_content(self, arguments: Mapping[str, object]) -> m.ArtifactContentV1:
         verified = self._verified_artifact_content(
-            self._artifact_summary(cast(str, arguments["artifact_id"]))
+            self._artifact_summary(
+                cast(str, arguments["project_id"]),
+                cast(str, arguments["artifact_id"]),
+                require_current=True,
+            )
         )
         documents = [
             m.ArtifactDocumentPreviewV1(
@@ -757,7 +771,12 @@ class CoreControlProviderV1:
         )
 
     def _get_artifact_diff(self, arguments: Mapping[str, object]) -> m.ArtifactDiffV1:
-        current = self._artifact_summary(cast(str, arguments["artifact_id"]))
+        project_id = cast(str, arguments["project_id"])
+        current = self._artifact_summary(
+            project_id,
+            cast(str, arguments["artifact_id"]),
+            require_current=True,
+        )
         previous = self._previous_artifact_summary(
             current,
             cast(str | None, arguments["previous_artifact_id"]),
@@ -766,8 +785,18 @@ class CoreControlProviderV1:
         previous_content = self._verified_artifact_content(previous)
         return _artifact_diff(previous_content, current_content)
 
-    def _artifact_summary(self, artifact_id: str) -> m.ArtifactSummaryV1:
-        reachability = self.store.artifact_reachability(artifact_id)
+    def _artifact_summary(
+        self,
+        project_id: str,
+        artifact_id: str,
+        *,
+        require_current: bool,
+    ) -> m.ArtifactSummaryV1:
+        reachability = self.store.artifact_reachability(
+            project_id,
+            artifact_id,
+            require_current=require_current,
+        )
         if not reachability:
             raise ResourceNotFoundError("artifact", artifact_id)
         if self._run_control is None:
@@ -776,7 +805,8 @@ class CoreControlProviderV1:
         matches: list[m.ArtifactSummaryBaseV1] = []
         for reachable in reachability:
             after: str | None = None
-            while True:
+            seen_cursors: set[str] = set()
+            for _page_number in range(_MAX_ARTIFACT_PAGES_PER_RUN):
                 page = self._run_control.invoke(
                     "listCoreRunArtifactsV1",
                     {
@@ -800,9 +830,12 @@ class CoreControlProviderV1:
                     matches.append(item)
                 if not page.has_more:
                     break
-                if page.next_cursor is None or page.next_cursor == after:
+                if page.next_cursor is None or page.next_cursor in seen_cursors:
                     raise StoreCorruptionError("run artifact pagination did not advance")
+                seen_cursors.add(page.next_cursor)
                 after = page.next_cursor
+            else:
+                raise StoreCorruptionError("run artifact pagination exceeded its closed bound")
         unique = {item.model_dump_json(): item for item in matches}
         if len(unique) != 1:
             raise StoreCorruptionError(
@@ -825,7 +858,11 @@ class CoreControlProviderV1:
         for candidate_id in candidate_ids:
             assert candidate_id is not None
             try:
-                candidate = self._artifact_summary(candidate_id)
+                candidate = self._artifact_summary(
+                    current.project_id,
+                    candidate_id,
+                    require_current=False,
+                )
             except ResourceNotFoundError:
                 if requested_id is not None:
                     raise
@@ -849,9 +886,7 @@ class CoreControlProviderV1:
         )
         return cast(m.ArtifactSummaryV1, candidates[-1])
 
-    def _verified_artifact_content(
-        self, summary: m.ArtifactSummaryV1
-    ) -> _VerifiedArtifactContent:
+    def _verified_artifact_content(self, summary: m.ArtifactSummaryV1) -> _VerifiedArtifactContent:
         if summary.artifact_type not in _TEXT_ARTIFACT_TYPES:
             raise _artifact_content_error(
                 "artifact_content_type_unsupported",
@@ -873,7 +908,10 @@ class CoreControlProviderV1:
                 or record.state is not EvolutionArtifactState.ACTIVE
             ):
                 raise ValueError("artifact metadata identity does not match its summary")
-            with ArtifactPayloadService(self._evolution_artifact_root) as payloads:
+            with ArtifactPayloadService(
+                self._evolution_artifact_root,
+                limits=_ARTIFACT_INSPECTION_LIMITS,
+            ) as payloads:
                 snapshot = payloads.issue_snapshot(
                     artifact_id=record.artifact_id,
                     artifact_type=str(record.type),
@@ -906,9 +944,11 @@ class CoreControlProviderV1:
                 ):
                     raise ValueError("artifact payload contains a non-text document")
                 selected_paths = _selected_artifact_paths(summary, record, snapshot)
-                entries = {
-                    entry.relative_path: entry for entry in snapshot.payload_entries
-                }
+                entries = {entry.relative_path: entry for entry in snapshot.payload_entries}
+                if set(selected_paths) != set(entries):
+                    raise ValueError(
+                        "artifact text inventory contains documents outside its typed projection"
+                    )
                 documents: list[_VerifiedArtifactDocument] = []
                 for relative_path in selected_paths:
                     entry = entries[relative_path]
@@ -1163,9 +1203,7 @@ class CoreControlProviderV1:
             )
         ]
         if self._service_supervisor is not None:
-            services.extend(
-                service.to_contract() for service in self._service_supervisor.list()
-            )
+            services.extend(service.to_contract() for service in self._service_supervisor.list())
         return services
 
     def _require_registry(self, purpose: str) -> VerifiedExecutableRegistry:
@@ -1285,7 +1323,7 @@ def _artifact_content_error(code: str, message: str) -> CoreControlHTTPError:
 
 def _artifact_authority_error() -> CoreControlHTTPError:
     return _error(
-        502,
+        503,
         code="artifact_authority_invalid",
         message="Core could not verify the authoritative evolution artifact record.",
         category=m.ErrorCategory.ARTIFACT,
@@ -1318,6 +1356,30 @@ def _artifact_diff(
         len(line) > 16_384
         for document in (*previous.documents, *current.documents)
         for line in document.content.splitlines()
+    ):
+        raise _artifact_content_error(
+            "artifact_diff_oversize",
+            "The artifact diff exceeds the bounded structured diff budget.",
+        )
+    total_input_lines = 0
+    total_comparisons = 0
+    for path in old_by_path.keys() | new_by_path.keys():
+        old_lines = old_by_path[path].content.splitlines() if path in old_by_path else []
+        new_lines = new_by_path[path].content.splitlines() if path in new_by_path else []
+        total_input_lines += len(old_lines) + len(new_lines)
+        if path in old_by_path and path in new_by_path:
+            if (
+                len(old_lines) > _MAX_ARTIFACT_DIFF_SEQUENCE_LINES
+                or len(new_lines) > _MAX_ARTIFACT_DIFF_SEQUENCE_LINES
+            ):
+                raise _artifact_content_error(
+                    "artifact_diff_oversize",
+                    "The artifact diff exceeds the bounded structured diff budget.",
+                )
+            total_comparisons += len(old_lines) * len(new_lines)
+    if (
+        total_input_lines > _MAX_ARTIFACT_DIFF_INPUT_LINES
+        or total_comparisons > _MAX_ARTIFACT_DIFF_COMPARISONS
     ):
         raise _artifact_content_error(
             "artifact_diff_oversize",
