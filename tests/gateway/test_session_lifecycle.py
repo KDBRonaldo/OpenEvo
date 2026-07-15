@@ -16,7 +16,7 @@ from openevo.gateway.storage import SessionStore
 from openevo.harness.models import AgentSpec
 from openevo.rollout.models import SessionDispatchRequest, SessionStatus
 from openevo.rollout.timer import StageTimer
-from openevo.runtime.base import BaseRuntime
+from openevo.runtime.base import BaseRuntime, RuntimeReadback, RuntimeReadbackBudget
 from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.models import ExecInput, ExecResult, PrepareAction, RuntimeSpec
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
@@ -76,10 +76,24 @@ class RecordingRuntime(BaseRuntime):
     async def upload_dir(self, local_path: str, remote_path: str) -> None:
         raise AssertionError("upload_dir was not requested")
 
-    async def download_file(self, remote_path: str, local_path: str) -> None:
+    async def download_file(
+        self,
+        remote_path: str,
+        local_path: str,
+        *,
+        budget: RuntimeReadbackBudget,
+    ) -> RuntimeReadback:
+        del remote_path, local_path, budget
         raise AssertionError("download_file was not requested")
 
-    async def download_dir(self, remote_path: str, local_path: str) -> None:
+    async def download_dir(
+        self,
+        remote_path: str,
+        local_path: str,
+        *,
+        budget: RuntimeReadbackBudget,
+    ) -> RuntimeReadback:
+        del remote_path, local_path, budget
         raise AssertionError("download_dir was not requested")
 
 

@@ -61,6 +61,13 @@ def _import_runtime_class(import_path: str) -> type[BaseRuntime]:
 
 
 def _validate_runtime_capabilities(runtime: BaseRuntime) -> None:
+    if (
+        type(runtime).download_file is not BaseRuntime.download_file
+        or type(runtime).download_dir is not BaseRuntime.download_dir
+    ):
+        raise ValueError(
+            "runtime backends cannot override the Core-owned trusted readback contract"
+        )
     spec = runtime.spec
     backend = spec.backend
     if spec.gpus > 0 and not runtime.supports_gpus:

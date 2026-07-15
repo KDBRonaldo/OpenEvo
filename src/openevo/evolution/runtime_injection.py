@@ -10,6 +10,10 @@ from typing import Any, Mapping, Sequence
 
 from openevo.evolution.agent_system import normalize_agent_system_target_path
 from openevo.evolution.framework.handlers import PayloadManifestEntry, payload_tree_digest
+from openevo.runtime.base import (
+    RUNTIME_READBACK_MAX_BYTES,
+    RUNTIME_READBACK_MAX_FILES,
+)
 
 
 _ARTIFACT_TYPES = {
@@ -21,8 +25,8 @@ _ARTIFACT_TYPES = {
 _SAFE_SKILL_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _MAX_ARTIFACTS = 256
-_MAX_RUNTIME_FILES = 4096
-_MAX_RUNTIME_BYTES = 64 * 1024 * 1024
+_MAX_RUNTIME_FILES = RUNTIME_READBACK_MAX_FILES
+_MAX_RUNTIME_BYTES = RUNTIME_READBACK_MAX_BYTES
 
 
 @dataclass(frozen=True, slots=True)

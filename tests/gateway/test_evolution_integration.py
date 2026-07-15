@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import subprocess
+from tempfile import TemporaryDirectory
 import threading
 import time
 from pathlib import Path
@@ -46,7 +47,10 @@ from openevo.rollout.models import (
     SessionTiming,
 )
 from openevo.rollout.timer import StageTimer
-from openevo.runtime.base import BaseRuntime
+from openevo.runtime.base import (
+    BaseRuntime,
+    RuntimeReadbackBudget,
+)
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     MANAGED_RUNTIME_IMAGES,
@@ -3982,10 +3986,14 @@ async def test_callback_retries_use_stable_result_idempotency_proof() -> None:
         }
 
 
-class FakeRuntime:
+class FakeRuntime(BaseRuntime):
     def __init__(self, *, workdir: str | None = None) -> None:
-        self.spec = RuntimeSpec(image="runtime:latest", workdir=workdir)
-        self.runtime_session_dir = "/openevo/session"
+        self._temporary = TemporaryDirectory(prefix="openevo-gateway-fake-runtime-")
+        super().__init__(
+            RuntimeSpec(image="runtime:latest", workdir=workdir),
+            "fake-runtime-session",
+            Path(self._temporary.name),
+        )
         self.uploads: dict[str, str] = {}
         self.runtime_files: dict[str, bytes] = {}
         self.runtime_dirs: set[str] = set()
@@ -3994,6 +4002,12 @@ class FakeRuntime:
     @property
     def runtime_id(self) -> str:
         return "fake-runtime"
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        self._destroyed = True
 
     async def exec(self, command, **kwargs):
         self.exec_commands.append(command)
@@ -4025,47 +4039,62 @@ class FakeRuntime:
                     }
                 )
             entries.sort(key=lambda item: item["relative_path"])
-            return ExecResult(return_code=0, stdout=json.dumps(entries))
+            return ExecResult(
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "schema_version": "1",
+                        "files": entries,
+                        "consumed": {
+                            "files": len(entries),
+                            "nodes": 2 * len(entries),
+                            "bytes": sum(item["size_bytes"] for item in entries),
+                        },
+                    }
+                ),
+            )
         return ExecResult(return_code=0)
 
     async def upload_file(self, source, target):
         payload = Path(source).read_bytes()
         self.uploads[target] = payload.decode("utf-8")
-        self.runtime_files[target] = payload
-        self._record_runtime_parents(target)
+        self.set_runtime_file(target, payload)
 
     async def upload_dir(self, source, target):
         self.uploads[target] = str(source)
         self.runtime_dirs.add(target.rstrip("/"))
+        host_target = self._session_host_path(target.rstrip("/"))
+        if host_target is not None:
+            host_target.mkdir(parents=True, exist_ok=True)
         source_root = Path(source)
         for path in source_root.rglob("*"):
             if path.is_file():
                 remote = f"{target.rstrip('/')}/{path.relative_to(source_root).as_posix()}"
-                self.runtime_files[remote] = path.read_bytes()
-                self._record_runtime_parents(remote)
+                self.set_runtime_file(remote, path.read_bytes())
 
-    async def download_file(self, remote_path: str, local_path: str) -> None:
-        payload = self.runtime_files.get(remote_path)
-        if payload is None:
-            raise FileNotFoundError(remote_path)
-        target = Path(local_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(payload)
+    def set_runtime_file(self, path: str, payload: bytes) -> None:
+        self.runtime_files[path] = payload
+        host_path = self._session_host_path(path)
+        if host_path is not None:
+            host_path.parent.mkdir(parents=True, exist_ok=True)
+            host_path.write_bytes(payload)
+        self._record_runtime_parents(path)
 
-    async def download_dir(self, remote_path: str, local_path: str) -> None:
-        prefix = f"{remote_path.rstrip('/')}/"
-        if remote_path.rstrip("/") not in self.runtime_dirs and not any(
-            path.startswith(prefix) for path in self.runtime_files
-        ):
-            raise FileNotFoundError(remote_path)
-        target_root = Path(local_path)
-        target_root.mkdir(parents=True, exist_ok=True)
-        for path, payload in self.runtime_files.items():
-            if not path.startswith(prefix):
-                continue
-            target = target_root / path.removeprefix(prefix)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(payload)
+    def remove_runtime_file(self, path: str) -> bytes:
+        payload = self.runtime_files.pop(path)
+        host_path = self._session_host_path(path)
+        if host_path is not None:
+            host_path.unlink()
+        return payload
+
+    def _session_host_path(self, path: str) -> Path | None:
+        prefix = f"{self.runtime_session_dir.rstrip('/')}/"
+        if not path.startswith(prefix):
+            return None
+        relative = path.removeprefix(prefix)
+        if not relative or any(part in {"", ".", ".."} for part in relative.split("/")):
+            raise AssertionError("fake runtime path must be canonical")
+        return self.session_dir.joinpath(*relative.split("/"))
 
     def _record_runtime_parents(self, path: str) -> None:
         parent = Path(path).parent.as_posix()
@@ -4104,19 +4133,47 @@ async def test_runtime_agent_system_target_inventory_is_bounded_and_no_follow(
     (microagents / "repo.md").write_text("actual nested target", encoding="utf-8")
     (microagents / "ignored.txt").write_text("not an instruction target", encoding="utf-8")
     runtime = LocalTargetInventoryRuntime(tmp_path)
+    budget = RuntimeReadbackBudget()
 
-    inventory = await node_module._runtime_agent_system_target_inventory(runtime)
+    inventory = await node_module._runtime_agent_system_target_inventory(
+        runtime,
+        budget=budget,
+    )
 
     assert [item["relative_path"] for item in inventory] == [
         "agent_system_targets/.openhands/microagents/repo.md",
         "agent_system_targets/AGENTS.md",
     ]
     assert inventory[1]["sha256"] == hashlib.sha256(b"actual root target").hexdigest()
+    assert budget.files_consumed == 2
+    assert budget.bytes_consumed == len(b"actual root targetactual nested target")
     outside = tmp_path.parent / "outside-target.md"
     outside.write_text("must not be read", encoding="utf-8")
     (tmp_path / "CLAUDE.md").symlink_to(outside)
     with pytest.raises(ValueError, match="target readback failed"):
-        await node_module._runtime_agent_system_target_inventory(runtime)
+        await node_module._runtime_agent_system_target_inventory(
+            runtime,
+            budget=RuntimeReadbackBudget(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_agent_system_target_failure_exhausts_shared_budget(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "AGENTS.md").write_bytes(b"over-budget")
+    runtime = LocalTargetInventoryRuntime(tmp_path)
+    budget = RuntimeReadbackBudget(max_bytes=4)
+
+    with pytest.raises(ValueError, match="target readback failed"):
+        await node_module._runtime_agent_system_target_inventory(
+            runtime,
+            budget=budget,
+        )
+
+    assert budget.files_consumed == budget.max_files
+    assert budget.nodes_consumed == budget.max_nodes
+    assert budget.bytes_consumed == budget.max_bytes
 
 
 class BindMountRuntime(BaseRuntime):
@@ -4161,15 +4218,6 @@ class BindMountRuntime(BaseRuntime):
     async def upload_dir(self, local_path: str, remote_path: str) -> None:
         copied = self._copy_to_bind_mount(local_path, remote_path)
         assert copied is True
-
-    async def download_file(self, remote_path: str, local_path: str) -> None:
-        copied = self._copy_from_bind_mount(remote_path, Path(local_path))
-        assert copied is True
-
-    async def download_dir(self, remote_path: str, local_path: str) -> None:
-        copied = self._copy_from_bind_mount(remote_path, Path(local_path))
-        assert copied is True
-
 
 @pytest.mark.asyncio
 async def test_write_evolution_context_files(tmp_path):
@@ -4491,6 +4539,38 @@ async def test_gateway_runtime_receipt_binds_three_selected_artifacts(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_gateway_runtime_receipt_rejects_self_reported_non_core_runtime(
+    tmp_path: Path,
+) -> None:
+    (
+        manager,
+        _managed,
+        injection,
+        _context,
+        _artifact_ids,
+        _runtime,
+    ) = await _stage_gateway_runtime_receipt_context(tmp_path)
+
+    class SelfReportingRuntime:
+        called = False
+
+        async def download_dir(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            self.called = True
+            return object()
+
+    runtime = SelfReportingRuntime()
+    with pytest.raises(TypeError, match="trusted runtime"):
+        await node_module._runtime_injection_receipt_from_readback(
+            runtime=runtime,
+            target_dir=manager.evolution.context.target_dir,
+            plan=injection.staged.injection_plan,
+        )
+
+    assert runtime.called is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -4516,28 +4596,39 @@ async def test_gateway_runtime_receipt_fails_closed_on_runtime_readback_drift(
         runtime,
     ) = await _stage_gateway_runtime_receipt_context(tmp_path)
     if mutation == "replace_instruction":
-        runtime.runtime_files["/openevo/session/evolution/instruction.txt"] = b"replaced"
+        runtime.set_runtime_file(
+            "/openevo/session/evolution/instruction.txt",
+            b"replaced",
+        )
     elif mutation == "replace_memory":
-        runtime.runtime_files["/openevo/session/evolution/memory.md"] = b"replaced"
+        runtime.set_runtime_file(
+            "/openevo/session/evolution/memory.md",
+            b"replaced",
+        )
     elif mutation == "replace_skill":
         skill_path = next(
             path
             for path in runtime.runtime_files
             if path.endswith("/SKILL.md") and path.startswith("/openevo/session/evolution/skills/")
         )
-        runtime.runtime_files[skill_path] = b"replaced"
+        runtime.set_runtime_file(skill_path, b"replaced")
     elif mutation == "extra_skill":
-        runtime.runtime_files["/openevo/session/evolution/skills/unexpected/SKILL.md"] = (
-            b"unexpected"
+        runtime.set_runtime_file(
+            "/openevo/session/evolution/skills/unexpected/SKILL.md",
+            b"unexpected",
         )
     elif mutation == "missing_agent_target":
-        runtime.runtime_files.pop("/openevo/session/AGENTS.md")
+        runtime.remove_runtime_file("/openevo/session/AGENTS.md")
     elif mutation == "wrong_agent_target":
-        runtime.runtime_files["/openevo/session/CLAUDE.md"] = runtime.runtime_files.pop(
-            "/openevo/session/AGENTS.md"
+        runtime.set_runtime_file(
+            "/openevo/session/CLAUDE.md",
+            runtime.remove_runtime_file("/openevo/session/AGENTS.md"),
         )
     else:
-        runtime.runtime_files["/openevo/session/CLAUDE.md"] = b"unexpected target"
+        runtime.set_runtime_file(
+            "/openevo/session/CLAUDE.md",
+            b"unexpected target",
+        )
 
     with pytest.raises((FileNotFoundError, ValueError)):
         await node_module._runtime_injection_receipt_from_readback(

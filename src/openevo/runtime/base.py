@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
+import hashlib
 import os
+import secrets
 import stat
+import struct
+import sys
+import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
@@ -19,10 +26,42 @@ RUNTIME_AGENT_LOG_DIR: Final[str] = f"{RUNTIME_LOGS_DIR}/agent"
 RUNTIME_EVAL_LOG_DIR: Final[str] = f"{RUNTIME_LOGS_DIR}/eval"
 RUNTIME_EVAL_ARTIFACT_DIR: Final[str] = f"{RUNTIME_SESSION_DIR}/eval_artifacts"
 LOCAL_COMMAND_CAPTURE_MAX_BYTES: Final[int] = 4 * 1024 * 1024
+RUNTIME_READBACK_MAX_FILES: Final[int] = 4096
+RUNTIME_READBACK_MAX_BYTES: Final[int] = 64 * 1024 * 1024
+# A maximally nested 4096-file tree has at most 8191 entries. Every directory
+# is enumerated twice, so this limit admits that full receipt inventory while
+# still bounding failed and verification enumeration attempts.
+RUNTIME_READBACK_MAX_NODES: Final[int] = 4 * RUNTIME_READBACK_MAX_FILES
 _LOCAL_COMMAND_FINALIZE_SECONDS: Final[float] = 5.0
 _COPY_MAX_DEPTH: Final[int] = 64
 _COPY_MAX_NODES: Final[int] = 100_000
 _COPY_CHUNK_BYTES: Final[int] = 64 * 1024
+_RENAME_NOREPLACE: Final[int] = 1
+_IN_NONBLOCK: Final[int] = os.O_NONBLOCK
+_IN_CLOEXEC: Final[int] = os.O_CLOEXEC
+_IN_MODIFY: Final[int] = 0x00000002
+_IN_ATTRIB: Final[int] = 0x00000004
+_IN_CLOSE_WRITE: Final[int] = 0x00000008
+_IN_MOVED_FROM: Final[int] = 0x00000040
+_IN_MOVED_TO: Final[int] = 0x00000080
+_IN_CREATE: Final[int] = 0x00000100
+_IN_DELETE: Final[int] = 0x00000200
+_IN_DELETE_SELF: Final[int] = 0x00000400
+_IN_MOVE_SELF: Final[int] = 0x00000800
+_IN_Q_OVERFLOW: Final[int] = 0x00004000
+_IN_IGNORED: Final[int] = 0x00008000
+_IN_MUTATION_MASK: Final[int] = (
+    _IN_MODIFY
+    | _IN_ATTRIB
+    | _IN_CLOSE_WRITE
+    | _IN_MOVED_FROM
+    | _IN_MOVED_TO
+    | _IN_CREATE
+    | _IN_DELETE
+    | _IN_DELETE_SELF
+    | _IN_MOVE_SELF
+)
+_INOTIFY_EVENT_HEADER: Final[struct.Struct] = struct.Struct("iIII")
 _DIRECTORY_FLAGS: Final[int] = (
     os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 )
@@ -36,6 +75,115 @@ _FILE_WRITE_FLAGS: Final[int] = (
 
 class RuntimePathSecurityError(RuntimeError):
     """Raised when a bind-mount path cannot be proven to stay in its authority."""
+
+
+@dataclass(slots=True)
+class RuntimeReadbackBudget:
+    """Non-refundable limits shared by one trusted runtime readback."""
+
+    max_files: int = RUNTIME_READBACK_MAX_FILES
+    max_nodes: int = RUNTIME_READBACK_MAX_NODES
+    max_bytes: int = RUNTIME_READBACK_MAX_BYTES
+    _files: int = field(default=0, init=False)
+    _nodes: int = field(default=0, init=False)
+    _bytes: int = field(default=0, init=False)
+    _lock: threading.Lock = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_files <= RUNTIME_READBACK_MAX_FILES:
+            raise ValueError("runtime readback file budget is outside the closed limit")
+        if not 1 <= self.max_nodes <= RUNTIME_READBACK_MAX_NODES:
+            raise ValueError("runtime readback node budget is outside the closed limit")
+        if not 1 <= self.max_bytes <= RUNTIME_READBACK_MAX_BYTES:
+            raise ValueError("runtime readback byte budget is outside the closed limit")
+        self._lock = threading.Lock()
+
+    @property
+    def files_consumed(self) -> int:
+        with self._lock:
+            return self._files
+
+    @property
+    def nodes_consumed(self) -> int:
+        with self._lock:
+            return self._nodes
+
+    @property
+    def bytes_consumed(self) -> int:
+        with self._lock:
+            return self._bytes
+
+    @property
+    def remaining_files(self) -> int:
+        with self._lock:
+            return max(0, self.max_files - self._files)
+
+    @property
+    def remaining_nodes(self) -> int:
+        with self._lock:
+            return max(0, self.max_nodes - self._nodes)
+
+    @property
+    def remaining_bytes(self) -> int:
+        with self._lock:
+            return max(0, self.max_bytes - self._bytes)
+
+    def consume_node(self) -> None:
+        with self._lock:
+            self._nodes += 1
+            if self._nodes > self.max_nodes:
+                raise RuntimePathSecurityError("runtime readback exceeds the node budget")
+
+    def consume_file(self) -> None:
+        with self._lock:
+            self._files += 1
+            if self._files > self.max_files:
+                raise RuntimePathSecurityError("runtime readback exceeds the file budget")
+
+    def require_byte_capacity(self, size: int) -> None:
+        with self._lock:
+            if size < 0 or size > self.max_bytes - self._bytes:
+                raise RuntimePathSecurityError("runtime readback exceeds the byte budget")
+
+    def consume_bytes(self, size: int) -> None:
+        with self._lock:
+            if size < 0 or size > self.max_bytes - self._bytes:
+                raise RuntimePathSecurityError("runtime readback exceeds the byte budget")
+            self._bytes += size
+
+    def consume_report(self, *, files: int, nodes: int, bytes_read: int) -> None:
+        if min(files, nodes, bytes_read) < 0:
+            raise RuntimePathSecurityError("runtime readback returned an invalid budget report")
+        with self._lock:
+            self._files += files
+            self._nodes += nodes
+            self._bytes += bytes_read
+            if (
+                self._files > self.max_files
+                or self._nodes > self.max_nodes
+                or self._bytes > self.max_bytes
+            ):
+                raise RuntimePathSecurityError("runtime readback exceeds its shared budget")
+
+    def exhaust(self) -> None:
+        """Pessimistically prevent retry when remote failure hides exact usage."""
+
+        with self._lock:
+            self._files = self.max_files
+            self._nodes = self.max_nodes
+            self._bytes = self.max_bytes
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeReadbackFile:
+    relative_path: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeReadback:
+    files: tuple[RuntimeReadbackFile, ...]
 
 
 @dataclass(slots=True)
@@ -765,6 +913,589 @@ def _copy_opened_entry(
         os.close(target_fd)
 
 
+def _readback_directory_identity(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _readback_file_identity(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _readback_object_identity(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadbackSourceEntry:
+    name: str
+    relative_path: str
+    stat: os.stat_result
+    is_directory: bool
+
+    @property
+    def identity(self) -> tuple[int, ...]:
+        if self.is_directory:
+            return _readback_directory_identity(self.stat)
+        return _readback_file_identity(self.stat)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadbackDirectorySnapshot:
+    identity: tuple[int, ...]
+    entries: tuple[_ReadbackSourceEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadbackTargetEntry:
+    name: str
+    is_directory: bool
+    identity: tuple[int, ...]
+    children: tuple[_ReadbackTargetEntry, ...] = ()
+
+
+class _ReadbackMutationAuthority:
+    """One Linux event generation covering every held source directory."""
+
+    def __init__(self) -> None:
+        if not sys.platform.startswith("linux"):
+            raise RuntimePathSecurityError(
+                "trusted runtime readback mutation authority requires Linux"
+            )
+        libc = ctypes.CDLL(None, use_errno=True)
+        init = libc.inotify_init1
+        init.argtypes = (ctypes.c_int,)
+        init.restype = ctypes.c_int
+        descriptor = init(_IN_NONBLOCK | _IN_CLOEXEC)
+        if descriptor < 0:
+            error = ctypes.get_errno()
+            raise RuntimePathSecurityError(
+                "trusted runtime readback mutation authority is unavailable"
+            ) from OSError(error, os.strerror(error))
+        self._descriptor = descriptor
+        self._watches: set[int] = set()
+        self._closed = False
+
+    def add(self, directory_fd: int) -> None:
+        if self._closed:
+            raise RuntimePathSecurityError("runtime readback mutation authority is closed")
+        libc = ctypes.CDLL(None, use_errno=True)
+        add_watch = libc.inotify_add_watch
+        add_watch.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+        add_watch.restype = ctypes.c_int
+        watch = add_watch(
+            self._descriptor,
+            os.fsencode(f"/proc/self/fd/{directory_fd}"),
+            _IN_MUTATION_MASK,
+        )
+        if watch < 0:
+            error = ctypes.get_errno()
+            raise RuntimePathSecurityError(
+                "trusted runtime readback mutation authority is unavailable"
+            ) from OSError(error, os.strerror(error))
+        self._watches.add(watch)
+
+    def require_quiet(self) -> None:
+        if self._closed:
+            raise RuntimePathSecurityError("runtime readback mutation authority is closed")
+        while True:
+            try:
+                payload = os.read(self._descriptor, 64 * 1024)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                raise RuntimePathSecurityError(
+                    "runtime readback mutation authority is unavailable"
+                ) from exc
+            if not payload:
+                raise RuntimePathSecurityError(
+                    "runtime readback mutation authority is unavailable"
+                )
+            offset = 0
+            while offset < len(payload):
+                if len(payload) - offset < _INOTIFY_EVENT_HEADER.size:
+                    raise RuntimePathSecurityError(
+                        "runtime readback mutation evidence is malformed"
+                    )
+                watch, mask, _cookie, name_size = _INOTIFY_EVENT_HEADER.unpack_from(
+                    payload,
+                    offset,
+                )
+                offset += _INOTIFY_EVENT_HEADER.size + name_size
+                if offset > len(payload):
+                    raise RuntimePathSecurityError(
+                        "runtime readback mutation evidence is malformed"
+                    )
+                if (
+                    watch not in self._watches
+                    or mask & (_IN_Q_OVERFLOW | _IN_IGNORED | _IN_MUTATION_MASK)
+                ):
+                    raise RuntimePathSecurityError(
+                        "runtime readback source tree changed during transfer"
+                    )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        os.close(self._descriptor)
+
+
+def _check_readback_cancel(cancellation: threading.Event) -> None:
+    if cancellation.is_set():
+        raise RuntimePathSecurityError("runtime readback was cancelled")
+
+
+def _enumerate_readback_source_directory(
+    directory_fd: int,
+    *,
+    relative_prefix: str,
+    expected_owner: int,
+    budget: RuntimeReadbackBudget,
+    cancellation: threading.Event,
+    consume_files: bool,
+) -> _ReadbackDirectorySnapshot:
+    _check_readback_cancel(cancellation)
+    before = os.fstat(directory_fd)
+    if not stat.S_ISDIR(before.st_mode) or before.st_uid != expected_owner:
+        raise RuntimePathSecurityError("runtime readback source is not an owned directory")
+    names: list[str] = []
+    with os.scandir(directory_fd) as iterator:
+        for entry in iterator:
+            _check_readback_cancel(cancellation)
+            budget.consume_node()
+            names.append(entry.name)
+    names.sort()
+    entries: list[_ReadbackSourceEntry] = []
+    for name in names:
+        _check_readback_cancel(cancellation)
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if observed.st_uid != expected_owner:
+            raise RuntimePathSecurityError("runtime readback source contains an unowned entry")
+        relative_path = f"{relative_prefix}/{name}" if relative_prefix else name
+        if stat.S_ISDIR(observed.st_mode):
+            is_directory = True
+        elif stat.S_ISREG(observed.st_mode):
+            if observed.st_nlink != 1:
+                raise RuntimePathSecurityError(
+                    "runtime readback source contains a hard-linked file"
+                )
+            if consume_files:
+                budget.consume_file()
+            is_directory = False
+        else:
+            raise RuntimePathSecurityError(
+                "runtime readback source contains a link or special file"
+            )
+        entries.append(
+            _ReadbackSourceEntry(
+                name=name,
+                relative_path=relative_path,
+                stat=observed,
+                is_directory=is_directory,
+            )
+        )
+    after = os.fstat(directory_fd)
+    if _readback_directory_identity(after) != _readback_directory_identity(before):
+        raise RuntimePathSecurityError("runtime readback directory changed during enumeration")
+    return _ReadbackDirectorySnapshot(
+        identity=_readback_directory_identity(before),
+        entries=tuple(entries),
+    )
+
+
+def _verify_readback_source_directory(
+    directory_fd: int,
+    expected: _ReadbackDirectorySnapshot,
+    *,
+    relative_prefix: str,
+    expected_owner: int,
+    budget: RuntimeReadbackBudget,
+    cancellation: threading.Event,
+) -> None:
+    observed = _enumerate_readback_source_directory(
+        directory_fd,
+        relative_prefix=relative_prefix,
+        expected_owner=expected_owner,
+        budget=budget,
+        cancellation=cancellation,
+        consume_files=False,
+    )
+    expected_entries = tuple(
+        (entry.name, entry.is_directory, entry.identity) for entry in expected.entries
+    )
+    observed_entries = tuple(
+        (entry.name, entry.is_directory, entry.identity) for entry in observed.entries
+    )
+    if observed.identity != expected.identity or observed_entries != expected_entries:
+        raise RuntimePathSecurityError("runtime readback source tree changed during transfer")
+
+
+def _open_private_readback_file(parent_fd: int, name: str) -> int:
+    try:
+        return os.open(
+            name,
+            _FILE_WRITE_FLAGS | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise RuntimePathSecurityError("runtime readback target file could not be created") from exc
+
+
+def _copy_readback_regular_file(
+    source_parent_fd: int,
+    source: _ReadbackSourceEntry,
+    target_parent_fd: int,
+    *,
+    budget: RuntimeReadbackBudget,
+    cancellation: threading.Event,
+) -> tuple[RuntimeReadbackFile, _ReadbackTargetEntry]:
+    budget.require_byte_capacity(source.stat.st_size)
+    source_fd = os.open(source.name, _FILE_READ_FLAGS, dir_fd=source_parent_fd)
+    target_fd = -1
+    try:
+        opened = os.fstat(source_fd)
+        if _readback_file_identity(opened) != source.identity:
+            raise RuntimePathSecurityError("runtime readback source file changed while opening")
+        target_fd = _open_private_readback_file(target_parent_fd, source.name)
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < opened.st_size:
+            _check_readback_cancel(cancellation)
+            chunk = os.pread(
+                source_fd,
+                min(_COPY_CHUNK_BYTES, opened.st_size - offset),
+                offset,
+            )
+            if not chunk:
+                raise RuntimePathSecurityError(
+                    "runtime readback source ended before its verified size"
+                )
+            budget.consume_bytes(len(chunk))
+            digest.update(chunk)
+            written_offset = 0
+            while written_offset < len(chunk):
+                _check_readback_cancel(cancellation)
+                written = os.pwrite(
+                    target_fd,
+                    chunk[written_offset:],
+                    offset + written_offset,
+                )
+                if written <= 0:
+                    raise RuntimePathSecurityError(
+                        "runtime readback target write made no progress"
+                    )
+                written_offset += written
+            offset += len(chunk)
+        os.ftruncate(target_fd, opened.st_size)
+        os.fsync(target_fd)
+        source_after = os.fstat(source_fd)
+        named_after = os.stat(source.name, dir_fd=source_parent_fd, follow_symlinks=False)
+        if (
+            _readback_file_identity(source_after) != source.identity
+            or _readback_file_identity(named_after) != source.identity
+        ):
+            raise RuntimePathSecurityError("runtime readback source file changed during transfer")
+        target_after = os.fstat(target_fd)
+        named_target = os.stat(source.name, dir_fd=target_parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(target_after.st_mode)
+            or target_after.st_uid != os.geteuid()
+            or target_after.st_nlink != 1
+            or target_after.st_size != opened.st_size
+            or stat.S_IMODE(target_after.st_mode) != 0o600
+            or _readback_file_identity(named_target)
+            != _readback_file_identity(target_after)
+        ):
+            raise RuntimePathSecurityError("runtime readback target file changed during transfer")
+        return (
+            RuntimeReadbackFile(
+                relative_path=source.relative_path,
+                size_bytes=opened.st_size,
+                sha256=digest.hexdigest(),
+            ),
+            _ReadbackTargetEntry(
+                name=source.name,
+                is_directory=False,
+                identity=_readback_file_identity(target_after),
+            ),
+        )
+    finally:
+        if target_fd >= 0:
+            os.close(target_fd)
+        os.close(source_fd)
+
+
+def _copy_readback_directory(
+    source_fd: int,
+    target_fd: int,
+    *,
+    relative_prefix: str,
+    expected_owner: int,
+    budget: RuntimeReadbackBudget,
+    cancellation: threading.Event,
+    mutation_authority: _ReadbackMutationAuthority,
+    depth: int,
+) -> tuple[list[RuntimeReadbackFile], tuple[_ReadbackTargetEntry, ...]]:
+    if depth > _COPY_MAX_DEPTH:
+        raise RuntimePathSecurityError("runtime readback exceeds the directory depth limit")
+    mutation_authority.add(source_fd)
+    source_snapshot = _enumerate_readback_source_directory(
+        source_fd,
+        relative_prefix=relative_prefix,
+        expected_owner=expected_owner,
+        budget=budget,
+        cancellation=cancellation,
+        consume_files=True,
+    )
+    files: list[RuntimeReadbackFile] = []
+    target_entries: list[_ReadbackTargetEntry] = []
+    for source in source_snapshot.entries:
+        _check_readback_cancel(cancellation)
+        if source.is_directory:
+            child_source_fd = os.open(source.name, _DIRECTORY_FLAGS, dir_fd=source_fd)
+            child_target_fd = -1
+            try:
+                if _readback_directory_identity(os.fstat(child_source_fd)) != source.identity:
+                    raise RuntimePathSecurityError(
+                        "runtime readback source directory changed while opening"
+                    )
+                os.mkdir(source.name, mode=0o700, dir_fd=target_fd)
+                child_target_fd = os.open(source.name, _DIRECTORY_FLAGS, dir_fd=target_fd)
+                child_files, child_entries = _copy_readback_directory(
+                    child_source_fd,
+                    child_target_fd,
+                    relative_prefix=source.relative_path,
+                    expected_owner=expected_owner,
+                    budget=budget,
+                    cancellation=cancellation,
+                    mutation_authority=mutation_authority,
+                    depth=depth + 1,
+                )
+                os.fsync(child_target_fd)
+                target_after = os.fstat(child_target_fd)
+                named_target = os.stat(
+                    source.name,
+                    dir_fd=target_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(target_after.st_mode)
+                    or target_after.st_uid != os.geteuid()
+                    or stat.S_IMODE(target_after.st_mode) != 0o700
+                    or _readback_directory_identity(named_target)
+                    != _readback_directory_identity(target_after)
+                ):
+                    raise RuntimePathSecurityError(
+                        "runtime readback target directory changed during transfer"
+                    )
+                files.extend(child_files)
+                target_entries.append(
+                    _ReadbackTargetEntry(
+                        name=source.name,
+                        is_directory=True,
+                        identity=_readback_directory_identity(target_after),
+                        children=child_entries,
+                    )
+                )
+            finally:
+                if child_target_fd >= 0:
+                    os.close(child_target_fd)
+                os.close(child_source_fd)
+        else:
+            file, target_entry = _copy_readback_regular_file(
+                source_fd,
+                source,
+                target_fd,
+                budget=budget,
+                cancellation=cancellation,
+            )
+            files.append(file)
+            target_entries.append(target_entry)
+    _verify_readback_source_directory(
+        source_fd,
+        source_snapshot,
+        relative_prefix=relative_prefix,
+        expected_owner=expected_owner,
+        budget=budget,
+        cancellation=cancellation,
+    )
+    return files, tuple(target_entries)
+
+
+def _verify_readback_target_directory(
+    directory_fd: int,
+    expected: tuple[_ReadbackTargetEntry, ...],
+    *,
+    cancellation: threading.Event,
+    depth: int,
+) -> None:
+    if depth > _COPY_MAX_DEPTH:
+        raise RuntimePathSecurityError("runtime readback target exceeds the depth limit")
+    _check_readback_cancel(cancellation)
+    with os.scandir(directory_fd) as iterator:
+        names = sorted(entry.name for entry in iterator)
+    if names != [entry.name for entry in expected]:
+        raise RuntimePathSecurityError("runtime readback target inventory changed")
+    for entry in expected:
+        observed = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+        if entry.is_directory:
+            if _readback_directory_identity(observed) != entry.identity:
+                raise RuntimePathSecurityError("runtime readback target directory changed")
+            child_fd = os.open(entry.name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            try:
+                if _readback_directory_identity(os.fstat(child_fd)) != entry.identity:
+                    raise RuntimePathSecurityError("runtime readback target directory changed")
+                _verify_readback_target_directory(
+                    child_fd,
+                    entry.children,
+                    cancellation=cancellation,
+                    depth=depth + 1,
+                )
+            finally:
+                os.close(child_fd)
+        elif _readback_file_identity(observed) != entry.identity:
+            raise RuntimePathSecurityError("runtime readback target file changed")
+
+
+def _rename_readback_noreplace(
+    source_dir_fd: int,
+    source: str,
+    target_dir_fd: int,
+    target: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "runtime readback requires atomic no-replace rename")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if (
+        renameat2(
+            source_dir_fd,
+            os.fsencode(source),
+            target_dir_fd,
+            os.fsencode(target),
+            _RENAME_NOREPLACE,
+        )
+        != 0
+    ):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _discard_readback_staging(
+    parent_fd: int,
+    staging_name: str,
+    staging_fd: int,
+    staging_identity: tuple[int, ...],
+) -> None:
+    try:
+        _remove_directory_contents(
+            staging_fd,
+            expected_owner=os.geteuid(),
+            depth=0,
+            budget=[RUNTIME_READBACK_MAX_NODES],
+        )
+    except (OSError, RuntimePathSecurityError):
+        return
+    try:
+        named = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if _readback_object_identity(named) != staging_identity:
+        return
+    try:
+        os.rmdir(staging_name, dir_fd=parent_fd)
+    except OSError:
+        return
+
+
+def _discard_readback_publication(
+    parent_fd: int,
+    target_name: str,
+    publication_fd: int,
+    publication_identity: tuple[int, ...],
+    *,
+    is_directory: bool,
+) -> None:
+    if is_directory:
+        try:
+            _remove_directory_contents(
+                publication_fd,
+                expected_owner=os.geteuid(),
+                depth=0,
+                budget=[RUNTIME_READBACK_MAX_NODES],
+            )
+        except (OSError, RuntimePathSecurityError):
+            return
+    try:
+        named = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if _readback_object_identity(named) != publication_identity:
+        return
+    try:
+        if is_directory:
+            os.rmdir(target_name, dir_fd=parent_fd)
+        else:
+            os.unlink(target_name, dir_fd=parent_fd)
+    except OSError:
+        return
+
+
+def _source_ancestor_identities(
+    session_fd: int,
+    parents: _RelativeDirectoryPin,
+) -> tuple[tuple[int, ...], ...]:
+    return tuple(
+        _readback_directory_identity(os.fstat(descriptor))
+        for descriptor in (session_fd, *parents.descriptors)
+    )
+
+
+def _require_source_ancestor_identities(
+    session_fd: int,
+    parents: _RelativeDirectoryPin,
+    expected: tuple[tuple[int, ...], ...],
+) -> None:
+    observed = _source_ancestor_identities(session_fd, parents)
+    if observed != expected:
+        raise RuntimePathSecurityError("runtime readback source ancestor changed")
+
+
 class BaseRuntime(ABC):
     """Base class for long-lived per-session execution runtimes."""
 
@@ -848,13 +1579,39 @@ class BaseRuntime(ABC):
     async def upload_dir(self, local_path: str, remote_path: str) -> None:
         """Copy a directory tree from the host into the runtime."""
 
-    @abstractmethod
-    async def download_file(self, remote_path: str, local_path: str) -> None:
-        """Copy a single file from inside the runtime to the host."""
+    async def download_file(
+        self,
+        remote_path: str,
+        local_path: str,
+        *,
+        budget: RuntimeReadbackBudget,
+    ) -> RuntimeReadback:
+        """Atomically read back one stable bind-mounted runtime file."""
 
-    @abstractmethod
-    async def download_dir(self, remote_path: str, local_path: str) -> None:
-        """Copy a directory tree from inside the runtime to the host."""
+        return await BaseRuntime._trusted_runtime_readback(
+            self,
+            remote_path,
+            Path(local_path),
+            budget=budget,
+            expected_directory=False,
+        )
+
+    async def download_dir(
+        self,
+        remote_path: str,
+        local_path: str,
+        *,
+        budget: RuntimeReadbackBudget,
+    ) -> RuntimeReadback:
+        """Atomically read back one stable bind-mounted runtime directory."""
+
+        return await BaseRuntime._trusted_runtime_readback(
+            self,
+            remote_path,
+            Path(local_path),
+            budget=budget,
+            expected_directory=True,
+        )
 
     def resolve_host_path(self, runtime_path: str) -> Path | None:
         """Map a runtime path back to a host path via the session bind mount."""
@@ -863,6 +1620,334 @@ class BaseRuntime(ABC):
             runtime_path,
             expected_identity=self._session_root_identity,
         )
+
+    async def _trusted_runtime_readback(
+        self,
+        runtime_path: str,
+        local_path: Path,
+        *,
+        budget: RuntimeReadbackBudget,
+        expected_directory: bool,
+    ) -> RuntimeReadback:
+        if not isinstance(budget, RuntimeReadbackBudget):
+            raise TypeError("runtime readback requires the closed budget authority")
+        cancellation = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                BaseRuntime._trusted_runtime_readback_sync,
+                self,
+                runtime_path,
+                local_path,
+                budget,
+                expected_directory,
+                cancellation,
+            )
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancellation.set()
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancellation.set()
+                except BaseException:
+                    break
+            if worker.done() and not worker.cancelled():
+                try:
+                    worker.result()
+                except BaseException:
+                    pass
+            raise
+
+    def _trusted_runtime_readback_sync(
+        self,
+        runtime_path: str,
+        local_path: Path,
+        budget: RuntimeReadbackBudget,
+        expected_directory: bool,
+        cancellation: threading.Event,
+    ) -> RuntimeReadback:
+        relative_parts = _runtime_relative_parts(runtime_path)
+        if relative_parts is None:
+            raise RuntimePathSecurityError(
+                "trusted runtime readback requires the session bind mount"
+            )
+        if not relative_parts:
+            raise RuntimePathSecurityError("runtime readback source must not be the session root")
+
+        session_pin = _pin_absolute_directory(self.session_dir)
+        source_parents: _RelativeDirectoryPin | None = None
+        source_fd = -1
+        target_parent_pin: _DirectoryPin | None = None
+        staging_fd = -1
+        payload_fd = -1
+        staging_name: str | None = None
+        staging_identity: tuple[int, ...] | None = None
+        publication_identity: tuple[int, ...] | None = None
+        publication_active = False
+        readback_complete = False
+        mutation_authority: _ReadbackMutationAuthority | None = None
+        try:
+            _check_readback_cancel(cancellation)
+            _require_session_root(session_pin, self._session_root_identity)
+            source_parents = _open_relative_directories(
+                session_pin.descriptor,
+                relative_parts[:-1],
+                create=False,
+                expected_owner=self._session_root_identity[3],
+            )
+            source_parent_fd = (
+                source_parents.descriptor
+                if source_parents.descriptors
+                else session_pin.descriptor
+            )
+            source_name = relative_parts[-1]
+            source_before = os.stat(
+                source_name,
+                dir_fd=source_parent_fd,
+                follow_symlinks=False,
+            )
+            if source_before.st_uid != self._session_root_identity[3]:
+                raise RuntimePathSecurityError("runtime readback source is not owned by Core")
+            if stat.S_ISDIR(source_before.st_mode):
+                if not expected_directory:
+                    raise RuntimePathSecurityError("runtime readback expected a regular file")
+                source_flags = _DIRECTORY_FLAGS
+                source_identity = _readback_directory_identity(source_before)
+            elif stat.S_ISREG(source_before.st_mode):
+                if expected_directory:
+                    raise RuntimePathSecurityError("runtime readback expected a directory")
+                if source_before.st_nlink != 1:
+                    raise RuntimePathSecurityError(
+                        "runtime readback source is a hard-linked file"
+                    )
+                source_flags = _FILE_READ_FLAGS
+                source_identity = _readback_file_identity(source_before)
+                budget.consume_node()
+                budget.consume_file()
+            else:
+                raise RuntimePathSecurityError(
+                    "runtime readback source is a link or special file"
+                )
+            source_fd = os.open(source_name, source_flags, dir_fd=source_parent_fd)
+            source_opened = os.fstat(source_fd)
+            opened_identity = (
+                _readback_directory_identity(source_opened)
+                if expected_directory
+                else _readback_file_identity(source_opened)
+            )
+            if opened_identity != source_identity:
+                raise RuntimePathSecurityError("runtime readback source changed while opening")
+            mutation_authority = _ReadbackMutationAuthority()
+            mutation_authority.add(session_pin.descriptor)
+            for descriptor in source_parents.descriptors:
+                mutation_authority.add(descriptor)
+            if expected_directory:
+                mutation_authority.add(source_fd)
+            ancestor_identities = _source_ancestor_identities(
+                session_pin.descriptor,
+                source_parents,
+            )
+
+            target_parts = _canonical_absolute_parts(
+                str(local_path.absolute()),
+                label="runtime readback target",
+            )
+            if not target_parts:
+                raise RuntimePathSecurityError(
+                    "runtime readback target must not be the filesystem root"
+                )
+            target_parent = Path(os.sep).joinpath(*target_parts[:-1])
+            target_name = target_parts[-1]
+            target_parent_pin = _pin_absolute_directory(target_parent, create=True)
+            try:
+                os.stat(target_name, dir_fd=target_parent_pin.descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimePathSecurityError("runtime readback target already exists")
+
+            for _attempt in range(16):
+                candidate = f".{target_name}.openevo-readback-{secrets.token_hex(12)}"
+                try:
+                    os.mkdir(candidate, mode=0o700, dir_fd=target_parent_pin.descriptor)
+                except FileExistsError:
+                    continue
+                staging_name = candidate
+                break
+            if staging_name is None:
+                raise RuntimePathSecurityError("runtime readback staging name is unavailable")
+            staging_fd = os.open(
+                staging_name,
+                _DIRECTORY_FLAGS,
+                dir_fd=target_parent_pin.descriptor,
+            )
+            staging_opened = os.fstat(staging_fd)
+            if (
+                not stat.S_ISDIR(staging_opened.st_mode)
+                or staging_opened.st_uid != os.geteuid()
+                or stat.S_IMODE(staging_opened.st_mode) != 0o700
+            ):
+                raise RuntimePathSecurityError("runtime readback staging is not private")
+            staging_identity = _readback_object_identity(staging_opened)
+            target_parent_after_staging = _readback_directory_identity(
+                os.fstat(target_parent_pin.descriptor)
+            )
+
+            if expected_directory:
+                payload_name = "payload"
+                os.mkdir(payload_name, mode=0o700, dir_fd=staging_fd)
+                payload_fd = os.open(payload_name, _DIRECTORY_FLAGS, dir_fd=staging_fd)
+                files, target_entries = _copy_readback_directory(
+                    source_fd,
+                    payload_fd,
+                    relative_prefix="",
+                    expected_owner=self._session_root_identity[3],
+                    budget=budget,
+                    cancellation=cancellation,
+                    mutation_authority=mutation_authority,
+                    depth=0,
+                )
+                os.fsync(payload_fd)
+                _verify_readback_target_directory(
+                    payload_fd,
+                    target_entries,
+                    cancellation=cancellation,
+                    depth=0,
+                )
+            else:
+                payload_name = source_name
+                source_entry = _ReadbackSourceEntry(
+                    name=source_name,
+                    relative_path=source_name,
+                    stat=source_before,
+                    is_directory=False,
+                )
+                file, target_entry = _copy_readback_regular_file(
+                    source_parent_fd,
+                    source_entry,
+                    staging_fd,
+                    budget=budget,
+                    cancellation=cancellation,
+                )
+                files = [file]
+                payload_fd = os.open(payload_name, _FILE_READ_FLAGS, dir_fd=staging_fd)
+                if _readback_file_identity(os.fstat(payload_fd)) != target_entry.identity:
+                    raise RuntimePathSecurityError("runtime readback target file changed")
+
+            _check_readback_cancel(cancellation)
+            named_source_after = os.stat(
+                source_name,
+                dir_fd=source_parent_fd,
+                follow_symlinks=False,
+            )
+            final_source_identity = (
+                _readback_directory_identity(named_source_after)
+                if expected_directory
+                else _readback_file_identity(named_source_after)
+            )
+            if final_source_identity != source_identity:
+                raise RuntimePathSecurityError("runtime readback source path changed")
+            _require_source_ancestor_identities(
+                session_pin.descriptor,
+                source_parents,
+                ancestor_identities,
+            )
+            source_parents.verify(session_pin.descriptor, label="runtime readback source")
+            session_pin.verify(label="session root")
+            _require_session_root(session_pin, self._session_root_identity)
+            mutation_authority.require_quiet()
+
+            try:
+                os.stat(target_name, dir_fd=target_parent_pin.descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimePathSecurityError("runtime readback target was replaced")
+            if (
+                _readback_directory_identity(os.fstat(target_parent_pin.descriptor))
+                != target_parent_after_staging
+            ):
+                raise RuntimePathSecurityError("runtime readback target parent changed")
+            target_parent_pin.verify(label="runtime readback target parent")
+            os.fsync(staging_fd)
+            _check_readback_cancel(cancellation)
+            payload_identity = _readback_object_identity(os.fstat(payload_fd))
+            _rename_readback_noreplace(
+                staging_fd,
+                payload_name,
+                target_parent_pin.descriptor,
+                target_name,
+            )
+            publication_active = True
+            publication_identity = payload_identity
+            named_target = os.stat(
+                target_name,
+                dir_fd=target_parent_pin.descriptor,
+                follow_symlinks=False,
+            )
+            if _readback_object_identity(named_target) != payload_identity:
+                raise RuntimePathSecurityError("runtime readback target was replaced")
+            if expected_directory:
+                _verify_readback_target_directory(
+                    payload_fd,
+                    target_entries,
+                    cancellation=cancellation,
+                    depth=0,
+                )
+            elif (
+                not stat.S_ISREG(named_target.st_mode)
+                or named_target.st_nlink != 1
+                or named_target.st_size != files[0].size_bytes
+            ):
+                raise RuntimePathSecurityError("runtime readback target file changed")
+            target_parent_pin.verify(label="runtime readback target parent")
+            readback_complete = True
+            return RuntimeReadback(
+                files=tuple(sorted(files, key=lambda item: item.relative_path))
+            )
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"runtime readback source is unavailable: {runtime_path}") from exc
+        except RuntimePathSecurityError:
+            raise
+        except OSError as exc:
+            raise RuntimePathSecurityError("trusted runtime readback failed closed") from exc
+        finally:
+            if mutation_authority is not None:
+                mutation_authority.close()
+            if (
+                publication_active
+                and not readback_complete
+                and publication_identity is not None
+                and payload_fd >= 0
+                and target_parent_pin is not None
+            ):
+                _discard_readback_publication(
+                    target_parent_pin.descriptor,
+                    target_name,
+                    payload_fd,
+                    publication_identity,
+                    is_directory=expected_directory,
+                )
+            if payload_fd >= 0:
+                os.close(payload_fd)
+            if staging_fd >= 0 and staging_name is not None and staging_identity is not None:
+                _discard_readback_staging(
+                    target_parent_pin.descriptor if target_parent_pin is not None else -1,
+                    staging_name,
+                    staging_fd,
+                    staging_identity,
+                )
+                os.close(staging_fd)
+            if target_parent_pin is not None:
+                target_parent_pin.close()
+            if source_fd >= 0:
+                os.close(source_fd)
+            if source_parents is not None:
+                source_parents.close()
+            session_pin.close()
 
     def _copy_from_bind_mount(self, runtime_path: str, local_path: Path) -> bool:
         relative_parts = _runtime_relative_parts(runtime_path)

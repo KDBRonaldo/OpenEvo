@@ -68,6 +68,7 @@ from openevo.rollout.models import (
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import (
     BaseRuntime,
+    RuntimeReadbackBudget,
     RuntimePathSecurityError,
     validate_session_bind_path,
 )
@@ -98,7 +99,6 @@ from openevo.evolution.agent_system import (
     ROOT_AGENT_SYSTEM_FILES,
     normalize_agent_system_target_path,
 )
-from openevo.evolution.artifact_payloads import ArtifactPayloadService
 from openevo.evolution.client import EvolutionClient
 from openevo.evolution.framework.handlers import PayloadManifestEntry, payload_tree_digest
 from openevo.evolution.runtime_injection import (
@@ -137,25 +137,50 @@ _CLEANUP_JOURNAL_PENDING_RE = re.compile(r"[0-9a-f]{64}\.pending")
 _CLEANUP_JOURNAL_GENERATION_RE = re.compile(r"[0-9a-f]{32}")
 _CLEANUP_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _AGENT_SYSTEM_TARGET_READBACK_SCRIPT = r"""
+import ctypes
 import hashlib
 import json
 import os
 import stat
+import struct
 import sys
 
 _MARKER = "_OPENEVO_TARGET_READBACK_V1"
-_MAX_FILES = 4096
-_MAX_BYTES = 64 * 1024 * 1024
+_CLOSED_MAX_FILES = 4096
+_CLOSED_MAX_NODES = 16384
+_CLOSED_MAX_BYTES = 64 * 1024 * 1024
 _DIR_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 _FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+_IN_MUTATION_MASK = 0x00000002 | 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200 | 0x00000400 | 0x00000800
+_IN_Q_OVERFLOW = 0x00004000
+_IN_IGNORED = 0x00008000
+_EVENT = struct.Struct("iIII")
+_limits = [int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])]
+_used = [0, 0, 0]
+_watch_fd = -1
+_watches = set()
 
 
 def _fail():
     raise RuntimeError("closed runtime target readback")
 
 
-def _dir_identity(value):
+def _path_dir_identity(value):
     return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid)
+
+
+def _tree_dir_identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
 
 def _file_identity(value):
@@ -172,6 +197,70 @@ def _file_identity(value):
     )
 
 
+def _consume_node():
+    _used[1] += 1
+    if _used[1] > _limits[1]:
+        _fail()
+
+
+def _consume_file():
+    _used[0] += 1
+    if _used[0] > _limits[0]:
+        _fail()
+
+
+def _consume_bytes(size):
+    if size < 0 or size > _limits[2] - _used[2]:
+        _fail()
+    _used[2] += size
+
+
+def _open_mutation_authority():
+    global _watch_fd
+    libc = ctypes.CDLL(None, use_errno=True)
+    init = libc.inotify_init1
+    init.argtypes = [ctypes.c_int]
+    init.restype = ctypes.c_int
+    _watch_fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
+    if _watch_fd < 0:
+        _fail()
+
+
+def _watch(directory):
+    libc = ctypes.CDLL(None, use_errno=True)
+    add = libc.inotify_add_watch
+    add.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    add.restype = ctypes.c_int
+    watch = add(
+        _watch_fd,
+        os.fsencode("/proc/self/fd/" + str(directory)),
+        _IN_MUTATION_MASK,
+    )
+    if watch < 0:
+        _fail()
+    _watches.add(watch)
+
+
+def _require_quiet():
+    while True:
+        try:
+            payload = os.read(_watch_fd, 65536)
+        except BlockingIOError:
+            return
+        if not payload:
+            _fail()
+        offset = 0
+        while offset < len(payload):
+            if len(payload) - offset < _EVENT.size:
+                _fail()
+            watch, mask, _cookie, name_size = _EVENT.unpack_from(payload, offset)
+            offset += _EVENT.size + name_size
+            if offset > len(payload):
+                _fail()
+            if watch not in _watches or mask & (_IN_MUTATION_MASK | _IN_Q_OVERFLOW | _IN_IGNORED):
+                _fail()
+
+
 def _open_absolute_root(value):
     if not isinstance(value, str) or not value.startswith("/"):
         _fail()
@@ -183,7 +272,7 @@ def _open_absolute_root(value):
     for part in parts:
         parent = descriptors[-1]
         child = os.open(part, _DIR_FLAGS, dir_fd=parent)
-        identity = _dir_identity(os.fstat(child))
+        identity = _path_dir_identity(os.fstat(child))
         if not stat.S_ISDIR(identity[2]):
             _fail()
         bindings.append((parent, part, child, identity))
@@ -196,7 +285,8 @@ def _open_optional_dir(parent, name):
         descriptor = os.open(name, _DIR_FLAGS, dir_fd=parent)
     except FileNotFoundError:
         return None
-    identity = _dir_identity(os.fstat(descriptor))
+    _consume_node()
+    identity = _tree_dir_identity(os.fstat(descriptor))
     if not stat.S_ISDIR(identity[2]):
         _fail()
     return descriptor, (parent, name, descriptor, identity)
@@ -204,10 +294,19 @@ def _open_optional_dir(parent, name):
 
 def _verify_binding(binding):
     parent, name, descriptor, expected = binding
-    if _dir_identity(os.fstat(descriptor)) != expected:
+    if _path_dir_identity(os.fstat(descriptor)) != expected:
         _fail()
     observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
-    if _dir_identity(observed) != expected:
+    if _path_dir_identity(observed) != expected:
+        _fail()
+
+
+def _verify_tree_binding(binding):
+    parent, name, descriptor, expected = binding
+    if _tree_dir_identity(os.fstat(descriptor)) != expected:
+        _fail()
+    observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if _tree_dir_identity(observed) != expected:
         _fail()
 
 
@@ -218,6 +317,7 @@ def _present_names(parent, names):
             os.stat(name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
             continue
+        _consume_node()
         present.append(name)
     return present
 
@@ -225,6 +325,7 @@ def _present_names(parent, names):
 def _target_names(parent):
     names = []
     for name in os.listdir(parent):
+        _consume_node()
         if not name.endswith(".md"):
             continue
         try:
@@ -246,14 +347,16 @@ def _require_missing(parent, name):
 
 
 def _scan_file(parent, name, relative_path, budget):
+    del budget
     named_before = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if (
         not stat.S_ISREG(named_before.st_mode)
         or named_before.st_nlink != 1
         or named_before.st_size < 0
-        or named_before.st_size > _MAX_BYTES - budget[0]
+        or named_before.st_size > _limits[2] - _used[2]
     ):
         _fail()
+    _consume_file()
     descriptor = os.open(name, _FILE_FLAGS, dir_fd=parent)
     try:
         opened_before = os.fstat(descriptor)
@@ -265,10 +368,9 @@ def _scan_file(parent, name, relative_path, budget):
             chunk = os.read(descriptor, min(65536, remaining))
             if not chunk:
                 _fail()
+            _consume_bytes(len(chunk))
             digest.update(chunk)
             remaining -= len(chunk)
-        if os.read(descriptor, 1):
-            _fail()
         opened_after = os.fstat(descriptor)
         named_after = os.stat(name, dir_fd=parent, follow_symlinks=False)
         if (
@@ -278,7 +380,6 @@ def _scan_file(parent, name, relative_path, budget):
             _fail()
     finally:
         os.close(descriptor)
-    budget[0] += opened_before.st_size
     return {
         "relative_path": relative_path,
         "size_bytes": opened_before.st_size,
@@ -287,6 +388,13 @@ def _scan_file(parent, name, relative_path, budget):
 
 
 def _main():
+    if (
+        len(sys.argv) != 6
+        or not 0 <= _limits[0] <= _CLOSED_MAX_FILES
+        or not 0 <= _limits[1] <= _CLOSED_MAX_NODES
+        or not 0 <= _limits[2] <= _CLOSED_MAX_BYTES
+    ):
+        _fail()
     root_files = json.loads(sys.argv[2])
     if (
         not isinstance(root_files, list)
@@ -297,50 +405,71 @@ def _main():
     descriptors, bindings = _open_absolute_root(sys.argv[1])
     optional_descriptors = []
     try:
+        _open_mutation_authority()
         root = descriptors[-1]
+        _watch(root)
+        root_identity = _tree_dir_identity(os.fstat(root))
         root_before = _present_names(root, root_files)
         openhands = _open_optional_dir(root, ".openhands")
         microagents = None
         microagent_names = []
         if openhands is not None:
             optional_descriptors.append(openhands[0])
+            _watch(openhands[0])
             microagents = _open_optional_dir(openhands[0], "microagents")
             if microagents is not None:
                 optional_descriptors.append(microagents[0])
+                _watch(microagents[0])
                 microagent_names = _target_names(microagents[0])
 
-        if len(root_before) + len(microagent_names) > _MAX_FILES:
-            _fail()
-        budget = [0]
-        files = [_scan_file(root, name, name, budget) for name in root_before]
+        files = [_scan_file(root, name, name, None) for name in root_before]
         if microagents is not None:
             files.extend(
                 _scan_file(
                     microagents[0],
                     name,
                     ".openhands/microagents/" + name,
-                    budget,
+                    None,
                 )
                 for name in microagent_names
             )
 
         if _present_names(root, root_files) != root_before:
             _fail()
+        if _tree_dir_identity(os.fstat(root)) != root_identity:
+            _fail()
         if openhands is None:
             _require_missing(root, ".openhands")
         else:
-            _verify_binding(openhands[1])
             if microagents is None:
                 _require_missing(openhands[0], "microagents")
             else:
                 if _target_names(microagents[0]) != microagent_names:
                     _fail()
-                _verify_binding(microagents[1])
+                _verify_tree_binding(microagents[1])
+            _verify_tree_binding(openhands[1])
         for binding in reversed(bindings):
             _verify_binding(binding)
+        _require_quiet()
         files.sort(key=lambda item: item["relative_path"])
-        sys.stdout.write(json.dumps(files, sort_keys=True, separators=(",", ":")))
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "schema_version": "1",
+                    "files": files,
+                    "consumed": {
+                        "files": _used[0],
+                        "nodes": _used[1],
+                        "bytes": _used[2],
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     finally:
+        if _watch_fd >= 0:
+            os.close(_watch_fd)
         for descriptor in reversed(optional_descriptors):
             os.close(descriptor)
         for descriptor in reversed(descriptors):
@@ -1158,35 +1287,52 @@ async def _runtime_injection_receipt_from_readback(
     target_dir: str,
     plan: RuntimeInjectionPlan,
 ) -> dict[str, object]:
-    with TemporaryDirectory(prefix="openevo-evolution-readback-") as temporary:
-        readback_root = Path(temporary)
-        await runtime.download_dir(target_dir, str(readback_root / "evolution"))
-        with ArtifactPayloadService(readback_root) as payloads:
-            snapshot = payloads.issue_snapshot(
-                artifact_id="runtime-readback",
-                artifact_type="runtime_readback",
-                name="runtime-readback",
-                uri=readback_root.as_uri(),
-                manifest={},
-                scores={},
-                rank_index=0,
-            )
+    budget = RuntimeReadbackBudget()
+    temporary = TemporaryDirectory(prefix="openevo-evolution-readback-")
+    try:
+        readback_root = Path(temporary.name)
+        if not isinstance(runtime, BaseRuntime):
+            raise TypeError("runtime injection receipt requires a trusted runtime")
+        readback = await BaseRuntime.download_dir(
+            runtime,
+            target_dir,
+            str(readback_root / "evolution"),
+            budget=budget,
+        )
         files = [
             {
-                "relative_path": entry.relative_path,
+                "relative_path": f"evolution/{entry.relative_path}",
                 "size_bytes": entry.size_bytes,
                 "sha256": entry.sha256,
             }
-            for entry in snapshot.payload_entries
+            for entry in readback.files
         ]
         if plan.agent_system_targets:
-            files.extend(await _runtime_agent_system_target_inventory(runtime))
+            files.extend(
+                await _runtime_agent_system_target_inventory(
+                    runtime,
+                    budget=budget,
+                )
+            )
             files.sort(key=lambda item: str(item["relative_path"]))
-    return receipt_from_runtime_readback(plan.authority, files)
+        return receipt_from_runtime_readback(plan.authority, files)
+    finally:
+        cleanup = asyncio.create_task(asyncio.to_thread(temporary.cleanup))
+        cleanup_cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+        cleanup.result()
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
 
 
 async def _runtime_agent_system_target_inventory(
     runtime: BaseRuntime,
+    *,
+    budget: RuntimeReadbackBudget,
 ) -> list[dict[str, object]]:
     target_root = _agent_system_target_root(runtime)
     if not target_root.is_absolute():
@@ -1201,23 +1347,52 @@ async def _runtime_agent_system_target_inventory(
             shlex.quote(_AGENT_SYSTEM_TARGET_READBACK_SCRIPT),
             shlex.quote(target_root.as_posix()),
             shlex.quote(root_files),
+            str(budget.remaining_files),
+            str(budget.remaining_nodes),
+            str(budget.remaining_bytes),
         )
     )
-    result = await runtime.exec(command, timeout_sec=30.0)
+    try:
+        result = await runtime.exec(command, timeout_sec=30.0)
+    except BaseException:
+        budget.exhaust()
+        raise
     if (
         result is None
         or getattr(result, "return_code", None) != 0
         or not isinstance(getattr(result, "stdout", None), str)
     ):
+        budget.exhaust()
         raise ValueError("runtime agent-system target readback failed")
     payload = result.stdout
     if len(payload.encode("utf-8")) > 2 * 1024 * 1024:
+        budget.exhaust()
         raise ValueError("runtime agent-system target inventory exceeds its byte bound")
     try:
-        values = json.loads(payload)
+        document = json.loads(payload)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        budget.exhaust()
         raise ValueError("runtime agent-system target inventory is invalid") from exc
-    if not isinstance(values, list):
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "files",
+        "consumed",
+    }:
+        budget.exhaust()
+        raise ValueError("runtime agent-system target inventory is invalid")
+    values = document.get("files")
+    consumed = document.get("consumed")
+    if (
+        document.get("schema_version") != "1"
+        or not isinstance(values, list)
+        or not isinstance(consumed, dict)
+        or set(consumed) != {"files", "nodes", "bytes"}
+        or any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in consumed.values()
+        )
+    ):
+        budget.exhaust()
         raise ValueError("runtime agent-system target inventory is invalid")
     files: list[dict[str, object]] = []
     for value in values:
@@ -1226,23 +1401,50 @@ async def _runtime_agent_system_target_inventory(
             "size_bytes",
             "sha256",
         }:
+            budget.exhaust()
             raise ValueError("runtime agent-system target inventory is invalid")
         relative_path = value.get("relative_path")
-        if not isinstance(relative_path, str):
+        size_bytes = value.get("size_bytes")
+        digest = value.get("sha256")
+        if (
+            not isinstance(relative_path, str)
+            or not isinstance(size_bytes, int)
+            or isinstance(size_bytes, bool)
+            or size_bytes < 0
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+        ):
+            budget.exhaust()
             raise ValueError("runtime agent-system target inventory is invalid")
         try:
             normalized = normalize_agent_system_target_path(relative_path)
         except ValueError as exc:
+            budget.exhaust()
             raise ValueError("runtime agent-system target inventory is invalid") from exc
         if normalized != relative_path:
+            budget.exhaust()
             raise ValueError("runtime agent-system target inventory is not canonical")
         files.append(
             {
                 "relative_path": f"agent_system_targets/{relative_path}",
-                "size_bytes": value.get("size_bytes"),
-                "sha256": value.get("sha256"),
+                "size_bytes": size_bytes,
+                "sha256": digest,
             }
         )
+    if (
+        consumed["files"] != len(files)
+        or consumed["bytes"] != sum(int(item["size_bytes"]) for item in files)
+    ):
+        budget.exhaust()
+        raise ValueError("runtime agent-system target inventory is invalid")
+    try:
+        budget.consume_report(
+            files=consumed["files"],
+            nodes=consumed["nodes"],
+            bytes_read=consumed["bytes"],
+        )
+    except RuntimePathSecurityError as exc:
+        raise ValueError("runtime agent-system target inventory exceeds its budget") from exc
     return files
 
 

@@ -105,6 +105,39 @@ does not silently inject an unrelated or stale artifact. Injection evidence
 records the selected IDs, rejected incompatible IDs, staged paths, and payload
 integrity.
 
+## Runtime Readback Receipt
+
+Gateway publishes a runtime injection receipt only after harness postprocessing
+and a Core-owned trusted readback of the actual runtime source tree. Docker and
+Apptainer share the base runtime implementation; neither may substitute
+`docker cp`, tar, a backend-provided metadata document, the original upload
+source, or a later scan of the downloaded host copy as source authority.
+
+The runtime walk is no-follow and FD-relative below the pinned session bind.
+Every directory carries strong inode/ctime/mtime identity plus Linux mutation
+generation evidence, is enumerated in sorted order before copying, and is
+enumerated again after all descendants have been streamed. File bytes are
+hashed while copied in bounded chunks. Source additions, removals, rename or
+replace/restore ABA, in-place changes, growth, symlinks, hardlinks, and special
+files reject the receipt. Host output uses a private staging tree and atomic
+no-replace publication so a failed attempt cannot overwrite or delete a raced
+replacement.
+
+One non-refundable `RuntimeReadbackBudget` covers the canonical evolution tree
+and the separate agent-system target scan. Its closed maxima exactly match the
+receipt payload limits of 4096 files and 64 MiB; the 16384 node-attempt bound
+covers both mandatory directory enumerations. Failed or cancelled remote target
+inventory pessimistically exhausts the remaining authority when exact progress
+cannot be recovered. All synchronous traversal and cleanup runs in controlled
+worker threads, and cancellation waits for the worker to stop before runtime
+teardown proceeds.
+
+Gateway builds receipt v3 from the source-stream inventory. The Core run owner
+still reconstructs the expected rendering from the pinned context/revision and
+authoritative artifact bytes, then compares every ordered file digest,
+instruction digest, artifact runtime path, and tree digest before allowing the
+session to succeed.
+
 ## Benchmark/Science Consumers
 
 Benchmark/science consumers share the same Core runtime injection contract.

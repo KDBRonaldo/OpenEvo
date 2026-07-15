@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 from openevo.runtime import base as runtime_base
-from openevo.runtime.base import BaseRuntime, RuntimePathSecurityError
+from openevo.runtime import factory as runtime_factory
+from openevo.runtime.apptainer import ApptainerRuntime
+from openevo.runtime.base import (
+    BaseRuntime,
+    RuntimePathSecurityError,
+    RuntimeReadbackBudget,
+)
+from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
@@ -42,17 +51,50 @@ class ProbeRuntime(BaseRuntime):
     async def upload_dir(self, local_path: str, remote_path: str) -> None:
         del local_path, remote_path
 
-    async def download_file(self, remote_path: str, local_path: str) -> None:
-        del remote_path, local_path
-
-    async def download_dir(self, remote_path: str, local_path: str) -> None:
-        del remote_path, local_path
-
 
 def _runtime(tmp_path: Path) -> ProbeRuntime:
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     return ProbeRuntime(RuntimeSpec(image="runtime:latest"), "session", session_dir)
+
+
+def test_builtin_backends_share_the_core_owned_trusted_download_contract() -> None:
+    assert DockerRuntime.download_file is BaseRuntime.download_file
+    assert DockerRuntime.download_dir is BaseRuntime.download_dir
+    assert ApptainerRuntime.download_file is BaseRuntime.download_file
+    assert ApptainerRuntime.download_dir is BaseRuntime.download_dir
+
+
+def test_runtime_factory_rejects_backend_readback_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadbackOverrideRuntime(ProbeRuntime):
+        async def download_dir(
+            self,
+            remote_path: str,
+            local_path: str,
+            *,
+            budget: RuntimeReadbackBudget,
+        ) -> object:
+            del remote_path, local_path, budget
+            return object()
+
+    monkeypatch.setattr(
+        runtime_factory,
+        "_import_runtime_class",
+        lambda _import_path: ReadbackOverrideRuntime,
+    )
+
+    with pytest.raises(ValueError, match="cannot override"):
+        runtime_factory.create_runtime(
+            RuntimeSpec(
+                image="runtime:latest",
+                import_path="tests.runtime:ReadbackOverrideRuntime",
+            ),
+            "plugin-session",
+            tmp_path / "plugin-session",
+        )
 
 
 @pytest.mark.parametrize(
@@ -116,6 +158,480 @@ def test_copy_to_bind_mount_rejects_final_symlink_without_overwriting_outside(
         )
 
     assert outside.read_text(encoding="utf-8") == "outside remains"
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_publishes_stable_private_tree_and_source_inventory(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    nested = source / "skills" / "parser"
+    nested.mkdir(parents=True)
+    (source / "instruction.txt").write_bytes(b"use stable context")
+    (nested / "SKILL.md").write_bytes(b"stable skill")
+    target = tmp_path / "readback" / "evolution"
+    budget = RuntimeReadbackBudget()
+
+    result = await runtime.download_dir(
+        "/openevo/session/evolution",
+        str(target),
+        budget=budget,
+    )
+
+    assert [(item.relative_path, item.size_bytes, item.sha256) for item in result.files] == [
+        (
+            "instruction.txt",
+            len(b"use stable context"),
+            hashlib.sha256(b"use stable context").hexdigest(),
+        ),
+        (
+            "skills/parser/SKILL.md",
+            len(b"stable skill"),
+            hashlib.sha256(b"stable skill").hexdigest(),
+        ),
+    ]
+    assert (target / "instruction.txt").read_bytes() == b"use stable context"
+    assert (target / "skills" / "parser" / "SKILL.md").read_bytes() == b"stable skill"
+    assert (target.stat().st_mode & 0o777) == 0o700
+    assert ((target / "instruction.txt").stat().st_mode & 0o777) == 0o600
+    assert budget.files_consumed == 2
+    assert budget.bytes_consumed == len(b"use stable contextstable skill")
+    assert budget.nodes_consumed == 8
+    assert list(target.parent.glob(".*.openevo-readback-*")) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ["late_file", "remove", "rename", "add_remove_aba", "replace_restore"],
+)
+async def test_trusted_readback_rejects_source_tree_mutation_after_enumeration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    payload = source / "memory.md"
+    payload.write_bytes(b"stable memory")
+    target = tmp_path / "readback" / "evolution"
+    original_copy = runtime_base._copy_readback_regular_file
+    mutated = False
+
+    def mutate_after_copy(*args, **kwargs):
+        nonlocal mutated
+        result = original_copy(*args, **kwargs)
+        if not mutated:
+            mutated = True
+            if mutation == "late_file":
+                (source / "late.md").write_bytes(b"late")
+            elif mutation == "remove":
+                payload.unlink()
+            elif mutation == "rename":
+                payload.rename(source / "renamed.md")
+            elif mutation == "add_remove_aba":
+                transient = source / "transient.md"
+                transient.write_bytes(b"transient")
+                transient.unlink()
+            else:
+                displaced = source / "memory.original"
+                payload.rename(displaced)
+                payload.write_bytes(b"replacement")
+                payload.unlink()
+                displaced.rename(payload)
+        return result
+
+    monkeypatch.setattr(runtime_base, "_copy_readback_regular_file", mutate_after_copy)
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimePathSecurityError, match="changed"):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=budget,
+        )
+
+    assert mutated is True
+    assert not target.exists()
+    assert list(target.parent.glob(".*.openevo-readback-*")) == []
+    assert budget.files_consumed == 1
+    assert budget.bytes_consumed == len(b"stable memory")
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_rejects_in_place_source_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    payload = source / "memory.md"
+    payload.write_bytes(b"stable memory")
+    target = tmp_path / "readback" / "evolution"
+    original_pread = runtime_base.os.pread
+    mutated = False
+
+    def mutate_during_read(descriptor: int, size: int, offset: int) -> bytes:
+        nonlocal mutated
+        chunk = original_pread(descriptor, size, offset)
+        if not mutated:
+            mutated = True
+            payload.write_bytes(b"changed bytes")
+        return chunk
+
+    monkeypatch.setattr(runtime_base.os, "pread", mutate_during_read)
+
+    with pytest.raises(RuntimePathSecurityError, match="changed"):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=RuntimeReadbackBudget(),
+        )
+
+    assert mutated is True
+    assert not target.exists()
+    assert list(target.parent.glob(".*.openevo-readback-*")) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_type", ["symlink", "hardlink"])
+async def test_trusted_readback_rejects_linked_source_members(
+    tmp_path: Path,
+    entry_type: str,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    outside = runtime.session_dir / "outside.md"
+    outside.write_bytes(b"outside")
+    member = source / "member.md"
+    if entry_type == "symlink":
+        member.symlink_to(outside)
+    else:
+        os.link(outside, member)
+    target = tmp_path / "readback" / "evolution"
+
+    with pytest.raises(RuntimePathSecurityError, match="link"):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=RuntimeReadbackBudget(),
+        )
+
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_rejects_sparse_file_before_host_payload_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    sparse = source / "sparse.bin"
+    with sparse.open("wb") as stream:
+        stream.truncate(runtime_base.RUNTIME_READBACK_MAX_BYTES + 1)
+    target = tmp_path / "readback" / "evolution"
+    budget = RuntimeReadbackBudget()
+    writes = 0
+    original_pwrite = runtime_base.os.pwrite
+
+    def record_write(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        return original_pwrite(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_base.os, "pwrite", record_write)
+
+    with pytest.raises(RuntimePathSecurityError, match="byte budget"):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=budget,
+        )
+
+    assert budget.bytes_consumed == 0
+    assert writes == 0
+    assert not target.exists()
+    assert list(target.parent.glob(".*.openevo-readback-*")) == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_rejects_file_growth_during_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    growing = source / "growing.bin"
+    growing.write_bytes(b"initial")
+    target = tmp_path / "readback" / "evolution"
+    original_pread = runtime_base.os.pread
+    grew = False
+
+    def grow_after_read(descriptor: int, size: int, offset: int) -> bytes:
+        nonlocal grew
+        chunk = original_pread(descriptor, size, offset)
+        if not grew:
+            grew = True
+            with growing.open("ab") as stream:
+                stream.write(b"growth")
+        return chunk
+
+    monkeypatch.setattr(runtime_base.os, "pread", grow_after_read)
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimePathSecurityError, match="changed"):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=budget,
+        )
+
+    assert grew is True
+    assert budget.bytes_consumed == len(b"initial")
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_file_budget_stops_before_any_payload_publish(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    for index in range(3):
+        (source / f"{index}.txt").write_bytes(b"x")
+    target = tmp_path / "readback" / "evolution"
+    budget = RuntimeReadbackBudget(max_files=2)
+
+    with pytest.raises(RuntimePathSecurityError, match="file budget"):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=budget,
+        )
+
+    assert budget.files_consumed == 3
+    assert budget.bytes_consumed == 0
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_default_file_limit_rejects_large_inventory_before_copy(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    for index in range(runtime_base.RUNTIME_READBACK_MAX_FILES + 1):
+        (source / f"{index:04d}.txt").touch()
+    target = tmp_path / "readback" / "evolution"
+    budget = RuntimeReadbackBudget()
+
+    with pytest.raises(RuntimePathSecurityError, match="file budget"):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=budget,
+        )
+
+    assert budget.files_consumed == runtime_base.RUNTIME_READBACK_MAX_FILES + 1
+    assert budget.bytes_consumed == 0
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_node_attempt_budget_is_non_refundable(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"a")
+    (source / "b.txt").write_bytes(b"b")
+    target = tmp_path / "readback" / "evolution"
+    budget = RuntimeReadbackBudget(max_nodes=2)
+
+    with pytest.raises(RuntimePathSecurityError, match="node budget"):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=budget,
+        )
+
+    assert budget.nodes_consumed == 3
+    assert budget.files_consumed == 2
+    assert budget.bytes_consumed == 2
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_cancellation_waits_for_private_staging_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    (source / "memory.md").write_bytes(b"memory")
+    target = tmp_path / "readback" / "evolution"
+    original_copy = runtime_base._copy_readback_regular_file
+    original_discard = runtime_base._discard_readback_staging
+    started = threading.Event()
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+
+    def wait_for_cancel(*args, **kwargs):
+        cancellation = kwargs["cancellation"]
+        started.set()
+        while not cancellation.is_set():
+            time.sleep(0.005)
+        return original_copy(*args, **kwargs)
+
+    def delayed_discard(*args, **kwargs):
+        cleanup_started.set()
+        assert release_cleanup.wait(1)
+        return original_discard(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_base, "_copy_readback_regular_file", wait_for_cancel)
+    monkeypatch.setattr(runtime_base, "_discard_readback_staging", delayed_discard)
+    task = asyncio.create_task(
+        runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=RuntimeReadbackBudget(),
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    task.cancel()
+    assert await asyncio.to_thread(cleanup_started.wait, 1)
+    task.cancel()
+    assert not task.done()
+    release_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not target.exists()
+    assert list(target.parent.glob(".*.openevo-readback-*")) == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_timeout_cancels_worker_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    (source / "memory.md").write_bytes(b"memory")
+    target = tmp_path / "readback" / "evolution"
+    original_copy = runtime_base._copy_readback_regular_file
+
+    def wait_for_cancel(*args, **kwargs):
+        cancellation = kwargs["cancellation"]
+        while not cancellation.is_set():
+            time.sleep(0.005)
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_base, "_copy_readback_regular_file", wait_for_cancel)
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            runtime.download_dir(
+                "/openevo/session/evolution",
+                str(target),
+                budget=RuntimeReadbackBudget(),
+            ),
+            timeout=0.05,
+        )
+
+    assert not target.exists()
+    assert list(target.parent.glob(".*.openevo-readback-*")) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_timing", ["before_publish", "after_publish"])
+async def test_trusted_readback_never_removes_replacement_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_timing: str,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    (source / "memory.md").write_bytes(b"memory")
+    target = tmp_path / "readback" / "evolution"
+    displaced = target.with_name("displaced-readback")
+    original_rename = runtime_base._rename_readback_noreplace
+
+    def replace_target(source_fd: int, source_name: str, target_fd: int, target_name: str) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if replacement_timing == "before_publish":
+            target.mkdir()
+            (target / "owner.txt").write_text("replacement", encoding="utf-8")
+            original_rename(source_fd, source_name, target_fd, target_name)
+            return
+        original_rename(source_fd, source_name, target_fd, target_name)
+        target.rename(displaced)
+        target.mkdir()
+        (target / "owner.txt").write_text("replacement", encoding="utf-8")
+
+    monkeypatch.setattr(runtime_base, "_rename_readback_noreplace", replace_target)
+
+    with pytest.raises(RuntimePathSecurityError):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=RuntimeReadbackBudget(),
+        )
+
+    assert (target / "owner.txt").read_text(encoding="utf-8") == "replacement"
+    assert list(target.parent.glob(".*.openevo-readback-*")) == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_readback_removes_its_failed_published_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = runtime.session_dir / "evolution"
+    source.mkdir()
+    (source / "memory.md").write_bytes(b"memory")
+    target = tmp_path / "readback" / "evolution"
+    original_verify = runtime_base._verify_readback_target_directory
+    verifications = 0
+
+    def reject_post_publish(*args, **kwargs):
+        nonlocal verifications
+        verifications += 1
+        original_verify(*args, **kwargs)
+        if verifications == 2:
+            raise RuntimePathSecurityError("post-publication mutation")
+
+    monkeypatch.setattr(
+        runtime_base,
+        "_verify_readback_target_directory",
+        reject_post_publish,
+    )
+
+    with pytest.raises(RuntimePathSecurityError, match="post-publication"):
+        await runtime.download_dir(
+            "/openevo/session/evolution",
+            str(target),
+            budget=RuntimeReadbackBudget(),
+        )
+
+    assert verifications == 2
+    assert not target.exists()
+    assert list(target.parent.glob(".*.openevo-readback-*")) == []
 
 
 def test_copy_from_bind_mount_rejects_parent_symlink_without_reading_outside(

@@ -11,8 +11,8 @@ and out, then tear it down.
   stages of a session.
 - The host session directory is **bind-mounted** to a fixed in-container path,
   `/openevo/session` (`RUNTIME_SESSION_DIR`). Uploads/downloads under that path
-  use descriptor-relative host-side copies; paths outside it fall back to
-  `docker cp` / `tar` streaming.
+  use descriptor-relative host-side copies. Trusted downloads outside that bind
+  fail closed; Docker and Apptainer do not fall back to `docker cp` or tar.
 - Commands run in a login shell (`bash -lc`) with working directory
   `cwd or spec.workdir or /openevo/session`.
 - The factory verifies the chosen backend actually supports what the spec asks
@@ -30,9 +30,13 @@ and out, then tear it down.
 
 ## The contract
 
-A backend implements `start`, `stop`, `exec`, `upload_file`, `upload_dir`,
-`download_file`, `download_dir` (plus `cancel`), hiding container details from
-harnesses and evaluators. Well-known in-container paths (from `base.py`) are
+A backend implements `start`, `stop`, `exec`, `upload_file`, and `upload_dir`
+(plus `cancel`), hiding container details from harnesses and evaluators. Core's
+base runtime owns the final `download_file` and `download_dir` implementations;
+callers must pass one explicit `RuntimeReadbackBudget` and receive a
+source-stream `RuntimeReadback` inventory. Runtime factory admission rejects
+plugin backends that override either method, and Base dispatch cannot be
+redirected through a subclass private hook. Well-known in-container paths (from `base.py`) are
 `/openevo/session` and, under it, `artifacts/`, `logs/`, `logs/agent/`,
 `logs/eval/`, and `eval_artifacts/`. Those container-visible log paths are
 agent/runtime workspace paths. Gateway-owned step stdout/stderr is persisted in
@@ -58,6 +62,35 @@ reject links and special-file leaves, and recheck root, ancestor, leaf, owner,
 link count, and inode bindings after transfer. A `..` component, symlink, or
 concurrent directory replacement fails closed without falling back to a
 pathname copy.
+
+## Trusted runtime readback
+
+One injection readback shares a non-refundable closed budget across the
+evolution tree and agent-system target inventory: at most 4096 files, 64 MiB of
+streamed file bytes, and 16384 source-node enumeration attempts. The node limit
+allows two complete ordered enumerations of a maximally nested 4096-file tree;
+failed enumeration, open, copy, hash, and remote target attempts retain the
+resources already consumed. Limits may be reduced for tests or narrower
+consumers but cannot be raised above this contract.
+
+The source path must resolve below the held `/openevo/session` bind. Core pins
+every ancestor and traverses directories relative to no-follow FDs. Each source
+directory is bound to device/inode, ownership, mode, link count, size, mtime,
+ctime, and a Linux inotify mutation generation. Core records sorted entries,
+streams each single-link regular file in bounded chunks while hashing and
+charging bytes, then re-enumerates every directory and compares the complete
+ordered entry identities. Late additions, removals, rename or replace/restore
+ABA, in-place writes, growth, links, and special files fail the whole readback.
+A sparse or declared-large file is rejected against remaining capacity before
+any host payload file is created.
+
+Host output is built below a random `0700` staging directory with `0600` files,
+fsynced, rechecked by held descriptors, and published with Linux
+`renameat2(RENAME_NOREPLACE)`. Normal failure removes the identity-bound partial
+staging tree; a raced destination replacement is never overwritten or removed.
+The synchronous FD walk runs in a controlled worker thread. Timeout or task
+cancellation signals that worker and waits for bounded cleanup before returning
+to the event loop.
 
 ## Docker vs Apptainer
 
