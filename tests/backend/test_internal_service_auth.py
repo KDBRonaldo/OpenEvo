@@ -13,6 +13,11 @@ from fastapi import FastAPI
 import pytest
 
 from openevo.evolution.server import create_app
+from openevo.evolution.models import (
+    ArtifactRegisterRequest,
+    ArtifactType,
+    ContextResolveRequest,
+)
 from openevo.gateway import server as gateway_server
 from openevo.gateway.session_files import HeldCodexCredentialAuthority
 from openevo.internal_auth import (
@@ -187,6 +192,7 @@ def test_evolution_internal_surface_fails_closed_and_registers_exact_worker(tmp_
     with TestClient(app) as client:
         assert client.get("/v1/health").status_code == 401
         assert client.get("/v1/internal/jobs/missing-job").status_code == 401
+        assert client.get("/v1/internal/contexts/missing/runtime-authority").status_code == 401
         wrong = identity.request_headers()
         wrong["Authorization"] = "Bearer wrong-credential-value-that-is-long-enough"
         assert client.get("/v1/health", headers=wrong).status_code == 401
@@ -202,6 +208,37 @@ def test_evolution_internal_surface_fails_closed_and_registers_exact_worker(tmp_
             ).status_code
             == 404
         )
+        assert (
+            client.get(
+                "/v1/internal/contexts/missing/runtime-authority",
+                headers=identity.request_headers(),
+            ).status_code
+            == 403
+        )
+
+        memory_path = tmp_path / "artifacts" / "authority-memory.md"
+        memory_path.write_text("Exact runtime authority.", encoding="utf-8")
+        memory = app.state.store.register_artifact(
+            ArtifactRegisterRequest(
+                type=ArtifactType.TEXT_MEMORY,
+                name="authority memory",
+                uri=memory_path.as_uri(),
+                promoted=False,
+            )
+        )
+        context = app.state.store.resolve_context(
+            ContextResolveRequest(
+                task_id="authority-task",
+                instruction="Use exact authority.",
+                metadata={"evolution": {"context_artifact_ids": [memory.artifact_id]}},
+            )
+        )
+        authority_response = client.get(
+            f"/v1/internal/contexts/{context.context_id}/runtime-authority",
+            headers=_identity("core-control").request_headers(),
+        )
+        assert authority_response.status_code == 200
+        assert authority_response.json() == context.model_dump(mode="json")
 
         registration = {
             "framework_lock_digest": FRAMEWORK_LOCK,
@@ -216,9 +253,7 @@ def test_evolution_internal_surface_fails_closed_and_registers_exact_worker(tmp_
         )
         assert response.status_code == 200
         assert response.json() == registration
-        workers = client.get("/v1/health", headers=identity.request_headers()).json()[
-            "workers"
-        ]
+        workers = client.get("/v1/health", headers=identity.request_headers()).json()["workers"]
         assert workers == [registration]
 
 

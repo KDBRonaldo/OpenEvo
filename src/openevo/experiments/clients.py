@@ -23,6 +23,8 @@ class EvolutionClientProtocol(Protocol):
 
     def get_artifact(self, artifact_id: str) -> dict[str, Any]: ...
 
+    def get_context_runtime_authority(self, context_id: str) -> dict[str, Any]: ...
+
     def update_artifact_promotion(
         self,
         artifact_id: str,
@@ -168,11 +170,20 @@ class EvolutionHttpClient:
             raise ValueError("evolution artifact response was not a JSON object")
         return result
 
+    def get_context_runtime_authority(self, context_id: str) -> dict[str, Any]:
+        encoded_context_id = quote(context_id, safe="")
+        response = self._client.get(
+            f"{self.base_url}/v1/internal/contexts/{encoded_context_id}/runtime-authority"
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("context runtime authority was not a JSON object")
+        return result
+
     def get_internal_job_result(self, job_id: str) -> dict[str, Any]:
         encoded_job_id = quote(job_id, safe="")
-        response = self._client.get(
-            f"{self.base_url}/v1/internal/jobs/{encoded_job_id}"
-        )
+        response = self._client.get(f"{self.base_url}/v1/internal/jobs/{encoded_job_id}")
         response.raise_for_status()
         result = response.json()
         if not isinstance(result, dict):
@@ -231,9 +242,7 @@ class EvolutionHttpClient:
 
     def list_human_feedback(self, *, review_id: str) -> list[dict[str, Any]]:
         encoded_review_id = quote(review_id, safe="")
-        response = self._client.get(
-            f"{self.base_url}/v1/reviews/{encoded_review_id}/feedback"
-        )
+        response = self._client.get(f"{self.base_url}/v1/reviews/{encoded_review_id}/feedback")
         response.raise_for_status()
         result = response.json()
         if not isinstance(result, list):

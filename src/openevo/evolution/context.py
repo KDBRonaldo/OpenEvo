@@ -96,16 +96,30 @@ def request_uses_subscription_auth(request: ContextCompatibilityRequest) -> bool
 def requested_context_artifact_ids(
     request: ContextCompatibilityRequest,
 ) -> set[str] | None:
+    ordered = requested_context_artifact_order(request)
+    return None if ordered is None else set(ordered)
+
+
+def requested_context_artifact_order(
+    request: ContextCompatibilityRequest,
+) -> tuple[str, ...] | None:
     evolution_metadata = request.metadata.get("evolution")
     if not isinstance(evolution_metadata, dict):
         return None
 
     if "context_artifact_ids" not in evolution_metadata:
         return None
-    values = _string_items(evolution_metadata.get("context_artifact_ids"))
-    if values is None:
-        return set()
-    return {value for value in values if value}
+    raw_values = evolution_metadata.get("context_artifact_ids")
+    if not isinstance(raw_values, (list, tuple)) or len(raw_values) > 256:
+        raise ValueError("requested context artifact inventory is invalid")
+    values: list[str] = []
+    for value in raw_values:
+        if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 256:
+            raise ValueError("requested context artifact inventory is invalid")
+        values.append(value)
+    if len(values) != len(set(values)):
+        raise ValueError("requested context artifact inventory contains duplicates")
+    return tuple(values)
 
 
 def artifact_matches(

@@ -570,6 +570,71 @@ def test_context_resolver_honors_explicit_context_artifact_ids(tmp_path):
     assert context.adapter_merge_spec.adapters == []
     assert adapter.artifact_id not in context.selection["artifact_ids"]
 
+    generic_context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task-a",
+            instruction="continue task",
+            base_model="gpt-5.1-codex-mini",
+            metadata={"task_tags": ["openevo_run_task:run-1:task-a"]},
+        )
+    )
+    assert generic_context.memory["artifact_ids"] == [
+        old_memory.artifact_id,
+        latest_memory.artifact_id,
+    ]
+
+    ordered_context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task-a",
+            instruction="continue task",
+            base_model="gpt-5.1-codex-mini",
+            metadata={
+                "task_tags": ["openevo_run_task:run-1:task-a"],
+                "evolution": {
+                    "context_artifact_ids": [
+                        latest_memory.artifact_id,
+                        old_memory.artifact_id,
+                    ]
+                },
+            },
+        )
+    )
+    assert ordered_context.selection["artifact_ids"] == [
+        latest_memory.artifact_id,
+        old_memory.artifact_id,
+    ]
+    assert ordered_context.memory["artifact_ids"] == [
+        latest_memory.artifact_id,
+        old_memory.artifact_id,
+    ]
+    assert ordered_context.memory["rendered_text"] == ("Latest round advice.\n\nOld round advice.")
+    assert store.get_context_runtime_authority(ordered_context.context_id) == ordered_context
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE contexts SET selected_artifact_ids_json = ? WHERE context_id = ?",
+            (json.dumps([old_memory.artifact_id]), ordered_context.context_id),
+        )
+        conn.commit()
+    with pytest.raises(ValueError, match="inconsistent"):
+        store.get_context_runtime_authority(ordered_context.context_id)
+
+    for invalid_ids, message in (
+        ([latest_memory.artifact_id, latest_memory.artifact_id], "duplicates"),
+        ([latest_memory.artifact_id, "artifact-not-in-revision"], "unavailable"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            store.resolve_context(
+                ContextResolveRequest(
+                    task_id="task-a",
+                    instruction="continue task",
+                    base_model="gpt-5.1-codex-mini",
+                    metadata={
+                        "task_tags": ["openevo_run_task:run-1:task-a"],
+                        "evolution": {"context_artifact_ids": invalid_ids},
+                    },
+                )
+            )
+
     adapter_context = store.resolve_context(
         ContextResolveRequest(
             task_id="task-a",

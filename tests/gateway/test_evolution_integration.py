@@ -6,9 +6,11 @@ import hashlib
 import json
 import multiprocessing
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -3985,6 +3987,8 @@ class FakeRuntime:
         self.spec = RuntimeSpec(image="runtime:latest", workdir=workdir)
         self.runtime_session_dir = "/openevo/session"
         self.uploads: dict[str, str] = {}
+        self.runtime_files: dict[str, bytes] = {}
+        self.runtime_dirs: set[str] = set()
         self.exec_commands: list[str] = []
 
     @property
@@ -3993,13 +3997,126 @@ class FakeRuntime:
 
     async def exec(self, command, **kwargs):
         self.exec_commands.append(command)
-        return None
+        if "_OPENEVO_TARGET_READBACK_V1" in command:
+            target_root = (self.spec.workdir or self.runtime_session_dir).rstrip("/")
+            prefix = f"{target_root}/"
+            entries = []
+            for path, payload in self.runtime_files.items():
+                if not path.startswith(prefix):
+                    continue
+                relative_path = path.removeprefix(prefix)
+                parts = relative_path.split("/")
+                if relative_path not in {
+                    "AGENTS.md",
+                    "agents.md",
+                    "CLAUDE.md",
+                    "GEMINI.md",
+                } and not (
+                    len(parts) == 3
+                    and parts[:2] == [".openhands", "microagents"]
+                    and parts[2].endswith(".md")
+                ):
+                    continue
+                entries.append(
+                    {
+                        "relative_path": relative_path,
+                        "size_bytes": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+            entries.sort(key=lambda item: item["relative_path"])
+            return ExecResult(return_code=0, stdout=json.dumps(entries))
+        return ExecResult(return_code=0)
 
     async def upload_file(self, source, target):
-        self.uploads[target] = Path(source).read_text(encoding="utf-8")
+        payload = Path(source).read_bytes()
+        self.uploads[target] = payload.decode("utf-8")
+        self.runtime_files[target] = payload
+        self._record_runtime_parents(target)
 
     async def upload_dir(self, source, target):
         self.uploads[target] = str(source)
+        self.runtime_dirs.add(target.rstrip("/"))
+        source_root = Path(source)
+        for path in source_root.rglob("*"):
+            if path.is_file():
+                remote = f"{target.rstrip('/')}/{path.relative_to(source_root).as_posix()}"
+                self.runtime_files[remote] = path.read_bytes()
+                self._record_runtime_parents(remote)
+
+    async def download_file(self, remote_path: str, local_path: str) -> None:
+        payload = self.runtime_files.get(remote_path)
+        if payload is None:
+            raise FileNotFoundError(remote_path)
+        target = Path(local_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+
+    async def download_dir(self, remote_path: str, local_path: str) -> None:
+        prefix = f"{remote_path.rstrip('/')}/"
+        if remote_path.rstrip("/") not in self.runtime_dirs and not any(
+            path.startswith(prefix) for path in self.runtime_files
+        ):
+            raise FileNotFoundError(remote_path)
+        target_root = Path(local_path)
+        target_root.mkdir(parents=True, exist_ok=True)
+        for path, payload in self.runtime_files.items():
+            if not path.startswith(prefix):
+                continue
+            target = target_root / path.removeprefix(prefix)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+
+    def _record_runtime_parents(self, path: str) -> None:
+        parent = Path(path).parent.as_posix()
+        while parent not in {"", ".", "/"}:
+            self.runtime_dirs.add(parent)
+            parent = Path(parent).parent.as_posix()
+
+
+class LocalTargetInventoryRuntime:
+    def __init__(self, root: Path) -> None:
+        self.spec = RuntimeSpec(image="runtime:latest", workdir=str(root))
+        self.runtime_session_dir = str(root)
+
+    async def exec(self, command: str, **_kwargs: object) -> ExecResult:
+        completed = subprocess.run(
+            command,
+            shell=True,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return ExecResult(
+            return_code=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_agent_system_target_inventory_is_bounded_and_no_follow(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "AGENTS.md").write_text("actual root target", encoding="utf-8")
+    microagents = tmp_path / ".openhands" / "microagents"
+    microagents.mkdir(parents=True)
+    (microagents / "repo.md").write_text("actual nested target", encoding="utf-8")
+    (microagents / "ignored.txt").write_text("not an instruction target", encoding="utf-8")
+    runtime = LocalTargetInventoryRuntime(tmp_path)
+
+    inventory = await node_module._runtime_agent_system_target_inventory(runtime)
+
+    assert [item["relative_path"] for item in inventory] == [
+        "agent_system_targets/.openhands/microagents/repo.md",
+        "agent_system_targets/AGENTS.md",
+    ]
+    assert inventory[1]["sha256"] == hashlib.sha256(b"actual root target").hexdigest()
+    outside = tmp_path.parent / "outside-target.md"
+    outside.write_text("must not be read", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").symlink_to(outside)
+    with pytest.raises(ValueError, match="target readback failed"):
+        await node_module._runtime_agent_system_target_inventory(runtime)
 
 
 class BindMountRuntime(BaseRuntime):
@@ -4046,10 +4163,12 @@ class BindMountRuntime(BaseRuntime):
         assert copied is True
 
     async def download_file(self, remote_path: str, local_path: str) -> None:
-        return None
+        copied = self._copy_from_bind_mount(remote_path, Path(local_path))
+        assert copied is True
 
     async def download_dir(self, remote_path: str, local_path: str) -> None:
-        return None
+        copied = self._copy_from_bind_mount(remote_path, Path(local_path))
+        assert copied is True
 
 
 @pytest.mark.asyncio
@@ -4224,8 +4343,16 @@ async def test_resolved_store_context_stages_all_text_artifacts(tmp_path):
     assert env["OPENEVO_AGENTS_MD"] == "/openevo/session/AGENTS.md"
 
 
-@pytest.mark.asyncio
-async def test_gateway_runtime_receipt_binds_three_selected_artifacts(tmp_path: Path) -> None:
+async def _stage_gateway_runtime_receipt_context(
+    tmp_path: Path,
+) -> tuple[
+    GatewayNodeManager,
+    ManagedSession,
+    Any,
+    dict[str, Any],
+    list[str],
+    FakeRuntime,
+]:
     memory_text = "Remember the verified parser precedence."
     agent_system_text = "Read the repository instructions before editing."
     skill_text = "---\nname: verified-parser\n---\nUse recursive descent.\n"
@@ -4291,7 +4418,7 @@ async def test_gateway_runtime_receipt_binds_three_selected_artifacts(tmp_path: 
     ).model_dump(mode="json")
     runtime = FakeRuntime()
     manager = GatewayNodeManager.__new__(GatewayNodeManager)
-    manager.evolution = EvolutionConfig(enabled=True, context={"fail_open": False})
+    manager.evolution = EvolutionConfig(enabled=True, context={"fail_open": True})
     manager.evolution_client = FakeEvolutionClient(context=context)
     manager.model_served = "served-model"
     request = SessionDispatchRequest(
@@ -4314,24 +4441,46 @@ async def test_gateway_runtime_receipt_binds_three_selected_artifacts(tmp_path: 
     )
     managed.execution_deadline = asyncio.get_running_loop().time() + 60
 
-    await manager._resolve_and_inject_evolution_context(managed, FakeHarness())
+    injection = await manager._resolve_and_inject_evolution_context(managed, FakeHarness())
+    return manager, managed, injection, context, artifact_ids, runtime
 
-    receipt = request.metadata["evolution"]["runtime_injection_receipt"]
-    assert receipt["schema_version"] == "2"
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_receipt_binds_three_selected_artifacts(tmp_path: Path) -> None:
+    (
+        manager,
+        managed,
+        injection,
+        context,
+        artifact_ids,
+        runtime,
+    ) = await _stage_gateway_runtime_receipt_context(tmp_path)
+    request = managed.request
+    receipt = await node_module._runtime_injection_receipt_from_readback(
+        runtime=runtime,
+        target_dir=manager.evolution.context.target_dir,
+        plan=injection.staged.injection_plan,
+    )
+    manager._publish_runtime_injection_receipt(managed, receipt)
+
+    assert request.metadata["evolution"]["runtime_injection_receipt"] == receipt
+    assert receipt["schema_version"] == "3"
     assert receipt["context_id"] == context["context_id"]
     assert receipt["revision_id"] == "revision-verified"
     assert (
         receipt["instruction_sha256"]
         == hashlib.sha256(request.instruction.encode("utf-8")).hexdigest()
     )
-    assert len(receipt["staged_tree_sha256"]) == 64
+    assert len(receipt["runtime_tree_sha256"]) == 64
+    assert receipt["files"]
     inventory = {item["artifact_id"]: item for item in context["selection"]["artifacts"]}
     received = {item["artifact_id"]: item for item in receipt["artifacts"]}
     assert set(received) == set(artifact_ids)
     for artifact_id, item in received.items():
         assert item["artifact_type"] == inventory[artifact_id]["artifact_type"]
         assert item["content_sha256"] == inventory[artifact_id]["content_sha256"]
-        assert len(item["staged_sha256"]) == 64
+        assert item["runtime_paths"]
+        assert len(item["runtime_tree_sha256"]) == 64
     assert {item["artifact_type"] for item in receipt["artifacts"]} == {
         "agent_system",
         "skill_bundle",
@@ -4339,6 +4488,143 @@ async def test_gateway_runtime_receipt_binds_three_selected_artifacts(tmp_path: 
     }
     assert "file://" not in runtime.uploads["/openevo/session/evolution/context.json"]
     assert str(tmp_path) not in runtime.uploads["/openevo/session/evolution/context.json"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "replace_instruction",
+        "replace_memory",
+        "replace_skill",
+        "extra_skill",
+        "missing_agent_target",
+        "wrong_agent_target",
+        "extra_agent_target",
+    ],
+)
+async def test_gateway_runtime_receipt_fails_closed_on_runtime_readback_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    (
+        manager,
+        managed,
+        injection,
+        _context,
+        _artifact_ids,
+        runtime,
+    ) = await _stage_gateway_runtime_receipt_context(tmp_path)
+    if mutation == "replace_instruction":
+        runtime.runtime_files["/openevo/session/evolution/instruction.txt"] = b"replaced"
+    elif mutation == "replace_memory":
+        runtime.runtime_files["/openevo/session/evolution/memory.md"] = b"replaced"
+    elif mutation == "replace_skill":
+        skill_path = next(
+            path
+            for path in runtime.runtime_files
+            if path.endswith("/SKILL.md") and path.startswith("/openevo/session/evolution/skills/")
+        )
+        runtime.runtime_files[skill_path] = b"replaced"
+    elif mutation == "extra_skill":
+        runtime.runtime_files["/openevo/session/evolution/skills/unexpected/SKILL.md"] = (
+            b"unexpected"
+        )
+    elif mutation == "missing_agent_target":
+        runtime.runtime_files.pop("/openevo/session/AGENTS.md")
+    elif mutation == "wrong_agent_target":
+        runtime.runtime_files["/openevo/session/CLAUDE.md"] = runtime.runtime_files.pop(
+            "/openevo/session/AGENTS.md"
+        )
+    else:
+        runtime.runtime_files["/openevo/session/CLAUDE.md"] = b"unexpected target"
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        await node_module._runtime_injection_receipt_from_readback(
+            runtime=runtime,
+            target_dir=manager.evolution.context.target_dir,
+            plan=injection.staged.injection_plan,
+        )
+
+    assert "runtime_injection_receipt" not in managed.request.metadata["evolution"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_exact_context_renders_revision_memory_order(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "ordered-artifacts"
+    store = EvolutionStore(
+        db_path=tmp_path / "ordered-evolution.db",
+        artifact_root=artifact_root,
+    )
+    store.initialize()
+    sources = artifact_root / "sources"
+    sources.mkdir(parents=True)
+    high_score_source = sources / "high-score.md"
+    low_score_source = sources / "low-score.md"
+    high_score_source.write_text("High score memory.", encoding="utf-8")
+    low_score_source.write_text("Low score memory.", encoding="utf-8")
+    high_score = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="high score memory",
+            uri=high_score_source.as_uri(),
+            scores={"quality": 1.0},
+            promoted=False,
+        )
+    )
+    low_score = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="low score memory",
+            uri=low_score_source.as_uri(),
+            scores={"quality": 0.1},
+            promoted=False,
+        )
+    )
+    artifact_ids = [low_score.artifact_id, high_score.artifact_id]
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="ordered-task",
+            instruction="Use revision order.",
+            metadata={"evolution": {"context_artifact_ids": artifact_ids}},
+        )
+    ).model_dump(mode="json")
+    runtime = FakeRuntime()
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(enabled=True, context={"fail_open": False})
+    manager.evolution_client = FakeEvolutionClient(context=context)
+    manager.model_served = "served-model"
+    request = SessionDispatchRequest(
+        session_id="session-ordered",
+        task_id="ordered-task",
+        instruction="Use revision order.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(harness="fake"),
+        metadata={
+            "openevo": {"revision_id": "revision-ordered"},
+            "evolution": {"context_artifact_ids": artifact_ids},
+        },
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "ordered-session-artifacts",
+        runtime=runtime,
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    injection = await manager._resolve_and_inject_evolution_context(managed, FakeHarness())
+    assert context["selection"]["artifact_ids"] == artifact_ids
+    assert runtime.uploads["/openevo/session/evolution/memory.md"] == (
+        "Low score memory.\n\nHigh score memory."
+    )
+    receipt = await node_module._runtime_injection_receipt_from_readback(
+        runtime=runtime,
+        target_dir=manager.evolution.context.target_dir,
+        plan=injection.staged.injection_plan,
+    )
+    assert [item["artifact_id"] for item in receipt["artifacts"]] == artifact_ids
 
 
 @pytest.mark.asyncio
@@ -4371,7 +4657,7 @@ async def test_gateway_runtime_receipt_rejects_forged_selection_digest(
     ).model_dump(mode="json")
     context["selection"]["artifacts"][0]["content_sha256"] = "0" * 64
     manager = GatewayNodeManager.__new__(GatewayNodeManager)
-    manager.evolution = EvolutionConfig(enabled=True, context={"fail_open": False})
+    manager.evolution = EvolutionConfig(enabled=True, context={"fail_open": True})
     manager.evolution_client = FakeEvolutionClient(context=context)
     manager.model_served = "served-model"
     request = SessionDispatchRequest(
@@ -4732,6 +5018,33 @@ async def test_resolve_and_inject_evolution_context_fail_open_replaces_non_dict_
         "context_injected": False,
         "error": "context_resolution_failed",
     }
+
+
+@pytest.mark.asyncio
+async def test_exact_context_resolution_never_fails_open(tmp_path: Path) -> None:
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(enabled=True, context={"fail_open": True})
+    manager.evolution_client = FakeEvolutionClient(error=RuntimeError("backend down"))
+    manager.model_served = "served-model"
+    request = SessionDispatchRequest(
+        session_id="session-exact-empty",
+        task_id="task-exact-empty",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(harness="fake"),
+        metadata={"evolution": {"context_artifact_ids": []}},
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        runtime=FakeRuntime(),
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    with pytest.raises(RuntimeError, match="backend down"):
+        await manager._resolve_and_inject_evolution_context(managed, FakeHarness())
 
 
 @pytest.mark.asyncio

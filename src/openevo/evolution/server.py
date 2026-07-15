@@ -79,9 +79,7 @@ def create_app(
         else require_verified_executable_registry(executable_registry)
     )
     effective_snapshot = (
-        verified_registry.snapshot
-        if verified_registry is not None
-        else registry_snapshot
+        verified_registry.snapshot if verified_registry is not None else registry_snapshot
     )
     root = Path(artifact_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -133,7 +131,9 @@ def create_app(
             "registry_digest",
             "worker_id",
         }:
-            raise HTTPException(status_code=422, detail="worker registration is not a closed object")
+            raise HTTPException(
+                status_code=422, detail="worker registration is not a closed object"
+            )
         worker_id = payload.get("worker_id")
         generation_digest = payload.get("generation_digest")
         registry_digest = payload.get("registry_digest")
@@ -188,6 +188,25 @@ def create_app(
             return store.resolve_context(request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/internal/contexts/{context_id}/runtime-authority",
+        response_model=ContextResolveResponse,
+    )
+    def get_context_runtime_authority(
+        context_id: str,
+        request: Request,
+    ) -> ContextResolveResponse:
+        if internal_identity is None:
+            raise HTTPException(status_code=404, detail="context runtime authority is disabled")
+        if request.headers.get(INTERNAL_SERVICE_HEADER) != "core-control":
+            raise HTTPException(status_code=403, detail="context authority caller mismatch")
+        try:
+            return store.get_context_runtime_authority(context_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=404, detail="context runtime authority unavailable"
+            ) from exc
 
     @app.post("/v1/datasets", response_model=DatasetCreateResponse)
     def create_dataset(request: DatasetCreateRequest) -> DatasetCreateResponse:

@@ -50,7 +50,7 @@ MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 128 * 1024
 MAX_EVIDENCE_ITEMS = 64
 REQUIRED_TARGET_IDS = ("agent_system", "skill_bundle", "text_memory")
-RUNTIME_CONTEXT_RECEIPT_PREFIX = "Runtime context receipt v2: "
+RUNTIME_CONTEXT_RECEIPT_PREFIX = "Runtime context receipt v3: "
 CONTEXT_CANARY_INSTRUCTION = (
     "\n\nOpenEvo E2E context canary v1: when OPENEVO_MEMORY_FILE, "
     "OPENEVO_SKILLS_DIR, and OPENEVO_AGENT_SYSTEM_FILE are set, read the memory file, "
@@ -179,6 +179,10 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "reused_artifact_count",
         "successor_revision",
         "cleanup",
+        "active_run_cleanup_required",
+        "active_run_cancel_requested",
+        "active_run_cancelled",
+        "active_run_cleanup_succeeded",
         "desktop_disconnect_succeeded",
         "sidecar_shutdown_succeeded",
         "core_ownership_release_requested",
@@ -408,6 +412,7 @@ class DesktopScienceWorkflow:
         self.profile_id: str | None = None
         self.project_id: str | None = None
         self._method_ids: dict[str, str] = {}
+        self._active_run: dict[str, Any] | None = None
 
     def run(self) -> dict[str, object]:
         profile = self._create_and_confirm_profile()
@@ -451,7 +456,73 @@ class DesktopScienceWorkflow:
             "reuse": reuse,
         }
 
-    def cleanup(self) -> bool:
+    def cleanup(self) -> dict[str, bool]:
+        run_cleanup = self._cancel_active_run()
+        return {
+            **run_cleanup,
+            "desktop_disconnect_succeeded": self._disconnect(),
+        }
+
+    def _cancel_active_run(self) -> dict[str, bool]:
+        outcome = {
+            "active_run_cleanup_required": False,
+            "active_run_cancel_requested": False,
+            "active_run_cancelled": False,
+            "active_run_cleanup_succeeded": True,
+        }
+        active = self._active_run
+        if active is None:
+            return outcome
+        outcome["active_run_cleanup_required"] = True
+        try:
+            run_id = _text(active, "id", "cleanup_run_cancel")
+            observed = self._api.request(
+                "GET",
+                f"/desktop/v1/runs/{run_id}",
+                stage="cleanup_run_cancel",
+            )
+            assert observed is not None
+            self._active_run = observed
+            if observed.get("status") in TERMINAL_RUN_STATES:
+                outcome["active_run_cleanup_required"] = False
+                self._active_run = None
+                return outcome
+            cancelling = self._api.request(
+                "POST",
+                f"/desktop/v1/runs/{run_id}/cancel",
+                stage="cleanup_run_cancel",
+                headers={
+                    "Idempotency-Key": self._idempotency(f"cancel-{run_id}"),
+                    "If-Match": _etag(observed, "cleanup_run_cancel"),
+                },
+                expected_status=202,
+            )
+            assert cancelling is not None
+            outcome["active_run_cancel_requested"] = True
+            self._active_run = cancelling
+            deadline = time.monotonic() + 120.0
+            while cancelling.get("status") not in TERMINAL_RUN_STATES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    outcome["active_run_cleanup_succeeded"] = False
+                    return outcome
+                time.sleep(min(self._poll_seconds, remaining, 2.0))
+                cancelling = self._api.request(
+                    "GET",
+                    f"/desktop/v1/runs/{run_id}",
+                    stage="cleanup_run_cancel",
+                )
+                assert cancelling is not None
+                self._active_run = cancelling
+            outcome["active_run_cancelled"] = cancelling.get("status") == "cancelled"
+            outcome["active_run_cleanup_succeeded"] = outcome["active_run_cancelled"]
+            self._active_run = None
+            return outcome
+        except BaseException:
+            outcome["active_run_cleanup_succeeded"] = False
+            return outcome
+
+    def _disconnect(self) -> bool:
         if self.profile_id is None:
             return True
         try:
@@ -473,7 +544,7 @@ class DesktopScienceWorkflow:
                 timeout_seconds=60,
             )
             return operation.get("state") == "succeeded"
-        except Exception:
+        except BaseException:
             return False
 
     def _create_and_confirm_profile(self) -> dict[str, Any]:
@@ -775,6 +846,7 @@ class DesktopScienceWorkflow:
         )
         assert run is not None
         _text(run, "id", f"session_{ordinal}_create")
+        self._active_run = run
         return run
 
     def _wait_run(self, run: dict[str, Any], *, ordinal: int) -> dict[str, Any]:
@@ -791,6 +863,8 @@ class DesktopScienceWorkflow:
             )
             assert observed is not None
             run = observed
+            self._active_run = run
+        self._active_run = None
         return run
 
     def _observe_session(self, run: dict[str, Any], *, ordinal: int) -> SessionObservation:
@@ -2077,6 +2151,10 @@ def main(argv: list[str] | None = None) -> int:
     native: NativeSidecar | None = None
     workflow: DesktopScienceWorkflow | None = None
     cleanup = {
+        "active_run_cleanup_required": False,
+        "active_run_cancel_requested": False,
+        "active_run_cancelled": False,
+        "active_run_cleanup_succeeded": True,
         "desktop_disconnect_succeeded": False,
         "sidecar_shutdown_succeeded": False,
         "core_ownership_release_requested": False,
@@ -2130,13 +2208,19 @@ def main(argv: list[str] | None = None) -> int:
             }
         finally:
             if workflow is not None:
-                cleanup["desktop_disconnect_succeeded"] = workflow.cleanup()
+                cleanup.update(workflow.cleanup())
             if native is not None:
                 cleanup["core_ownership_release_requested"] = True
                 cleanup["sidecar_shutdown_succeeded"] = native.terminate()
             evidence["cleanup"] = cleanup
             evidence["finished_at"] = _utc_now()
-            if evidence.get("outcome") == "passed" and not all(cleanup.values()):
+            cleanup_complete = (
+                cleanup["active_run_cleanup_succeeded"]
+                and cleanup["desktop_disconnect_succeeded"]
+                and cleanup["sidecar_shutdown_succeeded"]
+                and cleanup["core_ownership_release_requested"]
+            )
+            if evidence.get("outcome") == "passed" and not cleanup_complete:
                 evidence["outcome"] = "failed"
                 evidence["failure"] = {
                     "stage": "cleanup",

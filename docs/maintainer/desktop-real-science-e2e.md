@@ -80,15 +80,19 @@ The runner performs these actions only through Desktop Local API v1:
    generation-adjacent revision produced by session 1. Require all three
    session-1 artifacts in session 2's pinned context, require each session-2
    artifact lineage to reference its matching predecessor, and verify the Core
-   runtime-context receipt digest. Gateway creates the v2 receipt only after it
-   resolves and stages the exact admitted artifact set. The receipt binds the
-   pinned revision and context, final instruction SHA-256, staged-tree SHA-256,
-   and each artifact's type, authoritative content SHA-256, and staged SHA-256.
-   Core compares it with the revision-owned artifact summaries before success;
-   runner-returned metadata cannot supply the receipt. No Codex transcript or
-   artifact content is retained in evidence.
-7. Request profile disconnect, then terminate and wait for the sidecar process
-   group. Sidecar shutdown owns tunnel and Core attachment release.
+   runtime-context receipt digest. Gateway creates the v3 receipt only after the
+   harness/postprocess path and a final runtime download/readback. It binds the
+   pinned revision/context, effective instruction SHA-256, complete runtime file
+   inventory/tree, authoritative source content, canonical memory/agent-system
+   files, every skill file, and every agent-system target. Core independently
+   rebuilds the expected rendering from the persisted context before success;
+   runner-returned metadata cannot supply or mutate the receipt. No Codex
+   transcript or artifact content is retained in evidence.
+7. If timeout, interruption, or another failure leaves a nonterminal Desktop run,
+   request cancellation and wait a bounded interval for terminal `cancelled`.
+   Record only boolean cleanup outcome fields; cancellation failure remains a
+   failure. Then request profile disconnect and terminate/wait for the sidecar
+   process group. Sidecar shutdown owns tunnel and Core attachment release.
 
 All polling, activation, run, HTTP, build, and shutdown waits are finite and
 positive. The build timeout is configurable with `--build-timeout-seconds`.

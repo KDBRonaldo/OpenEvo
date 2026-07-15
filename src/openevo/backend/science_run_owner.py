@@ -41,6 +41,7 @@ from openevo.backend.service_supervisor import (
     ServiceRunLease,
 )
 from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
+from openevo.evolution.runtime_injection import build_runtime_injection_plan
 from openevo.experiments import EvolutionHttpClient, RolloutHttpClient, run_experiment
 from openevo.experiments.clients import EvolutionClientProtocol, RolloutClientProtocol
 from openevo.internal_auth import (
@@ -663,6 +664,7 @@ class CoreScienceRunOwner:
             evolution = self._evolution_factory(binding)
             rollout = _AdmittingRolloutClient(
                 rollout_base,
+                evolution_client=evolution,
                 owner=self,
                 run_id=run_id,
                 binding=binding,
@@ -690,9 +692,12 @@ class CoreScienceRunOwner:
                     execution_profile=compiled.execution_profile,
                 )
                 runtime_context_receipt = rollout.runtime_context_receipt
+                runtime_context_authority = rollout.runtime_context_authority
                 result.pop("runtime_context_receipt", None)
+                result.pop("_runtime_context_authority", None)
                 if runtime_context_receipt is not None:
                     result["runtime_context_receipt"] = runtime_context_receipt
+                    result["_runtime_context_authority"] = runtime_context_authority
             finally:
                 for client in (rollout_base, evolution):
                     close = getattr(client, "close", None)
@@ -755,10 +760,12 @@ class CoreScienceRunOwner:
             request = self._ledger.request_for_run(run_id)
             context = _result_context(result)
             runtime_context_receipt = _runtime_context_receipt(result)
+            runtime_context_authority = _runtime_context_authority(result)
             _verify_runtime_context_receipt(
                 runtime_context_receipt,
                 revision_id=request.required_revision.revision.id,
                 artifacts=_runtime_context_artifact_authority(self._ledger, run_id),
+                authority=runtime_context_authority,
             )
             project = self._project_store.get_project(run.project_id)
             predecessor = request.required_revision.revision
@@ -819,7 +826,7 @@ class CoreScienceRunOwner:
                         terminal,
                         sequence,
                         m.LogLevel.INFO,
-                        f"Runtime context receipt v2: {digest}",
+                        f"Runtime context receipt v3: {digest}",
                     )
                 )
             self._ledger.mutate_run_with_evidence(
@@ -1206,26 +1213,36 @@ class _AdmittingRolloutClient:
         self,
         client: RolloutClientProtocol,
         *,
+        evolution_client: EvolutionClientProtocol,
         owner: CoreScienceRunOwner,
         run_id: str,
         binding: ServiceRunBinding,
         cancellation: threading.Event,
     ) -> None:
         self._client = client
+        self._evolution_client = evolution_client
         self._owner = owner
         self._run_id = run_id
         self._binding = binding
         self._cancellation = cancellation
         self._runtime_context_receipt: dict[str, object] | None = None
+        self._runtime_context_authority: dict[str, object] | None = None
         self._expected_context_artifact_ids: tuple[str, ...] = ()
         self._expected_revision_id: str | None = None
         self._expected_context_artifacts: dict[str, dict[str, str]] = {}
+        self._instruction: str | None = None
 
     @property
     def runtime_context_receipt(self) -> dict[str, object] | None:
         if self._runtime_context_receipt is None:
             return None
-        return dict(self._runtime_context_receipt)
+        return _runtime_context_receipt_copy(self._runtime_context_receipt)
+
+    @property
+    def runtime_context_authority(self) -> dict[str, object] | None:
+        if self._runtime_context_authority is None:
+            return None
+        return _runtime_context_receipt_copy(self._runtime_context_authority)
 
     def submit_task(self, payload: dict[str, Any]) -> str:
         if self._cancellation.is_set():
@@ -1250,12 +1267,16 @@ class _AdmittingRolloutClient:
             or len(context_artifact_ids) != len(set(context_artifact_ids))
         ):
             raise ValueError("rollout payload has invalid context artifact identity")
-        self._expected_context_artifact_ids = tuple(sorted(context_artifact_ids))
+        self._expected_context_artifact_ids = tuple(context_artifact_ids)
+        instruction = payload.get("instruction")
+        if not isinstance(instruction, str) or not instruction:
+            raise ValueError("rollout payload has no instruction authority")
+        self._instruction = instruction
         authoritative = _runtime_context_artifact_authority(
             self._owner._ledger,
             self._run_id,
         )
-        if set(self._expected_context_artifact_ids) != set(authoritative):
+        if self._expected_context_artifact_ids != tuple(authoritative):
             raise ValueError("rollout payload context differs from revision authority")
         openevo_metadata = (
             payload_metadata.get("openevo") if isinstance(payload_metadata, dict) else None
@@ -1299,17 +1320,36 @@ class _AdmittingRolloutClient:
             raise _RunCancelled()
         if result.get("status") == "completed":
             receipt = _rollout_runtime_context_receipt(result)
+            authority = None
+            if receipt is not None:
+                if self._expected_revision_id is None or self._instruction is None:
+                    raise ValueError("rollout runtime context authority is incomplete")
+                context = self._evolution_client.get_context_runtime_authority(
+                    cast(str, receipt["context_id"])
+                )
+                authority = build_runtime_injection_plan(
+                    context=context,
+                    revision_id=self._expected_revision_id,
+                    instruction=self._instruction,
+                    expected_artifact_ids=self._expected_context_artifact_ids,
+                ).authority
             _verify_runtime_context_receipt(
                 receipt,
                 revision_id=self._expected_revision_id,
                 artifacts=self._expected_context_artifacts,
+                authority=authority,
             )
             if (
                 self._runtime_context_receipt is not None
                 and self._runtime_context_receipt != receipt
             ):
                 raise RuntimeError("rollout runtime context receipt changed")
-            self._runtime_context_receipt = receipt
+            self._runtime_context_receipt = (
+                None if receipt is None else _runtime_context_receipt_copy(receipt)
+            )
+            self._runtime_context_authority = (
+                None if authority is None else _runtime_context_receipt_copy(authority)
+            )
         return result
 
 
@@ -1541,9 +1581,7 @@ def _rollout_runtime_context_receipt(
     receipt = _validate_runtime_context_receipt(value)
     if evolution.get("context_id") != receipt["context_id"]:
         raise ValueError("science rollout receipt context differs from runtime metadata")
-    if tuple(item["artifact_id"] for item in receipt["artifacts"]) != tuple(
-        sorted(context_artifact_ids)
-    ):
+    if tuple(item["artifact_id"] for item in receipt["artifacts"]) != tuple(context_artifact_ids):
         raise ValueError("science rollout receipt differs from runtime metadata")
     return receipt
 
@@ -1560,57 +1598,130 @@ def _runtime_context_receipt(
     return validated
 
 
+def _runtime_context_authority(
+    result: Mapping[str, object],
+) -> dict[str, object] | None:
+    value = result.get("_runtime_context_authority")
+    if value is None:
+        return None
+    validated = _validate_runtime_context_receipt(value)
+    if validated != value:
+        raise ValueError("science result runtime context authority is not canonical")
+    return validated
+
+
+def _runtime_context_receipt_copy(value: Mapping[str, object]) -> dict[str, object]:
+    copied = json.loads(_canonical_bytes(value))
+    if not isinstance(copied, dict):
+        raise ValueError("science runtime context receipt is invalid")
+    return cast(dict[str, object], copied)
+
+
 def _validate_runtime_context_receipt(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or set(value) != {
         "schema_version",
         "context_id",
         "revision_id",
         "instruction_sha256",
-        "staged_tree_sha256",
+        "runtime_tree_sha256",
+        "files",
         "artifacts",
     }:
         raise ValueError("science runtime context receipt is invalid")
+    files = value.get("files")
     artifacts = value.get("artifacts")
     if (
-        value.get("schema_version") != "2"
+        value.get("schema_version") != "3"
         or not _bounded_identity(value.get("context_id"))
         or not _bounded_identity(value.get("revision_id"))
         or not _sha256(value.get("instruction_sha256"))
-        or not _sha256(value.get("staged_tree_sha256"))
+        or not _sha256(value.get("runtime_tree_sha256"))
+        or not isinstance(files, list)
+        or not 0 < len(files) <= 4096
         or not isinstance(artifacts, list)
         or not 0 < len(artifacts) <= 256
     ):
         raise ValueError("science runtime context receipt is invalid")
-    validated_artifacts: list[dict[str, str]] = []
+    validated_files: list[dict[str, object]] = []
+    total_bytes = 0
+    for file in files:
+        if not isinstance(file, dict) or set(file) != {
+            "relative_path",
+            "size_bytes",
+            "sha256",
+        }:
+            raise ValueError("science runtime context file receipt is invalid")
+        path = file.get("relative_path")
+        size = file.get("size_bytes")
+        digest = file.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not _sha256(digest)
+        ):
+            raise ValueError("science runtime context file receipt is invalid")
+        total_bytes += size
+        validated_files.append({"relative_path": path, "size_bytes": size, "sha256": digest})
+    paths = [cast(str, item["relative_path"]) for item in validated_files]
+    files_by_path = {cast(str, item["relative_path"]): item for item in validated_files}
+    if (
+        total_bytes > 64 * 1024 * 1024
+        or len(paths) != len(set(paths))
+        or paths != sorted(paths)
+        or value["runtime_tree_sha256"]
+        != hashlib.sha256(_canonical_bytes({"files": validated_files})).hexdigest()
+        or files_by_path.get("evolution/instruction.txt", {}).get("sha256")
+        != value["instruction_sha256"]
+    ):
+        raise ValueError("science runtime context file receipt is not canonical")
+    validated_artifacts: list[dict[str, object]] = []
     for artifact in artifacts:
         if not isinstance(artifact, dict) or set(artifact) != {
             "artifact_id",
             "artifact_type",
             "content_sha256",
-            "staged_sha256",
+            "runtime_paths",
+            "runtime_tree_sha256",
         }:
             raise ValueError("science runtime context artifact receipt is invalid")
         artifact_id = artifact.get("artifact_id")
         artifact_type = artifact.get("artifact_type")
+        runtime_paths = artifact.get("runtime_paths")
         if (
             not _bounded_identity(artifact_id)
             or artifact_type not in _CONTEXT_TYPES
             or artifact_type == "dataset"
             or not _sha256(artifact.get("content_sha256"))
-            or not _sha256(artifact.get("staged_sha256"))
+            or not _sha256(artifact.get("runtime_tree_sha256"))
+            or not isinstance(runtime_paths, list)
+            or not runtime_paths
+            or len(runtime_paths) > 4096
+            or not all(isinstance(path, str) and path in files_by_path for path in runtime_paths)
+            or len(runtime_paths) != len(set(runtime_paths))
         ):
             raise ValueError("science runtime context artifact receipt is invalid")
-        validated_artifacts.append(cast(dict[str, str], dict(artifact)))
-    if len({item["artifact_id"] for item in validated_artifacts}) != len(
-        validated_artifacts
-    ) or validated_artifacts != sorted(validated_artifacts, key=lambda item: item["artifact_id"]):
-        raise ValueError("science runtime context artifact receipt is not canonical")
+        runtime_entries = [files_by_path[cast(str, path)] for path in runtime_paths]
+        if (
+            artifact["runtime_tree_sha256"]
+            != hashlib.sha256(_canonical_bytes({"files": runtime_entries})).hexdigest()
+        ):
+            raise ValueError("science runtime context artifact receipt digest is invalid")
+        validated_artifacts.append(dict(artifact))
+    if len({item["artifact_id"] for item in validated_artifacts}) != len(validated_artifacts):
+        raise ValueError("science runtime context artifact receipt is duplicated")
     return {
-        "schema_version": "2",
+        "schema_version": "3",
         "context_id": value["context_id"],
         "revision_id": value["revision_id"],
         "instruction_sha256": value["instruction_sha256"],
-        "staged_tree_sha256": value["staged_tree_sha256"],
+        "runtime_tree_sha256": value["runtime_tree_sha256"],
+        "files": validated_files,
         "artifacts": validated_artifacts,
     }
 
@@ -1621,7 +1732,8 @@ def _runtime_context_artifact_authority(
 ) -> dict[str, dict[str, str]]:
     context = ledger.input_context(run_id)
     expected_types: dict[str, str] = {}
-    for artifact_type, artifact_ids in context.items():
+    for artifact_type in _CONTEXT_TYPES:
+        artifact_ids = context.get(artifact_type, [])
         if artifact_type == "dataset":
             continue
         for artifact_id in artifact_ids:
@@ -1646,18 +1758,27 @@ def _verify_runtime_context_receipt(
     *,
     revision_id: str | None,
     artifacts: Mapping[str, Mapping[str, str]],
+    authority: dict[str, object] | None,
 ) -> None:
     if not artifacts:
-        if receipt is not None:
+        if receipt is not None or authority is not None:
             raise ValueError("science run produced an unexpected runtime context receipt")
         return
-    if receipt is None or receipt.get("revision_id") != revision_id:
+    if (
+        receipt is None
+        or authority is None
+        or receipt.get("revision_id") != revision_id
+        or authority.get("revision_id") != revision_id
+    ):
         raise ValueError("science runtime context receipt revision is invalid")
-    received = cast(list[dict[str, str]], receipt["artifacts"])
-    if {item["artifact_id"] for item in received} != set(artifacts):
+    if receipt != authority:
+        raise ValueError("science runtime context receipt differs from expected rendering")
+    received = cast(list[dict[str, object]], receipt["artifacts"])
+    if tuple(item["artifact_id"] for item in received) != tuple(artifacts):
         raise ValueError("science runtime context receipt membership is invalid")
     for item in received:
-        expected = artifacts[item["artifact_id"]]
+        artifact_id = cast(str, item["artifact_id"])
+        expected = artifacts[artifact_id]
         if (
             item["artifact_type"] != expected["artifact_type"]
             or item["content_sha256"] != expected["content_sha256"]

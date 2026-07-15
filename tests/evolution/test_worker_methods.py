@@ -776,9 +776,7 @@ def test_text_memory_expel_reflector_rejects_missing_required_sections(
 ) -> None:
     _patch_reflector_llm(
         monkeypatch,
-        "# Terminal Bench Textual Memory\n\n"
-        "## Do\n"
-        "- Rerun the exact test.\n",
+        "# Terminal Bench Textual Memory\n\n## Do\n- Rerun the exact test.\n",
     )
     job = _job(
         "text_memory_expel_reflector",
@@ -865,9 +863,7 @@ def test_canonical_text_reflectors_default_to_twenty_records(
                                 "content": f"PROMPT_{index:02d}_MARKER",
                             }
                         ],
-                        "response_messages": [
-                            {"role": "assistant", "content": f"Result {index}"}
-                        ],
+                        "response_messages": [{"role": "assistant", "content": f"Result {index}"}],
                     }
                 ],
             }
@@ -966,8 +962,7 @@ def test_text_memory_reflector_redacts_forbidden_output_literals(
     _patch_reflector_llm(
         monkeypatch,
         content=(
-            "# Leaky Memory\n\n"
-            "- Secret Heldout Paper requires values from golden_source.xlsx.\n"
+            "# Leaky Memory\n\n- Secret Heldout Paper requires values from golden_source.xlsx.\n"
         ),
     )
     job = _job(
@@ -1088,12 +1083,7 @@ def test_skill_bundle_reflector_uses_latest_prior_skill_as_base(
 ):
     captured = _patch_reflector_llm(
         monkeypatch,
-        content=(
-            "---\n"
-            "name: latest-skill\n"
-            "description: Use latest skill base.\n"
-            "---\n"
-        ),
+        content=("---\nname: latest-skill\ndescription: Use latest skill base.\n---\n"),
     )
     old_dir = tmp_path / "old-skill"
     old_dir.mkdir()
@@ -1188,9 +1178,7 @@ def test_skill_bundle_reflector_redacts_forbidden_output_literals(
 
     artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
 
-    skill = (Path(artifact.uri.removeprefix("file://")) / "SKILL.md").read_text(
-        encoding="utf-8"
-    )
+    skill = (Path(artifact.uri.removeprefix("file://")) / "SKILL.md").read_text(encoding="utf-8")
     assert "Secret Heldout Paper" not in skill
     assert "golden_source.xlsx" not in skill
     assert "[REDACTED_ARTICLE_TITLES_" in skill
@@ -1252,7 +1240,7 @@ def test_agent_system_method_preserves_selection_metadata(tmp_path):
     assert artifact_request.scores == {"quality": 0.7}
     assert artifact_request.lineage == {"source": "unit-test"}
 
-    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "store")
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
     artifact = store.register_artifact(artifact_request)
 
@@ -1342,7 +1330,7 @@ def test_agent_system_reflector_writes_agents_md_from_dataset_trajectories(
     assert "Fix the package import bug." in text
     assert "pytest failed after an unverified edit" in text
 
-    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "store")
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
     registered = store.register_artifact(artifact)
     context = store.resolve_context(
@@ -1361,8 +1349,7 @@ def test_agent_system_reflector_uses_configured_llm_response(tmp_path, monkeypat
     captured = _patch_reflector_llm(
         monkeypatch,
         content=(
-            "# LLM Evolved Agent System\n\n"
-            "Always run focused verification before broad cleanup."
+            "# LLM Evolved Agent System\n\nAlways run focused verification before broad cleanup."
         ),
     )
     job = _job(
@@ -1385,8 +1372,7 @@ def test_agent_system_reflector_uses_configured_llm_response(tmp_path, monkeypat
 
     text = Path(artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
     assert text == (
-        "# LLM Evolved Agent System\n\n"
-        "Always run focused verification before broad cleanup.\n"
+        "# LLM Evolved Agent System\n\nAlways run focused verification before broad cleanup.\n"
     )
     assert captured["url"] == "http://reflector.test/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer secret"
@@ -1495,9 +1481,7 @@ def test_agent_system_reflector_can_use_codex_cli_subscription_provider(tmp_path
     assert "--model" in captured["args"]
     assert captured["args"][captured["args"].index("--model") + 1] == "gpt-5.4"
     assert captured["args"][-1] == "-"
-    assert captured["input"].startswith(
-        "Return only the Markdown agent-system instruction file."
-    )
+    assert captured["input"].startswith("Return only the Markdown agent-system instruction file.")
     assert captured["input"] not in captured["args"]
     assert captured["env"]["CODEX_HOME"] == "/tmp/codex-home"
     assert "OPENAI_API_KEY" not in captured["env"]
@@ -1799,9 +1783,7 @@ def test_agent_system_audit_does_not_treat_test_coverage_as_source_coverage():
 
     findings = _audit_agent_system_markdown(text, forbidden_literals=[])
 
-    assert not any(
-        finding["code"] == "source_coverage_not_actionable" for finding in findings
-    )
+    assert not any(finding["code"] == "source_coverage_not_actionable" for finding in findings)
 
 
 def test_agent_system_history_reflector_uses_round_history_and_deltas(
@@ -1817,8 +1799,7 @@ def test_agent_system_history_reflector_uses_round_history_and_deltas(
     )
     base_path = tmp_path / "round2-agents.md"
     base_path.write_text(
-        "# Round 2 Agent System\n\n"
-        "Preserve canonical article ids and reduce over-extraction.\n",
+        "# Round 2 Agent System\n\nPreserve canonical article ids and reduce over-extraction.\n",
         encoding="utf-8",
     )
     round1 = _history_round_dataset_artifact(
@@ -2018,8 +1999,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
                                 "AWS_ACCESS_KEY_ID": "AKIA_SHARED_ACCESS",
                                 "access_key_id": "AKIA_SHARED_COLON",
                                 "signed_url": (
-                                    "https://example.com/download"
-                                    "?X-Amz-Signature=shared-sig#frag"
+                                    "https://example.com/download?X-Amz-Signature=shared-sig#frag"
                                 ),
                                 "file_path": "/secret.txt",
                                 "workspace_path": "/workspace/prod/key.pem",
@@ -2029,8 +2009,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
                                 "windows_user_path": r"C:\Users\Alice Smith\secret.txt",
                                 "unc_path": r"\\server\share\secret.txt",
                                 "safe_route": (
-                                    "Keep route /api/v1/feedback, /healthz, "
-                                    "and /v1/reviews."
+                                    "Keep route /api/v1/feedback, /healthz, and /v1/reviews."
                                 ),
                                 "safe_detail": "Nested safe shared detail survives.",
                             },
@@ -2054,9 +2033,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
                                 "summary": "Available evaluator summary survives.",
                             },
                             "reviewer_rationale": "Reviewer rationale must not render.",
-                            "adjudication_rationale": (
-                                "Adjudication rationale must not render."
-                            ),
+                            "adjudication_rationale": ("Adjudication rationale must not render."),
                             "human": [
                                 {
                                     "feedback_id": "hfb_bounded_search",
@@ -2159,8 +2136,8 @@ def test_agent_system_history_reflector_consumes_human_feedback(
                                     "status": "consumed",
                                     "decision": "revise",
                                     "observed_issues": ["consumed prompt issue"],
-                                }
-                            ]
+                                },
+                            ],
                         }
                     }
                 }
@@ -2287,9 +2264,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
         "hfb_bounded_search",
     ]
     assert artifact.manifest["human_feedback_count"] == 2
-    assert artifact.manifest["shared_evolution_feedback_ids"] == [
-        "hfb_direct_record_feedback"
-    ]
+    assert artifact.manifest["shared_evolution_feedback_ids"] == ["hfb_direct_record_feedback"]
     assert artifact.manifest["shared_evolution_feedback_count"] == 1
     assert (
         "Configured reviewer finding stays visible."
@@ -2598,20 +2573,20 @@ def test_agent_system_pareto_reflector_selects_candidate_with_external_gate(
                 "CSV, TSV, XLS, and XLSX sources, and verify every package has a coverage "
                 "decision."
             ),
-                (
-                    "# Provenance Candidate\n\n"
-                    "- When task inputs are grouped by package or article, before extraction "
-                    "build a canonical source-id map from each top-level input directory to "
-                    "itself, use only those ids in final records, and before finalizing verify "
-                    "every record's source id is in that map.\n"
-                    "- Before extracting from package-like sources, recursively inventory "
-                    "every file under the allowed input root, inspect structured evidence "
-                    "formats such as tables, spreadsheets, CSV, TSV, XLS, and XLSX, and "
-                    "verify every package has inspected evidence or an exclusion reason.\n"
-                    "- Before accepting table-derived records, compare precision and recall "
-                    "risks, remove unsupported candidates, and verify output volume is within "
-                    "the task's expected source coverage rather than a raw DNA-cell dump."
-                ),
+            (
+                "# Provenance Candidate\n\n"
+                "- When task inputs are grouped by package or article, before extraction "
+                "build a canonical source-id map from each top-level input directory to "
+                "itself, use only those ids in final records, and before finalizing verify "
+                "every record's source id is in that map.\n"
+                "- Before extracting from package-like sources, recursively inventory "
+                "every file under the allowed input root, inspect structured evidence "
+                "formats such as tables, spreadsheets, CSV, TSV, XLS, and XLSX, and "
+                "verify every package has inspected evidence or an exclusion reason.\n"
+                "- Before accepting table-derived records, compare precision and recall "
+                "risks, remove unsupported candidates, and verify output volume is within "
+                "the task's expected source coverage rather than a raw DNA-cell dump."
+            ),
         ],
     )
     round1 = _history_round_dataset_artifact(
@@ -2651,9 +2626,7 @@ def test_agent_system_pareto_reflector_selects_candidate_with_external_gate(
                                     "feedback_id": "hfb_pareto_bounded",
                                     "status": "available_for_evolution",
                                     "decision": "revise",
-                                    "observed_issues": [
-                                        "Pareto reviewer saw article-id drift."
-                                    ],
+                                    "observed_issues": ["Pareto reviewer saw article-id drift."],
                                     "suggested_changes": [
                                         "Preserve canonical source ids in each candidate."
                                     ],
@@ -2732,7 +2705,9 @@ def test_agent_system_pareto_reflector_selects_candidate_with_external_gate(
     agent_system_artifact = next(
         artifact for artifact in artifacts if artifact.type == ArtifactType.AGENT_SYSTEM
     )
-    report_artifact = next(artifact for artifact in artifacts if artifact.type == ArtifactType.REPORT)
+    report_artifact = next(
+        artifact for artifact in artifacts if artifact.type == ArtifactType.REPORT
+    )
     text = Path(agent_system_artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
     assert text.startswith("# Provenance Candidate")
     assert agent_system_artifact.promoted is True
@@ -2871,15 +2846,12 @@ def test_agent_system_gepa_reflector_resolves_mutation_strategies(
         artifact_root=tmp_path / "artifacts",
     )
 
-    candidates = [
-        artifact for artifact in artifacts if artifact.type == ArtifactType.AGENT_SYSTEM
-    ]
+    candidates = [artifact for artifact in artifacts if artifact.type == ArtifactType.AGENT_SYSTEM]
     assert [artifact.manifest["candidate_strategy"] for artifact in candidates] == (
         expected_strategies
     )
     assert all(
-        artifact.manifest["candidate_count"] == len(expected_strategies)
-        for artifact in candidates
+        artifact.manifest["candidate_count"] == len(expected_strategies) for artifact in candidates
     )
 
 
@@ -2985,7 +2957,9 @@ def test_agent_system_gepa_reflector_generates_mutation_pool_from_verifier_feedb
     agent_system_artifacts = [
         artifact for artifact in artifacts if artifact.type == ArtifactType.AGENT_SYSTEM
     ]
-    report_artifact = next(artifact for artifact in artifacts if artifact.type == ArtifactType.REPORT)
+    report_artifact = next(
+        artifact for artifact in artifacts if artifact.type == ArtifactType.REPORT
+    )
     assert len(agent_system_artifacts) == 2
     assert [artifact.manifest["candidate_strategy"] for artifact in agent_system_artifacts] == [
         "preservation_gate",
@@ -3072,9 +3046,7 @@ def test_agent_system_gepa_history_sort_and_best_round_tie_are_stable(
         artifact["artifact_id"] = f"artifact_{label}"
         artifacts.append(artifact)
 
-    round_three_manifest = Path(
-        artifacts[0]["uri"].removeprefix("file://")
-    )
+    round_three_manifest = Path(artifacts[0]["uri"].removeprefix("file://"))
     payload = json.loads(round_three_manifest.read_text(encoding="utf-8"))
     payload["metrics"]["f1"] = None
     round_three_manifest.write_text(json.dumps(payload), encoding="utf-8")
@@ -3300,15 +3272,11 @@ def test_parametric_memory_lora_sft_exports_every_successful_trace(tmp_path: Pat
                 "traces": [
                     {
                         "prompt_messages": [{"role": "user", "content": "First call"}],
-                        "response_messages": [
-                            {"role": "assistant", "content": "First response"}
-                        ],
+                        "response_messages": [{"role": "assistant", "content": "First response"}],
                     },
                     {
                         "prompt_messages": [{"role": "user", "content": "Second call"}],
-                        "response_messages": [
-                            {"role": "assistant", "content": "Second response"}
-                        ],
+                        "response_messages": [{"role": "assistant", "content": "Second response"}],
                     },
                 ],
             },
@@ -3321,9 +3289,7 @@ def test_parametric_memory_lora_sft_exports_every_successful_trace(tmp_path: Pat
                 "traces": [
                     {
                         "prompt_messages": [{"role": "user", "content": "Failed call"}],
-                        "response_messages": [
-                            {"role": "assistant", "content": "Failed response"}
-                        ],
+                        "response_messages": [{"role": "assistant", "content": "Failed response"}],
                     }
                 ],
             },
@@ -3404,9 +3370,7 @@ def test_parametric_memory_lora_sft_full_trace_preserves_trace_tools(tmp_path: P
                 "reward": 1.0,
                 "traces": [
                     {
-                        "prompt_messages": [
-                            {"role": "user", "content": "Train model."}
-                        ],
+                        "prompt_messages": [{"role": "user", "content": "Train model."}],
                         "response_messages": [
                             {
                                 "role": "assistant",
@@ -3418,9 +3382,7 @@ def test_parametric_memory_lora_sft_full_trace_preserves_trace_tools(tmp_path: P
                                         "function": {
                                             "name": "tb_exec",
                                             "arguments": {
-                                                "command": (
-                                                    "cp model.bin /app/model.bin"
-                                                )
+                                                "command": ("cp model.bin /app/model.bin")
                                             },
                                         },
                                     }
@@ -3493,9 +3455,7 @@ def test_parametric_memory_lora_sft_can_project_response_tail(tmp_path: Path):
                 "reward": 1.0,
                 "traces": [
                     {
-                        "prompt_messages": [
-                            {"role": "user", "content": "Recover the password."}
-                        ],
+                        "prompt_messages": [{"role": "user", "content": "Recover the password."}],
                         "response_messages": [
                             {
                                 "role": "assistant",
@@ -3595,10 +3555,7 @@ def test_parametric_memory_lora_sft_can_project_terminal_bench_final_actions(
         "type": "item.completed",
         "item": {
             "type": "command_execution",
-            "command": (
-                "printf '%s\\n' '8XDP5Q2RT9ZK7VB3BV4WW54' "
-                "> /app/recovered_passwords.txt"
-            ),
+            "command": ("printf '%s\\n' '8XDP5Q2RT9ZK7VB3BV4WW54' > /app/recovered_passwords.txt"),
             "exit_code": 0,
             "status": "completed",
             "aggregated_output": "wrote recovered_passwords.txt successfully\n",
@@ -3622,9 +3579,7 @@ def test_parametric_memory_lora_sft_can_project_terminal_bench_final_actions(
                 "reward": 1.0,
                 "traces": [
                     {
-                        "prompt_messages": [
-                            {"role": "user", "content": "Recover the password."}
-                        ],
+                        "prompt_messages": [{"role": "user", "content": "Recover the password."}],
                         "response_messages": [
                             {
                                 "role": "assistant",
@@ -3716,10 +3671,7 @@ def test_parametric_memory_lora_sft_can_project_terminal_bench_tool_call_policy(
         "type": "item.completed",
         "item": {
             "type": "command_execution",
-            "command": (
-                "printf '%s\\n' '8XDP5Q2RT9ZK7VB3BV4WW54' "
-                "> /app/recovered_passwords.txt"
-            ),
+            "command": ("printf '%s\\n' '8XDP5Q2RT9ZK7VB3BV4WW54' > /app/recovered_passwords.txt"),
             "exit_code": 0,
             "status": "completed",
             "aggregated_output": "wrote recovered_passwords.txt successfully\n",
@@ -3741,7 +3693,7 @@ def test_parametric_memory_lora_sft_can_project_terminal_bench_tool_call_policy(
                                 "role": "user",
                                 "content": (
                                     "Recover the PASSWORD from launchcode.txt. "
-                                    "It starts with \"8XD\" and ends with \"W54\". "
+                                    'It starts with "8XD" and ends with "W54". '
                                     "Write each matching password to the file: "
                                     "/app/recovered_passwords.txt"
                                 ),
@@ -3849,12 +3801,8 @@ def test_parametric_memory_lora_sft_can_project_corrective_tool_call_policy(
                 "reward": 0.0,
                 "traces": [
                     {
-                        "prompt_messages": [
-                            {"role": "user", "content": "Recover the password."}
-                        ],
-                        "response_messages": [
-                            {"role": "assistant", "content": "budget exceeded"}
-                        ],
+                        "prompt_messages": [{"role": "user", "content": "Recover the password."}],
+                        "response_messages": [{"role": "assistant", "content": "budget exceeded"}],
                         "metadata": {
                             "llm_calls": [
                                 {
@@ -3921,8 +3869,7 @@ def test_parametric_memory_lora_sft_can_project_corrective_tool_call_policy(
                     "arguments": {
                         "task_id": "terminal-bench-task",
                         "command": (
-                            "printf '%s\\n' 8XDP5Q2RT9ZK7VB3BV4WW54 "
-                            "> /app/recovered_passwords.txt"
+                            "printf '%s\\n' 8XDP5Q2RT9ZK7VB3BV4WW54 > /app/recovered_passwords.txt"
                         ),
                     },
                 },
@@ -3993,8 +3940,7 @@ def test_parametric_memory_lora_sft_can_project_corrective_tool_call_policy(
             "arguments": {
                 "task_id": "terminal-bench-task",
                 "command": (
-                    "printf '%s\\n' 8XDP5Q2RT9ZK7VB3BV4WW54 "
-                    "> /app/recovered_passwords.txt"
+                    "printf '%s\\n' 8XDP5Q2RT9ZK7VB3BV4WW54 > /app/recovered_passwords.txt"
                 ),
             },
         },
@@ -4215,12 +4161,8 @@ def test_parametric_memory_lora_sft_corrective_projection_can_shape_tool_content
     assert tool_message["role"] == "tool"
     assert tool_message["content"] == '{"task_yaml": "recover", "stdout": "visi'
     assert "Tool result payload" not in json.dumps(training_line)
-    assert artifact.manifest["training_projection"][
-        "strip_input_tool_result_payload"
-    ] is True
-    assert artifact.manifest["training_projection"][
-        "max_input_tool_content_chars"
-    ] == 40
+    assert artifact.manifest["training_projection"]["strip_input_tool_result_payload"] is True
+    assert artifact.manifest["training_projection"]["max_input_tool_content_chars"] == 40
 
 
 def test_parametric_memory_lora_sft_corrective_projection_can_export_weighted_stages(
@@ -4270,9 +4212,7 @@ def test_parametric_memory_lora_sft_corrective_projection_can_export_weighted_st
                                                 "description": "Read the task.",
                                                 "parameters_schema": {
                                                     "type": "object",
-                                                    "properties": {
-                                                        "task_id": {"type": "string"}
-                                                    },
+                                                    "properties": {"task_id": {"type": "string"}},
                                                     "required": ["task_id"],
                                                 },
                                             },
@@ -4383,10 +4323,7 @@ def test_parametric_memory_lora_sft_corrective_projection_can_export_weighted_st
         json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
     ]
     assert len(training_lines) == 3
-    assert [
-        line["metadata"]["projection_stage"]
-        for line in training_lines
-    ] == [
+    assert [line["metadata"]["projection_stage"] for line in training_lines] == [
         "read_task",
         "short_exec_after_read",
         "short_exec_after_read",
@@ -4396,14 +4333,8 @@ def test_parametric_memory_lora_sft_corrective_projection_can_export_weighted_st
         0,
         1,
     ]
-    assert (
-        training_lines[0]["messages"][-1]["tool_calls"][0]["function"]["name"]
-        == "tb_read_task"
-    )
-    assert (
-        training_lines[1]["messages"][-1]["tool_calls"][0]["function"]["name"]
-        == "tb_exec"
-    )
+    assert training_lines[0]["messages"][-1]["tool_calls"][0]["function"]["name"] == "tb_read_task"
+    assert training_lines[1]["messages"][-1]["tool_calls"][0]["function"]["name"] == "tb_exec"
     assert (
         training_lines[2]["messages"][-1]["tool_calls"][0]["function"]["arguments"]
         == training_lines[1]["messages"][-1]["tool_calls"][0]["function"]["arguments"]
@@ -4454,8 +4385,7 @@ def test_parametric_memory_lora_sft_corrective_projection_can_export_finish_mess
                                             "name": "tb_collect_result",
                                             "tool_call_id": "call-collect",
                                             "content": (
-                                                "collected result for "
-                                                "terminal-bench-task"
+                                                "collected result for terminal-bench-task"
                                             ),
                                         },
                                     ],
@@ -4535,9 +4465,9 @@ def test_parametric_memory_lora_sft_corrective_projection_can_export_finish_mess
         "role": "assistant",
         "content": finish_content,
     }
-    assert artifact.manifest["training_projection"]["stages"][0][
-        "target_assistant_message"
-    ] == {"content": finish_content}
+    assert artifact.manifest["training_projection"]["stages"][0]["target_assistant_message"] == {
+        "content": finish_content
+    }
 
 
 def test_parametric_memory_lora_sft_corrective_projection_can_insert_synthetic_tool_results(
@@ -4659,9 +4589,9 @@ def test_parametric_memory_lora_sft_corrective_projection_can_insert_synthetic_t
     ]
     assert messages[3] == {"role": "tool", **synthetic_result}
     assert messages[4]["tool_calls"][0]["function"]["name"] == "tb_collect_result"
-    assert artifact.manifest["training_projection"]["stages"][0][
-        "synthetic_tool_results"
-    ] == [synthetic_result]
+    assert artifact.manifest["training_projection"]["stages"][0]["synthetic_tool_results"] == [
+        synthetic_result
+    ]
 
 
 def test_parametric_memory_lora_sft_password_recovery_recipe_exports_mixed_records(
@@ -4715,9 +4645,7 @@ def test_parametric_memory_lora_sft_password_recovery_recipe_exports_mixed_recor
                                                 "description": "Read task.",
                                                 "parameters_schema": {
                                                     "type": "object",
-                                                    "properties": {
-                                                        "task_id": {"type": "string"}
-                                                    },
+                                                    "properties": {"task_id": {"type": "string"}},
                                                     "required": ["task_id"],
                                                 },
                                             },
@@ -4844,26 +4772,19 @@ def test_parametric_memory_lora_sft_password_recovery_recipe_exports_mixed_recor
         json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
     ]
     assert len(training_lines) == 4
-    assert [
-        line["metadata"]["projection_stage"]
-        for line in training_lines
-    ] == [
+    assert [line["metadata"]["projection_stage"] for line in training_lines] == [
         "read_task",
         "short_exec_after_read",
         "short_exec_after_read",
         "correct_back_to_short_exec",
     ]
     assert [
-        line["messages"][-1]["tool_calls"][0]["function"]["name"]
-        for line in training_lines
+        line["messages"][-1]["tool_calls"][0]["function"]["name"] for line in training_lines
     ] == ["tb_read_task", "tb_exec", "tb_exec", "tb_exec"]
-    assert (
-        training_lines[1]["messages"][-1]["tool_calls"][0]["function"]["arguments"]
-        == {
-            "task_id": "terminal-bench-task",
-            "command": target_command,
-        }
-    )
+    assert training_lines[1]["messages"][-1]["tool_calls"][0]["function"]["arguments"] == {
+        "task_id": "terminal-bench-task",
+        "command": target_command,
+    }
     assert "Dummy entry" in json.dumps(training_lines[-1], ensure_ascii=False)
     assert artifact.manifest["training_projection"]["recipe"] == {
         "type": "terminal_bench_password_recovery_shorttarget_recipe",
@@ -4931,9 +4852,7 @@ def test_parametric_memory_lora_sft_requires_successful_records(tmp_path: Path):
                 "traces": [
                     {
                         "prompt_messages": [{"role": "user", "content": "Failed call"}],
-                        "response_messages": [
-                            {"role": "assistant", "content": "Failed response"}
-                        ],
+                        "response_messages": [{"role": "assistant", "content": "Failed response"}],
                     }
                 ],
             }
@@ -5061,12 +4980,7 @@ def test_parametric_memory_lora_sft_cleans_stale_adapter_output(tmp_path: Path):
         },
     )
     stale_adapter_dir = (
-        tmp_path
-        / "artifacts"
-        / "workers"
-        / job.job_id
-        / "parametric_memory_lora_sft"
-        / "adapter"
+        tmp_path / "artifacts" / "workers" / job.job_id / "parametric_memory_lora_sft" / "adapter"
     )
     stale_adapter_dir.mkdir(parents=True)
     (stale_adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
@@ -5080,8 +4994,7 @@ def test_parametric_memory_lora_sft_cleans_stale_adapter_output(tmp_path: Path):
 def test_parametric_memory_lora_sft_trainer_timeout(tmp_path: Path):
     trainer_script = tmp_path / "fake_hanging_trainer.py"
     trainer_script.write_text(
-        "import time\n"
-        "time.sleep(5)\n",
+        "import time\ntime.sleep(5)\n",
         encoding="utf-8",
     )
     job = _job(
@@ -5342,7 +5255,9 @@ def test_run_once_heartbeats_during_blocking_method_before_half_lease(
     assert len(client.heartbeats) >= 4
     assert client.completed != []
     assert client.failed == []
-    assert not any(thread.name.startswith("openevo-heartbeat-") for thread in threading.enumerate())
+    assert not any(
+        thread.name.startswith("openevo-heartbeat-") for thread in threading.enumerate()
+    )
 
 
 @pytest.mark.parametrize("lease_seconds", [None, 30])
@@ -5379,7 +5294,9 @@ def test_run_once_stops_heartbeat_thread_when_method_fails(tmp_path, monkeypatch
     assert len(client.failed) == 1
     assert client.failed[0]["error"] == "method failed"
     assert client.failed[0]["retryable"] is False
-    assert not any(thread.name.startswith("openevo-heartbeat-") for thread in threading.enumerate())
+    assert not any(
+        thread.name.startswith("openevo-heartbeat-") for thread in threading.enumerate()
+    )
 
 
 def test_run_once_heartbeat_failure_prevents_complete_and_fails_once(tmp_path, monkeypatch):
@@ -5418,7 +5335,9 @@ def test_run_once_heartbeat_failure_prevents_complete_and_fails_once(tmp_path, m
     assert len(client.failed) == 1
     assert client.failed[0]["error"] == "heartbeat failed"
     assert client.failed[0]["retryable"] is False
-    assert not any(thread.name.startswith("openevo-heartbeat-") for thread in threading.enumerate())
+    assert not any(
+        thread.name.startswith("openevo-heartbeat-") for thread in threading.enumerate()
+    )
 
 
 def test_run_once_fails_unknown_method(tmp_path):
@@ -5464,9 +5383,7 @@ def test_run_once_fails_invalid_claim_payload_with_job_identity(tmp_path):
 def test_run_once_preserves_completion_error_when_redundant_fail_is_rejected(
     tmp_path,
 ) -> None:
-    job = _job("skill_bundle", tmp_path, config={"name": "demo"}).model_dump(
-        mode="json"
-    )
+    job = _job("skill_bundle", tmp_path, config={"name": "demo"}).model_dump(mode="json")
     client = FakeClient(job)
 
     def reject_complete(*args, **kwargs):

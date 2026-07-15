@@ -314,12 +314,15 @@ flowchart TB
 
 ## 失败语义
 
-- Evolution backend 不可用：
-  - 遵循 `evolution.context.fail_open`；当 fail-open 为 true 时，session 会在没有
-    evolution context 的情况下继续。
-- 坏 skill artifact：
-  - 跳过并记录 warning；memory 和 adapter context 仍然生效。
-- 坏 agent system target path：
-  - 跳过该目标并记录 warning；其他 target、memory、skills 和 adapters 仍然生效。
+- 未携带 exact `metadata.evolution.context_artifact_ids` 的通用解析：
+  - Evolution backend 不可用时遵循 `evolution.context.fail_open`；坏的 legacy candidate
+    仍按通用 resolver 的过滤/跳过语义处理。
+- 携带 exact revision membership 的产品解析：
+  - 顺序是权威 contract；resolver 不按 score/time/ID 重排，也不要求成员
+    `promoted=true`。重复、缺失、不兼容、非法 payload、错误 agent-system target、
+    runtime 写入或最终 readback 漂移都 fail closed，不能由 `fail_open` 降级成 warning。
+  - Gateway 在 agent/postprocess 后回读 canonical 文件、完整 skill tree 和全部
+    agent-system target；target 枚举在 runtime 内以有界、逐组件 no-follow 方式完成，只返回
+    相对路径、大小和 SHA-256。Core 再用持久化 context 和原始 instruction 独立复算 receipt v3。
 - 没有选中 adapter：
   - `merge_mode` 为 `reference_only`；proxy 保持 served base model 不变。

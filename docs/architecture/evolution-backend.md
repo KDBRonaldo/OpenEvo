@@ -314,10 +314,11 @@ flowchart TB
 
 Compatibility 目前会考虑 task metadata、agent harness 和 base model。
 When `metadata.evolution.context_artifact_ids` is present, context resolution
-treats it as a strict allowlist for every artifact type, including
-`parametric_memory`. This is required for controlled ablations because promoted
-compatible artifacts from other runs must not be injected unless the rollout
-explicitly selected them.
+treats it as a strict ordered membership list for every artifact type, including
+`parametric_memory`. It rejects duplicate, unavailable, incompatible, invalid, or
+unselected members and does not apply generic score/time/ID ranking. Exact
+revision members may remain `promoted=false`; promoted-only filtering and the
+existing fallback ordering apply only when no exact list is supplied.
 
 `agent_system` artifact 的 manifest 可以声明 `target_path`，例如 `AGENTS.md` 或
 `.openhands/microagents/repo.md`。注册时会规范化并校验这个路径：必须是 allowlist
@@ -382,6 +383,9 @@ adapter name；如果旧 artifact 没有这个字段，则回退到 artifact nam
 - Runner 只把与 target type 相同的 artifacts 交给 gate；`report` 等辅助 outputs 保留在 job
   结果中但不进入 target history/context。没有外部 gate 时，只复用 method 自己标记为
   `promoted=true` 的 target outputs；没有此类 output 会 fail closed，Core 不从 scores 猜 winner。
+  这是 generic runner 语义。Core managed science product runner 不向 `promotion_gate=none` job
+  注入 `promoted=true`，也不改写算法输出；它把本次 typed target outputs 作为 successor
+  revision 成员，下一 session 只按该 revision 的有序成员关系消费它们。
 - `PATCH /v1/artifacts/{id}/promotion` 的请求 body 必须显式包含 `promoted`，例如
   `{"promoted": true}` 或 `{"promoted": false}`；空 body 会被拒绝，避免缺省值意外
   promote artifact。

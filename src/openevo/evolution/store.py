@@ -20,6 +20,7 @@ from openevo.evolution.context import (
     artifact_manifest,
     artifact_matches,
     artifact_type,
+    requested_context_artifact_order,
     requested_context_artifact_ids,
     request_uses_subscription_auth,
     sort_candidates,
@@ -4010,7 +4011,7 @@ class EvolutionStore:
 
     def _requested_context_artifact_rows(
         self,
-        artifact_ids: set[str],
+        artifact_ids: tuple[str, ...],
     ) -> list[dict[str, object]]:
         if not artifact_ids:
             return []
@@ -4019,8 +4020,9 @@ class EvolutionStore:
             for artifact_id in artifact_ids
         ):
             raise ValueError("requested context artifact inventory is invalid")
-        ordered = tuple(sorted(artifact_ids))
-        placeholders = ", ".join("?" for _ in ordered)
+        if len(artifact_ids) != len(set(artifact_ids)):
+            raise ValueError("requested context artifact inventory contains duplicates")
+        placeholders = ", ".join("?" for _ in artifact_ids)
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
@@ -4031,13 +4033,13 @@ class EvolutionStore:
                 (
                     str(ArtifactState.ACTIVE),
                     str(ArtifactState.EXPERIMENTAL),
-                    *ordered,
+                    *artifact_ids,
                 ),
             ).fetchall()
-        values = [dict(row) for row in rows]
-        if {str(row["artifact_id"]) for row in values} != artifact_ids:
+        values = {str(row["artifact_id"]): dict(row) for row in rows}
+        if set(values) != set(artifact_ids):
             raise ValueError("requested context artifact is unavailable")
-        return values
+        return [values[artifact_id] for artifact_id in artifact_ids]
 
     def resolve_context_projections(
         self,
@@ -5620,11 +5622,14 @@ class EvolutionStore:
         raw_payload = request.model_dump(mode="python")
         _validate_finite_floats(raw_payload, "request")
 
-        requested_artifact_ids = requested_context_artifact_ids(request)
+        requested_artifact_order = requested_context_artifact_order(request)
+        requested_artifact_ids = (
+            None if requested_artifact_order is None else set(requested_artifact_order)
+        )
         rows = (
             self._promoted_artifact_rows()
-            if requested_artifact_ids is None
-            else self._requested_context_artifact_rows(requested_artifact_ids)
+            if requested_artifact_order is None
+            else self._requested_context_artifact_rows(requested_artifact_order)
         )
         rows = [
             row
@@ -5636,7 +5641,8 @@ class EvolutionStore:
             and {str(row["artifact_id"]) for row in rows} != requested_artifact_ids
         ):
             raise ValueError("requested context artifact is incompatible")
-        rows = sort_candidates(rows)
+        if requested_artifact_order is None:
+            rows = sort_candidates(rows)
 
         selected_memory: list[dict[str, object]] = []
         rendered_parts: list[str] = []
@@ -5781,7 +5787,10 @@ class EvolutionStore:
                     selected_ids.append(artifact_id)
                     selected_inventory.append(inventory)
 
-        if requested_artifact_ids is not None and set(selected_ids) != requested_artifact_ids:
+        if (
+            requested_artifact_order is not None
+            and tuple(selected_ids) != requested_artifact_order
+        ):
             raise ValueError("requested context artifact was not selected exactly")
 
         for _ in range(MAX_CONTEXT_ID_ATTEMPTS):
@@ -5813,7 +5822,7 @@ class EvolutionStore:
                     "artifact_ids": selected_ids,
                     "artifacts": selected_inventory,
                     "reasons": [
-                        "matched requested promoted compatible artifacts"
+                        "matched requested compatible artifacts"
                         if requested_artifact_ids is not None
                         else "matched promoted compatible artifacts"
                     ],
@@ -5829,6 +5838,75 @@ class EvolutionStore:
             ):
                 return response
         raise RuntimeError("could not allocate unique context id")
+
+    def get_context_runtime_authority(self, context_id: str) -> ContextResolveResponse:
+        """Read one immutable legacy context through a bounded canonical boundary."""
+
+        if not context_id or len(context_id.encode("utf-8")) > 256:
+            raise ValueError("context runtime authority identity is invalid")
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            self._verify_bound_store_identity(conn)
+            size_row = conn.execute(
+                "SELECT CASE WHEN typeof(response_json) = 'text' "
+                "THEN length(CAST(response_json AS BLOB)) END, "
+                "CASE WHEN typeof(selected_artifact_ids_json) = 'text' "
+                "THEN length(CAST(selected_artifact_ids_json AS BLOB)) END "
+                "FROM contexts WHERE context_id = ?",
+                (context_id,),
+            ).fetchone()
+            if (
+                size_row is None
+                or not isinstance(size_row[0], int)
+                or isinstance(size_row[0], bool)
+                or not isinstance(size_row[1], int)
+                or isinstance(size_row[1], bool)
+                or size_row[0] < 0
+                or size_row[1] < 0
+            ):
+                raise ValueError("context runtime authority does not exist")
+            response_bytes = size_row[0]
+            selected_bytes = size_row[1]
+            if (
+                response_bytes > MAX_CONTEXT_SNAPSHOT_BYTES
+                or selected_bytes > MAX_CONTEXT_SNAPSHOT_BYTES
+            ):
+                raise ValueError("context runtime authority exceeds its byte bound")
+            row = conn.execute(
+                "SELECT CASE WHEN typeof(response_json) = 'text' "
+                "AND length(CAST(response_json AS BLOB)) = ? "
+                "THEN response_json END AS response_json, "
+                "CASE WHEN typeof(selected_artifact_ids_json) = 'text' "
+                "AND length(CAST(selected_artifact_ids_json AS BLOB)) = ? "
+                "THEN selected_artifact_ids_json END AS selected_json "
+                "FROM contexts WHERE context_id = ?",
+                (response_bytes, selected_bytes, context_id),
+            ).fetchone()
+            self._verify_bound_store_identity(conn)
+            conn.commit()
+        if (
+            row is None
+            or not isinstance(row["response_json"], str)
+            or not isinstance(row["selected_json"], str)
+            or len(row["response_json"].encode("utf-8")) != response_bytes
+            or len(row["selected_json"].encode("utf-8")) != selected_bytes
+        ):
+            raise ValueError("context runtime authority changed while it was read")
+        try:
+            response = ContextResolveResponse.model_validate_json(row["response_json"])
+            selected_ids = json.loads(row["selected_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("context runtime authority is invalid") from exc
+        canonical = _json_dumps(response.model_dump(mode="json"))
+        selection_ids = response.selection.get("artifact_ids")
+        if (
+            row["response_json"] != canonical
+            or response.context_id != context_id
+            or not isinstance(selected_ids, list)
+            or selection_ids != selected_ids
+        ):
+            raise ValueError("context runtime authority is inconsistent")
+        return response
 
     def _persist_context(
         self,

@@ -299,7 +299,7 @@ def test_transcript_to_resolved_text_memory_architecture_flow(
         worker_client,
         worker_id="worker-architecture-flow",
         capabilities=["text_memory_mining"],
-        artifact_root=tmp_path / "worker-artifacts",
+        artifact_root=tmp_path / "store" / "worker-artifacts",
     )
 
     assert ran is True

@@ -129,13 +129,26 @@ generation-bound admission verifier. Core never exposes the private credential
 or service URLs through the Desktop contract.
 
 For a run with pinned context artifacts, Gateway emits a closed runtime
-injection receipt only after exact context resolution and staging. It binds the
-context/revision, final instruction digest, staged-tree digest, and source/staged
-digest for each artifact. The rollout wrapper, not the experiment runner,
-captures that receipt. Before publishing success, Core checks its exact artifact
-membership, types, and source content digests against the input revision's
-durable artifact authority. Missing, extra, changed, or runner-supplied receipts
-fail closed.
+injection receipt only after the harness and post-processing finish and Gateway
+reads the files back from the runtime. Receipt v3 binds the context/revision,
+effective instruction digest, the complete runtime file inventory and tree
+digest, and each artifact's source content plus actual runtime paths/tree. The
+inventory includes canonical context/memory/agent-system/adapter files, every
+skill file, and every agent-system target file. Missing, extra, replaced, or
+wrong-target runtime bytes fail closed.
+
+Gateway enumerates allowed agent-system targets inside the runtime with a
+bounded, component-pinned no-follow reader. It returns only relative target
+names, byte counts, and SHA-256 values; target content and absolute paths never
+enter the receipt transport.
+
+The rollout wrapper, not the experiment runner, captures that receipt. It reads
+the immutable persisted context through the generation-authenticated Evolution
+service, independently rebuilds the expected rendering from the original task
+instruction and ordered revision membership, and requires exact equality before
+success. The wrapper stores a canonical deep copy of both receipt and authority
+for restart-safe finalization; runner-returned or runner-mutated metadata cannot
+supply or alter either value.
 
 ## Cross-Session Evolution
 

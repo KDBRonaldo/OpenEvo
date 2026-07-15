@@ -104,14 +104,17 @@ def test_register_artifact_route(tmp_path):
     assert json.loads(row["scores_json"]) == {"heldout_reward_delta": 0.08}
     assert json.loads(row["tags_json"]) == ["calculator"]
     manifest_path = Path(row["manifest_path"])
-    assert manifest_path == (
-        tmp_path
-        / "artifacts"
-        / "artifacts"
-        / "parametric_memory"
-        / body["artifact_id"]
-        / "manifest.json"
-    ).resolve()
+    assert (
+        manifest_path
+        == (
+            tmp_path
+            / "artifacts"
+            / "artifacts"
+            / "parametric_memory"
+            / body["artifact_id"]
+            / "manifest.json"
+        ).resolve()
+    )
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["manifest"] == {
         "base_model": "Qwen/Qwen3.6-27B",
         "adapter_format": "lora",
@@ -203,8 +206,9 @@ def test_register_artifact_route_uses_sync_handler(tmp_path):
 
 
 def test_context_resolve_route_uses_sync_handler_and_persists_context(tmp_path):
-    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
-    memory_file = tmp_path / "memory.md"
+    artifact_root = tmp_path / "artifacts"
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=artifact_root)
+    memory_file = artifact_root / "memory.md"
     memory_file.write_text("Prefer table-driven parser tests.", encoding="utf-8")
 
     with TestClient(app) as client:
@@ -713,8 +717,9 @@ def test_job_route_claim_heartbeat_and_complete(tmp_path):
 
 
 def test_backend_event_dataset_job_context_flow(tmp_path):
-    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
-    memory_file = tmp_path / "calculator-memory.md"
+    artifact_root = tmp_path / "artifacts"
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=artifact_root)
+    memory_file = artifact_root / "calculator-memory.md"
     memory_file.write_text("Prefer exact arithmetic for calculator tasks.", encoding="utf-8")
 
     with TestClient(app) as client:

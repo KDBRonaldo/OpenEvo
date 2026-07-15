@@ -210,10 +210,6 @@ class CompiledTask:
                 "name": f"{self.task_id}:{spec.artifact_type}:round-{round_index}",
                 "experiment_id": self.experiment_id,
                 "experiment_name": self.experiment_name,
-                "promoted": not _promotion_gate_targets_artifact(
-                    self.promotion_gate,
-                    spec.artifact_type,
-                ),
                 "task_id": self.task_id,
                 "task_tags": self._task_tags(),
                 "round_index": round_index,
@@ -227,9 +223,7 @@ class CompiledTask:
                     "method_resolution": {
                         "requested_method": spec.requested_method,
                         "resolved_method": spec.method,
-                        "prior_dataset_artifact_ids": list(
-                            spec.prior_dataset_artifact_ids
-                        ),
+                        "prior_dataset_artifact_ids": list(spec.prior_dataset_artifact_ids),
                     },
                 },
                 "compatibility": compatibility,
@@ -239,6 +233,7 @@ class CompiledTask:
                 if base_model:
                     payload["config"]["compatibility"]["base_model"] = [base_model]
             if _promotion_gate_targets_artifact(self.promotion_gate, spec.artifact_type):
+                payload["config"]["promoted"] = False
                 payload["config"]["promotion_gate"] = _worker_visible_promotion_gate(
                     self.promotion_gate
                 )
@@ -317,9 +312,7 @@ class CompiledExperiment:
     ) -> EvolutionPlan:
         _validate_round_index(round_index, self.round_count)
         task = self._select_task(task_id)
-        prior_dataset_ids = _prior_dataset_artifact_ids(
-            prior_dataset_artifact_ids
-        )
+        prior_dataset_ids = _prior_dataset_artifact_ids(prior_dataset_artifact_ids)
         selections = _plan_selections(
             self._target_selections_json,
             prior_dataset_artifact_ids=prior_dataset_ids,
@@ -356,9 +349,7 @@ class CompiledExperiment:
         prior_dataset_artifact_ids: Sequence[str],
         task_id: str | None = None,
     ) -> list[CompiledEvolutionMethodSpec]:
-        normalized_prior_dataset_ids = _prior_dataset_artifact_ids(
-            prior_dataset_artifact_ids
-        )
+        normalized_prior_dataset_ids = _prior_dataset_artifact_ids(prior_dataset_artifact_ids)
         plan = self.evolution_plan_for_round(
             round_index,
             prior_dataset_artifact_ids=normalized_prior_dataset_ids,
@@ -528,9 +519,7 @@ def validate_project_evolution_selections(
             None,
         )
         method_ids = (
-            resolver.resolved_method_ids
-            if resolver is not None
-            else (resolved_method_id,)
+            resolver.resolved_method_ids if resolver is not None else (resolved_method_id,)
         )
         for method_id in method_ids:
             method = registry_snapshot.methods.get(method_id)
@@ -701,11 +690,7 @@ def _input_artifact_ids_for_binding(
     if binding.source is InputBindingSource.CURRENT_DATASET:
         return [dataset_artifact_id] if binding.artifact_type == "dataset" else []
     if binding.source is InputBindingSource.HISTORY_DATASETS:
-        return (
-            list(spec.prior_dataset_artifact_ids)
-            if binding.artifact_type == "dataset"
-            else []
-        )
+        return list(spec.prior_dataset_artifact_ids) if binding.artifact_type == "dataset" else []
     if binding.source is InputBindingSource.CURRENT_TARGET_ARTIFACTS:
         return _context_artifact_ids_for_type(
             context_artifact_ids,
@@ -745,9 +730,7 @@ def _project_method_config(
         elif injection.source is ProjectConfigInjectionSource.AGENT_MODEL:
             config[injection.field_name] = agent_model
         else:  # pragma: no cover - the descriptor enum is closed.
-            raise ValueError(
-                f"unsupported project config injection source {injection.source!r}"
-            )
+            raise ValueError(f"unsupported project config injection source {injection.source!r}")
     return config
 
 
@@ -773,8 +756,7 @@ def _resolve_project_method_id(
         return requested_method
     if target_id != "agent_system" or requested_method != "auto":
         raise ValueError(
-            f"selection resolver {requested_method!r} is unsupported for target "
-            f"{target_id!r}"
+            f"selection resolver {requested_method!r} is unsupported for target {target_id!r}"
         )
     resolved = resolve_agent_system_method(
         requested_method,
@@ -782,8 +764,7 @@ def _resolve_project_method_id(
     )
     if resolved not in resolver.resolved_method_ids:
         raise ValueError(
-            f"selection resolver {requested_method!r} returned undeclared method "
-            f"{resolved!r}"
+            f"selection resolver {requested_method!r} returned undeclared method {resolved!r}"
         )
     return resolved
 
@@ -867,10 +848,7 @@ def _runtime_payload(config: ExperimentConfig) -> dict[str, Any]:
     if config.runtime.env:
         payload["env"] = dict(config.runtime.env)
     if config.runtime.prepare:
-        payload["prepare"] = [
-            action.model_dump(mode="json")
-            for action in config.runtime.prepare
-        ]
+        payload["prepare"] = [action.model_dump(mode="json") for action in config.runtime.prepare]
     return payload
 
 
@@ -912,10 +890,7 @@ def _reflector_llm(config: ExperimentConfig) -> dict[str, str]:
         return {"provider": config.agent.provider, "model": config.agent.model}
     provider = (
         "codex_cli"
-        if (
-            config.agent.auth in _SUBSCRIPTION_AUTH_MODES
-            or config.agent.preset == "codex"
-        )
+        if (config.agent.auth in _SUBSCRIPTION_AUTH_MODES or config.agent.preset == "codex")
         else "openai_chat"
     )
     return {"provider": provider, "model": config.agent.model}
@@ -929,11 +904,7 @@ def _promotion_gate(config: ExperimentConfig) -> dict[str, Any]:
 
 
 def _worker_visible_promotion_gate(promotion_gate: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        str(key): value
-        for key, value in promotion_gate.items()
-        if key != "llm"
-    }
+    return {str(key): value for key, value in promotion_gate.items() if key != "llm"}
 
 
 def _promotion_gate_targets_artifact(

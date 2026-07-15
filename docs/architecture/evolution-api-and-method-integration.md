@@ -185,14 +185,17 @@ Worker complete 和 direct artifact registration 都使用同一类 artifact pay
 - `compatibility`：context resolver 的过滤条件；为空表示全局匹配。
 - `scores`：可由算法记录评估信息。候选生成、评估、最佳结果选择和 promotion 属于 method
   的受保护逻辑；Core context resolver 不得用一套新排序替换 method 的 promoted 结果。
-  Release run 应显式携带 method-selected promoted artifact ID，再由 resolver 做
-  compatibility 和 payload/lineage 校验。Generic fallback ordering 是当前
+  Generic run 可沿用 method-selected promoted artifact；Core managed science release run
+  则携带 successor revision 的有序 artifact membership，再由 resolver 做 compatibility 和
+  payload/lineage 校验，不要求或改写成员的 `promoted` 字段。Generic fallback ordering 是当前
   `src/openevo/evolution/context.py` 的实现细节，修改它需要独立 issue、回归测试和
   algorithm-impact review。
 - stale artifact guard：Context resolve 验证 selected artifact 的 payload hash、source
   dataset / producing job lineage 和 compatibility，避免把无关或陈旧 artifact 注入后续
   session；productization 不通过重新排列 unpromoted candidates 来解决 stale selection。
-- `promoted`：只有 promoted 且 active/experimental 的 artifacts 会进入 context resolve。
+- `promoted`：未提供 exact revision membership 时，只有 promoted 且 active/experimental 的
+  artifacts 会进入通用 context resolve。显式 `context_artifact_ids` 模式按 revision 顺序读取
+  active/experimental 成员，即使其 `promoted=false`；重复、缺失或额外成员 fail closed。
   Worker complete 期间新 outputs 先处于不可读取、不可 promotion、不可 resolve 的 transient
   `staged` state；只有 job success 的最终事务会把它们一起发布为 active。
 - `manifest.promotion_support`：启用 runner/backend promotion gate 时，算法应写入
@@ -217,8 +220,10 @@ Worker complete 和 direct artifact registration 都使用同一类 artifact pay
   `suggested_changes`、`risks` 和 `validation_checks`；这些 insight 会进入 promotion review
   记录，但不会替代 `approved` 的 promotion 判定。Runner 只 promotion 通过的候选。如果
   gated job 没有产出目标 artifact type，gate 会以 `missing_target_artifact` 拒绝。Runner 不把
-  `report` 等非目标 outputs 送入 gate 或后续 target context；无 gate 时只沿用 method 自己
-  `promoted=true` 的 target output，没有这样的算法结果就 fail closed。
+  `report` 等非目标 outputs 送入 gate 或后续 target context；generic runner 无 gate 时只沿用
+  method 自己 `promoted=true` 的 target output，没有这样的算法结果就 fail closed。Core
+  managed science product runner 的 successor 由 typed target output membership 决定，
+  `promotion_gate=none` 不注入 `promoted=true`，也不把算法的 false 改写成 true。
 
 ## HITL Review Lifecycle
 

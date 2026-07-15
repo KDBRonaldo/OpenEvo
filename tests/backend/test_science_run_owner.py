@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 import sqlite3
 import threading
@@ -26,6 +27,8 @@ from openevo.backend.service_supervisor import (
     ServiceRunReadinessCode,
     SupervisorStateError,
 )
+from openevo.evolution.framework.handlers import PayloadManifestEntry, payload_tree_digest
+from openevo.evolution.runtime_injection import build_runtime_injection_plan
 from openevo.internal_auth import (
     GenerationBoundRunAdmissionCheck,
     InternalServiceIdentity,
@@ -40,6 +43,14 @@ from tests.framework_testkit import verified_builtin_registry
 _GENERATION_DIGEST = "b" * 64
 _FRAMEWORK_LOCK_DIGEST = "c" * 64
 _PAYLOAD_DIGEST = "d" * 64
+_MEMORY_PAYLOAD = b"Durable runtime memory."
+_MEMORY_ENTRY = PayloadManifestEntry(
+    relative_path="memory.md",
+    media_type="text/markdown",
+    size_bytes=len(_MEMORY_PAYLOAD),
+    sha256=hashlib.sha256(_MEMORY_PAYLOAD).hexdigest(),
+)
+_ARTIFACT_CONTENT_DIGEST = payload_tree_digest((_MEMORY_ENTRY,))
 
 
 def _runtime_receipt(
@@ -47,13 +58,64 @@ def _runtime_receipt(
     revision_id: str,
     artifacts: list[dict[str, str]],
 ) -> dict[str, object]:
+    payloads: dict[str, bytes] = {
+        "evolution/adapters.json": b"{}",
+        "evolution/context.json": b"{}",
+        "evolution/instruction.txt": b"effective instruction",
+        "evolution/memory.md": b"durable memory",
+    }
+    runtime_paths: dict[str, list[str]] = {}
+    for artifact in artifacts:
+        artifact_id = artifact["artifact_id"]
+        artifact_type = artifact["artifact_type"]
+        if artifact_type == "text_memory":
+            runtime_paths[artifact_id] = ["evolution/memory.md"]
+        elif artifact_type == "skill_bundle":
+            path = f"evolution/skills/{artifact_id}/SKILL.md"
+            payloads[path] = f"skill {artifact_id}".encode()
+            runtime_paths[artifact_id] = [path]
+        elif artifact_type == "agent_system":
+            target = f"agent_system_targets/{artifact_id}.md"
+            payloads["evolution/agent_system.md"] = b"agent system"
+            payloads[target] = b"agent system"
+            runtime_paths[artifact_id] = ["evolution/agent_system.md", target]
+        else:
+            runtime_paths[artifact_id] = ["evolution/adapters.json"]
+    files = [
+        {
+            "relative_path": path,
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        for path, payload in sorted(payloads.items())
+    ]
+    files_by_path = {item["relative_path"]: item for item in files}
+    received_artifacts = []
+    for artifact in artifacts:
+        paths = runtime_paths[artifact["artifact_id"]]
+        received_artifacts.append(
+            {
+                "artifact_id": artifact["artifact_id"],
+                "artifact_type": artifact["artifact_type"],
+                "content_sha256": artifact["content_sha256"],
+                "runtime_paths": paths,
+                "runtime_tree_sha256": hashlib.sha256(
+                    owner_module._canonical_bytes(
+                        {"files": [files_by_path[path] for path in paths]}
+                    )
+                ).hexdigest(),
+            }
+        )
     return {
-        "schema_version": "2",
+        "schema_version": "3",
         "context_id": "context-verified",
         "revision_id": revision_id,
-        "instruction_sha256": "1" * 64,
-        "staged_tree_sha256": "2" * 64,
-        "artifacts": sorted(artifacts, key=lambda item: item["artifact_id"]),
+        "instruction_sha256": files_by_path["evolution/instruction.txt"]["sha256"],
+        "runtime_tree_sha256": hashlib.sha256(
+            owner_module._canonical_bytes({"files": files})
+        ).hexdigest(),
+        "files": files,
+        "artifacts": received_artifacts,
     }
 
 
@@ -143,6 +205,7 @@ def test_runtime_context_receipt_rejects_wrong_revision_content_and_membership()
             receipt,
             revision_id="revision-2",
             artifacts=authority,
+            authority=receipt,
         )
     with pytest.raises(ValueError, match="content authority"):
         owner_module._verify_runtime_context_receipt(
@@ -154,6 +217,7 @@ def test_runtime_context_receipt_rejects_wrong_revision_content_and_membership()
                     "content_sha256": "9" * 64,
                 }
             },
+            authority=receipt,
         )
     with pytest.raises(ValueError, match="membership"):
         owner_module._verify_runtime_context_receipt(
@@ -166,6 +230,7 @@ def test_runtime_context_receipt_rejects_wrong_revision_content_and_membership()
                     "content_sha256": "5" * 64,
                 },
             },
+            authority=receipt,
         )
 
 
@@ -280,24 +345,24 @@ class _FakeRolloutClient:
 
 
 class _ReceiptRolloutClient(_FakeRolloutClient):
+    def __init__(self, contexts: dict[str, dict[str, Any]]) -> None:
+        super().__init__()
+        self._contexts = contexts
+
     def get_task(self, task_id: str) -> dict[str, Any]:
         payload = self.submissions[-1]
         metadata = payload["metadata"]
         evolution = metadata["evolution"]
         artifact_ids = evolution["context_artifact_ids"]
         revision_id = metadata["openevo"]["revision_id"]
-        receipt = _runtime_receipt(
+        context = _runtime_context(artifact_ids)
+        self._contexts[context["context_id"]] = context
+        receipt = build_runtime_injection_plan(
+            context=context,
             revision_id=revision_id,
-            artifacts=[
-                {
-                    "artifact_id": artifact_id,
-                    "artifact_type": "text_memory",
-                    "content_sha256": "e" * 64,
-                    "staged_sha256": "f" * 64,
-                }
-                for artifact_id in artifact_ids
-            ],
-        )
+            instruction=payload["instruction"],
+            expected_artifact_ids=artifact_ids,
+        ).authority
         return {
             "task_id": task_id,
             "status": "completed",
@@ -317,11 +382,58 @@ class _ReceiptRolloutClient(_FakeRolloutClient):
 
 
 class _FakeEvolutionClient:
-    def __init__(self) -> None:
+    def __init__(self, contexts: dict[str, dict[str, Any]] | None = None) -> None:
         self.closed = False
+        self.contexts = contexts if contexts is not None else {}
+
+    def get_context_runtime_authority(self, context_id: str) -> dict[str, Any]:
+        return self.contexts[context_id]
 
     def close(self) -> None:
         self.closed = True
+
+
+def _runtime_context(artifact_ids: list[str]) -> dict[str, Any]:
+    items = [
+        {
+            "artifact_id": artifact_id,
+            "rendered_text": _MEMORY_PAYLOAD.decode(),
+        }
+        for artifact_id in artifact_ids
+    ]
+    return {
+        "context_id": "context-verified",
+        "memory": {
+            "artifact_ids": artifact_ids,
+            "rendered_text": "\n\n".join(item["rendered_text"] for item in items),
+            "items": items,
+        },
+        "agent_system": {
+            "artifact_ids": [],
+            "rendered_text": "",
+            "target_path": "AGENTS.md",
+            "targets": [],
+        },
+        "skills": [],
+        "adapter_merge_spec": {
+            "base_model": None,
+            "merge_mode": "reference_only",
+            "adapters": [],
+        },
+        "selection": {
+            "artifact_ids": artifact_ids,
+            "artifacts": [
+                {
+                    "artifact_id": artifact_id,
+                    "artifact_type": "text_memory",
+                    "content_sha256": _ARTIFACT_CONTENT_DIGEST,
+                    "payload_entries": [_MEMORY_ENTRY.model_dump(mode="json")],
+                }
+                for artifact_id in artifact_ids
+            ],
+            "reasons": ["matched requested compatible artifacts"],
+        },
+    }
 
 
 class _RunnerSequence:
@@ -424,6 +536,7 @@ def _owner(
     services: _FakeServiceOwner,
     runner: Callable[..., dict[str, Any]],
     rollout_factory: Callable[[ServiceRunBinding], object] | None = None,
+    evolution_factory: Callable[[ServiceRunBinding], object] | None = None,
 ) -> CoreScienceRunOwner:
     return CoreScienceRunOwner(
         state_root=state_root,
@@ -432,7 +545,7 @@ def _owner(
         executable_registry=registry,
         experiment_runner=runner,
         rollout_factory=rollout_factory or (lambda _binding: _FakeRolloutClient()),
-        evolution_factory=lambda _binding: _FakeEvolutionClient(),
+        evolution_factory=evolution_factory or (lambda _binding: _FakeEvolutionClient()),
         poll_interval_seconds=0,
         max_poll_attempts=10,
     )
@@ -463,7 +576,7 @@ def _completed_result(
         "created_at": "2026-07-14T00:00:01Z",
         "payload_byte_size": 12,
         "payload_file_count": 1,
-        "payload_manifest_digest": "e" * 64,
+        "payload_manifest_digest": _ARTIFACT_CONTENT_DIGEST,
     }
     return {
         "status": "completed",
@@ -1280,6 +1393,7 @@ def test_successor_context_is_pinned_into_the_next_session(
     store = CoreControlStoreV1(tmp_path / "projects")
     project = _project(store, registry)
     services = _FakeServiceOwner(_binding(registry))
+    runtime_contexts: dict[str, dict[str, Any]] = {}
 
     successor_revision_id: list[str] = []
 
@@ -1296,6 +1410,7 @@ def test_successor_context_is_pinned_into_the_next_session(
             rollout.submit_task(
                 {
                     "task_id": task_id,
+                    "instruction": "Use the exact successor memory.",
                     "metadata": {
                         "openevo": {"revision_id": successor_revision_id[0]},
                         "evolution": {"context_artifact_ids": ["memory-for-next-session"]},
@@ -1304,7 +1419,14 @@ def test_successor_context_is_pinned_into_the_next_session(
             )
             == task_id
         )
-        assert rollout.get_task(task_id)["status"] == "completed"
+        rollout_result = rollout.get_task(task_id)
+        assert rollout_result["status"] == "completed"
+        rollout_result["results"][0]["metadata"]["evolution"]["runtime_injection_receipt"][
+            "files"
+        ][0]["sha256"] = "0" * 64
+        exposed_receipt = rollout.runtime_context_receipt
+        assert exposed_receipt is not None
+        exposed_receipt["files"][0]["sha256"] = "1" * 64
         return _completed_result(artifact_id="memory-second-session")
 
     runner = _RunnerSequence(first, second)
@@ -1314,7 +1436,8 @@ def test_successor_context_is_pinned_into_the_next_session(
         registry,
         services,
         runner,
-        rollout_factory=lambda _binding: _ReceiptRolloutClient(),
+        rollout_factory=lambda _binding: _ReceiptRolloutClient(runtime_contexts),
+        evolution_factory=lambda _binding: _FakeEvolutionClient(runtime_contexts),
     )
     try:
         first_run = _invoke_create(owner, _run_request(project), "session-one")
@@ -1344,7 +1467,7 @@ def test_successor_context_is_pinned_into_the_next_session(
         assert [item.artifact_id for item in context.artifacts] == ["memory-for-next-session"]
         assert context.artifacts[0].revision.generation == 1
         assert any(
-            item.message.startswith("Runtime context receipt v2: ")
+            item.message.startswith("Runtime context receipt v3: ")
             for item in owner._ledger.logs(second_run.id)
         )
     finally:

@@ -85,15 +85,19 @@ raw secrets, private paths, and hidden benchmark answers.
 ## Context Resolver Boundary
 
 The evolution method owns candidate evaluation, best-result selection, and
-promotion. Context resolution filters for promoted, compatible artifacts and
-validates explicit artifact IDs selected by the method/run. It must not rerank
-unpromoted method candidates or replace a method-selected promoted artifact.
+promotion. Generic context resolution filters for promoted, compatible artifacts
+and keeps its existing fallback ordering. A Core product run instead passes the
+ordered artifact membership from its pinned revision. Exact resolution validates
+and consumes that list in order, without requiring or rewriting each member's
+`promoted` flag; Core's successor membership, not a guessed score or promotion
+bit, is authoritative for the next session.
 
 Generic fallback ordering for old artifacts is an implementation detail of
 `src/openevo/evolution/context.py`; productization does not redefine it. Release
-science and benchmark paths pass the method-selected promoted artifact ID
-explicitly. Changing fallback ranking requires a separate issue, regression
-tests, and algorithm-impact review.
+science paths pass the exact revision artifact IDs explicitly and reject
+duplicates, omissions, incompatible members, or reordered resolver output.
+Changing fallback ranking requires a separate issue, regression tests, and
+algorithm-impact review.
 
 Core rejects artifacts incompatible with the task, harness, model, execution
 mode, or base model. It also validates payload and lineage references so a run
@@ -113,7 +117,7 @@ Core and Desktop.
 
 ### Science Consumers
 
-OpenEvo Desktop lets ordinary users inspect promoted text memory, skill bundle,
-and agent-system artifacts plus method-owned selection evidence. It requests a
-follow-up run with the promoted artifact IDs; Core performs the final
-compatibility check and staging.
+OpenEvo Desktop lets ordinary users inspect text memory, skill bundle, and
+agent-system artifacts plus method-owned evidence. A follow-up product run uses
+the artifact membership committed in the pinned successor revision; Core performs
+the final ordered compatibility, payload, rendering, and runtime-readback checks.

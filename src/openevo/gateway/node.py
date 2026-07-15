@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import fcntl
 import hashlib
 import json
@@ -93,9 +94,19 @@ from openevo.trajectory.models import (
 )
 from openevo.trajectory.builder.agent_transcript import AgentTranscriptBuilder
 from openevo.trajectory.registry import StrategyRegistry
-from openevo.evolution.agent_system import normalize_agent_system_target_path
+from openevo.evolution.agent_system import (
+    ROOT_AGENT_SYSTEM_FILES,
+    normalize_agent_system_target_path,
+)
+from openevo.evolution.artifact_payloads import ArtifactPayloadService
 from openevo.evolution.client import EvolutionClient
 from openevo.evolution.framework.handlers import PayloadManifestEntry, payload_tree_digest
+from openevo.evolution.runtime_injection import (
+    RuntimeInjectionPlan,
+    build_runtime_injection_plan,
+    instruction_with_evolution_context,
+    receipt_from_runtime_readback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +136,223 @@ _CLEANUP_JOURNAL_RECORD_RE = re.compile(r"[0-9a-f]{64}\.json")
 _CLEANUP_JOURNAL_PENDING_RE = re.compile(r"[0-9a-f]{64}\.pending")
 _CLEANUP_JOURNAL_GENERATION_RE = re.compile(r"[0-9a-f]{32}")
 _CLEANUP_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+_AGENT_SYSTEM_TARGET_READBACK_SCRIPT = r"""
+import hashlib
+import json
+import os
+import stat
+import sys
+
+_MARKER = "_OPENEVO_TARGET_READBACK_V1"
+_MAX_FILES = 4096
+_MAX_BYTES = 64 * 1024 * 1024
+_DIR_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+_FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def _fail():
+    raise RuntimeError("closed runtime target readback")
+
+
+def _dir_identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid)
+
+
+def _file_identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _open_absolute_root(value):
+    if not isinstance(value, str) or not value.startswith("/"):
+        _fail()
+    parts = [part for part in value.split("/") if part]
+    if any(part in {".", ".."} for part in parts):
+        _fail()
+    descriptors = [os.open("/", _DIR_FLAGS)]
+    bindings = []
+    for part in parts:
+        parent = descriptors[-1]
+        child = os.open(part, _DIR_FLAGS, dir_fd=parent)
+        identity = _dir_identity(os.fstat(child))
+        if not stat.S_ISDIR(identity[2]):
+            _fail()
+        bindings.append((parent, part, child, identity))
+        descriptors.append(child)
+    return descriptors, bindings
+
+
+def _open_optional_dir(parent, name):
+    try:
+        descriptor = os.open(name, _DIR_FLAGS, dir_fd=parent)
+    except FileNotFoundError:
+        return None
+    identity = _dir_identity(os.fstat(descriptor))
+    if not stat.S_ISDIR(identity[2]):
+        _fail()
+    return descriptor, (parent, name, descriptor, identity)
+
+
+def _verify_binding(binding):
+    parent, name, descriptor, expected = binding
+    if _dir_identity(os.fstat(descriptor)) != expected:
+        _fail()
+    observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if _dir_identity(observed) != expected:
+        _fail()
+
+
+def _present_names(parent, names):
+    present = []
+    for name in names:
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        present.append(name)
+    return present
+
+
+def _target_names(parent):
+    names = []
+    for name in os.listdir(parent):
+        if not name.endswith(".md"):
+            continue
+        try:
+            encoded = name.encode("utf-8")
+        except UnicodeError:
+            _fail()
+        if not encoded or len(encoded) > 256 or name in {".", ".."} or "/" in name:
+            _fail()
+        names.append(name)
+    return sorted(names)
+
+
+def _require_missing(parent, name):
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    _fail()
+
+
+def _scan_file(parent, name, relative_path, budget):
+    named_before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(named_before.st_mode)
+        or named_before.st_nlink != 1
+        or named_before.st_size < 0
+        or named_before.st_size > _MAX_BYTES - budget[0]
+    ):
+        _fail()
+    descriptor = os.open(name, _FILE_FLAGS, dir_fd=parent)
+    try:
+        opened_before = os.fstat(descriptor)
+        if _file_identity(opened_before) != _file_identity(named_before):
+            _fail()
+        remaining = opened_before.st_size
+        digest = hashlib.sha256()
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                _fail()
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            _fail()
+        opened_after = os.fstat(descriptor)
+        named_after = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            _file_identity(opened_after) != _file_identity(opened_before)
+            or _file_identity(named_after) != _file_identity(opened_before)
+        ):
+            _fail()
+    finally:
+        os.close(descriptor)
+    budget[0] += opened_before.st_size
+    return {
+        "relative_path": relative_path,
+        "size_bytes": opened_before.st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _main():
+    root_files = json.loads(sys.argv[2])
+    if (
+        not isinstance(root_files, list)
+        or len(root_files) != len(set(root_files))
+        or not all(isinstance(value, str) and value for value in root_files)
+    ):
+        _fail()
+    descriptors, bindings = _open_absolute_root(sys.argv[1])
+    optional_descriptors = []
+    try:
+        root = descriptors[-1]
+        root_before = _present_names(root, root_files)
+        openhands = _open_optional_dir(root, ".openhands")
+        microagents = None
+        microagent_names = []
+        if openhands is not None:
+            optional_descriptors.append(openhands[0])
+            microagents = _open_optional_dir(openhands[0], "microagents")
+            if microagents is not None:
+                optional_descriptors.append(microagents[0])
+                microagent_names = _target_names(microagents[0])
+
+        if len(root_before) + len(microagent_names) > _MAX_FILES:
+            _fail()
+        budget = [0]
+        files = [_scan_file(root, name, name, budget) for name in root_before]
+        if microagents is not None:
+            files.extend(
+                _scan_file(
+                    microagents[0],
+                    name,
+                    ".openhands/microagents/" + name,
+                    budget,
+                )
+                for name in microagent_names
+            )
+
+        if _present_names(root, root_files) != root_before:
+            _fail()
+        if openhands is None:
+            _require_missing(root, ".openhands")
+        else:
+            _verify_binding(openhands[1])
+            if microagents is None:
+                _require_missing(openhands[0], "microagents")
+            else:
+                if _target_names(microagents[0]) != microagent_names:
+                    _fail()
+                _verify_binding(microagents[1])
+        for binding in reversed(bindings):
+            _verify_binding(binding)
+        files.sort(key=lambda item: item["relative_path"])
+        sys.stdout.write(json.dumps(files, sort_keys=True, separators=(",", ":")))
+    finally:
+        for descriptor in reversed(optional_descriptors):
+            os.close(descriptor)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+try:
+    _main()
+except BaseException:
+    sys.stderr.write(_MARKER + " failed\n")
+    raise SystemExit(74)
+"""
 _RECOVERY_PHASE_RUNTIME_ACTIVE = "runtime_active"
 _RECOVERY_PHASE_TERMINAL_FINALIZATION = "terminal_finalization"
 _RECOVERY_PHASE_TERMINAL_DELIVERY = "terminal_delivery"
@@ -198,6 +426,13 @@ class _EvolutionStagingResult:
     env: dict[str, str]
     artifacts: tuple[_StagedEvolutionArtifact, ...]
     staged_tree_sha256: str
+    injection_plan: RuntimeInjectionPlan | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _EvolutionInjection:
+    env: dict[str, str]
+    staged: _EvolutionStagingResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +537,8 @@ async def write_evolution_context_files(
         host_dir=host_dir,
         target_dir=target_dir,
         expected_artifact_ids=None,
+        instruction=None,
+        revision_id=None,
     )
     return dict(staged.env)
 
@@ -313,6 +550,8 @@ async def _stage_evolution_context_files(
     host_dir: Path,
     target_dir: str,
     expected_artifact_ids: tuple[str, ...] | None,
+    instruction: str | None,
+    revision_id: str | None,
 ) -> _EvolutionStagingResult:
     del host_dir  # Staging must stay outside the agent-writable session bind.
     selected = _selected_evolution_artifacts(
@@ -332,6 +571,16 @@ async def _stage_evolution_context_files(
         "agent_system",
         selected_by_id=selected_by_id,
     )
+    injection_plan = None
+    if expected_artifact_ids:
+        if instruction is None or revision_id is None:
+            raise ValueError("exact evolution staging requires instruction and revision authority")
+        injection_plan = build_runtime_injection_plan(
+            context=context,
+            revision_id=revision_id,
+            instruction=instruction,
+            expected_artifact_ids=expected_artifact_ids,
+        )
     with TemporaryDirectory(prefix="openevo-evolution-upload-") as temporary:
         evolution_dir = Path(temporary)
         skills_dir = evolution_dir / "skills"
@@ -342,6 +591,7 @@ async def _stage_evolution_context_files(
         memory_path = evolution_dir / "memory.md"
         agent_system_path = evolution_dir / "agent_system.md"
         adapters_path = evolution_dir / "adapters.json"
+        instruction_path = evolution_dir / "instruction.txt"
 
         skill_digests = _stage_evolution_skill_bundles(
             context,
@@ -358,30 +608,31 @@ async def _stage_evolution_context_files(
                     context=context,
                     targets_dir=agent_system_targets_dir,
                     rendered=agent_system_text,
+                    target_payloads=(
+                        injection_plan.agent_system_targets if injection_plan is not None else None
+                    ),
                 )
             )
 
         memory_text = _memory_rendered_text(context)
-        context_path.write_text(
-            json.dumps(_runtime_context_document(context), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        memory_path.write_text(
-            memory_text,
-            encoding="utf-8",
-        )
-        agent_system_path.write_text(
-            agent_system_text,
-            encoding="utf-8",
-        )
-        adapters_path.write_text(
-            json.dumps(
-                context.get("adapter_merge_spec") or {},
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
+        if injection_plan is None:
+            context_path.write_text(
+                json.dumps(_runtime_context_document(context), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            memory_path.write_text(memory_text, encoding="utf-8")
+            agent_system_path.write_text(agent_system_text, encoding="utf-8")
+            adapters_path.write_text(
+                json.dumps(
+                    context.get("adapter_merge_spec") or {},
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        else:
+            for filename, payload in injection_plan.canonical_files.items():
+                (evolution_dir / filename).write_bytes(payload)
 
         await runtime.upload_file(str(context_path), f"{target_dir}/context.json")
         await runtime.upload_file(str(memory_path), f"{target_dir}/memory.md")
@@ -389,6 +640,11 @@ async def _stage_evolution_context_files(
             await runtime.upload_file(
                 str(agent_system_path),
                 f"{target_dir}/agent_system.md",
+            )
+        if injection_plan is not None:
+            await runtime.upload_file(
+                str(instruction_path),
+                f"{target_dir}/instruction.txt",
             )
         await runtime.upload_file(str(adapters_path), f"{target_dir}/adapters.json")
         await runtime.upload_dir(str(skills_dir), f"{target_dir}/skills")
@@ -427,7 +683,6 @@ async def _stage_evolution_context_files(
                 staged_sha256=staged_sha256,
             )
         )
-    staged_artifacts.sort(key=lambda item: item.artifact_id)
     staged_tree_sha256 = _canonical_sha256(
         {
             "artifacts": [
@@ -449,6 +704,7 @@ async def _stage_evolution_context_files(
         env=env,
         artifacts=tuple(staged_artifacts),
         staged_tree_sha256=staged_tree_sha256,
+        injection_plan=injection_plan,
     )
 
 
@@ -482,11 +738,9 @@ def _selected_evolution_artifacts(
         or len(artifact_ids) != len(set(artifact_ids))
     ):
         raise ValueError("evolution context selection identity is invalid")
-    if expected_artifact_ids is not None and tuple(sorted(artifact_ids)) != tuple(
-        sorted(expected_artifact_ids)
-    ):
+    if expected_artifact_ids is not None and tuple(artifact_ids) != expected_artifact_ids:
         raise ValueError("resolved evolution context differs from admission")
-    selected: list[_SelectedEvolutionArtifact] = []
+    selected_by_id: dict[str, _SelectedEvolutionArtifact] = {}
     for value in artifacts:
         if not isinstance(value, dict) or set(value) != {
             "artifact_id",
@@ -513,21 +767,17 @@ def _selected_evolution_artifacts(
         entries = tuple(PayloadManifestEntry.model_validate(entry) for entry in raw_entries)
         if payload_tree_digest(entries) != content_sha256:
             raise ValueError("evolution context artifact digest is invalid")
-        selected.append(
-            _SelectedEvolutionArtifact(
-                artifact_id=artifact_id,
-                artifact_type=artifact_type,
-                content_sha256=content_sha256,
-                payload_entries=entries,
-            )
+        if artifact_id in selected_by_id:
+            raise ValueError("evolution context artifact inventory is duplicated")
+        selected_by_id[artifact_id] = _SelectedEvolutionArtifact(
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            content_sha256=content_sha256,
+            payload_entries=entries,
         )
-    if (
-        len(selected) != len(artifact_ids)
-        or len({item.artifact_id for item in selected}) != len(selected)
-        or {item.artifact_id for item in selected} != set(artifact_ids)
-    ):
+    if len(selected_by_id) != len(artifact_ids) or set(selected_by_id) != set(artifact_ids):
         raise ValueError("evolution context artifact inventory is incomplete")
-    return tuple(sorted(selected, key=lambda item: item.artifact_id))
+    return tuple(selected_by_id[artifact_id] for artifact_id in artifact_ids)
 
 
 def _selected_text_items(
@@ -663,12 +913,20 @@ async def _stage_evolution_agent_system(
     context: dict,
     targets_dir: Path,
     rendered: str,
+    target_payloads: Mapping[str, bytes] | None = None,
 ) -> dict[str, str]:
     agent_system = context.get("agent_system") or {}
     if not isinstance(agent_system, dict):
         return {}
 
-    target_specs = _agent_system_target_specs(agent_system, rendered)
+    target_specs = (
+        [
+            {"target_path": target_path, "rendered_text": payload.decode("utf-8")}
+            for target_path, payload in target_payloads.items()
+        ]
+        if target_payloads is not None
+        else _agent_system_target_specs(agent_system, rendered)
+    )
     target_root = _agent_system_target_root(runtime)
     remote_targets: list[str] = []
     agents_md_target: str | None = None
@@ -846,19 +1104,7 @@ def _canonical_sha256(value: object) -> str:
 
 
 def _instruction_with_evolution_context(instruction: str, context: dict) -> str:
-    agent_system = str((context.get("agent_system") or {}).get("rendered_text") or "").strip()
-    memory = str((context.get("memory") or {}).get("rendered_text") or "").strip()
-    if not agent_system and not memory:
-        return instruction
-    parts: list[str] = []
-    if agent_system:
-        parts.append(
-            f"Use the following evolved agent system instructions for this task:\n{agent_system}"
-        )
-    if memory:
-        parts.append(f"Use the following long-term memory for this task:\n{memory}")
-    parts.append(f"Task:\n{instruction}")
-    return "\n\n".join(parts)
+    return instruction_with_evolution_context(instruction, context)
 
 
 def _existing_evolution_metadata(metadata: dict) -> dict:
@@ -885,7 +1131,7 @@ def _admitted_context_artifact_ids(
         or len(artifact_ids) != len(set(artifact_ids))
     ):
         raise ValueError("admitted evolution context artifact identity is invalid")
-    return tuple(sorted(artifact_ids))
+    return tuple(artifact_ids)
 
 
 def _admitted_revision_id(
@@ -906,39 +1152,98 @@ def _admitted_revision_id(
     return revision_id
 
 
-def _runtime_injection_receipt(
+async def _runtime_injection_receipt_from_readback(
     *,
-    context: dict[str, Any],
-    revision_id: str,
-    instruction: str,
-    staged: _EvolutionStagingResult,
-    expected_artifact_ids: tuple[str, ...],
+    runtime: BaseRuntime,
+    target_dir: str,
+    plan: RuntimeInjectionPlan,
 ) -> dict[str, object]:
-    context_id = context.get("context_id")
-    if (
-        not isinstance(context_id, str)
-        or not context_id
-        or len(context_id.encode("utf-8")) > 256
-        or tuple(item.artifact_id for item in staged.artifacts)
-        != tuple(sorted(expected_artifact_ids))
-    ):
-        raise ValueError("runtime injection receipt authority is incomplete")
-    return {
-        "schema_version": "2",
-        "context_id": context_id,
-        "revision_id": revision_id,
-        "instruction_sha256": _sha256_text(instruction),
-        "staged_tree_sha256": staged.staged_tree_sha256,
-        "artifacts": [
+    with TemporaryDirectory(prefix="openevo-evolution-readback-") as temporary:
+        readback_root = Path(temporary)
+        await runtime.download_dir(target_dir, str(readback_root / "evolution"))
+        with ArtifactPayloadService(readback_root) as payloads:
+            snapshot = payloads.issue_snapshot(
+                artifact_id="runtime-readback",
+                artifact_type="runtime_readback",
+                name="runtime-readback",
+                uri=readback_root.as_uri(),
+                manifest={},
+                scores={},
+                rank_index=0,
+            )
+        files = [
             {
-                "artifact_id": item.artifact_id,
-                "artifact_type": item.artifact_type,
-                "content_sha256": item.content_sha256,
-                "staged_sha256": item.staged_sha256,
+                "relative_path": entry.relative_path,
+                "size_bytes": entry.size_bytes,
+                "sha256": entry.sha256,
             }
-            for item in staged.artifacts
-        ],
-    }
+            for entry in snapshot.payload_entries
+        ]
+        if plan.agent_system_targets:
+            files.extend(await _runtime_agent_system_target_inventory(runtime))
+            files.sort(key=lambda item: str(item["relative_path"]))
+    return receipt_from_runtime_readback(plan.authority, files)
+
+
+async def _runtime_agent_system_target_inventory(
+    runtime: BaseRuntime,
+) -> list[dict[str, object]]:
+    target_root = _agent_system_target_root(runtime)
+    if not target_root.is_absolute():
+        raise ValueError("runtime agent-system target root must be absolute")
+    root_files = json.dumps(sorted(ROOT_AGENT_SYSTEM_FILES), separators=(",", ":"))
+    command = " ".join(
+        (
+            "/usr/bin/python3",
+            "-I",
+            "-S",
+            "-c",
+            shlex.quote(_AGENT_SYSTEM_TARGET_READBACK_SCRIPT),
+            shlex.quote(target_root.as_posix()),
+            shlex.quote(root_files),
+        )
+    )
+    result = await runtime.exec(command, timeout_sec=30.0)
+    if (
+        result is None
+        or getattr(result, "return_code", None) != 0
+        or not isinstance(getattr(result, "stdout", None), str)
+    ):
+        raise ValueError("runtime agent-system target readback failed")
+    payload = result.stdout
+    if len(payload.encode("utf-8")) > 2 * 1024 * 1024:
+        raise ValueError("runtime agent-system target inventory exceeds its byte bound")
+    try:
+        values = json.loads(payload)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("runtime agent-system target inventory is invalid") from exc
+    if not isinstance(values, list):
+        raise ValueError("runtime agent-system target inventory is invalid")
+    files: list[dict[str, object]] = []
+    for value in values:
+        if not isinstance(value, dict) or set(value) != {
+            "relative_path",
+            "size_bytes",
+            "sha256",
+        }:
+            raise ValueError("runtime agent-system target inventory is invalid")
+        relative_path = value.get("relative_path")
+        if not isinstance(relative_path, str):
+            raise ValueError("runtime agent-system target inventory is invalid")
+        try:
+            normalized = normalize_agent_system_target_path(relative_path)
+        except ValueError as exc:
+            raise ValueError("runtime agent-system target inventory is invalid") from exc
+        if normalized != relative_path:
+            raise ValueError("runtime agent-system target inventory is not canonical")
+        files.append(
+            {
+                "relative_path": f"agent_system_targets/{relative_path}",
+                "size_bytes": value.get("size_bytes"),
+                "sha256": value.get("sha256"),
+            }
+        )
+    return files
 
 
 def build_evolution_session_event(result: SessionResult) -> dict:
@@ -1668,9 +1973,7 @@ class GatewayNodeManager:
         if authority is not None:
             return authority.prepare_snapshot()
         if getattr(self, "_internal_headers", None):
-            raise SessionFileSecurityError(
-                "release Gateway credential authority is unavailable"
-            )
+            raise SessionFileSecurityError("release Gateway credential authority is unavailable")
         temporary_authority = HeldCodexCredentialAuthority.open(
             Path.home() / ".codex" / "auth.json"
         )
@@ -1740,9 +2043,7 @@ class GatewayNodeManager:
 
         auth_path = Path(os.path.abspath(Path.home() / ".codex" / "auth.json"))
         protected_paths = (
-            (auth_path,)
-            if session_dir is None
-            else (auth_path, session_dir.resolve())
+            (auth_path,) if session_dir is None else (auth_path, session_dir.resolve())
         )
         for action in runtime_spec.prepare:
             if action.type not in {"upload_file", "upload_dir"} or not action.source:
@@ -1846,9 +2147,15 @@ class GatewayNodeManager:
             self._start_eval_prewarm(managed)
             harness = self._resolve_agent_harness(request)
 
-            evolution_env = await self._resolve_and_inject_evolution_context(
+            resolved_evolution = await self._resolve_and_inject_evolution_context(
                 managed,
                 harness,
+            )
+            evolution_injection = (
+                resolved_evolution if isinstance(resolved_evolution, _EvolutionInjection) else None
+            )
+            evolution_env = (
+                evolution_injection.env if evolution_injection is not None else resolved_evolution
             )
             if evolution_env:
                 harness.env.update(evolution_env)
@@ -1865,6 +2172,19 @@ class GatewayNodeManager:
             # Postprocess always runs so harnesses can collect artifacts from
             # failed or timed-out agent runs before post-run evaluation.
             await self._await_with_budget(harness.postprocess(runtime, agent_result), managed)
+            if (
+                evolution_injection is not None
+                and evolution_injection.staged.injection_plan is not None
+            ):
+                receipt = await self._await_with_budget(
+                    _runtime_injection_receipt_from_readback(
+                        runtime=runtime,
+                        target_dir=self.evolution.context.target_dir,
+                        plan=evolution_injection.staged.injection_plan,
+                    ),
+                    managed,
+                )
+                self._publish_runtime_injection_receipt(managed, receipt)
             self._redact_core_capture_authority(managed)
 
         except GatewayExecutionTimeout as exc:
@@ -1923,7 +2243,7 @@ class GatewayNodeManager:
         self,
         managed: ManagedSession,
         harness: BaseHarness,
-    ) -> dict[str, str]:
+    ) -> _EvolutionInjection | dict[str, str]:
         request = managed.request
         if self.evolution is None or not self.evolution.enabled or self.evolution_client is None:
             return {}
@@ -1955,23 +2275,16 @@ class GatewayNodeManager:
                     host_dir=managed.session_dir,
                     target_dir=self.evolution.context.target_dir,
                     expected_artifact_ids=expected_artifact_ids,
+                    instruction=request.instruction,
+                    revision_id=revision_id,
                 ),
                 managed,
             )
-            request.instruction = _instruction_with_evolution_context(
-                request.instruction,
-                context,
+            request.instruction = (
+                staged.injection_plan.effective_instruction
+                if staged.injection_plan is not None
+                else _instruction_with_evolution_context(request.instruction, context)
             )
-            runtime_injection_receipt = None
-            if expected_artifact_ids:
-                assert revision_id is not None
-                runtime_injection_receipt = _runtime_injection_receipt(
-                    context=context,
-                    revision_id=revision_id,
-                    instruction=request.instruction,
-                    staged=staged,
-                    expected_artifact_ids=expected_artifact_ids,
-                )
             adapter_merge_spec = context.get("adapter_merge_spec")
             if isinstance(adapter_merge_spec, dict):
                 request.metadata["adapter_merge_spec"] = adapter_merge_spec
@@ -1980,8 +2293,6 @@ class GatewayNodeManager:
                 "context_id": context.get("context_id"),
                 "context_injected": True,
             }
-            if runtime_injection_receipt is not None:
-                evolution_metadata["runtime_injection_receipt"] = runtime_injection_receipt
             request.metadata["evolution"] = evolution_metadata
             registry_metadata: dict[str, Any] = {"evolution": evolution_metadata}
             if isinstance(adapter_merge_spec, dict):
@@ -1992,9 +2303,11 @@ class GatewayNodeManager:
                     request.session_id,
                     registry_metadata,
                 )
+            if staged.injection_plan is not None:
+                return _EvolutionInjection(env=dict(staged.env), staged=staged)
             return dict(staged.env)
         except Exception as exc:
-            if not self.evolution.context.fail_open:
+            if expected_artifact_ids is not None or not self.evolution.context.fail_open:
                 raise
             request.metadata["evolution"] = {
                 **_existing_evolution_metadata(request.metadata),
@@ -2008,6 +2321,24 @@ class GatewayNodeManager:
                 level=logging.WARNING,
             )
             return {}
+
+    def _publish_runtime_injection_receipt(
+        self,
+        managed: ManagedSession,
+        receipt: dict[str, object],
+    ) -> None:
+        request = managed.request
+        evolution_metadata = _existing_evolution_metadata(request.metadata)
+        if evolution_metadata.get("context_id") != receipt.get("context_id"):
+            raise ValueError("runtime injection receipt context changed before publication")
+        evolution_metadata["runtime_injection_receipt"] = receipt
+        request.metadata["evolution"] = evolution_metadata
+        session_registry = getattr(self, "session_registry", None)
+        if session_registry is not None:
+            session_registry.update_metadata(
+                request.session_id,
+                {"evolution": evolution_metadata},
+            )
 
     async def _export_evolution_event(self, result: SessionResult) -> bool:
         authority = self._current_export_authority()

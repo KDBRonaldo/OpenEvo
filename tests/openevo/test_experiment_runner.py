@@ -4154,6 +4154,7 @@ def test_core_authoritative_successor_selects_target_output_without_rewriting_pr
     first_job = result["tasks"][0]["rounds"][0]["jobs"][0]
     assert first_job["promotion_status"] == "core_selected"
     assert first_job["approved_artifact_ids"] == ["candidate-agent-system"]
+    assert "promoted" not in evolution.jobs[0]["config"]
     assert artifacts["candidate-agent-system"]["promoted"] is False
     assert rollout.submitted[1]["metadata"]["evolution"]["context_artifact_ids"] == [
         "candidate-agent-system"

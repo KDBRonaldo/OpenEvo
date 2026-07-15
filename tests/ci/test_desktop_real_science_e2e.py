@@ -301,9 +301,154 @@ def test_closed_evidence_schema_accepts_runtime_receipt_shape() -> None:
             "session_2_lineage_verified": True,
             "runtime_context_receipt_sha256": digest,
         },
+        "cleanup": {
+            "active_run_cleanup_required": True,
+            "active_run_cancel_requested": True,
+            "active_run_cancelled": True,
+            "active_run_cleanup_succeeded": True,
+            "desktop_disconnect_succeeded": True,
+            "sidecar_shutdown_succeeded": True,
+            "core_ownership_release_requested": True,
+        },
     }
 
     module._audit_evidence(payload, private_values=())
+
+
+def test_cleanup_cancels_active_run_before_disconnect(monkeypatch) -> None:
+    module = _load_runner()
+    calls: list[tuple[str, str] | tuple[str]] = []
+    observations = iter(
+        [
+            {"id": "run-active", "status": "running", "etag": '"' + "1" * 64 + '"'},
+            {"id": "run-active", "status": "cancelled", "etag": '"' + "3" * 64 + '"'},
+        ]
+    )
+
+    class FakeApi:
+        def request(self, method: str, route: str, **kwargs: object):
+            calls.append((method, route))
+            if method == "GET":
+                return next(observations)
+            assert method == "POST"
+            assert kwargs["expected_status"] == 202
+            headers = kwargs["headers"]
+            assert headers["If-Match"] == '"' + "1" * 64 + '"'  # type: ignore[index]
+            return {
+                "id": "run-active",
+                "status": "cancelling",
+                "etag": '"' + "2" * 64 + '"',
+            }
+
+    workflow = _workflow(module)
+    workflow._api = FakeApi()
+    workflow._active_run = {
+        "id": "run-active",
+        "status": "running",
+        "etag": '"' + "0" * 64 + '"',
+    }
+    workflow._disconnect = lambda: calls.append(("disconnect",)) or True
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+    outcome = workflow.cleanup()
+
+    assert calls == [
+        ("GET", "/desktop/v1/runs/run-active"),
+        ("POST", "/desktop/v1/runs/run-active/cancel"),
+        ("GET", "/desktop/v1/runs/run-active"),
+        ("disconnect",),
+    ]
+    assert outcome == {
+        "active_run_cleanup_required": True,
+        "active_run_cancel_requested": True,
+        "active_run_cancelled": True,
+        "active_run_cleanup_succeeded": True,
+        "desktop_disconnect_succeeded": True,
+    }
+
+
+def test_cleanup_does_not_treat_non_cancelled_terminal_run_as_success(monkeypatch) -> None:
+    module = _load_runner()
+    observations = iter(
+        [
+            {"id": "run-active", "status": "running", "etag": '"' + "1" * 64 + '"'},
+            {"id": "run-active", "status": "failed", "etag": '"' + "3" * 64 + '"'},
+        ]
+    )
+
+    class FakeApi:
+        def request(self, method: str, _route: str, **_kwargs: object):
+            if method == "GET":
+                return next(observations)
+            return {
+                "id": "run-active",
+                "status": "cancelling",
+                "etag": '"' + "2" * 64 + '"',
+            }
+
+    workflow = _workflow(module)
+    workflow._api = FakeApi()
+    workflow._active_run = {
+        "id": "run-active",
+        "status": "running",
+        "etag": '"' + "0" * 64 + '"',
+    }
+    workflow._disconnect = lambda: True
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+    outcome = workflow.cleanup()
+
+    assert outcome["active_run_cancel_requested"] is True
+    assert outcome["active_run_cancelled"] is False
+    assert outcome["active_run_cleanup_succeeded"] is False
+    assert outcome["desktop_disconnect_succeeded"] is True
+
+
+def test_active_run_cleanup_timeout_and_interrupt_are_closed(monkeypatch) -> None:
+    module = _load_runner()
+
+    class TimeoutApi:
+        def request(self, method: str, _route: str, **_kwargs: object):
+            if method == "GET":
+                return {
+                    "id": "run-active",
+                    "status": "running",
+                    "etag": '"' + "1" * 64 + '"',
+                }
+            return {
+                "id": "run-active",
+                "status": "cancelling",
+                "etag": '"' + "2" * 64 + '"',
+            }
+
+    timeout_workflow = _workflow(module)
+    timeout_workflow._api = TimeoutApi()
+    timeout_workflow._active_run = {
+        "id": "run-active",
+        "status": "running",
+        "etag": '"' + "0" * 64 + '"',
+    }
+    monotonic = iter((0.0, 121.0))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(monotonic))
+    timed_out = timeout_workflow._cancel_active_run()
+    assert timed_out["active_run_cancel_requested"] is True
+    assert timed_out["active_run_cancelled"] is False
+    assert timed_out["active_run_cleanup_succeeded"] is False
+
+    class InterruptedApi:
+        def request(self, *_args: object, **_kwargs: object):
+            raise KeyboardInterrupt
+
+    interrupted_workflow = _workflow(module)
+    interrupted_workflow._api = InterruptedApi()
+    interrupted_workflow._active_run = {
+        "id": "run-active",
+        "status": "running",
+        "etag": '"' + "0" * 64 + '"',
+    }
+    interrupted = interrupted_workflow._cancel_active_run()
+    assert interrupted["active_run_cancel_requested"] is False
+    assert interrupted["active_run_cleanup_succeeded"] is False
 
 
 def test_capability_selection_enables_all_three_remote_supported_methods() -> None:
