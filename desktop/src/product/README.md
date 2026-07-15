@@ -70,7 +70,14 @@ poll is bound to the provider, Desktop/Core project identities, active project
 session, and run ID; a project or session change rejects a late response. The
 next timeout is armed only after the current request settles, transient failures
 remain retryable, and terminal, offline, switched-project, and unmounted states
-stop polling. SSE invalidations remain the immediate refresh path.
+stop polling. Poll, SSE, manual, lifecycle, and mutation-dependent refreshes all
+use one serial renderer owner. Calls arriving during an active refresh coalesce
+into one trailing refresh, and existing waiters move to that trailing result so
+a poll cannot supersede mutation recovery. A completion whose polling identity
+is no longer current is not rendered; the renderer adopts its authoritative
+epoch as stale and performs a serial reconciliation before mutations are enabled
+again. SSE invalidations remain the immediate refresh path without creating
+parallel snapshot loads.
 
 The release adapter deliberately has no fallback for those native calls. The
 Rust host implements `select_project_source` with the operating-system folder

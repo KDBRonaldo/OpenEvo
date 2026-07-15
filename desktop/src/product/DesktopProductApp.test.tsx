@@ -177,8 +177,11 @@ describe("DesktopProductApp", () => {
     });
     expect(screenText()).toContain("Second research task");
 
+    await flush();
+    expect(refresh).toHaveBeenCalledTimes(inFlightRefreshCount + 1);
+    const reconciledRefreshCount = refresh.mock.calls.length;
     await advance(5_000);
-    expect(refresh).toHaveBeenCalledTimes(inFlightRefreshCount);
+    expect(refresh).toHaveBeenCalledTimes(reconciledRefreshCount);
   });
 
   it("cancels run polling when the renderer unmounts", async () => {

@@ -56,7 +56,7 @@ import {
   type ProductMutationIntent,
   type ProductArtifactCollectionState,
   type ProductResourceMutationIntent,
-  ProductRefreshOrder,
+  type ProductRefreshResult,
   unavailableDesktopProductProvider,
 } from "./provider";
 import { MethodConfigEditor, methodConfigErrors } from "./MethodConfigEditor";
@@ -111,6 +111,18 @@ type RunPollingIdentity = {
   readonly activeProjectEtag: string;
   readonly activeProfileId: string;
 };
+type SnapshotRefreshWaiter = {
+  readonly isRelevant: SnapshotRefreshGuard;
+  readonly resolve: (snapshot: DesktopProductSnapshot | null) => void;
+};
+type SnapshotRefreshBatch = {
+  readonly provider: DesktopProductProvider;
+  readonly waiters: SnapshotRefreshWaiter[];
+};
+type SnapshotRefreshPublication =
+  | { readonly kind: "result"; readonly result: ProductRefreshResult }
+  | { readonly kind: "rejected"; readonly error: unknown }
+  | { readonly kind: "pending"; readonly epoch: number | null };
 
 export interface DesktopProductAppProps {
   provider?: DesktopProductProvider;
@@ -130,39 +142,54 @@ export function DesktopProductApp({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
   const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
-  const refreshOrder = useRef(new ProductRefreshOrder());
+  const refreshCoordinator = useRef<SnapshotRefreshCoordinator | null>(null);
+  if (refreshCoordinator.current === null) refreshCoordinator.current = new SnapshotRefreshCoordinator();
 
-  const refresh = useCallback(async (isRelevant: SnapshotRefreshGuard = () => true): Promise<DesktopProductSnapshot | null> => {
-    const sequence = refreshOrder.current.begin();
-    try {
-      const result = await provider.refresh();
-      if (!refreshOrder.current.isCurrent(sequence) || !isRelevant()) return null;
-      if (result.status !== "fresh") {
-        setSnapshot((current) => current ? { ...current, stream: result.stream } : current);
-        if (result.status === "error") setLoadError(userMessage(result.stream.error));
-        return null;
-      }
-      const next = result.snapshot;
-      setSnapshot(next);
-      setLoadError(null);
-      setSelectedProjectId((current) => {
-        if (current && next.projects.some((project) => project.project_id === current)) {
-          return current;
-        }
-        return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
-      });
-      return next;
-    } catch (error) {
-      if (refreshOrder.current.isCurrent(sequence) && isRelevant()) {
-        setSnapshot((current) => current ? {
-          ...current,
-          stream: { status: "error", epoch: current.stream.epoch, error: error instanceof DesktopApiError ? error.apiError : null },
-        } : current);
-        setLoadError(userMessage(error));
-      }
-      return null;
+  const publishRefresh = useCallback((publication: SnapshotRefreshPublication): void => {
+    if (publication.kind === "pending") {
+      setSnapshot((current) => current ? {
+        ...current,
+        stream: { status: "stale", epoch: publication.epoch ?? current.stream.epoch, reason: "refresh_pending" },
+      } : current);
+      return;
     }
-  }, [provider]);
+    if (publication.kind === "rejected") {
+      setSnapshot((current) => current ? {
+        ...current,
+        stream: {
+          status: "error",
+          epoch: current.stream.epoch,
+          error: publication.error instanceof DesktopApiError ? publication.error.apiError : null,
+        },
+      } : current);
+      setLoadError(userMessage(publication.error));
+      return;
+    }
+    const result = publication.result;
+    if (result.status !== "fresh") {
+      setSnapshot((current) => current ? { ...current, stream: result.stream } : current);
+      if (result.status === "error") setLoadError(userMessage(result.stream.error));
+      return;
+    }
+    const next = result.snapshot;
+    setSnapshot(next);
+    setLoadError(null);
+    setSelectedProjectId((current) => {
+      if (current && next.projects.some((project) => project.project_id === current)) return current;
+      return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    const coordinator = refreshCoordinator.current!;
+    coordinator.mount(provider, publishRefresh);
+    return () => coordinator.unmount(provider);
+  }, [provider, publishRefresh]);
+
+  const refresh = useCallback(
+    (isRelevant: SnapshotRefreshGuard = () => true) => refreshCoordinator.current!.request(provider, isRelevant),
+    [provider],
+  );
 
   useEffect(() => {
     let active = true;
@@ -544,6 +571,132 @@ export function DesktopProductApp({
       ) : null}
     </div>
   );
+}
+
+class SnapshotRefreshCoordinator {
+  private provider: DesktopProductProvider | null = null;
+  private publish: ((publication: SnapshotRefreshPublication) => void) | null = null;
+  private mounted = false;
+  private running = false;
+  private readonly queue: SnapshotRefreshBatch[] = [];
+
+  mount(
+    provider: DesktopProductProvider,
+    publish: (publication: SnapshotRefreshPublication) => void,
+  ): void {
+    this.provider = provider;
+    this.publish = publish;
+    this.mounted = true;
+    this.pump();
+  }
+
+  unmount(provider: DesktopProductProvider): void {
+    if (this.provider !== provider) return;
+    this.mounted = false;
+    this.provider = null;
+    this.publish = null;
+    this.clearQueued();
+  }
+
+  request(
+    provider: DesktopProductProvider,
+    isRelevant: SnapshotRefreshGuard,
+  ): Promise<DesktopProductSnapshot | null> {
+    if (!this.mounted || this.provider !== provider) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      this.queuedBatch(provider).waiters.push({ isRelevant, resolve });
+      this.pump();
+    });
+  }
+
+  private queuedBatch(provider: DesktopProductProvider): SnapshotRefreshBatch {
+    const pending = this.queue.at(-1);
+    if (pending?.provider === provider) return pending;
+    const batch: SnapshotRefreshBatch = { provider, waiters: [] };
+    this.queue.push(batch);
+    return batch;
+  }
+
+  private pump(): void {
+    if (this.running) return;
+    if (!this.mounted) {
+      this.clearQueued();
+      return;
+    }
+    const batch = this.queue.shift();
+    if (!batch) return;
+    if (batch.provider !== this.provider) {
+      this.resolveBatch(batch, null);
+      this.pump();
+      return;
+    }
+    this.running = true;
+    void this.execute(batch).finally(() => {
+      this.running = false;
+      this.pump();
+    });
+  }
+
+  private async execute(batch: SnapshotRefreshBatch): Promise<void> {
+    let publication: SnapshotRefreshPublication;
+    let freshSnapshot: DesktopProductSnapshot | null = null;
+    try {
+      const result = await batch.provider.refresh();
+      publication = { kind: "result", result };
+      if (result.status === "fresh") freshSnapshot = result.snapshot;
+    } catch (error) {
+      publication = { kind: "rejected", error };
+    }
+
+    if (!this.mounted || this.provider !== batch.provider || this.publish === null) {
+      this.resolveBatch(batch, null);
+      return;
+    }
+
+    const trailing = this.queue.find((candidate) => candidate.provider === batch.provider);
+    if (trailing) {
+      trailing.waiters.unshift(...batch.waiters);
+      this.publish({ kind: "pending", epoch: refreshPublicationEpoch(publication) });
+      return;
+    }
+
+    const relevance = batch.waiters.map((waiter) => safeRefreshGuard(waiter.isRelevant));
+    if (!relevance.some(Boolean)) {
+      this.resolveBatch(batch, null);
+      this.publish({ kind: "pending", epoch: refreshPublicationEpoch(publication) });
+      this.queuedBatch(batch.provider).waiters.push({
+        isRelevant: () => this.mounted && this.provider === batch.provider,
+        resolve: () => undefined,
+      });
+      return;
+    }
+
+    this.publish(publication);
+    batch.waiters.forEach((waiter, index) => waiter.resolve(relevance[index] ? freshSnapshot : null));
+  }
+
+  private resolveBatch(batch: SnapshotRefreshBatch, snapshot: DesktopProductSnapshot | null): void {
+    for (const waiter of batch.waiters) waiter.resolve(snapshot);
+  }
+
+  private clearQueued(): void {
+    for (const batch of this.queue.splice(0)) this.resolveBatch(batch, null);
+  }
+}
+
+function refreshPublicationEpoch(publication: SnapshotRefreshPublication): number | null {
+  if (publication.kind !== "result") return null;
+  return publication.result.status === "fresh"
+    ? publication.result.snapshot.stream.epoch
+    : publication.result.stream.epoch;
+}
+
+function safeRefreshGuard(isRelevant: SnapshotRefreshGuard): boolean {
+  try {
+    return isRelevant();
+  } catch {
+    return false;
+  }
 }
 
 function useActiveRunPolling(
