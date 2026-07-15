@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 ResultCallback = Callable[[SessionResult], Awaitable[None] | None]
 
 
+class RolloutTaskCancelled(RuntimeError):
+    pass
+
+
 def _trajectory_status(status: str) -> str:
     if status == SessionStatus.TIMEOUT:
         return SessionStatus.TIMEOUT
@@ -57,6 +61,8 @@ class Pipeline:
         self._lifecycle_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[SessionResult]] = {}
         self._pending_lock = asyncio.Lock()
+        self._active_sessions: dict[str, dict[str, SessionContext]] = {}
+        self._cancelled_tasks: set[str] = set()
 
     async def _emit(self, event_type: str, payload: dict) -> None:
         if self.event_bus is not None:
@@ -82,6 +88,8 @@ class Pipeline:
                     if not future.done():
                         future.cancel()
                 self._pending.clear()
+                self._active_sessions.clear()
+                self._cancelled_tasks.clear()
             if self._client is not None:
                 await self._client.aclose()
                 self._client = None
@@ -106,6 +114,28 @@ class Pipeline:
             future.set_result(result)
             return True
 
+    async def cancel_task(self, task_id: str) -> None:
+        async with self._pending_lock:
+            self._cancelled_tasks.add(task_id)
+            sessions = list(self._active_sessions.get(task_id, {}).values())
+        for session in sessions:
+            if session.gateway_url is not None:
+                await self._cancel_gateway_session(session)
+            async with self._pending_lock:
+                future = self._pending.get(session.session_id)
+                if future is not None and not future.done():
+                    future.set_result(
+                        self._failure_result(
+                            session,
+                            status=SessionStatus.ERROR,
+                            error="session cancelled",
+                        )
+                    )
+
+    async def _task_cancelled(self, task_id: str) -> bool:
+        async with self._pending_lock:
+            return task_id in self._cancelled_tasks
+
     def status(self) -> dict[str, object]:
         return {
             "pending_sessions": len(self._pending),
@@ -128,6 +158,7 @@ class Pipeline:
         session.completion_future = future
         async with self._pending_lock:
             self._pending[session.session_id] = future
+            self._active_sessions.setdefault(session.task_id, {})[session.session_id] = session
 
         session.timer.mark("dispatch", "started")
         await self._emit(
@@ -147,6 +178,8 @@ class Pipeline:
                 },
             )
             result = await self._wait_for_result(session, dispatch_request, future)
+        except RolloutTaskCancelled as exc:
+            result = self._failure_result(session, error=str(exc))
         except TimeoutError as exc:
             logger.warning("Session %s timed out in rollout pipeline", session.session_id)
             result = self._failure_result(session, status=SessionStatus.TIMEOUT, error=str(exc))
@@ -166,13 +199,23 @@ class Pipeline:
                     await maybe_awaitable
             return result
         finally:
-            await self._cleanup_session(session)
+            try:
+                await self._cleanup_session(session)
+            finally:
+                async with self._pending_lock:
+                    active = self._active_sessions.get(session.task_id)
+                    if active is not None:
+                        active.pop(session.session_id, None)
+                        if not active:
+                            self._active_sessions.pop(session.task_id, None)
 
     async def _dispatch_session(self, session: SessionContext) -> SessionDispatchRequest:
         if self._client is None:
             raise RuntimeError("pipeline has not been started")
 
         while True:
+            if await self._task_cancelled(session.task_id):
+                raise RolloutTaskCancelled("session cancelled before gateway dispatch")
             node = self.scheduler.acquire_node()
             if node is None:
                 remaining_timeout = self._remaining_timeout_seconds(session)
@@ -201,7 +244,13 @@ class Pipeline:
                     timeout=min(30.0, dispatch_timeout),
                 )
                 response.raise_for_status()
+                if await self._task_cancelled(session.task_id):
+                    await self._cancel_gateway_session(session)
+                    raise RolloutTaskCancelled("session cancelled after gateway dispatch")
                 return dispatch_request
+            except RolloutTaskCancelled:
+                self.scheduler.release_reservation(node.node_id)
+                raise
             except Exception as exc:
                 if await self._accepted_duplicate_dispatch(
                     exc, node.gateway_url, session, dispatch_request
@@ -411,6 +460,15 @@ class Pipeline:
                 session.gateway_url,
                 exc_info=True,
             )
+
+    async def _cancel_gateway_session(self, session: SessionContext) -> None:
+        if self._client is None or session.gateway_url is None:
+            return
+        response = await self._client.delete(
+            f"{session.gateway_url}/sessions/{session.session_id}"
+        )
+        if response.status_code not in {200, 404}:
+            response.raise_for_status()
 
     def _persist_result(self, result: SessionResult) -> None:
         path = self._result_path(result.task_id, result.session_id)

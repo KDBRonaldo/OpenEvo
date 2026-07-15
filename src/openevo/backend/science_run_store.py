@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import sqlite3
 import stat
 import threading
@@ -38,6 +39,14 @@ CREATE TABLE IF NOT EXISTS runs (
     resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
     deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
     UNIQUE(project_id, idempotency_key)
+) STRICT;
+CREATE TABLE IF NOT EXISTS pending_run_creates (
+    project_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    run_id TEXT NOT NULL UNIQUE,
+    request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+    request_json BLOB NOT NULL,
+    PRIMARY KEY(project_id, idempotency_key)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS mutations (
     operation_id TEXT NOT NULL,
@@ -129,9 +138,19 @@ class ScienceRunPreconditionFailed(ScienceRunStoreError):
 class ScienceRunCreateAdmission:
     project_id: str
     idempotency_key: str
+    run_id: str
     request_digest: str
     request_json: bytes = field(repr=False)
     _owner: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutTaskAdmissionAuthority:
+    task_id: str
+    generation_digest: str
+    registry_digest: str
+    framework_lock_digest: str
+    payload_sha256: str
 
 
 class ScienceRunStore:
@@ -166,6 +185,8 @@ class ScienceRunStore:
         idempotency_key: str,
     ) -> tuple[m.RunV1 | None, ScienceRunCreateAdmission | None]:
         request_json = _model_bytes(request)
+        if len(request_json) > _MAX_DOCUMENT_BYTES:
+            raise ScienceRunConflict("science run request exceeds its bound")
         request_digest = hashlib.sha256(request_json).hexdigest()
         identity = (request.project_id, idempotency_key)
         with self._create_condition:
@@ -180,11 +201,63 @@ class ScienceRunStore:
                     )
                 if existing is not None:
                     return existing, None
+                with self._reader() as connection:
+                    durable_pending = _pending_create_run(
+                        connection,
+                        project_id=request.project_id,
+                        idempotency_key=idempotency_key,
+                        request_digest=request_digest,
+                        request_json=request_json,
+                    )
                 pending = self._create_admissions.get(identity)
                 if pending is None:
+                    if durable_pending is None:
+                        run_id = f"run-{secrets.token_hex(16)}"
+                        with self._transaction() as connection:
+                            existing = _existing_create_run(
+                                connection,
+                                project_id=request.project_id,
+                                idempotency_key=idempotency_key,
+                                request_digest=request_digest,
+                                request_json=request_json,
+                            )
+                            if existing is not None:
+                                return existing, None
+                            durable_pending = _pending_create_run(
+                                connection,
+                                project_id=request.project_id,
+                                idempotency_key=idempotency_key,
+                                request_digest=request_digest,
+                                request_json=request_json,
+                            )
+                            if durable_pending is None:
+                                count = int(
+                                    connection.execute(
+                                        "SELECT (SELECT COUNT(*) FROM runs) + "
+                                        "(SELECT COUNT(*) FROM pending_run_creates)"
+                                    ).fetchone()[0]
+                                )
+                                if count >= _MAX_RUNS:
+                                    raise ScienceRunConflict(
+                                        "science run capacity is exhausted"
+                                    )
+                                connection.execute(
+                                    "INSERT INTO pending_run_creates("
+                                    "project_id, idempotency_key, run_id, request_digest, "
+                                    "request_json) VALUES (?, ?, ?, ?, ?)",
+                                    (
+                                        request.project_id,
+                                        idempotency_key,
+                                        run_id,
+                                        request_digest,
+                                        request_json,
+                                    ),
+                                )
+                                durable_pending = run_id
                     admission = ScienceRunCreateAdmission(
                         project_id=request.project_id,
                         idempotency_key=idempotency_key,
+                        run_id=durable_pending,
                         request_digest=request_digest,
                         request_json=request_json,
                         _owner=object(),
@@ -212,6 +285,8 @@ class ScienceRunStore:
         with self._create_condition:
             if self._create_admissions.get(identity) is not admission:
                 raise ScienceRunStoreError("science run create admission ownership is invalid")
+            if run.id != admission.run_id:
+                raise ScienceRunStoreError("science run create identity changed before commit")
             try:
                 with self._transaction() as connection:
                     existing = _existing_create_run(
@@ -223,6 +298,17 @@ class ScienceRunStore:
                     )
                     if existing is not None:
                         return existing, True
+                    pending_run_id = _pending_create_run(
+                        connection,
+                        project_id=admission.project_id,
+                        idempotency_key=admission.idempotency_key,
+                        request_digest=admission.request_digest,
+                        request_json=admission.request_json,
+                    )
+                    if pending_run_id != admission.run_id:
+                        raise ScienceRunStoreError(
+                            "science run create authority changed before commit"
+                        )
                     count = int(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0])
                     if count >= _MAX_RUNS:
                         raise ScienceRunConflict("science run capacity is exhausted")
@@ -240,12 +326,48 @@ class ScienceRunStore:
                             context_json,
                         ),
                     )
+                    deleted = connection.execute(
+                        "DELETE FROM pending_run_creates WHERE project_id = ? "
+                        "AND idempotency_key = ? AND run_id = ?",
+                        (
+                            admission.project_id,
+                            admission.idempotency_key,
+                            admission.run_id,
+                        ),
+                    ).rowcount
+                    if deleted != 1:
+                        raise ScienceRunStoreError(
+                            "science run create authority was not consumed"
+                        )
                     return run, False
             finally:
                 self._release_create_admission(admission)
 
     def abort_create_run(self, admission: ScienceRunCreateAdmission) -> None:
         with self._create_condition:
+            identity = (admission.project_id, admission.idempotency_key)
+            if self._create_admissions.get(identity) is admission:
+                with self._transaction() as connection:
+                    row = connection.execute(
+                        "SELECT run_id, request_digest, request_json "
+                        "FROM pending_run_creates WHERE project_id = ? "
+                        "AND idempotency_key = ?",
+                        identity,
+                    ).fetchone()
+                    if row is not None:
+                        if (
+                            row["run_id"] != admission.run_id
+                            or row["request_digest"] != admission.request_digest
+                            or bytes(row["request_json"]) != admission.request_json
+                        ):
+                            raise ScienceRunStoreError(
+                                "science run create authority changed before abort"
+                            )
+                        connection.execute(
+                            "DELETE FROM pending_run_creates WHERE project_id = ? "
+                            "AND idempotency_key = ? AND run_id = ?",
+                            (*identity, admission.run_id),
+                        )
             self._release_create_admission(admission)
 
     def _release_create_admission(self, admission: ScienceRunCreateAdmission) -> None:
@@ -797,6 +919,42 @@ class ScienceRunStore:
             raise ScienceRunStoreError("rollout task admission identity is ambiguous")
         return None if not rows else str(rows[0]["run_id"])
 
+    def rollout_task_admission(
+        self, run_id: str
+    ) -> RolloutTaskAdmissionAuthority | None:
+        self.get_run(run_id)
+        with self._lock, self._reader() as connection:
+            rows = connection.execute(
+                "SELECT task_id, generation_digest, registry_digest, "
+                "framework_lock_digest, payload_sha256 FROM admissions "
+                "WHERE run_id = ? AND operation = ? LIMIT 2",
+                (run_id, "rollout_task_submit"),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ScienceRunStoreError("rollout task admission identity is ambiguous")
+        if not rows:
+            return None
+        row = rows[0]
+        task_id = str(row["task_id"])
+        if not task_id or len(task_id.encode("utf-8")) > 256:
+            raise ScienceRunStoreError("rollout task admission identity is invalid")
+        values = tuple(
+            str(row[key])
+            for key in (
+                "generation_digest",
+                "registry_digest",
+                "framework_lock_digest",
+                "payload_sha256",
+            )
+        )
+        if any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in values
+        ):
+            raise ScienceRunStoreError("rollout task admission digest is invalid")
+        return RolloutTaskAdmissionAuthority(task_id, *values)
+
     def active_run_ids(self) -> list[str]:
         return [run.id for run in self.list_runs() if run.status in _ACTIVE_STATUSES]
 
@@ -828,6 +986,40 @@ class ScienceRunStore:
             ).fetchone()
             if row is None or int(row["schema_version"]) != 1:
                 raise ScienceRunStoreError("science run schema identity is invalid")
+            pending = connection.execute(
+                "SELECT project_id, idempotency_key, run_id, request_digest, request_json "
+                "FROM pending_run_creates LIMIT ?",
+                (_MAX_RUNS + 1,),
+            ).fetchall()
+            if len(pending) > _MAX_RUNS:
+                raise ScienceRunStoreError("pending science run inventory exceeds its bound")
+            for item in pending:
+                request_json = bytes(item["request_json"])
+                if len(request_json) > _MAX_DOCUMENT_BYTES:
+                    raise ScienceRunStoreError("pending science run request exceeds its bound")
+                request = _model(m.RunCreateV1, request_json)
+                if (
+                    request.project_id != item["project_id"]
+                    or hashlib.sha256(request_json).hexdigest() != item["request_digest"]
+                    or not isinstance(item["idempotency_key"], str)
+                    or not item["idempotency_key"]
+                    or _pending_create_run(
+                        connection,
+                        project_id=str(item["project_id"]),
+                        idempotency_key=str(item["idempotency_key"]),
+                        request_digest=str(item["request_digest"]),
+                        request_json=request_json,
+                    )
+                    != item["run_id"]
+                ):
+                    raise ScienceRunStoreError("pending science run authority is invalid")
+                overlap = connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ? OR "
+                    "(project_id = ? AND idempotency_key = ?) LIMIT 1",
+                    (item["run_id"], item["project_id"], item["idempotency_key"]),
+                ).fetchone()
+                if overlap is not None:
+                    raise ScienceRunStoreError("pending science run authority overlaps a run")
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -942,6 +1134,32 @@ def _existing_create_run(
     ):
         raise ScienceRunIdempotencyConflict("run idempotency key was reused")
     return _model(m.RunV1, existing["run_json"])
+
+
+def _pending_create_run(
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    idempotency_key: str,
+    request_digest: str,
+    request_json: bytes,
+) -> str | None:
+    pending = connection.execute(
+        "SELECT run_id, request_digest, request_json FROM pending_run_creates "
+        "WHERE project_id = ? AND idempotency_key = ?",
+        (project_id, idempotency_key),
+    ).fetchone()
+    if pending is None:
+        return None
+    if (
+        pending["request_digest"] != request_digest
+        or bytes(pending["request_json"]) != request_json
+    ):
+        raise ScienceRunIdempotencyConflict("run idempotency key was reused")
+    run_id = pending["run_id"]
+    if not isinstance(run_id, str) or not run_id.startswith("run-") or len(run_id) != 36:
+        raise ScienceRunStoreError("pending science run identity is invalid")
+    return run_id
 
 
 def _require_live_run(connection: sqlite3.Connection, run_id: str) -> m.RunV1:

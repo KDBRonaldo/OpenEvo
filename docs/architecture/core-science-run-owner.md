@@ -32,17 +32,31 @@ returns a typed 503 and leaves no durable run. Fixed public messages are selecte
 from the closed readiness code, so command output and authentication material
 cannot enter the response.
 
-Durable idempotency is resolved before this volatile readiness work. An exact
-request replay returns the existing run even if host readiness has since changed,
+Durable idempotency is resolved before this volatile readiness work. Core first
+persists an exact `(project_id, idempotency_key, request digest, canonical
+request, run_id)` create authority. An exact request replay returns the existing
+run even if host readiness has since changed,
 and a different payload under the same project/key returns canonical
 `idempotency_key_reused` 409 without probing services. That mismatch is not
 persisted as a failed replay, so it cannot poison a later exact replay of the
 original request after process-local coalescing eviction or restart. A truly
-new request obtains a store-owned, per-key admission claim;
-the final SQLite insert rechecks the durable identity before commit. Concurrent
+new request obtains a store-owned, per-key admission claim. A process exit before
+the run insert leaves that authority for exact retry, while successful commit
+atomically consumes it into the run row. The final SQLite insert rechecks the
+durable identity before commit. Concurrent
 same-key callers therefore cannot both run readiness or create separate runs,
 and a failed readiness probe releases the in-memory claim without writing a run,
 job, or per-run thread.
+
+A running cancellation is not a terminal-state shortcut. Core persists
+`cancelling`, addresses the exact rollout task recorded in the generation-bound
+admission, and waits for rollout to cancel every Gateway session. Gateway DELETE
+waits for runtime cancellation, harness/postrun cleanup, and dispatcher ownership
+removal before it returns. Only that end-to-end acknowledgement permits Core to
+publish `cancelled`. On restart, a cancelling run reloads the task and generation
+authority and retries termination; missing or mismatched generation authority
+stays non-terminal and fail closed. A cancelling run with no rollout admission is
+safe to finish because no remote task was submitted.
 
 After that admission preparation, Core persists the run before acknowledging
 HTTP 202. The normal state sequence is:
@@ -172,15 +186,18 @@ shared by text memory, skill bundle, agent system, and parametric memory.
 Core persists the complete bounded runner result before successor activation.
 If the process exits after remote work completes, startup does not rerun the
 task. It replays the idempotent revision activation and exact artifact/context
-publication. An interrupted run without a completed result becomes failed; a
-persisted cancellation becomes cancelled.
+publication. An interrupted pre-dispatch run without a completed result becomes
+failed. An interrupted running task with a rollout admission is first moved to
+`cancelling` and terminated through that exact authority. A persisted
+cancellation becomes `cancelled` only after the same termination proof.
 
 ## Durable Ledger
 
 The private ledger lives under `<state-root>/science-runs/` in an owner-only
 directory and uses a private SQLite database. It stores canonical validated
 documents for runs, requests, completed results, mutation replay, timeline,
-logs, Desktop artifact summaries, revision context, and private admissions.
+logs, Desktop artifact summaries, revision context, pending create authority,
+and private generation-bound admissions.
 
 All tables have explicit row and document budgets. Timeline and log sequence
 numbers are allocated in their insert transaction. A success transition and

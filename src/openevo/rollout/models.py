@@ -176,7 +176,7 @@ class TaskResult(BaseModel):
     """Blocking response returned once all rollout sessions resolve."""
 
     task_id: str
-    status: str  # Task-level status vocabulary: "running" | "completed" | "failed"
+    status: str  # Task-level status: "running" | "completed" | "failed" | "cancelled"
     results: list[SessionResult]
     result_paths: list[str] = Field(default_factory=list)
 

@@ -143,6 +143,9 @@ class CoreScienceRunOwner:
         self._condition = threading.Condition()
         self._lifecycle_lock = threading.RLock()
         self._cancel_events: dict[str, threading.Event] = {}
+        self._active_rollouts: dict[str, _AdmittingRolloutClient] = {}
+        self._cancel_workers: dict[str, threading.Thread] = {}
+        self._pending_cancellations: set[str] = set()
         self._pending_finalizations: set[str] = set()
         self._closed = False
         self._recover_interrupted_runs()
@@ -248,6 +251,10 @@ class CoreScienceRunOwner:
         self._worker.join(timeout=30.0)
         if self._worker.is_alive():
             raise RuntimeError("science run owner did not stop before shutdown")
+        for worker in list(self._cancel_workers.values()):
+            worker.join(timeout=30.0)
+            if worker.is_alive():
+                raise RuntimeError("science run cancellation owner did not stop")
         self._ledger.close()
 
     def request_stop(self) -> None:
@@ -257,6 +264,8 @@ class CoreScienceRunOwner:
             self._closed = True
             for event in self._cancel_events.values():
                 event.set()
+            for run_id in tuple(self._active_rollouts):
+                self._schedule_rollout_cancellation(run_id)
             self._condition.notify_all()
 
     def _create_run(self, arguments: Mapping[str, object]) -> Response:
@@ -279,7 +288,7 @@ class CoreScienceRunOwner:
                     request.required_revision.revision.id,
                 )
                 now = self._timestamp()
-                run_id = f"run-{secrets.token_hex(16)}"
+                run_id = admission.run_id
                 run = _run_model(
                     {
                         "id": run_id,
@@ -406,6 +415,8 @@ class CoreScienceRunOwner:
             assert updated is not None
             if not replayed:
                 self._cancel_events.setdefault(run_id, threading.Event()).set()
+                if updated.status is m.RunStatus.CANCELLING:
+                    self._schedule_rollout_cancellation(run_id)
         if replayed:
             return _response(updated, status_code=202)
         status = updated.status
@@ -568,21 +579,42 @@ class CoreScienceRunOwner:
         try:
             while True:
                 with self._condition:
+                    cancellations = sorted(self._pending_cancellations)
                     pending = sorted(self._pending_finalizations)
                     queued = self._ledger.queued_run_ids()
-                    while not self._closed and not pending and not queued:
+                    while (
+                        not self._closed
+                        and not cancellations
+                        and not pending
+                        and not queued
+                    ):
                         self._condition.wait(timeout=1.0)
+                        cancellations = sorted(self._pending_cancellations)
                         pending = sorted(self._pending_finalizations)
                         queued = self._ledger.queued_run_ids()
                     if self._closed:
                         return
-                    if pending:
+                    if cancellations:
+                        run_id = cancellations[0]
+                        self._pending_cancellations.discard(run_id)
+                        cancel = True
+                        finalize = False
+                    elif pending:
                         run_id = pending[0]
                         self._pending_finalizations.discard(run_id)
+                        cancel = False
                         finalize = True
                     else:
                         run_id = queued[0]
+                        cancel = False
                         finalize = False
+                if cancel:
+                    if not self._resume_cancellation(run_id):
+                        with self._condition:
+                            if not self._closed:
+                                self._pending_cancellations.add(run_id)
+                                self._condition.wait(timeout=max(1.0, self._poll_interval))
+                    continue
                 if finalize:
                     if not self._resume_finalization(run_id):
                         with self._condition:
@@ -597,6 +629,9 @@ class CoreScienceRunOwner:
     def _execute(self, run_id: str) -> None:
         cancellation = self._cancel_events.setdefault(run_id, threading.Event())
         service_lease: ServiceRunLease | None = None
+        rollout_base: RolloutClientProtocol | None = None
+        evolution: EvolutionClientProtocol | None = None
+        rollout: _AdmittingRolloutClient | None = None
         try:
             if cancellation.is_set():
                 raise _RunCancelled()
@@ -642,24 +677,6 @@ class CoreScienceRunOwner:
                 binding=binding,
                 workspace_path=workspace_path,
             )
-            run = self._ledger.mutate_run(
-                run_id,
-                lambda current, version: _worker_transition(
-                    current,
-                    expected=m.RunStatus.PREPARING,
-                    status=m.RunStatus.RUNNING,
-                    version=version,
-                    now=self._timestamp(),
-                    cancellation=cancellation,
-                ),
-            )
-            self._append_timeline(
-                run,
-                m.TimelinePhase.EXECUTION,
-                m.TimelineEventStatus.RUNNING,
-                "Science task running",
-                "The Codex harness is executing on the remote managed runtime.",
-            )
             rollout_base = self._rollout_factory(binding)
             evolution = self._evolution_factory(binding)
             rollout = _AdmittingRolloutClient(
@@ -669,6 +686,28 @@ class CoreScienceRunOwner:
                 run_id=run_id,
                 binding=binding,
                 cancellation=cancellation,
+            )
+            with self._lifecycle_lock:
+                if cancellation.is_set():
+                    raise _RunCancelled()
+                self._active_rollouts[run_id] = rollout
+                run = self._ledger.mutate_run(
+                    run_id,
+                    lambda current, version: _worker_transition(
+                        current,
+                        expected=m.RunStatus.PREPARING,
+                        status=m.RunStatus.RUNNING,
+                        version=version,
+                        now=self._timestamp(),
+                        cancellation=cancellation,
+                    ),
+                )
+            self._append_timeline(
+                run,
+                m.TimelinePhase.EXECUTION,
+                m.TimelineEventStatus.RUNNING,
+                "Science task running",
+                "The Codex harness is executing on the remote managed runtime.",
             )
             output_dir = self._output_root / run_id
             output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -699,10 +738,9 @@ class CoreScienceRunOwner:
                     result["runtime_context_receipt"] = runtime_context_receipt
                     result["_runtime_context_authority"] = runtime_context_authority
             finally:
-                for client in (rollout_base, evolution):
-                    close = getattr(client, "close", None)
-                    if callable(close):
-                        close()
+                with self._lifecycle_lock:
+                    if self._active_rollouts.get(run_id) is rollout:
+                        self._active_rollouts.pop(run_id, None)
             if cancellation.is_set():
                 raise _RunCancelled()
             if result.get("status") != "completed":
@@ -710,20 +748,101 @@ class CoreScienceRunOwner:
             self._ledger.store_result(run_id, result)
             self._finalize_completed_result(run_id, result, cancellation=cancellation)
         except _RunCancelled:
-            self._finish_cancelled(run_id)
+            self._complete_or_defer_cancellation(run_id, rollout)
         except BaseException as exc:
             if cancellation.is_set():
-                self._finish_cancelled(run_id)
+                self._complete_or_defer_cancellation(run_id, rollout)
             elif self._ledger.result_for_run(run_id) is not None:
                 with self._condition:
                     self._pending_finalizations.add(run_id)
             else:
                 self._finish_failed(run_id, exc)
         finally:
+            if rollout is not None:
+                with self._lifecycle_lock:
+                    if self._active_rollouts.get(run_id) is rollout:
+                        self._active_rollouts.pop(run_id, None)
+            for client in (rollout_base, evolution):
+                if client is None:
+                    continue
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
             if service_lease is not None:
                 service_lease.close()
             with self._condition:
                 self._condition.notify_all()
+
+    def _schedule_rollout_cancellation(self, run_id: str) -> None:
+        authority = self._active_rollouts.get(run_id)
+        existing = self._cancel_workers.get(run_id)
+        if authority is None or (existing is not None and existing.is_alive()):
+            return
+
+        def terminate() -> None:
+            try:
+                authority.terminate()
+            except BaseException:
+                return
+            finally:
+                with self._condition:
+                    self._condition.notify_all()
+
+        worker = threading.Thread(
+            target=terminate,
+            name=f"openevo-science-run-cancel-{run_id}",
+            daemon=True,
+        )
+        self._cancel_workers[run_id] = worker
+        worker.start()
+
+    def _complete_or_defer_cancellation(
+        self,
+        run_id: str,
+        authority: _AdmittingRolloutClient | None,
+    ) -> None:
+        if authority is None or authority.termination_proven:
+            self._finish_cancelled(run_id)
+            return
+        with self._condition:
+            self._pending_cancellations.add(run_id)
+            self._condition.notify_all()
+
+    def _resume_cancellation(self, run_id: str) -> bool:
+        try:
+            run = self._ledger.get_run(run_id)
+            if run.status is m.RunStatus.CANCELLED:
+                return True
+            if run.status is not m.RunStatus.CANCELLING:
+                raise ScienceRunStoreError("recoverable cancellation has invalid run status")
+            admission = self._ledger.rollout_task_admission(run_id)
+            if admission is None:
+                self._finish_cancelled(run_id)
+                return True
+            binding = self._services.run_binding()
+            if (
+                admission.generation_digest != binding.generation_digest
+                or admission.registry_digest != binding.registry_digest
+                or admission.framework_lock_digest != binding.framework_lock_digest
+                or admission.registry_digest != run.registry_digest
+            ):
+                return False
+            client = self._rollout_factory(binding)
+            try:
+                result = client.cancel_task(admission.task_id)
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+            if (
+                result.get("task_id") != admission.task_id
+                or result.get("status") != "cancelled"
+            ):
+                return False
+            self._finish_cancelled(run_id)
+            return True
+        except BaseException:
+            return False
 
     def _resume_finalization(self, run_id: str) -> bool:
         cancellation = self._cancel_events.setdefault(run_id, threading.Event())
@@ -1031,9 +1150,27 @@ class CoreScienceRunOwner:
             run = self._ledger.get_run(run_id)
             if run.status is m.RunStatus.CANCELLING:
                 self._cancel_events.setdefault(run_id, threading.Event()).set()
-                self._finish_cancelled(run_id)
+                if self._ledger.result_for_run(run_id) is not None:
+                    self._finish_cancelled(run_id)
+                else:
+                    self._pending_cancellations.add(run_id)
             elif self._ledger.result_for_run(run_id) is not None:
                 self._pending_finalizations.add(run_id)
+            elif (
+                run.status is m.RunStatus.RUNNING
+                and self._ledger.rollout_task_admission(run_id) is not None
+            ):
+                self._ledger.mutate_run(
+                    run_id,
+                    lambda current, version: _transition_run(
+                        current,
+                        m.RunStatus.CANCELLING,
+                        version=version,
+                        now=self._timestamp(),
+                    ),
+                )
+                self._cancel_events.setdefault(run_id, threading.Event()).set()
+                self._pending_cancellations.add(run_id)
             else:
                 self._finish_failed(run_id, RuntimeError("Core restarted during the run"))
 
@@ -1231,6 +1368,12 @@ class _AdmittingRolloutClient:
         self._expected_revision_id: str | None = None
         self._expected_context_artifacts: dict[str, dict[str, str]] = {}
         self._instruction: str | None = None
+        self._operation_lock = threading.RLock()
+        self._termination_condition = threading.Condition()
+        self._submitted_task_id: str | None = None
+        self._termination_in_progress = False
+        self._termination_complete = False
+        self._termination_error: BaseException | None = None
 
     @property
     def runtime_context_receipt(self) -> dict[str, object] | None:
@@ -1244,9 +1387,12 @@ class _AdmittingRolloutClient:
             return None
         return _runtime_context_receipt_copy(self._runtime_context_authority)
 
+    @property
+    def termination_proven(self) -> bool:
+        with self._termination_condition:
+            return self._submitted_task_id is None or self._termination_complete
+
     def submit_task(self, payload: dict[str, Any]) -> str:
-        if self._cancellation.is_set():
-            raise _RunCancelled()
         canonical = canonicalize_task_request(payload)
         task_id = canonical.request.task_id
         payload_metadata = canonical.request.metadata
@@ -1307,16 +1453,60 @@ class _AdmittingRolloutClient:
         )
         if not accepted:
             raise RuntimeError("rollout admission changed for an existing task")
-        submitted = self._client.submit_task(canonical.payload)
-        if submitted != task_id:
-            raise RuntimeError("rollout service changed the admitted task identity")
-        return submitted
+        with self._operation_lock:
+            if self._cancellation.is_set():
+                raise _RunCancelled()
+            if self._submitted_task_id not in {None, task_id}:
+                raise RuntimeError("rollout task identity changed within one run")
+            self._submitted_task_id = task_id
+            submitted = self._client.submit_task(canonical.payload)
+            if submitted != task_id:
+                raise RuntimeError("rollout service changed the admitted task identity")
+            if self._cancellation.is_set():
+                self.terminate()
+                raise _RunCancelled()
+            return submitted
+
+    def cancel_task(self, task_id: str) -> dict[str, Any]:
+        if self._submitted_task_id not in {None, task_id}:
+            raise RuntimeError("rollout cancellation task identity changed")
+        self._submitted_task_id = task_id
+        self.terminate()
+        return {"task_id": task_id, "status": "cancelled"}
+
+    def terminate(self) -> None:
+        with self._termination_condition:
+            while self._termination_in_progress:
+                self._termination_condition.wait()
+            if self._termination_complete:
+                return
+            self._termination_in_progress = True
+        error: BaseException | None = None
+        try:
+            with self._operation_lock:
+                task_id = self._submitted_task_id
+                if task_id is None:
+                    return
+                result = self._client.cancel_task(task_id)
+                if result.get("task_id") != task_id or result.get("status") != "cancelled":
+                    raise RuntimeError("rollout cancellation did not prove termination")
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            with self._termination_condition:
+                self._termination_in_progress = False
+                self._termination_complete = error is None
+                self._termination_error = error
+                self._termination_condition.notify_all()
 
     def get_task(self, task_id: str) -> dict[str, Any]:
         if self._cancellation.is_set():
+            self.cancel_task(task_id)
             raise _RunCancelled()
         result = self._client.get_task(task_id)
         if self._cancellation.is_set():
+            self.cancel_task(task_id)
             raise _RunCancelled()
         if result.get("status") == "completed":
             receipt = _rollout_runtime_context_receipt(result)

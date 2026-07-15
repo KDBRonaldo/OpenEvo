@@ -719,7 +719,7 @@ async def delete_session(session_id: str):
         raise HTTPException(status_code=400, detail="Session ID cannot be empty")
 
     try:
-        await state.node_manager.cancel(safe_session_id)
+        await state.node_manager.cancel_and_wait(safe_session_id)
     except CancelAuthorityPersistenceError as exc:
         raise HTTPException(
             status_code=503,

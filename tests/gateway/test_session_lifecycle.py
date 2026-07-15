@@ -1535,3 +1535,48 @@ async def test_postrun_base_exception_pops_session_without_killing_worker(
         assert dispatcher._workers[-1].done() is False
     finally:
         await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_wait_terminated_requires_postrun_owner_to_release_session(tmp_path: Path) -> None:
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    postrun_entered = asyncio.Event()
+    allow_postrun = asyncio.Event()
+
+    async def postrun(_managed: ManagedSession) -> None:
+        postrun_entered.set()
+        await allow_postrun.wait()
+
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="wait-terminated-postrun",
+            task_id="task",
+            instruction="work",
+            remaining_timeout_seconds=10,
+            runtime=RuntimeSpec(image="runtime:latest"),
+            agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+        ),
+        timer=StageTimer(),
+        session_dir=tmp_path / "wait-terminated-postrun",
+        artifacts_dir=tmp_path / "wait-terminated-postrun" / "artifacts",
+        stage=SessionStage.POSTRUN,
+    )
+    dispatcher.on_postrun = postrun
+    dispatcher._sessions[managed.session_id] = managed
+    cleanup = asyncio.create_task(dispatcher._invoke_postrun_and_pop(managed))
+    waiter = asyncio.create_task(dispatcher.wait_terminated(managed.session_id))
+    try:
+        await asyncio.wait_for(postrun_entered.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert waiter.done() is False
+        allow_postrun.set()
+        await asyncio.wait_for(cleanup, timeout=1)
+        await asyncio.wait_for(waiter, timeout=1)
+        assert managed.session_id not in dispatcher._sessions
+    finally:
+        allow_postrun.set()
+        await asyncio.gather(cleanup, waiter, return_exceptions=True)

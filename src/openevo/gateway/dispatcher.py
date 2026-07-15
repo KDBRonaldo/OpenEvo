@@ -315,6 +315,11 @@ class SessionDispatcher:
     async def active_count(self) -> int:
         return (await self.snapshot()).active_count
 
+    async def wait_terminated(self, session_id: str) -> None:
+        async with self._condition:
+            while session_id in self._sessions:
+                await self._condition.wait()
+
     async def snapshot(self) -> DispatcherSnapshot:
         async with self._lock:
             snap = DispatcherSnapshot()
@@ -423,8 +428,9 @@ class SessionDispatcher:
                 preserve_task_cancellation=False,
             )
         finally:
-            async with self._lock:
+            async with self._condition:
                 self._sessions.pop(managed.session_id, None)
+                self._condition.notify_all()
 
     @staticmethod
     async def _await_owned_cleanup(awaitable: Awaitable[None]) -> list[BaseException]:

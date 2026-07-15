@@ -272,6 +272,9 @@ cancellation completes any required POSTRUN enqueue before preserving
 `CancelledError` or another `BaseException`. POSTRUN callback execution and
 session removal are one shielded owned cleanup operation, so callback base
 exceptions do not strand the session or terminate the stage worker.
+Gateway session DELETE waits on dispatcher removal after that owned POSTRUN
+operation. Its success response is therefore termination authority for callers,
+not merely acknowledgement that a cancellation event was set.
 READY semaphore capacity is released only by a session with explicit slot
 ownership. Cancelling a READY waiter therefore cannot release another session's
 permit; acquire/cancel races either transfer ownership and release it once or

@@ -43,6 +43,8 @@ class _TaskRecord:
     results: list[SessionResult] = field(default_factory=list)
     result_paths: list[str] = field(default_factory=list)
     session_states: dict[str, str] = field(default_factory=dict)
+    cancel_requested: bool = False
+    background_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
 def _harness_from_request(request: TaskRequest) -> str | None:
@@ -141,8 +143,39 @@ class RolloutManager:
                 "num_samples": request.num_samples,
             },
         )
-        asyncio.create_task(self._run_task_background(request))
+        background = asyncio.create_task(self._run_task_background(request))
+        with self._lock:
+            self._tasks[request.task_id].background_task = background
         return request.task_id
+
+    async def cancel_task(self, task_id: str) -> TaskStatus:
+        with self._lock:
+            record = self._tasks.get(task_id)
+            if record is None:
+                raise KeyError(task_id)
+            if record.status == "cancelled":
+                result = self.get_task(task_id)
+                if result is None:
+                    raise RuntimeError("cancelled rollout task disappeared")
+                return result
+            if record.status != "running":
+                raise ValueError(f"task {task_id} is already terminal")
+            record.cancel_requested = True
+            record.updated_at = time.time()
+            background = record.background_task
+        await self.pipeline.cancel_task(task_id)
+        if background is None:
+            raise RuntimeError("rollout task has no completion owner")
+        while not background.done():
+            try:
+                await asyncio.shield(background)
+            except asyncio.CancelledError:
+                continue
+        background.result()
+        result = self.get_task(task_id)
+        if result is None or result.status != "cancelled":
+            raise RuntimeError("rollout task cancellation did not reach terminal ownership")
+        return result
 
     async def _run_task_background(self, request: TaskRequest) -> None:
         """Execute a task in the background, updating the record on completion."""
@@ -151,6 +184,10 @@ class RolloutManager:
             logger.info("Task %s completed with %d results", request.task_id, len(result.results))
         except Exception:
             logger.exception("Background task %s failed", request.task_id)
+            with self._lock:
+                record = self._tasks[request.task_id]
+                record.status = "failed"
+                record.updated_at = time.time()
             self._emit("task.completed", {"task_id": request.task_id, "status": "failed"})
             return
         self._emit(
@@ -244,7 +281,7 @@ class RolloutManager:
         ordered_results = list(results)
         with self._lock:
             record = self._tasks[request.task_id]
-            record.status = "completed"
+            record.status = "cancelled" if record.cancel_requested else "completed"
             record.completed_sessions = len(ordered_results)
             record.results = ordered_results
             record.updated_at = time.time()
@@ -252,7 +289,7 @@ class RolloutManager:
 
         return TaskResult(
             task_id=request.task_id,
-            status="completed",
+            status=record.status,
             results=ordered_results,
             result_paths=result_paths,
         )

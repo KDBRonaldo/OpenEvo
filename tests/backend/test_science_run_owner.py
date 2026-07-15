@@ -340,6 +340,9 @@ class _FakeRolloutClient:
     def get_task(self, task_id: str) -> dict[str, Any]:
         return {"task_id": task_id, "status": "completed"}
 
+    def cancel_task(self, task_id: str) -> dict[str, Any]:
+        return {"task_id": task_id, "status": "cancelled"}
+
     def close(self) -> None:
         self.closed = True
 
@@ -664,11 +667,19 @@ def _seed_run(
     *,
     status: m.RunStatus,
     run_id: str = "run-recovery-seed",
-) -> None:
+) -> str:
     timestamp = "2026-07-15T12:00:00.000000Z"
+    ledger = ScienceRunStore(root / "science-runs")
+    replay, admission = ledger.begin_create_run(
+        request=request,
+        idempotency_key=f"seed-{run_id}",
+    )
+    assert replay is None
+    assert admission is not None
+    persisted_run_id = admission.run_id
     queued = owner_module._run_model(
         {
-            "id": run_id,
+            "id": persisted_run_id,
             "project_id": request.project_id,
             "project_snapshot": request.project_snapshot,
             "task_snapshot": request.task_snapshot,
@@ -690,16 +701,14 @@ def _seed_run(
         },
         version=1,
     )
-    ledger = ScienceRunStore(root / "science-runs")
-    ledger.create_run(
-        request=request,
-        idempotency_key=f"seed-{run_id}",
+    ledger.commit_create_run(
+        admission,
         run=queued,
         input_context={},
     )
     if status is not m.RunStatus.QUEUED:
         ledger.mutate_run(
-            run_id,
+            persisted_run_id,
             lambda run, version: owner_module._transition_run(
                 run,
                 status,
@@ -708,6 +717,7 @@ def _seed_run(
             ),
         )
     ledger.close()
+    return persisted_run_id
 
 
 def test_create_is_idempotent_and_rejects_a_valid_mismatched_reuse(
@@ -838,6 +848,46 @@ def test_concurrent_new_create_has_one_readiness_owner_and_one_durable_run(
         second.join(5)
         owner.close()
         store.close()
+
+
+def test_pending_create_identity_survives_restart_and_rejects_mismatched_reuse(
+    tmp_path: Path,
+    registry: object,
+) -> None:
+    project_store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(project_store, registry)
+    request = _run_request(project)
+    state_root = tmp_path / "science-runs"
+    first = ScienceRunStore(state_root)
+    replay, interrupted = first.begin_create_run(
+        request=request,
+        idempotency_key="sigterm-create",
+    )
+    assert replay is None
+    assert interrupted is not None
+    interrupted_run_id = interrupted.run_id
+    first.close()
+
+    restarted = ScienceRunStore(state_root)
+    try:
+        replay, recovered = restarted.begin_create_run(
+            request=request,
+            idempotency_key="sigterm-create",
+        )
+        assert replay is None
+        assert recovered is not None
+        assert recovered.run_id == interrupted_run_id
+
+        mismatched = request.model_copy(update={"expected_registry_digest": "e" * 64})
+        with pytest.raises(owner_module.ScienceRunIdempotencyConflict):
+            restarted.begin_create_run(
+                request=mismatched,
+                idempotency_key="sigterm-create",
+            )
+        restarted.abort_create_run(recovered)
+    finally:
+        restarted.close()
+        project_store.close()
 
 
 def test_revision_activation_during_readiness_leaves_zero_persisted_runs(
@@ -1103,6 +1153,93 @@ def test_cancelled_queued_run_is_not_selected_after_current_worker_releases(
         store.close()
 
 
+def test_running_cancel_waits_for_rollout_termination_authority_before_cancelled(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+    runner_entered = threading.Event()
+    cancel_entered = threading.Event()
+    allow_termination = threading.Event()
+    remote_terminated = threading.Event()
+
+    class BlockingCancellationRollout(_FakeRolloutClient):
+        def get_task(self, task_id: str) -> dict[str, Any]:
+            while not remote_terminated.is_set():
+                time.sleep(0.005)
+            return {"task_id": task_id, "status": "cancelled"}
+
+        def cancel_task(self, task_id: str) -> dict[str, Any]:
+            cancel_entered.set()
+            assert allow_termination.wait(5)
+            remote_terminated.set()
+            return {"task_id": task_id, "status": "cancelled"}
+
+    rollout = BlockingCancellationRollout()
+
+    def run(_config: object, **kwargs: Any) -> dict[str, Any]:
+        client = kwargs["rollout_client"]
+        task_id = str(kwargs["task_ids"][0])
+        client.submit_task(
+            {
+                "task_id": task_id,
+                "instruction": "Wait for cancellation authority.",
+                "agent": {"harness": "codex"},
+                "metadata": {"evolution": {"context_artifact_ids": []}},
+            }
+        )
+        runner_entered.set()
+        client.get_task(task_id)
+        raise AssertionError("cancelled rollout must not return a completed experiment")
+
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        run,
+        rollout_factory=lambda _binding: rollout,
+    )
+    cancellation_result: list[m.RunV1] = []
+    cancellation_errors: list[BaseException] = []
+    cancel_thread: threading.Thread | None = None
+    try:
+        created = _invoke_create(owner, _run_request(project), "cancel-authority-create")
+        assert runner_entered.wait(5)
+        running = _wait_for_status(owner, created.id, m.RunStatus.RUNNING)
+
+        def cancel() -> None:
+            try:
+                cancellation_result.append(_cancel(owner, running, "cancel-authority"))
+            except BaseException as exc:
+                cancellation_errors.append(exc)
+
+        cancel_thread = threading.Thread(target=cancel)
+        cancel_thread.start()
+        assert cancel_entered.wait(5)
+        cancel_thread.join(5)
+        assert not cancel_thread.is_alive()
+        assert cancellation_errors == []
+        assert len(cancellation_result) == 1
+        assert cancellation_result[0].status is m.RunStatus.CANCELLING
+        assert _get_run(owner, created.id).status is m.RunStatus.CANCELLING
+        assert remote_terminated.is_set() is False
+
+        allow_termination.set()
+        assert remote_terminated.wait(5)
+        assert _wait_for_status(owner, created.id, m.RunStatus.CANCELLED).status is (
+            m.RunStatus.CANCELLED
+        )
+    finally:
+        allow_termination.set()
+        remote_terminated.set()
+        if cancel_thread is not None:
+            cancel_thread.join(5)
+        owner.close()
+        store.close()
+
+
 def test_retry_enforces_etag_attempt_binding_and_idempotent_replay(
     tmp_path: Path, registry: object
 ) -> None:
@@ -1250,7 +1387,7 @@ def test_restart_recovers_interrupted_preparing_attempt_as_failed(
     project = _project(store, registry)
     request = _run_request(project)
     state_root = tmp_path / "owner"
-    _seed_run(state_root, request, status=m.RunStatus.PREPARING)
+    run_id = _seed_run(state_root, request, status=m.RunStatus.PREPARING)
     services = _FakeServiceOwner(_binding(registry))
     runner_calls: list[object] = []
 
@@ -1260,7 +1397,7 @@ def test_restart_recovers_interrupted_preparing_attempt_as_failed(
 
     owner = _owner(state_root, store, registry, services, should_not_run)
     try:
-        recovered = _get_run(owner, "run-recovery-seed")
+        recovered = _get_run(owner, run_id)
         assert recovered.status is m.RunStatus.FAILED
         assert recovered.current_error is not None
         assert recovered.current_error.code == "science_run_failed"
@@ -1275,6 +1412,80 @@ def test_restart_recovers_interrupted_preparing_attempt_as_failed(
         store.close()
 
 
+def test_restart_keeps_cancelling_until_exact_rollout_task_is_terminated(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    request = _run_request(project)
+    state_root = tmp_path / "owner"
+    task_id = "task-cancelling-recovery"
+    run_id = _seed_run(
+        state_root,
+        request,
+        status=m.RunStatus.PREPARING,
+        run_id="run-cancelling-recovery",
+    )
+    binding = _binding(registry)
+    ledger = ScienceRunStore(state_root / "science-runs")
+    timestamp = "2026-07-15T12:00:01.000000Z"
+    ledger.mutate_run(
+        run_id,
+        lambda run, version: owner_module._transition_run(
+            run, m.RunStatus.RUNNING, version=version, now=timestamp
+        ),
+    )
+    ledger.mutate_run(
+        run_id,
+        lambda run, version: owner_module._transition_run(
+            run, m.RunStatus.CANCELLING, version=version, now=timestamp
+        ),
+    )
+    assert ledger.register_admission(
+        run_id=run_id,
+        operation=RunAdmissionOperation.ROLLOUT_TASK_SUBMIT.value,
+        task_id=task_id,
+        session_id=None,
+        generation_digest=binding.generation_digest,
+        registry_digest=binding.registry_digest,
+        framework_lock_digest=binding.framework_lock_digest,
+        payload_sha256="a" * 64,
+        allow_create=True,
+    )
+    ledger.close()
+
+    cancel_entered = threading.Event()
+    allow_termination = threading.Event()
+
+    class RecoveringRollout(_FakeRolloutClient):
+        def cancel_task(self, candidate: str) -> dict[str, Any]:
+            assert candidate == task_id
+            cancel_entered.set()
+            assert allow_termination.wait(5)
+            return {"task_id": candidate, "status": "cancelled"}
+
+    services = _FakeServiceOwner(binding)
+    owner = _owner(
+        state_root,
+        store,
+        registry,
+        services,
+        lambda *_args, **_kwargs: pytest.fail("recovery must not rerun the experiment"),
+        rollout_factory=lambda _binding: RecoveringRollout(),
+    )
+    try:
+        assert cancel_entered.wait(5)
+        assert _get_run(owner, run_id).status is m.RunStatus.CANCELLING
+        allow_termination.set()
+        assert _wait_for_status(owner, run_id, m.RunStatus.CANCELLED).status is (
+            m.RunStatus.CANCELLED
+        )
+    finally:
+        allow_termination.set()
+        owner.close()
+        store.close()
+
+
 def test_timeline_and_log_sequence_allocation_is_concurrency_safe(
     tmp_path: Path, registry: object
 ) -> None:
@@ -1282,7 +1493,9 @@ def test_timeline_and_log_sequence_allocation_is_concurrency_safe(
     project = _project(store, registry)
     request = _run_request(project)
     state_root = tmp_path / "owner"
-    _seed_run(state_root, request, status=m.RunStatus.CANCELLED, run_id="run-concurrent")
+    run_id = _seed_run(
+        state_root, request, status=m.RunStatus.CANCELLED, run_id="run-concurrent"
+    )
     services = _FakeServiceOwner(_binding(registry))
 
     def fixed_clock() -> datetime:
@@ -1300,7 +1513,7 @@ def test_timeline_and_log_sequence_allocation_is_concurrency_safe(
         poll_interval_seconds=0,
         max_poll_attempts=10,
     )
-    run = _get_run(owner, "run-concurrent")
+    run = _get_run(owner, run_id)
 
     def concurrently(call: Callable[[int], None], count: int = 24) -> list[BaseException]:
         barrier = threading.Barrier(count)

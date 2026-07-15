@@ -13,6 +13,8 @@ class RolloutClientProtocol(Protocol):
 
     def get_task(self, task_id: str) -> dict[str, Any]: ...
 
+    def cancel_task(self, task_id: str) -> dict[str, Any]: ...
+
 
 class EvolutionClientProtocol(Protocol):
     def create_dataset(self, payload: dict[str, Any]) -> dict[str, Any]: ...
@@ -103,6 +105,17 @@ class RolloutHttpClient:
         result = response.json()
         if not isinstance(result, dict):
             raise ValueError("rollout task response was not a JSON object")
+        return result
+
+    def cancel_task(self, task_id: str) -> dict[str, Any]:
+        encoded_task_id = quote(task_id, safe="")
+        response = self._client.delete(f"{self.base_url}/rollout/task/{encoded_task_id}")
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("rollout cancellation response was not a JSON object")
+        if result.get("task_id") != task_id or result.get("status") != "cancelled":
+            raise ValueError("rollout cancellation response did not prove termination")
         return result
 
 

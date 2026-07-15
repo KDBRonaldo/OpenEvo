@@ -29,6 +29,28 @@ def test_rollout_http_client_url_encodes_task_id_path_segment() -> None:
     assert captured_paths == [b"/rollout/task/bench%3Fx%23frag"]
 
 
+def test_rollout_http_client_cancel_requires_exact_terminal_authority() -> None:
+    captured: list[tuple[str, bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append((request.method, request.url.raw_path))
+        return httpx.Response(
+            200,
+            json={"task_id": "task?cancel#exact", "status": "cancelled"},
+        )
+
+    client = RolloutHttpClient(
+        "http://rollout.example",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert client.cancel_task("task?cancel#exact") == {
+        "task_id": "task?cancel#exact",
+        "status": "cancelled",
+    }
+    assert captured == [("DELETE", b"/rollout/task/task%3Fcancel%23exact")]
+
+
 def test_rollout_http_client_rejects_non_object_submit_response() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=["not", "an", "object"])

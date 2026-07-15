@@ -182,6 +182,16 @@ async def get_task(task_id: str):
     return task
 
 
+@app.delete("/rollout/task/{task_id}", response_model=TaskStatus)
+async def cancel_task(task_id: str):
+    try:
+        return await get_state().manager.cancel_task(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Task not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/rollout/status")
 async def rollout_status():
     return get_state().manager.status()

@@ -1970,6 +1970,12 @@ class GatewayNodeManager:
             before_cancel=persist_cancel_authority,
         )
 
+    async def cancel_and_wait(self, session_id: str) -> bool:
+        cancelled = await self.cancel(session_id)
+        if cancelled:
+            await self._dispatcher.wait_terminated(session_id)
+        return cancelled
+
     async def active_sessions(self) -> int:
         return await self._dispatcher.active_count()
 

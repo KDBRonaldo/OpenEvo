@@ -46,12 +46,18 @@ against the agent's wall-clock.
 |---|---|---|
 | POST | `/rollout/task/submit` | Submit a task (returns immediately) |
 | GET | `/rollout/task/{task_id}` | Task status / progress |
+| DELETE | `/rollout/task/{task_id}` | Cancel all sessions and wait for Gateway termination |
 | GET | `/rollout/status` | Service + fleet summary |
 | POST | `/nodes/register`, `/nodes/{id}/heartbeat` | Gateway registration + heartbeat |
 | GET / DELETE | `/nodes`, `/nodes/{id}` | List / inspect / drain nodes |
 | POST | `/callbacks/session_result` | Gateway → rollout result callback |
 | GET | `/tasks`, `/tasks/{id}/sessions`, `/events` | Observability (used by the dashboard) |
 | GET | `/health` | Health check |
+
+Task cancellation sends DELETE for every accepted Gateway session and waits for
+each Gateway to release runtime, harness, and postrun ownership. The endpoint
+returns `status: "cancelled"` only after the background task has reached that
+terminal state.
 
 ## Task request shape
 
