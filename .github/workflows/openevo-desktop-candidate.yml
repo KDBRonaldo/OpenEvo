@@ -37,6 +37,8 @@ jobs:
             echo "candidate_label must be a short filename-safe identifier" >&2
             exit 1
           fi
+          git check-ref-format \
+            "refs/tags/openevo-desktop-v0-${CANDIDATE_LABEL}.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
 
       - uses: actions/setup-node@v4
         with:
@@ -432,21 +434,59 @@ jobs:
             'import json; print(json.load(open("candidate-artifacts/release-candidate.json"))["version"])')"
           tag="openevo-desktop-v${version}-${CANDIDATE_LABEL}.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
           title="OpenEvo Desktop ${version} unsigned candidate"
+          owner="$(python -c 'import secrets; print(secrets.token_hex(16))')"
+          git check-ref-format "refs/tags/$tag"
+
+          release_status="$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          if [ "$release_status" = "200" ]; then
+            echo "Draft release already exists: $tag" >&2
+            exit 1
+          fi
+          if [ "$release_status" != "404" ]; then
+            echo "Could not prove draft release absence (HTTP $release_status)" >&2
+            exit 1
+          fi
+
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "Candidate Git tag already exists: $tag" >&2
+            exit 1
+          fi
+          if [ "$tag_status" -ne 2 ]; then
+            echo "Could not prove candidate Git tag absence: $tag" >&2
+            exit 1
+          fi
+
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
         env:
           CANDIDATE_LABEL: ${{ inputs.candidate_label }}
+          GH_TOKEN: ${{ github.token }}
 
       - name: Create unsigned draft prerelease and upload exact assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_TITLE: ${{ steps.release.outputs.title }}
+          RELEASE_OWNER: ${{ steps.release.outputs.owner }}
         run: |
+          python scripts/ci/openevo_release_candidate.py write-draft-body \
+            "$RUNNER_TEMP/draft-release-body.md" \
+            --release-notes candidate-artifacts/release-notes.md \
+            --ownership-token "$RELEASE_OWNER"
           gh release create "$RELEASE_TAG" \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TITLE" \
-            --notes-file candidate-artifacts/release-notes.md \
+            --notes-file "$RUNNER_TEMP/draft-release-body.md" \
             --draft \
             --prerelease
           gh release upload "$RELEASE_TAG" candidate-artifacts/*
@@ -456,6 +496,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_TITLE: ${{ steps.release.outputs.title }}
+          RELEASE_OWNER: ${{ steps.release.outputs.owner }}
         run: |
           mkdir downloaded-draft
           gh release download "$RELEASE_TAG" --dir downloaded-draft --pattern '*'
@@ -472,7 +513,22 @@ jobs:
             --release-notes candidate-artifacts/release-notes.md \
             --expected-tag "$RELEASE_TAG" \
             --expected-target "$GITHUB_SHA" \
-            --expected-title "$RELEASE_TITLE"
+            --expected-title "$RELEASE_TITLE" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-owner "$RELEASE_OWNER"
+
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "Draft unexpectedly created a real Git tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [ "$tag_status" -ne 2 ]; then
+            echo "Could not prove candidate Git tag absence: $RELEASE_TAG" >&2
+            exit 1
+          fi
 
       - name: Retain point-in-time draft verification record
         uses: actions/upload-artifact@v4
@@ -486,23 +542,70 @@ jobs:
         id: verified
         run: echo "complete=true" >> "$GITHUB_OUTPUT"
 
-      - name: Delete an unverified draft and its candidate tag
+      - name: Delete an owned unverified draft and verify no candidate tag
         if: ${{ always() && steps.release.outputs.tag != '' && steps.verified.outputs.complete != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
+          RELEASE_OWNER: ${{ steps.release.outputs.owner }}
         run: |
-          for attempt in 1 2 3; do
-            if gh release delete "$RELEASE_TAG" --yes --cleanup-tag; then
-              break
+          release_status="$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if [ "$release_status" = "200" ]; then
+            gh release view "$RELEASE_TAG" \
+              --json body,isDraft,isPrerelease,name,tagName,targetCommitish,url \
+              > "$RUNNER_TEMP/cleanup-draft-release.json"
+            if ! python scripts/ci/openevo_release_candidate.py validate-draft \
+              "$RUNNER_TEMP/cleanup-draft-release.json" \
+              --release-notes candidate-artifacts/release-notes.md \
+              --expected-tag "$RELEASE_TAG" \
+              --expected-target "$GITHUB_SHA" \
+              --expected-title "$RELEASE_TITLE" \
+              --expected-repository "$GITHUB_REPOSITORY" \
+              --expected-owner "$RELEASE_OWNER"; then
+              echo "Refusing to delete a draft not owned by this workflow attempt" >&2
+              exit 1
             fi
-            sleep "$attempt"
-          done
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            for attempt in 1 2 3; do
+              if gh release delete "$RELEASE_TAG" --yes; then
+                break
+              fi
+              sleep "$attempt"
+            done
+          elif [ "$release_status" != "404" ]; then
+            echo "Could not determine unverified draft ownership (HTTP $release_status)" >&2
+            exit 1
+          fi
+
+          release_status="$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if [ "$release_status" = "200" ]; then
             echo "Unverified draft still exists: $RELEASE_TAG" >&2
             exit 1
           fi
-          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+          if [ "$release_status" != "404" ]; then
+            echo "Could not prove unverified draft absence (HTTP $release_status)" >&2
+            exit 1
+          fi
+
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
             echo "Unverified candidate tag still exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [ "$tag_status" -ne 2 ]; then
+            echo "Could not prove unverified candidate tag absence: $RELEASE_TAG" >&2
             exit 1
           fi

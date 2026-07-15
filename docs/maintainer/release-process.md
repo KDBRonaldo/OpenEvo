@@ -134,19 +134,28 @@ outputs, downloads every asset into a clean directory, and verifies:
 - the Core descriptor references the uploaded Core artifact;
 - the DMG version and bundled/fetched descriptor match the candidate commit;
 - release notes exactly match the release-tool-owned canonical packaging
-  document. It states unsigned/not-notarized status, available and unavailable execution
+  document. The GitHub body adds only a release-tool-generated, 128-bit random
+  ownership marker used by failure cleanup. The document states
+  unsigned/not-notarized status, available and unavailable execution
   modes, known limitations, `0 of 3` benchmark gates with all three rescue
   counts `pending`, privacy/security behavior, and install/upgrade/uninstall
-  retention for both `~/.openevo/desktop` and remote data;
+  retention for `~/.openevo/desktop`, the Tauri native host app-data directory
+  for `org.openevo.desktop`, and remote data;
 - the GitHub draft title, tag, target commit, body, draft state, and prerelease
-  state match the candidate at the point the workflow completes;
+  state match the candidate at the discrete API read immediately after asset
+  redownload; this is not an atomic assertion about later workflow completion;
 - no unclassified development, secret, benchmark-private, or source-checkout
   files are present.
 
-If creation, upload, redownload, metadata validation, or verification-record
-upload fails or is cancelled, an `always()` cleanup retries deletion and then
-requires both the draft and candidate tag to be absent. A successful run leaves
-the draft and candidate tag for review; it does not publish the release.
+Before creation, the workflow validates the exact candidate tag name as a Git
+ref and requires both a same-name release and remote Git tag to be absent. If
+creation, upload, redownload, metadata validation, or verification-record upload
+fails or is cancelled, an `always()` cleanup deletes only a draft whose complete
+metadata and random ownership marker still match this workflow attempt. It does
+not delete Git tags, and it fails unless both the owned draft and any same-name
+remote Git tag are absent afterward. A successful run leaves the draft for
+review but proves that no real Git tag exists; the draft's `tagName` is release
+metadata only. It does not publish the release.
 
 A GitHub draft remains administratively mutable after the workflow. The
 workflow provides point-in-time verification, not an immutable GitHub object.

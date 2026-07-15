@@ -76,6 +76,8 @@ manifest, checksum inventory, and draft roundtrip from reviewed source.
 - Rollback limitations:
 - Desktop uninstall steps:
 - Local `~/.openevo/desktop` data retention and cleanup:
+- Tauri native host app-data for `org.openevo.desktop`, including run-retry
+  recovery state, retention and cleanup:
 - Remote state/model/runtime cache cleanup:
 - Troubleshooting guide:
 - Support issue link:

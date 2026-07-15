@@ -35,6 +35,8 @@ def test_candidate_release_notes_are_one_canonical_document() -> None:
     assert "Self-Deployed Reference mode: unavailable in this candidate." in notes
     assert "Credential-canary verification for release assets: pending." in notes
     assert "Local Desktop data under ~/.openevo/desktop is retained" in notes
+    assert "org.openevo.desktop" in notes
+    assert "run-retry recovery" in notes
 
 
 def test_write_notes_command_creates_but_never_replaces_canonical_document(
@@ -56,6 +58,36 @@ def test_write_notes_command_creates_but_never_replaces_canonical_document(
     assert candidate.main(arguments) == 0
     assert output.read_text(encoding="utf-8") == _release_notes_text()
     assert candidate.main(arguments) == 1
+
+
+def test_write_draft_body_binds_owner_and_never_replaces_output(tmp_path: Path) -> None:
+    candidate = _load_module()
+    notes = tmp_path / "release-notes.md"
+    notes.write_text(_release_notes_text(), encoding="utf-8")
+    output = tmp_path / "draft-release-body.md"
+    arguments = [
+        "write-draft-body",
+        str(output),
+        "--release-notes",
+        str(notes),
+        "--ownership-token",
+        "d" * 32,
+    ]
+
+    assert candidate.main(arguments) == 0
+    assert output.read_text(encoding="utf-8") == _owned_draft_body(candidate, notes)
+    assert candidate.main(arguments) == 1
+
+
+@pytest.mark.parametrize("ownership_token", ["", "D" * 32, "a" * 31, "g" * 32])
+def test_draft_body_rejects_invalid_ownership_token(ownership_token: str) -> None:
+    candidate = _load_module()
+
+    with pytest.raises(candidate.CandidateError, match="ownership token"):
+        candidate.render_draft_release_body(
+            release_notes=_release_notes_text(),
+            ownership_token=ownership_token,
+        )
 
 
 def test_candidate_manifest_rejects_extra_or_contradictory_release_claims(
@@ -89,8 +121,18 @@ def _draft_release_metadata(*, body: str) -> dict[str, object]:
         "name": "OpenEvo Desktop 0.1.0 unsigned candidate",
         "tagName": "openevo-desktop-v0.1.0-exhibition.123.2",
         "targetCommitish": "8e45af371eef49a86530a849041f7dcf047620ec",
-        "url": "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/example",
+        "url": (
+            "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/"
+            "openevo-desktop-v0.1.0-exhibition.123.2"
+        ),
     }
+
+
+def _owned_draft_body(candidate, notes: Path) -> str:
+    return candidate.render_draft_release_body(
+        release_notes=notes.read_text(encoding="utf-8"),
+        ownership_token="d" * 32,
+    )
 
 
 def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> None:
@@ -99,9 +141,7 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
     notes.write_text(_release_notes_text(), encoding="utf-8")
     metadata = tmp_path / "draft-release.json"
     metadata.write_text(
-        json.dumps(
-            _draft_release_metadata(body=notes.read_text(encoding="utf-8").rstrip("\n"))
-        ),
+        json.dumps(_draft_release_metadata(body=_owned_draft_body(candidate, notes))),
         encoding="utf-8",
     )
 
@@ -111,6 +151,8 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
         expected_target="8e45af371eef49a86530a849041f7dcf047620ec",
         expected_title="OpenEvo Desktop 0.1.0 unsigned candidate",
+        expected_repository="CompLifeLab-ZJU/OpenEvo",
+        expected_owner="d" * 32,
     ) == []
     assert (
         candidate.main(
@@ -125,6 +167,10 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
                 "8e45af371eef49a86530a849041f7dcf047620ec",
                 "--expected-title",
                 "OpenEvo Desktop 0.1.0 unsigned candidate",
+                "--expected-repository",
+                "CompLifeLab-ZJU/OpenEvo",
+                "--expected-owner",
+                "d" * 32,
             ]
         )
         == 0
@@ -140,6 +186,7 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         ("name", "edited title"),
         ("tagName", "edited-tag"),
         ("targetCommitish", "f" * 40),
+        ("url", "https://github.com/attacker/unrelated/releases/tag/forged"),
     ],
 )
 def test_draft_release_metadata_rejects_review_surface_mutation(
@@ -150,9 +197,7 @@ def test_draft_release_metadata_rejects_review_surface_mutation(
     candidate = _load_module()
     notes = tmp_path / "release-notes.md"
     notes.write_text(_release_notes_text(), encoding="utf-8")
-    payload = _draft_release_metadata(
-        body=notes.read_text(encoding="utf-8").rstrip("\n")
-    )
+    payload = _draft_release_metadata(body=_owned_draft_body(candidate, notes))
     payload[field] = replacement
     metadata = tmp_path / "draft-release.json"
     metadata.write_text(json.dumps(payload), encoding="utf-8")
@@ -163,6 +208,8 @@ def test_draft_release_metadata_rejects_review_surface_mutation(
         expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
         expected_target="8e45af371eef49a86530a849041f7dcf047620ec",
         expected_title="OpenEvo Desktop 0.1.0 unsigned candidate",
+        expected_repository="CompLifeLab-ZJU/OpenEvo",
+        expected_owner="d" * 32,
     )
 
     assert errors

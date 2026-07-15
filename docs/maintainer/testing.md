@@ -147,14 +147,20 @@ browser-download quarantine/Gatekeeper path as unavailable or pending. This
 checksum-bound packaging draft is never edited into a final release; a future
 final path must create and revalidate a new candidate inventory.
 It also states that uninstalling the application retains local data under
-`~/.openevo/desktop` and remote Core state, task data, models, and caches.
+`~/.openevo/desktop`, the Tauri native host app-data directory for
+`org.openevo.desktop` (including run-retry recovery state), and remote Core
+state, task data, models, and caches.
 
 After asset redownload, the candidate workflow queries the GitHub draft and
 validates its exact body, title, tag, target commit, draft flag, and prerelease
-flag. It stores that point-in-time record as a run-attempt-qualified immutable
-Actions artifact. The GitHub draft itself remains administratively mutable, so
-any post-run edit invalidates it. Cancellation or failure before the final
-completion marker retries draft/tag deletion and verifies both are absent.
+flag. The body must contain the canonical notes followed only by the 128-bit
+random ownership marker generated for that workflow attempt. It stores that
+discrete, point-in-time record as a run-attempt-qualified immutable Actions
+artifact; this does not make an atomic claim about workflow completion. The
+GitHub draft itself remains administratively mutable, so any post-run edit
+invalidates it. Tests require exact Git-ref validation, pre-creation release/tag
+absence, ownership-bound cleanup, and real-tag absence after both success and
+failure. Cleanup never deletes a Git tag.
 
 Remote capability discovery has an additional artifact-level gate. In a clean
 environment containing the exact Core wheel, run

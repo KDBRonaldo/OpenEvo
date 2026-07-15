@@ -57,6 +57,16 @@ def _load_module():
     return module
 
 
+def _load_release_candidate_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/openevo_release_candidate.py"
+    spec = importlib.util.spec_from_file_location("openevo_release_candidate", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_desktop_wheel_smoke_module():
     path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_desktop_wheel.py"
     spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_wheel", path)
@@ -1223,6 +1233,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "actions/download-artifact@v4",
         "retention-days: 14",
         "openevo_release_candidate.py write-notes",
+        "openevo_release_candidate.py write-draft-body",
         "permissions:\n      contents: write",
         "gh release create",
         "--draft",
@@ -1231,10 +1242,15 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "gh release download",
         "diff -qr candidate-artifacts downloaded-draft",
         "validate-draft",
+        "--expected-owner",
+        "--expected-repository",
         "gh release view",
+        "secrets.token_hex(16)",
+        "git check-ref-format",
         "steps.verified.outputs.complete != 'true'",
         "if: ${{ always()",
         "git ls-remote --exit-code --tags origin",
+        "Refusing to delete a draft not owned by this workflow attempt",
         "gh release delete",
     ):
         assert marker in text
@@ -1258,6 +1274,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
         "Credential-canary verification for release assets: pending.",
         "Local Desktop data under ~/.openevo/desktop is retained",
+        "org.openevo.desktop",
+        "run-retry recovery",
         "## Install, Upgrade, And Uninstall",
         "Install:",
         "Upgrade:",
@@ -1275,6 +1293,15 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert "needs: [macos-candidate, linux-core-candidate]" in text
     assert text.index("gh release create") < text.index("gh release upload")
     assert text.index("gh release upload") < text.index("gh release download")
+    cleanup = text.split(
+        "      - name: Delete an owned unverified draft", maxsplit=1
+    )[1]
+    assert cleanup.index("validate-draft") < cleanup.index("gh release delete")
+    assert "--cleanup-tag" not in cleanup
+    assert text.count("git ls-remote --exit-code --tags origin") >= 3
+    assert text.index("Verify every draft asset and review-facing field") < text.index(
+        "Mark draft roundtrip complete"
+    )
     candidate_artifact_name = (
         "openevo-desktop-candidate-${{ github.sha }}-"
         "${{ github.run_id }}-${{ github.run_attempt }}"
@@ -1346,6 +1373,29 @@ def test_release_execution_mode_authority_has_no_renderer_fixture_fallback() -> 
     assert "self_deployed_release_unavailable" not in product_app
     assert "RELEASE_EXECUTION_MODE_CAPABILITIES" not in product_app
     assert "self_deployed_release_unavailable" in release_capabilities
+
+
+def test_release_docs_and_notes_match_execution_mode_and_native_storage_authority() -> None:
+    by_mode = {
+        capability.mode: capability
+        for capability in RELEASE_EXECUTION_MODE_CAPABILITIES_V1.modes
+    }
+    readme = Path("README.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+    notes = _load_release_candidate_module().render_candidate_release_notes(
+        source_commit="a" * 40,
+        version="0.1.0",
+        architecture="aarch64",
+    )
+
+    assert by_mode["codex_subscription_transcript"].support_state == "supported"
+    assert by_mode["self-deployed"].support_state == "unavailable"
+    assert "Codex subscription transcript mode: available in this candidate." in notes
+    assert "Self-Deployed Reference mode: unavailable in this candidate." in notes
+    assert "current Desktop release marks it unavailable and blocks" in normalized_readme
+    assert "persistent WebView storage" not in readme
+    assert "Tauri native host app data directory" in normalized_readme
+    assert "org.openevo.desktop" in normalized_readme
 
 
 def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:

@@ -88,8 +88,10 @@ The repository currently provides:
   bytes. Only after both jobs pass does a write-scoped job create an unsigned
   draft prerelease, upload every manifest member, download every asset into an
   empty directory, revalidate the closed inventory, compare all bytes, and
-  validate the review-facing draft fields. A separate run-attempt-qualified
-  Actions artifact retains that point-in-time metadata record;
+  validate the review-facing draft fields and the per-attempt random ownership
+  marker. A separate run-attempt-qualified Actions artifact retains that
+  point-in-time metadata record. The successful draft has a `tagName` but does
+  not create a remote Git tag;
 - a disabled `.github/workflows/openevo-release-artifact.yml` placeholder that
   publishes nothing.
 
@@ -97,7 +99,8 @@ The candidate workflow proves the native packaging, exact-byte transfer, Core
 service, minimal dependency/license/security, and draft-asset roundtrip named
 above. It does not complete the ordinary science E2E, benchmark gates,
 secret-canary/privacy suite, code signing, notarization, or final publication,
-and its candidate tag is not a public release authorization.
+and the draft's candidate tag name is not a real Git tag or public release
+authorization.
 
 ### Native host trust boundary, phase one
 
@@ -726,23 +729,30 @@ The replacement workflow must:
    executable and sidecar with `file -b` and `lipo -archs`, then require the raw
    and copied observations to match the declared candidate architecture;
 6. exercise first-run through a descriptor-matched remote Core health check;
-7. create a draft GitHub prerelease, upload all required assets, download them into
-   a clean directory, and revalidate names, versions, commits, checksums, title,
-   tag, target commit, body, draft state, and prerelease state;
+7. require the candidate release and real Git tag to be absent, create a draft
+   GitHub prerelease with a per-attempt random ownership marker, upload all
+   required assets, download them into a clean directory, and revalidate names,
+   versions, commits, checksums, title, tag name, target commit, body, draft
+   state, prerelease state, and ownership at a discrete API read;
 8. retain the point-in-time draft verification record as a run-attempt-qualified
-   Actions artifact and leave the candidate as an unpublished review draft.
+   Actions artifact, prove no real Git tag was created, and leave the candidate
+   as an unpublished review draft.
 
 Final publication remains disabled. The manual candidate workflow implements
-the packaging-level draft roundtrip and retries deletion of a newly created
-draft and candidate tag if the job fails or is cancelled before its final
-verification marker. It deliberately leaves
+the packaging-level draft roundtrip. If the job fails or is cancelled before
+its final verification marker, cleanup first verifies the exact draft metadata
+and random ownership marker, then retries deletion of that owned draft. Cleanup
+never deletes a Git tag and fails unless a same-name tag is absent. It
+deliberately leaves
 a successful candidate as an unsigned draft prerelease; a maintainer cannot use
 that result to bypass the still-pending science, benchmark, privacy, review,
 signing, or notarization gates.
 
 The GitHub draft is administratively mutable; it is not an immutable publication
-authority. Any post-workflow edit, asset replacement, or tag movement
-invalidates the candidate and requires deleting it and running a new candidate.
+authority. Validation describes individual GitHub API reads, not an atomic
+snapshot at workflow completion. Any post-workflow edit, asset replacement, or
+tag movement invalidates the candidate and requires deleting it and running a
+new candidate.
 
 ## Packaged Runtime Rules
 
