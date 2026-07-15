@@ -104,6 +104,14 @@ class ExecutionModeReleaseUnavailableError(Exception):
         self.capability = capability
 
 
+class ActiveProjectMismatchError(Exception):
+    """A mutation names a project other than the active Desktop session."""
+
+    def __init__(self, operation_id: str) -> None:
+        super().__init__("requested project does not own the active Desktop session")
+        self.operation_id = operation_id
+
+
 class InvalidNativeChallengeError(Exception):
     """The native readiness challenge is missing or malformed."""
 
@@ -1428,16 +1436,22 @@ class DesktopReleaseProvider:
 
     def _create_run(self, arguments: Mapping[str, object]) -> object:
         request = cast(local_v1.RunCreateV1, arguments["request"])
-        with self._project_session_lock:
-            project = self._require_project_match(
-                request.project_id,
-                cast(str, arguments["if_match"]),
+        if_match = cast(str, arguments["if_match"])
+
+        def create(bridge: DesktopCoreBridgeV1, project: ProjectV1) -> object:
+            if project.project_id != request.project_id:
+                raise ActiveProjectMismatchError("createRun")
+            if not hmac.compare_digest(project.etag, if_match):
+                raise ETagConflictError("project", project.project_id, project.etag)
+            return bridge.create_run(
+                project, idempotency_key=cast(str, arguments["idempotency_key"])
             )
-            self._require_supported_execution_mode("createRun", project.execution.mode)
-            return self._require_bridge("createRun").create_run(
-                project,
-                idempotency_key=cast(str, arguments["idempotency_key"]),
-            )
+
+        return self._invoke_active_core(
+            "createRun",
+            create,
+            enforce_execution_mode_support=True,
+        )
 
     def _get_run(self, arguments: Mapping[str, object]) -> object:
         return self._invoke_active_core(
@@ -1916,6 +1930,7 @@ class DesktopReleaseProvider:
 
 
 __all__ = (
+    "ActiveProjectMismatchError",
     "DesktopReleaseProvider",
     "ExecutionModeReleaseUnavailableError",
     "InvalidNativeChallengeError",

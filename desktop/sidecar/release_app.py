@@ -40,6 +40,7 @@ from desktop.sidecar.provider_store import (
     ResourceNotFoundError,
 )
 from desktop.sidecar.release_provider import (
+    ActiveProjectMismatchError,
     DesktopReleaseProvider,
     ExecutionModeReleaseUnavailableError,
     InvalidNativeChallengeError,
@@ -398,6 +399,20 @@ def create_release_desktop_local_api_app(
             category=_operation_category(exc.operation_id),
             repair_action="user_input_required",
             next_action="Choose a supported execution mode and save the project before continuing.",
+        )
+
+    @app.exception_handler(ActiveProjectMismatchError)
+    async def handle_active_project_mismatch(
+        request: Request, exc: ActiveProjectMismatchError
+    ) -> JSONResponse:
+        return _error_response(
+            request,
+            status_code=409,
+            code="active_project_mismatch",
+            message="The requested resource does not belong to the active local project.",
+            category="service",
+            repair_action="none",
+            next_action="Reconnect and activate the saved project.",
         )
 
     @app.exception_handler(InvalidNativeChallengeError)

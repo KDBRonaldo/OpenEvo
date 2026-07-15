@@ -377,7 +377,11 @@ def test_release_execution_mode_gate_rejects_create_update_activate_and_run(
         assert rejected_activation.status_code == 409
         assert provider._store.pending_operation_ids() == ()
 
-        monkeypatch.setattr(provider, "_require_project_match", lambda *_args: project)
+        monkeypatch.setattr(
+            provider,
+            "_active_project_for_runtime",
+            lambda: CoreRuntimeSessionBinding(project=project, generation=1),
+        )
         rejected_run = client.post(
             "/desktop/v1/runs",
             headers={
@@ -405,6 +409,250 @@ def test_release_execution_mode_gate_rejects_create_update_activate_and_run(
 
         bridge.activate_project.assert_not_called()
         bridge.create_run.assert_not_called()
+
+
+def test_create_run_gates_active_self_deployed_mode_before_request_project_identity(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    lifecycle = FakeRemoteLifecycle()
+    app = _app(
+        tmp_path / "state",
+        core_bridge=bridge,
+        remote_lifecycle=lifecycle,
+    )
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Run authority server",
+            key="create-profile-run-authority-0001",
+        ).json()
+        provider = app.state.desktop_release_provider
+        active_request = _project(
+            profile["profile_id"], name="Active unavailable project"
+        )
+        active_request["execution"] = {
+            "mode": "self-deployed",
+            "hf_model": "open-models/release-gated-model",
+        }
+        active_project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(active_request),
+            idempotency_key="seed-active-unavailable-run-project-0001",
+        )
+        requested_project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(
+                _project(profile["profile_id"], name="Requested subscription project")
+            ),
+            idempotency_key="seed-requested-subscription-run-project-0001",
+        )
+        provider._active_project_for_runtime = (  # type: ignore[method-assign]
+            lambda: CoreRuntimeSessionBinding(project=active_project, generation=1)
+        )
+        headers = {
+            **SESSION_HEADERS,
+            "If-Match": requested_project.etag,
+            "Idempotency-Key": "create-run-active-authority-0001",
+        }
+
+        first = client.post(
+            "/desktop/v1/runs",
+            headers=headers,
+            json={"project_id": requested_project.project_id},
+        )
+        replay = client.post(
+            "/desktop/v1/runs",
+            headers=headers,
+            json={"project_id": requested_project.project_id},
+        )
+
+        for response in (first, replay):
+            assert response.status_code == 409
+            assert response.json()["code"] == "self_deployed_release_unavailable"
+            assert response.json()["category"] == "run"
+        assert bridge.method_calls == []
+        assert lifecycle.connect_calls == 0
+        assert lifecycle.accept_calls == 0
+        assert lifecycle.disconnect_calls == 0
+
+
+def test_create_run_rejects_supported_non_active_project_before_core(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    lifecycle = FakeRemoteLifecycle()
+    app = _app(
+        tmp_path / "state",
+        core_bridge=bridge,
+        remote_lifecycle=lifecycle,
+    )
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Run identity server",
+            key="create-profile-run-identity-0001",
+        ).json()
+        provider = app.state.desktop_release_provider
+        active_project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(
+                _project(profile["profile_id"], name="Active subscription project")
+            ),
+            idempotency_key="seed-active-subscription-run-project-0001",
+        )
+        requested_project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(
+                _project(profile["profile_id"], name="Different subscription project")
+            ),
+            idempotency_key="seed-different-subscription-run-project-0001",
+        )
+        provider._active_project_for_runtime = (  # type: ignore[method-assign]
+            lambda: CoreRuntimeSessionBinding(project=active_project, generation=1)
+        )
+
+        response = client.post(
+            "/desktop/v1/runs",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": requested_project.etag,
+                "Idempotency-Key": "create-run-project-mismatch-0001",
+            },
+            json={"project_id": requested_project.project_id},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "active_project_mismatch"
+        assert response.json()["category"] == "service"
+        assert response.json()["repair_action"] == "unsupported"
+        assert response.json()["next_action"] == "Reconnect and activate the saved project."
+        assert bridge.method_calls == []
+        assert lifecycle.connect_calls == 0
+        assert lifecycle.accept_calls == 0
+        assert lifecycle.disconnect_calls == 0
+
+
+def test_activation_replay_rechecks_unavailable_release_mode_before_return(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    lifecycle = FakeRemoteLifecycle()
+    app = _app(
+        tmp_path / "state",
+        core_bridge=bridge,
+        remote_lifecycle=lifecycle,
+    )
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Activation replay server",
+            key="create-profile-activation-replay-0001",
+        ).json()
+        request = _project(profile["profile_id"], name="Unavailable replay project")
+        request["execution"] = {
+            "mode": "self-deployed",
+            "hf_model": "open-models/release-gated-model",
+        }
+        provider = app.state.desktop_release_provider
+        project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(request),
+            idempotency_key="seed-unavailable-activation-replay-project-0001",
+        )
+        action = {
+            "route": f"/desktop/v1/projects/{project.project_id}/activate",
+            "operation_kind": "project_activate",
+            "project_id": project.project_id,
+            "key": "activation-unavailable-replay-0001",
+            "body": {},
+            "if_match": project.etag,
+        }
+        reservation = provider._store.begin_project_runtime_action(**action)
+
+        response = client.post(
+            action["route"],
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": project.etag,
+                "Idempotency-Key": action["key"],
+            },
+        )
+        conflicting_replay = client.post(
+            action["route"],
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": '"' + "a" * 64 + '"',
+                "Idempotency-Key": action["key"],
+            },
+        )
+
+        for replay_response in (response, conflicting_replay):
+            assert replay_response.status_code == 409
+            assert replay_response.json()["code"] == "self_deployed_release_unavailable"
+        assert provider._store.get_local_operation(
+            reservation.operation.operation_id
+        ) == reservation.operation
+        assert bridge.method_calls == []
+        assert lifecycle.connect_calls == 0
+        assert lifecycle.accept_calls == 0
+        assert lifecycle.disconnect_calls == 0
+
+
+def test_supported_subscription_activation_replay_remains_exact_and_local(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    lifecycle = FakeRemoteLifecycle()
+    app = _app(
+        tmp_path / "state",
+        core_bridge=bridge,
+        remote_lifecycle=lifecycle,
+    )
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Supported activation replay server",
+            key="create-profile-supported-activation-replay-0001",
+        ).json()
+        provider = app.state.desktop_release_provider
+        project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(
+                _project(profile["profile_id"], name="Supported replay project")
+            ),
+            idempotency_key="seed-supported-activation-replay-project-0001",
+        )
+        action = {
+            "route": f"/desktop/v1/projects/{project.project_id}/activate",
+            "operation_kind": "project_activate",
+            "project_id": project.project_id,
+            "key": "activation-supported-replay-0001",
+            "body": {},
+            "if_match": project.etag,
+        }
+        reservation = provider._store.begin_project_runtime_action(**action)
+
+        response = client.post(
+            action["route"],
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": project.etag,
+                "Idempotency-Key": action["key"],
+            },
+        )
+        conflicting_replay = client.post(
+            action["route"],
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": '"' + "a" * 64 + '"',
+                "Idempotency-Key": action["key"],
+            },
+        )
+
+        assert response.status_code == 202
+        assert response.json() == reservation.operation.model_dump(mode="json")
+        assert response.headers["etag"] == reservation.operation.etag
+        assert conflicting_replay.status_code == 409
+        assert conflicting_replay.json()["code"] == "idempotency_key_reused"
+        assert bridge.method_calls == []
+        assert lifecycle.connect_calls == 0
+        assert lifecycle.accept_calls == 0
+        assert lifecycle.disconnect_calls == 0
 
 
 def test_release_execution_mode_gate_rejects_retry_and_restart_before_core(

@@ -3838,8 +3838,9 @@ class DesktopProviderStore:
     ) -> ProjectRuntimeActionReservation:
         """Atomically admit and reserve one durable background action for a project.
 
-        The guard may only inspect the validated project and raise. Exact replays
-        return their frozen operation without invoking it.
+        The guard may only inspect the validated project and raise. Existing
+        idempotency identities invoke it before exact or conflicting replay
+        resolution; new actions invoke it after ETag validation.
         """
 
         if operation_kind not in _PROJECT_OPERATION_KINDS:
@@ -3855,7 +3856,12 @@ class DesktopProviderStore:
         with self._transaction(write=True) as connection:
             now_epoch = identity[5]
             self._cleanup_expired_idempotency_records(connection, now_epoch)
-            existing = self._project_action_replay(connection, identity, discard_expired=True)
+            existing = self._project_action_replay(
+                connection,
+                identity,
+                discard_expired=True,
+                admission_guard=admission_guard,
+            )
             if existing is not None:
                 return ProjectRuntimeActionReservation(existing, None, True)
             self._validate_action_route_binding(
@@ -4142,6 +4148,7 @@ class DesktopProviderStore:
         identity: tuple[str, str, str, str, str, int],
         *,
         discard_expired: bool = False,
+        admission_guard: Callable[[ProjectV1], None] | None = None,
     ) -> LocalOperationV1 | None:
         row = connection.execute(
             """
@@ -4159,6 +4166,11 @@ class DesktopProviderStore:
             connection, row, now_epoch=identity[5]
         ):
             return None
+        if admission_guard is not None:
+            project = self._project_from_row(
+                self._require_project_row(connection, identity[2])
+            )
+            admission_guard(project)
         if row["request_digest"] != identity[4]:
             raise IdempotencyConflictError(
                 "idempotency key is already bound to a different request"

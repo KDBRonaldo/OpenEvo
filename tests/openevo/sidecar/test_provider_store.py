@@ -3098,7 +3098,7 @@ def test_project_runtime_action_is_durable_idempotent_and_completes_atomically(
     assert store.begin_project_runtime_action(**action).operation == finished
 
 
-def test_project_runtime_action_admission_guard_is_atomic_and_skipped_for_replay(
+def test_project_runtime_action_admission_guard_precedes_exact_and_conflicting_replay(
     tmp_path: Path,
 ) -> None:
     store = DesktopProviderStore(tmp_path / "state")
@@ -3123,10 +3123,30 @@ def test_project_runtime_action_admission_guard_is_atomic_and_skipped_for_replay
     assert store.pending_operation_ids() == ()
 
     reservation = store.begin_project_runtime_action(**action)
-    replay = store.begin_project_runtime_action(**action, admission_guard=reject)
+    observed: list[ProjectV1] = []
+    replay = store.begin_project_runtime_action(
+        **action,
+        admission_guard=observed.append,
+    )
     assert reservation.replayed is False
     assert replay.replayed is True
     assert replay.operation == reservation.operation
+    assert observed == [project]
+
+    with pytest.raises(RuntimeError, match="release capability"):
+        store.begin_project_runtime_action(**action, admission_guard=reject)
+    with pytest.raises(RuntimeError, match="release capability"):
+        store.begin_project_runtime_action(
+            **{**action, "body": {"conflicting": True}},
+            admission_guard=reject,
+        )
+
+    with pytest.raises(IdempotencyConflictError):
+        store.begin_project_runtime_action(
+            **{**action, "body": {"conflicting": True}},
+            admission_guard=observed.append,
+        )
+    assert observed == [project, project]
 
 
 @pytest.mark.parametrize("remote_kind", ["missing", "not_ready", "wrong_revision_project"])
