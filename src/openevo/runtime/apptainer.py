@@ -154,6 +154,43 @@ class ApptainerRuntime(BaseRuntime):
         if rc != 0:
             raise RuntimeError(f"apptainer upload_dir failed with exit code {rc}")
 
+    async def download_file(self, remote_path: str, local_path: str) -> None:
+        if self._copy_from_bind_mount(remote_path, Path(local_path)):
+            return
+        parent = str(Path(remote_path).parent)
+        filename = Path(remote_path).name
+        local_dir = str(Path(local_path).parent)
+        Path(local_dir).mkdir(parents=True, exist_ok=True)
+        rc, _, _ = await self._run_local_command(
+            "bash",
+            "-c",
+            f"{self._binary} exec instance://{self._instance_name} "
+            f"tar -cf - -C {shlex.quote(parent)} {shlex.quote(filename)} | "
+            f"tar -xf - -C {shlex.quote(local_dir)}",
+            capture=False,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"apptainer download_file failed with exit code {rc}"
+            )
+
+    async def download_dir(self, remote_path: str, local_path: str) -> None:
+        if self._copy_from_bind_mount(remote_path, Path(local_path)):
+            return
+        Path(local_path).mkdir(parents=True, exist_ok=True)
+        rc, _, _ = await self._run_local_command(
+            "bash",
+            "-c",
+            f"{self._binary} exec instance://{self._instance_name} "
+            f"tar -cf - -C {shlex.quote(remote_path)} . | "
+            f"tar -xf - -C {shlex.quote(local_path)}",
+            capture=False,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"apptainer download_dir failed with exit code {rc}"
+            )
+
     @staticmethod
     def _resolve_binary() -> str:
         override = os.environ.get("OPENEVO_APPTAINER_BIN")

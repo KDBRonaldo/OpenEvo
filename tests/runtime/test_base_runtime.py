@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import os
 import sys
 import threading
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
+import openevo.runtime as runtime_api
 from openevo.runtime import base as runtime_base
 from openevo.runtime import factory as runtime_factory
 from openevo.runtime.apptainer import ApptainerRuntime
@@ -51,6 +54,14 @@ class ProbeRuntime(BaseRuntime):
     async def upload_dir(self, local_path: str, remote_path: str) -> None:
         del local_path, remote_path
 
+    async def download_file(self, remote_path: str, local_path: str) -> None:
+        copied = self._copy_from_bind_mount(remote_path, Path(local_path))
+        assert copied is True
+
+    async def download_dir(self, remote_path: str, local_path: str) -> None:
+        copied = self._copy_from_bind_mount(remote_path, Path(local_path))
+        assert copied is True
+
 
 def _runtime(tmp_path: Path) -> ProbeRuntime:
     session_dir = tmp_path / "session"
@@ -58,14 +69,125 @@ def _runtime(tmp_path: Path) -> ProbeRuntime:
     return ProbeRuntime(RuntimeSpec(image="runtime:latest"), "session", session_dir)
 
 
-def test_builtin_backends_share_the_core_owned_trusted_download_contract() -> None:
-    assert DockerRuntime.download_file is BaseRuntime.download_file
-    assert DockerRuntime.download_dir is BaseRuntime.download_dir
-    assert ApptainerRuntime.download_file is BaseRuntime.download_file
-    assert ApptainerRuntime.download_dir is BaseRuntime.download_dir
+def test_public_download_contract_remains_abstract_two_argument_none_api() -> None:
+    assert BaseRuntime.download_file.__isabstractmethod__ is True
+    assert BaseRuntime.download_dir.__isabstractmethod__ is True
+    assert list(inspect.signature(BaseRuntime.download_file).parameters) == [
+        "self",
+        "remote_path",
+        "local_path",
+    ]
+    assert list(inspect.signature(BaseRuntime.download_dir).parameters) == [
+        "self",
+        "remote_path",
+        "local_path",
+    ]
+    assert DockerRuntime.download_file is not BaseRuntime.download_file
+    assert DockerRuntime.download_dir is not BaseRuntime.download_dir
+    assert ApptainerRuntime.download_file is not BaseRuntime.download_file
+    assert ApptainerRuntime.download_dir is not BaseRuntime.download_dir
+    assert not hasattr(runtime_api, "RuntimeReadback")
+    assert not hasattr(runtime_api, "RuntimeReadbackBudget")
+    assert not hasattr(runtime_api, "RuntimeReadbackFile")
 
 
-def test_runtime_factory_rejects_backend_readback_override(
+@pytest.mark.asyncio
+async def test_public_download_api_accepts_two_arguments_and_returns_none(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    source_file = runtime.session_dir / "result.txt"
+    source_file.write_bytes(b"result")
+    source_dir = runtime.session_dir / "results"
+    source_dir.mkdir()
+    (source_dir / "nested.txt").write_bytes(b"nested")
+    local_file = tmp_path / "downloads" / "result.txt"
+    local_dir = tmp_path / "downloads" / "results"
+
+    file_result = await runtime.download_file(
+        "/openevo/session/result.txt",
+        str(local_file),
+    )
+    dir_result = await runtime.download_dir(
+        "/openevo/session/results",
+        str(local_dir),
+    )
+
+    assert file_result is None
+    assert dir_result is None
+    assert local_file.read_bytes() == b"result"
+    assert (local_dir / "nested.txt").read_bytes() == b"nested"
+
+
+@pytest.mark.asyncio
+async def test_docker_public_download_uses_docker_cp_outside_session_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_dir = tmp_path / "docker-session"
+    session_dir.mkdir()
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest"),
+        "docker-download",
+        session_dir,
+    )
+    runtime._container_id = "a" * 64
+    runtime._ownership_state = "verified"
+    monkeypatch.setattr(runtime, "_copy_from_bind_mount", lambda *_args: False)
+    run_command = AsyncMock(return_value=(0, None, None))
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+    local_file = tmp_path / "docker-downloads" / "result.txt"
+    local_dir = tmp_path / "docker-downloads" / "results"
+
+    assert await runtime.download_file("/workspace/result.txt", str(local_file)) is None
+    assert await runtime.download_dir("/workspace/results", str(local_dir)) is None
+
+    assert run_command.await_args_list[0].args == (
+        "docker",
+        "cp",
+        f"{'a' * 64}:/workspace/result.txt",
+        str(local_file),
+    )
+    assert run_command.await_args_list[1].args == (
+        "docker",
+        "cp",
+        f"{'a' * 64}:/workspace/results",
+        str(local_dir),
+    )
+
+
+@pytest.mark.asyncio
+async def test_apptainer_public_download_uses_tar_outside_session_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_dir = tmp_path / "apptainer-session"
+    session_dir.mkdir()
+    runtime = ApptainerRuntime(
+        RuntimeSpec(backend="apptainer", image="runtime.sif"),
+        "apptainer-download",
+        session_dir,
+    )
+    monkeypatch.setattr(runtime, "_copy_from_bind_mount", lambda *_args: False)
+    run_command = AsyncMock(return_value=(0, None, None))
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+    local_file = tmp_path / "apptainer-downloads" / "result.txt"
+    local_dir = tmp_path / "apptainer-downloads" / "results"
+
+    assert await runtime.download_file("/workspace/result.txt", str(local_file)) is None
+    assert await runtime.download_dir("/workspace/results", str(local_dir)) is None
+
+    file_command = run_command.await_args_list[0].args
+    dir_command = run_command.await_args_list[1].args
+    assert file_command[:2] == ("bash", "-c")
+    assert "tar -cf - -C /workspace result.txt" in file_command[2]
+    assert f"tar -xf - -C {local_file.parent}" in file_command[2]
+    assert dir_command[:2] == ("bash", "-c")
+    assert "tar -cf - -C /workspace/results ." in dir_command[2]
+    assert f"tar -xf - -C {local_dir}" in dir_command[2]
+
+
+def test_runtime_factory_admits_plugin_download_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -74,11 +196,8 @@ def test_runtime_factory_rejects_backend_readback_override(
             self,
             remote_path: str,
             local_path: str,
-            *,
-            budget: RuntimeReadbackBudget,
-        ) -> object:
-            del remote_path, local_path, budget
-            return object()
+        ) -> None:
+            del remote_path, local_path
 
     monkeypatch.setattr(
         runtime_factory,
@@ -86,15 +205,17 @@ def test_runtime_factory_rejects_backend_readback_override(
         lambda _import_path: ReadbackOverrideRuntime,
     )
 
-    with pytest.raises(ValueError, match="cannot override"):
-        runtime_factory.create_runtime(
-            RuntimeSpec(
-                image="runtime:latest",
-                import_path="tests.runtime:ReadbackOverrideRuntime",
-            ),
-            "plugin-session",
-            tmp_path / "plugin-session",
-        )
+    runtime = runtime_factory.create_runtime(
+        RuntimeSpec(
+            image="runtime:latest",
+            import_path="tests.runtime:ReadbackOverrideRuntime",
+        ),
+        "plugin-session",
+        tmp_path / "plugin-session",
+    )
+
+    assert type(runtime) is ReadbackOverrideRuntime
+    assert runtime.download_dir.__func__ is ReadbackOverrideRuntime.download_dir
 
 
 @pytest.mark.parametrize(
@@ -173,10 +294,12 @@ async def test_trusted_readback_publishes_stable_private_tree_and_source_invento
     target = tmp_path / "readback" / "evolution"
     budget = RuntimeReadbackBudget()
 
-    result = await runtime.download_dir(
+    result = await runtime_base._sealed_session_bind_readback(
+        runtime,
         "/openevo/session/evolution",
-        str(target),
+        target,
         budget=budget,
+        expected_directory=True,
     )
 
     assert [(item.relative_path, item.size_bytes, item.sha256) for item in result.files] == [
@@ -247,10 +370,12 @@ async def test_trusted_readback_rejects_source_tree_mutation_after_enumeration(
     budget = RuntimeReadbackBudget()
 
     with pytest.raises(RuntimePathSecurityError, match="changed"):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=budget,
+            expected_directory=True,
         )
 
     assert mutated is True
@@ -285,10 +410,12 @@ async def test_trusted_readback_rejects_in_place_source_mutation(
     monkeypatch.setattr(runtime_base.os, "pread", mutate_during_read)
 
     with pytest.raises(RuntimePathSecurityError, match="changed"):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=RuntimeReadbackBudget(),
+            expected_directory=True,
         )
 
     assert mutated is True
@@ -315,10 +442,12 @@ async def test_trusted_readback_rejects_linked_source_members(
     target = tmp_path / "readback" / "evolution"
 
     with pytest.raises(RuntimePathSecurityError, match="link"):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=RuntimeReadbackBudget(),
+            expected_directory=True,
         )
 
     assert not target.exists()
@@ -348,10 +477,12 @@ async def test_trusted_readback_rejects_sparse_file_before_host_payload_write(
     monkeypatch.setattr(runtime_base.os, "pwrite", record_write)
 
     with pytest.raises(RuntimePathSecurityError, match="byte budget"):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=budget,
+            expected_directory=True,
         )
 
     assert budget.bytes_consumed == 0
@@ -387,10 +518,12 @@ async def test_trusted_readback_rejects_file_growth_during_stream(
     budget = RuntimeReadbackBudget()
 
     with pytest.raises(RuntimePathSecurityError, match="changed"):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=budget,
+            expected_directory=True,
         )
 
     assert grew is True
@@ -411,10 +544,12 @@ async def test_trusted_readback_file_budget_stops_before_any_payload_publish(
     budget = RuntimeReadbackBudget(max_files=2)
 
     with pytest.raises(RuntimePathSecurityError, match="file budget"):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=budget,
+            expected_directory=True,
         )
 
     assert budget.files_consumed == 3
@@ -435,10 +570,12 @@ async def test_trusted_readback_default_file_limit_rejects_large_inventory_befor
     budget = RuntimeReadbackBudget()
 
     with pytest.raises(RuntimePathSecurityError, match="file budget"):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=budget,
+            expected_directory=True,
         )
 
     assert budget.files_consumed == runtime_base.RUNTIME_READBACK_MAX_FILES + 1
@@ -459,10 +596,12 @@ async def test_trusted_readback_node_attempt_budget_is_non_refundable(
     budget = RuntimeReadbackBudget(max_nodes=2)
 
     with pytest.raises(RuntimePathSecurityError, match="node budget"):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=budget,
+            expected_directory=True,
         )
 
     assert budget.nodes_consumed == 3
@@ -502,10 +641,12 @@ async def test_trusted_readback_cancellation_waits_for_private_staging_cleanup(
     monkeypatch.setattr(runtime_base, "_copy_readback_regular_file", wait_for_cancel)
     monkeypatch.setattr(runtime_base, "_discard_readback_staging", delayed_discard)
     task = asyncio.create_task(
-        runtime.download_dir(
+        runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=RuntimeReadbackBudget(),
+            expected_directory=True,
         )
     )
     assert await asyncio.to_thread(started.wait, 1)
@@ -544,10 +685,12 @@ async def test_trusted_readback_timeout_cancels_worker_before_return(
 
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(
-            runtime.download_dir(
+            runtime_base._sealed_session_bind_readback(
+                runtime,
                 "/openevo/session/evolution",
-                str(target),
+                target,
                 budget=RuntimeReadbackBudget(),
+                expected_directory=True,
             ),
             timeout=0.05,
         )
@@ -586,10 +729,12 @@ async def test_trusted_readback_never_removes_replacement_target(
     monkeypatch.setattr(runtime_base, "_rename_readback_noreplace", replace_target)
 
     with pytest.raises(RuntimePathSecurityError):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=RuntimeReadbackBudget(),
+            expected_directory=True,
         )
 
     assert (target / "owner.txt").read_text(encoding="utf-8") == "replacement"
@@ -623,10 +768,12 @@ async def test_trusted_readback_removes_its_failed_published_tree(
     )
 
     with pytest.raises(RuntimePathSecurityError, match="post-publication"):
-        await runtime.download_dir(
+        await runtime_base._sealed_session_bind_readback(
+            runtime,
             "/openevo/session/evolution",
-            str(target),
+            target,
             budget=RuntimeReadbackBudget(),
+            expected_directory=True,
         )
 
     assert verifications == 2

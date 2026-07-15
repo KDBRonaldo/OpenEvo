@@ -1579,39 +1579,13 @@ class BaseRuntime(ABC):
     async def upload_dir(self, local_path: str, remote_path: str) -> None:
         """Copy a directory tree from the host into the runtime."""
 
-    async def download_file(
-        self,
-        remote_path: str,
-        local_path: str,
-        *,
-        budget: RuntimeReadbackBudget,
-    ) -> RuntimeReadback:
-        """Atomically read back one stable bind-mounted runtime file."""
+    @abstractmethod
+    async def download_file(self, remote_path: str, local_path: str) -> None:
+        """Copy a single file from inside the runtime to the host."""
 
-        return await BaseRuntime._trusted_runtime_readback(
-            self,
-            remote_path,
-            Path(local_path),
-            budget=budget,
-            expected_directory=False,
-        )
-
-    async def download_dir(
-        self,
-        remote_path: str,
-        local_path: str,
-        *,
-        budget: RuntimeReadbackBudget,
-    ) -> RuntimeReadback:
-        """Atomically read back one stable bind-mounted runtime directory."""
-
-        return await BaseRuntime._trusted_runtime_readback(
-            self,
-            remote_path,
-            Path(local_path),
-            budget=budget,
-            expected_directory=True,
-        )
+    @abstractmethod
+    async def download_dir(self, remote_path: str, local_path: str) -> None:
+        """Copy a directory tree from inside the runtime to the host."""
 
     def resolve_host_path(self, runtime_path: str) -> Path | None:
         """Map a runtime path back to a host path via the session bind mount."""
@@ -2212,3 +2186,35 @@ class BaseRuntime(ABC):
             await process.wait()
         except ProcessLookupError:
             pass
+
+
+def _has_sealed_session_bind_readback(runtime: object) -> bool:
+    """Return whether Core can independently inspect this runtime's session bind."""
+
+    return (
+        sys.platform.startswith("linux")
+        and isinstance(runtime, BaseRuntime)
+        and runtime.runtime_session_dir == RUNTIME_SESSION_DIR
+        and runtime.spec.import_path is None
+    )
+
+
+async def _sealed_session_bind_readback(
+    runtime: BaseRuntime,
+    runtime_path: str,
+    local_path: Path,
+    *,
+    budget: RuntimeReadbackBudget,
+    expected_directory: bool,
+) -> RuntimeReadback:
+    """Read a Core-owned session bind without consulting backend download hooks."""
+
+    if not _has_sealed_session_bind_readback(runtime):
+        raise RuntimePathSecurityError("sealed session-bind readback is unavailable")
+    return await BaseRuntime._trusted_runtime_readback(
+        runtime,
+        runtime_path,
+        local_path,
+        budget=budget,
+        expected_directory=expected_directory,
+    )

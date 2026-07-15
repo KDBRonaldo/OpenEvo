@@ -9,7 +9,7 @@ from openevo.harness.models import AgentSpec, MCPServerSpec
 from openevo.harness.presets.claude_code import ClaudeCodeHarness
 from openevo.harness.presets.codex import CodexHarness
 from openevo.harness.presets.openhands_sdk import OpenHandsSdkHarness
-from openevo.runtime.base import BaseRuntime, RuntimeReadback, RuntimeReadbackBudget
+from openevo.runtime.base import BaseRuntime
 from openevo.runtime.managed import MANAGED_CODEX_BINARY
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
@@ -65,21 +65,15 @@ class RecordingRuntime(BaseRuntime):
         self,
         remote_path: str,
         local_path: str,
-        *,
-        budget: RuntimeReadbackBudget,
-    ) -> RuntimeReadback:
-        del remote_path, local_path, budget
-        return RuntimeReadback(files=())
+    ) -> None:
+        del remote_path, local_path
 
     async def download_dir(
         self,
         remote_path: str,
         local_path: str,
-        *,
-        budget: RuntimeReadbackBudget,
-    ) -> RuntimeReadback:
-        del remote_path, local_path, budget
-        return RuntimeReadback(files=())
+    ) -> None:
+        del remote_path, local_path
 
 
 def _codex_config_toml(commands: list[str]) -> str:

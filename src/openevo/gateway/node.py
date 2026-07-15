@@ -68,8 +68,11 @@ from openevo.rollout.models import (
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import (
     BaseRuntime,
+    RUNTIME_SESSION_DIR,
     RuntimeReadbackBudget,
     RuntimePathSecurityError,
+    _has_sealed_session_bind_readback,
+    _sealed_session_bind_readback,
     validate_session_bind_path,
 )
 from openevo.runtime.factory import create_runtime
@@ -99,6 +102,7 @@ from openevo.evolution.agent_system import (
     ROOT_AGENT_SYSTEM_FILES,
     normalize_agent_system_target_path,
 )
+from openevo.evolution.artifact_payloads import ArtifactPayloadService
 from openevo.evolution.client import EvolutionClient
 from openevo.evolution.framework.handlers import PayloadManifestEntry, payload_tree_digest
 from openevo.evolution.runtime_injection import (
@@ -136,6 +140,7 @@ _CLEANUP_JOURNAL_RECORD_RE = re.compile(r"[0-9a-f]{64}\.json")
 _CLEANUP_JOURNAL_PENDING_RE = re.compile(r"[0-9a-f]{64}\.pending")
 _CLEANUP_JOURNAL_GENERATION_RE = re.compile(r"[0-9a-f]{32}")
 _CLEANUP_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+_CANONICAL_EVOLUTION_TARGET_DIR = f"{RUNTIME_SESSION_DIR}/evolution"
 _AGENT_SYSTEM_TARGET_READBACK_SCRIPT = r"""
 import ctypes
 import hashlib
@@ -156,6 +161,7 @@ _IN_Q_OVERFLOW = 0x00004000
 _IN_IGNORED = 0x00008000
 _EVENT = struct.Struct("iIII")
 _limits = [int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])]
+_sealed = len(sys.argv) == 7 and sys.argv[6] == "sealed"
 _used = [0, 0, 0]
 _watch_fd = -1
 _watches = set()
@@ -389,7 +395,8 @@ def _scan_file(parent, name, relative_path, budget):
 
 def _main():
     if (
-        len(sys.argv) != 6
+        len(sys.argv) != 7
+        or sys.argv[6] not in {"compat", "sealed"}
         or not 0 <= _limits[0] <= _CLOSED_MAX_FILES
         or not 0 <= _limits[1] <= _CLOSED_MAX_NODES
         or not 0 <= _limits[2] <= _CLOSED_MAX_BYTES
@@ -405,9 +412,11 @@ def _main():
     descriptors, bindings = _open_absolute_root(sys.argv[1])
     optional_descriptors = []
     try:
-        _open_mutation_authority()
+        if _sealed:
+            _open_mutation_authority()
         root = descriptors[-1]
-        _watch(root)
+        if _sealed:
+            _watch(root)
         root_identity = _tree_dir_identity(os.fstat(root))
         root_before = _present_names(root, root_files)
         openhands = _open_optional_dir(root, ".openhands")
@@ -415,11 +424,13 @@ def _main():
         microagent_names = []
         if openhands is not None:
             optional_descriptors.append(openhands[0])
-            _watch(openhands[0])
+            if _sealed:
+                _watch(openhands[0])
             microagents = _open_optional_dir(openhands[0], "microagents")
             if microagents is not None:
                 optional_descriptors.append(microagents[0])
-                _watch(microagents[0])
+                if _sealed:
+                    _watch(microagents[0])
                 microagent_names = _target_names(microagents[0])
 
         files = [_scan_file(root, name, name, None) for name in root_before]
@@ -450,7 +461,8 @@ def _main():
             _verify_tree_binding(openhands[1])
         for binding in reversed(bindings):
             _verify_binding(binding)
-        _require_quiet()
+        if _sealed:
+            _require_quiet()
         files.sort(key=lambda item: item["relative_path"])
         sys.stdout.write(
             json.dumps(
@@ -1291,27 +1303,52 @@ async def _runtime_injection_receipt_from_readback(
     temporary = TemporaryDirectory(prefix="openevo-evolution-readback-")
     try:
         readback_root = Path(temporary.name)
-        if not isinstance(runtime, BaseRuntime):
-            raise TypeError("runtime injection receipt requires a trusted runtime")
-        readback = await BaseRuntime.download_dir(
-            runtime,
-            target_dir,
-            str(readback_root / "evolution"),
-            budget=budget,
+        sealed = (
+            target_dir == _CANONICAL_EVOLUTION_TARGET_DIR
+            and _has_sealed_session_bind_readback(runtime)
         )
-        files = [
-            {
-                "relative_path": f"evolution/{entry.relative_path}",
-                "size_bytes": entry.size_bytes,
-                "sha256": entry.sha256,
-            }
-            for entry in readback.files
-        ]
+        if sealed:
+            readback = await _sealed_session_bind_readback(
+                runtime,
+                target_dir,
+                readback_root / "evolution",
+                budget=budget,
+                expected_directory=True,
+            )
+            files = [
+                {
+                    "relative_path": f"evolution/{entry.relative_path}",
+                    "size_bytes": entry.size_bytes,
+                    "sha256": entry.sha256,
+                }
+                for entry in readback.files
+            ]
+        else:
+            await runtime.download_dir(target_dir, str(readback_root / "evolution"))
+            with ArtifactPayloadService(readback_root) as payloads:
+                snapshot = payloads.issue_snapshot(
+                    artifact_id="runtime-readback",
+                    artifact_type="runtime_readback",
+                    name="runtime-readback",
+                    uri=readback_root.as_uri(),
+                    manifest={},
+                    scores={},
+                    rank_index=0,
+                )
+            files = [
+                {
+                    "relative_path": entry.relative_path,
+                    "size_bytes": entry.size_bytes,
+                    "sha256": entry.sha256,
+                }
+                for entry in snapshot.payload_entries
+            ]
         if plan.agent_system_targets:
             files.extend(
                 await _runtime_agent_system_target_inventory(
                     runtime,
                     budget=budget,
+                    sealed=sealed,
                 )
             )
             files.sort(key=lambda item: str(item["relative_path"]))
@@ -1333,6 +1370,7 @@ async def _runtime_agent_system_target_inventory(
     runtime: BaseRuntime,
     *,
     budget: RuntimeReadbackBudget,
+    sealed: bool = True,
 ) -> list[dict[str, object]]:
     target_root = _agent_system_target_root(runtime)
     if not target_root.is_absolute():
@@ -1350,6 +1388,7 @@ async def _runtime_agent_system_target_inventory(
             str(budget.remaining_files),
             str(budget.remaining_nodes),
             str(budget.remaining_bytes),
+            "sealed" if sealed else "compat",
         )
     )
     try:

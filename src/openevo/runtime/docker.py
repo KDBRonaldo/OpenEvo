@@ -1398,3 +1398,23 @@ class DockerRuntime(BaseRuntime):
             raise RuntimeError(
                 f"docker chmod failed for {remote_path} with exit code {rc}: {stderr}"
             )
+
+    async def download_file(self, remote_path: str, local_path: str) -> None:
+        if self._copy_from_bind_mount(remote_path, Path(local_path)):
+            return
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        rc, _, _ = await self._run_local_command(
+            "docker", "cp", f"{self._container_ref}:{remote_path}", local_path
+        )
+        if rc != 0:
+            raise RuntimeError(f"docker cp download_file failed with exit code {rc}")
+
+    async def download_dir(self, remote_path: str, local_path: str) -> None:
+        if self._copy_from_bind_mount(remote_path, Path(local_path)):
+            return
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        rc, _, _ = await self._run_local_command(
+            "docker", "cp", f"{self._container_ref}:{remote_path}", local_path
+        )
+        if rc != 0:
+            raise RuntimeError(f"docker cp download_dir failed with exit code {rc}")

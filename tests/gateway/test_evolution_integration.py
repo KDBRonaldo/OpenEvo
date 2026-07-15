@@ -47,6 +47,7 @@ from openevo.rollout.models import (
     SessionTiming,
 )
 from openevo.rollout.timer import StageTimer
+from openevo.runtime import base as runtime_base
 from openevo.runtime.base import (
     BaseRuntime,
     RuntimeReadbackBudget,
@@ -3998,6 +3999,7 @@ class FakeRuntime(BaseRuntime):
         self.runtime_files: dict[str, bytes] = {}
         self.runtime_dirs: set[str] = set()
         self.exec_commands: list[str] = []
+        self.downloads: list[tuple[str, str]] = []
 
     @property
     def runtime_id(self) -> str:
@@ -4071,6 +4073,31 @@ class FakeRuntime(BaseRuntime):
             if path.is_file():
                 remote = f"{target.rstrip('/')}/{path.relative_to(source_root).as_posix()}"
                 self.set_runtime_file(remote, path.read_bytes())
+
+    async def download_file(self, remote_path: str, local_path: str) -> None:
+        self.downloads.append((remote_path, local_path))
+        payload = self.runtime_files.get(remote_path)
+        if payload is None:
+            raise FileNotFoundError(remote_path)
+        target = Path(local_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+
+    async def download_dir(self, remote_path: str, local_path: str) -> None:
+        self.downloads.append((remote_path, local_path))
+        prefix = f"{remote_path.rstrip('/')}/"
+        if remote_path.rstrip("/") not in self.runtime_dirs and not any(
+            path.startswith(prefix) for path in self.runtime_files
+        ):
+            raise FileNotFoundError(remote_path)
+        target_root = Path(local_path)
+        target_root.mkdir(parents=True, exist_ok=True)
+        for path, payload in self.runtime_files.items():
+            if not path.startswith(prefix):
+                continue
+            target = target_root / path.removeprefix(prefix)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
 
     def set_runtime_file(self, path: str, payload: bytes) -> None:
         self.runtime_files[path] = payload
@@ -4217,6 +4244,14 @@ class BindMountRuntime(BaseRuntime):
 
     async def upload_dir(self, local_path: str, remote_path: str) -> None:
         copied = self._copy_to_bind_mount(local_path, remote_path)
+        assert copied is True
+
+    async def download_file(self, remote_path: str, local_path: str) -> None:
+        copied = self._copy_from_bind_mount(remote_path, Path(local_path))
+        assert copied is True
+
+    async def download_dir(self, remote_path: str, local_path: str) -> None:
+        copied = self._copy_from_bind_mount(remote_path, Path(local_path))
         assert copied is True
 
 @pytest.mark.asyncio
@@ -4393,6 +4428,8 @@ async def test_resolved_store_context_stages_all_text_artifacts(tmp_path):
 
 async def _stage_gateway_runtime_receipt_context(
     tmp_path: Path,
+    *,
+    target_dir: str = "/openevo/session/evolution",
 ) -> tuple[
     GatewayNodeManager,
     ManagedSession,
@@ -4466,7 +4503,10 @@ async def _stage_gateway_runtime_receipt_context(
     ).model_dump(mode="json")
     runtime = FakeRuntime()
     manager = GatewayNodeManager.__new__(GatewayNodeManager)
-    manager.evolution = EvolutionConfig(enabled=True, context={"fail_open": True})
+    manager.evolution = EvolutionConfig(
+        enabled=True,
+        context={"fail_open": True, "target_dir": target_dir},
+    )
     manager.evolution_client = FakeEvolutionClient(context=context)
     manager.model_served = "served-model"
     request = SessionDispatchRequest(
@@ -4536,10 +4576,11 @@ async def test_gateway_runtime_receipt_binds_three_selected_artifacts(tmp_path: 
     }
     assert "file://" not in runtime.uploads["/openevo/session/evolution/context.json"]
     assert str(tmp_path) not in runtime.uploads["/openevo/session/evolution/context.json"]
+    assert runtime.downloads == []
 
 
 @pytest.mark.asyncio
-async def test_gateway_runtime_receipt_rejects_self_reported_non_core_runtime(
+async def test_gateway_runtime_receipt_ignores_plugin_reported_inventory(
     tmp_path: Path,
 ) -> None:
     (
@@ -4553,21 +4594,90 @@ async def test_gateway_runtime_receipt_rejects_self_reported_non_core_runtime(
 
     class SelfReportingRuntime:
         called = False
+        spec = RuntimeSpec(image="runtime:latest")
+        runtime_session_dir = "/openevo/session"
 
         async def download_dir(self, *args: object, **kwargs: object) -> object:
-            del args, kwargs
+            del kwargs
             self.called = True
-            return object()
+            destination = Path(str(args[1]))
+            destination.mkdir(parents=True)
+            (destination / "forged.txt").write_text("forged", encoding="utf-8")
+            return {"files": "plugin-controlled"}
+
+        async def exec(self, *_args: object, **_kwargs: object) -> ExecResult:
+            return ExecResult(
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "schema_version": "1",
+                        "files": [],
+                        "consumed": {"files": 0, "nodes": 0, "bytes": 0},
+                    }
+                ),
+            )
 
     runtime = SelfReportingRuntime()
-    with pytest.raises(TypeError, match="trusted runtime"):
+    with pytest.raises(ValueError):
         await node_module._runtime_injection_receipt_from_readback(
             runtime=runtime,
             target_dir=manager.evolution.context.target_dir,
             plan=injection.staged.injection_plan,
         )
 
-    assert runtime.called is False
+    assert runtime.called is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_receipt_custom_target_uses_compatible_download(
+    tmp_path: Path,
+) -> None:
+    target_dir = "/custom/evolution"
+    manager, _managed, injection, _context, _artifact_ids, runtime = (
+        await _stage_gateway_runtime_receipt_context(tmp_path, target_dir=target_dir)
+    )
+
+    receipt = await node_module._runtime_injection_receipt_from_readback(
+        runtime=runtime,
+        target_dir=target_dir,
+        plan=injection.staged.injection_plan,
+    )
+
+    assert receipt["schema_version"] == "3"
+    assert runtime.downloads and runtime.downloads[0][0] == target_dir
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback", ["non_linux", "unavailable", "third_party"])
+async def test_gateway_runtime_receipt_without_sealed_primitive_uses_compatible_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback: str,
+) -> None:
+    manager, _managed, injection, _context, _artifact_ids, runtime = (
+        await _stage_gateway_runtime_receipt_context(tmp_path)
+    )
+    if fallback == "non_linux":
+        monkeypatch.setattr(runtime_base.sys, "platform", "darwin")
+    elif fallback == "unavailable":
+        monkeypatch.setattr(
+            node_module,
+            "_has_sealed_session_bind_readback",
+            lambda _runtime: False,
+        )
+    else:
+        runtime.spec = runtime.spec.model_copy(
+            update={"import_path": "tests.runtime:PluginRuntime"}
+        )
+
+    receipt = await node_module._runtime_injection_receipt_from_readback(
+        runtime=runtime,
+        target_dir=manager.evolution.context.target_dir,
+        plan=injection.staged.injection_plan,
+    )
+
+    assert receipt["schema_version"] == "3"
+    assert runtime.downloads
 
 
 @pytest.mark.asyncio

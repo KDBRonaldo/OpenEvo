@@ -108,12 +108,16 @@ integrity.
 ## Runtime Readback Receipt
 
 Gateway publishes a runtime injection receipt only after harness postprocessing
-and a Core-owned trusted readback of the actual runtime source tree. Docker and
-Apptainer share the base runtime implementation; neither may substitute
-`docker cp`, tar, a backend-provided metadata document, the original upload
-source, or a later scan of the downloaded host copy as source authority.
+and Core-owned verification of the runtime readback. The public
+`BaseRuntime.download_file(remote_path, local_path) -> None` and
+`download_dir(remote_path, local_path) -> None` contracts are unchanged:
+Docker/Apptainer keep bind-copy plus `docker cp`/tar fallback, and third-party
+runtime plugins may override them.
 
-The runtime walk is no-follow and FD-relative below the pinned session bind.
+For the canonical `/openevo/session/evolution` product target on a supported
+Linux Core runtime, Gateway uses a separate private primitive rather than the
+public download methods. Its runtime walk is no-follow and FD-relative below
+the pinned session bind.
 Every directory carries strong inode/ctime/mtime identity plus Linux mutation
 generation evidence, is enumerated in sorted order before copying, and is
 enumerated again after all descendants have been streamed. File bytes are
@@ -123,7 +127,7 @@ files reject the receipt. Host output uses a private staging tree and atomic
 no-replace publication so a failed attempt cannot overwrite or delete a raced
 replacement.
 
-One non-refundable `RuntimeReadbackBudget` covers the canonical evolution tree
+One private non-refundable readback budget covers the canonical evolution tree
 and the separate agent-system target scan. Its closed maxima exactly match the
 receipt payload limits of 4096 files and 64 MiB; the 16384 node-attempt bound
 covers both mandatory directory enumerations. Failed or cancelled remote target
@@ -137,6 +141,13 @@ still reconstructs the expected rendering from the pinned context/revision and
 authoritative artifact bytes, then compares every ordered file digest,
 instruction digest, artifact runtime path, and tree digest before allowing the
 session to succeed.
+
+For a custom target directory, non-Linux Core host, or third-party runtime,
+Gateway preserves the public backend download path. It ignores backend-returned
+inventory and runs the existing bounded `ArtifactPayloadService` verification
+over the downloaded tree. That compatibility fallback supports the same receipt
+comparison but does not assert the private Linux primitive's source mutation
+evidence.
 
 ## Benchmark/Science Consumers
 

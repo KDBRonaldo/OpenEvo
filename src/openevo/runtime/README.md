@@ -11,8 +11,8 @@ and out, then tear it down.
   stages of a session.
 - The host session directory is **bind-mounted** to a fixed in-container path,
   `/openevo/session` (`RUNTIME_SESSION_DIR`). Uploads/downloads under that path
-  use descriptor-relative host-side copies. Trusted downloads outside that bind
-  fail closed; Docker and Apptainer do not fall back to `docker cp` or tar.
+  use descriptor-relative host-side copies. Docker and Apptainer retain their
+  normal `docker cp` or tar fallback for paths outside that bind.
 - Commands run in a login shell (`bash -lc`) with working directory
   `cwd or spec.workdir or /openevo/session`.
 - The factory verifies the chosen backend actually supports what the spec asks
@@ -30,13 +30,12 @@ and out, then tear it down.
 
 ## The contract
 
-A backend implements `start`, `stop`, `exec`, `upload_file`, and `upload_dir`
-(plus `cancel`), hiding container details from harnesses and evaluators. Core's
-base runtime owns the final `download_file` and `download_dir` implementations;
-callers must pass one explicit `RuntimeReadbackBudget` and receive a
-source-stream `RuntimeReadback` inventory. Runtime factory admission rejects
-plugin backends that override either method, and Base dispatch cannot be
-redirected through a subclass private hook. Well-known in-container paths (from `base.py`) are
+A backend implements `start`, `stop`, `exec`, `upload_file`, `upload_dir`,
+`download_file(remote_path, local_path) -> None`, and
+`download_dir(remote_path, local_path) -> None` (plus `cancel`), hiding
+container details from harnesses and evaluators. The two download methods remain
+abstract backend APIs, and `RuntimeSpec.import_path` plugins may implement or
+override them. Well-known in-container paths (from `base.py`) are
 `/openevo/session` and, under it, `artifacts/`, `logs/`, `logs/agent/`,
 `logs/eval/`, and `eval_artifacts/`. Those container-visible log paths are
 agent/runtime workspace paths. Gateway-owned step stdout/stderr is persisted in
@@ -63,15 +62,19 @@ link count, and inode bindings after transfer. A `..` component, symlink, or
 concurrent directory replacement fails closed without falling back to a
 pathname copy.
 
-## Trusted runtime readback
+## Private session-bind receipt readback
 
-One injection readback shares a non-refundable closed budget across the
-evolution tree and agent-system target inventory: at most 4096 files, 64 MiB of
-streamed file bytes, and 16384 source-node enumeration attempts. The node limit
-allows two complete ordered enumerations of a maximally nested 4096-file tree;
-failed enumeration, open, copy, hash, and remote target attempts retain the
-resources already consumed. Limits may be reduced for tests or narrower
-consumers but cannot be raised above this contract.
+The public download API is not the receipt authority. For the product's
+canonical `/openevo/session/evolution` target on a supported Linux Core runtime,
+Gateway may call a separate module-private session-bind primitive that bypasses
+backend download hooks. That primitive shares a non-refundable closed budget
+across the evolution tree and agent-system target inventory: at most 4096
+files, 64 MiB of streamed file bytes, and 16384 source-node enumeration
+attempts. The node limit allows two complete ordered enumerations of a
+maximally nested 4096-file tree; failed enumeration, open, copy, hash, and
+remote target attempts retain the resources already consumed. Limits may be
+reduced for tests or narrower consumers but cannot be raised above this
+contract.
 
 The source path must resolve below the held `/openevo/session` bind. Core pins
 every ancestor and traverses directories relative to no-follow FDs. Each source
@@ -91,6 +94,12 @@ staging tree; a raced destination replacement is never overwritten or removed.
 The synchronous FD walk runs in a controlled worker thread. Timeout or task
 cancellation signals that worker and waits for bounded cleanup before returning
 to the event loop.
+
+Custom target directories, non-Linux Core hosts, and third-party runtimes keep
+the ordinary backend download behavior. Gateway ignores any backend return
+metadata and applies Core's bounded `ArtifactPayloadService` verification to the
+downloaded tree before constructing a receipt. This compatibility path does not
+claim the stronger source-tree mutation evidence of the private Linux bind walk.
 
 ## Docker vs Apptainer
 

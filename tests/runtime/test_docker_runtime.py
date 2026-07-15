@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openevo.runtime import docker as docker_module
-from openevo.runtime.base import RuntimePathSecurityError, RuntimeReadbackBudget
+from openevo.runtime.base import RuntimePathSecurityError
 from openevo.runtime.docker import (
     DockerRuntime,
     _CREDENTIAL_VIEW_NAME,
@@ -259,11 +259,15 @@ async def test_bind_copy_security_failure_never_falls_back_to_docker_cp(
             "/openevo/session/target.txt",
         )
     else:
-        expected_error = "session bind mount"
+        expected_error = "unsafe bind"
+        monkeypatch.setattr(
+            runtime,
+            "_copy_from_bind_mount",
+            lambda *args: (_ for _ in ()).throw(RuntimePathSecurityError("unsafe bind source")),
+        )
         operation_call = runtime.download_file(
-            "/outside/source.txt",
+            "/openevo/session/source.txt",
             str(tmp_path / "target.txt"),
-            budget=RuntimeReadbackBudget(),
         )
 
     with pytest.raises(RuntimePathSecurityError, match=expected_error):
