@@ -28,6 +28,14 @@ reconfiguration, a required external user action, or unsupported behavior. The
 full release guide must be generated or checked against the final typed-error
 catalog and packaged UI.
 
+If a session retry reports that its response was lost, leave Desktop open while
+it refreshes the run. Desktop clears the error only after Core shows the same run
+with a newly appended attempt; a status or ETag change alone is not treated as
+success. Retrying the button before that proof reuses the original idempotent
+action. If the remote workspace is offline, reconnect it first. The special
+`core_not_started` state instead offers project activation because activation
+starts Core for that project.
+
 ## Remote Python bootstrap
 
 OpenEvo Desktop automatically looks for remote Python 3.13, 3.12, or 3.11. On a

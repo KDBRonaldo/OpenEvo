@@ -132,7 +132,9 @@ describe("DesktopProductApp", () => {
     await clickButton("Start session");
     provider.loseActiveCoreSession();
     await advance(1_005);
-    expect(screenText()).toContain("Activate this project");
+    expect(screenText()).toContain("Remote workspace is offline");
+    expect(screenText()).not.toContain("Activate this project");
+    expect(button("Connect").disabled).toBe(false);
 
     const offlineRefreshCount = refresh.mock.calls.length;
     await advance(5_000);
@@ -371,6 +373,29 @@ describe("DesktopProductApp", () => {
     expect(screenText()).not.toContain("Evolution is not configured");
   });
 
+  it("names the first missing required field in workspace and project setup", async () => {
+    provider = createFixtureDesktopProductProvider({ newUser: true });
+    root = await renderProduct(provider);
+
+    await clickButton("Add workspace");
+    const host = labelledControl<HTMLInputElement>("Server address", "input");
+    expect(host.required).toBe(true);
+    expect(screenText()).toContain("Enter the remote server address.");
+    expect(button("Save workspace").getAttribute("aria-describedby")).toBe("workspace-required-fields");
+
+    await act(async () => root?.unmount());
+    root = null;
+    provider.dispose();
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    root = await renderProduct(provider);
+
+    await clickAria("Create project");
+    const objective = labelledControl<HTMLTextAreaElement>("Objective", "textarea");
+    expect(objective.required).toBe(true);
+    expect(screenText()).toContain("Describe the research objective.");
+    expect(button("Prepare evolution").getAttribute("aria-describedby")).toBe("project-required-fields");
+  });
+
   it("shows the authoritative retired state after editing an active project", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     root = await renderProduct(provider);
@@ -392,8 +417,8 @@ describe("DesktopProductApp", () => {
       active_tunnel: false,
       failure: { code: "core_not_started" },
     });
-    expect(screenText()).toContain("Remote workspace is offline");
     expect(screenText()).toContain("Activate this project");
+    expect(optionalButton("Connect")).toBeNull();
     expect(button("Start session").disabled).toBe(true);
     expect(button("Start session").title).toContain("Connect this project's remote workspace");
   });
@@ -406,7 +431,7 @@ describe("DesktopProductApp", () => {
     root = await renderProduct(provider);
 
     await clickAria("Create project");
-    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
     setInput("Objective", "Keep subscription defaults scoped to this new project.");
     await clickButton("Prepare evolution");
@@ -500,7 +525,7 @@ describe("DesktopProductApp", () => {
     root = await renderProduct(provider);
 
     await clickAria("Create project");
-    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
     expect(button("Subscription").disabled).toBe(false);
     expect(button("Self-deployed").disabled).toBe(true);
     expect(button("Self-deployed").title).toContain("not available in this OpenEvo Desktop release");
@@ -515,12 +540,12 @@ describe("DesktopProductApp", () => {
     expect(button("Start session").disabled).toBe(true);
     expect(button("Start session").title).toContain("not available in this OpenEvo Desktop release");
     await clickAria("Project settings");
-    expect(button("Self-deployed").getAttribute("aria-selected")).toBe("true");
+    expect(button("Self-deployed").getAttribute("aria-checked")).toBe("true");
     expect(screenText()).toContain("Choose Subscription to save or run this project.");
     expect(button("Save").disabled).toBe(true);
 
     await clickButton("Subscription");
-    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
     expect(button("Save").disabled).toBe(false);
     await clickButton("Save");
     expect(startRun).not.toHaveBeenCalled();
@@ -530,10 +555,26 @@ describe("DesktopProductApp", () => {
   });
 
   it("blocks activation for a saved release-unavailable mode", async () => {
-    provider = createFixtureDesktopProductProvider({ newUser: false, releaseExecutionModes: true });
+    provider = createFixtureDesktopProductProvider({ startOnline: true, releaseExecutionModes: true });
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const project = before.snapshot.projects[0];
+    if (!project) throw new Error("Expected a project fixture.");
+    await provider.updateProject(project.project_id, {
+      name: project.name,
+      task: project.task,
+      source: project.source,
+      execution: project.execution,
+      evolution: project.evolution,
+    }, {
+      actionId: "retire-release-unavailable-project-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: project.etag,
+    });
     const activateProject = vi.spyOn(provider, "activateProject");
     root = await renderProduct(provider);
 
+    expect(optionalButton("Connect")).toBeNull();
     expect(button("Activate project").disabled).toBe(true);
     expect(button("Activate project").title).toContain("not available in this OpenEvo Desktop release");
     expect(activateProject).not.toHaveBeenCalled();
@@ -547,7 +588,7 @@ describe("DesktopProductApp", () => {
     expect(screenText()).not.toContain("Managed model");
     await clickAria("Create project");
     await clickButton("Self-deployed");
-    expect(button("Self-deployed").getAttribute("aria-selected")).toBe("true");
+    expect(button("Self-deployed").getAttribute("aria-checked")).toBe("true");
     expect(labelledControl<HTMLInputElement>("Hugging Face model", "input").value).toBe("Qwen/Qwen3-8B");
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
     setInput("Objective", "Keep self-deployed defaults scoped to this new project.");
@@ -576,7 +617,7 @@ describe("DesktopProductApp", () => {
     await clickAria("Create project");
     expect(screenText()).toContain("New project");
     expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("New research project");
-    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
     expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
     expect(screenText()).not.toContain("example/stale-a-model");
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
@@ -1025,7 +1066,32 @@ describe("DesktopProductApp", () => {
     expect(screenText()).not.toContain("The retry response was lost.");
   });
 
-  it("clears an unknown retry error when a later authoritative refresh proves advancement", async () => {
+  it("keeps an accepted retry response visible when the following snapshot still lags", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    root = await renderProduct(provider);
+
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const advancedSnapshot = withAdvancedRetry(failed.snapshot);
+    const advancedRun = advancedSnapshot.runs.find((run) => run.id === "run-failed-model");
+    if (!advancedRun) throw new Error("Expected the advanced retry run.");
+    const retryRun = vi.fn(async () => advancedRun);
+    Object.assign(provider, { retryRun });
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({ status: "fresh", snapshot: failed.snapshot });
+
+    await clickButton("Retry session");
+    await flush();
+
+    expect(retryRun).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("The retry was admitted.");
+    expect(screenText()).not.toContain("Action could not be completed");
+    expect(optionalButton("Retry session")).toBeNull();
+  });
+
+  it("polls after an unknown retry until a later authoritative refresh proves advancement", async () => {
+    vi.useFakeTimers();
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
     const retryRun = vi.fn(async () => {
@@ -1045,12 +1111,78 @@ describe("DesktopProductApp", () => {
       status: "fresh",
       snapshot: withAdvancedRetry(failed.snapshot),
     });
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
+    await advance(1_005);
 
     expect(screenText()).toContain("The retry was admitted.");
     expect(screenText()).not.toContain("Action could not be completed");
     expect(screenText()).not.toContain("The retry response was lost.");
+  });
+
+  it("does not treat a temporarily absent run as retry advancement", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    const retryRun = vi.fn(async () => {
+      throw new DesktopProductUserError("The retry response was lost.");
+    });
+    Object.assign(provider, { retryRun });
+    root = await renderProduct(provider);
+
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    await clickButton("Retry session");
+    await flush();
+    const retryCalls = retryRun.mock.calls as unknown as Array<[string, ProductResourceMutationIntent]>;
+    const firstActionId = retryCalls[0]?.[1].actionId;
+
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: {
+        ...failed.snapshot,
+        runs: failed.snapshot.runs.filter((run) => run.id !== "run-failed-model"),
+      },
+    });
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+
+    expect(screenText()).toContain("Action could not be completed");
+    expect(screenText()).toContain("The retry response was lost.");
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+    await clickButton("Retry session");
+    expect(retryRun).toHaveBeenCalledTimes(2);
+    expect(retryCalls[1]?.[1].actionId).toBe(firstActionId);
+  });
+
+  it("does not treat status or ETag churn without a new attempt as retry advancement", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    const retryRun = vi.fn(async () => {
+      throw new DesktopProductUserError("The retry response was lost.");
+    });
+    Object.assign(provider, { retryRun });
+    root = await renderProduct(provider);
+
+    await clickButton("Cancel session");
+    const failed = await provider.refresh();
+    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    await clickButton("Retry session");
+    await flush();
+
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: {
+        ...failed.snapshot,
+        runs: failed.snapshot.runs.map((run) => run.id === "run-failed-model"
+          ? { ...run, status: "queued", etag: `"${"f".repeat(64)}"` }
+          : run),
+      },
+    });
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+
+    expect(screenText()).toContain("Action could not be completed");
+    expect(screenText()).toContain("The retry response was lost.");
   });
 
   it("does not let retry completion clear a newer operation error", async () => {
@@ -1326,42 +1458,30 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Research server");
   });
 
-  it("supports roving keyboard selection in project and artifact tabs", async () => {
+  it("supports radio-group selection and roving artifact tabs", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     const selectSource = vi.spyOn(provider, "selectProjectSource");
     root = await renderProduct(provider);
     await clickAria("Project settings");
 
-    const tablists = document.querySelectorAll('[role="tablist"]');
-    expect(tablists.length).toBeGreaterThanOrEqual(2);
-    expect(document.querySelector('[role="tab"][aria-selected="true"]')).not.toBeNull();
-
-    const sourceTabs = document.querySelector<HTMLElement>('[role="tablist"][aria-label="Research source"]');
-    const scratch = sourceTabs?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
-    if (!scratch) throw new Error("Selected research source tab was not found.");
+    const sourceChoices = document.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Research source"]');
+    const scratch = sourceChoices?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]');
+    if (!scratch) throw new Error("Selected research source was not found.");
     scratch.focus();
     await pressKey(scratch, "ArrowDown");
-    expect(document.activeElement).toBe(scratch);
-    await pressKey(scratch, "ArrowRight");
-    const folder = sourceTabs?.querySelector<HTMLButtonElement>('[role="tab"]:not([aria-selected="true"])');
+    const folder = sourceChoices?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]');
     expect(document.activeElement).toBe(folder);
-    expect(sourceTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Scratch");
-    expect(selectSource).not.toHaveBeenCalled();
-    if (!folder) throw new Error("Folder source tab was not found.");
-    await pressKey(folder, "Enter");
-    expect(sourceTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Folder snapshot");
+    expect(folder?.textContent).toContain("Folder snapshot");
     expect(selectSource).toHaveBeenCalledTimes(1);
 
-    const modelTabs = document.querySelector<HTMLElement>('[role="tablist"][aria-label="Model mode"]');
-    const selectedModel = modelTabs?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
-    if (!selectedModel) throw new Error("Selected model tab was not found.");
+    const modelChoices = document.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Model mode"]');
+    const selectedModel = modelChoices?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]');
+    if (!selectedModel) throw new Error("Selected model choice was not found.");
     selectedModel.focus();
     await pressKey(selectedModel, "ArrowRight");
     const nextModel = document.activeElement;
-    expect(modelTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe(selectedModel.textContent);
     if (!(nextModel instanceof HTMLElement)) throw new Error("Next model tab was not focused.");
-    await pressKey(nextModel, "Enter");
-    expect(modelTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).not.toBe(selectedModel.textContent);
+    expect(modelChoices?.querySelector('[role="radio"][aria-checked="true"]')?.textContent).not.toBe(selectedModel.textContent);
 
     await clickAria("Close settings");
     await clickButton("Discard changes");
@@ -1376,17 +1496,25 @@ describe("DesktopProductApp", () => {
     if (!(changes instanceof HTMLElement)) throw new Error("Changes tab was not focused.");
     await pressKey(changes, "Enter");
     expect(artifactTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Changes");
+    expect(changes.getAttribute("aria-controls")).toBe("artifact-view-panel");
+    expect(document.querySelector('#artifact-view-panel[role="tabpanel"]')?.getAttribute("aria-labelledby")).toBe(changes.id);
   });
 
   it("keeps services read-only and does not render unavailable diagnostics or restart controls", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+    const refresh = vi.spyOn(provider, "refresh");
     root = await renderProduct(provider);
 
+    expect(screenText()).toContain("Remote services need attention");
+    await clickButton("Open System");
     await clickButton("System");
     expect(optionalButton("Run diagnostics")).toBeNull();
     expect(document.querySelector('button[aria-label="Run diagnostics"]')).toBeNull();
     expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
     expect(screenText()).toContain("Needs attention");
+    const refreshesBeforeAction = refresh.mock.calls.length;
+    await clickButton("Refresh status");
+    expect(refresh.mock.calls.length).toBeGreaterThan(refreshesBeforeAction);
   });
 
   it("requires explicit activation after a project switch", async () => {
@@ -1426,20 +1554,20 @@ describe("DesktopProductApp", () => {
     expect(document.querySelector('button[aria-label="Restart Model service"]')).toBeNull();
   });
 
-  it("hides stale services after tunnel loss and allows the active project to reactivate", async () => {
+  it("shows only reconnect recovery after an active project loses its tunnel", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true, seedCompletedRun: true });
     provider.useRunStateReviewScenario();
     provider.loseActiveCoreSession();
     const activateProject = vi.spyOn(provider, "activateProject");
     root = await renderProduct(provider);
 
-    expect(screenText()).toContain("Activate this project");
+    expect(screenText()).toContain("Remote workspace is offline");
+    expect(screenText()).not.toContain("Activate this project");
     expect(screenText()).not.toContain("Preparing the selected model.");
     await clickButton("System");
     expect(screenText()).toContain("Services are unavailable for this project.");
     expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
-    expect(button("Activate project").disabled).toBe(true);
-    expect(button("Activate project").title).toContain("Reconnect");
+    expect(optionalButton("Activate project")).toBeNull();
     expect(activateProject).not.toHaveBeenCalled();
   });
 
@@ -1473,7 +1601,7 @@ describe("DesktopProductApp", () => {
     expect(projectBDialog).not.toBe(projectADialog);
     expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("Second research project");
     expect(labelledControl<HTMLInputElement>("Task title", "input").value).toBe("Second research task");
-    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
     expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
     expect(screenText()).not.toContain("example/stale-a-model");
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
@@ -1891,10 +2019,12 @@ function withAdvancedRetry(snapshot: DesktopProductSnapshot): DesktopProductSnap
     ...failedRun,
     status: "queued",
     queued_reason: queuedReason,
+    attempt_count: failedRun.attempt_count + 1,
     current_attempt_id: "attempt-run-failed-model-retry",
     current_attempt: {
       ...failedRun.current_attempt,
       id: "attempt-run-failed-model-retry",
+      number: failedRun.attempt_count + 1,
       status: "queued",
       queued_reason: queuedReason,
       error: null,
@@ -1902,6 +2032,19 @@ function withAdvancedRetry(snapshot: DesktopProductSnapshot): DesktopProductSnap
       finished_at: null,
     },
     current_error: null,
+    attempts: [
+      ...failedRun.attempts,
+      {
+        ...failedRun.current_attempt,
+        id: "attempt-run-failed-model-retry",
+        number: failedRun.attempt_count + 1,
+        status: "queued",
+        queued_reason: queuedReason,
+        error: null,
+        started_at: null,
+        finished_at: null,
+      },
+    ],
     started_at: null,
     finished_at: null,
     etag: `"${"e".repeat(64)}"`,

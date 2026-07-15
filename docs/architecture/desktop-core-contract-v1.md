@@ -689,6 +689,15 @@ resolved only from that gated collection. Therefore selecting B cannot display
 or mutate A's services, and the same active project can request reactivation
 after its connection becomes unreadable.
 
+Renderer recovery actions follow the authoritative connection reason. An
+`offline` state with `core_not_started`, a matching connected profile, and a
+compatible contract exposes project activation without also asking the user to
+connect again, because activation owns Core startup. Any other unreadable or
+lost tunnel exposes reconnect recovery and hides project activation until the
+connection is authoritative. A selected ready project with a non-running
+service shows a Research warning and a read-only System status refresh; this
+release does not infer or expose service restart.
+
 ### Sidecar Mapping
 
 The adapter between the two v1 contracts is deterministic and fail closed:
@@ -949,6 +958,13 @@ those identities, current attempt/error, `updated_at`, and strong ETag. A run
 has at most 100 attempts; detail embeds all of them in contiguous number order,
 and current attempt ID, number, status, error, and run ID must match the run.
 Retry creates a new attempt; it never rewrites a terminal attempt.
+After an ambiguous retry response, the renderer retains the same idempotency key
+and polls bounded authoritative snapshots. It reconciles success only when the
+same run preserves the complete original attempt prefix and appends a new
+current attempt. A missing run, a changed status, or ETag churn without that
+append is not success and cannot clear the retry error. A validated retry
+response carrying that proof is authoritative for the run and remains visible
+when an immediately following aggregate snapshot still lags it.
 
 Evolution is cross-session. A successful task seals its dataset, runs every
 enabled target, validates and materializes all outputs, and then atomically

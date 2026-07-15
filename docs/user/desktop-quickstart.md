@@ -30,7 +30,11 @@ service restart, local repair, and workspace-sync controls are absent because
 the current Core release has no corresponding release handlers. Their frozen
 Local API routes are reserved for a future implementation and fail closed if
 called directly. To update a folder snapshot, select the folder again in project
-settings.
+settings. If SSH is still connected and Core has not yet started for a saved
+project, Desktop offers project activation directly. If the active tunnel was
+lost, Desktop asks you to reconnect first and does not show an unusable
+activation action. A service warning links to System, where `Refresh status`
+rereads authoritative service health.
 
 Long-running local connection and project activation show `Cancel operation`.
 Cancellation closes the exact connecting/bootstrap transport, active SSH
@@ -38,11 +42,12 @@ subprocesses, tunnel, and Core client owned by that operation. It returns the
 workspace or project to its authoritative retryable state; a late background
 completion cannot reactivate the cancelled session.
 
-Project and artifact mode controls use manual tab activation: Left and Right,
-or Home and End, move focus without starting an action; Enter or Space activates
-the focused choice. When closing a form with unsaved changes, the underlying
-form becomes inert and focus remains inside the confirmation until the draft is
-kept or discarded. Pointer input outside that confirmation is ignored.
+Research source and model-mode choices are radio groups: Arrow keys, Home, and
+End move and select the choice. Artifact views use manual tab activation: those
+keys move focus, while Enter or Space activates the focused tab. When closing a
+form with unsaved changes, the underlying form becomes inert and focus remains
+inside the confirmation until the draft is kept or discarded. Pointer input
+outside that confirmation is ignored.
 
 Desktop must show setup-required or typed error states until a real sidecar and
 remote Core Backend are reachable. This document becomes a user quickstart only

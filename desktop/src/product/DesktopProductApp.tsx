@@ -74,6 +74,7 @@ type RevisionRefV1 = NonNullable<NonNullable<ProjectV1["remote"]>["active_revisi
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_HF_MODEL = "Qwen/Qwen3-8B";
 const ACTIVE_RUN_REFRESH_INTERVAL_MS = 1_000;
+const PENDING_RETRY_REFRESH_LIMIT = 60;
 const REQUIRED_EVOLUTION_TARGETS = ["text_memory", "skill_bundle", "agent_system"] as const;
 
 type Workspace = "research" | "evolution" | "system";
@@ -95,6 +96,9 @@ type PendingRunRetry = {
   readonly runEtag: string;
   readonly actionId: string;
   readonly errorOwner: number;
+  readonly originalAttemptCount: number;
+  readonly originalAttemptIds: readonly string[];
+  readonly originalCurrentAttemptId: string | null;
   reconciled: boolean;
 };
 type SaveAttemptResult = {
@@ -160,6 +164,7 @@ export function DesktopProductApp({
   const actionStateGeneration = useRef(0);
   const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
   const pendingRunRetry = useRef<PendingRunRetry | null>(null);
+  const [pendingRetryPoll, setPendingRetryPoll] = useState<PendingRunRetry | null>(null);
   const recoveredProjectSetup = useRef<string | null>(null);
   const [cancellingOperation, setCancellingOperation] = useState(false);
   const refreshCoordinator = useRef<SnapshotRefreshCoordinator | null>(null);
@@ -176,6 +181,14 @@ export function DesktopProductApp({
   const clearActionError = useCallback((owner: number): void => {
     setActionError((current) => current?.owner === owner ? null : current);
   }, []);
+
+  const clearPendingRetry = useCallback((pending: PendingRunRetry): void => {
+    if (pendingRunRetry.current !== pending) return;
+    pending.reconciled = true;
+    pendingRunRetry.current = null;
+    setPendingRetryPoll((current) => current === pending ? null : current);
+    clearActionError(pending.errorOwner);
+  }, [clearActionError]);
 
   const publishRefresh = useCallback((publication: SnapshotRefreshPublication): void => {
     if (publication.kind === "pending") {
@@ -206,9 +219,7 @@ export function DesktopProductApp({
     const next = result.snapshot;
     const pendingRetry = pendingRunRetry.current;
     if (pendingRetry && retryAdvancedInSnapshot(next, pendingRetry)) {
-      pendingRetry.reconciled = true;
-      pendingRunRetry.current = null;
-      clearActionError(pendingRetry.errorOwner);
+      clearPendingRetry(pendingRetry);
     }
     setSnapshot(next);
     setLoadError(null);
@@ -216,7 +227,7 @@ export function DesktopProductApp({
       if (current && next.projects.some((project) => project.project_id === current)) return current;
       return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
     });
-  }, [clearActionError]);
+  }, [clearPendingRetry]);
 
   useLayoutEffect(() => {
     const coordinator = refreshCoordinator.current!;
@@ -325,6 +336,26 @@ export function DesktopProductApp({
   useActiveRunPolling(runPollingIdentity, refresh);
 
   useEffect(() => {
+    if (!pendingRetryPoll) return;
+    let active = true;
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      if (!active || pendingRunRetry.current !== pendingRetryPoll || attempts >= PENDING_RETRY_REFRESH_LIMIT) return;
+      attempts += 1;
+      await refresh("poll", () => active && pendingRunRetry.current === pendingRetryPoll);
+      if (active && pendingRunRetry.current === pendingRetryPoll && attempts < PENDING_RETRY_REFRESH_LIMIT) {
+        timer = setTimeout(() => void poll(), ACTIVE_RUN_REFRESH_INTERVAL_MS);
+      }
+    };
+    timer = setTimeout(() => void poll(), ACTIVE_RUN_REFRESH_INTERVAL_MS);
+    return () => {
+      active = false;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [pendingRetryPoll, provider, refresh]);
+
+  useEffect(() => {
     if (!snapshot) return;
     const setupProjectId = snapshot.activeOperation?.operation_kind === "project_activate"
       ? snapshot.activeOperation.resource.resource_id
@@ -363,7 +394,16 @@ export function DesktopProductApp({
   const settingsFormIdentity = settingsProject ? `project:${settingsProject.project_id}` : "create";
   const settingsCapability = projectCapability(snapshot, settingsProject);
   const projectServices = projectSessionReady ? snapshot.services : [];
+  const servicesNeedAttention = projectSessionReady
+    && projectServices.some((service) => service.status !== "running");
   const canCreateProject = profile?.connection_state === "connected";
+  const coreCanActivateProject = connection.profile_id === profile?.profile_id
+    && (displayedConnectionState === "online"
+      || displayedConnectionState === "degraded"
+      || (connection.state === "offline" && connection.failure?.code === "core_not_started"));
+  const canShowActivation = coreCanActivateProject
+    && profile?.connection_state === "connected"
+    && snapshot.state.contract.compatible;
   const activationReason = getProjectActivationReason(snapshot, project, profile, actionState);
   const startReason = getStartReason(snapshot, project, profile, activeRun, actionState);
   const canStart = startReason === null;
@@ -398,18 +438,25 @@ export function DesktopProductApp({
     }
     const existing = pendingRunRetry.current;
     const errorOwner = reserveActionErrorOwner();
+    const sameFailedSnapshot = existing?.runId === run.id && existing.runEtag === run.etag;
     const pending = {
       runId: run.id,
       runEtag: run.etag,
-      actionId: existing?.runId === run.id && existing.runEtag === run.etag
-        ? existing.actionId
-        : newActionId(),
+      actionId: sameFailedSnapshot ? existing.actionId : newActionId(),
       errorOwner,
+      originalAttemptCount: sameFailedSnapshot ? existing.originalAttemptCount : run.attempt_count,
+      originalAttemptIds: sameFailedSnapshot ? existing.originalAttemptIds : run.attempts.map((attempt) => attempt.id),
+      originalCurrentAttemptId: sameFailedSnapshot ? existing.originalCurrentAttemptId : run.current_attempt_id,
       reconciled: false,
     };
     pendingRunRetry.current = pending;
+    setPendingRetryPoll(pending);
+    let retryResponse: RunV1 | null = null;
     void act(
-      () => retryRun.call(provider, run.id, resourceIntent(snapshot, run.etag, pending.actionId)),
+      async () => {
+        retryResponse = await retryRun.call(provider, run.id, resourceIntent(snapshot, run.etag, pending.actionId));
+        return retryResponse;
+      },
       null,
       true,
       errorOwner,
@@ -418,10 +465,12 @@ export function DesktopProductApp({
         if (pending.reconciled) clearActionError(errorOwner);
         return;
       }
-      if (result.saved
-        || (result.refreshedSnapshot && retryAdvancedInSnapshot(result.refreshedSnapshot, pending))) {
-        pendingRunRetry.current = null;
-        clearActionError(errorOwner);
+      const acceptedRetryResponse = retryResponse;
+      if (acceptedRetryResponse && retryAdvancedRun(acceptedRetryResponse, pending)) {
+        setSnapshot((current) => current ? mergeAuthoritativeRetryRun(current, acceptedRetryResponse, pending) : current);
+        clearPendingRetry(pending);
+      } else if (result.refreshedSnapshot && retryAdvancedInSnapshot(result.refreshedSnapshot, pending)) {
+        clearPendingRetry(pending);
       }
     });
   };
@@ -501,13 +550,21 @@ export function DesktopProductApp({
             }}
             onSetup={() => setConnectionSettingsOpen(true)}
           />
-          {project && !projectSessionReady ? (
+          {project && !projectSessionReady && canShowActivation ? (
             <ProjectActivationGate
               project={project}
               busy={actionState === "working"}
               disabledReason={activationReason}
               onActivate={() => void act(() => provider.activateProject(project.project_id, resourceIntent(snapshot, project.etag)))}
             />
+          ) : null}
+
+          {workspace === "research" && servicesNeedAttention ? (
+            <div className="service-health-notice" role="status">
+              <AlertCircle size={17} />
+              <div><strong>Remote services need attention</strong><span>Review the remote environment before starting another session.</span></div>
+              <button type="button" className="secondary-button" onClick={() => setWorkspace("system")}><Activity size={15} /> Open System</button>
+            </div>
           ) : null}
 
           {workspace === "research" ? (
@@ -555,6 +612,7 @@ export function DesktopProductApp({
               busy={actionState === "working"}
               onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id, resourceIntent(snapshot, profile.etag)))}
               onConfigure={() => setConnectionSettingsOpen(true)}
+              onRefresh={() => void refresh("manual")}
             />
           ) : null}
         </main>
@@ -1020,7 +1078,10 @@ function ConnectionGate({
   const core = snapshot.state.core;
   const profileId = profile?.profile_id ?? null;
   if (core.state === "online" && core.profile_id === profileId) return null;
-  if (!hasProject && core.state === "offline" && core.failure?.code === "core_not_started" && profile?.connection_state === "connected") return null;
+  if (core.state === "offline"
+    && core.failure?.code === "core_not_started"
+    && profile?.connection_state === "connected"
+    && (!hasProject || core.profile_id === profileId)) return null;
   if (core.state === "degraded") {
     return <InlineNotice tone="warning" title="Remote workspace needs attention" detail={core.failure?.message ?? "Open System to review service status and operation logs."} />;
   }
@@ -1543,10 +1604,10 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
                   <div className="artifact-meta"><span>{activeGeneration === null ? "Revision unknown" : `Revision ${activeGeneration}`}</span>{selected.scores[0] ? <span>Quality {Math.round(selected.scores[0].value * 100)}%</span> : null}</div>
                 </div>
                 <div className="segmented-control" role="tablist" aria-label="Artifact view" onKeyDown={handleTablistKeyDown}>
-                  <button type="button" role="tab" aria-selected={view === "content"} tabIndex={view === "content" ? 0 : -1} className={view === "content" ? "active" : ""} onClick={() => setView("content")}><FileText size={14} /> Content</button>
-                  <button type="button" role="tab" aria-selected={view === "diff"} tabIndex={view === "diff" ? 0 : -1} className={view === "diff" ? "active" : ""} onClick={() => setView("diff")}><FileDiff size={14} /> Changes</button>
+                  <button id="artifact-content-tab" aria-controls="artifact-view-panel" type="button" role="tab" aria-selected={view === "content"} tabIndex={view === "content" ? 0 : -1} className={view === "content" ? "active" : ""} onClick={() => setView("content")}><FileText size={14} /> Content</button>
+                  <button id="artifact-diff-tab" aria-controls="artifact-view-panel" type="button" role="tab" aria-selected={view === "diff"} tabIndex={view === "diff" ? 0 : -1} className={view === "diff" ? "active" : ""} onClick={() => setView("diff")}><FileDiff size={14} /> Changes</button>
                 </div>
-                <div className="artifact-body" role="tabpanel">
+                <div id="artifact-view-panel" aria-labelledby={view === "content" ? "artifact-content-tab" : "artifact-diff-tab"} className="artifact-body" role="tabpanel">
                   {loading ? <div className="artifact-loading"><LoaderCircle className="spin" size={17} /> Loading artifact...</div> : null}
                   {error ? <InlineNotice tone="error" title="Artifact unavailable" detail={error} /> : null}
                   {!loading && !error && view === "content" && content ? <ArtifactContent content={content} /> : null}
@@ -1565,15 +1626,16 @@ function ArtifactContent({ content }: { content: ArtifactContentV1 }) {
   const [documentId, setDocumentId] = useState(content.documents[0]?.document_id ?? "");
   useEffect(() => setDocumentId(content.documents[0]?.document_id ?? ""), [content.artifact_id]);
   const document = content.documents.find((item) => item.document_id === documentId) ?? content.documents[0];
+  const documentIndex = document ? content.documents.findIndex((item) => item.document_id === document.document_id) : -1;
   return (
     <>
       {content.truncated ? <InlineNotice tone="warning" title="Preview is truncated" detail={`Showing ${content.documents.length} of ${content.total_documents} documents.`} /> : null}
       {content.documents.length > 1 ? (
         <div className="document-tabs" role="tablist" aria-label="Artifact documents" onKeyDown={handleTablistKeyDown}>
-          {content.documents.map((item) => <button role="tab" aria-selected={item.document_id === document?.document_id} tabIndex={item.document_id === document?.document_id ? 0 : -1} key={item.document_id} type="button" className={item.document_id === document?.document_id ? "active" : ""} onClick={() => setDocumentId(item.document_id)}>{item.display_name}</button>)}
+          {content.documents.map((item, index) => <button id={`artifact-document-tab-${index}`} aria-controls="artifact-document-panel" role="tab" aria-selected={item.document_id === document?.document_id} tabIndex={item.document_id === document?.document_id ? 0 : -1} key={item.document_id} type="button" className={item.document_id === document?.document_id ? "active" : ""} onClick={() => setDocumentId(item.document_id)}>{item.display_name}</button>)}
         </div>
       ) : null}
-      {document ? <pre className="artifact-document">{document.content}</pre> : null}
+      {document ? <pre id="artifact-document-panel" role={content.documents.length > 1 ? "tabpanel" : undefined} aria-labelledby={content.documents.length > 1 ? `artifact-document-tab-${documentIndex}` : undefined} className="artifact-document">{document.content}</pre> : null}
     </>
   );
 }
@@ -1604,8 +1666,10 @@ function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
   );
 }
 
-function SystemWorkspace({ snapshot, profile, services, projectSessionReady, busy, onConnect, onConfigure }: { snapshot: DesktopProductSnapshot; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onConfigure: () => void }) {
+function SystemWorkspace({ snapshot, profile, services, projectSessionReady, busy, onConnect, onConfigure, onRefresh }: { snapshot: DesktopProductSnapshot; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onConfigure: () => void; onRefresh: () => void }) {
   const core = snapshot.state.core;
+  const readyServices = services.filter((service) => service.status === "running").length;
+  const servicesNeedAttention = services.some((service) => service.status !== "running");
   return (
     <div className="workspace-stack" data-testid="system-workspace">
       <div className="workspace-heading"><div><p className="eyebrow">System</p><h1>Remote environment</h1><p>Connection, service status, and model availability.</p></div></div>
@@ -1625,7 +1689,8 @@ function SystemWorkspace({ snapshot, profile, services, projectSessionReady, bus
         </section>
       </div>
       <section className="services-section">
-        <div className="section-heading"><div><Activity size={17} /><h2>Services</h2></div><span>{services.filter((service) => service.status === "running").length} of {services.length} ready</span></div>
+        <div className="section-heading"><div><Activity size={17} /><h2>Services</h2></div><div className="section-heading-actions"><span>{readyServices} of {services.length} ready</span><button type="button" className="text-button" onClick={onRefresh} disabled={busy}><RefreshCw size={14} /> Refresh status</button></div></div>
+        {servicesNeedAttention ? <InlineNotice tone="warning" title="Remote services need attention" detail="Refresh the status. If the issue persists, reconnect the remote workspace." /> : null}
         <div className="service-list">
           {services.map((service) => <ServiceRow key={service.id} service={service} />)}
           {!services.length ? <div className="empty-row">Services are unavailable for this project.</div> : null}
@@ -1678,6 +1743,15 @@ function RemoteWorkspaceDrawer({
   const pendingSaveIntent = useRef<ProfileSaveIntent | null>(null);
   const parsedPort = Number(port);
   const valid = name.trim() !== "" && host.trim() !== "" && user.trim() !== "" && Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65_535;
+  const requiredFieldMessage = name.trim() === ""
+    ? "Enter a workspace name."
+    : host.trim() === ""
+      ? "Enter the remote server address."
+      : !Number.isInteger(parsedPort) || parsedPort <= 0 || parsedPort > 65_535
+        ? "Enter a port from 1 to 65535."
+        : user.trim() === ""
+          ? "Enter the remote server user name."
+          : null;
   const markDirty = () => { pendingSaveIntent.current = null; setDirty(true); };
   const update = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement>) => { setter(event.target.value); markDirty(); };
   useEffect(() => {
@@ -1704,9 +1778,10 @@ function RemoteWorkspaceDrawer({
         <div className="drawer-content" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}>
           <section className="form-section">
             <h3>Server</h3>
-            <label>Workspace name<input value={name} onChange={update(setName)} placeholder="Research server" /></label>
-            <div className="form-grid host-grid"><label>Server address<input value={host} onChange={update(setHost)} placeholder="research.example.org" /></label><label>Port<input inputMode="numeric" value={port} onChange={update(setPort)} /></label></div>
-            <label>User name<input value={user} onChange={update(setUser)} /></label>
+            <label>Workspace name<input required value={name} onChange={update(setName)} placeholder="Research server" /></label>
+            <div className="form-grid host-grid"><label>Server address<input required value={host} onChange={update(setHost)} placeholder="research.example.org" /></label><label>Port<input required inputMode="numeric" value={port} onChange={update(setPort)} /></label></div>
+            <label>User name<input required value={user} onChange={update(setUser)} /></label>
+            {requiredFieldMessage ? <p className="form-error" id="workspace-required-fields" role="status">{requiredFieldMessage}</p> : null}
           </section>
           <section className="form-section">
             <h3>Authentication</h3>
@@ -1721,7 +1796,7 @@ function RemoteWorkspaceDrawer({
           </section>
         </div>
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
-        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={guardedClose.requestClose}>Cancel</button><button className="primary-button" type="button" disabled={!valid || busy || streamEpoch === null || (profile !== null && !dirty)} title={!valid ? "Complete the required server fields" : streamEpoch === null ? "Refresh this view before saving" : profile && !dirty ? "No unsaved changes" : "Save remote workspace"} onClick={() => {
+        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={guardedClose.requestClose}>Cancel</button><button className="primary-button" type="button" aria-describedby={requiredFieldMessage ? "workspace-required-fields" : undefined} disabled={!valid || busy || streamEpoch === null || (profile !== null && !dirty)} title={!valid ? "Complete the required server fields" : streamEpoch === null ? "Refresh this view before saving" : profile && !dirty ? "No unsaved changes" : "Save remote workspace"} onClick={() => {
           const input: ProfileCreateV1 = {
             name: name.trim(),
             host: host.trim(),
@@ -1916,6 +1991,15 @@ function SettingsDrawer({
     setDirty(true);
   }, [incompleteSetup, modeCapabilities, rows]);
   const setupReady = !incompleteSetup || (modeCapabilities !== null && rows.every((row) => !row.selection.enabled || row.valid));
+  const requiredFieldMessage = name.trim() === ""
+    ? "Enter a project name."
+    : title.trim() === ""
+      ? "Enter a task title."
+      : objective.trim() === ""
+        ? "Describe the research objective."
+        : activeModel.trim() === ""
+          ? "Enter the model name."
+          : null;
   const valid = name.trim().length > 0
     && title.trim().length > 0
     && objective.trim().length > 0
@@ -1946,27 +2030,28 @@ function SettingsDrawer({
         <div className="drawer-content" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}>
           <section className="form-section">
             <h3>Project</h3>
-            <label>Project name<input value={name} onChange={change(setName)} /></label>
-            <label>Task title<input value={title} onChange={change(setTitle)} /></label>
-            <label>Objective<textarea rows={5} value={objective} onChange={change(setObjective)} /></label>
+            <label>Project name<input required value={name} onChange={change(setName)} /></label>
+            <label>Task title<input required value={title} onChange={change(setTitle)} /></label>
+            <label>Objective<textarea required rows={5} value={objective} onChange={change(setObjective)} /></label>
+            {requiredFieldMessage ? <p className="form-error" id="project-required-fields" role="status">{requiredFieldMessage}</p> : null}
           </section>
           <section className="form-section">
             <h3>Research source</h3>
-            <div className="segmented-control wide" role="tablist" aria-label="Research source" onKeyDown={handleTablistKeyDown}>
-              <button type="button" role="tab" aria-selected={source.kind === "scratch"} tabIndex={source.kind === "scratch" ? 0 : -1} className={source.kind === "scratch" ? "active" : ""} disabled={selectingSource || busy} onClick={() => { invalidateSourceSelection(); void settlePendingSource("discard").then(() => { setSource({ kind: "scratch", display_name: "New workspace", import_ref: null }); setSourceError(null); markDirty(); }); }}>Scratch</button>
-              <button type="button" role="tab" aria-selected={source.kind === "native_folder_snapshot"} tabIndex={source.kind === "native_folder_snapshot" ? 0 : -1} className={source.kind === "native_folder_snapshot" ? "active" : ""} disabled={selectingSource || busy} onClick={() => void selectSource()}>{selectingSource ? "Selecting..." : "Folder snapshot"}</button>
+            <div className="segmented-control wide" role="radiogroup" aria-label="Research source" onKeyDown={handleTablistKeyDown}>
+              <button type="button" role="radio" aria-checked={source.kind === "scratch"} tabIndex={source.kind === "scratch" ? 0 : -1} className={source.kind === "scratch" ? "active" : ""} disabled={selectingSource || busy} onClick={() => { invalidateSourceSelection(); void settlePendingSource("discard").then(() => { setSource({ kind: "scratch", display_name: "New workspace", import_ref: null }); setSourceError(null); markDirty(); }); }}>Scratch</button>
+              <button type="button" role="radio" aria-checked={source.kind === "native_folder_snapshot"} tabIndex={source.kind === "native_folder_snapshot" ? 0 : -1} className={source.kind === "native_folder_snapshot" ? "active" : ""} disabled={selectingSource || busy} onClick={() => void selectSource()}>{selectingSource ? "Selecting..." : "Folder snapshot"}</button>
             </div>
             <div className="source-summary"><FolderOpen size={17} /><span><strong>{source.display_name}</strong><small>{source.kind === "scratch" ? "A new managed workspace will be created." : "A native snapshot reference is ready."}</small></span></div>
             {sourceError ? <p className="form-error" role="alert">{sourceError}</p> : null}
           </section>
           <section className="form-section">
             <h3>Model mode</h3>
-            <div className="segmented-control wide" role="tablist" aria-label="Model mode" onKeyDown={handleTablistKeyDown}>{executionModeCapabilities.modes.map((capability) => (
+            <div className="segmented-control wide" role="radiogroup" aria-label="Model mode" onKeyDown={handleTablistKeyDown}>{executionModeCapabilities.modes.map((capability) => (
               <button
                 type="button"
-                role="tab"
+                role="radio"
                 key={capability.mode}
-                aria-selected={mode === capability.mode}
+                aria-checked={mode === capability.mode}
                 aria-describedby={capability.support_state === "supported" ? undefined : "execution-mode-support-message"}
                 tabIndex={focusMode === capability.mode ? 0 : -1}
                 className={mode === capability.mode ? "active" : ""}
@@ -1975,7 +2060,7 @@ function SettingsDrawer({
                 onClick={() => { setMode(capability.mode); markDirty(); }}
               >{capability.display_name}</button>
             ))}</div>
-            {mode === "self-deployed" ? <label>Hugging Face model<input value={hfModel} onChange={change(setHfModel)} placeholder="organization/model" /></label> : <label>Codex model<input value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>}
+            {mode === "self-deployed" ? <label>Hugging Face model<input required value={hfModel} onChange={change(setHfModel)} placeholder="organization/model" /></label> : <label>Codex model<input required value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>}
             {activeModeCapability.support_state !== "supported" ? <p className="mode-support-message" id="execution-mode-support-message" role="status">{activeModeCapability.message}</p> : null}
             <p className="form-help">Sessions use transcript capture. Token-level metrics are unavailable in this mode.</p>
           </section>
@@ -2019,7 +2104,7 @@ function SettingsDrawer({
           </section>
         </div>
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
-        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={() => void reset()} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" disabled={!valid || busy || selectingSource || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : activeModeCapability.support_state !== "supported" ? activeModeCapability.message : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); const pendingActionId = pendingSourceActionId.current; void onSave({
+        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={() => void reset()} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" aria-describedby={requiredFieldMessage ? "project-required-fields" : undefined} disabled={!valid || busy || selectingSource || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : activeModeCapability.support_state !== "supported" ? activeModeCapability.message : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); const pendingActionId = pendingSourceActionId.current; void onSave({
           name: name.trim(),
           task: { title: title.trim(), objective: objective.trim() },
           source,
@@ -2482,7 +2567,32 @@ function retryAdvancedInSnapshot(
 ): boolean {
   if (snapshot.stream.status !== "fresh") return false;
   const run = snapshot.runs.find((item) => item.id === pending.runId);
-  return !run || run.etag !== pending.runEtag || run.status !== "failed";
+  return run ? retryAdvancedRun(run, pending) : false;
+}
+
+function retryAdvancedRun(run: RunV1, pending: PendingRunRetry): boolean {
+  if (run.id !== pending.runId
+    || run.attempt_count <= pending.originalAttemptCount
+    || run.current_attempt_id === null
+    || run.current_attempt?.id !== run.current_attempt_id
+    || run.current_attempt_id === pending.originalCurrentAttemptId
+    || pending.originalAttemptIds.includes(run.current_attempt_id)
+    || run.attempts.length !== run.attempt_count) return false;
+  return pending.originalAttemptIds.every((attemptId, index) => run.attempts[index]?.id === attemptId);
+}
+
+function mergeAuthoritativeRetryRun(
+  snapshot: DesktopProductSnapshot,
+  response: RunV1,
+  pending: PendingRunRetry,
+): DesktopProductSnapshot {
+  const index = snapshot.runs.findIndex((run) => run.id === pending.runId);
+  if (index < 0) return snapshot;
+  const current = snapshot.runs[index];
+  if (!current || retryAdvancedRun(current, pending) || current.attempt_count > response.attempt_count) return snapshot;
+  const runs = [...snapshot.runs];
+  runs[index] = response;
+  return { ...snapshot, runs };
 }
 
 function canReadmitRun(
@@ -2630,28 +2740,30 @@ function useGuardedDrawerClose(dirty: boolean, onClose: () => void) {
 function handleTablistKeyDown(event: React.KeyboardEvent<HTMLElement>) {
   if (event.key === "Enter" || event.key === " ") {
     const active = document.activeElement;
-    if (active instanceof HTMLButtonElement && active.getAttribute("role") === "tab" && event.currentTarget.contains(active)) {
+    if (active instanceof HTMLButtonElement && ["tab", "radio"].includes(active.getAttribute("role") ?? "") && event.currentTarget.contains(active)) {
       event.preventDefault();
       active.click();
     }
     return;
   }
-  const direction = event.key === "ArrowRight"
+  const direction = event.key === "ArrowRight" || event.key === "ArrowDown"
     ? 1
-    : event.key === "ArrowLeft"
+    : event.key === "ArrowLeft" || event.key === "ArrowUp"
       ? -1
       : 0;
   if (direction === 0 && event.key !== "Home" && event.key !== "End") return;
-  const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]:not(:disabled)'));
-  if (tabs.length === 0) return;
-  const currentIndex = tabs.findIndex((tab) => tab === document.activeElement);
+  const choices = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]:not(:disabled), [role="radio"]:not(:disabled)'));
+  if (choices.length === 0) return;
+  const currentIndex = choices.findIndex((choice) => choice === document.activeElement);
   const nextIndex = event.key === "Home"
     ? 0
     : event.key === "End"
-      ? tabs.length - 1
-      : (Math.max(0, currentIndex) + direction + tabs.length) % tabs.length;
+      ? choices.length - 1
+      : (Math.max(0, currentIndex) + direction + choices.length) % choices.length;
   event.preventDefault();
-  tabs[nextIndex]?.focus();
+  const next = choices[nextIndex];
+  next?.focus();
+  if (next?.getAttribute("role") === "radio") next.click();
 }
 
 function useDialogFocus(onClose: () => void) {
