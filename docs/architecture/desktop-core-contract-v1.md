@@ -984,6 +984,13 @@ latch. Every Core retry transport, including a cached exact replay, checks that
 latch immediately before dispatch. Failure to persist an accepted response or
 clear a deterministic rejection therefore requires application restart and
 cannot reuse stale in-memory authority to contact Core.
+Recovery writes and Core retry dispatch share a synchronous provider gate. A
+refresh reconciliation clear cannot overlap an exact replay, and a synchronously
+claimed retry prevents refresh from starting that clear. Once uncertain, the
+provider refuses to expose its stale cached recovery record. The renderer treats
+that read failure as restart-required across both fresh and failed refresh
+publications, abandons ordinary ambiguity polling, and does not replace it with
+the generic unknown-outcome message.
 Schema-invalid, oversized, identity-inconsistent, unreadable, or unsafe persisted
 data remains in place and fails startup closed; it is never silently treated as
 an absent retry. This persistence lets a

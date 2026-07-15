@@ -1052,6 +1052,36 @@ describe("DesktopProductApp", () => {
     expect(startRun).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "accepted retry persistence",
+    "rejected retry clear",
+  ])("preserves restart guidance after uncertain %s", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRunStateReviewScenario();
+    root = await renderProduct(provider);
+    await clickButton("Cancel session");
+    const restartError = new DesktopProductUserError(
+      "OpenEvo could not save local retry recovery state. Restart Desktop and try again.",
+    );
+    let restartRequired = false;
+    const retryRun = vi.fn(async () => {
+      restartRequired = true;
+      throw restartError;
+    });
+    const getRunRetryRecovery = vi.fn(() => {
+      if (restartRequired) throw restartError;
+      return null;
+    });
+    Object.assign(provider, { retryRun, getRunRetryRecovery });
+
+    await clickButton("Retry session");
+
+    expect(screenText()).toContain("Restart Desktop and try again.");
+    expect(screenText()).not.toContain("The retry outcome is not yet confirmed.");
+    expect(retryRun).toHaveBeenCalledTimes(1);
+    expect(getRunRetryRecovery).toHaveBeenCalled();
+  });
+
   it("shows the failed preview outcome and retries by appending an attempt to the same run", async () => {
     provider = createFixtureDesktopProductProvider({
       startOnline: true,

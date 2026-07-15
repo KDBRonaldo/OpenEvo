@@ -220,15 +220,38 @@ export function DesktopProductApp({
       return;
     }
     const result = publication.result;
+    let pendingRetry = pendingRunRetry.current;
+    let recoveredRetry: ProductRunRetryRecovery | null = null;
+    let retryRecoveryReadFailed = false;
+    let retryRecoveryFailure: unknown = null;
+    try {
+      recoveredRetry = provider.getRunRetryRecovery?.() ?? null;
+    } catch (error) {
+      retryRecoveryReadFailed = true;
+      retryRecoveryFailure = error;
+    }
+    if (retryRecoveryReadFailed) {
+      if (pendingRetry) {
+        abandonPendingRetry(pendingRetry);
+        pendingRetry = null;
+      }
+      const errorOwner = actionErrorGeneration.current + 1;
+      actionErrorGeneration.current = errorOwner;
+      setActionRecovery(null);
+      setPendingRetryPoll(null);
+      setActionError({ owner: errorOwner, message: userMessage(retryRecoveryFailure) });
+    }
     if (result.status !== "fresh") {
       setSnapshot((current) => current ? { ...current, stream: result.stream } : current);
-      if (result.status === "error") setLoadError(userMessage(result.stream.error));
+      if (result.status === "error") {
+        setLoadError(userMessage(
+          retryRecoveryReadFailed ? retryRecoveryFailure : result.stream.error,
+        ));
+      }
       return;
     }
     let next = result.snapshot;
-    let pendingRetry = pendingRunRetry.current;
-    const recoveredRetry = provider.getRunRetryRecovery?.() ?? null;
-    if (!pendingRetry && recoveredRetry) {
+    if (!retryRecoveryReadFailed && !pendingRetry && recoveredRetry) {
       const errorOwner = actionErrorGeneration.current + 1;
       actionErrorGeneration.current = errorOwner;
       pendingRetry = pendingRetryFromRecovery(recoveredRetry, errorOwner);
@@ -253,7 +276,7 @@ export function DesktopProductApp({
       if (current && next.projects.some((project) => project.project_id === current)) return current;
       return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
     });
-  }, [clearPendingRetry, provider]);
+  }, [abandonPendingRetry, clearPendingRetry, provider]);
 
   useLayoutEffect(() => {
     const coordinator = refreshCoordinator.current!;

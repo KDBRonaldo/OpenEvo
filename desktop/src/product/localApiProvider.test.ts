@@ -526,6 +526,52 @@ describe("LocalApiDesktopProductProvider", () => {
     expect(provider.getRunRetryRecovery()?.acceptedRun).toEqual(accepted);
   });
 
+  it("serializes refresh reconciliation against exact retry transport", async () => {
+    const client = mockClient();
+    const retrySource = failedRetrySourceRun();
+    const accepted = advancedRetryRun(retrySource);
+    const clearStarted = deferred<void>();
+    const clearWrite = deferred<void>();
+    let durable: string | null = null;
+    client.listRuns = pagedMock([[runSummary(retrySource)]]);
+    client.getRun = vi.fn().mockResolvedValue(retrySource);
+    client.retryRun = vi.fn().mockRejectedValueOnce(new TypeError("retry response was lost"));
+    const provider = createProvider(client, undefined, {
+      read: () => durable,
+      write: async (next) => {
+        durable = next;
+        if (next === null) {
+          clearStarted.resolve(undefined);
+          await clearWrite.promise;
+        }
+      },
+    });
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("expected a fresh fixture");
+    const intent = {
+      actionId: "renderer-action-retry-refresh-clear-0001",
+      streamEpoch: before.snapshot.stream.epoch,
+      etag: retrySource.etag,
+    };
+    await expect(provider.retryRun(retrySource.id, intent))
+      .rejects.toBeInstanceOf(DesktopProductAmbiguousMutationError);
+
+    const retryTransport = vi.fn().mockResolvedValue(accepted);
+    client.retryRun = retryTransport;
+    client.listRuns = pagedMock([[runSummary(accepted)]]);
+    client.getRun = vi.fn().mockResolvedValue(accepted);
+    const reconciliation = provider.refresh();
+    await clearStarted.promise;
+
+    await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/wait|updating/i);
+    expect(retryTransport).not.toHaveBeenCalled();
+    clearWrite.reject(new Error("clear directory fsync failed"));
+    expect((await reconciliation).status).toBe("error");
+    expect(() => provider.getRunRetryRecovery()).toThrow(/restart/i);
+    await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/restart/i);
+    expect(retryTransport).not.toHaveBeenCalled();
+  });
+
   it("claims the first retry synchronously before its durable write settles", async () => {
     const client = mockClient();
     const retrySource = failedRetrySourceRun();
@@ -697,6 +743,7 @@ describe("LocalApiDesktopProductProvider", () => {
 
     await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/restart/i);
     expect(client.retryRun).toHaveBeenCalledTimes(1);
+    expect(() => provider.getRunRetryRecovery()).toThrow(/restart/i);
     expect((await provider.refresh()).status).toBe("fresh");
     await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/restart/i);
     expect(client.retryRun).toHaveBeenCalledTimes(1);
@@ -736,6 +783,7 @@ describe("LocalApiDesktopProductProvider", () => {
 
     await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/restart/i);
     expect(client.retryRun).toHaveBeenCalledTimes(1);
+    expect(() => provider.getRunRetryRecovery()).toThrow(/restart/i);
     expect((await provider.refresh()).status).toBe("fresh");
     await expect(provider.retryRun(retrySource.id, intent)).rejects.toThrow(/restart/i);
     expect(client.retryRun).toHaveBeenCalledTimes(1);
@@ -1407,8 +1455,12 @@ function eventResponse(body: string): Response {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
 }
 
 async function settle(): Promise<void> {

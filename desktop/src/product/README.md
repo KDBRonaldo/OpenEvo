@@ -119,6 +119,11 @@ Any recovery-store write failure also latches the provider unavailable for the
 rest of its lifetime. Every Core retry transport, including a cached exact
 replay, checks that latch; persisting an accepted response or clearing a rejected
 retry therefore cannot be bypassed without restarting Desktop.
+Recovery writes and retry dispatch also share a synchronous provider gate. A
+refresh-owned reconciliation clear cannot overlap an exact replay, and an active
+retry claim prevents refresh from starting a clear. Once the latch is set, the
+provider refuses to expose its stale cached recovery record; the renderer keeps
+the restart-required error across fresh or failed refreshes and stops polling.
 Bounded polling starts only
 after the request becomes ambiguous. An aggregate that arrives while the retry
 transport is still in flight cannot reconcile or clear the journal. A later
