@@ -47,10 +47,13 @@ FINAL_ROLES = tuple(role for role, _name in REQUIRED_INPUT_ROLES) + (
 )
 RELEASE_NOTES_REQUIRED_LINES = (
     "## Supported Workflows",
+    "Codex subscription transcript mode: available in this candidate.",
+    "Self-Deployed Reference mode: unavailable in this candidate.",
     "## Known Limitations",
     "Parameter evolution is not included in this candidate.",
     "PyPI is not used for this release.",
     "Only the declared architecture was built.",
+    "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.",
     "## Validation Results",
     "Benchmark gates completed by this packaging candidate: 0 of 3.",
     "Textual-memory pass@1 rescue count: pending.",
@@ -58,12 +61,10 @@ RELEASE_NOTES_REQUIRED_LINES = (
     "Agent-system pass@1 rescue count: pending.",
     "## Security And Privacy",
     "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
-    "Release assets contain no credentials.",
+    "Credential-canary verification for release assets: pending.",
     "## Install, Upgrade, And Uninstall",
 )
 RELEASE_NOTES_REQUIRED_PREFIXES = (
-    "Codex subscription transcript mode:",
-    "Self-Deployed Reference mode:",
     "Install:",
     "Upgrade:",
     "Uninstall:",

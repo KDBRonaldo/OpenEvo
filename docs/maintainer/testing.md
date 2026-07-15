@@ -141,7 +141,11 @@ limitations, validation results, security/privacy, and
 install/upgrade/uninstall. The packaging-only draft must explicitly report zero
 of three benchmark gates complete and all textual-memory,
 trajectory-to-skill, and agent-system rescue counts as pending; it cannot imply
-that packaging smoke is algorithm-performance evidence.
+that packaging smoke is algorithm-performance evidence. The same notes must
+report Self-Deployed Reference mode, credential-canary verification, and the
+browser-download quarantine/Gatekeeper path as unavailable or pending. This
+checksum-bound packaging draft is never edited into a final release; a future
+final path must create and revalidate a new candidate inventory.
 
 Remote capability discovery has an additional artifact-level gate. In a clean
 environment containing the exact Core wheel, run

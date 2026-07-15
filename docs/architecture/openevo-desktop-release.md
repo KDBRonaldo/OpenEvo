@@ -725,7 +725,8 @@ The replacement workflow must:
 6. exercise first-run through a descriptor-matched remote Core health check;
 7. create a draft GitHub prerelease, upload all required assets, download them into
    a clean directory, and revalidate names, versions, commits, and checksums;
-8. publish the already-validated draft without rebuilding any bytes.
+8. leave the checksum-bound packaging candidate as an unpublished draft for
+   review; do not edit, retag, promote, or publish it as a final release.
 
 Final publication remains disabled. The manual candidate workflow implements
 the packaging-level draft roundtrip and deletes a newly created draft and its
@@ -745,6 +746,10 @@ signing, or notarization gates.
   checkout dependency, development override, or stale web bundle.
 - The unsigned/not-notarized warning and manual Gatekeeper launch procedure
   must match behavior observed from the copied app.
+
+The current packaging-only candidate launches a copied app without simulating
+browser-download quarantine. It therefore records the Privacy & Security allow
+flow as pending and does not satisfy that final Gatekeeper requirement.
 
 ## Blocking Validation
 

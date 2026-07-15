@@ -3,9 +3,11 @@
 Replace every placeholder and remove sections that do not apply before
 publishing a GitHub Release.
 
-An automated packaging-only draft keeps every section and reports unrun
-benchmark gates as `0 of 3` with each rescue count `pending`. Those placeholders
-must be replaced by validated results before final publication.
+This template is for a future final External Beta candidate. The automated
+packaging-only draft uses a smaller closed note contract, is checksum-bound to
+its `0 of 3` and `pending` results, and must never be edited or promoted. After
+all final gates pass, populate this template and generate a new candidate,
+manifest, checksum inventory, and draft roundtrip from reviewed source.
 
 ## Release
 

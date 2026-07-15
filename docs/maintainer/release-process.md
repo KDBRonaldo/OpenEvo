@@ -131,11 +131,12 @@ downloads every asset into a clean directory, and verifies:
 - SHA256 files match downloaded bytes;
 - the Core descriptor references the uploaded Core artifact;
 - the DMG version and bundled/fetched descriptor match the candidate commit;
-- release notes state unsigned/not-notarized status, supported modes, known
-  limitations, benchmark gate status and rescue counts, privacy/security
-  behavior, and install/upgrade/uninstall steps. A packaging-only draft must
-  state `0 of 3` completed benchmark gates and mark all three rescue counts
-  `pending`; final publication must replace those values with validated results;
+- release notes state unsigned/not-notarized status, available and unavailable
+  execution modes, known limitations, benchmark gate status and rescue counts,
+  privacy/security behavior, and install/upgrade/uninstall steps. A
+  packaging-only draft must state `0 of 3` completed benchmark gates and mark
+  all three rescue counts
+  `pending`; the immutable packaging draft must not be edited or promoted;
 - no unclassified development, secret, benchmark-private, or source-checkout
   files are present.
 
@@ -144,13 +145,16 @@ deletes that draft and its candidate tag. A successful run leaves the draft and
 candidate tag for review; it does not publish the release.
 
 Two fresh-context `gpt-5.6-sol` high-effort reviews must approve product/spec
-compliance and release risk before publication.
+compliance and release risk before a candidate reaches `stable`.
 
 ## Publication
 
-After validation, create the final annotated tag at the candidate commit and
-publish the already-validated draft release without rebuilding assets. Record
-the release URL and final asset checksums in the release issue.
+Final External Beta publication remains disabled. The packaging-only draft from
+this workflow must not be edited, retagged, or promoted. After the science,
+benchmark, privacy, signing-policy, and final product gates are implemented and
+pass, create a new final candidate from a reviewed `stable` commit. That future
+path must generate final release notes and a new manifest/checksum inventory,
+roundtrip every asset again, and publish only those unchanged revalidated bytes.
 
 ## Rollback
 

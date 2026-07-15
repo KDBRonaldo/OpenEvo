@@ -26,12 +26,13 @@ def _release_notes_text() -> str:
         "Architecture: aarch64\n\n"
         "UNSIGNED AND NOT NOTARIZED.\n\n"
         "## Supported Workflows\n\n"
-        "Codex subscription transcript mode: remote subscription harness.\n"
-        "Self-Deployed Reference mode: remote reference model serving.\n\n"
+        "Codex subscription transcript mode: available in this candidate.\n"
+        "Self-Deployed Reference mode: unavailable in this candidate.\n\n"
         "## Known Limitations\n\n"
         "Parameter evolution is not included in this candidate.\n"
         "PyPI is not used for this release.\n"
-        "Only the declared architecture was built.\n\n"
+        "Only the declared architecture was built.\n"
+        "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.\n\n"
         "## Validation Results\n\n"
         "Benchmark gates completed by this packaging candidate: 0 of 3.\n"
         "Textual-memory pass@1 rescue count: pending.\n"
@@ -39,7 +40,7 @@ def _release_notes_text() -> str:
         "Agent-system pass@1 rescue count: pending.\n\n"
         "## Security And Privacy\n\n"
         "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.\n"
-        "Release assets contain no credentials.\n\n"
+        "Credential-canary verification for release assets: pending.\n\n"
         "## Install, Upgrade, And Uninstall\n\n"
         "Install: open the DMG and copy OpenEvo Desktop to Applications.\n"
         "Upgrade: quit the app and replace it with a newer reviewed DMG.\n"
@@ -108,12 +109,13 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
     "required_marker",
     [
         "## Supported Workflows",
-        "Codex subscription transcript mode",
-        "Self-Deployed Reference mode",
+        "Codex subscription transcript mode: available in this candidate.",
+        "Self-Deployed Reference mode: unavailable in this candidate.",
         "## Known Limitations",
         "Parameter evolution is not included in this candidate.",
         "PyPI is not used for this release.",
         "Only the declared architecture was built.",
+        "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.",
         "## Validation Results",
         "Benchmark gates completed by this packaging candidate: 0 of 3.",
         "Textual-memory pass@1 rescue count: pending.",
@@ -121,7 +123,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         "Agent-system pass@1 rescue count: pending.",
         "## Security And Privacy",
         "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
-        "Release assets contain no credentials.",
+        "Credential-canary verification for release assets: pending.",
         "## Install, Upgrade, And Uninstall",
         "Install:",
         "Upgrade:",

@@ -1219,12 +1219,13 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "retention-days: 14",
         "unsigned and not notarized",
         "## Supported Workflows",
-        "Codex subscription transcript mode",
-        "Self-Deployed Reference mode",
+        "Codex subscription transcript mode: available in this candidate.",
+        "Self-Deployed Reference mode: unavailable in this candidate.",
         "## Known Limitations",
         "Parameter evolution is not included in this candidate.",
         "PyPI is not used for this release.",
         "Only the declared architecture was built.",
+        "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.",
         "## Validation Results",
         "Benchmark gates completed by this packaging candidate: 0 of 3.",
         "Textual-memory pass@1 rescue count: pending.",
@@ -1232,7 +1233,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "Agent-system pass@1 rescue count: pending.",
         "## Security And Privacy",
         "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
-        "Release assets contain no credentials.",
+        "Credential-canary verification for release assets: pending.",
         "## Install, Upgrade, And Uninstall",
         "Install:",
         "Upgrade:",
@@ -1678,28 +1679,6 @@ def _desktop_state_payload() -> dict[str, object]:
             "host_key_review": None,
             "core": None,
             "failure": None,
-        },
-        "execution_mode_capabilities": {
-            "schema_version": "1",
-            "modes": [
-                {
-                    "mode": "codex_subscription_transcript",
-                    "display_name": "Subscription",
-                    "support_state": "supported",
-                    "reason_code": None,
-                    "message": "Available in this OpenEvo Desktop release.",
-                },
-                {
-                    "mode": "self-deployed",
-                    "display_name": "Self-deployed",
-                    "support_state": "unavailable",
-                    "reason_code": "self_deployed_release_unavailable",
-                    "message": (
-                        "Self-deployed execution is not available in this OpenEvo "
-                        "Desktop release. Choose Subscription to save or run this project."
-                    ),
-                },
-            ],
         },
         "active_project": None,
         "pending_operation_ids": [],

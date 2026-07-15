@@ -23,7 +23,7 @@ Install OpenEvo Desktop .dmg
 -> configure a remote server and optional network proxy
 -> run doctor/bootstrap from Desktop
 -> start the remote OpenEvo Core Backend
--> choose Codex subscription transcript mode or Self-Deployed Reference mode
+-> choose an execution mode currently enabled by the Desktop release
 -> launch a science run
 -> monitor services, logs, timeline, and evolved artifacts
 ```
@@ -42,13 +42,14 @@ harness on the remote server. It requires transcript capture, does not call
 model APIs directly, and supports non-parametric evolution such as text memory,
 skill bundles, and agent-system instructions.
 
-**Self-Deployed Reference mode** uses a remote model-serving path, initially
-vLLM. It supports the same non-parametric evolution path and provides the
-deployment structure for future parameter-oriented work.
+**Self-Deployed Reference mode** is present in the Core architecture, initially
+around vLLM, but the current Desktop release marks it unavailable and blocks
+saving or running that mode. It is not a runnable Desktop product claim until
+its release gates pass.
 
-In both modes, OpenEvo is a wrapper around an existing harness. OpenEvo captures
-or ingests trajectories/transcripts, evolves typed artifacts, and injects the
-selected context into later sessions.
+For every enabled mode, OpenEvo is a wrapper around an existing harness. OpenEvo
+captures or ingests trajectories/transcripts, evolves typed artifacts, and
+injects the selected context into later sessions.
 
 ## Repository Structure
 
