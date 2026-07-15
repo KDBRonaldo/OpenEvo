@@ -34,8 +34,11 @@ cannot enter the response.
 
 Durable idempotency is resolved before this volatile readiness work. An exact
 request replay returns the existing run even if host readiness has since changed,
-and a different payload under the same project/key returns 409 without probing
-services. A truly new request obtains a store-owned, per-key admission claim;
+and a different payload under the same project/key returns canonical
+`idempotency_key_reused` 409 without probing services. That mismatch is not
+persisted as a failed replay, so it cannot poison a later exact replay of the
+original request after process-local coalescing eviction or restart. A truly
+new request obtains a store-owned, per-key admission claim;
 the final SQLite insert rechecks the durable identity before commit. Concurrent
 same-key callers therefore cannot both run readiness or create separate runs,
 and a failed readiness probe releases the in-memory claim without writing a run,
@@ -56,7 +59,8 @@ Worker transitions compare the persisted source state inside the SQLite write
 transaction, so a concurrent cancellation cannot resurrect a cancelled run.
 Cancel, retry, and delete combine the state mutation and idempotency record in
 one transaction. Reusing an idempotency key with different request or ETag
-identity fails closed.
+identity fails closed as canonical `idempotency_key_reused`; the provider does
+not persist that mismatch as a replayable operation failure.
 
 One owner worker executes ordinary-user science runs serially. This keeps the
 single managed service generation and subscription identity deterministic for

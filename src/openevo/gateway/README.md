@@ -70,17 +70,28 @@ by a dedicated private host directory that is not below the session, workspace,
 artifact, or log tree.
 
 The gateway pins every component from the absolute filesystem anchor to the
-remote user's `~/.codex/auth.json` and the private credential root, opens the
-leaf with `O_NOFOLLOW`, and requires a user-owned, link-count-one regular file
-with private permissions and a bounded size. Before runtime creation, it first
-durably journals the private credential root, then copies the bytes into a
-random `0700` staging child inside that managed root. Size, digest, UTF-8 JSON,
-redactor construction, owner, mode, link count, inode, and source/staging path
-chains are all verified there. Linux
-`renameat2(RENAME_NOREPLACE)` then publishes the complete `0600` inode as the
-credential root's final `auth.json`. The empty staging inode's device/inode is
-durably added to the cleanup journal before any secret bytes are copied; after
-publication, its final full identity is durably recorded before staging returns.
+remote user's `~/.codex/auth.json`, opens the leaf with `O_NOFOLLOW`, and
+requires a user-owned, link-count-one regular file with private permissions and
+a bounded size. Readiness retains the descriptor, full inode identity, and
+content digest. Before any session registry, storage, directory, cleanup
+journal, or queue mutation, dispatch reads only that held descriptor into an
+anonymous memfd, verifies the descriptor, digest, and current pathname before
+and after the copy, validates the bounded JSON/redactor, and write-seals the
+memfd. The final source-authority check commits that private snapshot and is the
+run's point of no return. Replacement of the original auth pathname before or
+during that commit returns a stable retryable 503 with zero session side
+effects. Replacement after the commit is permitted: this run owns the sealed
+bytes and does not require the external source pathname to remain unchanged.
+
+Dispatch then creates and durably journals the private credential root and
+synchronously copies only from the sealed snapshot into a random `0700`
+staging child. Size, digest, owner, mode, link count, inode, and staging path
+chains are verified there. Linux `renameat2(RENAME_NOREPLACE)` publishes the
+complete `0600` inode as the credential root's final `auth.json`. The empty
+staging inode's device/inode is journaled before secret bytes are copied; after
+publication, its final full identity is recorded before dispatch registers or
+queues the session and before HTTP can return `REGISTERED`. Publication failure
+is also a stable retryable 503 and rolls back all newly owned session state.
 
 DockerRuntime reopens and revalidates the root and exact auth identities. It
 creates a separate empty home view plus an empty target placeholder and pins all

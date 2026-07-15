@@ -20,7 +20,11 @@ from openevo.config import GatewayNodeConfig, TopologyConfig
 from openevo.gateway.completion_writer import CompletionWriter
 from openevo.gateway.detection import APIType, detect, extract_model
 from openevo.gateway.engine import get_engine
-from openevo.gateway.node import CancelAuthorityPersistenceError, GatewayNodeManager
+from openevo.gateway.node import (
+    CancelAuthorityPersistenceError,
+    GatewayNodeManager,
+    GatewayReadinessError,
+)
 from openevo.gateway.session_files import (
     HeldCodexCredentialAuthority,
     SessionFileSecurityError,
@@ -631,6 +635,13 @@ async def create_session(request: Request):
         state = get_state()
         try:
             await state.node_manager.dispatch(dispatch_request)
+        except GatewayReadinessError as exc:
+            raise RunAdmissionError(
+                "credential_readiness_failed",
+                "The managed subscription credential was not ready for session admission.",
+                status_code=503,
+                retryable=True,
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:

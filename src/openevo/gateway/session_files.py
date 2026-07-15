@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import errno
 import ctypes
+import fcntl
 import hashlib
 import json
 import os
 import secrets
 import stat
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
@@ -37,6 +39,17 @@ _LEAF_PIN_FLAGS: Final[int] = (
     getattr(os, "O_PATH", os.O_RDONLY | os.O_NONBLOCK) | os.O_CLOEXEC | os.O_NOFOLLOW
 )
 _RENAME_NOREPLACE: Final[int] = 1
+_MFD_CLOEXEC: Final[int] = 0x0001
+_MFD_ALLOW_SEALING: Final[int] = 0x0002
+_F_ADD_SEALS: Final[int] = 1033
+_F_GET_SEALS: Final[int] = 1034
+_F_SEAL_SEAL: Final[int] = 0x0001
+_F_SEAL_SHRINK: Final[int] = 0x0002
+_F_SEAL_GROW: Final[int] = 0x0004
+_F_SEAL_WRITE: Final[int] = 0x0008
+_CREDENTIAL_SNAPSHOT_SEALS: Final[int] = (
+    _F_SEAL_SEAL | _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE
+)
 CODEX_CREDENTIAL_AUTHORITY_FD_ENV: Final[str] = "OPENEVO_CODEX_CREDENTIAL_AUTHORITY_FD"
 
 
@@ -47,7 +60,15 @@ class SessionFileSecurityError(RuntimeError):
 class HeldCodexCredentialAuthority:
     """Held auth file plus verified authority over its absolute pathname."""
 
-    __slots__ = ("_closed", "_descriptor", "_identity", "_path", "_pin")
+    __slots__ = (
+        "_closed",
+        "_content_sha256",
+        "_descriptor",
+        "_identity",
+        "_lock",
+        "_path",
+        "_pin",
+    )
 
     def __init__(
         self,
@@ -56,11 +77,14 @@ class HeldCodexCredentialAuthority:
         descriptor: int,
         pin: _AbsoluteDirectoryPin,
         identity: CredentialFileIdentity,
+        content_sha256: str,
     ) -> None:
         self._path = path
         self._descriptor = descriptor
         self._pin = pin
         self._identity = identity
+        self._content_sha256 = content_sha256
+        self._lock = threading.RLock()
         self._closed = False
 
     @classmethod
@@ -90,6 +114,7 @@ class HeldCodexCredentialAuthority:
                 descriptor=descriptor,
                 pin=pin,
                 identity=_auth_identity(opened),
+                content_sha256=_digest_fd(descriptor, opened.st_size),
             )
             authority.verify()
             return authority
@@ -137,6 +162,7 @@ class HeldCodexCredentialAuthority:
             descriptor=descriptor,
             pin=pin,
             identity=_auth_identity(opened),
+            content_sha256=_digest_fd(descriptor, opened.st_size),
         )
         try:
             authority.verify()
@@ -148,6 +174,10 @@ class HeldCodexCredentialAuthority:
     @property
     def identity(self) -> CredentialFileIdentity:
         return self._identity
+
+    @property
+    def content_sha256(self) -> str:
+        return self._content_sha256
 
     def inheritance_descriptor(self) -> int:
         self.verify()
@@ -162,46 +192,170 @@ class HeldCodexCredentialAuthority:
             if _auth_identity(os.fstat(duplicate)) != self._identity:
                 raise SessionFileSecurityError("held Codex credential descriptor changed")
             return duplicate
-        except Exception:
+        except BaseException:
             if duplicate >= 0:
                 os.close(duplicate)
             raise
 
     def verify(self) -> None:
-        if self._closed:
-            raise SessionFileSecurityError("held Codex credential authority is closed")
-        try:
-            self._pin.verify(label="Codex subscription auth source")
-            held = os.fstat(self._descriptor)
-            if _auth_identity(held) != self._identity:
-                raise SessionFileSecurityError("held Codex subscription auth changed")
-            _require_private_auth(held)
-            current = os.stat(
-                self._path.name,
-                dir_fd=self._pin.descriptor,
-                follow_symlinks=False,
-            )
-            if _auth_identity(current) != self._identity:
-                raise SessionFileSecurityError(
-                    "Codex subscription auth pathname no longer matches readiness authority"
+        with self._lock:
+            if self._closed:
+                raise SessionFileSecurityError("held Codex credential authority is closed")
+            try:
+                self._pin.verify(label="Codex subscription auth source")
+                held = os.fstat(self._descriptor)
+                if _auth_identity(held) != self._identity:
+                    raise SessionFileSecurityError("held Codex subscription auth changed")
+                _require_private_auth(held)
+                if _digest_fd(self._descriptor, held.st_size) != self._content_sha256:
+                    raise SessionFileSecurityError("held Codex subscription auth content changed")
+                current = os.stat(
+                    self._path.name,
+                    dir_fd=self._pin.descriptor,
+                    follow_symlinks=False,
                 )
-            _require_private_auth(current)
-            self._pin.verify(label="Codex subscription auth source")
+                if _auth_identity(current) != self._identity:
+                    raise SessionFileSecurityError(
+                        "Codex subscription auth pathname no longer matches readiness authority"
+                    )
+                _require_private_auth(current)
+                self._pin.verify(label="Codex subscription auth source")
+            except SessionFileSecurityError:
+                raise
+            except OSError as exc:
+                raise SessionFileSecurityError(
+                    "Codex subscription auth pathname authority is unavailable"
+                ) from exc
+
+    def prepare_snapshot(self) -> PreparedCodexCredentialSnapshot:
+        """Commit an anonymous credential snapshot while pathname authority is current."""
+
+        with self._lock:
+            self.verify()
+            descriptor = -1
+            try:
+                descriptor = _memfd_create("openevo-codex-auth")
+                os.fchmod(descriptor, 0o600)
+                source = os.fstat(self._descriptor)
+                _copy_exact(self._descriptor, descriptor, source.st_size)
+                os.fsync(descriptor)
+                if _digest_fd(descriptor, source.st_size) != self._content_sha256:
+                    raise SessionFileSecurityError(
+                        "prepared Codex auth digest does not match readiness authority"
+                    )
+                self.verify()
+                fcntl.fcntl(descriptor, _F_ADD_SEALS, _CREDENTIAL_SNAPSHOT_SEALS)
+                if fcntl.fcntl(descriptor, _F_GET_SEALS) != _CREDENTIAL_SNAPSHOT_SEALS:
+                    raise SessionFileSecurityError("prepared Codex auth snapshot is not sealed")
+                snapshot = PreparedCodexCredentialSnapshot(
+                    descriptor=descriptor,
+                    size=source.st_size,
+                    content_sha256=self._content_sha256,
+                    source_identity=self._identity,
+                    redactor=CredentialRedactor.from_auth_json(
+                        _read_fd_exact(descriptor, source.st_size)
+                    ),
+                )
+                snapshot.verify()
+                # This final authority check is the linearization point. Once it
+                # succeeds, the sealed snapshot owns this run's credential bytes;
+                # later replacement of the original pathname is irrelevant.
+                self.verify()
+                descriptor = -1
+                return snapshot
+            except SessionFileSecurityError:
+                raise
+            except (OSError, ValueError) as exc:
+                raise SessionFileSecurityError(
+                    "Codex subscription auth could not be snapshotted safely"
+                ) from exc
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                os.close(self._descriptor)
+            finally:
+                self._pin.close()
+
+
+class PreparedCodexCredentialSnapshot:
+    """Sealed anonymous auth bytes committed before session admission side effects."""
+
+    __slots__ = (
+        "_closed",
+        "_content_sha256",
+        "_descriptor",
+        "_redactor",
+        "_size",
+        "_source_identity",
+    )
+
+    def __init__(
+        self,
+        *,
+        descriptor: int,
+        size: int,
+        content_sha256: str,
+        source_identity: CredentialFileIdentity,
+        redactor: CredentialRedactor,
+    ) -> None:
+        self._descriptor = descriptor
+        self._size = size
+        self._content_sha256 = content_sha256
+        self._source_identity = source_identity
+        self._redactor = redactor
+        self._closed = False
+
+    @property
+    def redactor(self) -> CredentialRedactor:
+        return self._redactor
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def duplicate_verified_descriptor(self) -> int:
+        self.verify()
+        descriptor = os.dup(self._descriptor)
+        try:
+            os.set_inheritable(descriptor, False)
+            if _digest_fd(descriptor, self._size) != self._content_sha256:
+                raise SessionFileSecurityError("prepared Codex auth snapshot changed")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def verify(self) -> None:
+        if self._closed:
+            raise SessionFileSecurityError("prepared Codex auth snapshot is closed")
+        try:
+            opened = os.fstat(self._descriptor)
+            if opened.st_size != self._size or not stat.S_ISREG(opened.st_mode):
+                raise SessionFileSecurityError("prepared Codex auth snapshot changed")
+            if (
+                fcntl.fcntl(self._descriptor, _F_GET_SEALS)
+                != _CREDENTIAL_SNAPSHOT_SEALS
+            ):
+                raise SessionFileSecurityError("prepared Codex auth snapshot seal changed")
+            if _digest_fd(self._descriptor, self._size) != self._content_sha256:
+                raise SessionFileSecurityError("prepared Codex auth snapshot digest changed")
         except SessionFileSecurityError:
             raise
         except OSError as exc:
-            raise SessionFileSecurityError(
-                "Codex subscription auth pathname authority is unavailable"
-            ) from exc
+            raise SessionFileSecurityError("prepared Codex auth snapshot is unavailable") from exc
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        try:
-            os.close(self._descriptor)
-        finally:
-            self._pin.close()
+        os.close(self._descriptor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,54 +888,49 @@ def stage_codex_subscription_auth(
     *,
     source: Path,
     source_authority: HeldCodexCredentialAuthority | None = None,
+    prepared_snapshot: PreparedCodexCredentialSnapshot | None = None,
     session_dir: Path,
     session_identity: SessionRootIdentity,
     target_home_parts: tuple[str, ...],
     on_identity: Callable[[CredentialFileIdentity], None] | None = None,
 ) -> StagedCodexCredential:
-    """Validate auth inside a managed private root, then atomically publish it."""
+    """Atomically publish committed auth bytes inside a managed private root."""
 
-    source_parent_fd = -1
-    source_name = source.name
     source_fd = -1
     target_parent_fd = -1
     staged_fd = -1
     staged_file_identity: tuple[int, int] | None = None
     redactor: CredentialRedactor | None = None
-    source_pin: _AbsoluteDirectoryPin | None = None
     target_pin: _AbsoluteDirectoryPin | None = None
     staging_pin: _AbsoluteDirectoryPin | None = None
     staging_dir: Path | None = None
     staging_root_identity: SessionRootIdentity | None = None
     published = False
+    owned_snapshot: PreparedCodexCredentialSnapshot | None = None
     try:
-        if not source.is_absolute() or source.name in {"", ".", ".."}:
+        if prepared_snapshot is not None and source_authority is not None:
             raise SessionFileSecurityError(
-                "Codex subscription auth source must be absolute and canonical"
+                "prepared Codex auth cannot be combined with source authority"
             )
-        if source_authority is None:
-            source_pin = _pin_absolute_directory(source.parent)
-            source_pin.verify(label="Codex subscription auth source")
-            source_parent_fd = os.dup(source_pin.descriptor)
-            source_before = os.stat(
-                source_name,
-                dir_fd=source_parent_fd,
-                follow_symlinks=False,
-            )
-            _require_private_auth(source_before)
-            source_fd = os.open(
-                source_name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-                dir_fd=source_parent_fd,
-            )
-        else:
-            source_authority.verify()
-            source_fd = source_authority.duplicate_verified_descriptor()
-            source_before = os.fstat(source_fd)
+        if prepared_snapshot is None:
+            if not source.is_absolute() or source.name in {"", ".", ".."}:
+                raise SessionFileSecurityError(
+                    "Codex subscription auth source must be absolute and canonical"
+                )
+            if source_authority is None:
+                temporary_authority = HeldCodexCredentialAuthority.open(source)
+                try:
+                    owned_snapshot = temporary_authority.prepare_snapshot()
+                finally:
+                    temporary_authority.close()
+            else:
+                owned_snapshot = source_authority.prepare_snapshot()
+            prepared_snapshot = owned_snapshot
+        prepared_snapshot.verify()
+        source_fd = prepared_snapshot.duplicate_verified_descriptor()
         source_opened = os.fstat(source_fd)
-        _require_private_auth(source_opened)
-        if _auth_identity(source_before) != _auth_identity(source_opened):
-            raise SessionFileSecurityError("Codex subscription auth changed while it was opened")
+        if source_opened.st_size != prepared_snapshot.size:
+            raise SessionFileSecurityError("prepared Codex auth snapshot changed while opened")
 
         target_pin = _pin_absolute_directory(session_dir)
         target_pin.verify(label="credential root")
@@ -833,18 +982,9 @@ def stage_codex_subscription_auth(
                 "staged Codex auth digest does not match the verified source"
             )
         source_after = os.fstat(source_fd)
-        if _auth_identity(source_opened) != _auth_identity(source_after):
-            raise SessionFileSecurityError("Codex subscription auth changed while it was copied")
-        _require_private_auth(source_after)
-        if source_authority is None:
-            _require_path_identity(
-                source_parent_fd,
-                source_name,
-                source_after,
-                label="Codex subscription auth",
-            )
-        else:
-            source_authority.verify()
+        if source_opened.st_size != source_after.st_size:
+            raise SessionFileSecurityError("prepared Codex auth snapshot changed while copied")
+        prepared_snapshot.verify()
 
         staged_after = os.fstat(staged_fd)
         _require_private_staged_auth(
@@ -860,35 +1000,23 @@ def stage_codex_subscription_auth(
             staged_after,
             label="staged Codex auth",
         )
-        redactor = CredentialRedactor.from_auth_json(
-            _read_fd_exact(staged_fd, source_opened.st_size)
-        )
+        redactor = prepared_snapshot.redactor
 
         source_final = os.fstat(source_fd)
         staged_final = os.fstat(staged_fd)
-        if _auth_identity(source_after) != _auth_identity(source_final):
+        if source_after.st_size != source_final.st_size:
             raise SessionFileSecurityError(
-                "Codex subscription auth changed during final verification"
+                "prepared Codex auth snapshot changed during final verification"
             )
         if _auth_identity(staged_after) != _auth_identity(staged_final):
             raise SessionFileSecurityError("staged Codex auth changed during final verification")
-        if source_authority is None:
-            _require_path_identity(
-                source_parent_fd,
-                source_name,
-                source_final,
-                label="Codex subscription auth",
-            )
-        else:
-            source_authority.verify()
+        prepared_snapshot.verify()
         _require_path_identity(
             staging_pin.descriptor,
             "auth.json",
             staged_final,
             label="staged Codex auth",
         )
-        if source_pin is not None:
-            source_pin.verify(label="Codex subscription auth source")
         staging_pin.verify(label="credential staging root")
 
         target_pin.verify(label="credential root")
@@ -995,11 +1123,13 @@ def stage_codex_subscription_auth(
             "~/.codex/auth.json is a private, user-owned regular file"
         ) from exc
     finally:
-        for descriptor in (staged_fd, target_parent_fd, source_fd, source_parent_fd):
+        for descriptor in (staged_fd, target_parent_fd, source_fd):
             if descriptor >= 0:
                 os.close(descriptor)
         if target_pin is not None:
             target_pin.close()
+        if owned_snapshot is not None:
+            owned_snapshot.close()
         if staging_pin is not None:
             cleanup_failed = False
             try:
@@ -1017,8 +1147,6 @@ def stage_codex_subscription_auth(
                 raise SessionFileSecurityError(
                     "credential staging root could not be removed safely"
                 )
-        if source_pin is not None:
-            source_pin.close()
 
 
 def load_staged_codex_subscription_redactor(
@@ -1179,7 +1307,10 @@ def remove_credential_tree(
                 max_depth=max_depth,
                 budget=[max_auth_nodes],
             )
-            if auth_identity is not None and matches == 0:
+            # A failed publisher may already have scrubbed and unlinked its
+            # journaled inode. An empty pinned root proves there is no
+            # replacement to erase; any remaining entry stays fail-closed.
+            if auth_identity is not None and matches == 0 and os.listdir(root_fd):
                 raise SessionFileSecurityError(
                     "journal-bound credential auth was not found during cleanup"
                 )
@@ -1555,19 +1686,23 @@ def _rename_noreplace(
 
 
 def _copy_exact(source_fd: int, target_fd: int, expected_size: int) -> None:
-    remaining = expected_size
-    while remaining:
-        chunk = os.read(source_fd, min(64 * 1024, remaining))
+    offset = 0
+    while offset < expected_size:
+        chunk = os.pread(
+            source_fd,
+            min(64 * 1024, expected_size - offset),
+            offset,
+        )
         if not chunk:
             raise SessionFileSecurityError("Codex subscription auth changed while it was copied")
         view = memoryview(chunk)
         while view:
-            written = os.write(target_fd, view)
+            written = os.pwrite(target_fd, view, offset)
             if written <= 0:
                 raise SessionFileSecurityError("staged Codex auth could not be written")
             view = view[written:]
-        remaining -= len(chunk)
-    if os.read(source_fd, 1):
+            offset += written
+    if os.pread(source_fd, 1, expected_size):
         raise SessionFileSecurityError("Codex subscription auth changed while it was copied")
 
 
@@ -1583,6 +1718,25 @@ def _read_fd_exact(descriptor: int, expected_size: int) -> bytes:
     if os.pread(descriptor, 1, expected_size):
         raise SessionFileSecurityError("verified credential grew during read")
     return b"".join(chunks)
+
+
+def _memfd_create(name: str) -> int:
+    create = getattr(os, "memfd_create", None)
+    if create is not None:
+        return int(create(name, _MFD_CLOEXEC | _MFD_ALLOW_SEALING))
+    libc = ctypes.CDLL(None, use_errno=True)
+    create = getattr(libc, "memfd_create", None)
+    if create is None:
+        raise OSError(errno.ENOSYS, "memfd_create is unavailable")
+    create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    create.restype = ctypes.c_int
+    descriptor = int(
+        create(name.encode("ascii"), _MFD_CLOEXEC | _MFD_ALLOW_SEALING)
+    )
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return descriptor
 
 
 def _digest_fd(descriptor: int, expected_size: int) -> str:

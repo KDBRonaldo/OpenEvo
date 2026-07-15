@@ -25,6 +25,7 @@ from openevo.backend.service_control import CoreServiceControlError
 from openevo.backend.science_execution import compile_science_execution
 from openevo.backend.science_run_store import (
     ScienceRunConflict,
+    ScienceRunIdempotencyConflict,
     ScienceRunNotFound,
     ScienceRunPreconditionFailed,
     ScienceRunStore,
@@ -183,6 +184,13 @@ class CoreScienceRunOwner:
             raise _owner_error("run_not_found", str(exc), 404, False) from exc
         except ScienceRunPreconditionFailed as exc:
             raise _owner_error("run_etag_precondition_failed", str(exc), 412, True) from exc
+        except ScienceRunIdempotencyConflict as exc:
+            raise _owner_error(
+                "idempotency_key_reused",
+                "The idempotency key was already used for a different request.",
+                409,
+                False,
+            ) from exc
         except ScienceRunConflict as exc:
             raise _owner_error("run_conflict", str(exc), 409, False) from exc
         except (ScienceRunStoreError, ValueError) as exc:

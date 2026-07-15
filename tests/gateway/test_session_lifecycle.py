@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from openevo.gateway.dispatcher import ManagedSession, SessionDispatcher, SessionStage
-from openevo.gateway.node import GatewayNodeManager
+from openevo.gateway import session_files
+from openevo.gateway.node import GatewayNodeManager, GatewayReadinessError
 from openevo.gateway.session import SessionRegistry
-from openevo.gateway.session_files import CredentialRedactor
+from openevo.gateway.session_files import CredentialRedactor, HeldCodexCredentialAuthority
 from openevo.gateway.storage import SessionStore
 from openevo.harness.models import AgentSpec
 from openevo.rollout.models import SessionDispatchRequest, SessionStatus
@@ -17,6 +19,7 @@ from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
 from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.models import ExecInput, ExecResult, PrepareAction, RuntimeSpec
+from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
 from openevo.trajectory.models import EvaluatorSpec, StrategySpec
 from openevo.trajectory.registry import (
     default_builder_registry,
@@ -79,6 +82,272 @@ class RecordingRuntime(BaseRuntime):
     async def download_dir(self, remote_path: str, local_path: str) -> None:
         raise AssertionError("download_dir was not requested")
 
+
+def _subscription_dispatch_request(session_id: str) -> SessionDispatchRequest:
+    return SessionDispatchRequest(
+        session_id=session_id,
+        task_id=f"task-{session_id}",
+        instruction="Exercise subscription admission.",
+        remaining_timeout_seconds=10,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_subscription_authority_race_has_zero_session_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"original-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="credential-race",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+    )
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    original_copy = session_files._copy_exact
+    replaced = False
+
+    def replace_during_snapshot(source_fd: int, target_fd: int, size: int) -> None:
+        nonlocal replaced
+        original_copy(source_fd, target_fd, size)
+        if not replaced:
+            replaced = True
+            replacement = auth.with_name("auth.replacement")
+            replacement.write_text('{"access_token":"replacement"}\n', encoding="utf-8")
+            replacement.chmod(0o600)
+            os.replace(replacement, auth)
+
+    monkeypatch.setattr(session_files, "_copy_exact", replace_during_snapshot)
+    try:
+        with pytest.raises(GatewayReadinessError):
+            await manager.dispatch(_subscription_dispatch_request("authority-race"))
+        assert registry.get("authority-race") is None
+        assert storage.get_session_metadata("authority-race") is None
+        assert (await manager._dispatcher.snapshot()).active_count == 0
+        assert {path.relative_to(tmp_path) for path in tmp_path.rglob("*")} == before
+    finally:
+        await manager._client.aclose()
+        authority.close()
+
+
+@pytest.mark.asyncio
+async def test_closed_subscription_authority_has_zero_session_side_effects(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"closed-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    manager = GatewayNodeManager(
+        node_id="credential-closed",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+    )
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    authority.close()
+    try:
+        with pytest.raises(GatewayReadinessError):
+            await manager.dispatch(_subscription_dispatch_request("closed-authority"))
+        assert manager.session_registry.get("closed-authority") is None
+        assert manager.storage.get_session_metadata("closed-authority") is None
+        assert (await manager._dispatcher.snapshot()).active_count == 0
+        assert {path.relative_to(tmp_path) for path in tmp_path.rglob("*")} == before
+    finally:
+        await manager._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subscription_publication_failure_rolls_back_session_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"publication-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    manager = GatewayNodeManager(
+        node_id="credential-publication",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+    )
+
+    def fail_publication(*_args, **_kwargs) -> None:
+        raise OSError("injected renameat2 failure")
+
+    monkeypatch.setattr(session_files, "_rename_noreplace", fail_publication)
+    try:
+        with pytest.raises(GatewayReadinessError):
+            await manager.dispatch(_subscription_dispatch_request("publication-failure"))
+        assert manager.session_registry.get("publication-failure") is None
+        assert manager.storage.get_session_metadata("publication-failure") is None
+        assert (await manager._dispatcher.snapshot()).active_count == 0
+        assert list(tmp_path.glob("session-publicat-*")) == []
+        assert list(tmp_path.glob("credentials-publicat-*")) == []
+        journal_records = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in tmp_path.rglob("*.json")
+            if path.name != "auth.json"
+        ]
+        assert any(
+            record.get("kind") == "retired"
+            and record.get("session_id") == "publication-failure"
+            for record in journal_records
+        )
+    finally:
+        await manager._client.aclose()
+        authority.close()
+
+
+@pytest.mark.asyncio
+async def test_subscription_snapshot_is_point_of_no_return_for_source_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = '{"access_token":"original-secret"}\n'
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(original, encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    manager = GatewayNodeManager(
+        node_id="credential-commit",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+    )
+    real_stage = manager._stage_codex_subscription_auth
+    admitted: list[ManagedSession] = []
+
+    def replace_after_snapshot(*args, **kwargs):
+        replacement = auth.with_name("auth.replacement")
+        replacement.write_text('{"access_token":"replacement"}\n', encoding="utf-8")
+        replacement.chmod(0o600)
+        os.replace(replacement, auth)
+        return real_stage(*args, **kwargs)
+
+    async def capture_enqueue(managed: ManagedSession) -> None:
+        admitted.append(managed)
+
+    monkeypatch.setattr(manager, "_stage_codex_subscription_auth", replace_after_snapshot)
+    monkeypatch.setattr(manager._dispatcher, "enqueue", capture_enqueue)
+    try:
+        await manager.dispatch(_subscription_dispatch_request("snapshot-commit"))
+        assert len(admitted) == 1
+        managed = admitted[0]
+        assert managed.credential_dir is not None
+        assert (managed.credential_dir / "auth.json").read_text() == original
+        assert manager.session_registry.get("snapshot-commit") is not None
+    finally:
+        await manager._client.aclose()
+        authority.close()
+
+
+@pytest.mark.asyncio
+async def test_subscription_dispatch_cancellation_releases_snapshot_and_session_state(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "home" / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"access_token":"cancellation-secret"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    authority = HeldCodexCredentialAuthority.open(auth)
+    manager = GatewayNodeManager(
+        node_id="credential-cancellation",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+        credential_authority=authority,
+    )
+    manager._dispatcher._started = True
+    before_fds = len(os.listdir("/proc/self/fd"))
+    await manager._dispatcher._lock.acquire()
+    task = asyncio.create_task(
+        manager.dispatch(_subscription_dispatch_request("cancelled-admission"))
+    )
+    try:
+        async with asyncio.timeout(5):
+            while manager.session_registry.get("cancelled-admission") is None:
+                await asyncio.sleep(0)
+        task.cancel()
+        manager._dispatcher._lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert manager.session_registry.get("cancelled-admission") is None
+        assert manager.storage.get_session_metadata("cancelled-admission") is None
+        assert (await manager._dispatcher.snapshot()).active_count == 0
+        assert list(tmp_path.glob("session-cancelle-*")) == []
+        assert list(tmp_path.glob("credentials-cancelle-*")) == []
+        journal_records = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in tmp_path.rglob("*.json")
+            if path.name != "auth.json"
+        ]
+        assert any(
+            record.get("kind") == "retired"
+            and record.get("session_id") == "cancelled-admission"
+            for record in journal_records
+        )
+        assert len(os.listdir("/proc/self/fd")) == before_fds
+    finally:
+        if manager._dispatcher._lock.locked():
+            manager._dispatcher._lock.release()
+        manager._dispatcher._started = False
+        await manager._client.aclose()
+        authority.close()
 
 @pytest.mark.asyncio
 async def test_dispatch_runs_runtime_lifecycle_and_builds_stdout_trajectory(

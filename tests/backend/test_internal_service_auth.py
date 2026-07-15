@@ -591,6 +591,69 @@ def test_gateway_auth_replacement_fails_before_admission_or_session_side_effect(
         gateway_server._credential_authority = None
 
 
+def test_gateway_credential_publication_failure_is_typed_retryable_503(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class DispatchProbe:
+        async def dispatch(self, _request) -> None:
+            raise gateway_server.GatewayReadinessError("private security detail")
+
+    class AdmissionVerifier:
+        async def verify(self, _check: GenerationBoundRunAdmissionCheck) -> None:
+            return None
+
+    monkeypatch.setattr(
+        gateway_server,
+        "get_state",
+        lambda: SimpleNamespace(
+            node=SimpleNamespace(id="core-gateway"),
+            node_manager=DispatchProbe(),
+        ),
+    )
+    identity = _identity("gateway")
+    authority = _credential_authority(tmp_path)
+    gateway_server._internal_identity = identity
+    gateway_server._run_admission_verifier = AdmissionVerifier()
+    gateway_server._credential_authority = authority
+    try:
+        response = TestClient(gateway_server.app).post(
+            "/sessions",
+            headers=identity.request_headers(),
+            json={
+                "session_id": "credential-publication-failure",
+                "task_id": "credential-publication-task",
+                "instruction": "must not be registered",
+                "remaining_timeout_seconds": 30,
+                "agent": {
+                    "harness": "codex",
+                    "settings": {
+                        "auth_mode": "subscription",
+                        "capture_mode": "transcript",
+                    },
+                },
+                "runtime": {"image": "caller-supplied-image"},
+            },
+        )
+        assert response.status_code == 503
+        assert response.json() == {
+            "error": {
+                "code": "credential_readiness_failed",
+                "message": (
+                    "The managed subscription credential was not ready for session admission."
+                ),
+                "retryable": True,
+            }
+        }
+        assert "private security detail" not in response.text
+        assert "REGISTERED" not in response.text
+    finally:
+        authority.close()
+        gateway_server._internal_identity = None
+        gateway_server._run_admission_verifier = None
+        gateway_server._credential_authority = None
+
+
 def test_gateway_internal_management_routes_fail_closed_without_auth() -> None:
     gateway_server._internal_identity = _identity("gateway")
     try:

@@ -119,6 +119,10 @@ class ScienceRunConflict(ScienceRunStoreError):
     pass
 
 
+class ScienceRunIdempotencyConflict(ScienceRunConflict):
+    pass
+
+
 class ScienceRunPreconditionFailed(ScienceRunStoreError):
     pass
 
@@ -193,7 +197,7 @@ class ScienceRunStore:
                     pending.request_digest != request_digest
                     or pending.request_json != request_json
                 ):
-                    raise ScienceRunConflict("run idempotency key was reused")
+                    raise ScienceRunIdempotencyConflict("run idempotency key was reused")
                 self._create_condition.wait()
                 if self._closed:
                     raise ScienceRunStoreError("science run store is closed")
@@ -467,7 +471,9 @@ class ScienceRunStore:
             ).fetchone()
             if row is not None:
                 if row["request_digest"] != request_digest:
-                    raise ScienceRunConflict("run mutation idempotency key was reused")
+                    raise ScienceRunIdempotencyConflict(
+                        "run mutation idempotency key was reused"
+                    )
                 if int(row["status_code"]) != status_code:
                     raise ScienceRunStoreError("persisted mutation status changed")
                 response = (
@@ -914,7 +920,7 @@ def _existing_create_run(
         existing["request_digest"] != request_digest
         or bytes(existing["request_json"]) != request_json
     ):
-        raise ScienceRunConflict("run idempotency key was reused")
+        raise ScienceRunIdempotencyConflict("run idempotency key was reused")
     return _model(m.RunV1, existing["run_json"])
 
 
@@ -1004,6 +1010,7 @@ def _object_value(payload: bytes | str, *, label: str) -> dict[str, object]:
 __all__ = [
     "ScienceRunConflict",
     "ScienceRunCreateAdmission",
+    "ScienceRunIdempotencyConflict",
     "ScienceRunNotFound",
     "ScienceRunPreconditionFailed",
     "ScienceRunStore",

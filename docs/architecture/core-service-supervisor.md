@@ -154,13 +154,17 @@ managed Science Dockerfile. Supervisor preflight and Docker runtime creation use
 the same authoritative verifier; the latter receives the verified immutable
 image reference rather than the mutable tag. It opens `~/.codex/auth.json`
 no-follow, requires a link-count-one owner-owned `0600` file, and retains that
-read-only descriptor plus a verified absolute-directory pin as the generation's
-credential authority. Only the FD number is inherited by Gateway; auth content
-is never placed in argv, ordinary environment values, logs, public APIs, or
-durable state. Gateway revalidates the held inode and current pathname before
-run admission and again before staging the private Codex home. Atomic pathname
-replacement therefore fails closed instead of switching a ready generation to
-different subscription evidence. Probe stdout and stderr are drained concurrently without
+read-only descriptor, content digest, and verified absolute-directory pin as
+the generation's credential authority. Only the FD number is inherited by
+Gateway; auth content is never placed in argv, ordinary environment values,
+logs, public APIs, or durable state. Before any session side effect, Gateway
+copies only from that FD into a sealed anonymous snapshot and revalidates the
+held inode, digest, and current pathname before and after the copy. The final
+authority check commits the per-run snapshot: replacement before that point
+fails with a typed retryable 503, while replacement afterward does not revoke
+the committed run or require the source pathname to remain stable. Gateway
+synchronously publishes the committed bytes to the private Codex home before
+session registration, queueing, or HTTP success. Probe stdout and stderr are drained concurrently without
 `communicate()`. One hard aggregate byte budget covers both streams; crossing it
 immediately kills the complete probe process group and performs a bounded leader
 reap. Cancellation and deadline paths use the same group-wide bounded cleanup.

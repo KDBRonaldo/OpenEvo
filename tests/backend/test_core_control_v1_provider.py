@@ -5144,6 +5144,26 @@ class _SuccessfulMutationRunControl(_RecordingRunControl):
         return "owner-retried"
 
 
+class _DurableIdempotencyRunControl(_RecordingRunControl):
+    def __init__(self) -> None:
+        super().__init__()
+        self._accepted: Mapping[str, object] | None = None
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self.invocations.append((operation_id, arguments))
+        if self._accepted is None:
+            self._accepted = dict(arguments)
+            return "owner-retried"
+        if dict(arguments) != self._accepted:
+            raise CoreRunControlError(
+                "idempotency_key_reused",
+                "The idempotency key was already used for a different request.",
+                http_status=409,
+                retryable=False,
+            )
+        return "owner-retried"
+
+
 class _BlockingSuccessfulRunControl(_RecordingRunControl):
     def __init__(self) -> None:
         super().__init__()
@@ -6852,6 +6872,41 @@ def test_concurrent_run_mutation_same_key_with_different_payload_conflicts(
         assert first.result(timeout=10) == "owner-retried"
 
     assert [invocation[0] for invocation in run_control.invocations] == ["cancelCoreRunV1"]
+
+
+def test_durable_run_idempotency_conflict_does_not_poison_exact_replay(
+    tmp_path: Path,
+) -> None:
+    original = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "durable-conflict-key",
+    }
+    conflicting = {**original, "request": {"reason": "superseded"}}
+    run_control = _DurableIdempotencyRunControl()
+
+    first_app = _app(tmp_path, run_control=run_control)
+    with TestClient(first_app):
+        assert (
+            first_app.state.core_control_provider.invoke("cancelCoreRunV1", original)
+            == "owner-retried"
+        )
+
+    restarted_app = _app(tmp_path, run_control=run_control)
+    provider = restarted_app.state.core_control_provider
+    with TestClient(restarted_app):
+        with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+            provider.invoke("cancelCoreRunV1", conflicting)
+        assert raised.value.error.code == "idempotency_key_reused"
+        assert provider.store.replay_failed_idempotency("cancelCoreRunV1", original) is None
+        assert provider.invoke("cancelCoreRunV1", original) == "owner-retried"
+
+    assert [invocation[0] for invocation in run_control.invocations] == [
+        "cancelCoreRunV1",
+        "cancelCoreRunV1",
+        "cancelCoreRunV1",
+    ]
 
 
 def test_run_mutation_success_replay_is_bounded_and_lru_evicted(

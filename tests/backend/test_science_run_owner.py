@@ -425,7 +425,7 @@ def test_create_is_idempotent_and_rejects_a_valid_mismatched_reuse(
         mismatched = _run_request(store.get_project(project.id))
         with pytest.raises(CoreRunControlError) as error:
             _invoke_create(owner, mismatched, "create-key")
-        assert error.value.code == "run_conflict"
+        assert error.value.code == "idempotency_key_reused"
         assert len(owner._ledger.list_runs()) == 1
     finally:
         services.ensure_allowed.set()
@@ -460,7 +460,7 @@ def test_create_replay_and_conflict_precede_volatile_readiness(
         mismatched = request.model_copy(update={"expected_registry_digest": "e" * 64})
         with pytest.raises(CoreRunControlError) as conflict:
             _invoke_create(owner, mismatched, "readiness-order")
-        assert conflict.value.code == "run_conflict"
+        assert conflict.value.code == "idempotency_key_reused"
         assert services.ensure_calls == calls_before_replay
         assert len(owner._ledger.list_runs()) == 1
     finally:
@@ -845,7 +845,7 @@ def test_retry_enforces_etag_attempt_binding_and_idempotent_replay(
                 "retryCoreRunV1",
                 {**arguments, "if_match": accepted.etag},
             )
-        assert reused.value.code == "run_conflict"
+        assert reused.value.code == "idempotency_key_reused"
         retry_allowed.set()
         succeeded = _wait_for_status(owner, created.id, m.RunStatus.SUCCEEDED)
         assert succeeded.attempt_count == 2

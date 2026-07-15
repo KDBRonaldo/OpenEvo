@@ -35,6 +35,7 @@ from openevo.gateway.session_files import (
     CredentialFileIdentity,
     CredentialRedactor,
     HeldCodexCredentialAuthority,
+    PreparedCodexCredentialSnapshot,
     SessionFileSecurityError,
     StagedCodexCredential,
     VerifiedSessionTranscript,
@@ -140,6 +141,10 @@ class GatewayExecutionTimeout(TimeoutError):
 
 class CancelAuthorityPersistenceError(RuntimeError):
     """Raised when cancellation cannot be made durable before runtime effects."""
+
+
+class GatewayReadinessError(RuntimeError):
+    """Stable admission failure for managed credential readiness or publication."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -756,13 +761,22 @@ class GatewayNodeManager:
 
     async def dispatch(self, request: SessionDispatchRequest) -> None:
         self._canonicalize_request_capture_mode(request)
-        if _is_codex_subscription_agent(request.agent):
-            self.verify_credential_authority()
         session_id = request.session_id
         if self.session_registry.get(session_id) is not None:
             raise ValueError(
                 f"session {session_id} already exists; rollout session IDs are single-use"
             )
+
+        runtime_spec = self._resolve_runtime_spec(request)
+        self._validate_subscription_admission(request, runtime_spec, None)
+        prepared_credential: PreparedCodexCredentialSnapshot | None = None
+        if _is_codex_subscription_agent(request.agent):
+            try:
+                prepared_credential = self._prepare_codex_subscription_auth(request)
+            except SessionFileSecurityError as exc:
+                raise GatewayReadinessError(
+                    "managed subscription credential readiness failed"
+                ) from exc
 
         session_dir: Path | None = None
         session_root_identity: tuple[int, int, int] | None = None
@@ -770,23 +784,6 @@ class GatewayNodeManager:
         log_authority_identity: tuple[int, int, int] | None = None
         managed: ManagedSession | None = None
         try:
-            info = self.session_registry.register(
-                session_id,
-                task_id=request.task_id,
-                registered=True,
-                status=SessionStatus.REGISTERED,
-                metadata=dict(request.metadata),
-            )
-            self.storage.ensure_session(
-                info.session_id,
-                model_requested=None,
-                model_used=None,
-                api_type=None,
-                task_id=info.task_id,
-                created_at=info.created_at.isoformat(),
-                metadata=dict(request.metadata),
-            )
-
             timer = StageTimer()
             timer.mark("dispatch", "started")
             session_dir = Path(
@@ -808,26 +805,83 @@ class GatewayNodeManager:
                 log_authority_dir=log_authority_dir,
                 log_authority_identity=log_authority_identity,
             )
+            self._validate_subscription_admission(request, runtime_spec, session_dir)
+            self._validate_runtime_admission(runtime_spec, managed)
+            if prepared_credential is not None:
+                try:
+                    self._publish_prepared_codex_subscription_auth(
+                        managed,
+                        prepared_credential,
+                    )
+                except Exception as exc:
+                    raise GatewayReadinessError(
+                        "managed subscription credential publication failed"
+                    ) from exc
+
+            info = self.session_registry.register(
+                session_id,
+                task_id=request.task_id,
+                registered=True,
+                status=SessionStatus.REGISTERED,
+                metadata=dict(request.metadata),
+            )
+            self.storage.ensure_session(
+                info.session_id,
+                model_requested=None,
+                model_used=None,
+                api_type=None,
+                task_id=info.task_id,
+                created_at=info.created_at.isoformat(),
+                metadata=dict(request.metadata),
+            )
             self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
             await self._dispatcher.enqueue(managed)
-        except Exception:
-            self.storage.delete_session(session_id)
-            self.session_registry.remove(session_id)
+        except BaseException:
+            try:
+                self.storage.delete_session(session_id)
+                self.session_registry.remove(session_id)
+            except Exception as exc:
+                self._log_credential_safe_exception(
+                    managed,
+                    "Failed to roll back session registration",
+                    exc,
+                    session_id=session_id,
+                    level=logging.WARNING,
+                )
+            cleanup_complete = True
             if session_dir is not None:
-                await self._remove_session_dir_best_effort(
+                cleanup_complete = await self._remove_session_dir_best_effort(
                     session_dir,
                     session_id,
                     session_root_identity,
-                )
+                ) and cleanup_complete
             if log_authority_dir is not None:
-                await self._remove_log_authority_best_effort(
+                cleanup_complete = await self._remove_log_authority_best_effort(
                     log_authority_dir,
                     session_id,
                     log_authority_identity,
-                )
-            if managed is not None:
-                self._retire_cleanup_ownership(self._cleanup_ownership_for(managed))
+                ) and cleanup_complete
+            if managed is not None and managed.credential_dir is not None:
+                cleanup_complete = await self._remove_credential_dir_best_effort(
+                    managed.credential_dir,
+                    session_id,
+                    managed.credential_root_identity,
+                    managed.credential_auth_identity,
+                ) and cleanup_complete
+            if managed is not None and cleanup_complete:
+                try:
+                    self._retire_cleanup_ownership(self._cleanup_ownership_for(managed))
+                except Exception as exc:
+                    self._log_credential_safe_exception(
+                        managed,
+                        "Failed to retire rolled-back session ownership",
+                        exc,
+                        level=logging.WARNING,
+                    )
             raise
+        finally:
+            if prepared_credential is not None:
+                prepared_credential.close()
 
     async def cancel(self, session_id: str) -> bool:
         def persist_cancel_authority(managed: ManagedSession) -> None:
@@ -877,6 +931,12 @@ class GatewayNodeManager:
             runtime_spec = self._resolve_runtime_spec(request)
             self._validate_subscription_admission(request, runtime_spec, managed.session_dir)
             self._validate_runtime_admission(runtime_spec, managed)
+            if _is_codex_subscription_agent(request.agent) and (
+                managed.credential_mount is None or managed.credential_redactor is None
+            ):
+                raise RuntimeError(
+                    "subscription credential was not committed before session admission"
+                )
             if _is_codex_subscription_agent(request.agent):
                 runtime_spec = runtime_spec.model_copy(
                     update={
@@ -886,35 +946,6 @@ class GatewayNodeManager:
                         }
                     }
                 )
-            if _is_codex_subscription_agent(request.agent):
-                credential_dir = Path(
-                    mkdtemp(
-                        prefix=f"credentials-{request.session_id[:8]}-",
-                        dir=managed.session_dir.parent,
-                    )
-                )
-                managed.credential_dir = credential_dir
-                managed.credential_root_identity = capture_session_root_identity(credential_dir)
-                self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
-
-                def persist_auth_identity(auth_identity: CredentialFileIdentity) -> None:
-                    managed.credential_auth_identity = auth_identity
-                    self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
-
-                staged_credential = self._stage_codex_subscription_auth(
-                    request,
-                    managed.credential_dir,
-                    managed.credential_root_identity,
-                    on_identity=persist_auth_identity,
-                )
-                managed.credential_redactor = staged_credential.redactor
-                managed.credential_auth_identity = staged_credential.auth_identity
-                managed.credential_mount = ManagedCredentialMount(
-                    root=managed.credential_dir,
-                    root_identity=managed.credential_root_identity,
-                    auth_identity=staged_credential.auth_identity,
-                )
-                self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
             if managed.credential_dir is None:
                 runtime = create_runtime(
                     runtime_spec,
@@ -1035,6 +1066,7 @@ class GatewayNodeManager:
         credential_dir: Path,
         credential_root_identity: tuple[int, int, int] | None = None,
         *,
+        prepared_snapshot: PreparedCodexCredentialSnapshot | None = None,
         on_identity: Callable[[CredentialFileIdentity], None] | None = None,
     ) -> StagedCodexCredential:
         if not _is_codex_subscription_agent(request.agent):
@@ -1044,14 +1076,76 @@ class GatewayNodeManager:
         try:
             return stage_codex_subscription_auth(
                 source=Path.home() / ".codex" / "auth.json",
-                source_authority=getattr(self, "_credential_authority", None),
+                source_authority=(
+                    None
+                    if prepared_snapshot is not None
+                    else getattr(self, "_credential_authority", None)
+                ),
+                prepared_snapshot=prepared_snapshot,
                 session_dir=credential_dir,
                 session_identity=identity,
                 target_home_parts=(),
                 on_identity=on_identity,
             )
-        except SessionFileSecurityError as exc:
-            raise RuntimeError(str(exc)) from exc
+        except SessionFileSecurityError:
+            raise
+
+    def _publish_prepared_codex_subscription_auth(
+        self,
+        managed: ManagedSession,
+        prepared_snapshot: PreparedCodexCredentialSnapshot,
+    ) -> None:
+        request = managed.request
+        credential_dir = Path(
+            mkdtemp(
+                prefix=f"credentials-{request.session_id[:8]}-",
+                dir=managed.session_dir.parent,
+            )
+        )
+        managed.credential_dir = credential_dir
+        managed.credential_root_identity = capture_session_root_identity(credential_dir)
+        self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
+
+        def persist_auth_identity(auth_identity: CredentialFileIdentity) -> None:
+            managed.credential_auth_identity = auth_identity
+            self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
+
+        staged_credential = self._stage_codex_subscription_auth(
+            request,
+            credential_dir,
+            managed.credential_root_identity,
+            prepared_snapshot=prepared_snapshot,
+            on_identity=persist_auth_identity,
+        )
+        managed.credential_redactor = staged_credential.redactor
+        managed.credential_auth_identity = staged_credential.auth_identity
+        managed.credential_mount = ManagedCredentialMount(
+            root=credential_dir,
+            root_identity=managed.credential_root_identity,
+            auth_identity=staged_credential.auth_identity,
+        )
+        self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
+
+    def _prepare_codex_subscription_auth(
+        self,
+        request: SessionDispatchRequest,
+    ) -> PreparedCodexCredentialSnapshot:
+        if not _is_codex_subscription_agent(request.agent):
+            raise RuntimeError("credential preparation requires a Codex subscription agent")
+        authority = getattr(self, "_credential_authority", None)
+        if authority is not None:
+            return authority.prepare_snapshot()
+        if getattr(self, "_internal_headers", None):
+            raise SessionFileSecurityError(
+                "release Gateway credential authority is unavailable"
+            )
+        temporary_authority = HeldCodexCredentialAuthority.open(
+            Path.home() / ".codex" / "auth.json"
+        )
+        try:
+            return temporary_authority.prepare_snapshot()
+        finally:
+            temporary_authority.close()
 
     def verify_credential_authority(self) -> None:
         authority = getattr(self, "_credential_authority", None)
@@ -1071,7 +1165,7 @@ class GatewayNodeManager:
     def _validate_subscription_admission(
         request: SessionDispatchRequest,
         runtime_spec: RuntimeSpec,
-        session_dir: Path,
+        session_dir: Path | None,
     ) -> None:
         if not _is_subscription_agent(request.agent):
             return
@@ -1112,8 +1206,12 @@ class GatewayNodeManager:
         if runtime_spec.import_path is not None or runtime_spec.kwargs:
             raise RuntimeError("subscription execution forbids custom runtime loaders and options")
 
-        auth_path = (Path.home() / ".codex" / "auth.json").resolve()
-        protected_paths = (auth_path, session_dir.resolve())
+        auth_path = Path(os.path.abspath(Path.home() / ".codex" / "auth.json"))
+        protected_paths = (
+            (auth_path,)
+            if session_dir is None
+            else (auth_path, session_dir.resolve())
+        )
         for action in runtime_spec.prepare:
             if action.type not in {"upload_file", "upload_dir"} or not action.source:
                 continue

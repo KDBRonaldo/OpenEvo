@@ -633,6 +633,7 @@ class LocalManagedScienceRuntimeProbe:
             code=ServiceRunReadinessCode.READY,
             identity_digest=_digest_json(
                 {
+                    "auth_content_sha256": credential_authority.content_sha256,
                     "auth_identity": credential_authority.identity,
                     "codex_model": request.codex_model,
                     "codex_version_output_digest": hashlib.sha256(codex.stdout).hexdigest(),
@@ -2602,7 +2603,11 @@ class CoreServiceSupervisor:
         candidate: HeldCodexCredentialAuthority,
     ) -> bool:
         active = self._active_credential_authority
-        if active is None or active.identity != candidate.identity:
+        if (
+            active is None
+            or active.identity != candidate.identity
+            or active.content_sha256 != candidate.content_sha256
+        ):
             return False
         try:
             active.verify()

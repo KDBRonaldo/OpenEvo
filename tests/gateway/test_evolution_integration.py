@@ -545,9 +545,9 @@ async def test_invalid_subscription_auth_fails_before_runtime_creation(
 
     create.assert_not_called()
     assert managed.runtime is None
-    assert managed.pending_status == SessionStatus.ERROR
-    assert managed.credential_dir is not None
-    assert not (managed.credential_dir / "auth.json").exists()
+    assert managed.final_result is not None
+    assert managed.final_result.status == SessionStatus.ERROR
+    assert managed.credential_dir is None
 
 
 @pytest.mark.asyncio
@@ -588,30 +588,33 @@ async def test_subscription_initialization_exception_log_redacts_credential_cana
     manager._cleanup_retries = {}
     manager._cleanup_journal_dir = tmp_path / "journal"
     manager._docker_ownership_root = tmp_path / "docker-ownership"
-
-    def stage_auth(_request, credential_dir, _identity, *, on_identity=None):
-        auth = credential_dir / "auth.json"
-        auth.write_text(f'{{"access_token":"{secret}"}}\n', encoding="utf-8")
-        auth.chmod(0o600)
-        state = auth.stat(follow_symlinks=False)
-        credential = session_files.StagedCodexCredential(
-            redactor=session_files.CredentialRedactor.from_auth_json(auth.read_bytes()),
-            auth_identity=(
-                state.st_dev,
-                state.st_ino,
-                state.st_mode,
-                state.st_uid,
-                state.st_nlink,
-                state.st_size,
-                state.st_mtime_ns,
-                state.st_ctime_ns,
-            ),
-        )
-        if on_identity is not None:
-            on_identity(credential.auth_identity)
-        return credential
-
-    monkeypatch.setattr(manager, "_stage_codex_subscription_auth", stage_auth)
+    credential_dir = tmp_path / "credentials"
+    credential_dir.mkdir(mode=0o700)
+    auth = credential_dir / "auth.json"
+    auth.write_text(f'{{"access_token":"{secret}"}}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    state = auth.stat(follow_symlinks=False)
+    auth_identity = (
+        state.st_dev,
+        state.st_ino,
+        state.st_mode,
+        state.st_uid,
+        state.st_nlink,
+        state.st_size,
+        state.st_mtime_ns,
+        state.st_ctime_ns,
+    )
+    managed.credential_dir = credential_dir
+    managed.credential_root_identity = capture_session_root_identity(credential_dir)
+    managed.credential_auth_identity = auth_identity
+    managed.credential_redactor = session_files.CredentialRedactor.from_auth_json(
+        auth.read_bytes()
+    )
+    managed.credential_mount = ManagedCredentialMount(
+        root=credential_dir,
+        root_identity=managed.credential_root_identity,
+        auth_identity=auth_identity,
+    )
     monkeypatch.setattr(
         node_module,
         "create_runtime",

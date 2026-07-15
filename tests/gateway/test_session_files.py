@@ -67,6 +67,32 @@ def test_held_credential_authority_rejects_atomic_auth_replacement(
         authority.close()
 
 
+def test_committed_snapshot_survives_later_auth_path_replacement(tmp_path: Path) -> None:
+    original = '{"access_token":"readiness-secret"}\n'
+    source = _private_auth(tmp_path, original)
+    authority = HeldCodexCredentialAuthority.open(source)
+    snapshot = authority.prepare_snapshot()
+    replacement = source.with_name("auth.replacement")
+    replacement.write_text('{"access_token":"replacement-secret"}\n', encoding="utf-8")
+    replacement.chmod(0o600)
+    os.replace(replacement, source)
+    root, identity = _session_root(tmp_path)
+    try:
+        stage_codex_subscription_auth(
+            source=source,
+            prepared_snapshot=snapshot,
+            session_dir=root,
+            session_identity=identity,
+            target_home_parts=("home", ".codex"),
+        )
+        assert (root / "home" / ".codex" / "auth.json").read_text() == original
+        with pytest.raises(SessionFileSecurityError, match="changed"):
+            authority.verify()
+    finally:
+        snapshot.close()
+        authority.close()
+
+
 def test_log_writer_and_reader_share_private_pinned_authority(tmp_path: Path) -> None:
     root, identity = _session_root(tmp_path)
 
@@ -252,14 +278,18 @@ def test_auth_staging_detects_credential_root_ancestor_replacement(
     identity = capture_session_root_identity(root)
     displaced_anchor = tmp_path / "displaced-credential-anchor"
     original_copy = session_files._copy_exact
+    copy_count = 0
 
     def replace_ancestor_then_copy(
         source_fd: int,
         target_fd: int,
         expected_size: int,
     ) -> None:
-        anchor.rename(displaced_anchor)
-        root.mkdir(parents=True, mode=0o700)
+        nonlocal copy_count
+        copy_count += 1
+        if copy_count == 2:
+            anchor.rename(displaced_anchor)
+            root.mkdir(parents=True, mode=0o700)
         original_copy(source_fd, target_fd, expected_size)
 
     monkeypatch.setattr(session_files, "_copy_exact", replace_ancestor_then_copy)
@@ -293,21 +323,56 @@ def test_auth_staging_detects_target_replacement_without_leaking_secret(
     assert secret not in target.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("race_target", ["source", "target"])
-def test_auth_staging_final_path_recheck_detects_new_hardlink(
+def test_auth_snapshot_final_authority_recheck_detects_new_source_hardlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    race_target: str,
+) -> None:
+    secret = '{"access_token":"canary-secret"}\n'
+    source = _private_auth(tmp_path, secret)
+    root, identity = _session_root(tmp_path)
+    raced_link = source.with_name("raced-source-link.json")
+    authority = HeldCodexCredentialAuthority.open(source)
+    original_verify = HeldCodexCredentialAuthority.verify
+    verify_count = 0
+
+    def add_hardlink_before_final_verify(
+        candidate: HeldCodexCredentialAuthority,
+    ) -> None:
+        nonlocal verify_count
+        verify_count += 1
+        if candidate is authority and verify_count == 3:
+            os.link(source, raced_link)
+        original_verify(candidate)
+
+    monkeypatch.setattr(
+        HeldCodexCredentialAuthority,
+        "verify",
+        add_hardlink_before_final_verify,
+    )
+    try:
+        with pytest.raises(SessionFileSecurityError, match="changed"):
+            stage_codex_subscription_auth(
+                source=source,
+                source_authority=authority,
+                session_dir=root,
+                session_identity=identity,
+                target_home_parts=("home", ".codex"),
+            )
+    finally:
+        authority.close()
+
+    assert not (root / "home" / ".codex" / "auth.json").exists()
+
+
+def test_auth_staging_final_path_recheck_detects_new_target_hardlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     secret = '{"access_token":"canary-secret"}\n'
     source = _private_auth(tmp_path, secret)
     root, identity = _session_root(tmp_path)
     target = root / "home" / ".codex" / "auth.json"
-    raced_link = (
-        source.with_name("raced-source-link.json")
-        if race_target == "source"
-        else target.with_name("raced-target-link.json")
-    )
+    raced_link = target.with_name("raced-target-link.json")
     original_require = session_files._require_path_identity
     raced = False
 
@@ -319,9 +384,7 @@ def test_auth_staging_final_path_recheck_detects_new_hardlink(
         label: str,
     ) -> None:
         nonlocal raced
-        is_selected = (race_target == "source" and label == "Codex subscription auth") or (
-            race_target == "target" and label == "staged Codex auth" and target.exists()
-        )
+        is_selected = label == "staged Codex auth" and target.exists()
         if is_selected and not raced:
             raced = True
             os.link(
@@ -343,8 +406,7 @@ def test_auth_staging_final_path_recheck_detects_new_hardlink(
         _stage(source, root, identity)
 
     assert not target.exists()
-    if race_target == "target":
-        assert secret not in raced_link.read_text(encoding="utf-8")
+    assert secret not in raced_link.read_text(encoding="utf-8")
 
 
 def test_auth_staging_rejects_same_size_target_content_mismatch(

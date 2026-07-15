@@ -147,24 +147,31 @@ class SessionDispatcher:
         self._started = False
 
     async def start(self) -> None:
-        if self._started:
-            return
-        self._workers = [
-            *(asyncio.create_task(self._init_worker()) for _ in range(self.max_init_workers)),
-            *(asyncio.create_task(self._run_worker()) for _ in range(self.max_run_workers)),
-            *(
-                asyncio.create_task(self._postrun_worker())
-                for _ in range(self.max_postrun_workers)
-            ),
-        ]
-        self._started = True
+        async with self._lock:
+            if self._started:
+                return
+            self._workers = [
+                *(
+                    asyncio.create_task(self._init_worker())
+                    for _ in range(self.max_init_workers)
+                ),
+                *(asyncio.create_task(self._run_worker()) for _ in range(self.max_run_workers)),
+                *(
+                    asyncio.create_task(self._postrun_worker())
+                    for _ in range(self.max_postrun_workers)
+                ),
+            ]
+            self._started = True
 
     async def stop(self) -> list[ManagedSession]:
         if not self._started:
             return []
         async with self._lock:
+            self._started = False
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            workers = self._workers
+            self._workers = []
         cancel_tasks: list[tuple[ManagedSession, Awaitable[None]]] = []
         for managed in sessions:
             managed.cancel_requested = True
@@ -185,22 +192,23 @@ class SessionDispatcher:
                         outcome,
                         level=logging.WARNING,
                     )
-        for task in self._workers:
+        for task in workers:
             task.cancel()
-        if self._workers:
-            await asyncio.gather(*self._workers, return_exceptions=True)
-        self._workers.clear()
-        self._started = False
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
         return sessions
 
     async def enqueue(self, managed: ManagedSession) -> None:
-        if not self._started:
-            raise RuntimeError("dispatcher has not been started")
         async with self._lock:
+            if not self._started:
+                raise RuntimeError("dispatcher has not been started")
             if managed.session_id in self._sessions:
                 raise ValueError(f"session {managed.session_id} is already enqueued")
             self._sessions[managed.session_id] = managed
-        await self._init_queue.put(managed.session_id)
+            # The queue is unbounded. Publish while still holding the registry
+            # lock so cancellation cannot strand a registered session between
+            # the in-memory admission and its INIT work item.
+            self._init_queue.put_nowait(managed.session_id)
 
     async def cancel(
         self,

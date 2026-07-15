@@ -53,7 +53,11 @@ When a `CoreRunControl` is injected, its operation-ID set must exactly equal all
 frozen `/v1/runs*` routes, including `listCoreRunArtifactsV1`. Retryable errors
 from that owner are not persisted as failed idempotency results, so an exact
 same-key mutation retry calls the owner again; non-retryable failures retain the
-existing replay policy. A retry of a retryable run error persisted by an older
+existing replay policy. Durable owner detection of a different canonical
+request under the same key maps exactly to `idempotency_key_reused`; that
+conflict is never persisted as a failed result, so the original exact request
+remains replayable after process-local eviction or restart. A retry of a
+retryable run error persisted by an older
 Core version first compares the request digest in constant time, then
 transactionally removes that exact failed row before calling the owner. The
 provider coalesces concurrent exact keyed run mutations through a bounded
