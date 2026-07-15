@@ -13,6 +13,8 @@ from desktop.server.launcher import main
 BUILD_METADATA_RELATIVE_PATH = Path("desktop/packaging/sidecar-build-metadata.json")
 BUILD_METADATA_MAX_BYTES = 1024
 NATIVE_EXECUTABLE_PATH_ENV = "OPENEVO_NATIVE_EXECUTABLE_PATH"
+NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"
+NATIVE_EXECUTABLE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"
 
 
 @dataclass(frozen=True)
@@ -56,7 +58,10 @@ def _load_packaged_build_metadata() -> _PackagedBuildMetadata:
 
 
 if __name__ == "__main__":
-    os.environ.pop("OPENEVO_NATIVE_EXECUTABLE_FD", None)
+    if os.environ.pop(NATIVE_LISTENER_FD_ENV, None) != "3":
+        raise ValueError("invalid packaged native listener handoff")
+    if os.environ.pop(NATIVE_EXECUTABLE_FD_ENV, None) != "4":
+        raise ValueError("invalid packaged native archive handoff")
     os.environ.pop(NATIVE_EXECUTABLE_PATH_ENV, None)
     metadata = _load_packaged_build_metadata()
     raise SystemExit(main(packaged_source_commit=metadata.source_commit))

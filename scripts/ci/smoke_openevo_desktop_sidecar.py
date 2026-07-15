@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import hmac
 from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
 import posixpath
 import re
+import secrets
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -37,7 +43,16 @@ EXPECTED_ACTIVE_SELECTIONS = {
     "skill_bundle": "skill_bundle_reflector",
     "text_memory": "text_memory_reflector",
 }
-SIDECAR_MUTATION_TOKEN_HEADER = "X-OpenEvo-Sidecar-Token"
+DESKTOP_SESSION_HEADER = "X-OpenEvo-Desktop-Session"
+NATIVE_CHALLENGE_HEADER = "X-OpenEvo-Native-Challenge"
+NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
+NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"
+NATIVE_ARCHIVE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"
+NATIVE_ARCHIVE_PATH_ENV = "OPENEVO_NATIVE_EXECUTABLE_PATH"
+NATIVE_LISTENER_FD = 3
+NATIVE_ARCHIVE_FD = 4
+NATIVE_GUARD_MIN_FD = 64
+NATIVE_SIDECAR_BASENAME = "openevo-desktop-sidecar"
 _LOCAL_HTTP_OPENER = build_opener(ProxyHandler({}))
 
 
@@ -80,10 +95,138 @@ def _asset_references(index_html: str) -> list[str]:
     return sorted(set(parser.assets))
 
 
-def _allocate_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+class _NativeCredentials:
+    def __init__(
+        self,
+        *,
+        instance_id: str,
+        readiness_key: bytes,
+        session_token: str,
+        handoff_token: str,
+    ) -> None:
+        self.instance_id = instance_id
+        self.readiness_key = readiness_key
+        self.session_token = session_token
+        self.handoff_token = handoff_token
+
+    @classmethod
+    def create(cls) -> "_NativeCredentials":
+        return cls(
+            instance_id=secrets.token_hex(16),
+            readiness_key=secrets.token_bytes(32),
+            session_token=secrets.token_hex(32),
+            handoff_token=secrets.token_hex(32),
+        )
+
+    def frame(self) -> bytes:
+        payload = {
+            "protocol": NATIVE_SIDECAR_PROTOCOL,
+            "instance_id": self.instance_id,
+            "readiness_key": self.readiness_key.hex(),
+            "session_token": self.session_token,
+            "handoff_token": self.handoff_token,
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        if len(encoded) + 1 > 512:
+            raise SmokeFailure("native sidecar frame exceeded its byte limit")
+        return encoded + b"\n"
+
+
+def _duplicate_fd(fd: int) -> int:
+    return int(fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, NATIVE_GUARD_MIN_FD))
+
+
+@contextmanager
+def _fixed_native_descriptors(listener_fd: int, archive_fd: int):
+    listener_guard = _duplicate_fd(listener_fd)
+    archive_guard = _duplicate_fd(archive_fd)
+    saved: dict[int, int | None] = {}
+    try:
+        for target in (NATIVE_LISTENER_FD, NATIVE_ARCHIVE_FD):
+            try:
+                saved[target] = _duplicate_fd(target)
+            except OSError as exc:
+                if exc.errno != 9:
+                    raise
+                saved[target] = None
+        os.dup2(listener_guard, NATIVE_LISTENER_FD, inheritable=True)
+        os.dup2(archive_guard, NATIVE_ARCHIVE_FD, inheritable=True)
+        yield
+    finally:
+        for target in (NATIVE_LISTENER_FD, NATIVE_ARCHIVE_FD):
+            previous = saved.get(target)
+            if previous is None:
+                try:
+                    os.close(target)
+                except OSError:
+                    pass
+            else:
+                os.dup2(previous, target, inheritable=False)
+                os.close(previous)
+        os.close(archive_guard)
+        os.close(listener_guard)
+
+
+def _launch_native_sidecar(
+    sidecar: Path,
+    *,
+    config_root: Path,
+    process_log,
+) -> tuple[subprocess.Popen[bytes], str, _NativeCredentials]:
+    launch_path = config_root.parent / NATIVE_SIDECAR_BASENAME
+    shutil.copyfile(sidecar, launch_path)
+    launch_path.chmod(0o500)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(128)
+    port = int(listener.getsockname()[1])
+    archive_fd = os.open(launch_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    credentials = _NativeCredentials.create()
+    child_env = dict(os.environ)
+    for name in tuple(child_env):
+        if name.startswith("_PYI_"):
+            child_env.pop(name)
+    child_env[NATIVE_LISTENER_FD_ENV] = str(NATIVE_LISTENER_FD)
+    child_env[NATIVE_ARCHIVE_FD_ENV] = str(NATIVE_ARCHIVE_FD)
+    child_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    execution_path = launch_path
+    if sys.platform == "darwin":
+        child_env[NATIVE_ARCHIVE_PATH_ENV] = str(launch_path)
+    else:
+        child_env.pop(NATIVE_ARCHIVE_PATH_ENV, None)
+        execution_path = Path(f"/proc/self/fd/{NATIVE_ARCHIVE_FD}")
+    command = [
+        str(execution_path),
+        "--listener-fd",
+        str(NATIVE_LISTENER_FD),
+        "--native-instance-stdin",
+        "--desktop-config-root",
+        str(config_root),
+    ]
+    process_log_guard = _duplicate_fd(process_log.fileno())
+    try:
+        with _fixed_native_descriptors(listener.fileno(), archive_fd):
+            process = subprocess.Popen(
+                command,
+                executable=str(execution_path),
+                stdin=subprocess.PIPE,
+                stdout=process_log_guard,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                pass_fds=(NATIVE_LISTENER_FD, NATIVE_ARCHIVE_FD),
+                start_new_session=True,
+            )
+    finally:
+        os.close(process_log_guard)
+        os.close(archive_fd)
+        listener.close()
+    if process.stdin is None:
+        _terminate(process)
+        raise SmokeFailure("native sidecar frame channel was not created")
+    process.stdin.write(credentials.frame())
+    process.stdin.close()
+    process.stdin = None
+    return process, f"http://127.0.0.1:{port}", credentials
 
 
 def _read_url(
@@ -107,7 +250,7 @@ def _read_url(
         raise SmokeFailure(
             f"{url} returned HTTP {exc.code}; expected {expected_status}"
         ) from exc
-    except URLError as exc:
+    except (URLError, OSError) as exc:
         raise SmokeFailure(f"{url} was not reachable: {exc}") from exc
 
 
@@ -264,42 +407,7 @@ def _assert_project_method_contract(method: dict[str, Any]) -> None:
         )
 
 
-def _smoke_capability_proxy(base_url: str, *, expected_core_version: str) -> str:
-    shell = _read_json(f"{base_url}/openevo-api/desktop/shell")
-    sidecar_security = shell.get("sidecar")
-    token = (
-        sidecar_security.get("mutation_token")
-        if isinstance(sidecar_security, dict)
-        else None
-    )
-    if not isinstance(token, str) or not token:
-        raise SmokeFailure("packaged sidecar did not expose a mutation token")
-
-    capability_url = f"{base_url}/openevo-api/desktop/capabilities"
-    _read_url(
-        f"{capability_url}?execution_mode=codex_subscription_transcript",
-        expected_status=403,
-    )
-    headers = {SIDECAR_MUTATION_TOKEN_HEADER: token}
-    registry_digests: set[str] = set()
-    for execution_mode in ("codex_subscription_transcript", "self-deployed"):
-        payload = _read_json(
-            f"{capability_url}?execution_mode={execution_mode}",
-            headers=headers,
-        )
-        _assert_capabilities(
-            payload,
-            execution_mode=execution_mode,
-            expected_core_version=expected_core_version,
-        )
-        registry_digests.add(payload["registry_digest"])
-    if len(registry_digests) != 1:
-        raise SmokeFailure("release modes did not resolve the same frozen registry")
-    _read_url(f"{base_url}/openevo-api/desktop/methods", expected_status=404)
-    return next(iter(registry_digests))
-
-
-def _terminate(process: subprocess.Popen[str]) -> None:
+def _terminate(process: subprocess.Popen[Any]) -> None:
     if process.poll() is not None:
         return
     try:
@@ -326,33 +434,17 @@ def smoke_sidecar(
     sidecar: Path,
     *,
     timeout_seconds: float,
-    backend_base_url: str | None = None,
-    expected_core_version: str | None = None,
-) -> str | None:
+) -> None:
     if not sidecar.is_file():
         raise SmokeFailure(f"sidecar executable does not exist: {sidecar}")
 
-    port = _allocate_port()
-    base_url = f"http://127.0.0.1:{port}"
-    with TemporaryDirectory(prefix="openevo-sidecar-smoke-") as config_root:
-        command = [
-            str(sidecar),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--desktop-config-root",
-            config_root,
-        ]
-        if backend_base_url is not None:
-            command.extend(["--backend-base-url", backend_base_url])
+    with TemporaryDirectory(prefix="openevo-sidecar-smoke-") as temporary_root:
+        root = Path(temporary_root)
         with TemporaryFile(mode="w+", encoding="utf-8") as process_log:
-            process = subprocess.Popen(
-                command,
-                stdout=process_log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                start_new_session=True,
+            process, base_url, credentials = _launch_native_sidecar(
+                sidecar,
+                config_root=root / "config",
+                process_log=process_log,
             )
             try:
                 deadline = time.monotonic() + timeout_seconds
@@ -360,8 +452,27 @@ def smoke_sidecar(
                     if process.poll() is not None:
                         raise SmokeFailure(_process_failure(process, process_log))
                     try:
-                        health = _read_json(f"{base_url}/health")
-                        if health.get("status") == "ok":
+                        challenge = secrets.token_hex(32)
+                        health = _read_json(
+                            f"{base_url}/health",
+                            headers={NATIVE_CHALLENGE_HEADER: challenge},
+                        )
+                        domain = (
+                            f"{NATIVE_SIDECAR_PROTOCOL}\0"
+                            f"{credentials.instance_id}\0{challenge}"
+                        ).encode("ascii")
+                        expected_proof = hmac.new(
+                            credentials.readiness_key,
+                            domain,
+                            hashlib.sha256,
+                        ).hexdigest()
+                        if health == {
+                            "service": "openevo-sidecar",
+                            "status": "ok",
+                            "protocol": NATIVE_SIDECAR_PROTOCOL,
+                            "instance_id": credentials.instance_id,
+                            "instance_proof": expected_proof,
+                        }:
                             break
                     except SmokeFailure:
                         time.sleep(0.25)
@@ -370,24 +481,43 @@ def smoke_sidecar(
                         f"sidecar did not become healthy within {timeout_seconds}s"
                     )
 
-                core_artifact = _read_json(
-                    f"{base_url}/openevo-api/desktop/core-artifact"
-                )
-                digest = core_artifact.get("distribution_digest")
-                framework_lock = core_artifact.get("framework_lock")
+                version = _read_json(f"{base_url}/version")
                 if (
-                    core_artifact.get("available") is not True
-                    or core_artifact.get("distribution") != "openevo"
-                    or not isinstance(digest, str)
-                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-                    or not isinstance(framework_lock, dict)
-                    or framework_lock.get("distribution_digest") != digest
-                    or framework_lock.get("wheel_filename")
-                    != core_artifact.get("wheel_filename")
+                    version.get("schema_version") != "1"
+                    or version.get("api_name") != "openevo-desktop-local-api"
+                    or version.get("provider_kind") != "desktop_sidecar"
+                    or version.get("build_channel") != "release"
+                    or version.get("preferred_major") != 1
+                    or version.get("supported_majors") != [1]
+                    or re.fullmatch(r"[0-9a-f]{64}", version.get("openapi_sha256", ""))
+                    is None
                 ):
-                    raise SmokeFailure(
-                        "packaged sidecar did not discover its exact embedded Core wheel"
-                    )
+                    raise SmokeFailure("packaged sidecar returned an invalid release contract")
+
+                session_headers = {DESKTOP_SESSION_HEADER: credentials.session_token}
+                state = _read_json(
+                    f"{base_url}/desktop/v1/state",
+                    headers=session_headers,
+                )
+                if state.get("schema_version") != "1":
+                    raise SmokeFailure("packaged sidecar returned an invalid Desktop state")
+                _read_url(
+                    f"{base_url}/desktop/v1/state",
+                    expected_status=401,
+                )
+                _read_url(
+                    f"{base_url}/openevo-native/session",
+                    headers=session_headers,
+                    expected_status=204,
+                )
+                _read_url(
+                    f"{base_url}/openevo-native/session",
+                    expected_status=403,
+                )
+                _read_url(
+                    f"{base_url}/openevo-api/desktop/shell",
+                    expected_status=404,
+                )
 
                 index_html = _read_url(f"{base_url}/openevo").decode("utf-8")
                 assets = _asset_references(index_html)
@@ -395,22 +525,11 @@ def smoke_sidecar(
                     raise SmokeFailure("/openevo did not reference any packaged assets")
                 for asset in assets:
                     _read_url(f"{base_url}/{asset}")
-                registry_digest = None
-                if backend_base_url is not None:
-                    if expected_core_version is None:
-                        raise SmokeFailure(
-                            "expected Core version is required for capability proxy smoke"
-                        )
-                    registry_digest = _smoke_capability_proxy(
-                        base_url,
-                        expected_core_version=expected_core_version,
-                    )
-                return registry_digest
             finally:
                 _terminate(process)
 
 
-def _process_failure(process: subprocess.Popen[str], process_log) -> str:
+def _process_failure(process: subprocess.Popen[Any], process_log) -> str:
     process.wait(timeout=2)
     process_log.flush()
     process_log.seek(0)
@@ -425,16 +544,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sidecar", type=Path)
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
-    parser.add_argument("--backend-base-url")
-    parser.add_argument("--expected-core-version")
     args = parser.parse_args(argv)
 
     try:
         smoke_sidecar(
             args.sidecar,
             timeout_seconds=args.timeout_seconds,
-            backend_base_url=args.backend_base_url,
-            expected_core_version=args.expected_core_version,
         )
     except SmokeFailure as exc:
         print(str(exc), file=sys.stderr)

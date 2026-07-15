@@ -153,19 +153,25 @@ same-UID process. Its owner retains a directory FD and performs only an
 identity-checked, non-recursive `rmdir`, so pathname replacement cannot cause
 recursive deletion.
 
-Linux execution and archive reads use inherited FD 4 through `/proc/self/fd/4`.
+The native launch protocol reserves inherited FD 3 for the already-listening
+loopback socket and inherited FD 4 for the verified onefile archive. It sets
+`OPENEVO_NATIVE_LISTENER_FD=3` and `OPENEVO_NATIVE_EXECUTABLE_FD=4`; either
+marker without the other, any other descriptor number, a non-listening FD 3,
+or a non-regular FD 4 fails closed. Linux execution and archive reads use FD 4
+through `/proc/self/fd/4`.
 On macOS, archive reads still use verified FD 4 through `/dev/fd/4`, but the
 PyInstaller onefile parent cannot use that device path for its later child
 `execvp`. The native host therefore supplies a second non-secret, closed
 environment field, `OPENEVO_NATIVE_EXECUTABLE_PATH`, containing only the private
 `.../openevo-desktop-sidecar` pathname whose final inode was matched to FD 4 in
-the Rust `pre_exec` hook. `OPENEVO_NATIVE_EXECUTABLE_FD` remains exactly `4`.
-Both names must be removed from the inherited environment allowlist before the
-native host sets its own values; Linux must leave the pathname field absent.
+the Rust `pre_exec` hook. All three names must be removed from the inherited
+environment before the native host sets its own values; Linux must leave the
+pathname field absent.
 
-The custom bootloader treats the two values as one protocol. A path without the
-FD marker, an FD value other than `4`, a macOS FD launch without the path, or a
-Linux FD launch with the path fails closed. On macOS it requires an absolute
+The custom bootloader treats the listener marker, archive marker, and optional
+macOS path as one closed protocol. A path without both FD markers, a macOS FD
+launch without the path, or a Linux FD launch with the path fails closed. On
+macOS it requires an absolute
 path with the fixed basename and no control or dot-segment components, then
 compares both the original and resolved pathname `lstat` identities with
 `fstat(4)`, requires a link-count-one regular file, rejects group/world write,
@@ -173,9 +179,19 @@ and accepts only root or effective-user ownership. It resolves parent-component
 aliases such as macOS `/var` to `/private/var` within those checks.
 `pyi_ctx->executable_filename`
 receives that resolved private path solely for onefile child execution;
+before onefile extraction can reuse the low descriptor numbers, the bootloader
+validates FD 3 with `SO_ACCEPTCONN`, validates FD 4 as a regular file, and
+duplicates both to dynamically allocated guard descriptors at or above 64.
+Every bootloader restart and onefile child `execvp` restores FD 3 and FD 4 with
+`dup2`, clears `FD_CLOEXEC`, and repeats the type/listener checks. The child
+closes the guard duplicates before entering Python, while retaining FD 3 for
+Uvicorn and FD 4 for the full process lifetime. PyInstaller continues to verify
+its archive path against FD 4 after Python entry, so closing or repurposing that
+descriptor is a fatal protocol violation. This avoids collisions with archive
+extraction opens without exposing an additional fixed inherited descriptor.
 `_pyi_main_resolve_pkg_archive` independently opens
 `/dev/fd/4`, so parent and child archive bytes remain FD-bound. The packaged
-Python entry point removes both protocol fields before launcher `main` runs.
+Python entry point removes all protocol fields before launcher `main` runs.
 
 The sidecar builder downloads only the exact size/SHA-256 PyInstaller sdist
 recorded in `uv.lock`, applies exact-source resolver and archive patches, and
@@ -201,13 +217,16 @@ The native host binds the loopback listener before spawn and transfers that
 already-bound socket on inherited FD 3, removing the release-and-rebind port
 window. Native code sends exactly one UTF-8 JSON frame of at most 512 bytes over
 the child's stdin and then closes the pipe. Its exact keys are `protocol`,
-`instance_id`, `readiness_key`, and `session_token`; protocol is
-`openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and both credentials
-are independently generated 256-bit values. Duplicate, missing, unknown,
+`instance_id`, `readiness_key`, `session_token`, and `handoff_token`; protocol
+is `openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and all three
+credentials are independently generated 256-bit values encoded as 64 lowercase
+hexadecimal characters. Duplicate, missing, unknown,
 malformed, or trailing input is rejected by the strict sidecar integration.
 The packaged Python launcher applies the same 512-byte bound, requires the
-closed four-key object and lowercase fixed-width hex values, and passes all
-three native values directly to `create_release_desktop_local_api_app`. It
+closed five-key object and lowercase fixed-width hex values. It passes the
+instance ID, readiness key, and session token directly to
+`create_release_desktop_local_api_app`, and retains the handoff token only for
+the hidden native workspace-import routes. It
 mounts only that release Local API and the audited product web. It does not
 construct the legacy sidecar app, expose `/openevo-api/*`, translate the Desktop
 session header into a legacy mutation token, or accept a backend base URL. Its
@@ -329,8 +348,9 @@ in addition to this fixed product override list. It has no `sh -c`,
 source-checkout Python, or
 direct-backend fallback. Debug builds retain a development launcher behind
 `cfg(debug_assertions)`: an optional program plus JSON string-array argv is
-passed directly to `Command` without shell parsing, and the local host and port
-arguments, inherited listener, and instance channel remain native-host owned.
+passed directly to `Command` without shell parsing; the inherited listener and
+instance channel remain native-host owned, and no sidecar launch path receives
+`--host` or `--port`.
 Linux executes the verified anonymous file through `/proc/self/fd`. macOS keeps
 the same digest-verified inode linked inside an owner-only `0700` launch
 directory only long enough for `exec`, passes its open descriptor to the
@@ -665,11 +685,23 @@ claimed release evidence.
 Before that outer lifecycle harness, the workflow installs the exact remote Core
 wheel in a clean Python environment and runs
 `scripts/ci/smoke_openevo_remote_capabilities.py` with the PyInstaller sidecar
-path. That smoke starts the real `openevo-backend serve --framework-lock`
-process, starts the packaged sidecar on a real listener, and checks mutation-token
-protection, both release profiles, registry identity, and target-rooted methods
-over HTTP. A source `TestClient` or local capability fixture in the outer
-lifecycle harness is not evidence for this packaged proxy path.
+path on Linux. That smoke calls the installed `ensure_core_service`, which owns
+the Core listener, readiness pipe, spawn lock, generation, and release identity,
+then starts the packaged sidecar through the FD 3/FD 4 native protocol. It uses
+the supervisor-issued bearer against `/v1/capabilities` and checks both release
+profiles, registry identity, and target-rooted methods over HTTP. It stops only
+a Core instance that the smoke created. A source `TestClient`, direct
+`openevo-backend serve --host/--port`, or local capability fixture is not
+release evidence. The macOS candidate job validates the exact wheel inventory
+and native packaged sidecar but leaves Linux remote-Core supervision to this
+Ubuntu release smoke.
+
+Outer-wheel validation requires the exact internal script set declared by the
+Core package: `openevo-backend = openevo.backend.launcher:main` and
+`openevo-core-service = openevo.backend.service:main`. The first is the backend
+launcher and the second is Desktop's maintenance supervisor entry point; neither
+is presented as a standalone user CLI. A missing entry, a changed target, or any
+additional console script fails release validation.
 
 ## External Beta Artifacts
 

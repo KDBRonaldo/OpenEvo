@@ -523,8 +523,6 @@ def main(
     packaged_source_commit: str | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(description="Run the OpenEvo Desktop sidecar.")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--static-root", type=Path, default=None)
     parser.add_argument(
         "--desktop-config-root",
@@ -566,8 +564,8 @@ def main(
     listener.setblocking(False)
     config = uvicorn.Config(
         app,
-        host=args.host,
-        port=args.port,
+        host="127.0.0.1",
+        port=0,
     )
     uvicorn.Server(config).run(sockets=[listener])
     return 0

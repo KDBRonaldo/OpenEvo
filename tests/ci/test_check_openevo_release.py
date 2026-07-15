@@ -30,6 +30,7 @@ GOOD_ENTRY_POINTS = "\n".join(
     [
         "[console_scripts]",
         "openevo-backend = openevo.backend.launcher:main",
+        "openevo-core-service = openevo.backend.service:main",
         "",
     ]
 )
@@ -198,6 +199,60 @@ def test_sidecar_smoke_extracts_desktop_static_assets() -> None:
     )
 
     assert assets == ["assets/index.css", "assets/index.js"]
+
+
+@pytest.mark.parametrize(
+    "startup_error",
+    [
+        TimeoutError("application has not accepted the inherited listener yet"),
+        ConnectionResetError("listener changed ownership during startup"),
+    ],
+)
+def test_sidecar_smoke_treats_startup_socket_error_as_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    startup_error: OSError,
+) -> None:
+    smoke = _load_sidecar_smoke_module()
+
+    class _TimeoutOpener:
+        def open(self, request, timeout):
+            raise startup_error
+
+    monkeypatch.setattr(smoke, "_LOCAL_HTTP_OPENER", _TimeoutOpener())
+
+    with pytest.raises(smoke.SmokeFailure, match="was not reachable"):
+        smoke._read_url("http://127.0.0.1:1/health")
+
+
+def test_release_smokes_use_the_native_fd_and_five_key_frame_protocol() -> None:
+    sidecar_smoke = Path("scripts/ci/smoke_openevo_desktop_sidecar.py").read_text(
+        encoding="utf-8"
+    )
+    remote_smoke = Path("scripts/ci/smoke_openevo_remote_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    bundle_smoke = Path("scripts/ci/smoke_openevo_desktop_bundle.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"' in sidecar_smoke
+    assert 'NATIVE_ARCHIVE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"' in sidecar_smoke
+    assert "pass_fds=(NATIVE_LISTENER_FD, NATIVE_ARCHIVE_FD)" in sidecar_smoke
+    assert "process_log_guard = _duplicate_fd(process_log.fileno())" in sidecar_smoke
+    assert "stdout=process_log_guard" in sidecar_smoke
+    assert '"handoff_token": self.handoff_token' in sidecar_smoke
+    assert '"--host"' not in sidecar_smoke
+    assert '"--port"' not in sidecar_smoke
+    assert "_smoke_capability_proxy" not in sidecar_smoke
+    assert "X-OpenEvo-Sidecar-Token" not in sidecar_smoke
+    assert '"--host"' not in remote_smoke
+    assert '"--port"' not in remote_smoke
+    assert "ensure_core_service(" in remote_smoke
+    assert "stop_core_service(" in remote_smoke
+    assert 'f"{base_url}/v1/capabilities' in remote_smoke
+    assert '"Authorization": f"Bearer {attachment.bearer_token}"' in remote_smoke
+    assert "sidecar_smoke.smoke_sidecar(" in remote_smoke
+    assert "smoke_sidecar(sidecar" in bundle_smoke
 
 
 def test_sidecar_smoke_rejects_core_owned_fields_in_project_contract() -> None:
@@ -1017,6 +1072,14 @@ def test_requires_expected_console_scripts(tmp_path: Path) -> None:
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
     assert any("openevo-backend = openevo.backend.launcher:main" in error for error in errors)
+    assert any("openevo-core-service = openevo.backend.service:main" in error for error in errors)
+
+
+def test_accepts_only_the_two_published_core_service_scripts(tmp_path: Path) -> None:
+    checker = _load_module()
+    wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+
+    assert checker.validate_wheel(wheel, expected_version="0.1.0") == []
 
 
 def test_rejects_unexpected_console_scripts(tmp_path: Path) -> None:
@@ -1197,6 +1260,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert ".openevo-remote-wheel-smoke/bin/openevo-backend --help" in text
     assert ".openevo-remote-wheel-smoke/bin/openevo-backend serve --help" in text
     assert ".openevo-remote-wheel-smoke/bin/openevo-backend run --help" in text
+    assert ".openevo-remote-wheel-smoke/bin/openevo-core-service --help" in text
     assert (
         "PYTHONPATH= .openevo-remote-wheel-smoke/bin/python "
         "scripts/ci/smoke_evolution_framework_wheel.py "
@@ -1208,16 +1272,21 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     ) in text
     assert "--wheel .openevo-remote-wheel/*.whl" in text
     assert '--sidecar "$sidecar"' in text
+    assert '--source-commit "$(git rev-parse HEAD)"' in text
     assert (
         'sidecar="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"'
     ) in text
-    assert "openevo-backend" in capability_smoke_text
+    assert "ensure_core_service" in capability_smoke_text
+    assert "stop_core_service" in capability_smoke_text
+    assert 'parser.add_argument("--source-commit", required=True)' in capability_smoke_text
+    assert '"--host"' not in capability_smoke_text
+    assert '"--port"' not in capability_smoke_text
     assert "sidecar_smoke.smoke_sidecar" in capability_smoke_text
     assert "TestClient" not in capability_smoke_text
     assert "create_sidecar_app" not in capability_smoke_text
     assert "BackendConnection" not in capability_smoke_text
     assert "backend_client_factory" not in capability_smoke_text
-    assert "start_new_session=True" in capability_smoke_text
+    assert "subprocess.Popen" not in capability_smoke_text
     assert "name: Smoke installed Core with source Desktop harness" in text
     assert "python -m venv .openevo-wheel-smoke" in text
     assert ".openevo-wheel-smoke/bin/python -m pip install dist/*.whl" in text
@@ -1293,7 +1362,7 @@ def test_desktop_candidate_workflow_builds_and_smokes_unsigned_dmg_without_publi
         "packaging/build_sidecar.py",
         "--core-wheel-output-dir",
         "framework-lock.json",
-        "smoke_openevo_remote_capabilities.py",
+        "smoke_openevo_desktop_sidecar.py",
         "cargo fmt --check",
         "cargo clippy --locked --release --all-targets -- -D warnings",
         "cargo test --locked --release",
@@ -1308,6 +1377,7 @@ def test_desktop_candidate_workflow_builds_and_smokes_unsigned_dmg_without_publi
         "unsigned and not notarized",
     ):
         assert marker in text
+    assert "smoke_openevo_remote_capabilities.py" not in text
 
     assert text.index("npm ci") < text.index("npm run tauri:build -- --ci")
     assert text.index("hdiutil attach") < text.index("actions/upload-artifact@v4")
@@ -1377,6 +1447,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "_write_sidecar_build_metadata" in sidecar_builder_text
     assert "desktop.server.launcher" in sidecar_entry_text
     assert "_load_packaged_build_metadata" in sidecar_entry_text
+    assert "os.close(4)" not in sidecar_entry_text
     assert 'name = "openevo-desktop"' in cargo
     assert 'serde = { version = "1", features = ["derive"] }' in cargo
     assert "tauri = " in cargo
@@ -1433,6 +1504,7 @@ def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
 ) -> None:
     builder = Path("desktop/packaging/build_sidecar.py").read_text(encoding="utf-8")
 
+    assert 'NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"' in builder
     assert 'NATIVE_EXECUTABLE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"' in builder
     assert 'NATIVE_EXECUTABLE_PATH_ENV = "OPENEVO_NATIVE_EXECUTABLE_PATH"' in builder
     assert "/dev/fd/{NATIVE_EXECUTABLE_FD}" in builder
@@ -1456,18 +1528,33 @@ def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
     source.write_text(
         module._BOOTLOADER_MACOS_INCLUDE_NEEDLE
         + module._BOOTLOADER_RESOLVER_NEEDLE
-        + module._BOOTLOADER_ARCHIVE_NEEDLE,
+        + module._BOOTLOADER_ARCHIVE_NEEDLE
+        + module._BOOTLOADER_RESTART_NEEDLE
+        + module._BOOTLOADER_CHILD_MAIN_NEEDLE,
         encoding="utf-8",
     )
+    utils_source = tmp_path / "bootloader/src/pyi_utils_posix.c"
+    utils_source.write_text(
+        module._BOOTLOADER_POSIX_INCLUDE_NEEDLE
+        + module._BOOTLOADER_NATIVE_HANDOFF_NEEDLE
+        + module._BOOTLOADER_CHILD_EXEC_NEEDLE,
+        encoding="utf-8",
+    )
+    utils_header = tmp_path / "bootloader/src/pyi_utils.h"
+    utils_header.write_text(module._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
 
     module._patch_fd_bound_bootloader(tmp_path)
 
     patched = source.read_text(encoding="utf-8")
+    patched_utils = utils_source.read_text(encoding="utf-8")
     assert patched.count('getenv("OPENEVO_NATIVE_EXECUTABLE_PATH")') == 1
+    assert patched.count('getenv("OPENEVO_NATIVE_LISTENER_FD")') == 1
     assert patched.count("pyi_archive_open(openevo_archive_path)") == 1
     assert patched.count("fstat(4, &openevo_fd_stat)") == 1
     assert patched.count("lstat(openevo_native_path, &openevo_path_stat)") == 1
     assert patched.count("lstat(openevo_resolved_path, &openevo_resolved_stat)") == 1
+    assert "SO_ACCEPTCONN" in patched_utils
+    assert "pyi_utils_openevo_native_handoff_restore()" in patched_utils
 
 
 def test_pre_external_beta_pypi_publish_workflow_is_disabled() -> None:
@@ -1604,36 +1691,63 @@ def _write_fake_sidecar(path: Path) -> None:
                 "#!/usr/bin/env python3",
                 "from http.server import BaseHTTPRequestHandler, HTTPServer",
                 "import argparse",
+                "import hashlib",
+                "import hmac",
                 "import json",
+                "import socket",
+                "import sys",
+                "frame = json.loads(sys.stdin.readline())",
+                "assert set(frame) == {'protocol', 'instance_id', 'readiness_key', 'session_token', 'handoff_token'}",
+                "assert frame['protocol'] == 'openevo-native-sidecar-v1'",
                 "",
                 "class Handler(BaseHTTPRequestHandler):",
                 "    def do_GET(self):",
                 "        if self.path == '/health':",
-                "            body = json.dumps({'status': 'ok'}).encode()",
+                "            challenge = self.headers.get('X-OpenEvo-Native-Challenge', '')",
+                "            domain = f\"{frame['protocol']}\\0{frame['instance_id']}\\0{challenge}\".encode()",
+                "            proof = hmac.new(bytes.fromhex(frame['readiness_key']), domain, hashlib.sha256).hexdigest()",
+                "            body = json.dumps({'service': 'openevo-sidecar', 'status': 'ok', 'protocol': frame['protocol'], 'instance_id': frame['instance_id'], 'instance_proof': proof}).encode()",
                 "            self.send_response(200)",
                 "            self.send_header('Content-Type', 'application/json')",
                 "            self.send_header('Content-Length', str(len(body)))",
                 "            self.end_headers()",
                 "            self.wfile.write(body)",
                 "            return",
-                "        if self.path == '/openevo-api/desktop/core-artifact':",
-                "            digest = 'a' * 64",
+                "        if self.path == '/version':",
                 "            body = json.dumps({",
-                "                'available': True,",
-                "                'distribution': 'openevo',",
-                "                'distribution_version': '0.1.0',",
-                "                'wheel_filename': 'openevo-0.1.0-py3-none-any.whl',",
-                "                'distribution_digest': digest,",
-                "                'framework_lock': {",
-                "                    'distribution_digest': digest,",
-                "                    'wheel_filename': 'openevo-0.1.0-py3-none-any.whl',",
-                "                },",
+                "                'schema_version': '1',",
+                "                'api_name': 'openevo-desktop-local-api',",
+                "                'preferred_major': 1,",
+                "                'supported_majors': [1],",
+                "                'openapi_sha256': 'a' * 64,",
+                "                'build_version': '0.1.0',",
+                "                'source_commit': '89baeb26',",
+                "                'build_channel': 'release',",
+                "                'provider_kind': 'desktop_sidecar',",
+                "                'feature_flags': [],",
                 "            }).encode()",
                 "            self.send_response(200)",
                 "            self.send_header('Content-Type', 'application/json')",
                 "            self.send_header('Content-Length', str(len(body)))",
                 "            self.end_headers()",
                 "            self.wfile.write(body)",
+                "            return",
+                "        if self.path == '/desktop/v1/state':",
+                "            if self.headers.get('X-OpenEvo-Desktop-Session') != frame['session_token']:",
+                "                self.send_response(401)",
+                "                self.end_headers()",
+                "                return",
+                "            body = json.dumps({'schema_version': '1'}).encode()",
+                "            self.send_response(200)",
+                "            self.send_header('Content-Type', 'application/json')",
+                "            self.send_header('Content-Length', str(len(body)))",
+                "            self.end_headers()",
+                "            self.wfile.write(body)",
+                "            return",
+                "        if self.path == '/openevo-native/session':",
+                "            status = 204 if self.headers.get('X-OpenEvo-Desktop-Session') == frame['session_token'] else 403",
+                "            self.send_response(status)",
+                "            self.end_headers()",
                 "            return",
                 "        if self.path == '/openevo':",
                 "            body = b'<script src=\"/assets/index.js\"></script>'",
@@ -1658,11 +1772,15 @@ def _write_fake_sidecar(path: Path) -> None:
                 "        return",
                 "",
                 "parser = argparse.ArgumentParser()",
-                "parser.add_argument('--host', default='127.0.0.1')",
-                "parser.add_argument('--port', type=int, required=True)",
+                "parser.add_argument('--listener-fd', type=int, required=True)",
+                "parser.add_argument('--native-instance-stdin', action='store_true', required=True)",
                 "parser.add_argument('--desktop-config-root')",
                 "args = parser.parse_args()",
-                "HTTPServer((args.host, args.port), Handler).serve_forever()",
+                "server = HTTPServer(('127.0.0.1', 0), Handler, bind_and_activate=False)",
+                "server.socket.close()",
+                "server.socket = socket.socket(fileno=args.listener_fd)",
+                "server.server_address = server.socket.getsockname()",
+                "server.serve_forever()",
                 "",
             ]
         ),

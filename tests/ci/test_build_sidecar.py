@@ -457,16 +457,48 @@ def test_fd_bound_bootloader_patch_is_exact_and_cross_platform(
     source_root = tmp_path / "pyinstaller"
     source = source_root / "bootloader/src/pyi_main.c"
     source.parent.mkdir(parents=True)
-    source.write_text(builder._BOOTLOADER_RESOLVER_NEEDLE, encoding="utf-8")
+    source.write_text(
+        builder._BOOTLOADER_MACOS_INCLUDE_NEEDLE
+        + builder._BOOTLOADER_RESOLVER_NEEDLE
+        + builder._BOOTLOADER_ARCHIVE_NEEDLE
+        + builder._BOOTLOADER_RESTART_NEEDLE
+        + builder._BOOTLOADER_CHILD_MAIN_NEEDLE,
+        encoding="utf-8",
+    )
+    utils_source = source_root / "bootloader/src/pyi_utils_posix.c"
+    utils_source.write_text(
+        builder._BOOTLOADER_POSIX_INCLUDE_NEEDLE
+        + builder._BOOTLOADER_NATIVE_HANDOFF_NEEDLE
+        + builder._BOOTLOADER_CHILD_EXEC_NEEDLE,
+        encoding="utf-8",
+    )
+    utils_header = source_root / "bootloader/src/pyi_utils.h"
+    utils_header.write_text(builder._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
 
     builder._patch_fd_bound_bootloader(source_root)
 
     patched = source.read_text(encoding="utf-8")
+    patched_utils = utils_source.read_text(encoding="utf-8")
+    patched_header = utils_header.read_text(encoding="utf-8")
     assert 'getenv("OPENEVO_NATIVE_EXECUTABLE_FD")' in patched
+    assert 'getenv("OPENEVO_NATIVE_LISTENER_FD")' in patched
     assert 'strcmp(openevo_native_fd, "4")' in patched
+    assert 'strcmp(openevo_native_listener_fd, "3")' in patched
     assert '"/proc/self/fd/4"' in patched
     assert '"/dev/fd/4"' in patched
     assert patched.count(builder._BOOTLOADER_RESOLVER_REPLACEMENT) == 1
+    assert "pyi_utils_openevo_native_handoff_prepare()" in patched
+    assert "pyi_utils_openevo_native_handoff_finish()" in patched
+    assert "F_DUPFD" in patched_utils
+    assert (
+        "dup2(openevo_listener_guard_fd, OPENEVO_NATIVE_LISTENER_FD)"
+        in patched_utils
+    )
+    assert "dup2(openevo_archive_guard_fd, OPENEVO_NATIVE_ARCHIVE_FD)" in patched_utils
+    assert "FD_CLOEXEC" in patched_utils
+    assert "SO_ACCEPTCONN" in patched_utils
+    assert "pyi_utils_openevo_native_handoff_restore()" in patched_utils
+    assert "pyi_utils_openevo_native_handoff_prepare" in patched_header
 
 
 @pytest.mark.parametrize(
@@ -487,8 +519,10 @@ def test_native_bootloader_validation_uses_the_compiled_platform_branch(
     executable.write_bytes(
         b"\0".join(
             (
+                b"OPENEVO_NATIVE_LISTENER_FD",
                 b"OPENEVO_NATIVE_EXECUTABLE_FD",
                 b"OPENEVO_NATIVE_EXECUTABLE_PATH",
+                b"OpenEvo native descriptors",
                 *platform_markers,
             )
         )
@@ -504,7 +538,10 @@ def test_native_bootloader_validation_rejects_an_unsupported_platform(
 ) -> None:
     builder = _load_builder()
     executable = tmp_path / "sidecar"
-    executable.write_bytes(b"OPENEVO_NATIVE_EXECUTABLE_FD\0OPENEVO_NATIVE_EXECUTABLE_PATH")
+    executable.write_bytes(
+        b"OPENEVO_NATIVE_LISTENER_FD\0OPENEVO_NATIVE_EXECUTABLE_FD\0"
+        b"OPENEVO_NATIVE_EXECUTABLE_PATH\0OpenEvo native descriptors"
+    )
     monkeypatch.setattr(builder.sys, "platform", "win32")
 
     with pytest.raises(RuntimeError, match="platform is unsupported"):

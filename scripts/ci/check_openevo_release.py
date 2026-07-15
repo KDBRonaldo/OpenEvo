@@ -22,6 +22,7 @@ EXPECTED_PROJECT_NAME = "openevo"
 EXPECTED_SUMMARY = "OpenEvo Desktop and agent evolution orchestration."
 EXPECTED_CONSOLE_SCRIPTS = {
     "openevo-backend": "openevo.backend.launcher:main",
+    "openevo-core-service": "openevo.backend.service:main",
 }
 REQUIRED_REMOTE_WHEEL_PREFIX = "openevo/wheels/"
 REQUIRED_RELEASE_NOTES = "release-notes.md"

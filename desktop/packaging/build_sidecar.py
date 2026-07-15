@@ -177,6 +177,8 @@ def _build_product_web(desktop_root: Path) -> str:
     return _validate_product_web_build(desktop_root)
 
 
+NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"
+NATIVE_LISTENER_FD = "3"
 NATIVE_EXECUTABLE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"
 NATIVE_EXECUTABLE_FD = "4"
 NATIVE_EXECUTABLE_PATH_ENV = "OPENEVO_NATIVE_EXECUTABLE_PATH"
@@ -201,11 +203,16 @@ _pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
 _BOOTLOADER_RESOLVER_REPLACEMENT = f"""static int
 _pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
 {{
-    /* Archive resolution remains FD-bound via \"/proc/self/fd/4\" or \"/dev/fd/4\". */
+    /* Preserve the native listener and archive across onefile parent extraction. */
+    const char *openevo_native_listener_fd = getenv(\"{NATIVE_LISTENER_FD_ENV}\");
     const char *openevo_native_fd = getenv(\"{NATIVE_EXECUTABLE_FD_ENV}\");
     const char *openevo_native_path = getenv(\"{NATIVE_EXECUTABLE_PATH_ENV}\");
     if (openevo_native_fd != NULL) {{
-        if (strcmp(openevo_native_fd, \"{NATIVE_EXECUTABLE_FD}\") != 0) {{
+        if (
+            openevo_native_listener_fd == NULL ||
+            strcmp(openevo_native_listener_fd, \"{NATIVE_LISTENER_FD}\") != 0 ||
+            strcmp(openevo_native_fd, \"{NATIVE_EXECUTABLE_FD}\") != 0
+        ) {{
             return -1;
         }}
 #if defined(__linux__)
@@ -276,9 +283,12 @@ _pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
 #else
         return -1;
 #endif
+        if (pyi_utils_openevo_native_handoff_prepare() != 0) {{
+            return -1;
+        }}
         return 0;
     }}
-    if (openevo_native_path != NULL) {{
+    if (openevo_native_listener_fd != NULL || openevo_native_path != NULL) {{
         return -1;
     }}
 
@@ -319,6 +329,178 @@ _pyi_main_resolve_pkg_archive(struct PYI_CONTEXT *pyi_ctx)
     }}
 
     /* Try opening embedded archive first */
+"""
+_BOOTLOADER_POSIX_INCLUDE_NEEDLE = """#include <errno.h>
+#include <signal.h> /* kill */
+#include <sys/stat.h> /* struct stat */
+#include <sys/wait.h>
+"""
+_BOOTLOADER_POSIX_INCLUDE_REPLACEMENT = """#include <errno.h>
+#include <fcntl.h> /* fcntl, F_DUPFD, FD_CLOEXEC */
+#include <signal.h> /* kill */
+#include <sys/socket.h> /* getsockopt, SOL_SOCKET, SO_ACCEPTCONN */
+#include <sys/stat.h> /* struct stat */
+#include <sys/wait.h>
+"""
+_BOOTLOADER_NATIVE_HANDOFF_NEEDLE = """/*
+ * If the program is activated by a systemd socket, systemd will set
+"""
+_BOOTLOADER_NATIVE_HANDOFF_REPLACEMENT = """/* OpenEvo native onefile FD handoff. */
+#define OPENEVO_NATIVE_LISTENER_FD 3
+#define OPENEVO_NATIVE_ARCHIVE_FD 4
+#define OPENEVO_NATIVE_GUARD_MIN_FD 64
+
+static int openevo_listener_guard_fd = -1;
+static int openevo_archive_guard_fd = -1;
+
+static int
+_pyi_utils_openevo_validate_native_fds(void)
+{
+    struct stat listener_stat;
+    struct stat archive_stat;
+    int accepting = 0;
+    socklen_t accepting_size = sizeof(accepting);
+
+    if (
+        fstat(OPENEVO_NATIVE_LISTENER_FD, &listener_stat) != 0 ||
+        fstat(OPENEVO_NATIVE_ARCHIVE_FD, &archive_stat) != 0 ||
+        !S_ISSOCK(listener_stat.st_mode) ||
+        !S_ISREG(archive_stat.st_mode) ||
+        getsockopt(
+            OPENEVO_NATIVE_LISTENER_FD,
+            SOL_SOCKET,
+            SO_ACCEPTCONN,
+            &accepting,
+            &accepting_size
+        ) != 0 ||
+        accepting_size != sizeof(accepting) ||
+        accepting != 1
+    ) {
+        return -1;
+    }
+    return 0;
+}
+
+static int
+_pyi_utils_openevo_clear_cloexec(int fd)
+{
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1 || fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+int
+pyi_utils_openevo_native_handoff_prepare(void)
+{
+    if (openevo_listener_guard_fd != -1 || openevo_archive_guard_fd != -1) {
+        return -1;
+    }
+    if (_pyi_utils_openevo_validate_native_fds() != 0) {
+        return -1;
+    }
+    openevo_listener_guard_fd = fcntl(
+        OPENEVO_NATIVE_LISTENER_FD,
+        F_DUPFD,
+        OPENEVO_NATIVE_GUARD_MIN_FD
+    );
+    if (openevo_listener_guard_fd == -1) {
+        return -1;
+    }
+    openevo_archive_guard_fd = fcntl(
+        OPENEVO_NATIVE_ARCHIVE_FD,
+        F_DUPFD,
+        OPENEVO_NATIVE_GUARD_MIN_FD
+    );
+    if (openevo_archive_guard_fd == -1) {
+        close(openevo_listener_guard_fd);
+        openevo_listener_guard_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+int
+pyi_utils_openevo_native_handoff_restore(void)
+{
+    if (openevo_listener_guard_fd == -1 && openevo_archive_guard_fd == -1) {
+        return 0;
+    }
+    if (
+        openevo_listener_guard_fd == -1 ||
+        openevo_archive_guard_fd == -1 ||
+        dup2(openevo_listener_guard_fd, OPENEVO_NATIVE_LISTENER_FD) == -1 ||
+        dup2(openevo_archive_guard_fd, OPENEVO_NATIVE_ARCHIVE_FD) == -1 ||
+        _pyi_utils_openevo_clear_cloexec(OPENEVO_NATIVE_LISTENER_FD) != 0 ||
+        _pyi_utils_openevo_clear_cloexec(OPENEVO_NATIVE_ARCHIVE_FD) != 0 ||
+        _pyi_utils_openevo_validate_native_fds() != 0
+    ) {
+        return -1;
+    }
+    return 0;
+}
+
+int
+pyi_utils_openevo_native_handoff_finish(void)
+{
+    if (pyi_utils_openevo_native_handoff_restore() != 0) {
+        return -1;
+    }
+    if (openevo_listener_guard_fd != -1) {
+        close(openevo_listener_guard_fd);
+        openevo_listener_guard_fd = -1;
+    }
+    if (openevo_archive_guard_fd != -1) {
+        close(openevo_archive_guard_fd);
+        openevo_archive_guard_fd = -1;
+    }
+    return 0;
+}
+
+/*
+ * If the program is activated by a systemd socket, systemd will set
+"""
+_BOOTLOADER_CHILD_EXEC_NEEDLE = """        /* Modify the LISTEN_PID environment variable, if necessary */
+"""
+_BOOTLOADER_CHILD_EXEC_REPLACEMENT = """        if (pyi_utils_openevo_native_handoff_restore() != 0) {
+            PYI_ERROR("LOADER: failed to restore OpenEvo native descriptors!\\n");
+            exit(-1);
+        }
+
+        /* Modify the LISTEN_PID environment variable, if necessary */
+"""
+_BOOTLOADER_UTILS_HEADER_NEEDLE = """/* Child process */
+int pyi_utils_create_child(struct PYI_CONTEXT *pyi_ctx);
+"""
+_BOOTLOADER_UTILS_HEADER_REPLACEMENT = """/* Child process */
+int pyi_utils_create_child(struct PYI_CONTEXT *pyi_ctx);
+int pyi_utils_openevo_native_handoff_prepare(void);
+int pyi_utils_openevo_native_handoff_restore(void);
+int pyi_utils_openevo_native_handoff_finish(void);
+"""
+_BOOTLOADER_RESTART_NEEDLE = """        if (needs_restart) {
+            PYI_DEBUG("LOADER: process needs to restart itself to apply modifications to library search path.\\n");
+"""
+_BOOTLOADER_RESTART_REPLACEMENT = """        if (needs_restart) {
+            PYI_DEBUG("LOADER: process needs to restart itself to apply modifications to library search path.\\n");
+            if (pyi_utils_openevo_native_handoff_restore() != 0) {
+                PYI_ERROR("LOADER: failed to restore OpenEvo native descriptors for restart!\\n");
+                return -1;
+            }
+"""
+_BOOTLOADER_CHILD_MAIN_NEEDLE = """_pyi_main_onedir_or_onefile_child(struct PYI_CONTEXT *pyi_ctx)
+{
+    int ret;
+"""
+_BOOTLOADER_CHILD_MAIN_REPLACEMENT = """_pyi_main_onedir_or_onefile_child(struct PYI_CONTEXT *pyi_ctx)
+{
+    int ret;
+
+    if (pyi_utils_openevo_native_handoff_finish() != 0) {
+        PYI_ERROR("LOADER: failed to finalize OpenEvo native descriptor handoff!\\n");
+        return -1;
+    }
 """
 
 
@@ -718,13 +900,20 @@ def _extract_locked_pyinstaller_sdist(
 def _patch_fd_bound_bootloader(source_root: Path) -> None:
     source = source_root / "bootloader/src/pyi_main.c"
     text = source.read_text(encoding="utf-8")
-    if text == _BOOTLOADER_RESOLVER_NEEDLE:
-        source.write_text(_BOOTLOADER_RESOLVER_REPLACEMENT, encoding="utf-8")
-        return
+    utils_source = source_root / "bootloader/src/pyi_utils_posix.c"
+    utils_text = utils_source.read_text(encoding="utf-8")
+    utils_header = source_root / "bootloader/src/pyi_utils.h"
+    utils_header_text = utils_header.read_text(encoding="utf-8")
     if (
         text.count(_BOOTLOADER_MACOS_INCLUDE_NEEDLE) != 1
         or text.count(_BOOTLOADER_RESOLVER_NEEDLE) != 1
         or text.count(_BOOTLOADER_ARCHIVE_NEEDLE) != 1
+        or text.count(_BOOTLOADER_RESTART_NEEDLE) != 1
+        or text.count(_BOOTLOADER_CHILD_MAIN_NEEDLE) != 1
+        or utils_text.count(_BOOTLOADER_POSIX_INCLUDE_NEEDLE) != 1
+        or utils_text.count(_BOOTLOADER_NATIVE_HANDOFF_NEEDLE) != 1
+        or utils_text.count(_BOOTLOADER_CHILD_EXEC_NEEDLE) != 1
+        or utils_header_text.count(_BOOTLOADER_UTILS_HEADER_NEEDLE) != 1
     ):
         raise RuntimeError("PyInstaller bootloader resolver does not match the audited patch")
     source.write_text(
@@ -739,6 +928,36 @@ def _patch_fd_bound_bootloader(source_root: Path) -> None:
         .replace(
             _BOOTLOADER_ARCHIVE_NEEDLE,
             _BOOTLOADER_ARCHIVE_REPLACEMENT,
+        )
+        .replace(
+            _BOOTLOADER_RESTART_NEEDLE,
+            _BOOTLOADER_RESTART_REPLACEMENT,
+        )
+        .replace(
+            _BOOTLOADER_CHILD_MAIN_NEEDLE,
+            _BOOTLOADER_CHILD_MAIN_REPLACEMENT,
+        ),
+        encoding="utf-8",
+    )
+    utils_source.write_text(
+        utils_text.replace(
+            _BOOTLOADER_POSIX_INCLUDE_NEEDLE,
+            _BOOTLOADER_POSIX_INCLUDE_REPLACEMENT,
+        )
+        .replace(
+            _BOOTLOADER_NATIVE_HANDOFF_NEEDLE,
+            _BOOTLOADER_NATIVE_HANDOFF_REPLACEMENT,
+        )
+        .replace(
+            _BOOTLOADER_CHILD_EXEC_NEEDLE,
+            _BOOTLOADER_CHILD_EXEC_REPLACEMENT,
+        ),
+        encoding="utf-8",
+    )
+    utils_header.write_text(
+        utils_header_text.replace(
+            _BOOTLOADER_UTILS_HEADER_NEEDLE,
+            _BOOTLOADER_UTILS_HEADER_REPLACEMENT,
         ),
         encoding="utf-8",
     )
@@ -769,8 +988,10 @@ def _prepare_fd_bound_pyinstaller(repo: Path, temporary_root: Path) -> Path:
     )
     bootloaders = list((source_root / "PyInstaller/bootloader").glob("*/run"))
     markers = (
+        NATIVE_LISTENER_FD_ENV.encode("ascii"),
         NATIVE_EXECUTABLE_FD_ENV.encode("ascii"),
         NATIVE_EXECUTABLE_PATH_ENV.encode("ascii"),
+        b"OpenEvo native descriptors",
     )
     if not bootloaders or not any(
         all(marker in payload for marker in markers)
@@ -783,8 +1004,10 @@ def _prepare_fd_bound_pyinstaller(repo: Path, temporary_root: Path) -> Path:
 def _validate_fd_bound_bootloader(executable: Path) -> None:
     payload = executable.read_bytes()
     required = [
+        NATIVE_LISTENER_FD_ENV.encode("ascii"),
         NATIVE_EXECUTABLE_FD_ENV.encode("ascii"),
         NATIVE_EXECUTABLE_PATH_ENV.encode("ascii"),
+        b"OpenEvo native descriptors",
     ]
     if sys.platform.startswith("linux"):
         required.append(f"/proc/self/fd/{NATIVE_EXECUTABLE_FD}".encode("ascii"))

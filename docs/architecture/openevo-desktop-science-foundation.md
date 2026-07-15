@@ -716,9 +716,10 @@ preview facade.
 ## Backend Launcher
 
 The Python package no longer exposes a user-facing `openevo` console script.
-The only package console script in the Core Backend migration phase is
-`openevo-backend`; backend maintenance automation and Desktop-native entrypoints
-are handled by productization tasks.
+Its closed internal script set is `openevo-backend` for the backend launcher and
+`openevo-core-service` for Desktop's maintenance supervisor. They are backend
+and product automation entry points, not separately published ordinary-user CLI
+surfaces.
 
 ## Limitations
 

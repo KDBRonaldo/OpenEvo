@@ -41,6 +41,7 @@ const NATIVE_WORKSPACE_CANCEL_ROUTE: &str = "/openevo-native/workspace-imports/c
 const NATIVE_WORKSPACE_DISCARD_ROUTE: &str = "/openevo-native/workspace-imports/discard";
 const NATIVE_SESSION_HEADER: &str = "X-OpenEvo-Desktop-Session";
 const NATIVE_HANDOFF_HEADER: &str = "X-OpenEvo-Native-Handoff";
+const NATIVE_LISTENER_FD_ENV: &str = "OPENEVO_NATIVE_LISTENER_FD";
 const NATIVE_EXECUTABLE_FD_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_FD";
 const NATIVE_EXECUTABLE_PATH_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_PATH";
 const PYINSTALLER_PRIVATE_ENV_PREFIX: &[u8] = b"_PYI_";
@@ -74,12 +75,13 @@ const SIDECAR_EXIT_EMERGENCY_TERM_GRACE: Duration = Duration::from_millis(250);
 const MACOS_PROCESS_GROUP_LIST_RETRIES: usize = 4;
 #[cfg(any(test, target_os = "macos"))]
 const MACOS_PROCESS_GROUP_MAX_PIDS: usize = 1_048_576;
-const RELEASE_FORBIDDEN_SIDECAR_ENV: [&str; 7] = [
+const RELEASE_FORBIDDEN_SIDECAR_ENV: [&str; 8] = [
     "OPENEVO_DESKTOP_SIDECAR_COMMAND",
     "OPENEVO_DESKTOP_SIDECAR_PROGRAM",
     "OPENEVO_DESKTOP_SIDECAR_ARGS_JSON",
     "OPENEVO_DESKTOP_SIDECAR_WORKDIR",
     "OPENEVO_DESKTOP_BACKEND_BASE_URL",
+    NATIVE_LISTENER_FD_ENV,
     NATIVE_EXECUTABLE_FD_ENV,
     NATIVE_EXECUTABLE_PATH_ENV,
 ];
@@ -1424,14 +1426,14 @@ fn sidecar_launch_spec(
 
 fn release_sidecar_launch_spec(
     bundled_path: Option<&Path>,
-    port: u16,
+    _port: u16,
 ) -> HostResult<SidecarLaunchSpec> {
     let source = bundled_path.ok_or_else(bundled_sidecar_missing_error)?;
     let (verified_executable, private_launch_dir) = prepare_packaged_sidecar(source)?;
     let program = release_execution_path(&private_launch_dir);
     Ok(SidecarLaunchSpec {
         program,
-        args: local_sidecar_args(port),
+        args: local_sidecar_args(),
         current_dir: None,
         remove_env: &RELEASE_FORBIDDEN_SIDECAR_ENV,
         private_launch_dir: Some(private_launch_dir),
@@ -2084,12 +2086,8 @@ fn instance_channel_error() -> NativeHostError {
     )
 }
 
-fn local_sidecar_args(port: u16) -> Vec<String> {
+fn local_sidecar_args() -> Vec<String> {
     vec![
-        "--host".to_string(),
-        "127.0.0.1".to_string(),
-        "--port".to_string(),
-        port.to_string(),
         "--listener-fd".to_string(),
         INHERITED_LISTENER_FD.to_string(),
         "--native-instance-stdin".to_string(),
@@ -2138,7 +2136,7 @@ fn debug_sidecar_launch_spec(
             vec!["-m".to_string(), DEBUG_FALLBACK_MODULE.to_string()],
         )
     };
-    args.extend(local_sidecar_args(port));
+    args.extend(local_sidecar_args());
     Ok(SidecarLaunchSpec {
         program,
         args,
@@ -2273,8 +2271,10 @@ fn command_from_launch_spec(
     for name in launch.remove_env {
         command.env_remove(name);
     }
+    command.env_remove(NATIVE_LISTENER_FD_ENV);
     command.env_remove(NATIVE_EXECUTABLE_FD_ENV);
     command.env_remove(NATIVE_EXECUTABLE_PATH_ENV);
+    command.env(NATIVE_LISTENER_FD_ENV, INHERITED_LISTENER_FD.to_string());
     if launch.verified_executable.is_some() {
         sanitize_pyinstaller_launch_environment(&mut command);
         command.env(
@@ -5290,15 +5290,7 @@ mod tests {
         assert_eq!(fs::read_dir(private_root).unwrap().count(), 1);
         assert_eq!(
             spec.args,
-            vec![
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "49152",
-                "--listener-fd",
-                "3",
-                "--native-instance-stdin",
-            ]
+            vec!["--listener-fd", "3", "--native-instance-stdin",]
         );
         assert!(spec.current_dir.is_none());
         assert_eq!(spec.remove_env, RELEASE_FORBIDDEN_SIDECAR_ENV);
@@ -5444,6 +5436,7 @@ mod tests {
     fn packaged_launch_owns_the_native_executable_environment() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _environment = ScopedEnvironment::set(&[
+            (NATIVE_LISTENER_FD_ENV, "99"),
             (NATIVE_EXECUTABLE_FD_ENV, "99"),
             (NATIVE_EXECUTABLE_PATH_ENV, "/tmp/attacker-sidecar"),
         ]);
@@ -5455,10 +5448,16 @@ mod tests {
             .command
             .get_envs()
             .filter(|(name, _)| {
-                *name == NATIVE_EXECUTABLE_FD_ENV || *name == NATIVE_EXECUTABLE_PATH_ENV
+                *name == NATIVE_LISTENER_FD_ENV
+                    || *name == NATIVE_EXECUTABLE_FD_ENV
+                    || *name == NATIVE_EXECUTABLE_PATH_ENV
             })
             .collect::<Vec<_>>();
 
+        assert!(native_environment.iter().any(|(name, value)| {
+            *name == NATIVE_LISTENER_FD_ENV
+                && value.is_some_and(|value| value == std::ffi::OsStr::new("3"))
+        }));
         assert!(native_environment.iter().any(|(name, value)| {
             *name == NATIVE_EXECUTABLE_FD_ENV
                 && value.is_some_and(|value| value == std::ffi::OsStr::new("4"))
@@ -5806,10 +5805,6 @@ mod tests {
             vec![
                 "--config",
                 "dev profile.json",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "49156",
                 "--listener-fd",
                 "3",
                 "--native-instance-stdin",
@@ -7812,7 +7807,11 @@ mod tests {
     #[ignore = "requires a freshly generated strict Local API PyInstaller externalBin"]
     fn packaged_external_bin_native_launch_smoke() {
         let _guard = ENV_LOCK.lock().unwrap();
+        let test_home = unique_test_dir();
+        fs::create_dir(&test_home).unwrap();
+        let test_home_text = test_home.to_str().unwrap();
         let _environment = ScopedEnvironment::set(&[
+            ("HOME", test_home_text),
             (
                 "_PYI_APPLICATION_HOME_DIR",
                 "/tmp/attacker-controlled-extraction",
@@ -7865,6 +7864,7 @@ mod tests {
         assert!(state.sidecar.lock().unwrap().is_none());
         assert!(!private_root.exists());
         assert!(path.exists());
+        fs::remove_dir_all(test_home).unwrap();
     }
 
     fn serve_health(

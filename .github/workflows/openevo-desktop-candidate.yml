@@ -104,7 +104,7 @@ jobs:
           test -x "$sidecar"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
 
-      - name: Clean-install and smoke exact remote Core wheel
+      - name: Clean-install exact Core wheel and smoke packaged sidecar
         run: |
           test "$(find .candidate-remote-wheel -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
           python -m venv "$RUNNER_TEMP/openevo-core-smoke"
@@ -114,10 +114,9 @@ jobs:
           PYTHONPATH= "$RUNNER_TEMP/openevo-core-smoke/bin/python" \
             scripts/ci/smoke_evolution_framework_wheel.py \
             --wheel .candidate-remote-wheel/openevo-*.whl
-          PYTHONPATH= "$RUNNER_TEMP/openevo-core-smoke/bin/python" \
-            scripts/ci/smoke_openevo_remote_capabilities.py \
-            --wheel .candidate-remote-wheel/openevo-*.whl \
-            --sidecar "$OPENEVO_PACKAGED_SIDECAR_PATH" \
+          "$RUNNER_TEMP/openevo-core-smoke/bin/python" \
+            scripts/ci/smoke_openevo_desktop_sidecar.py \
+            "$OPENEVO_PACKAGED_SIDECAR_PATH" \
             --timeout-seconds 60
 
       - name: Check release-mode Tauri host

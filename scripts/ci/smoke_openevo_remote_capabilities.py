@@ -7,24 +7,18 @@ import argparse
 import hashlib
 from importlib import metadata, util
 import json
-import os
 from pathlib import Path
+import re
 import shutil
-import signal
-import socket
-import subprocess
-import sys
 import tempfile
-from tempfile import TemporaryFile
-import time
 from types import ModuleType
-from urllib.error import URLError
-from urllib.request import build_opener, ProxyHandler
 
 import openevo
+from openevo.backend.runtime_identity import default_core_service_root
+from openevo.backend.service import ensure_core_service, stop_core_service
 
 
-_LOCAL_HTTP_OPENER = build_opener(ProxyHandler({}))
+_SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 def _sha256(path: Path) -> str:
@@ -35,66 +29,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _allocate_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
-def _wait_for_backend(
-    base_url: str,
-    process: subprocess.Popen[str],
-    process_log,
-    *,
-    timeout_seconds: float,
-) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(
-                "exact Core backend exited before readiness:\n"
-                f"{_process_output(process_log)}"
-            )
-        try:
-            with _LOCAL_HTTP_OPENER.open(
-                f"{base_url}/health", timeout=1
-            ) as response:
-                if response.status == 200:
-                    return
-        except URLError:
-            time.sleep(0.1)
-            continue
-        time.sleep(0.1)
-    raise RuntimeError("exact Core backend did not become ready")
-
-
-def _terminate(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=10)
-
-
-def _process_output(process_log) -> str:
-    process_log.flush()
-    process_log.seek(0)
-    return process_log.read()
+def _source_commit(value: str) -> str:
+    commit = value.strip()
+    if _SOURCE_COMMIT_PATTERN.fullmatch(commit) is None or set(commit) == {"0"}:
+        raise RuntimeError("remote capability smoke could not resolve the source commit")
+    return commit
 
 
 def _load_sidecar_smoke() -> ModuleType:
@@ -111,13 +50,15 @@ def smoke(
     wheel_path: Path,
     sidecar_path: Path,
     *,
+    source_commit: str,
     timeout_seconds: float,
 ) -> dict[str, str]:
     wheel = wheel_path.resolve(strict=True)
     sidecar = sidecar_path.resolve(strict=True)
-    repository_src = Path(__file__).resolve().parents[2] / "src"
+    script_parents = Path(__file__).resolve().parents
+    repository_src = script_parents[2] / "src" if len(script_parents) > 2 else None
     import_path = Path(openevo.__file__).resolve(strict=True)
-    if import_path.is_relative_to(repository_src):
+    if repository_src is not None and import_path.is_relative_to(repository_src):
         raise RuntimeError("remote capability smoke imported Core from source")
 
     version = metadata.version("openevo")
@@ -144,51 +85,44 @@ def smoke(
             ),
             encoding="utf-8",
         )
-        port = _allocate_port()
-        base_url = f"http://127.0.0.1:{port}"
-        executable = Path(sys.executable).with_name("openevo-backend")
-        if not executable.is_file():
-            raise RuntimeError("installed openevo-backend launcher is unavailable")
-        child_env = dict(os.environ)
-        child_env.pop("PYTHONPATH", None)
-        with TemporaryFile(mode="w+", encoding="utf-8") as process_log:
-            process = subprocess.Popen(
-                [
-                    str(executable),
-                    "serve",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(port),
-                    "--framework-lock",
-                    str(lock_path),
-                ],
-                cwd=root,
-                env=child_env,
-                stdout=process_log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                start_new_session=True,
+        service_root = default_core_service_root()
+        attachment = ensure_core_service(
+            service_root=service_root,
+            framework_lock=lock_path,
+            source_commit=_source_commit(source_commit),
+            deadline_seconds=timeout_seconds,
+        )
+        base_url = f"http://127.0.0.1:{attachment.port}"
+        headers = {"Authorization": f"Bearer {attachment.bearer_token}"}
+        try:
+            sidecar_smoke.smoke_sidecar(
+                sidecar,
+                timeout_seconds=timeout_seconds,
             )
-            try:
-                _wait_for_backend(
-                    base_url,
-                    process,
-                    process_log,
-                    timeout_seconds=timeout_seconds,
+            registry_digests: set[str] = set()
+            for execution_mode in (
+                "codex_subscription_transcript",
+                "self-deployed",
+            ):
+                payload = sidecar_smoke._read_json(
+                    f"{base_url}/v1/capabilities?execution_mode={execution_mode}",
+                    headers=headers,
                 )
-                registry_digest = sidecar_smoke.smoke_sidecar(
-                    sidecar,
-                    timeout_seconds=timeout_seconds,
-                    backend_base_url=base_url,
+                sidecar_smoke._assert_capabilities(
+                    payload,
+                    execution_mode=execution_mode,
                     expected_core_version=version,
                 )
-                if not isinstance(registry_digest, str):
-                    raise RuntimeError(
-                        "packaged sidecar capability smoke returned no registry digest"
-                    )
-            finally:
-                _terminate(process)
+                registry_digests.add(payload["registry_digest"])
+            if len(registry_digests) != 1:
+                raise RuntimeError("exact Core release modes resolved different registries")
+            registry_digest = next(iter(registry_digests))
+        finally:
+            if not attachment.attached:
+                stop_core_service(
+                    service_root=service_root,
+                    deadline_seconds=min(timeout_seconds, 60.0),
+                )
 
     return {
         "core_import_path": str(import_path),
@@ -202,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--sidecar", type=Path, required=True)
+    parser.add_argument("--source-commit", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
     args = parser.parse_args(argv)
     print(
@@ -209,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             smoke(
                 args.wheel,
                 args.sidecar,
+                source_commit=args.source_commit,
                 timeout_seconds=args.timeout_seconds,
             ),
             sort_keys=True,
