@@ -1,5 +1,12 @@
 # Testing
 
+The release Desktop process-boundary rehearsal is documented in
+[`desktop-real-science-e2e.md`](desktop-real-science-e2e.md). Its structural
+test is part of `tests/ci`; release evidence is valid only when the runner uses
+the real packaged sidecar, real SSH/Core lifecycle, and two real science
+sessions against a remote host. `--structural-check` is explicitly not E2E
+evidence.
+
 Use focused tests for ordinary changes and broaden the suite when touching
 shared contracts.
 
