@@ -20,7 +20,7 @@ import threading
 import time
 from typing import Any, Literal, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from . import models as m
 from .workspace import (
@@ -78,6 +78,35 @@ _IDEMPOTENCY_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
         m.ProjectValidationResponseV1,
     )
 }
+
+
+class _EvolutionRevisionActivationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    project_id: str
+    predecessor: m.RevisionRefV1
+    run_id: str
+    context_artifact_ids: dict[str, list[str]]
+
+    @model_validator(mode="after")
+    def _closed_context(self) -> _EvolutionRevisionActivationRequest:
+        if self.predecessor.project_id != self.project_id:
+            raise ValueError("evolution revision predecessor belongs to another project")
+        if _normalized_evolution_context_ids(self.context_artifact_ids) != (
+            self.context_artifact_ids
+        ):
+            raise ValueError("evolution revision context is not canonical")
+        if (
+            not 1 <= len(self.run_id.encode("utf-8")) <= 128
+            or any(
+                ord(character) < 0x21 or ord(character) == 0x7F
+                for character in self.run_id
+            )
+        ):
+            raise ValueError("evolution revision run identity is invalid")
+        return self
+
+
 _IDEMPOTENCY_REQUEST_MODELS: dict[str, type[BaseModel] | None] = {
     "createCoreProjectV1": m.ProjectCreateV1,
     "patchCoreProjectV1": m.ProjectPatchV1,
@@ -87,6 +116,7 @@ _IDEMPOTENCY_REQUEST_MODELS: dict[str, type[BaseModel] | None] = {
     "finalizeCoreWorkspaceUploadV1": m.WorkspaceUploadFinalizeV1,
     "abortCoreWorkspaceUploadV1": m.WorkspaceUploadAbortV1,
     "validateCoreProjectV1": m.ProjectValidationRequestV1,
+    "activateCoreEvolutionRevisionInternalV1": _EvolutionRevisionActivationRequest,
 }
 _IDEMPOTENCY_OPERATION_SPECS: dict[
     str, tuple[int, str, Literal["global", "project", "upload"]]
@@ -103,6 +133,7 @@ _IDEMPOTENCY_OPERATION_SPECS: dict[
     ),
     "abortCoreWorkspaceUploadV1": (200, "WorkspaceUploadSessionV1", "upload"),
     "validateCoreProjectV1": (200, "ProjectValidationResponseV1", "project"),
+    "activateCoreEvolutionRevisionInternalV1": (200, "ProjectV1", "project"),
 }
 
 
@@ -574,6 +605,46 @@ class CoreControlStoreV1:
                 raise ResourceNotFoundError("project", project_id)
             return _validate_bytes(m.ProjectV1, row["document_json"])
 
+    def workspace_snapshot_path(
+        self,
+        project_id: str,
+        snapshot: m.ImmutableSnapshotRefV1,
+    ) -> Path:
+        """Resolve one immutable imported workspace snapshot to its owner-bound path."""
+
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            if snapshot.kind is not m.SnapshotKind.WORKSPACE or snapshot != (
+                _snapshot_from_digest(
+                    self._signing_key,
+                    m.SnapshotKind.WORKSPACE,
+                    snapshot.content_sha256,
+                    snapshot.created_at,
+                )
+            ):
+                raise StoreCorruptionError("workspace snapshot Core identity is invalid")
+            owner = self._publication_owner_for_snapshot(snapshot.id)
+            if owner is None or owner[0] != project_id:
+                raise ResourceNotFoundError("workspace_snapshot", snapshot.id)
+            try:
+                fd = os.open(
+                    snapshot.id,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=self._workspace_root_fd,
+                )
+            except OSError as exc:
+                raise StoreCorruptionError(
+                    "workspace snapshot directory is unavailable"
+                ) from exc
+            try:
+                metadata = os.fstat(fd)
+                _require_private_directory_metadata(metadata)
+                _require_entry_binding(self._workspace_root_fd, snapshot.id, metadata)
+            finally:
+                os.close(fd)
+            self._verify_lifecycle_storage()
+            return self.workspace_root / snapshot.id
+
     def list_projects(
         self,
         *,
@@ -719,6 +790,108 @@ class CoreControlStoreV1:
             )
             self._verify_lifecycle_storage()
             return head
+
+    def activate_evolution_revision(
+        self,
+        project_id: str,
+        *,
+        predecessor: m.RevisionRefV1,
+        run_id: str,
+        context_artifact_ids: Mapping[str, list[str]],
+    ) -> m.RevisionV1:
+        """Atomically publish the context produced by one completed run for the next session."""
+
+        normalized_context = _normalized_evolution_context_ids(context_artifact_ids)
+        if (
+            not isinstance(run_id, str)
+            or not 1 <= len(run_id.encode("utf-8")) <= 128
+            or any(ord(character) < 0x21 or ord(character) == 0x7F for character in run_id)
+        ):
+            raise ValueError("run_id is outside the revision activation identity policy")
+        operation_id = "activateCoreEvolutionRevisionInternalV1"
+        activation_request = _EvolutionRevisionActivationRequest(
+            context_artifact_ids=normalized_context,
+            predecessor=predecessor,
+            project_id=project_id,
+            run_id=run_id,
+        )
+        envelope = _idempotency_envelope(
+            operation_id,
+            project_id,
+            activation_request,
+            {},
+        )
+        with self._mutex, self._transaction():
+            replay = self._idempotency_replay(
+                operation_id,
+                project_id,
+                run_id,
+                envelope,
+                m.ProjectV1,
+            )
+            if replay is not None:
+                replay_project = replay.model
+                if not isinstance(replay_project, m.ProjectV1):
+                    raise StoreCorruptionError("evolution revision replay is invalid")
+                active_revision = replay_project.active_revision
+                if active_revision is None:
+                    raise StoreCorruptionError("evolution revision replay has no revision")
+                revision = self._revision_row(active_revision.id)
+                if revision.predecessor_revision != predecessor:
+                    raise StoreCorruptionError(
+                        "evolution revision replay predecessor is invalid"
+                    )
+                return revision
+
+            row, current = self._project_row(project_id)
+            if current.status is not m.ProjectStatus.READY:
+                raise ResourceConflictError("project is not ready for evolution activation")
+            if predecessor.project_id != project_id or current.active_revision != predecessor:
+                raise ResourceConflictError("project revision advanced before activation")
+            now = self._project_mutation_timestamp(current)
+            next_version = int(row["resource_version"]) + 1
+            project_data = current.model_dump(mode="python", exclude={"etag"})
+            project_data["updated_at"] = now
+            project_data["current_project_snapshot"] = _snapshot(
+                self._signing_key,
+                m.SnapshotKind.PROJECT,
+                _project_snapshot_payload(project_data),
+                now,
+            )
+            refreshed = _model_with_etag(
+                m.ProjectV1,
+                project_data,
+                version=next_version,
+            )
+            updated, revision = self._publish_ready_revision(
+                refreshed,
+                now=now,
+                project_version=next_version,
+            )
+            if revision is None:
+                raise StoreCorruptionError("ready project did not publish an evolution revision")
+            self._connection.execute(
+                "UPDATE projects SET document_json = ?, resource_version = ?, updated_at = ? "
+                "WHERE project_id = ?",
+                (_model_bytes(updated), next_version, now, project_id),
+            )
+            self._insert_revision(
+                revision,
+                operation_id=operation_id,
+                resource_scope=project_id,
+                idempotency_key=run_id,
+                activation_request_digest=envelope.digest,
+            )
+            self._append_project_event(updated, now=now)
+            self._append_revision_activated_event(revision, now=now)
+            self._store_idempotency(
+                operation_id,
+                project_id,
+                run_id,
+                envelope,
+                StoredResult(200, updated, updated.etag),
+            )
+            return revision
 
     def patch_project(
         self,
@@ -2272,6 +2445,9 @@ class CoreControlStoreV1:
             operation_id == "createCoreProjectV1" and scope == "projects"
         ) or (
             operation_id == "patchCoreProjectV1" and scope == project_id
+        ) or (
+            operation_id == "activateCoreEvolutionRevisionInternalV1"
+            and scope == project_id
         ) or (
             operation_id == "finalizeCoreWorkspaceUploadV1"
             and isinstance(scope, str)
@@ -5148,6 +5324,38 @@ def _model_bytes(model: BaseModel) -> bytes:
     return _canonical_bytes(model.model_dump(mode="json"))
 
 
+def _normalized_evolution_context_ids(
+    value: Mapping[str, list[str]],
+) -> dict[str, list[str]]:
+    if not isinstance(value, Mapping) or len(value) > 128:
+        raise ValueError("evolution context artifact map exceeds its closed bound")
+    normalized: dict[str, list[str]] = {}
+    total = 0
+    for artifact_type, artifact_ids in sorted(value.items()):
+        if (
+            not isinstance(artifact_type, str)
+            or not 1 <= len(artifact_type) <= 128
+            or any(ord(character) < 0x21 or ord(character) == 0x7F for character in artifact_type)
+            or not isinstance(artifact_ids, list)
+            or len(artifact_ids) > 256
+        ):
+            raise ValueError("evolution context artifact map is invalid")
+        if any(
+            not isinstance(artifact_id, str)
+            or not 1 <= len(artifact_id.encode("utf-8")) <= 256
+            or any(ord(character) < 0x21 or ord(character) == 0x7F for character in artifact_id)
+            for artifact_id in artifact_ids
+        ):
+            raise ValueError("evolution context artifact ID is invalid")
+        if len(set(artifact_ids)) != len(artifact_ids):
+            raise ValueError("evolution context artifact IDs must be unique")
+        total += len(artifact_ids)
+        if total > 1024:
+            raise ValueError("evolution context has too many artifact IDs")
+        normalized[artifact_type] = list(artifact_ids)
+    return normalized
+
+
 def _canonical_bytes(value: object) -> bytes:
     return json.dumps(
         _json_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -5429,6 +5637,7 @@ def _validate_idempotency_request_envelope(
         "putCoreWorkspaceUploadChunkV1": {"if-match"},
         "finalizeCoreWorkspaceUploadV1": {"if-match", "if-project-match"},
         "abortCoreWorkspaceUploadV1": {"if-match"},
+        "activateCoreEvolutionRevisionInternalV1": set(),
     }[operation_id]
     if set(header_value) != expected_headers or any(
         not _is_etag(value) for value in header_value.values()
@@ -5508,6 +5717,21 @@ def _validate_idempotency_response_semantics(
             and _project_response_has_core_identity(model)
             and all(response_values[field] == value for field, value in request_values.items())
             and _is_etag(semantic_headers.get("if-match"))
+        )
+    elif operation_id == "activateCoreEvolutionRevisionInternalV1" and isinstance(
+        model, m.ProjectV1
+    ):
+        assert isinstance(request, _EvolutionRevisionActivationRequest)
+        active_revision = model.active_revision
+        valid = (
+            scope.project_id == request.project_id == model.id
+            and scope.upload_id is None
+            and not semantic_headers
+            and _project_response_has_core_identity(model)
+            and model.status is m.ProjectStatus.READY
+            and active_revision is not None
+            and active_revision.project_id == request.project_id
+            and active_revision.generation == request.predecessor.generation + 1
         )
     elif operation_id == "deleteCoreProjectV1":
         valid = (

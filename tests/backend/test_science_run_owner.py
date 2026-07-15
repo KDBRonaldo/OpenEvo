@@ -199,7 +199,9 @@ def _completed_result(
         },
         "scores": {"quality": 0.75},
         "promoted": True,
+        "created_at": "2026-07-14T00:00:01Z",
         "payload_byte_size": 12,
+        "payload_file_count": 1,
         "payload_manifest_digest": "e" * 64,
     }
     return {
@@ -213,7 +215,14 @@ def _completed_result(
                             "text_memory": [artifact_id],
                         },
                         "jobs": [
-                            {"worker_results": [{"outputs": [output] if include_output else []}]}
+                            {
+                                "worker_results": [
+                                    {
+                                        "artifact_ids": [artifact_id],
+                                        "outputs": [output] if include_output else [],
+                                    }
+                                ]
+                            }
                         ],
                     }
                 ]

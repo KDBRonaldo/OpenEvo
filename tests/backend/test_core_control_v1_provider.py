@@ -37,6 +37,7 @@ import openevo.backend.contracts.v1.provider as provider_module
 from openevo.backend.contracts.v1.store import (
     CoreControlStoreError,
     CoreControlStoreV1,
+    IdempotencyConflictError,
     StoreCorruptionError,
 )
 from openevo.backend.run_control import CoreRunControlError
@@ -2435,6 +2436,58 @@ def test_verified_subscription_project_publishes_durable_initial_revision(
         )
         assert head_after_restart.status_code == 200
         assert head_after_restart.json()["active_revision"] == initial_ref
+
+
+def test_store_activates_idempotent_cross_session_evolution_revision(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    registry = verified_builtin_registry(tmp_path / "registry")
+    app = _app(state_root, registry=registry)
+    with TestClient(app) as client:
+        created, _etag = _create_project(client, _project_create())
+        predecessor = m.RevisionRefV1.model_validate(created["active_revision"])
+        store = app.state.core_control_provider.store
+        revision = store.activate_evolution_revision(
+            created["id"],
+            predecessor=predecessor,
+            run_id="run-evolution-1",
+            context_artifact_ids={
+                "dataset": ["dataset-1"],
+                "text_memory": ["artifact-memory-1"],
+            },
+        )
+        replay = store.activate_evolution_revision(
+            created["id"],
+            predecessor=predecessor,
+            run_id="run-evolution-1",
+            context_artifact_ids={
+                "dataset": ["dataset-1"],
+                "text_memory": ["artifact-memory-1"],
+            },
+        )
+
+        assert revision.revision.generation == predecessor.generation + 1
+        assert revision.predecessor_revision == predecessor
+        assert revision.status is m.RevisionStatus.ACTIVE
+        assert replay == revision
+        assert store.get_project(created["id"]).active_revision == revision.revision
+
+        with pytest.raises(IdempotencyConflictError):
+            store.activate_evolution_revision(
+                created["id"],
+                predecessor=predecessor,
+                run_id="run-evolution-1",
+                context_artifact_ids={"text_memory": ["artifact-memory-2"]},
+            )
+
+    with TestClient(_app(state_root, registry=registry)) as restarted:
+        response = restarted.get(
+            f"/v1/projects/{created['id']}/revisions/head",
+            headers=AUTH,
+        )
+        assert response.status_code == 200
+        assert response.json()["active_revision"] == revision.revision.model_dump(mode="json")
 
 
 def test_project_patch_publishes_a_durable_direct_successor_revision(

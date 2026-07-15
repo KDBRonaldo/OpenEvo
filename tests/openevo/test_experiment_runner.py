@@ -408,6 +408,86 @@ def test_live_runner_calls_services_and_worker_in_order(tmp_path: Path) -> None:
     assert (tmp_path / "run" / "summary.json").exists()
 
 
+def test_live_runner_accepts_core_owned_run_identity(tmp_path: Path) -> None:
+    rollout = FakeRolloutClient()
+
+    result = run_experiment(
+        _config(),
+        run_id="core-run-123",
+        output_dir=tmp_path / "run",
+        rollout_client=rollout,
+        evolution_client=FakeEvolutionClient(),
+        worker_runner=FakeWorkerRunner(),
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    assert result["run_id"] == "core-run-123"
+    assert ":run-core-run-123:round-0" in rollout.submitted[0]["metadata"]["policy_version"]
+
+
+def test_live_runner_starts_from_pinned_revision_context(tmp_path: Path) -> None:
+    rollout = FakeRolloutClient()
+    evolution = FakeEvolutionClient()
+    initial = {
+        "dataset": ["prior-dataset"],
+        "text_memory": ["prior-memory"],
+        "parametric_memory": [],
+        "skill_bundle": ["prior-skill"],
+        "agent_system": ["prior-agent-system"],
+    }
+
+    result = run_experiment(
+        _config(),
+        initial_context_artifact_ids=initial,
+        output_dir=tmp_path / "run",
+        rollout_client=rollout,
+        evolution_client=evolution,
+        worker_runner=FakeWorkerRunner(),
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    assert rollout.submitted[0]["metadata"]["evolution"]["context_artifact_ids"] == [
+        "prior-memory",
+        "prior-skill",
+        "prior-agent-system",
+    ]
+    assert evolution.jobs[0]["input_artifact_ids"] == [
+        "dataset-artifact-1",
+        "prior-memory",
+    ]
+    final_ids = result["tasks"][0]["rounds"][0]["artifact_ids"]
+    assert final_ids["dataset"] == ["prior-dataset", "dataset-artifact-1"]
+
+
+def test_live_runner_can_dispatch_jobs_to_managed_method_worker(tmp_path: Path) -> None:
+    evolution = FakeEvolutionClient()
+    worker = FakeWorkerRunner()
+
+    run_experiment(
+        _config(),
+        managed_worker=True,
+        output_dir=tmp_path / "run",
+        rollout_client=FakeRolloutClient(),
+        evolution_client=evolution,
+        worker_runner=worker,
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    assert [job["job_type"] for job in evolution.jobs] == [
+        "text_memory_reflector",
+        "skill_bundle_reflector",
+        "agent_system_reflector",
+    ]
+    assert [call["capabilities"][0] for call in worker.calls] == [
+        "text_memory_reflector",
+        "skill_bundle_reflector",
+        "agent_system_reflector",
+    ]
+
+
 def test_live_runner_scopes_evolution_plans_to_each_task(tmp_path: Path) -> None:
     rollout = FakeRolloutClient()
     evolution = FakeEvolutionClient()

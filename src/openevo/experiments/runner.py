@@ -4,7 +4,7 @@ import json
 import math
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -115,8 +115,11 @@ def _empty_context_artifact_ids() -> dict[str, list[str]]:
 def run_experiment(
     config: ExperimentConfig,
     *,
+    run_id: str | None = None,
     task_ids: Sequence[str] | None = None,
     rounds_override: int | None = None,
+    initial_context_artifact_ids: Mapping[str, Sequence[str]] | None = None,
+    managed_worker: bool = False,
     output_dir: Path | None = None,
     artifact_root: Path | None = None,
     rollout_client: RolloutClientProtocol | None = None,
@@ -132,7 +135,7 @@ def run_experiment(
         poll_interval_seconds=poll_interval_seconds,
         max_poll_attempts=max_poll_attempts,
     )
-    run_id = uuid4().hex
+    run_id = run_id if run_id is not None else uuid4().hex
     compiled = compile_experiment(
         config,
         task_ids=task_ids,
@@ -165,6 +168,8 @@ def run_experiment(
             poll_interval_seconds=poll_interval_seconds,
             max_poll_attempts=max_poll_attempts,
             executable_registry=executable_registry,
+            initial_context_artifact_ids=initial_context_artifact_ids,
+            managed_worker=managed_worker,
         )
     finally:
         if owns_rollout and hasattr(rollout, "close"):
@@ -194,14 +199,19 @@ def _run_compiled_experiment(
     poll_interval_seconds: float,
     max_poll_attempts: int,
     executable_registry: VerifiedExecutableRegistry,
+    initial_context_artifact_ids: Mapping[str, Sequence[str]] | None,
+    managed_worker: bool,
 ) -> dict[str, Any]:
     task_results: list[dict[str, Any]] = []
     any_failure = False
     any_pending_review = False
     run_id = compiled.run_id or uuid4().hex
+    initial_context = _validated_initial_context_artifact_ids(
+        initial_context_artifact_ids
+    )
     for task in compiled.tasks:
-        history_context_artifact_ids = _empty_context_artifact_ids()
-        rollout_context_artifact_ids = _empty_context_artifact_ids()
+        history_context_artifact_ids = _snapshot_context_artifact_ids(initial_context)
+        rollout_context_artifact_ids = _snapshot_context_artifact_ids(initial_context)
         round_results: list[dict[str, Any]] = []
         for round_index in range(compiled.round_count):
             rollout_payload = task.rollout_payload_for_round(
@@ -259,11 +269,15 @@ def _run_compiled_experiment(
                     dataset_artifact_id=dataset_artifact_id,
                     context_artifact_ids=prior_context_artifact_ids,
                 )[0]
-                claim_capability = _claim_capability_for_job(
-                    run_id=run_id,
-                    task_id=task.task_id,
-                    round_index=round_index,
-                    method=spec.method,
+                claim_capability = (
+                    spec.method
+                    if managed_worker
+                    else _claim_capability_for_job(
+                        run_id=run_id,
+                        task_id=task.task_id,
+                        round_index=round_index,
+                        method=spec.method,
+                    )
                 )
                 job_payload["job_type"] = claim_capability
                 created_job = evolution_client.create_plan_bound_job(
@@ -490,6 +504,42 @@ def _snapshot_context_artifact_ids(
         artifact_type: list(artifact_ids)
         for artifact_type, artifact_ids in context_artifact_ids.items()
     }
+
+
+def _validated_initial_context_artifact_ids(
+    value: Mapping[str, Sequence[str]] | None,
+) -> dict[str, list[str]]:
+    result = _empty_context_artifact_ids()
+    if value is None:
+        return result
+    if len(value) > 128:
+        raise ValueError("initial context has too many artifact types")
+    total = 0
+    for artifact_type, artifact_ids in value.items():
+        if (
+            not isinstance(artifact_type, str)
+            or not artifact_type
+            or len(artifact_type) > 128
+        ):
+            raise ValueError("initial context artifact type is invalid")
+        if isinstance(artifact_ids, str) or not isinstance(artifact_ids, Sequence):
+            raise TypeError("initial context artifact IDs must be a sequence")
+        normalized: list[str] = []
+        for artifact_id in artifact_ids:
+            if (
+                not isinstance(artifact_id, str)
+                or not artifact_id
+                or len(artifact_id.encode("utf-8")) > 256
+            ):
+                raise ValueError("initial context artifact ID is invalid")
+            normalized.append(artifact_id)
+        if len(normalized) > 256 or len(set(normalized)) != len(normalized):
+            raise ValueError("initial context artifact IDs exceed their closed bound")
+        total += len(normalized)
+        if total > 1024:
+            raise ValueError("initial context has too many artifact IDs")
+        result[artifact_type] = normalized
+    return result
 
 
 def _promotion_gate_targets_artifact(
