@@ -36,6 +36,7 @@ from openevo.backend.service_supervisor import (
     ServiceGroupSnapshot,
     ServiceRunReadinessCode,
     ServiceRunBinding,
+    ServiceRunLease,
 )
 from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
 from openevo.experiments import EvolutionHttpClient, RolloutHttpClient, run_experiment
@@ -73,6 +74,16 @@ class _ServiceOwner(Protocol):
         runtime_image: str | None = None,
         total_timeout: float | None = None,
     ) -> ServiceGroupSnapshot: ...
+
+    def ensure_run_binding(
+        self,
+        execution_mode: ServiceExecutionMode,
+        *,
+        model_ref: str | None = None,
+        codex_model: str | None = None,
+        runtime_image: str | None = None,
+        total_timeout: float | None = None,
+    ) -> tuple[ServiceGroupSnapshot, ServiceRunLease | None]: ...
 
     def run_binding(self) -> ServiceRunBinding: ...
 
@@ -576,6 +587,7 @@ class CoreScienceRunOwner:
 
     def _execute(self, run_id: str) -> None:
         cancellation = self._cancel_events.setdefault(run_id, threading.Event())
+        service_lease: ServiceRunLease | None = None
         try:
             if cancellation.is_set():
                 raise _RunCancelled()
@@ -599,8 +611,10 @@ class CoreScienceRunOwner:
             )
             request = self._ledger.request_for_run(run_id)
             project = self._validate_create_request(request)
-            self._ensure_services(project)
-            binding = self._services.run_binding()
+            _, service_lease = self._ensure_services(project, require_binding=True)
+            if service_lease is None:
+                raise _service_generation_changed()
+            binding = service_lease.binding
             if binding.registry_digest != request.expected_registry_digest:
                 raise RuntimeError("managed service registry changed before execution")
             if cancellation.is_set():
@@ -688,6 +702,8 @@ class CoreScienceRunOwner:
             else:
                 self._finish_failed(run_id, exc)
         finally:
+            if service_lease is not None:
+                service_lease.close()
             with self._condition:
                 self._condition.notify_all()
 
@@ -845,26 +861,38 @@ class CoreScienceRunOwner:
 
         return wait_for_job
 
-    def _ensure_services(self, project: m.ProjectV1) -> ServiceGroupSnapshot:
+    def _ensure_services(
+        self,
+        project: m.ProjectV1,
+        *,
+        require_binding: bool = False,
+    ) -> tuple[ServiceGroupSnapshot, ServiceRunLease | None]:
         image = MANAGED_RUNTIME_IMAGES["managed_science"]
+        lease: ServiceRunLease | None = None
         try:
             if (
                 project.spec.execution_mode
                 is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
             ):
                 execution_mode = ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
-                snapshot = self._services.ensure(
-                    ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
-                    codex_model=project.spec.agent_model_ref,
-                    runtime_image=image,
-                )
+                arguments = {
+                    "codex_model": project.spec.agent_model_ref,
+                    "runtime_image": image,
+                }
             else:
                 execution_mode = ServiceExecutionMode.SELF_DEPLOYED
-                snapshot = self._services.ensure(
-                    ServiceExecutionMode.SELF_DEPLOYED,
-                    model_ref=project.spec.agent_model_ref,
-                    runtime_image=image,
+                arguments = {
+                    "model_ref": project.spec.agent_model_ref,
+                    "runtime_image": image,
+                }
+            if require_binding:
+                snapshot, lease = self._services.ensure_run_binding(
+                    execution_mode,
+                    **arguments,
                 )
+            else:
+                snapshot = self._services.ensure(execution_mode, **arguments)
+                lease = None
         except CoreServiceControlError as exc:
             raise _owner_error(
                 "run_service_supervisor_failed",
@@ -873,6 +901,8 @@ class CoreScienceRunOwner:
                 True,
             ) from exc
         if snapshot.execution_mode is not execution_mode:
+            if lease is not None:
+                lease.close()
             raise _owner_error(
                 "run_service_mode_mismatch",
                 "Managed services do not match the saved project execution mode.",
@@ -880,8 +910,25 @@ class CoreScienceRunOwner:
                 True,
             )
         if not snapshot.run_ready:
+            if lease is not None:
+                lease.close()
             raise _readiness_error(snapshot.run_readiness_code)
-        return snapshot
+        if snapshot.runtime_image != image:
+            if lease is not None:
+                lease.close()
+            raise _service_generation_changed()
+        binding = None if lease is None else lease.binding
+        if require_binding and (
+            binding is None
+            or binding.execution_mode is not snapshot.execution_mode
+            or binding.runtime_image != snapshot.runtime_image
+            or binding.runtime_identity_digest != snapshot.runtime_identity_digest
+            or binding.generation_digest != snapshot.generation_digest
+        ):
+            if lease is not None:
+                lease.close()
+            raise _service_generation_changed()
+        return snapshot, lease
 
     def _validate_create_request(self, request: m.RunCreateV1) -> m.ProjectV1:
         try:
@@ -955,16 +1002,18 @@ class CoreScienceRunOwner:
             return
 
     def _finish_failed(self, run_id: str, exc: BaseException) -> None:
-        del exc
         try:
             current = self._ledger.get_run(run_id)
             if current.status in _TERMINAL:
                 return
-            error = _api_error(
-                "science_run_failed",
-                "The remote science run did not complete.",
-                retryable=True,
-            )
+            if isinstance(exc, CoreRunControlError):
+                error = _api_error(exc.code, str(exc), retryable=exc.retryable)
+            else:
+                error = _api_error(
+                    "science_run_failed",
+                    "The remote science run did not complete.",
+                    retryable=True,
+                )
             terminal = self._ledger.mutate_run(
                 run_id,
                 lambda run, version: _transition_run(
@@ -1594,6 +1643,15 @@ def _readiness_error(code: ServiceRunReadinessCode) -> CoreRunControlError:
     }
     message = messages.get(code, "Managed Science run readiness is unavailable.")
     return _owner_error(f"run_{code.value}", message, 503, True)
+
+
+def _service_generation_changed() -> CoreRunControlError:
+    return _owner_error(
+        "run_service_generation_changed",
+        "Managed services changed before the science run could start.",
+        503,
+        True,
+    )
 
 
 def _admission_denied() -> RunAdmissionError:

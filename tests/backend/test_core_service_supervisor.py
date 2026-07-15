@@ -323,6 +323,18 @@ def _ensure_subscription(
     )
 
 
+def _ensure_subscription_binding(
+    supervisor: CoreServiceSupervisor,
+    *,
+    codex_model: str = "gpt-5.1-codex-mini",
+):
+    return supervisor.ensure_run_binding(
+        ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+        codex_model=codex_model,
+        runtime_image="openevo/science-runtime:0.1.0",
+    )
+
+
 def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identity(
     tmp_path: Path,
     framework_lock: Path,
@@ -333,6 +345,7 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         assert snapshot.services_available is True
         assert snapshot.run_ready is True
         assert snapshot.run_readiness_code is ServiceRunReadinessCode.READY
+        assert snapshot.runtime_image == "openevo/science-runtime:0.1.0"
         assert [service.id for service in snapshot.services] == [
             "evolution-backend",
             "rollout",
@@ -520,6 +533,90 @@ def test_concurrent_ensure_is_idempotent(
         assert snapshots[0].generation_digest == snapshots[1].generation_digest
     finally:
         backend.spawn_gate.set()
+        supervisor.close()
+
+
+def test_atomic_run_binding_lease_blocks_another_model_generation_until_release(
+    tmp_path: Path,
+    framework_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock)
+    binding_entered = threading.Event()
+    binding_allowed = threading.Event()
+    replacement_started = threading.Event()
+    original_run_binding = supervisor._run_binding_locked
+    first_results = []
+    replacement_results = []
+    errors: list[BaseException] = []
+    replacement_errors: list[SupervisorStateError] = []
+
+    def blocking_run_binding():
+        binding_entered.set()
+        assert binding_allowed.wait(5)
+        return original_run_binding()
+
+    monkeypatch.setattr(supervisor, "_run_binding_locked", blocking_run_binding)
+
+    def first() -> None:
+        try:
+            first_results.append(_ensure_subscription_binding(supervisor))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def replace() -> None:
+        replacement_started.set()
+        try:
+            replacement_results.append(
+                _ensure_subscription(supervisor, codex_model="gpt-5.2-codex")
+            )
+        except SupervisorStateError as exc:
+            replacement_errors.append(exc)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=first)
+    replacement_thread = threading.Thread(target=replace)
+    try:
+        first_thread.start()
+        assert binding_entered.wait(5)
+        replacement_thread.start()
+        assert replacement_started.wait(5)
+        time.sleep(0.05)
+        assert replacement_thread.is_alive()
+        assert replacement_results == []
+
+        binding_allowed.set()
+        first_thread.join(5)
+        replacement_thread.join(5)
+
+        assert not first_thread.is_alive()
+        assert not replacement_thread.is_alive()
+        assert errors == []
+        assert len(first_results) == 1
+        snapshot, lease = first_results[0]
+        assert lease is not None
+        binding = lease.binding
+        assert binding.execution_mode is snapshot.execution_mode
+        assert binding.runtime_image == snapshot.runtime_image
+        assert binding.runtime_identity_digest == snapshot.runtime_identity_digest
+        assert binding.generation_digest == snapshot.generation_digest
+        assert replacement_results == []
+        assert len(replacement_errors) == 1
+        assert "leased to an active run" in str(replacement_errors[0])
+        assert len(backend.spawned) == 4
+        assert backend.terminated == []
+        replay = _ensure_subscription(supervisor)
+        assert replay.generation_digest == snapshot.generation_digest
+
+        lease.close()
+        replacement = _ensure_subscription(supervisor, codex_model="gpt-5.2-codex")
+        assert replacement.generation_digest != snapshot.generation_digest
+        assert len(backend.spawned) == 8
+    finally:
+        binding_allowed.set()
+        first_thread.join(5)
+        replacement_thread.join(5)
         supervisor.close()
 
 

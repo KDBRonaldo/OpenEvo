@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+import sqlite3
 import threading
 import time
 from typing import Any
@@ -21,6 +22,7 @@ from openevo.backend.service_supervisor import (
     ServiceExecutionMode,
     ServiceGroupSnapshot,
     ServiceRunBinding,
+    ServiceRunLease,
     ServiceRunReadinessCode,
     SupervisorStateError,
 )
@@ -46,6 +48,7 @@ class _FakeServiceOwner:
         readiness_code: ServiceRunReadinessCode = ServiceRunReadinessCode.READY,
     ) -> None:
         self.binding = binding
+        self.binding_after_ensure: ServiceRunBinding | None = None
         self.ensure_error: BaseException | None = None
         self.block_all_ensures = False
         self.set_readiness(readiness_code)
@@ -53,6 +56,7 @@ class _FakeServiceOwner:
         self.ensure_allowed = threading.Event()
         self.ensure_allowed.set()
         self.ensure_calls = 0
+        self.ensure_run_binding_calls = 0
 
     def set_readiness(self, readiness_code: ServiceRunReadinessCode) -> None:
         ready = readiness_code is ServiceRunReadinessCode.READY
@@ -63,6 +67,7 @@ class _FakeServiceOwner:
             run_readiness_code=readiness_code,
             generation_digest=self.binding.generation_digest,
             services=(),
+            runtime_image=self.binding.runtime_image if ready else None,
             runtime_identity_digest=(self.binding.runtime_identity_digest if ready else None),
             status_message=None if ready else "secret probe output must not escape",
         )
@@ -79,6 +84,16 @@ class _FakeServiceOwner:
         ) and not self.ensure_allowed.wait(5):
             raise TimeoutError("test did not release service preparation")
         return self.snapshot
+
+    def ensure_run_binding(
+        self, *args: object, **kwargs: object
+    ) -> tuple[ServiceGroupSnapshot, ServiceRunLease | None]:
+        self.ensure_run_binding_calls += 1
+        snapshot = self.ensure(*args, **kwargs)
+        return snapshot, ServiceRunLease(
+            binding=self.binding_after_ensure or self.binding,
+            _release=lambda: None,
+        )
 
     def run_binding(self) -> ServiceRunBinding:
         return self.binding
@@ -171,10 +186,15 @@ def _run_request(project: m.ProjectV1) -> m.RunCreateV1:
     )
 
 
-def _binding(registry: object) -> ServiceRunBinding:
+def _binding(
+    registry: object,
+    *,
+    generation_digest: str = _GENERATION_DIGEST,
+    runtime_identity_digest: str = "f" * 64,
+) -> ServiceRunBinding:
     identity = InternalServiceIdentity(
         service_id="core-control",
-        generation_digest=_GENERATION_DIGEST,
+        generation_digest=generation_digest,
         registry_digest=registry.snapshot.registry_digest,
         framework_lock_digest=_FRAMEWORK_LOCK_DIGEST,
         credential="private-science-owner-test-credential-0123456789",
@@ -182,7 +202,7 @@ def _binding(registry: object) -> ServiceRunBinding:
     return ServiceRunBinding(
         execution_mode=ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
         runtime_image="openevo/science-runtime:0.1.0",
-        runtime_identity_digest="f" * 64,
+        runtime_identity_digest=runtime_identity_digest,
         generation_digest=identity.generation_digest,
         registry_digest=identity.registry_digest,
         framework_lock_digest=identity.framework_lock_digest,
@@ -605,6 +625,7 @@ def test_run_transitions_queued_preparing_running_succeeded_with_ordered_evidenc
         assert succeeded.attempt_count == 1
         assert succeeded.current_attempt is not None
         assert succeeded.current_attempt.status is m.RunStatus.SUCCEEDED
+        assert services.ensure_run_binding_calls == 1
 
         timeline = owner._ledger.timeline(queued.id)
         assert [item.sequence for item in timeline] == list(range(len(timeline)))
@@ -627,6 +648,47 @@ def test_run_transitions_queued_preparing_running_succeeded_with_ordered_evidenc
     finally:
         services.ensure_allowed.set()
         runner_allowed.set()
+        owner.close()
+        store.close()
+
+
+def test_generation_replacement_after_execution_ensure_fails_before_admission_or_runner(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+    services.ensure_allowed.clear()
+    runner_calls: list[dict[str, Any]] = []
+
+    def run(_config: object, **kwargs: Any) -> dict[str, Any]:
+        runner_calls.append(kwargs)
+        return _completed_result()
+
+    owner = _owner(tmp_path / "owner", store, registry, services, run)
+    try:
+        queued = _invoke_create(owner, _run_request(project), "generation-replacement")
+        _wait_for_status(owner, queued.id, m.RunStatus.PREPARING)
+        services.binding_after_ensure = _binding(
+            registry,
+            generation_digest="9" * 64,
+            runtime_identity_digest="8" * 64,
+        )
+        services.ensure_allowed.set()
+
+        failed = _wait_for_status(owner, queued.id, m.RunStatus.FAILED)
+        assert failed.current_error is not None
+        assert failed.current_error.code == "run_service_generation_changed"
+        assert failed.current_error.http_status == 503
+        assert failed.current_error.retryable is True
+        assert failed.current_error.message == (
+            "Managed services changed before the science run could start."
+        )
+        assert runner_calls == []
+        with sqlite3.connect(owner._ledger.database) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM admissions").fetchone()[0] == 0
+    finally:
+        services.ensure_allowed.set()
         owner.close()
         store.close()
 

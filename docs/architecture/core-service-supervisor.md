@@ -245,6 +245,19 @@ names the closed prerequisite or service/admission failure. `run_binding()`
 requires that stronger state and carries the exact execution mode, managed image,
 and runtime evidence digest to the science execution compiler.
 
+The run owner uses `ensure_run_binding()` rather than composing `ensure()` and
+`run_binding()` across separate lock acquisitions. The supervisor holds the same
+lifecycle mutex while it verifies readiness, captures the snapshot, refreshes
+process identity, and issues the binding. The snapshot carries the exact managed
+image in addition to execution mode, generation digest, and runtime identity
+digest. Before returning, the supervisor requires all four fields to match the
+binding and returns a process-local generation lease. While the run owner holds
+that lease, an exact same-plan readiness replay may inspect the healthy group,
+but a different model/runtime plan or force-restart fails before stop, spawn, or
+generation mutation. The run owner releases the lease after runner and admission
+work exits. A concurrent ensure therefore cannot replace the generation between
+readiness, binding issuance, and the run's private requests.
+
 The run owner still revalidates the exact project snapshots, immutable revision,
 registry, and generation before dispatch. Evolution outputs apply only to a
 later session after the revision contract commits. A promoted artifact, legacy

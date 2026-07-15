@@ -74,6 +74,18 @@ second probe closes the gap between HTTP admission and worker dispatch:
 - self-deployed modes use the managed remote model service and preserve the
   project's transcript or token-level capture mode.
 
+The second probe atomically returns its exact readiness snapshot and a leased run
+binding under one supervisor lifecycle lock. The lease prevents another model or
+runtime ensure from replacing the generation until runner and private admission
+work exits. Before creating service clients, output directories, runner work, or
+private admissions, the run owner independently
+requires the binding's generation digest, runtime identity digest, execution
+mode, and managed image to equal the snapshot and saved project request. A
+concurrent model ensure therefore cannot move a run onto the replacement
+generation. Any mismatch fails the run with the static retryable 503
+`run_service_generation_changed`; supervisor detail and private state are not
+included.
+
 Core compiles the project through `compile_science_execution()` and invokes the
 existing experiment runner. The runner accepts a Core-owned run ID, an exact
 initial context from the pinned revision, and a managed worker callback. This

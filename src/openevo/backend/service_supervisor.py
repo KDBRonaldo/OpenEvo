@@ -712,6 +712,7 @@ class ServiceGroupSnapshot:
     run_readiness_code: ServiceRunReadinessCode
     generation_digest: str
     services: tuple[SupervisorServiceSummary, ...]
+    runtime_image: str | None
     runtime_identity_digest: str | None
     status_message: str | None = None
 
@@ -719,7 +720,9 @@ class ServiceGroupSnapshot:
         if self.run_ready != (self.run_readiness_code is ServiceRunReadinessCode.READY):
             raise ValueError("service run readiness code does not match ready state")
         if self.run_ready and (
-            not self.services_available or self.runtime_identity_digest is None
+            not self.services_available
+            or self.runtime_image not in set(MANAGED_RUNTIME_IMAGES.values())
+            or self.runtime_identity_digest is None
         ):
             raise ValueError("run-ready service group lacks runtime evidence")
 
@@ -754,6 +757,21 @@ class ServiceRunBinding:
 
     def request_headers(self) -> dict[str, str]:
         return self._identity.request_headers()
+
+
+@dataclass(slots=True)
+class ServiceRunLease:
+    """Process-local lease preventing replacement of one bound run generation."""
+
+    binding: ServiceRunBinding
+    _release: Callable[[], None] = field(repr=False, compare=False)
+    _closed: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._release()
 
 
 class _StrictStateModel(BaseModel):
@@ -1634,6 +1652,7 @@ class CoreServiceSupervisor:
             self._active_plan_key: str | None = None
             self._active_credential: str | None = None
             self._active_runtime_request: ManagedScienceRuntimeRequest | None = None
+            self._active_run_lease: object | None = None
             self._active_cancellation: threading.Event | None = None
             self._ledger = self._load_or_initialize_ledger()
             self._recover_prior_owner_state()
@@ -1663,6 +1682,42 @@ class CoreServiceSupervisor:
             force_restart=False,
         )
 
+    def ensure_run_binding(
+        self,
+        execution_mode: ServiceExecutionMode,
+        *,
+        model_ref: str | None = None,
+        codex_model: str | None = None,
+        runtime_image: str | None = None,
+        total_timeout: float | None = None,
+    ) -> tuple[ServiceGroupSnapshot, ServiceRunLease | None]:
+        """Ensure readiness and issue its exact binding under one lifecycle lock."""
+
+        with self._mutex:
+            snapshot = self._ensure_locked(
+                execution_mode,
+                model_ref=model_ref,
+                codex_model=codex_model,
+                runtime_image=runtime_image,
+                total_timeout=total_timeout,
+                force_restart=False,
+            )
+            if not snapshot.run_ready:
+                return snapshot, None
+            if self._active_run_lease is not None:
+                raise SupervisorStateError("managed service generation already has a run lease")
+            binding = self._run_binding_locked()
+            if not _binding_matches_snapshot(snapshot, binding):
+                raise SupervisorStateError(
+                    "managed service generation changed while issuing a run binding"
+                )
+            token = object()
+            self._active_run_lease = token
+            return snapshot, ServiceRunLease(
+                binding=binding,
+                _release=lambda: self._release_run_lease(token),
+            )
+
     def _ensure_locked(
         self,
         execution_mode: ServiceExecutionMode,
@@ -1686,6 +1741,10 @@ class CoreServiceSupervisor:
             lock_payload = self._framework_lock_source.verified_payload()
             self._root.atomic_write("framework-lock.json", lock_payload)
             if execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
+                if self._active_run_lease is not None:
+                    raise SupervisorStateError(
+                        "managed service generation is leased to an active run"
+                    )
                 return self._ensure_self_deployed_unavailable(model_ref, deadline)
             if codex_model is None or runtime_image is None:
                 raise ValueError(
@@ -1718,6 +1777,26 @@ class CoreServiceSupervisor:
                     "runtime_image": runtime_request.runtime_image,
                 }
             )
+            if self._active_run_lease is not None:
+                if (
+                    force_restart
+                    or not runtime.ready
+                    or self._active_plan_key != plan_key
+                    or self._active_credential is None
+                    or not self._specs
+                    or self._ledger.generation_digest is None
+                    or not self._is_current_group_healthy(
+                        execution_mode,
+                        self._ledger.generation_digest,
+                        tuple(self._specs.values()),
+                        deadline,
+                        cancellation,
+                    )
+                ):
+                    raise SupervisorStateError(
+                        "managed service generation is leased to an active run"
+                    )
+                return self._group_snapshot()
             if (
                 not force_restart
                 and runtime.ready
@@ -1899,48 +1978,54 @@ class CoreServiceSupervisor:
 
     def run_binding(self) -> ServiceRunBinding:
         with self._mutex:
-            self._require_open()
-            self._verify_release_installation()
-            self._refresh_process_state()
-            snapshot = self._group_snapshot()
-            credential = self._active_credential
-            runtime_request = self._active_runtime_request
-            runtime_identity = snapshot.runtime_identity_digest
-            if (
-                not snapshot.run_ready
-                or credential is None
-                or runtime_request is None
-                or runtime_identity is None
-            ):
-                raise SupervisorStateError("managed service group is not ready for a run")
-            specs = self._specs
-            required = {"evolution-backend", "rollout", "gateway"}
-            if not required.issubset(specs):
-                raise SupervisorStateError("managed run service endpoints are unavailable")
-            ports = {service_id: specs[service_id].port for service_id in required}
-            if any(port is None for port in ports.values()):
-                raise SupervisorStateError("managed run service ports are unavailable")
-            identity = InternalServiceIdentity(
-                service_id="core-control",
-                generation_digest=snapshot.generation_digest,
-                registry_digest=self._release_identity.registry_digest,
-                framework_lock_digest=self._framework_lock_digest,
-                credential=credential,
-            )
-            return ServiceRunBinding(
-                execution_mode=snapshot.execution_mode,
-                runtime_image=runtime_request.runtime_image,
-                runtime_identity_digest=runtime_identity,
-                generation_digest=snapshot.generation_digest,
-                registry_digest=self._release_identity.registry_digest,
-                framework_lock_digest=self._framework_lock_digest,
-                rollout_url=f"http://127.0.0.1:{ports['rollout']}",
-                evolution_backend_url=(
-                    f"http://127.0.0.1:{ports['evolution-backend']}"
-                ),
-                gateway_url=f"http://127.0.0.1:{ports['gateway']}",
-                _identity=identity,
-            )
+            return self._run_binding_locked()
+
+    def _run_binding_locked(self) -> ServiceRunBinding:
+        self._require_open()
+        self._verify_release_installation()
+        self._refresh_process_state()
+        snapshot = self._group_snapshot()
+        credential = self._active_credential
+        runtime_request = self._active_runtime_request
+        runtime_identity = snapshot.runtime_identity_digest
+        if (
+            not snapshot.run_ready
+            or credential is None
+            or runtime_request is None
+            or runtime_identity is None
+        ):
+            raise SupervisorStateError("managed service group is not ready for a run")
+        specs = self._specs
+        required = {"evolution-backend", "rollout", "gateway"}
+        if not required.issubset(specs):
+            raise SupervisorStateError("managed run service endpoints are unavailable")
+        ports = {service_id: specs[service_id].port for service_id in required}
+        if any(port is None for port in ports.values()):
+            raise SupervisorStateError("managed run service ports are unavailable")
+        identity = InternalServiceIdentity(
+            service_id="core-control",
+            generation_digest=snapshot.generation_digest,
+            registry_digest=self._release_identity.registry_digest,
+            framework_lock_digest=self._framework_lock_digest,
+            credential=credential,
+        )
+        return ServiceRunBinding(
+            execution_mode=snapshot.execution_mode,
+            runtime_image=runtime_request.runtime_image,
+            runtime_identity_digest=runtime_identity,
+            generation_digest=snapshot.generation_digest,
+            registry_digest=self._release_identity.registry_digest,
+            framework_lock_digest=self._framework_lock_digest,
+            rollout_url=f"http://127.0.0.1:{ports['rollout']}",
+            evolution_backend_url=f"http://127.0.0.1:{ports['evolution-backend']}",
+            gateway_url=f"http://127.0.0.1:{ports['gateway']}",
+            _identity=identity,
+        )
+
+    def _release_run_lease(self, token: object) -> None:
+        with self._mutex:
+            if self._active_run_lease is token:
+                self._active_run_lease = None
 
     def authenticates_run_service(self, headers: Mapping[str, str]) -> bool:
         with self._mutex:
@@ -2686,6 +2771,12 @@ class CoreServiceSupervisor:
             run_readiness_code=readiness_code,
             generation_digest=generation,
             services=services,
+            runtime_image=(
+                self._active_runtime_request.runtime_image
+                if execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+                and self._active_runtime_request is not None
+                else None
+            ),
             runtime_identity_digest=self._ledger.runtime_identity_digest,
             status_message=message,
         )
@@ -3466,6 +3557,19 @@ def _digest_json(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def _binding_matches_snapshot(
+    snapshot: ServiceGroupSnapshot,
+    binding: ServiceRunBinding,
+) -> bool:
+    return (
+        snapshot.run_ready
+        and binding.execution_mode is snapshot.execution_mode
+        and binding.runtime_image == snapshot.runtime_image
+        and binding.runtime_identity_digest == snapshot.runtime_identity_digest
+        and binding.generation_digest == snapshot.generation_digest
+    )
+
+
 def _require_digest(value: str, name: str) -> None:
     if not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None:
         raise ValueError(f"{name} must be a lowercase SHA-256 digest")
@@ -3488,6 +3592,7 @@ __all__ = [
     "ServiceGroupSnapshot",
     "ServiceRunReadinessCode",
     "ServiceRunBinding",
+    "ServiceRunLease",
     "ServiceHealthProbe",
     "ServiceProcessSpec",
     "ServiceReleaseIdentity",
