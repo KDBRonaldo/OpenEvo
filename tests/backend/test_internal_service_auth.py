@@ -13,6 +13,7 @@ from fastapi import FastAPI
 
 from openevo.evolution.server import create_app
 from openevo.gateway import server as gateway_server
+from openevo.gateway.session_files import HeldCodexCredentialAuthority
 from openevo.internal_auth import (
     GenerationBoundRunAdmissionCheck,
     CoreRunAdmissionHttpVerifier,
@@ -40,6 +41,14 @@ def _identity(service_id: str = "evolution-backend") -> InternalServiceIdentity:
         framework_lock_digest=FRAMEWORK_LOCK,
         credential=CREDENTIAL,
     )
+
+
+def _credential_authority(tmp_path: Path) -> HeldCodexCredentialAuthority:
+    auth = tmp_path / ".codex" / "auth.json"
+    auth.parent.mkdir(mode=0o700)
+    auth.write_text('{"tokens":{"access_token":"test-secret"}}', encoding="utf-8")
+    auth.chmod(0o600)
+    return HeldCodexCredentialAuthority.open(auth)
 
 
 def test_internal_identity_is_consumed_from_fd_and_never_repr_visible(monkeypatch) -> None:
@@ -358,6 +367,7 @@ def test_release_rollout_submit_requires_generation_bound_run_admission(
 
 def test_release_gateway_session_create_and_dispatch_require_run_admission(
     monkeypatch,
+    tmp_path: Path,
 ) -> None:
     class DispatchProbe:
         called = False
@@ -377,6 +387,8 @@ def test_release_gateway_session_create_and_dispatch_require_run_admission(
     identity = _identity("gateway")
     gateway_server._internal_identity = identity
     gateway_server._run_admission_verifier = None
+    authority = _credential_authority(tmp_path)
+    gateway_server._credential_authority = authority
     try:
         client = TestClient(gateway_server.app)
         create_response = client.post(
@@ -414,11 +426,16 @@ def test_release_gateway_session_create_and_dispatch_require_run_admission(
         }
         assert dispatch.called is False
     finally:
+        authority.close()
         gateway_server._internal_identity = None
         gateway_server._run_admission_verifier = None
+        gateway_server._credential_authority = None
 
 
-def test_release_gateway_verifier_receives_only_generation_bound_digest(monkeypatch) -> None:
+def test_release_gateway_verifier_receives_only_generation_bound_digest(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     class DispatchProbe:
         called = False
 
@@ -445,6 +462,8 @@ def test_release_gateway_verifier_receives_only_generation_bound_digest(monkeypa
     identity = _identity("gateway")
     gateway_server._internal_identity = identity
     gateway_server._run_admission_verifier = verifier
+    authority = _credential_authority(tmp_path)
+    gateway_server._credential_authority = authority
     body = {
         "session_id": "release-session",
         "task_id": "release-task",
@@ -488,8 +507,88 @@ def test_release_gateway_verifier_receives_only_generation_bound_digest(monkeypa
         assert not hasattr(check, "runtime")
         assert not hasattr(check, "credential")
     finally:
+        authority.close()
         gateway_server._internal_identity = None
         gateway_server._run_admission_verifier = None
+        gateway_server._credential_authority = None
+
+
+def test_gateway_auth_replacement_fails_before_admission_or_session_side_effect(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class DispatchProbe:
+        called = False
+
+        async def dispatch(self, _request) -> None:
+            self.called = True
+
+    class AdmissionVerifier:
+        def __init__(self) -> None:
+            self.checks: list[GenerationBoundRunAdmissionCheck] = []
+
+        async def verify(self, check: GenerationBoundRunAdmissionCheck) -> None:
+            self.checks.append(check)
+
+    dispatch = DispatchProbe()
+    verifier = AdmissionVerifier()
+    monkeypatch.setattr(
+        gateway_server,
+        "get_state",
+        lambda: SimpleNamespace(
+            node=SimpleNamespace(id="core-gateway"),
+            node_manager=dispatch,
+        ),
+    )
+    identity = _identity("gateway")
+    authority = _credential_authority(tmp_path)
+    replacement = tmp_path / ".codex" / "auth.replacement"
+    replacement.write_text(
+        '{"tokens":{"access_token":"replacement-secret"}}',
+        encoding="utf-8",
+    )
+    replacement.chmod(0o600)
+    os.replace(replacement, tmp_path / ".codex" / "auth.json")
+    gateway_server._internal_identity = identity
+    gateway_server._run_admission_verifier = verifier
+    gateway_server._credential_authority = authority
+    try:
+        response = TestClient(gateway_server.app).post(
+            "/sessions",
+            headers=identity.request_headers(),
+            json={
+                "session_id": "replaced-credential-session",
+                "task_id": "replaced-credential-task",
+                "instruction": "must not be admitted",
+                "remaining_timeout_seconds": 30,
+                "agent": {
+                    "harness": "codex",
+                    "settings": {
+                        "auth_mode": "subscription",
+                        "capture_mode": "transcript",
+                    },
+                },
+                "runtime": {"image": "caller-supplied-image"},
+            },
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "error": {
+                "code": "credential_authority_changed",
+                "message": (
+                    "The managed subscription credential authority changed after readiness."
+                ),
+                "retryable": True,
+            }
+        }
+        assert verifier.checks == []
+        assert dispatch.called is False
+    finally:
+        authority.close()
+        gateway_server._internal_identity = None
+        gateway_server._run_admission_verifier = None
+        gateway_server._credential_authority = None
 
 
 def test_gateway_internal_management_routes_fail_closed_without_auth() -> None:

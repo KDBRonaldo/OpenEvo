@@ -37,6 +37,10 @@ from openevo.backend.service_supervisor import (
 )
 from openevo.config import TopologyConfig
 from openevo.internal_auth import InternalServiceIdentity
+from openevo.gateway.session_files import (
+    HeldCodexCredentialAuthority,
+    SessionFileSecurityError,
+)
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 from tests.framework_testkit import verified_builtin_registry
 
@@ -182,11 +186,23 @@ class FakeManagedScienceRuntimeProbe:
     def __init__(self, *, ready: bool = True) -> None:
         self.ready = ready
         self.requests: list[ManagedScienceRuntimeRequest] = []
+        self.auth_path: Path | None = None
+
+    def configure_auth_path(self, path: Path) -> None:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text('{"tokens":{"access_token":"test-secret"}}', encoding="utf-8")
+        path.chmod(0o600)
+        self.auth_path = path
 
     def verify(self, request, deadline, cancellation=None) -> ManagedScienceRuntimeReadiness:
         assert time.monotonic() < deadline
         assert cancellation is None or not cancellation.is_set()
         self.requests.append(request)
+        authority = (
+            HeldCodexCredentialAuthority.open(self.auth_path)
+            if self.ready and self.auth_path is not None
+            else None
+        )
         return ManagedScienceRuntimeReadiness(
             ready=self.ready,
             code=(
@@ -200,6 +216,7 @@ class FakeManagedScienceRuntimeProbe:
                 if self.ready
                 else "Managed Science runtime image is not prepared."
             ),
+            credential_authority=authority,
         )
 
 
@@ -289,6 +306,7 @@ def _supervisor(
     backend = backend or FakeProcessBackend()
     health = health or FakeHealthChecker()
     runtime_probe = runtime_probe or FakeManagedScienceRuntimeProbe()
+    runtime_probe.configure_auth_path(tmp_path / "codex-home" / ".codex" / "auth.json")
     supervisor = CoreServiceSupervisor(
         launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
         service_root=tmp_path / "core-services",
@@ -617,6 +635,34 @@ def test_atomic_run_binding_lease_blocks_another_model_generation_until_release(
         binding_allowed.set()
         first_thread.join(5)
         replacement_thread.join(5)
+        supervisor.close()
+
+
+def test_auth_replacement_revokes_active_run_service_authority(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, _, _, runtime_probe = _supervisor(tmp_path, framework_lock)
+    lease = None
+    try:
+        snapshot, lease = _ensure_subscription_binding(supervisor)
+        assert snapshot.run_ready
+        assert lease is not None
+        assert runtime_probe.auth_path is not None
+        replacement = runtime_probe.auth_path.with_name("auth.replacement")
+        replacement.write_text(
+            '{"tokens":{"access_token":"replacement-secret"}}',
+            encoding="utf-8",
+        )
+        replacement.chmod(0o600)
+        os.replace(replacement, runtime_probe.auth_path)
+
+        assert supervisor.authenticates_run_service(lease.binding.request_headers()) is False
+        with pytest.raises(SupervisorStateError, match="credential authority changed"):
+            supervisor.run_binding()
+    finally:
+        if lease is not None:
+            lease.close()
         supervisor.close()
 
 
@@ -1146,6 +1192,7 @@ def test_release_restart_completed_replay_reverifies_inventory_before_return(
     registry = verified_builtin_registry(tmp_path / "verified-restart-registry")
     backend = FakeProcessBackend()
     runtime_probe = FakeManagedScienceRuntimeProbe()
+    runtime_probe.configure_auth_path(tmp_path / "release-codex" / "auth.json")
 
     class ReleaseHealthChecker(FakeHealthChecker):
         pass
@@ -1202,6 +1249,7 @@ def test_release_restart_inventory_failure_is_transactional_between_reverificati
     registry = verified_builtin_registry(tmp_path / "verified-transaction-registry")
     backend = FakeProcessBackend()
     runtime_probe = FakeManagedScienceRuntimeProbe()
+    runtime_probe.configure_auth_path(tmp_path / "release-codex" / "auth.json")
 
     class ReleaseHealthChecker(FakeHealthChecker):
         pass
@@ -1723,6 +1771,53 @@ def test_local_managed_runtime_probe_binds_image_codex_and_private_auth(
         ("docker", "image", "inspect", "openevo/science-runtime:0.1.0"),
     ]
     assert "not-read-by-probe" not in readiness.message
+    assert readiness.credential_authority is not None
+    readiness.credential_authority.close()
+
+
+def test_runtime_probe_exception_closes_held_credential_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":"private-auth-material"}', encoding="utf-8")
+    auth.chmod(0o600)
+    opened: list[HeldCodexCredentialAuthority] = []
+    real_open = HeldCodexCredentialAuthority.open
+
+    def capture_open(path: Path) -> HeldCodexCredentialAuthority:
+        authority = real_open(path)
+        opened.append(authority)
+        return authority
+
+    class ExplodingRunner(FakeProbeCommandRunner):
+        def run(self, argv, deadline, cancellation=None) -> ProbeCommandResult:
+            if argv == ("docker", "--version"):
+                raise RuntimeError("controlled runtime probe failure")
+            return super().run(argv, deadline, cancellation)
+
+    monkeypatch.setattr(
+        supervisor_module.HeldCodexCredentialAuthority,
+        "open",
+        staticmethod(capture_open),
+    )
+    probe = LocalManagedScienceRuntimeProbe(
+        command_runner=ExplodingRunner(),
+        codex_auth_path=auth,
+    )
+
+    with pytest.raises(RuntimeError, match="controlled runtime probe failure"):
+        probe.verify(
+            ManagedScienceRuntimeRequest(
+                runtime_image="openevo/science-runtime:0.1.0",
+                codex_model="gpt-5.1-codex-mini",
+            ),
+            time.monotonic() + 1,
+        )
+
+    assert len(opened) == 1
+    with pytest.raises(SessionFileSecurityError, match="closed"):
+        opened[0].verify()
 
 
 def test_local_managed_runtime_probe_rejects_wrong_release_digest_before_run(

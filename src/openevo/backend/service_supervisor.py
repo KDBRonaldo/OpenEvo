@@ -52,6 +52,11 @@ from openevo.backend.contracts.v1.models import (
     ServiceSummaryV1,
 )
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
+from openevo.gateway.session_files import (
+    CODEX_CREDENTIAL_AUTHORITY_FD_ENV,
+    HeldCodexCredentialAuthority,
+    SessionFileSecurityError,
+)
 from openevo.runtime.managed import verified_managed_runtime_image_reference
 from openevo.internal_auth import (
     INTERNAL_CREDENTIAL_FD_ENV,
@@ -262,6 +267,11 @@ class ServiceProcessSpec:
         compare=False,
     )
     listen_fd: int | None = field(default=None, repr=False, compare=False)
+    codex_credential_authority: HeldCodexCredentialAuthority | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.service_id or not self.display_name or not self.argv:
@@ -306,12 +316,19 @@ class ManagedScienceRuntimeReadiness:
     code: ServiceRunReadinessCode
     identity_digest: str | None
     message: str
+    credential_authority: HeldCodexCredentialAuthority | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if self.ready != (self.code is ServiceRunReadinessCode.READY):
             raise ValueError("managed runtime readiness code does not match ready state")
         if self.ready != (self.identity_digest is not None):
             raise ValueError("ready managed runtime evidence requires an identity digest")
+        if self.ready != (self.credential_authority is not None):
+            raise ValueError("ready managed runtime evidence requires held credential authority")
         if self.identity_digest is not None:
             _require_digest(self.identity_digest, "managed runtime identity_digest")
         if not self.message.strip() or len(self.message) > 256:
@@ -543,28 +560,38 @@ class LocalManagedScienceRuntimeProbe:
                 message="Codex subscription login is unavailable on the remote Core host.",
             )
         try:
-            auth_identity = _private_file_metadata_identity(self._codex_auth_path)
-        except (OSError, SupervisorStateError, ValueError):
+            credential_authority = HeldCodexCredentialAuthority.open(self._codex_auth_path)
+        except (OSError, SessionFileSecurityError, ValueError):
             return ManagedScienceRuntimeReadiness(
                 ready=False,
                 code=ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
                 identity_digest=None,
                 message="Codex subscription login evidence is invalid on the remote Core host.",
             )
-        runtime = self._command_runner.run(("docker", "--version"), deadline, cancellation)
+        try:
+            runtime = self._command_runner.run(("docker", "--version"), deadline, cancellation)
+        except BaseException:
+            credential_authority.close()
+            raise
         if runtime.returncode != 0:
+            credential_authority.close()
             return ManagedScienceRuntimeReadiness(
                 ready=False,
                 code=ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
                 identity_digest=None,
                 message="The managed Science runtime executable is unavailable.",
             )
-        image_result = self._command_runner.run(
-            ("docker", "image", "inspect", request.runtime_image),
-            deadline,
-            cancellation,
-        )
+        try:
+            image_result = self._command_runner.run(
+                ("docker", "image", "inspect", request.runtime_image),
+                deadline,
+                cancellation,
+            )
+        except BaseException:
+            credential_authority.close()
+            raise
         if image_result.returncode != 0:
+            credential_authority.close()
             return ManagedScienceRuntimeReadiness(
                 ready=False,
                 code=ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
@@ -594,6 +621,7 @@ class LocalManagedScienceRuntimeProbe:
             json.JSONDecodeError,
             ValueError,
         ):
+            credential_authority.close()
             return ManagedScienceRuntimeReadiness(
                 ready=False,
                 code=ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
@@ -605,7 +633,7 @@ class LocalManagedScienceRuntimeProbe:
             code=ServiceRunReadinessCode.READY,
             identity_digest=_digest_json(
                 {
-                    "auth_identity": auth_identity,
+                    "auth_identity": credential_authority.identity,
                     "codex_model": request.codex_model,
                     "codex_version_output_digest": hashlib.sha256(codex.stdout).hexdigest(),
                     "runtime_version_output_digest": hashlib.sha256(runtime.stdout).hexdigest(),
@@ -615,6 +643,7 @@ class LocalManagedScienceRuntimeProbe:
                 }
             ),
             message="Managed Science runtime bootstrap is verified.",
+            credential_authority=credential_authority,
         )
 
 
@@ -1006,6 +1035,10 @@ class RealSubprocessBackend:
                     os.close(credential_write_fd)
                 child_env[INTERNAL_CREDENTIAL_FD_ENV] = str(credential_read_fd)
                 pass_fds.append(credential_read_fd)
+            if spec.codex_credential_authority is not None:
+                authority_fd = spec.codex_credential_authority.inheritance_descriptor()
+                child_env[CODEX_CREDENTIAL_AUTHORITY_FD_ENV] = str(authority_fd)
+                pass_fds.append(authority_fd)
             if spec.listen_fd is not None:
                 child_env[INTERNAL_LISTEN_FD_ENV] = str(spec.listen_fd)
                 pass_fds.append(spec.listen_fd)
@@ -1652,6 +1685,7 @@ class CoreServiceSupervisor:
             self._active_plan_key: str | None = None
             self._active_credential: str | None = None
             self._active_runtime_request: ManagedScienceRuntimeRequest | None = None
+            self._active_credential_authority: HeldCodexCredentialAuthority | None = None
             self._active_run_lease: object | None = None
             self._active_cancellation: threading.Event | None = None
             self._ledger = self._load_or_initialize_ledger()
@@ -1759,7 +1793,11 @@ class CoreServiceSupervisor:
                 deadline,
                 cancellation,
             )
-            self._raise_if_cancelled(cancellation)
+            candidate_authority = runtime.credential_authority
+            if cancellation.is_set():
+                if candidate_authority is not None:
+                    candidate_authority.close()
+                self._raise_if_cancelled(cancellation)
             plan_runtime_identity = runtime.identity_digest or _digest_json(
                 {
                     "codex_model": runtime_request.codex_model,
@@ -1783,43 +1821,64 @@ class CoreServiceSupervisor:
                     or not runtime.ready
                     or self._active_plan_key != plan_key
                     or self._active_credential is None
+                    or candidate_authority is None
+                    or not self._active_credential_authority_matches(candidate_authority)
                     or not self._specs
                     or self._ledger.generation_digest is None
-                    or not self._is_current_group_healthy(
+                    or not self._is_current_group_healthy_with_candidate(
                         execution_mode,
                         self._ledger.generation_digest,
                         tuple(self._specs.values()),
                         deadline,
                         cancellation,
+                        candidate_authority,
                     )
                 ):
+                    if candidate_authority is not None:
+                        candidate_authority.close()
                     raise SupervisorStateError(
                         "managed service generation is leased to an active run"
                     )
+                candidate_authority.close()
                 return self._group_snapshot()
             if (
                 not force_restart
                 and runtime.ready
                 and self._active_plan_key == plan_key
                 and self._active_credential is not None
+                and candidate_authority is not None
+                and self._active_credential_authority_matches(candidate_authority)
                 and self._specs
                 and self._ledger.generation_digest is not None
-                and self._is_current_group_healthy(
+                and self._is_current_group_healthy_with_candidate(
                     execution_mode,
                     self._ledger.generation_digest,
                     tuple(self._specs.values()),
                     deadline,
                     cancellation,
+                    candidate_authority,
                 )
             ):
-                self._raise_if_cancelled(cancellation)
+                if cancellation.is_set():
+                    candidate_authority.close()
+                    self._raise_if_cancelled(cancellation)
+                candidate_authority.close()
                 return self._group_snapshot()
-            if not self._stop_all(deadline):
+            try:
+                stopped = self._stop_all(deadline)
+            except BaseException:
+                if candidate_authority is not None:
+                    candidate_authority.close()
+                raise
+            if not stopped:
+                if candidate_authority is not None:
+                    candidate_authority.close()
                 self._ledger.group_status_message = (
                     "Existing managed children could not be stopped; service start aborted."
                 )
                 self._persist()
                 return self._group_snapshot()
+            self._release_active_credential_authority()
             listeners: dict[str, socket.socket] = {}
             try:
                 for service_id in ("evolution-backend", "rollout", "gateway"):
@@ -1828,10 +1887,14 @@ class CoreServiceSupervisor:
             except SupervisorStateError:
                 for listener in listeners.values():
                     listener.close()
+                if candidate_authority is not None:
+                    candidate_authority.close()
                 raise
             except Exception as exc:
                 for listener in listeners.values():
                     listener.close()
+                if candidate_authority is not None:
+                    candidate_authority.close()
                 raise SupervisorStateError("internal listener reservation failed") from exc
             credential = secrets.token_urlsafe(48)
             generation_digest = _digest_json(
@@ -1840,17 +1903,26 @@ class CoreServiceSupervisor:
                     "plan_key": plan_key,
                 }
             )
-            specs, topology = self._subscription_plan(
-                runtime_request,
-                plan_runtime_identity,
-                generation_digest,
-                credential,
-                listeners,
-            )
+            try:
+                specs, topology = self._subscription_plan(
+                    runtime_request,
+                    plan_runtime_identity,
+                    generation_digest,
+                    credential,
+                    listeners,
+                    candidate_authority,
+                )
+            except Exception:
+                for listener in listeners.values():
+                    listener.close()
+                if candidate_authority is not None:
+                    candidate_authority.close()
+                raise
             self._specs = {spec.service_id: spec for spec in specs}
             self._active_plan_key = plan_key
             self._active_credential = credential
             self._active_runtime_request = runtime_request
+            self._active_credential_authority = candidate_authority
             if not runtime.ready:
                 try:
                     self._install_planned_records(
@@ -1983,6 +2055,7 @@ class CoreServiceSupervisor:
     def _run_binding_locked(self) -> ServiceRunBinding:
         self._require_open()
         self._verify_release_installation()
+        self._require_active_credential_authority()
         self._refresh_process_state()
         snapshot = self._group_snapshot()
         credential = self._active_credential
@@ -2030,6 +2103,10 @@ class CoreServiceSupervisor:
     def authenticates_run_service(self, headers: Mapping[str, str]) -> bool:
         with self._mutex:
             if self._closed:
+                return False
+            try:
+                self._require_active_credential_authority()
+            except SupervisorStateError:
                 return False
             credential = self._active_credential
             generation = self._ledger.generation_digest
@@ -2133,6 +2210,7 @@ class CoreServiceSupervisor:
                 raise SupervisorStateError(
                     "managed children remain live; supervisor ownership was retained"
                 )
+            self._release_active_credential_authority()
             self._restart_results.clear()
             self._closed = True
             self._framework_lock_source.close()
@@ -2153,6 +2231,7 @@ class CoreServiceSupervisor:
     def _abandon_for_test(self) -> None:
         """Release only the owner lock; tests use this to emulate abrupt Core death."""
         with self._mutex:
+            self._release_active_credential_authority()
             self._closed = True
             self._framework_lock_source.close()
             self._root.close()
@@ -2164,6 +2243,7 @@ class CoreServiceSupervisor:
         generation_digest: str,
         credential: str,
         listeners: Mapping[str, socket.socket],
+        credential_authority: HeldCodexCredentialAuthority | None,
     ) -> tuple[tuple[ServiceProcessSpec, ...], dict[str, object]]:
         root = self._root.path
         topology_path = root / "topology.json"
@@ -2348,6 +2428,9 @@ class CoreServiceSupervisor:
                     listen_fd=(
                         listeners[service_id].fileno() if service_id in listeners else None
                     ),
+                    codex_credential_authority=(
+                        credential_authority if service_id == "gateway" else None
+                    ),
                 )
             )
         return tuple(specs), topology
@@ -2365,6 +2448,7 @@ class CoreServiceSupervisor:
             )
             self._persist()
             return self._group_snapshot()
+        self._release_active_credential_authority()
         now = _timestamp()
         identity = _digest_json(
             {
@@ -2512,6 +2596,56 @@ class CoreServiceSupervisor:
             if self._record(record.service_id).error_code == "service_stop_timeout":
                 stopped = False
         return stopped
+
+    def _active_credential_authority_matches(
+        self,
+        candidate: HeldCodexCredentialAuthority,
+    ) -> bool:
+        active = self._active_credential_authority
+        if active is None or active.identity != candidate.identity:
+            return False
+        try:
+            active.verify()
+            candidate.verify()
+        except SessionFileSecurityError:
+            return False
+        return True
+
+    def _is_current_group_healthy_with_candidate(
+        self,
+        execution_mode: ServiceExecutionMode,
+        generation_digest: str,
+        specs: tuple[ServiceProcessSpec, ...],
+        deadline: float,
+        cancellation: threading.Event,
+        candidate: HeldCodexCredentialAuthority,
+    ) -> bool:
+        try:
+            return self._is_current_group_healthy(
+                execution_mode,
+                generation_digest,
+                specs,
+                deadline,
+                cancellation,
+            )
+        except BaseException:
+            candidate.close()
+            raise
+
+    def _require_active_credential_authority(self) -> None:
+        authority = self._active_credential_authority
+        if authority is None:
+            raise SupervisorStateError("managed credential authority is unavailable")
+        try:
+            authority.verify()
+        except SessionFileSecurityError as exc:
+            raise SupervisorStateError("managed credential authority changed") from exc
+
+    def _release_active_credential_authority(self) -> None:
+        authority = self._active_credential_authority
+        self._active_credential_authority = None
+        if authority is not None:
+            authority.close()
 
     def _stop_service(
         self,
@@ -3100,25 +3234,6 @@ def _validated_run_admission_url(value: str) -> str:
     ):
         raise ValueError("run admission URL must be the Core loopback verifier")
     return f"http://127.0.0.1:{port}/internal/v1/run-admissions/verify"
-
-
-def _private_file_metadata_identity(path: Path) -> str:
-    fd = _open_absolute_nofollow_file(path, "Codex auth")
-    try:
-        info = os.fstat(fd)
-        _require_private_file(info, os.getuid(), "Codex auth")
-        return _digest_json(
-            {
-                "device": info.st_dev,
-                "inode": info.st_ino,
-                "mode": stat.S_IMODE(info.st_mode),
-                "mtime_ns": info.st_mtime_ns,
-                "size": info.st_size,
-                "uid": info.st_uid,
-            }
-        )
-    finally:
-        os.close(fd)
 
 
 def _hash_private_regular_file(path: Path, *, max_bytes: int) -> str:

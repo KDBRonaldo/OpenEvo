@@ -37,10 +37,171 @@ _LEAF_PIN_FLAGS: Final[int] = (
     getattr(os, "O_PATH", os.O_RDONLY | os.O_NONBLOCK) | os.O_CLOEXEC | os.O_NOFOLLOW
 )
 _RENAME_NOREPLACE: Final[int] = 1
+CODEX_CREDENTIAL_AUTHORITY_FD_ENV: Final[str] = "OPENEVO_CODEX_CREDENTIAL_AUTHORITY_FD"
 
 
 class SessionFileSecurityError(RuntimeError):
     """Raised when private session state cannot be handled without a path race."""
+
+
+class HeldCodexCredentialAuthority:
+    """Held auth file plus verified authority over its absolute pathname."""
+
+    __slots__ = ("_closed", "_descriptor", "_identity", "_path", "_pin")
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        descriptor: int,
+        pin: _AbsoluteDirectoryPin,
+        identity: CredentialFileIdentity,
+    ) -> None:
+        self._path = path
+        self._descriptor = descriptor
+        self._pin = pin
+        self._identity = identity
+        self._closed = False
+
+    @classmethod
+    def open(cls, path: Path) -> HeldCodexCredentialAuthority:
+        absolute = Path(os.path.abspath(os.fspath(path)))
+        if absolute.name in {"", ".", ".."}:
+            raise SessionFileSecurityError("Codex subscription auth path is invalid")
+        pin = _pin_absolute_directory(absolute.parent)
+        descriptor = -1
+        try:
+            pin.verify(label="Codex subscription auth source")
+            before = os.stat(absolute.name, dir_fd=pin.descriptor, follow_symlinks=False)
+            _require_private_auth(before)
+            descriptor = os.open(
+                absolute.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=pin.descriptor,
+            )
+            opened = os.fstat(descriptor)
+            _require_private_auth(opened)
+            if _auth_identity(before) != _auth_identity(opened):
+                raise SessionFileSecurityError(
+                    "Codex subscription auth changed while authority was acquired"
+                )
+            authority = cls(
+                path=absolute,
+                descriptor=descriptor,
+                pin=pin,
+                identity=_auth_identity(opened),
+            )
+            authority.verify()
+            return authority
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            pin.close()
+            raise
+
+    @classmethod
+    def from_inherited_environment(
+        cls,
+        path: Path,
+        *,
+        required: bool,
+    ) -> HeldCodexCredentialAuthority | None:
+        raw_descriptor = os.environ.pop(CODEX_CREDENTIAL_AUTHORITY_FD_ENV, None)
+        if raw_descriptor is None:
+            if required:
+                raise SessionFileSecurityError(
+                    "release Gateway is missing Codex credential authority"
+                )
+            return None
+        descriptor = -1
+        try:
+            descriptor = int(raw_descriptor)
+            if descriptor < 3 or str(descriptor) != raw_descriptor:
+                raise ValueError
+            os.set_inheritable(descriptor, False)
+            opened = os.fstat(descriptor)
+            _require_private_auth(opened)
+            absolute = Path(os.path.abspath(os.fspath(path)))
+            pin = _pin_absolute_directory(absolute.parent)
+        except (OSError, ValueError, SessionFileSecurityError) as exc:
+            if descriptor >= 3:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise SessionFileSecurityError(
+                "inherited Codex credential authority is invalid"
+            ) from exc
+        authority = cls(
+            path=absolute,
+            descriptor=descriptor,
+            pin=pin,
+            identity=_auth_identity(opened),
+        )
+        try:
+            authority.verify()
+        except Exception:
+            authority.close()
+            raise
+        return authority
+
+    @property
+    def identity(self) -> CredentialFileIdentity:
+        return self._identity
+
+    def inheritance_descriptor(self) -> int:
+        self.verify()
+        return self._descriptor
+
+    def duplicate_verified_descriptor(self) -> int:
+        self.verify()
+        duplicate = -1
+        try:
+            duplicate = os.dup(self._descriptor)
+            os.set_inheritable(duplicate, False)
+            if _auth_identity(os.fstat(duplicate)) != self._identity:
+                raise SessionFileSecurityError("held Codex credential descriptor changed")
+            return duplicate
+        except Exception:
+            if duplicate >= 0:
+                os.close(duplicate)
+            raise
+
+    def verify(self) -> None:
+        if self._closed:
+            raise SessionFileSecurityError("held Codex credential authority is closed")
+        try:
+            self._pin.verify(label="Codex subscription auth source")
+            held = os.fstat(self._descriptor)
+            if _auth_identity(held) != self._identity:
+                raise SessionFileSecurityError("held Codex subscription auth changed")
+            _require_private_auth(held)
+            current = os.stat(
+                self._path.name,
+                dir_fd=self._pin.descriptor,
+                follow_symlinks=False,
+            )
+            if _auth_identity(current) != self._identity:
+                raise SessionFileSecurityError(
+                    "Codex subscription auth pathname no longer matches readiness authority"
+                )
+            _require_private_auth(current)
+            self._pin.verify(label="Codex subscription auth source")
+        except SessionFileSecurityError:
+            raise
+        except OSError as exc:
+            raise SessionFileSecurityError(
+                "Codex subscription auth pathname authority is unavailable"
+            ) from exc
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            os.close(self._descriptor)
+        finally:
+            self._pin.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,6 +733,7 @@ def read_verified_session_transcript(
 def stage_codex_subscription_auth(
     *,
     source: Path,
+    source_authority: HeldCodexCredentialAuthority | None = None,
     session_dir: Path,
     session_identity: SessionRootIdentity,
     target_home_parts: tuple[str, ...],
@@ -597,20 +759,25 @@ def stage_codex_subscription_auth(
             raise SessionFileSecurityError(
                 "Codex subscription auth source must be absolute and canonical"
             )
-        source_pin = _pin_absolute_directory(source.parent)
-        source_pin.verify(label="Codex subscription auth source")
-        source_parent_fd = os.dup(source_pin.descriptor)
-        source_before = os.stat(
-            source_name,
-            dir_fd=source_parent_fd,
-            follow_symlinks=False,
-        )
-        _require_private_auth(source_before)
-        source_fd = os.open(
-            source_name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=source_parent_fd,
-        )
+        if source_authority is None:
+            source_pin = _pin_absolute_directory(source.parent)
+            source_pin.verify(label="Codex subscription auth source")
+            source_parent_fd = os.dup(source_pin.descriptor)
+            source_before = os.stat(
+                source_name,
+                dir_fd=source_parent_fd,
+                follow_symlinks=False,
+            )
+            _require_private_auth(source_before)
+            source_fd = os.open(
+                source_name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=source_parent_fd,
+            )
+        else:
+            source_authority.verify()
+            source_fd = source_authority.duplicate_verified_descriptor()
+            source_before = os.fstat(source_fd)
         source_opened = os.fstat(source_fd)
         _require_private_auth(source_opened)
         if _auth_identity(source_before) != _auth_identity(source_opened):
@@ -669,12 +836,15 @@ def stage_codex_subscription_auth(
         if _auth_identity(source_opened) != _auth_identity(source_after):
             raise SessionFileSecurityError("Codex subscription auth changed while it was copied")
         _require_private_auth(source_after)
-        _require_path_identity(
-            source_parent_fd,
-            source_name,
-            source_after,
-            label="Codex subscription auth",
-        )
+        if source_authority is None:
+            _require_path_identity(
+                source_parent_fd,
+                source_name,
+                source_after,
+                label="Codex subscription auth",
+            )
+        else:
+            source_authority.verify()
 
         staged_after = os.fstat(staged_fd)
         _require_private_staged_auth(
@@ -702,19 +872,23 @@ def stage_codex_subscription_auth(
             )
         if _auth_identity(staged_after) != _auth_identity(staged_final):
             raise SessionFileSecurityError("staged Codex auth changed during final verification")
-        _require_path_identity(
-            source_parent_fd,
-            source_name,
-            source_final,
-            label="Codex subscription auth",
-        )
+        if source_authority is None:
+            _require_path_identity(
+                source_parent_fd,
+                source_name,
+                source_final,
+                label="Codex subscription auth",
+            )
+        else:
+            source_authority.verify()
         _require_path_identity(
             staging_pin.descriptor,
             "auth.json",
             staged_final,
             label="staged Codex auth",
         )
-        source_pin.verify(label="Codex subscription auth source")
+        if source_pin is not None:
+            source_pin.verify(label="Codex subscription auth source")
         staging_pin.verify(label="credential staging root")
 
         target_pin.verify(label="credential root")

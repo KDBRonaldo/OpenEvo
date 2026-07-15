@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -10,7 +11,7 @@ import math
 from pathlib import Path
 import secrets
 import threading
-from typing import Any, Protocol, cast
+from typing import Any, Iterator, Protocol, cast
 
 from fastapi.responses import JSONResponse, Response
 
@@ -263,49 +264,44 @@ class CoreScienceRunOwner:
         try:
             project = self._validate_create_request(request)
             self._ensure_services(project)
-            input_context = self._ledger.revision_context(
-                request.project_id,
-                request.required_revision.revision.id,
-            )
-            now = self._timestamp()
-            run_id = f"run-{secrets.token_hex(16)}"
-            run = _run_model(
-                {
-                    "id": run_id,
-                    "project_id": request.project_id,
-                    "project_snapshot": request.project_snapshot,
-                    "task_snapshot": request.task_snapshot,
-                    "workspace_snapshot": request.workspace_snapshot,
-                    "registry_digest": request.expected_registry_digest,
-                    "execution_mode": project.spec.execution_mode,
-                    "capture_mode": project.spec.capture_mode,
-                    "status": m.RunStatus.QUEUED,
-                    "queued_reason": m.QueuedReasonV1(
-                        code=m.QueuedReasonCode.ADMISSION_PENDING,
-                        summary="Core is admitting the saved project revision.",
-                        retry_after_seconds=1,
-                    ),
-                    "attempt_count": 0,
-                    "required_revision": request.required_revision,
-                    "revision_transition": (
-                        None
-                        if request.required_revision.relation
-                        is m.RequiredRevisionRelation.ACTIVE
-                        else self._project_store.get_revision_head(
-                            request.project_id
-                        ).transition
-                    ),
-                    "created_at": now,
-                    "updated_at": now,
-                    "attempts": [],
-                },
-                version=1,
-            )
-            stored, replayed = self._ledger.commit_create_run(
-                admission,
-                run=run,
-                input_context=input_context,
-            )
+            with self._lifecycle_lock, self._pin_create_authority(request) as authority:
+                project = self._validate_create_authority(request, *authority)
+                input_context = self._ledger.revision_context(
+                    request.project_id,
+                    request.required_revision.revision.id,
+                )
+                now = self._timestamp()
+                run_id = f"run-{secrets.token_hex(16)}"
+                run = _run_model(
+                    {
+                        "id": run_id,
+                        "project_id": request.project_id,
+                        "project_snapshot": request.project_snapshot,
+                        "task_snapshot": request.task_snapshot,
+                        "workspace_snapshot": request.workspace_snapshot,
+                        "registry_digest": request.expected_registry_digest,
+                        "execution_mode": project.spec.execution_mode,
+                        "capture_mode": project.spec.capture_mode,
+                        "status": m.RunStatus.QUEUED,
+                        "queued_reason": m.QueuedReasonV1(
+                            code=m.QueuedReasonCode.ADMISSION_PENDING,
+                            summary="Core is admitting the saved project revision.",
+                            retry_after_seconds=1,
+                        ),
+                        "attempt_count": 0,
+                        "required_revision": request.required_revision,
+                        "revision_transition": authority[2].transition,
+                        "created_at": now,
+                        "updated_at": now,
+                        "attempts": [],
+                    },
+                    version=1,
+                )
+                stored, replayed = self._ledger.commit_create_run(
+                    admission,
+                    run=run,
+                    input_context=input_context,
+                )
         finally:
             self._ledger.abort_create_run(admission)
         if not replayed:
@@ -931,12 +927,30 @@ class CoreScienceRunOwner:
         return snapshot, lease
 
     def _validate_create_request(self, request: m.RunCreateV1) -> m.ProjectV1:
+        with self._pin_create_authority(request) as authority:
+            return self._validate_create_authority(request, *authority)
+
+    @contextmanager
+    def _pin_create_authority(
+        self,
+        request: m.RunCreateV1,
+    ) -> Iterator[tuple[m.ProjectV1, m.RevisionV1, m.RevisionHeadV1]]:
         try:
-            project = self._project_store.get_project(request.project_id)
-            revision = self._project_store.get_revision(request.required_revision.revision.id)
-            head = self._project_store.get_revision_head(request.project_id)
+            with self._project_store.pin_science_run_authority(
+                request.project_id,
+                request.required_revision.revision.id,
+            ) as authority:
+                yield authority
         except ResourceNotFoundError as exc:
             raise _owner_error("run_project_not_found", "The saved project was not found.", 404, False) from exc
+
+    def _validate_create_authority(
+        self,
+        request: m.RunCreateV1,
+        project: m.ProjectV1,
+        revision: m.RevisionV1,
+        head: m.RevisionHeadV1,
+    ) -> m.ProjectV1:
         if project.status is not m.ProjectStatus.READY:
             raise _owner_error("run_project_not_ready", "The saved project is not ready.", 409, True)
         if (

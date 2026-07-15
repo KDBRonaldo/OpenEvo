@@ -521,6 +521,61 @@ def test_concurrent_new_create_has_one_readiness_owner_and_one_durable_run(
         store.close()
 
 
+def test_revision_activation_during_readiness_leaves_zero_persisted_runs(
+    tmp_path: Path,
+    registry: object,
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+    services.block_all_ensures = True
+    services.ensure_allowed.clear()
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        lambda *_args, **_kwargs: _completed_result(),
+    )
+    request = _run_request(project)
+    errors: list[BaseException] = []
+
+    def create() -> None:
+        try:
+            _invoke_create(owner, request, "stale-readiness")
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=create)
+    try:
+        thread.start()
+        assert services.ensure_entered.wait(5)
+        store.activate_evolution_revision(
+            project.id,
+            predecessor=project.active_revision,
+            run_id="readiness-race-successor",
+            context_artifact_ids={},
+        )
+        services.ensure_allowed.set()
+        thread.join(5)
+
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], CoreRunControlError)
+        assert errors[0].code == "run_snapshot_mismatch"
+        assert owner._ledger.list_runs() == []
+
+        with pytest.raises(CoreRunControlError) as retry:
+            _invoke_create(owner, request, "stale-readiness")
+        assert retry.value.code == "run_snapshot_mismatch"
+        assert owner._ledger.list_runs() == []
+    finally:
+        services.ensure_allowed.set()
+        thread.join(5)
+        owner.close()
+        store.close()
+
+
 @pytest.mark.parametrize(
     "readiness_code",
     [

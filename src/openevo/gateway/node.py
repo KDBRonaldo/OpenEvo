@@ -34,6 +34,7 @@ from openevo.gateway.session import SessionRegistry
 from openevo.gateway.session_files import (
     CredentialFileIdentity,
     CredentialRedactor,
+    HeldCodexCredentialAuthority,
     SessionFileSecurityError,
     StagedCodexCredential,
     VerifiedSessionTranscript,
@@ -595,6 +596,7 @@ class GatewayNodeManager:
         evolution: EvolutionConfig | None = None,
         evolution_client: EvolutionClient | None = None,
         internal_headers: dict[str, str] | None = None,
+        credential_authority: HeldCodexCredentialAuthority | None = None,
     ) -> None:
         self.node_id = node_id
         self.gateway_url = gateway_url.rstrip("/")
@@ -611,6 +613,7 @@ class GatewayNodeManager:
         self.evolution = evolution
         self.evolution_client = evolution_client
         self._internal_headers = dict(internal_headers or {})
+        self._credential_authority = credential_authority
         self._client = httpx.AsyncClient(
             timeout=30.0,
             headers=self._internal_headers,
@@ -753,6 +756,8 @@ class GatewayNodeManager:
 
     async def dispatch(self, request: SessionDispatchRequest) -> None:
         self._canonicalize_request_capture_mode(request)
+        if _is_codex_subscription_agent(request.agent):
+            self.verify_credential_authority()
         session_id = request.session_id
         if self.session_registry.get(session_id) is not None:
             raise ValueError(
@@ -1039,6 +1044,7 @@ class GatewayNodeManager:
         try:
             return stage_codex_subscription_auth(
                 source=Path.home() / ".codex" / "auth.json",
+                source_authority=getattr(self, "_credential_authority", None),
                 session_dir=credential_dir,
                 session_identity=identity,
                 target_home_parts=(),
@@ -1046,6 +1052,16 @@ class GatewayNodeManager:
             )
         except SessionFileSecurityError as exc:
             raise RuntimeError(str(exc)) from exc
+
+    def verify_credential_authority(self) -> None:
+        authority = getattr(self, "_credential_authority", None)
+        if authority is None:
+            if getattr(self, "_internal_headers", None):
+                raise SessionFileSecurityError(
+                    "release Gateway credential authority is unavailable"
+                )
+            return
+        authority.verify()
 
     @staticmethod
     def _canonicalize_request_capture_mode(request: SessionDispatchRequest) -> None:

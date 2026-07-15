@@ -7,6 +7,7 @@ import pytest
 
 from openevo.gateway import session_files
 from openevo.gateway.session_files import (
+    HeldCodexCredentialAuthority,
     SessionFileSecurityError,
     capture_session_root_identity,
     load_staged_codex_subscription_redactor,
@@ -38,6 +39,32 @@ def _stage(source: Path, root: Path, identity: tuple[int, int, int]) -> Path:
         target_home_parts=("home", ".codex"),
     )
     return root / "home" / ".codex" / "auth.json"
+
+
+def test_held_credential_authority_rejects_atomic_auth_replacement(
+    tmp_path: Path,
+) -> None:
+    source = _private_auth(tmp_path, '{"access_token":"readiness-secret"}\n')
+    authority = HeldCodexCredentialAuthority.open(source)
+    replacement = source.with_name("auth.replacement")
+    replacement.write_text('{"access_token":"replacement-secret"}\n', encoding="utf-8")
+    replacement.chmod(0o600)
+    os.replace(replacement, source)
+    root, identity = _session_root(tmp_path)
+    try:
+        with pytest.raises(SessionFileSecurityError, match="changed|readiness authority"):
+            stage_codex_subscription_auth(
+                source=source,
+                source_authority=authority,
+                session_dir=root,
+                session_identity=identity,
+                target_home_parts=("home", ".codex"),
+            )
+        assert not (root / "home" / ".codex" / "auth.json").exists()
+        assert list(root.glob(".openevo-credential-staging-*")) == []
+    finally:
+        authority.close()
+        authority.close()
 
 
 def test_log_writer_and_reader_share_private_pinned_authority(tmp_path: Path) -> None:

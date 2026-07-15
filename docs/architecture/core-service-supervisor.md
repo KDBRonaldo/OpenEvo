@@ -153,9 +153,14 @@ image ID, and carry the `io.openevo.managed-runtime=true` label produced by the
 managed Science Dockerfile. Supervisor preflight and Docker runtime creation use
 the same authoritative verifier; the latter receives the verified immutable
 image reference rather than the mutable tag. It opens `~/.codex/auth.json`
-no-follow, requires a link-count-one
-owner-owned `0600` file, and hashes only file metadata. It never reads or
-persists auth content or the login-status output. Probe stdout and stderr are drained concurrently without
+no-follow, requires a link-count-one owner-owned `0600` file, and retains that
+read-only descriptor plus a verified absolute-directory pin as the generation's
+credential authority. Only the FD number is inherited by Gateway; auth content
+is never placed in argv, ordinary environment values, logs, public APIs, or
+durable state. Gateway revalidates the held inode and current pathname before
+run admission and again before staging the private Codex home. Atomic pathname
+replacement therefore fails closed instead of switching a ready generation to
+different subscription evidence. Probe stdout and stderr are drained concurrently without
 `communicate()`. One hard aggregate byte budget covers both streams; crossing it
 immediately kills the complete probe process group and performs a bounded leader
 reap. Cancellation and deadline paths use the same group-wide bounded cleanup.
@@ -258,8 +263,11 @@ generation mutation. The run owner releases the lease after runner and admission
 work exits. A concurrent ensure therefore cannot replace the generation between
 readiness, binding issuance, and the run's private requests.
 
-The run owner still revalidates the exact project snapshots, immutable revision,
-registry, and generation before dispatch. Evolution outputs apply only to a
+After potentially long service readiness, the run owner opens an authoritative
+project-store `BEGIN IMMEDIATE`, compares the exact project/task/workspace
+snapshots, registry, revision and active generation again, and holds that pin
+through context capture and new-run persistence. A concurrent project mutation
+or successor activation therefore leaves no persisted run. Evolution outputs apply only to a
 later session after the revision contract commits. A promoted artifact, legacy
 context result, or caller-provided readiness field cannot make a generation
 runnable.

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,6 +21,10 @@ from openevo.gateway.completion_writer import CompletionWriter
 from openevo.gateway.detection import APIType, detect, extract_model
 from openevo.gateway.engine import get_engine
 from openevo.gateway.node import CancelAuthorityPersistenceError, GatewayNodeManager
+from openevo.gateway.session_files import (
+    HeldCodexCredentialAuthority,
+    SessionFileSecurityError,
+)
 from openevo.gateway.proxy import (
     InferenceClient,
     UpstreamError,
@@ -54,6 +59,7 @@ from openevo.internal_auth import (
     install_internal_auth,
     read_internal_service_identity,
     require_generation_bound_run_admission,
+    RunAdmissionError,
 )
 
 logging.basicConfig(
@@ -83,6 +89,24 @@ _configured_topology_path: str | None = None
 _configured_node_id: str | None = None
 _internal_identity: InternalServiceIdentity | None = None
 _run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None
+_credential_authority: HeldCodexCredentialAuthority | None = None
+
+
+def _require_credential_authority() -> None:
+    if _internal_identity is None:
+        return
+    authority = _credential_authority
+    try:
+        if authority is None:
+            raise SessionFileSecurityError("credential authority is unavailable")
+        authority.verify()
+    except SessionFileSecurityError as exc:
+        raise RunAdmissionError(
+            "credential_authority_changed",
+            "The managed subscription credential authority changed after readiness.",
+            status_code=503,
+            retryable=True,
+        ) from exc
 
 
 def configure_server(
@@ -91,13 +115,15 @@ def configure_server(
     node_id: str | None = None,
     internal_identity: InternalServiceIdentity | None = None,
     run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None,
+    credential_authority: HeldCodexCredentialAuthority | None = None,
 ) -> None:
     global _configured_topology_path, _configured_node_id
-    global _internal_identity, _run_admission_verifier, _state
+    global _internal_identity, _run_admission_verifier, _credential_authority, _state
     _configured_topology_path = topology_path
     _configured_node_id = node_id
     _internal_identity = internal_identity
     _run_admission_verifier = run_admission_verifier
+    _credential_authority = credential_authority
     _state = None
 
 
@@ -151,6 +177,7 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         internal_headers=(
             _internal_identity.request_headers() if _internal_identity is not None else None
         ),
+        credential_authority=_credential_authority,
     )
     return GatewayState(
         topology=topology,
@@ -592,6 +619,7 @@ async def create_session(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if "agent" in body and "session_id" in body:
         dispatch_request = SessionDispatchRequest.model_validate(body)
+        _require_credential_authority()
         await require_generation_bound_run_admission(
             identity=_internal_identity,
             verifier=_run_admission_verifier,
@@ -620,6 +648,7 @@ async def create_session(request: Request):
     except InvalidSessionIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     effective_request = create_request.model_copy(update={"session_id": session_id})
+    _require_credential_authority()
     await require_generation_bound_run_admission(
         identity=_internal_identity,
         verifier=_run_admission_verifier,
@@ -945,11 +974,16 @@ def serve(
         required=False,
         expected_service_id="gateway",
     )
+    credential_authority = HeldCodexCredentialAuthority.from_inherited_environment(
+        Path.home() / ".codex" / "auth.json",
+        required=internal_identity is not None,
+    )
     configure_server(
         topology_path,
         node_id=node_id,
         internal_identity=internal_identity,
         run_admission_verifier=configured_run_admission_verifier(internal_identity),
+        credential_authority=credential_authority,
     )
     state = get_state()
     listen_fd = inherited_listen_fd()
@@ -960,7 +994,11 @@ def serve(
         kwargs.update(host=state.node.host, port=state.node.port)
     else:
         kwargs["fd"] = listen_fd
-    uvicorn.run(**kwargs)
+    try:
+        uvicorn.run(**kwargs)
+    finally:
+        if credential_authority is not None:
+            credential_authority.close()
 
 
 def main() -> None:

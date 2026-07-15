@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -18,7 +19,7 @@ import stat
 import sys
 import threading
 import time
-from typing import Any, Literal, TypeVar
+from typing import Any, Iterator, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
@@ -650,6 +651,32 @@ class CoreControlStoreV1:
             if row is None:
                 raise ResourceNotFoundError("project", project_id)
             return _validate_bytes(m.ProjectV1, row["document_json"])
+
+    @contextmanager
+    def pin_science_run_authority(
+        self,
+        project_id: str,
+        revision_id: str,
+    ) -> Iterator[tuple[m.ProjectV1, m.RevisionV1, m.RevisionHeadV1]]:
+        """Hold the authoritative project/revision generation through run persistence."""
+
+        with self._mutex, self._transaction():
+            _, project = self._project_row(project_id)
+            revision = self._revision_row(revision_id)
+            if revision.revision.project_id != project_id:
+                raise ResourceNotFoundError("revision", revision_id)
+            if project.active_revision is None:
+                raise ResourceNotFoundError("revision_head", project_id)
+            active = self._revision_row(project.active_revision.id)
+            if active.revision != project.active_revision:
+                raise StoreCorruptionError("project revision head binding is invalid")
+            head = _revision_head(
+                project,
+                active,
+                version=active.revision.generation + 1,
+            )
+            yield project, revision, head
+            self._verify_lifecycle_storage()
 
     def workspace_snapshot_path(
         self,
