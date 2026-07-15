@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import ctypes
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import struct
 import sys
 import threading
 import time
+from typing import TypeVar
 
 
 SSH_EXECUTABLE = "/usr/bin/ssh"
@@ -37,17 +39,22 @@ _AGENT_PROXY_CREATE_ATTEMPTS = 32
 _AGENT_PROXY_RANDOM_BYTES = 12
 _MAX_PENDING_AGENT_PROXY_CLEANUPS = 32
 _DARWIN_LOCAL_PEERPID = 0x002
-_LINUX_INOTIFY_MUTATION_MASK = (
-    0x00000002  # IN_MODIFY
-    | 0x00000004  # IN_ATTRIB
-    | 0x00000040  # IN_MOVED_FROM
-    | 0x00000080  # IN_MOVED_TO
-    | 0x00000100  # IN_CREATE
-    | 0x00000200  # IN_DELETE
-    | 0x00000400  # IN_DELETE_SELF
-    | 0x00000800  # IN_MOVE_SELF
-    | 0x00002000  # IN_UNMOUNT
+_LINUX_INOTIFY_ATTRIB = 0x00000004
+_LINUX_INOTIFY_DELETE_SELF = 0x00000400
+_LINUX_INOTIFY_MOVE_SELF = 0x00000800
+_LINUX_INOTIFY_UNMOUNT = 0x00002000
+_LINUX_INOTIFY_Q_OVERFLOW = 0x00004000
+_LINUX_INOTIFY_IGNORED = 0x00008000
+_LINUX_INOTIFY_DONT_FOLLOW = 0x02000000
+_LINUX_INOTIFY_TARGET_MASK = (
+    _LINUX_INOTIFY_ATTRIB
+    | _LINUX_INOTIFY_DELETE_SELF
+    | _LINUX_INOTIFY_MOVE_SELF
+    | _LINUX_INOTIFY_UNMOUNT
 )
+_LINUX_INOTIFY_EVENT = struct.Struct("iIII")
+_MAX_INOTIFY_OBSERVATION_BYTES = 1024 * 1024
+_SSH_AGENT_AUTHORITY_FAILURE = "SSH agent authority validation failed."
 
 _AGENT_PROXY_SETUP_GUARD = threading.Lock()
 _PENDING_AGENT_PROXY_CLEANUPS: dict[
@@ -57,8 +64,26 @@ _PENDING_AGENT_PROXY_CLEANUPS: dict[
 
 _ExecutableIdentity = tuple[int, int, int, int, int, int, int, int]
 _DirectoryIdentity = tuple[int, int, int, int]
-_DirectoryConnectEpoch = tuple[int, int, int, int, int]
 _SocketIdentity = tuple[int, int, int, int, int, int]
+_AuthorityResult = TypeVar("_AuthorityResult")
+
+
+class SshAgentAuthorityError(RuntimeError):
+    """A fixed, path-free SSH agent authority failure."""
+
+    def __init__(self) -> None:
+        super().__init__(_SSH_AGENT_AUTHORITY_FAILURE)
+
+
+def _run_agent_authority_operation(
+    operation: Callable[[], _AuthorityResult],
+) -> _AuthorityResult:
+    try:
+        return operation()
+    except Exception:
+        pass
+    # Raise after leaving the handler so Python cannot retain the rejected exception.
+    raise SshAgentAuthorityError() from None
 
 
 class VerifiedSystemExecutable:
@@ -205,6 +230,10 @@ class VerifiedSshAgentSocket:
 
     @classmethod
     def open(cls, path: str) -> VerifiedSshAgentSocket:
+        return _run_agent_authority_operation(lambda: cls._open(path))
+
+    @classmethod
+    def _open(cls, path: str) -> VerifiedSshAgentSocket:
         path = _canonical_agent_socket_path(path)
         encoded = os.fsencode(path)
         candidate = Path(path)
@@ -278,6 +307,9 @@ class VerifiedSshAgentSocket:
         return self._identity
 
     def verify_path_binding(self) -> None:
+        _run_agent_authority_operation(self._verify_path_binding)
+
+    def _verify_path_binding(self) -> None:
         for index, (descriptor, name, identity) in enumerate(self._directories):
             opened = os.fstat(descriptor)
             _require_agent_directory(opened)
@@ -303,28 +335,29 @@ class VerifiedSshAgentSocket:
         *,
         expected_peer: tuple[int, int] | None = None,
     ) -> tuple[socket.socket, tuple[int, int]]:
-        directory_descriptors = tuple(
-            descriptor for descriptor, _name, _identity in self._directories
+        return _run_agent_authority_operation(lambda: self._connect(expected_peer=expected_peer))
+
+    def _connect(
+        self,
+        *,
+        expected_peer: tuple[int, int] | None,
+    ) -> tuple[socket.socket, tuple[int, int]]:
+        mutation_monitor = _AgentTargetMutationMonitor.open(
+            self._directories,
+            socket_name=self._name,
+            socket_identity=self._identity,
         )
-        mutation_monitor = _DirectoryMutationMonitor.open(directory_descriptors)
         upstream: socket.socket | None = None
         try:
-            directory_epochs = tuple(
-                _agent_directory_connect_epoch(os.fstat(descriptor))
-                for descriptor in directory_descriptors
-            )
-            self.verify_path_binding()
+            self._verify_path_binding()
             upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 upstream.settimeout(_AGENT_CONNECT_TIMEOUT_SECONDS)
                 upstream.connect(self._path)
-                self.verify_path_binding()
-                final_epochs = tuple(
-                    _agent_directory_connect_epoch(os.fstat(descriptor))
-                    for descriptor in directory_descriptors
-                )
-                if final_epochs != directory_epochs or mutation_monitor.observed_mutation():
-                    raise ValueError("SSH agent socket directory changed during connect")
+                self._verify_path_binding()
+                if mutation_monitor.observed_target_mutation():
+                    self._verify_path_binding()
+                    raise ValueError("SSH agent socket target changed during connect")
                 peer = _unix_peer_process(upstream)
                 if peer[1] != os.geteuid() or (
                     expected_peer is not None and peer != expected_peer
@@ -375,6 +408,10 @@ class SshAgentSocketSource:
     def from_environment(cls, authentication_method: str) -> SshAgentSocketSource | None:
         if authentication_method != "ssh_agent":
             return None
+        return _run_agent_authority_operation(cls._from_environment)
+
+    @classmethod
+    def _from_environment(cls) -> SshAgentSocketSource | None:
         socket_path = os.environ.get("SSH_AUTH_SOCK")
         if socket_path is None:
             return None
@@ -395,6 +432,9 @@ class SshAgentSocketSource:
         return cls(canonical_path, identity, peer)
 
     def open_proxy(self) -> SshAgentProxy:
+        return _run_agent_authority_operation(self._open_proxy)
+
+    def _open_proxy(self) -> SshAgentProxy:
         authority = VerifiedSshAgentSocket.open(self._path)
         try:
             if authority.identity != self._identity:
@@ -411,90 +451,209 @@ class SshAgentSocketSource:
         return "SshAgentSocketSource(<redacted>)"
 
 
-class _DirectoryMutationMonitor:
-    __slots__ = ("_darwin_queue", "_descriptor", "_max_events")
+def _linux_inotify_payload_has_target_mutation(
+    payload: bytes,
+    target_kinds: dict[int, bool],
+) -> bool:
+    offset = 0
+    while offset < len(payload):
+        header_end = offset + _LINUX_INOTIFY_EVENT.size
+        if header_end > len(payload):
+            return True
+        watch, mask, _cookie, name_length = _LINUX_INOTIFY_EVENT.unpack_from(
+            payload,
+            offset,
+        )
+        event_end = header_end + name_length
+        if event_end > len(payload):
+            return True
+        if mask & (_LINUX_INOTIFY_Q_OVERFLOW | _LINUX_INOTIFY_IGNORED):
+            return True
+        socket_target = target_kinds.get(watch)
+        if socket_target is None:
+            return True
+        name = payload[header_end:event_end].rstrip(b"\x00")
+        if socket_target or not name:
+            return True
+        offset = event_end
+    return False
+
+
+class _AgentTargetMutationMonitor:
+    __slots__ = (
+        "_darwin_queue",
+        "_descriptor",
+        "_linux_target_kinds",
+        "_max_events",
+        "_owned_descriptors",
+    )
 
     def __init__(
         self,
         *,
         descriptor: int = -1,
         darwin_queue: object | None = None,
+        linux_target_kinds: dict[int, bool] | None = None,
         max_events: int = 0,
+        owned_descriptors: tuple[int, ...] = (),
     ) -> None:
         self._descriptor = descriptor
         self._darwin_queue = darwin_queue
+        self._linux_target_kinds = linux_target_kinds or {}
         self._max_events = max_events
+        self._owned_descriptors = owned_descriptors
 
     @classmethod
-    def open(cls, descriptors: tuple[int, ...]) -> _DirectoryMutationMonitor:
-        if not descriptors:
+    def open(
+        cls,
+        directories: tuple[tuple[int, str | None, _DirectoryIdentity], ...],
+        *,
+        socket_name: str,
+        socket_identity: _SocketIdentity,
+    ) -> _AgentTargetMutationMonitor:
+        if not directories:
             raise RuntimeError("SSH agent socket directory authority is unavailable")
         if sys.platform.startswith("linux"):
-            libc = ctypes.CDLL(None, use_errno=True)
-            inotify_init1 = libc.inotify_init1
-            inotify_init1.argtypes = [ctypes.c_int]
-            inotify_init1.restype = ctypes.c_int
-            inotify_add_watch = libc.inotify_add_watch
-            inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
-            inotify_add_watch.restype = ctypes.c_int
-            descriptor = inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
-            if descriptor < 0:
-                error = ctypes.get_errno()
-                raise OSError(error, "SSH agent socket mutation monitor is unavailable")
-            try:
-                for held in descriptors:
-                    watch_path = os.fsencode(f"/proc/self/fd/{held}")
-                    if (
-                        inotify_add_watch(
-                            descriptor,
-                            watch_path,
-                            _LINUX_INOTIFY_MUTATION_MASK,
-                        )
-                        < 0
-                    ):
-                        error = ctypes.get_errno()
-                        raise OSError(
-                            error,
-                            "SSH agent socket mutation monitor is unavailable",
-                        )
-            except BaseException:
-                os.close(descriptor)
-                raise
-            return cls(descriptor=descriptor)
+            return cls._open_linux(
+                directories,
+                socket_name=socket_name,
+            )
         if sys.platform == "darwin":
+            return cls._open_darwin(
+                directories,
+                socket_name=socket_name,
+                socket_identity=socket_identity,
+            )
+        raise RuntimeError("SSH agent socket mutation monitoring is unsupported")
+
+    @classmethod
+    def _open_linux(
+        cls,
+        directories: tuple[tuple[int, str | None, _DirectoryIdentity], ...],
+        *,
+        socket_name: str,
+    ) -> _AgentTargetMutationMonitor:
+        libc = ctypes.CDLL(None, use_errno=True)
+        inotify_init1 = libc.inotify_init1
+        inotify_init1.argtypes = [ctypes.c_int]
+        inotify_init1.restype = ctypes.c_int
+        inotify_add_watch = libc.inotify_add_watch
+        inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        inotify_add_watch.restype = ctypes.c_int
+        descriptor = inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+        if descriptor < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, "SSH agent socket mutation monitor is unavailable")
+        target_kinds: dict[int, bool] = {}
+        try:
+            for held, _name, _identity in directories[1:]:
+                watch = inotify_add_watch(
+                    descriptor,
+                    os.fsencode(f"/proc/self/fd/{held}"),
+                    _LINUX_INOTIFY_TARGET_MASK,
+                )
+                if watch < 0:
+                    error = ctypes.get_errno()
+                    raise OSError(
+                        error,
+                        "SSH agent socket mutation monitor is unavailable",
+                    )
+                target_kinds[watch] = False
+            parent = directories[-1][0]
+            socket_watch = inotify_add_watch(
+                descriptor,
+                os.fsencode(f"/proc/self/fd/{parent}/{socket_name}"),
+                _LINUX_INOTIFY_TARGET_MASK | _LINUX_INOTIFY_DONT_FOLLOW,
+            )
+            if socket_watch < 0:
+                error = ctypes.get_errno()
+                raise OSError(
+                    error,
+                    "SSH agent socket mutation monitor is unavailable",
+                )
+            target_kinds[socket_watch] = True
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return cls(descriptor=descriptor, linux_target_kinds=target_kinds)
+
+    @classmethod
+    def _open_darwin(
+        cls,
+        directories: tuple[tuple[int, str | None, _DirectoryIdentity], ...],
+        *,
+        socket_name: str,
+        socket_identity: _SocketIdentity,
+    ) -> _AgentTargetMutationMonitor:
+        event_only = getattr(os, "O_EVTONLY", None)
+        if not isinstance(event_only, int):
+            raise RuntimeError("SSH agent socket mutation monitoring is unsupported")
+        socket_descriptor = os.open(
+            socket_name,
+            event_only | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directories[-1][0],
+        )
+        kqueue: object | None = None
+        try:
+            metadata = os.fstat(socket_descriptor)
+            _require_agent_socket(metadata)
+            if _agent_socket_identity(metadata) != socket_identity:
+                raise ValueError("SSH agent socket monitor identity changed")
             kqueue = select.kqueue()
-            mutation_flags = (
+            directory_flags = (
                 select.KQ_NOTE_ATTRIB
                 | select.KQ_NOTE_DELETE
-                | select.KQ_NOTE_EXTEND
-                | select.KQ_NOTE_LINK
                 | select.KQ_NOTE_RENAME
                 | select.KQ_NOTE_REVOKE
-                | select.KQ_NOTE_WRITE
             )
+            socket_flags = directory_flags | select.KQ_NOTE_LINK
             changes = [
                 select.kevent(
                     held,
                     filter=select.KQ_FILTER_VNODE,
                     flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                    fflags=mutation_flags,
+                    fflags=directory_flags,
                 )
-                for held in descriptors
+                for held, _name, _identity in directories[1:]
             ]
-            try:
-                kqueue.control(changes, 0, 0)
-            except BaseException:
+            changes.append(
+                select.kevent(
+                    socket_descriptor,
+                    filter=select.KQ_FILTER_VNODE,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                    fflags=socket_flags,
+                )
+            )
+            kqueue.control(changes, 0, 0)
+        except BaseException:
+            if kqueue is not None:
                 kqueue.close()
-                raise
-            return cls(darwin_queue=kqueue, max_events=len(descriptors))
-        raise RuntimeError("SSH agent socket mutation monitoring is unsupported")
+            os.close(socket_descriptor)
+            raise
+        return cls(
+            darwin_queue=kqueue,
+            max_events=len(changes),
+            owned_descriptors=(socket_descriptor,),
+        )
 
-    def observed_mutation(self) -> bool:
+    def observed_target_mutation(self) -> bool:
         if self._descriptor >= 0:
-            try:
-                return bool(os.read(self._descriptor, 4096))
-            except BlockingIOError:
-                return False
+            observed = 0
+            while True:
+                try:
+                    payload = os.read(self._descriptor, 64 * 1024)
+                except BlockingIOError:
+                    return False
+                observed += len(payload)
+                if (
+                    not payload
+                    or observed > _MAX_INOTIFY_OBSERVATION_BYTES
+                    or _linux_inotify_payload_has_target_mutation(
+                        payload,
+                        self._linux_target_kinds,
+                    )
+                ):
+                    return True
         if self._darwin_queue is None:
             raise RuntimeError("SSH agent socket mutation monitor is unavailable")
         return bool(self._darwin_queue.control(None, self._max_events, 0))
@@ -506,9 +665,12 @@ class _DirectoryMutationMonitor:
         darwin_queue, self._darwin_queue = self._darwin_queue, None
         if darwin_queue is not None:
             darwin_queue.close()
+        owned_descriptors, self._owned_descriptors = self._owned_descriptors, ()
+        for owned in owned_descriptors:
+            os.close(owned)
 
     def __repr__(self) -> str:
-        return "_DirectoryMutationMonitor(<redacted>)"
+        return "_AgentTargetMutationMonitor(<redacted>)"
 
 
 class _PendingProxyNameCleanup:
@@ -1172,16 +1334,6 @@ def _agent_directory_identity(metadata: os.stat_result) -> _DirectoryIdentity:
     )
 
 
-def _agent_directory_connect_epoch(metadata: os.stat_result) -> _DirectoryConnectEpoch:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
-    )
-
-
 def _agent_socket_identity(metadata: os.stat_result) -> _SocketIdentity:
     return (
         metadata.st_dev,
@@ -1472,6 +1624,7 @@ __all__ = (
     "OWNED_SUBPROCESS_BIRTH_ARGUMENT",
     "SSH_EXECUTABLE",
     "SSH_KEYSCAN_EXECUTABLE",
+    "SshAgentAuthorityError",
     "SshAgentProxy",
     "SshAgentSocketSource",
     "VerifiedSshAgentSocket",

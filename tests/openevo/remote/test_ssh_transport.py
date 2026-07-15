@@ -2428,7 +2428,7 @@ def test_upstream_agent_replacement_during_spawn_never_starts_forwarding(
 
     monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", replacing_popen)
     try:
-        with pytest.raises(ValueError, match="binding changed") as exc_info:
+        with pytest.raises(executable_module.SshAgentAuthorityError) as exc_info:
             ssh_module._run_subprocess(
                 [ssh_module.SSH_EXECUTABLE, "-V"],
                 5,
@@ -2436,6 +2436,15 @@ def test_upstream_agent_replacement_during_spawn_never_starts_forwarding(
                 agent_socket_source=source,
             )
         assert str(upstream_path) not in str(exc_info.value)
+        assert upstream_path.name not in "".join(
+            traceback.format_exception(
+                type(exc_info.value),
+                exc_info.value,
+                exc_info.value.__traceback__,
+            )
+        )
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
         assert str(upstream_path) not in caplog.text
         assert len(proxy_paths) == 1
         assert not proxy_paths[0].exists()

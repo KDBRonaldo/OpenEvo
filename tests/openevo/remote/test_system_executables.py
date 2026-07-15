@@ -8,12 +8,45 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
+import traceback
 
 import pytest
 
 import openevo.deployment.host_keys as host_keys
 import openevo.deployment.system_executables as executables
 from openevo.deployment.ssh import _run_subprocess
+
+
+def _assert_sanitized_agent_authority_error(
+    error: BaseException,
+    canary: str,
+) -> None:
+    assert isinstance(error, executables.SshAgentAuthorityError)
+    assert str(error) == "SSH agent authority validation failed."
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert canary not in formatted
+    assert canary not in repr(error)
+
+
+def _serve_agent_connections(
+    listener: socket.socket,
+    stop: threading.Event,
+    errors: list[BaseException],
+) -> None:
+    listener.settimeout(0.05)
+    while not stop.is_set():
+        try:
+            connection, _address = listener.accept()
+        except socket.timeout:
+            continue
+        except OSError as error:
+            if not stop.is_set():
+                errors.append(error)
+            return
+        connection.close()
 
 
 @pytest.mark.parametrize(
@@ -139,7 +172,7 @@ def test_closed_ssh_environment_accepts_only_an_owner_private_unix_socket(
         assert str(socket_path) not in repr(source)
 
         socket_path.chmod(0o620)
-        with pytest.raises(ValueError, match="identity"):
+        with pytest.raises(executables.SshAgentAuthorityError):
             executables.closed_ssh_environment("ssh_agent")
     finally:
         listener.close()
@@ -157,8 +190,21 @@ def test_closed_ssh_environment_rejects_symlink_and_regular_file(
 
     for candidate in (regular, link):
         monkeypatch.setenv("SSH_AUTH_SOCK", str(candidate))
-        with pytest.raises(ValueError, match="identity"):
+        with pytest.raises(executables.SshAgentAuthorityError):
             executables.closed_ssh_environment("ssh_agent")
+
+
+def test_missing_agent_socket_path_is_absent_from_full_exception_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = "raw-agent-missing-canary.sock"
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / canary))
+
+    with pytest.raises(executables.SshAgentAuthorityError) as exc_info:
+        executables.SshAgentSocketSource.from_environment("ssh_agent")
+
+    _assert_sanitized_agent_authority_error(exc_info.value, canary)
 
 
 def test_agent_socket_authority_rejects_ancestor_path_replacement(tmp_path: Path) -> None:
@@ -177,7 +223,7 @@ def test_agent_socket_authority_rejects_ancestor_path_replacement(tmp_path: Path
         replacement.bind(str(socket_path))
         socket_path.chmod(0o600)
 
-        with pytest.raises(ValueError, match="ancestor path binding"):
+        with pytest.raises(executables.SshAgentAuthorityError):
             authority.verify_path_binding()
     finally:
         authority.close()
@@ -189,7 +235,8 @@ def test_agent_source_rejects_socket_replacement_before_connect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    socket_path = tmp_path / "agent.sock"
+    canary = "raw-agent-replaced-canary.sock"
+    socket_path = tmp_path / canary
     original = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     original.bind(str(socket_path))
@@ -203,8 +250,9 @@ def test_agent_source_rejects_socket_replacement_before_connect(
     replacement.listen(4)
     socket_path.chmod(0o600)
     try:
-        with pytest.raises(ValueError, match="source identity changed"):
+        with pytest.raises(executables.SshAgentAuthorityError) as exc_info:
             source.open_proxy()
+        _assert_sanitized_agent_authority_error(exc_info.value, canary)
     finally:
         replacement.close()
         original.close()
@@ -234,7 +282,7 @@ def test_agent_source_rejects_socket_replacement_during_connect(
 
     monkeypatch.setattr(socket.socket, "connect", connect_then_replace)
     try:
-        with pytest.raises(ValueError, match="binding changed"):
+        with pytest.raises(executables.SshAgentAuthorityError):
             source.open_proxy()
     finally:
         replacement.close()
@@ -271,14 +319,182 @@ def test_agent_source_rejects_socket_replace_and_restore_during_connect(
 
     monkeypatch.setattr(socket.socket, "connect", connect_through_replacement_then_restore)
     try:
-        with pytest.raises(
-            ValueError,
-            match="(path binding changed|directory changed during connect)",
-        ):
+        with pytest.raises(executables.SshAgentAuthorityError):
             source.open_proxy()
     finally:
         replacement.close()
         original.close()
+
+
+def test_agent_source_rejects_ancestor_rename_and_restore_aba_during_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_root = tmp_path / "agent-root"
+    agent_root.mkdir(mode=0o700)
+    held_root = tmp_path / "held-agent-root"
+    socket_path = agent_root / "agent.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(4)
+    socket_path.chmod(0o600)
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(socket_path))
+    source = executables.SshAgentSocketSource.from_environment("ssh_agent")
+    assert source is not None
+    real_connect = socket.socket.connect
+
+    def connect_then_rename_and_restore(stream: socket.socket, path: str) -> None:
+        real_connect(stream, path)
+        agent_root.rename(held_root)
+        held_root.rename(agent_root)
+
+    monkeypatch.setattr(socket.socket, "connect", connect_then_rename_and_restore)
+    try:
+        with pytest.raises(executables.SshAgentAuthorityError):
+            source.open_proxy()
+    finally:
+        listener.close()
+
+
+def test_agent_proxy_ignores_sustained_unrelated_shared_directory_churn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = tmp_path / "agent.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(16)
+    socket_path.chmod(0o600)
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(socket_path))
+    stop = threading.Event()
+    server_errors: list[BaseException] = []
+    server = threading.Thread(
+        target=_serve_agent_connections,
+        args=(listener, stop, server_errors),
+        daemon=True,
+    )
+    server.start()
+    source = executables.SshAgentSocketSource.from_environment("ssh_agent")
+    assert source is not None
+    churn_started = threading.Event()
+
+    def churn_siblings() -> None:
+        index = 0
+        while not stop.is_set():
+            sibling = tmp_path / f"unrelated-{index % 16}"
+            sibling_directory = tmp_path / f"unrelated-dir-{index % 16}"
+            try:
+                sibling.write_bytes(b"x")
+                sibling.unlink(missing_ok=True)
+                sibling_directory.mkdir()
+                sibling_directory.rmdir()
+            except (FileExistsError, FileNotFoundError):
+                pass
+            churn_started.set()
+            index += 1
+
+    churn = threading.Thread(target=churn_siblings, daemon=True)
+    churn.start()
+    assert churn_started.wait(2)
+    real_connect = socket.socket.connect
+
+    def connect_during_churn(stream: socket.socket, path: str) -> None:
+        real_connect(stream, path)
+        time.sleep(0.01)
+
+    monkeypatch.setattr(socket.socket, "connect", connect_during_churn)
+    try:
+        for _ in range(8):
+            proxy = source.open_proxy()
+            proxy.close()
+    finally:
+        stop.set()
+        listener.close()
+        churn.join(2)
+        server.join(2)
+
+    assert not churn.is_alive()
+    assert not server.is_alive()
+    assert server_errors == []
+
+
+def test_two_concurrent_agent_proxy_opens_do_not_interfere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = tmp_path / "agent.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(8)
+    socket_path.chmod(0o600)
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(socket_path))
+    stop = threading.Event()
+    server_errors: list[BaseException] = []
+    server = threading.Thread(
+        target=_serve_agent_connections,
+        args=(listener, stop, server_errors),
+        daemon=True,
+    )
+    server.start()
+    source = executables.SshAgentSocketSource.from_environment("ssh_agent")
+    assert source is not None
+    barrier = threading.Barrier(3)
+    proxies: list[executables.SshAgentProxy] = []
+    errors: list[BaseException] = []
+    result_guard = threading.Lock()
+
+    def open_proxy() -> None:
+        barrier.wait()
+        try:
+            proxy = source.open_proxy()
+        except BaseException as error:
+            with result_guard:
+                errors.append(error)
+            return
+        with result_guard:
+            proxies.append(proxy)
+
+    workers = [threading.Thread(target=open_proxy) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join(5)
+    try:
+        assert all(not worker.is_alive() for worker in workers)
+        assert errors == []
+        assert len(proxies) == 2
+        assert proxies[0].socket_path != proxies[1].socket_path
+    finally:
+        for proxy in proxies:
+            proxy.close()
+        stop.set()
+        listener.close()
+        server.join(2)
+
+    assert not server.is_alive()
+    assert server_errors == []
+
+
+def test_agent_connect_failure_is_absent_from_full_exception_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = "raw-agent-connect-canary.sock"
+    socket_path = tmp_path / canary
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(4)
+    socket_path.chmod(0o600)
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(socket_path))
+    source = executables.SshAgentSocketSource.from_environment("ssh_agent")
+    assert source is not None
+    listener.close()
+
+    with pytest.raises(executables.SshAgentAuthorityError) as exc_info:
+        source.open_proxy()
+
+    _assert_sanitized_agent_authority_error(exc_info.value, canary)
 
 
 def test_agent_proxy_rejects_same_uid_steal_then_relays_for_owned_child(

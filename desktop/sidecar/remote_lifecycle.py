@@ -71,6 +71,41 @@ class _RemoteTransport(Protocol):
 AuthResolver = Callable[[RemoteProfileV1], SSHAuthConfig]
 TransportFactory = Callable[[RemoteProfileConfig, TrustedKnownHostsBinding], _RemoteTransport]
 _MAX_CONNECTION_DEADLINE_SECONDS = 12.0
+_CREDENTIAL_UNAVAILABLE_MESSAGE = (
+    "The selected SSH authentication mode requires the native credential broker."
+)
+_SUPERSEDED_MESSAGE = "A newer remote lifecycle operation superseded this result."
+_SAFE_CONNECTION_FAILURE_MESSAGES = frozenset(
+    {
+        "The requested remote profile is not connected.",
+        "The SSH connection could not be established.",
+        "The pending SSH host key is no longer current.",
+        "The SSH host key could not be confirmed.",
+        "Another remote profile owns the connection.",
+        "The server did not present a supported SSH host key.",
+        "The SSH connectivity check failed.",
+        "The SSH connection deadline expired.",
+    }
+)
+
+
+def _detached_lifecycle_error(
+    error: RemoteLifecycleError,
+    *,
+    fallback: str,
+) -> RemoteLifecycleError:
+    if type(error) is RemoteCredentialUnavailableError:
+        return RemoteCredentialUnavailableError(_CREDENTIAL_UNAVAILABLE_MESSAGE)
+    if type(error) is RemoteLifecycleSupersededError:
+        return RemoteLifecycleSupersededError(_SUPERSEDED_MESSAGE)
+    message = error.args[0] if len(error.args) == 1 else None
+    if (
+        type(error) is RemoteConnectionFailedError
+        and type(message) is str
+        and message in _SAFE_CONNECTION_FAILURE_MESSAGES
+    ):
+        return RemoteConnectionFailedError(message)
+    return RemoteConnectionFailedError(fallback)
 
 
 @dataclass(frozen=True)
@@ -97,9 +132,7 @@ class _ActiveRemote:
 
 def ssh_agent_auth_for_release(profile: RemoteProfileV1) -> SSHAuthConfig:
     if profile.authentication_kind != "ssh_agent":
-        raise RemoteCredentialUnavailableError(
-            "The selected SSH authentication mode requires the native credential broker."
-        )
+        raise RemoteCredentialUnavailableError(_CREDENTIAL_UNAVAILABLE_MESSAGE)
     return SSHAuthConfig(method="ssh_agent")
 
 
@@ -171,6 +204,7 @@ class DesktopRemoteLifecycle:
         deadline = self._deadline()
         generation, displaced = self._begin(profile.profile_id)
         self._close_remotes(displaced)
+        failure: RemoteLifecycleError | None = None
         try:
             config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
             self._remaining(deadline)
@@ -187,15 +221,22 @@ class DesktopRemoteLifecycle:
                     host_key_candidate=candidate,
                 )
             return self._connect_with_binding(generation, config, binding, deadline=deadline)
-        except RemoteLifecycleSupersededError:
-            raise
-        except Exception as exc:
+        except RemoteLifecycleSupersededError as error:
+            failure = _detached_lifecycle_error(
+                error,
+                fallback="The SSH connection could not be established.",
+            )
+        except RemoteLifecycleError as error:
             self._publish_failure(generation, profile.profile_id, "ssh_connection_failed")
-            if isinstance(exc, RemoteLifecycleError):
-                raise
-            raise RemoteConnectionFailedError(
-                "The SSH connection could not be established."
-            ) from exc
+            failure = _detached_lifecycle_error(
+                error,
+                fallback="The SSH connection could not be established.",
+            )
+        except Exception:
+            self._publish_failure(generation, profile.profile_id, "ssh_connection_failed")
+        if failure is not None:
+            raise failure
+        raise RemoteConnectionFailedError("The SSH connection could not be established.")
 
     def accept_host_key(
         self,
@@ -214,6 +255,7 @@ class DesktopRemoteLifecycle:
             self._candidate = None
             self._snapshot = RemoteLifecycleSnapshot(profile.profile_id, "connecting")
         self._close_remotes(displaced)
+        failure: RemoteLifecycleError | None = None
         try:
             config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
             self._remaining(deadline)
@@ -228,13 +270,22 @@ class DesktopRemoteLifecycle:
             )
             self._remaining(deadline)
             return self._connect_with_binding(generation, config, binding, deadline=deadline)
-        except RemoteLifecycleSupersededError:
-            raise
-        except Exception as exc:
+        except RemoteLifecycleSupersededError as error:
+            failure = _detached_lifecycle_error(
+                error,
+                fallback="The SSH host key could not be confirmed.",
+            )
+        except RemoteLifecycleError as error:
             self._publish_failure(generation, profile.profile_id, "ssh_connection_failed")
-            if isinstance(exc, RemoteLifecycleError):
-                raise
-            raise RemoteConnectionFailedError("The SSH host key could not be confirmed.") from exc
+            failure = _detached_lifecycle_error(
+                error,
+                fallback="The SSH host key could not be confirmed.",
+            )
+        except Exception:
+            self._publish_failure(generation, profile.profile_id, "ssh_connection_failed")
+        if failure is not None:
+            raise failure
+        raise RemoteConnectionFailedError("The SSH host key could not be confirmed.")
 
     def disconnect(self, profile_id: str | None = None) -> None:
         with self._lock:
@@ -376,9 +427,7 @@ class DesktopRemoteLifecycle:
 
     def _require_generation(self, generation: int) -> None:
         if generation != self._generation:
-            raise RemoteLifecycleSupersededError(
-                "A newer remote lifecycle operation superseded this result."
-            )
+            raise RemoteLifecycleSupersededError(_SUPERSEDED_MESSAGE)
 
     def _owned_remotes_locked(self) -> tuple[_ActiveRemote, ...]:
         remotes: list[_ActiveRemote] = []

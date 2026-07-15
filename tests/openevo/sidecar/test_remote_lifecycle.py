@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 from threading import Event, Thread
+import traceback
 from typing import Callable, cast
 
 import pytest
@@ -442,6 +444,54 @@ def test_failed_connect_does_not_publish_an_active_transport() -> None:
     assert lifecycle.snapshot().state == "failed"
     assert lifecycle.snapshot().failure_code == "ssh_connection_failed"
     assert transport.closed
+
+
+def test_remote_lifecycle_drops_untrusted_transport_exception_chain() -> None:
+    canary = "raw-agent-lifecycle-canary.sock"
+
+    def fail_transport(*_args: object) -> FakeTransport:
+        raise OSError(errno.ENOENT, canary)
+
+    lifecycle = DesktopRemoteLifecycle(
+        cast(object, FakeHostKeys((_candidate(),), loaded=object())),
+        transport_factory=fail_transport,
+    )
+
+    with pytest.raises(RemoteConnectionFailedError) as exc_info:
+        lifecycle.connect(_profile(fingerprint=_candidate().fingerprint))
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert canary not in formatted
+    assert lifecycle.snapshot().state == "failed"
+
+
+def test_remote_lifecycle_rebuilds_nested_lifecycle_exception_chain() -> None:
+    canary = "raw-agent-wrapped-lifecycle-canary.sock"
+
+    def fail_transport(*_args: object) -> FakeTransport:
+        try:
+            raise OSError(errno.ENOENT, canary)
+        except OSError as error:
+            raise RemoteConnectionFailedError(canary) from error
+
+    lifecycle = DesktopRemoteLifecycle(
+        cast(object, FakeHostKeys((_candidate(),), loaded=object())),
+        transport_factory=fail_transport,
+    )
+
+    with pytest.raises(RemoteConnectionFailedError) as exc_info:
+        lifecycle.connect(_profile(fingerprint=_candidate().fingerprint))
+
+    error = exc_info.value
+    assert str(error) == "The SSH connection could not be established."
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert canary not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
 
 
 def test_remote_profile_projection_has_no_credential_or_local_path() -> None:
