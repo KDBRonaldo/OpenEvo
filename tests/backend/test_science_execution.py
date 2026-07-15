@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from openevo.backend.contracts.v1 import models as m
 from openevo.backend.contracts.v1.store import CoreControlStoreV1
 from openevo.backend.science_execution import compile_science_execution
@@ -9,7 +11,12 @@ from openevo.backend.service_supervisor import ServiceRunBinding
 from openevo.internal_auth import InternalServiceIdentity
 
 
-def _project(tmp_path: Path) -> m.ProjectV1:
+def _project(
+    tmp_path: Path,
+    *,
+    execution_mode: m.ExecutionMode = m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+    capture_mode: m.CaptureMode = m.CaptureMode.TRANSCRIPT,
+) -> m.ProjectV1:
     store = CoreControlStoreV1(tmp_path)
     result = store.create_project(
         m.ProjectCreateV1.model_validate(
@@ -33,7 +40,20 @@ def _project(tmp_path: Path) -> m.ProjectV1:
         registry_digest="a" * 64,
     )
     assert isinstance(result.model, m.ProjectV1)
-    return result.model
+    project = result.model
+    if (
+        execution_mode is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+        and capture_mode is m.CaptureMode.TRANSCRIPT
+    ):
+        return project
+    payload = project.model_dump(mode="python")
+    payload["execution_mode"] = execution_mode
+    payload["spec"] = {
+        **payload["spec"],
+        "execution_mode": execution_mode,
+        "capture_mode": capture_mode,
+    }
+    return m.ProjectV1.model_validate(payload)
 
 
 def _binding() -> ServiceRunBinding:
@@ -80,3 +100,42 @@ def test_project_compiles_to_single_session_existing_experiment_path(tmp_path: P
     assert execution.submitted_task_id == (
         f"{execution.task_id}--run-run-public-1--round-0"
     )
+
+
+@pytest.mark.parametrize("capture_mode", [m.CaptureMode.TOKEN_LEVEL, m.CaptureMode.TRANSCRIPT])
+def test_self_deployed_project_preserves_capture_mode_in_agent_and_profile(
+    tmp_path: Path,
+    capture_mode: m.CaptureMode,
+) -> None:
+    project = _project(
+        tmp_path,
+        execution_mode=m.ExecutionMode.SELF_DEPLOYED,
+        capture_mode=capture_mode,
+    )
+
+    execution = compile_science_execution(
+        project,
+        run_id=f"run-{capture_mode.value}",
+        binding=_binding(),
+        workspace_path=None,
+    )
+
+    assert execution.config.agent.auth == "proxy"
+    assert execution.config.agent.settings["auth_mode"] == "proxy"
+    assert execution.config.agent.settings["capture_mode"] == capture_mode.value
+    assert execution.execution_profile.execution_mode == "self_deployed"
+    assert execution.execution_profile.capture_mode == capture_mode.value
+
+
+def test_subscription_execution_rejects_non_transcript_capture(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    invalid_spec = project.spec.model_copy(update={"capture_mode": m.CaptureMode.TOKEN_LEVEL})
+    invalid_project = project.model_copy(update={"spec": invalid_spec})
+
+    with pytest.raises(ValueError, match="subscription.*transcript"):
+        compile_science_execution(
+            invalid_project,
+            run_id="run-invalid-subscription-capture",
+            binding=_binding(),
+            workspace_path=None,
+        )

@@ -39,6 +39,13 @@ pre-release runtime identity。新 producers 和新文档必须使用 OpenEvo id
 - `/v1/jobs/{job_id}/fail`
 - `/v1/contexts/resolve`
 
+Core's generation-bound run owner also uses the private authenticated
+`GET /v1/internal/jobs/{job_id}` observation. The store reads the job row and
+its output artifacts in one explicit SQLite read transaction, so concurrent job
+completion cannot combine an older state with newer outputs. Artifact IDs are
+returned only for a `succeeded` job snapshot, and worker error text is reduced
+to the bounded `evolution_job_failed` code.
+
 `artifact_payloads.py` 是 handler runtime 的 Core-owned 本地 payload 安全边界。它只扫描
 Evolution Backend 配置的 artifact root 内 normalized `file://` regular
 files/directories。构造时从绝对 filesystem anchor 逐组件 no-follow 固定并记录 allowed root，

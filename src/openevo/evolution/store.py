@@ -6832,26 +6832,37 @@ class EvolutionStore:
         """Return the closed terminal observation used by Core's managed run owner."""
 
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT job_id, state, error FROM jobs WHERE job_id = ?",
-                (job_id,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"unknown job: {job_id}")
-            artifacts = conn.execute(
-                """
-                SELECT artifact_id
-                FROM artifacts
-                WHERE state = ?
-                  AND json_extract(
-                        lineage_json,
-                        '$.openevo_execution.job_id'
-                      ) = ?
-                ORDER BY created_at ASC, artifact_id ASC
-                LIMIT 1025
-                """,
-                (str(ArtifactState.ACTIVE), job_id),
-            ).fetchall()
+            try:
+                conn.execute("BEGIN")
+                row = conn.execute(
+                    "SELECT job_id, state, error FROM jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"unknown job: {job_id}")
+                artifacts = []
+                if row["state"] == str(JobState.SUCCEEDED):
+                    artifacts = conn.execute(
+                        """
+                        SELECT artifact_id
+                        FROM artifacts
+                        WHERE state = ?
+                          AND json_extract(
+                                lineage_json,
+                                '$.openevo_execution.job_id'
+                              ) = ?
+                        ORDER BY created_at ASC, artifact_id ASC
+                        LIMIT 1025
+                        """,
+                        (str(ArtifactState.ACTIVE), job_id),
+                    ).fetchall()
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
         if len(artifacts) > 1024:
             raise ValueError("job output artifact count exceeds the internal bound")
         return {

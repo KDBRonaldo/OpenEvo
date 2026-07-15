@@ -40,7 +40,7 @@ from openevo.backend.contracts.v1.store import (
     IdempotencyConflictError,
     StoreCorruptionError,
 )
-from openevo.backend.run_control import CoreRunControlError
+from openevo.backend.run_control import RUN_OPERATION_IDS, CoreRunControlError
 from openevo.backend.service_supervisor import (
     ServiceComponent,
     ServiceStatus,
@@ -4690,6 +4690,24 @@ class _FailingRunControl(_RecordingRunControl):
         )
 
 
+class _MutationFailingRunControl(_RecordingRunControl):
+    def __init__(self, *, retryable: bool, fail_once: bool = False) -> None:
+        super().__init__()
+        self.retryable = retryable
+        self.fail_once = fail_once
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self.invocations.append((operation_id, arguments))
+        if self.fail_once and len(self.invocations) > 1:
+            return "owner-retried"
+        raise CoreRunControlError(
+            "run_owner_temporarily_unavailable" if self.retryable else "run_request_rejected",
+            "The managed run owner rejected the operation.",
+            http_status=503 if self.retryable else 409,
+            retryable=self.retryable,
+        )
+
+
 def test_injected_service_supervisor_is_projected_and_closed(tmp_path: Path) -> None:
     supervisor = _RecordingServiceSupervisor()
     app = _app(tmp_path, service_supervisor=supervisor)
@@ -4737,6 +4755,98 @@ def test_injected_run_control_owns_frozen_routes_and_status_counts(tmp_path: Pat
     assert status.json()["active_runs"] == 2
     assert status.json()["queued_runs"] == 3
     assert run_control.close_calls == 1
+
+
+def test_run_control_operation_ids_exactly_match_frozen_run_routes(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    with TestClient(app):
+        frozen_run_operation_ids = frozenset(
+            route.operation_id
+            for route in provider_module._iter_api_routes(app.routes)
+            if route.path.startswith("/v1/runs")
+        )
+
+    assert RUN_OPERATION_IDS == frozen_run_operation_ids
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "arguments"),
+    [
+        (
+            "createCoreRunV1",
+            {"request": {"project_id": "project-1"}, "idempotency_key": "same-key"},
+        ),
+        (
+            "cancelCoreRunV1",
+            {
+                "run_id": "run-1",
+                "request": {"reason": "user_requested"},
+                "if_match": '"' + "a" * 64 + '"',
+                "idempotency_key": "same-key",
+            },
+        ),
+        (
+            "retryCoreRunV1",
+            {
+                "run_id": "run-1",
+                "request": {"terminal_attempt_id": "attempt-1"},
+                "if_match": '"' + "a" * 64 + '"',
+                "idempotency_key": "same-key",
+            },
+        ),
+        (
+            "deleteCoreRunV1",
+            {
+                "run_id": "run-1",
+                "if_match": '"' + "a" * 64 + '"',
+                "idempotency_key": "same-key",
+            },
+        ),
+    ],
+)
+def test_retryable_run_mutation_failure_is_not_persisted_for_idempotency_replay(
+    tmp_path: Path,
+    operation_id: str,
+    arguments: Mapping[str, object],
+) -> None:
+    run_control = _MutationFailingRunControl(retryable=True, fail_once=True)
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+
+    with TestClient(app):
+        with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+            provider.invoke(operation_id, arguments)
+        assert raised.value.status_code == 503
+        assert raised.value.error.retryable is True
+        assert provider.invoke(operation_id, arguments) == "owner-retried"
+
+    assert [invocation[0] for invocation in run_control.invocations] == [
+        operation_id,
+        operation_id,
+    ]
+
+
+def test_non_retryable_run_mutation_failure_keeps_failure_idempotency_replay(
+    tmp_path: Path,
+) -> None:
+    run_control = _MutationFailingRunControl(retryable=False)
+    app = _app(tmp_path, run_control=run_control)
+    provider = app.state.core_control_provider
+    arguments = {
+        "run_id": "run-1",
+        "request": {"reason": "user_requested"},
+        "if_match": '"' + "a" * 64 + '"',
+        "idempotency_key": "same-key",
+    }
+
+    with TestClient(app):
+        for _ in range(2):
+            with pytest.raises(provider_module.CoreControlHTTPError) as raised:
+                provider.invoke("cancelCoreRunV1", arguments)
+            assert raised.value.status_code == 409
+            assert raised.value.error.retryable is False
+
+    assert [invocation[0] for invocation in run_control.invocations] == ["cancelCoreRunV1"]
 
 
 def test_run_control_failures_use_the_frozen_typed_error_contract(tmp_path: Path) -> None:

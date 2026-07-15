@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import json
 import math
@@ -1568,6 +1569,97 @@ def test_internal_job_result_does_not_expose_worker_error_text(tmp_path):
         "error": "evolution_job_failed",
         "job_id": job.job_id,
         "state": "failed",
+    }
+
+
+def test_internal_job_result_reads_job_and_outputs_from_one_sqlite_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    writer = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    job = store.create_job(
+        JobCreateRequest(
+            method="mock_lora",
+            job_type="parametric_memory_train",
+            config={"base_model": "Qwen/Qwen3.6-27B"},
+        )
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["parametric_memory_train"],
+            lease_seconds=60,
+        )
+    )
+    assert claim.job is not None
+    original_connect = store.connect
+    completed_artifact_ids: list[str] = []
+    statements: list[str] = []
+
+    class CursorAfterJobRead:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def fetchone(self):
+            row = self._cursor.fetchone()
+            completed = writer.complete_job(
+                job.job_id,
+                WorkerCompleteRequest(
+                    lease_id=claim.job.lease_id,
+                    artifacts=[
+                        ArtifactRegisterRequest(
+                            type=ArtifactType.PARAMETRIC_MEMORY,
+                            name="raced-output",
+                            uri="file:///tmp/raced-adapter",
+                            manifest={
+                                "base_model": "Qwen/Qwen3.6-27B",
+                                "adapter_format": "lora",
+                            },
+                            lineage={"openevo_execution": {"job_id": job.job_id}},
+                            compatibility={"base_model": "Qwen/Qwen3.6-27B"},
+                        )
+                    ],
+                ),
+            )
+            completed_artifact_ids.extend(completed["artifact_ids"])
+            return row
+
+    class ConnectionAfterJobRead:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, parameters=()):
+            statements.append(sql)
+            cursor = self._connection.execute(sql, parameters)
+            if "SELECT job_id, state, error FROM jobs" in sql:
+                return CursorAfterJobRead(cursor)
+            return cursor
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    @contextmanager
+    def raced_connect():
+        with original_connect() as connection:
+            yield ConnectionAfterJobRead(connection)
+
+    monkeypatch.setattr(store, "connect", raced_connect)
+
+    assert store.get_internal_job_result(job.job_id) == {
+        "artifact_ids": [],
+        "error": None,
+        "job_id": job.job_id,
+        "state": "claimed",
+    }
+    assert statements[0] == "BEGIN"
+    monkeypatch.setattr(store, "connect", original_connect)
+    assert store.get_internal_job_result(job.job_id) == {
+        "artifact_ids": completed_artifact_ids,
+        "error": None,
+        "job_id": job.job_id,
+        "state": "succeeded",
     }
 
 

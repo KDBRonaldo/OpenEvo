@@ -8,7 +8,6 @@ from pathlib import Path
 from openevo.backend.contracts.v1 import models as m
 from openevo.backend.service_supervisor import ServiceRunBinding
 from openevo.evolution.framework import EvolutionExecutionProfile
-from openevo.evolution.framework.profiles import execution_profile_for_release_mode
 from openevo.experiments.models import ExperimentConfig
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
 
@@ -43,6 +42,9 @@ def compile_science_execution(
         project.spec.execution_mode
         is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
     )
+    capture_mode = project.spec.capture_mode
+    if subscription and capture_mode is not m.CaptureMode.TRANSCRIPT:
+        raise ValueError("subscription science execution requires transcript capture")
     agent = {
         "preset": project.spec.harness_id,
         "model": project.spec.agent_model_ref,
@@ -50,7 +52,7 @@ def compile_science_execution(
         "provider": "codex_cli",
         "settings": {
             "auth_mode": "subscription" if subscription else "proxy",
-            "capture_mode": "transcript",
+            "capture_mode": capture_mode.value,
         },
     }
     runtime_env = {}
@@ -92,8 +94,10 @@ def compile_science_execution(
             },
         }
     )
-    profile = execution_profile_for_release_mode(
-        project.spec.execution_mode,
+    profile = EvolutionExecutionProfile(
+        execution_mode="subscription" if subscription else "self_deployed",
+        capture_mode=capture_mode.value,
+        harness_id=project.spec.harness_id,
         runtime_capabilities=() if subscription else ("adapter_serving",),
     )
     return CompiledScienceExecution(

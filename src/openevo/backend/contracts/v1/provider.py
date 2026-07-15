@@ -96,8 +96,12 @@ _UNAVAILABLE_OPERATIONS = frozenset(
 )
 
 
-def _run_control_http_error(exc: CoreRunControlError) -> CoreControlHTTPError:
-    return _error(
+class _RunControlHTTPError(CoreControlHTTPError):
+    """Preserve run-owner error provenance through the frozen HTTP contract."""
+
+
+def _run_control_http_error(exc: CoreRunControlError) -> _RunControlHTTPError:
+    return _RunControlHTTPError(
         exc.http_status,
         code=exc.code,
         message=str(exc),
@@ -232,7 +236,8 @@ class CoreControlProviderV1:
         except _PostCommitHTTPError:
             raise
         except CoreControlHTTPError as exc:
-            self.store.record_failed_idempotency(operation_id, arguments, exc.error)
+            if not (isinstance(exc, _RunControlHTTPError) and exc.error.retryable):
+                self.store.record_failed_idempotency(operation_id, arguments, exc.error)
             raise
 
     async def invoke_async(self, operation_id: str, arguments: Mapping[str, object]) -> object:

@@ -13,7 +13,7 @@ RUN_OPERATION_IDS = frozenset(
         "cancelCoreRunV1",
         "createCoreRunV1",
         "deleteCoreRunV1",
-        "getCoreRunArtifactsV1",
+        "listCoreRunArtifactsV1",
         "getCoreRunContextV1",
         "getCoreRunLogsV1",
         "getCoreRunTimelineV1",

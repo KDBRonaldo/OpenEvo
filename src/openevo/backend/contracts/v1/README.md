@@ -49,6 +49,11 @@ cancel requests return `409 ApiErrorV1` with code
 `operation_kind_not_cancellable`; the same response also admits the global
 `idempotency_key_reused` conflict. Every page satisfies `has_more` if and only if
 `next_cursor` is present.
+When a `CoreRunControl` is injected, its operation-ID set must exactly equal all
+frozen `/v1/runs*` routes, including `listCoreRunArtifactsV1`. Retryable errors
+from that owner are not persisted as failed idempotency results, so an exact
+same-key mutation retry calls the owner again; non-retryable failures retain the
+existing replay policy.
 
 `SseFrameV1` freezes matching wire `id`, `event`, and typed `data`; every
 non-heartbeat envelope binds its change resource identity, ETag or digest, and

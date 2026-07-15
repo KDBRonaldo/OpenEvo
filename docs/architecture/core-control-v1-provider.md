@@ -44,8 +44,8 @@ before releasing the threads.
 | `/v1/services`, `/v1/services/{id}` | Reports `core-control` plus read-only summaries from the release-injected `CoreServiceSupervisor`. No service is inferred from files, Desktop commands, or legacy scaffold state. |
 | `/v1/events` | Durable ordered SSE with signed opaque record IDs, at-least-once replay, a 10,000-record maximum window, 15-second durable heartbeats, and typed 400/410 cursor errors. |
 | Environment doctor/repair | Typed 503 until a real environment owner and recoverable operation implementation are wired. |
-| Run, timeline, run log, and run context routes | Typed 503. Phase one does not create a run or synthesize admission, attempts, pins, progress, or success. |
-| Artifact routes | Typed 503 until run ownership exposes authoritative v1 artifact projections. |
+| Run, timeline, run log, run context, and run artifact-list routes | Typed 503 without an injected `CoreRunControl`; otherwise the complete frozen `/v1/runs*` family delegates to that owner. |
+| Standalone artifact routes | Typed 503 until run ownership exposes authoritative v1 artifact projections. |
 | Service restart/log routes | Typed 503 until durable operation ownership is implemented. The provider never invokes Desktop SSH lifecycle or infers services it cannot observe. |
 | Operation, referenced-log, diagnostic, and cache-cleanup routes | Typed 503 until their durable business owners are implemented. |
 
@@ -372,3 +372,17 @@ counts to that owner and installs the private generation-authenticated admission
 endpoint; it does not compile experiments or inspect method logic itself. This
 dependency boundary is wired before the durable run implementation so the
 public OpenAPI and Desktop client remain unchanged while run ownership evolves.
+An anti-drift test derives every `/v1/runs*` operation ID from the frozen route
+table and requires exact equality with `RUN_OPERATION_IDS`; the run artifact
+route is therefore owned as `listCoreRunArtifactsV1`, its canonical operation
+ID. A retryable `CoreRunControlError` remains a transient observation and is not
+written to the provider failed-idempotency table. Repeating create, cancel,
+retry, or delete with the same request and idempotency key calls the owner again.
+Non-retryable owner errors retain the existing deterministic failure replay.
+
+The run owner's science execution projection preserves the exact project
+`capture_mode` in both experiment agent settings and the evolution execution
+profile. Subscription execution accepts only transcript capture. Self-deployed
+token-level execution uses proxy auth and a token-level profile, while a
+self-deployed transcript project remains transcript; neither mode is silently
+rewritten.
