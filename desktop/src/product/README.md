@@ -64,6 +64,13 @@ request resolves, and superseded requests cannot publish into the new identity.
 The Research view renders at most the latest 200
 matching records and separates agent, evolution, and system streams; SSE
 snapshot epochs trigger an authoritative output refresh while a session runs.
+The renderer also performs serial one-shot authoritative snapshot refreshes at
+a short interval while the selected ready project has a nonterminal run. Each
+poll is bound to the provider, Desktop/Core project identities, active project
+session, and run ID; a project or session change rejects a late response. The
+next timeout is armed only after the current request settles, transient failures
+remain retryable, and terminal, offline, switched-project, and unmounted states
+stop polling. SSE invalidations remain the immediate refresh path.
 
 The release adapter deliberately has no fallback for those native calls. The
 Rust host implements `select_project_source` with the operating-system folder

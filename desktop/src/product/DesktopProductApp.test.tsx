@@ -73,6 +73,140 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Research execution is using the selected workspace and evidence sources.");
   });
 
+  it("polls a nonterminal run from queued through running and stops at terminal without SSE", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 1_000 });
+    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
+    const refresh = vi.spyOn(provider, "refresh");
+    root = await renderProduct(provider);
+
+    await clickButton("Start session");
+    expect(screenText()).toContain("Queued");
+
+    await advance(1_005);
+    expect(screenText()).toContain("Preparing");
+    await advance(1_005);
+    expect(screenText()).toContain("Running");
+
+    await advance(1_005);
+    await advance(1_005);
+    await advance(1_005);
+    await advance(1_005);
+    expect(screenText()).toContain("Latest session complete");
+
+    const terminalRefreshCount = refresh.mock.calls.length;
+    await advance(3_000);
+    expect(refresh).toHaveBeenCalledTimes(terminalRefreshCount);
+  });
+
+  it("retries run polling after a transient refresh failure", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 900 });
+    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
+    root = await renderProduct(provider);
+
+    await clickButton("Start session");
+    provider.failNextRefresh();
+    const beforeFailure = provider.refreshCount();
+
+    await advance(1_005);
+    expect(provider.refreshCount()).toBe(beforeFailure + 1);
+    expect(screenText()).toContain("Queued");
+
+    await advance(1_005);
+    expect(provider.refreshCount()).toBe(beforeFailure + 2);
+    expect(screenText()).toContain("Running");
+  });
+
+  it("stops run polling after an authoritative refresh observes the session offline", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 10_000 });
+    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
+    const refresh = vi.spyOn(provider, "refresh");
+    root = await renderProduct(provider);
+
+    await clickButton("Start session");
+    provider.loseActiveCoreSession();
+    await advance(1_005);
+    expect(screenText()).toContain("Activate this project");
+
+    const offlineRefreshCount = refresh.mock.calls.length;
+    await advance(5_000);
+    expect(refresh).toHaveBeenCalledTimes(offlineRefreshCount);
+  });
+
+  it("keeps polling serial and rejects its late result after switching projects", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 10_000 });
+    provider.addDraftProject({ subscription: true });
+    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
+    const refresh = vi.spyOn(provider, "refresh");
+    root = await renderProduct(provider);
+
+    await clickButton("Start session");
+    const current = await provider.refresh();
+    if (current.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const stale = {
+      status: "fresh" as const,
+      snapshot: {
+        ...current.snapshot,
+        projects: current.snapshot.projects.filter((item) => item.project_id === "project-fixture-1"),
+      },
+    };
+    const pendingPoll = deferred<Awaited<ReturnType<FixtureDesktopProductProvider["refresh"]>>>();
+    refresh.mockImplementationOnce(() => pendingPoll.promise);
+
+    await advance(1_005);
+    const inFlightRefreshCount = refresh.mock.calls.length;
+    await advance(3_000);
+    expect(refresh).toHaveBeenCalledTimes(inFlightRefreshCount);
+
+    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+    if (!switcher) throw new Error("Project switcher was not found.");
+    await act(async () => {
+      switcher.value = "project-fixture-2";
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await flush();
+    expect(screenText()).toContain("Second research task");
+
+    await act(async () => {
+      pendingPoll.resolve(stale);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screenText()).toContain("Second research task");
+
+    await advance(5_000);
+    expect(refresh).toHaveBeenCalledTimes(inFlightRefreshCount);
+  });
+
+  it("cancels run polling when the renderer unmounts", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 10_000 });
+    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
+    const refresh = vi.spyOn(provider, "refresh");
+    root = await renderProduct(provider);
+
+    await clickButton("Start session");
+    const current = await provider.refresh();
+    const pendingPoll = deferred<Awaited<ReturnType<FixtureDesktopProductProvider["refresh"]>>>();
+    refresh.mockImplementationOnce(() => pendingPoll.promise);
+    await advance(1_005);
+    const inFlightRefreshCount = refresh.mock.calls.length;
+
+    await act(async () => root?.unmount());
+    root = null;
+    await act(async () => {
+      pendingPoll.resolve(current);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await advance(5_000);
+
+    expect(refresh).toHaveBeenCalledTimes(inFlightRefreshCount);
+  });
+
   it("never publishes a superseded run-log request into the next run", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     const initial = await provider.refresh();

@@ -72,6 +72,7 @@ type RevisionRefV1 = NonNullable<NonNullable<ProjectV1["remote"]>["active_revisi
 
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_HF_MODEL = "Qwen/Qwen3-8B";
+const ACTIVE_RUN_REFRESH_INTERVAL_MS = 1_000;
 
 type Workspace = "research" | "evolution" | "system";
 type AsyncState = "idle" | "working";
@@ -98,6 +99,18 @@ type ProfileSaveIntent = {
     | { readonly kind: "update"; readonly profileId: string; readonly intent: ProductResourceMutationIntent };
 };
 type ProfileSaveAttemptResult = { readonly saved: boolean; readonly pendingIntent: ProfileSaveIntent | null };
+type SnapshotRefreshGuard = () => boolean;
+type RunPollingIdentity = {
+  readonly provider: DesktopProductProvider;
+  readonly desktopProjectId: string;
+  readonly projectEtag: string;
+  readonly profileId: string;
+  readonly coreProjectId: string;
+  readonly runId: string;
+  readonly activeProjectId: string;
+  readonly activeProjectEtag: string;
+  readonly activeProfileId: string;
+};
 
 export interface DesktopProductAppProps {
   provider?: DesktopProductProvider;
@@ -119,11 +132,11 @@ export function DesktopProductApp({
   const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
   const refreshOrder = useRef(new ProductRefreshOrder());
 
-  const refresh = useCallback(async (): Promise<DesktopProductSnapshot | null> => {
+  const refresh = useCallback(async (isRelevant: SnapshotRefreshGuard = () => true): Promise<DesktopProductSnapshot | null> => {
     const sequence = refreshOrder.current.begin();
     try {
       const result = await provider.refresh();
-      if (!refreshOrder.current.isCurrent(sequence)) return null;
+      if (!refreshOrder.current.isCurrent(sequence) || !isRelevant()) return null;
       if (result.status !== "fresh") {
         setSnapshot((current) => current ? { ...current, stream: result.stream } : current);
         if (result.status === "error") setLoadError(userMessage(result.stream.error));
@@ -140,7 +153,7 @@ export function DesktopProductApp({
       });
       return next;
     } catch (error) {
-      if (refreshOrder.current.isCurrent(sequence)) {
+      if (refreshOrder.current.isCurrent(sequence) && isRelevant()) {
         setSnapshot((current) => current ? {
           ...current,
           stream: { status: "error", epoch: current.stream.epoch, error: error instanceof DesktopApiError ? error.apiError : null },
@@ -155,7 +168,7 @@ export function DesktopProductApp({
     let active = true;
     const load = async () => {
       if (!active) return;
-      await refresh();
+      await refresh(() => active);
     };
     void load();
     const unsubscribe = provider.subscribe((signal) => {
@@ -187,6 +200,22 @@ export function DesktopProductApp({
   const coreProjectId = project?.remote?.core_project_id ?? null;
   const projectRuns = stableRunOrder(snapshot?.runs.filter((run) => run.project_id === coreProjectId) ?? []);
   const activeRun = projectRuns.find((run) => !isTerminal(run.status)) ?? null;
+  const projectSessionReady = snapshot ? hasReadySelectedProjectSession(snapshot, project) : false;
+  const runPollingIdentity = useMemo(
+    () => runPollingIdentityFor(provider, snapshot, project, activeRun, projectSessionReady),
+    [
+      activeRun?.id,
+      coreProjectId,
+      project?.etag,
+      project?.profile_id,
+      project?.project_id,
+      projectSessionReady,
+      provider,
+      snapshot?.state.active_project?.profile_id,
+      snapshot?.state.active_project?.project_etag,
+      snapshot?.state.active_project?.project_id,
+    ],
+  );
 
   const act = useCallback(async (action: () => Promise<unknown>, conflictRecovery: ActionRecovery = null, refreshOnUnknown = false): Promise<ActionAttemptResult> => {
     setActionState("working");
@@ -216,6 +245,8 @@ export function DesktopProductApp({
     }
   }, [refresh]);
 
+  useActiveRunPolling(runPollingIdentity, refresh);
+
   if (!snapshot) {
     return (
       <div className="product-boot" data-testid="product-loading">
@@ -240,7 +271,6 @@ export function DesktopProductApp({
   const settingsProject = creatingProject ? null : project;
   const settingsFormIdentity = settingsProject ? `project:${settingsProject.project_id}` : "create";
   const settingsCapability = projectCapability(snapshot, settingsProject);
-  const projectSessionReady = hasReadySelectedProjectSession(snapshot, project);
   const projectServices = projectSessionReady ? snapshot.services : [];
   const canCreateProject = profile?.connection_state === "connected";
   const activationReason = getProjectActivationReason(snapshot, project, profile, actionState);
@@ -514,6 +544,104 @@ export function DesktopProductApp({
       ) : null}
     </div>
   );
+}
+
+function useActiveRunPolling(
+  identity: RunPollingIdentity | null,
+  refresh: (isRelevant?: SnapshotRefreshGuard) => Promise<DesktopProductSnapshot | null>,
+): void {
+  const currentIdentity = useRef(identity);
+
+  useLayoutEffect(() => {
+    currentIdentity.current = identity;
+  }, [identity]);
+
+  useEffect(() => {
+    if (!identity) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const isCurrent = () => !cancelled && sameRunPollingIdentity(currentIdentity.current, identity);
+    const schedule = () => {
+      if (!isCurrent()) return;
+      timer = setTimeout(() => {
+        timer = null;
+        void poll();
+      }, ACTIVE_RUN_REFRESH_INTERVAL_MS);
+    };
+    const poll = async () => {
+      if (!isCurrent()) return;
+      const next = await refresh(isCurrent);
+      if (!isCurrent()) return;
+      if (next && !snapshotHasRunPollingIdentity(next, identity)) return;
+      schedule();
+    };
+
+    schedule();
+    return () => {
+      cancelled = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [identity, refresh]);
+}
+
+function runPollingIdentityFor(
+  provider: DesktopProductProvider,
+  snapshot: DesktopProductSnapshot | null,
+  project: ProjectV1 | null,
+  run: RunV1 | null,
+  projectSessionReady: boolean,
+): RunPollingIdentity | null {
+  const activeProject = snapshot?.state.active_project;
+  const coreProjectId = project?.remote?.core_project_id;
+  if (!snapshot || !project || !run || !projectSessionReady || !activeProject || !coreProjectId) return null;
+  return {
+    provider,
+    desktopProjectId: project.project_id,
+    projectEtag: project.etag,
+    profileId: project.profile_id,
+    coreProjectId,
+    runId: run.id,
+    activeProjectId: activeProject.project_id,
+    activeProjectEtag: activeProject.project_etag,
+    activeProfileId: activeProject.profile_id,
+  };
+}
+
+function sameRunPollingIdentity(
+  current: RunPollingIdentity | null,
+  expected: RunPollingIdentity,
+): boolean {
+  return current !== null
+    && current.provider === expected.provider
+    && current.desktopProjectId === expected.desktopProjectId
+    && current.projectEtag === expected.projectEtag
+    && current.profileId === expected.profileId
+    && current.coreProjectId === expected.coreProjectId
+    && current.runId === expected.runId
+    && current.activeProjectId === expected.activeProjectId
+    && current.activeProjectEtag === expected.activeProjectEtag
+    && current.activeProfileId === expected.activeProfileId;
+}
+
+function snapshotHasRunPollingIdentity(
+  snapshot: DesktopProductSnapshot,
+  expected: RunPollingIdentity,
+): boolean {
+  const project = snapshot.projects.find((item) => item.project_id === expected.desktopProjectId) ?? null;
+  const activeProject = snapshot.state.active_project;
+  if (!project
+    || project.etag !== expected.projectEtag
+    || project.profile_id !== expected.profileId
+    || project.remote?.core_project_id !== expected.coreProjectId
+    || !hasReadySelectedProjectSession(snapshot, project)
+    || activeProject?.project_id !== expected.activeProjectId
+    || activeProject.project_etag !== expected.activeProjectEtag
+    || activeProject.profile_id !== expected.activeProfileId) {
+    return false;
+  }
+  const run = snapshot.runs.find((item) => item.id === expected.runId);
+  return run?.project_id === expected.coreProjectId && !isTerminal(run.status);
 }
 
 function NavButton({ icon: Icon, label, active, onClick }: { icon: LucideIcon; label: string; active: boolean; onClick: () => void }) {
