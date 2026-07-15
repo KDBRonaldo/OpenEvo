@@ -76,18 +76,24 @@ The runner performs these actions only through Desktop Local API v1:
    all three remote stable methods, reactivate, and run Core project validation.
 5. Run session 1 to `succeeded`; inspect its timeline, logs, context, artifact
    summary, and bounded artifact content endpoint.
-6. Run session 2 to `succeeded`; prove that its exact pinned revision is the
-   generation-adjacent revision produced by session 1. Require all three
-   session-1 artifacts in session 2's pinned context, require each session-2
-   artifact lineage to reference its matching predecessor, and verify the Core
-   runtime-context receipt digest. Gateway creates the v3 receipt only after the
-   harness/postprocess path and a final runtime download/readback. It binds the
-   pinned revision/context, effective instruction SHA-256, complete runtime file
-   inventory/tree, authoritative source content, canonical memory/agent-system
-   files, every skill file, and every agent-system target. Core independently
-   rebuilds the expected rendering from the persisted context before success;
-   runner-returned metadata cannot supply or mutate the receipt. No Codex
-   transcript or artifact content is retained in evidence.
+6. Prove session 1's pinned context contains neither its own output artifact IDs
+   nor their successor revision. Then run session 2 to `succeeded` and prove that
+   its exact pinned revision is the generation-adjacent revision produced by
+   session 1. Require all three session-1 artifacts in session 2's pinned context,
+   require each session-2 artifact lineage to reference its matching predecessor,
+   and verify the Core runtime-context receipt digest. Both successful sessions
+   must contain the real harness execution phase. Codex skill installation is
+   fail-closed; its setup no longer ignores copy failure. Gateway creates the v3
+   receipt only after harness setup, run, postprocess, and a final runtime
+   download/readback. It binds the pinned revision/context, effective instruction
+   SHA-256, complete runtime file inventory/tree, authoritative source content,
+   canonical memory/agent-system files, every skill file, and every agent-system
+   target. Core independently rebuilds the expected rendering from the persisted
+   context before success. Together, the successful execution phase, strict skill
+   installation, effective-instruction binding, and exact post-run receipt prove
+   the Codex harness path consumed the three context surfaces instead of merely
+   accepting a staging receipt. Runner-returned metadata cannot supply or mutate
+   the receipt. No Codex transcript or artifact content is retained in evidence.
 7. If timeout, interruption, or another failure leaves a nonterminal Desktop run,
    request cancellation and wait a bounded interval for terminal `cancelled`.
    Record only boolean cleanup outcome fields; cancellation failure remains a
@@ -109,8 +115,9 @@ manufacture a successor/artifact observation.
 The output is canonical JSON, mode `0600`, and at most 128 KiB. It contains
 release digests, build identity, redacted remote identity digests, state/count
 inventories, revision generations/manifests, artifact metadata digests, the
-runtime-context receipt digest, reuse booleans, and cleanup results. A closed
-field allowlist rejects every unrecognized evidence key.
+runtime-context receipt digest, session-1 exclusion and session-2 consumption
+booleans, and cleanup results. A closed field allowlist rejects every
+unrecognized evidence key.
 
 It does not contain:
 

@@ -80,10 +80,12 @@ class CodexHarness(BaseHarness):
 
         # Copy skills
         for skills_path in self.effective_skill_paths():
-            await runtime.exec(
+            result = await runtime.exec(
                 f"mkdir -p $HOME/.agents/skills && "
-                f"cp -r {shlex.quote(skills_path)}/* $HOME/.agents/skills/ 2>/dev/null || true"
+                f"cp -r {shlex.quote(skills_path)}/* $HOME/.agents/skills/"
             )
+            if result.return_code != 0:
+                raise RuntimeError("Codex skill installation failed")
 
     def run_steps(self, instruction: str) -> list[ExecInput]:
         escaped = shlex.quote(instruction)

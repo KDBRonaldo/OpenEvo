@@ -54,8 +54,9 @@ RUNTIME_CONTEXT_RECEIPT_PREFIX = "Runtime context receipt v3: "
 CONTEXT_CANARY_INSTRUCTION = (
     "\n\nOpenEvo E2E context canary v1: when OPENEVO_MEMORY_FILE, "
     "OPENEVO_SKILLS_DIR, and OPENEVO_AGENT_SYSTEM_FILE are set, read the memory file, "
-    "the root SKILL.md, and the agent-system file before completing the task. Do not "
-    "print environment values, filesystem locations, credentials, or file contents."
+    "every SKILL.md below the skill directory, and the agent-system file before "
+    "completing the task. Do not print environment values, filesystem locations, "
+    "credentials, or file contents."
 )
 TERMINAL_OPERATION_STATES = frozenset({"succeeded", "failed", "cancelled"})
 TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled"})
@@ -172,9 +173,11 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "adapter_count",
         "reuse",
         "successor_generation_delta",
+        "session_1_excluded_own_successor",
         "session_2_pinned_session_1_successor",
         "session_1_artifacts_reused",
         "session_2_runtime_injection_verified",
+        "session_2_harness_context_consumed",
         "session_2_lineage_verified",
         "reused_artifact_count",
         "successor_revision",
@@ -1013,7 +1016,7 @@ class DesktopScienceWorkflow:
             if isinstance(timeline_evidence, dict)
             else set()
         )
-        if not {"evolution", "revision", "terminal"}.issubset(phases):
+        if not {"execution", "evolution", "revision", "terminal"}.issubset(phases):
             raise E2EFailure(f"session_{ordinal}_timeline", "terminal_evidence_missing")
         logs_evidence = observation.evidence.get("logs")
         if not isinstance(logs_evidence, dict) or logs_evidence.get("count", 0) < 1:
@@ -1085,6 +1088,21 @@ class DesktopScienceWorkflow:
             target_id: _text(artifact, "id", "successor_reuse")
             for target_id, artifact in first_outputs.items()
         }
+        first_context_artifacts = first.context.get("artifacts")
+        if not isinstance(first_context_artifacts, list):
+            raise E2EFailure("successor_reuse", "first_context_invalid")
+        own_output_ids = set(first_artifact_ids.values())
+        if any(
+            isinstance(item, dict)
+            and (
+                item.get("artifact_id") in own_output_ids
+                or item.get("revision") == successor
+            )
+            for item in first_context_artifacts
+        ):
+            raise E2EFailure(
+                "successor_reuse", "first_session_consumed_own_successor"
+            )
         context_artifacts = second.context.get("artifacts")
         if not isinstance(context_artifacts, list):
             raise E2EFailure("successor_reuse", "second_context_invalid")
@@ -1126,9 +1144,11 @@ class DesktopScienceWorkflow:
             raise E2EFailure("successor_reuse", "runtime_context_receipt_mismatch")
         return {
             "successor_generation_delta": 1,
+            "session_1_excluded_own_successor": True,
             "session_2_pinned_session_1_successor": True,
             "session_1_artifacts_reused": True,
             "session_2_runtime_injection_verified": True,
+            "session_2_harness_context_consumed": True,
             "session_2_lineage_verified": True,
             "runtime_context_receipt_sha256": receipt_sha256,
             "reused_artifact_count": len(reused),

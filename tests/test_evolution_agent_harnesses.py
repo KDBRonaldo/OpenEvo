@@ -101,6 +101,36 @@ async def test_codex_setup_installs_static_and_evolution_skills(tmp_path):
     joined = "\n".join(copy_commands)
     assert "cp -r /openevo/static-skills/* $HOME/.agents/skills/" in joined
     assert "cp -r /openevo/session/evolution/skills/* $HOME/.agents/skills/" in joined
+    assert "|| true" not in joined
+
+
+@pytest.mark.asyncio
+async def test_codex_setup_fails_when_skill_installation_fails(tmp_path):
+    class FailingSkillRuntime(RecordingRuntime):
+        async def exec(
+            self,
+            command: str,
+            *,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: float | None = None,
+        ) -> ExecResult:
+            del cwd, env, timeout_sec
+            self.commands.append(command)
+            return ExecResult(
+                return_code=1 if ".agents/skills" in command else 0,
+            )
+
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            env={"OPENEVO_SKILLS_DIR": "/openevo/session/evolution/skills"},
+        )
+    )
+    runtime = FailingSkillRuntime(tmp_path)
+
+    with pytest.raises(RuntimeError, match="Codex skill installation failed"):
+        await harness.setup(runtime)
 
 
 @pytest.mark.asyncio

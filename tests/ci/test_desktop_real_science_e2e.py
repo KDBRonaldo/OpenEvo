@@ -178,7 +178,7 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
     first = module.SessionObservation(
         evidence={},
         run={"pinned_revision": predecessor},
-        context={},
+        context={"artifacts": []},
         artifacts=first_artifacts,
         document_sha256_by_target={
             target_id: "1" * 64 for target_id in module.REQUIRED_TARGET_IDS
@@ -211,13 +211,120 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
 
     reuse = workflow._assert_successor_reuse(first, second)
 
+    assert reuse["session_1_excluded_own_successor"] is True
     assert reuse["session_2_pinned_session_1_successor"] is True
     assert reuse["session_1_artifacts_reused"] is True
     assert reuse["session_2_runtime_injection_verified"] is True
+    assert reuse["session_2_harness_context_consumed"] is True
     assert reuse["runtime_context_receipt_sha256"] == receipt_sha256
     second.run["pinned_revision"] = _revision("revision-2", 2)
     with pytest.raises(module.E2EFailure, match="second_session_did_not_pin_successor"):
         workflow._assert_successor_reuse(first, second)
+
+
+def test_successor_reuse_rejects_session_one_consuming_its_own_output() -> None:
+    module = _load_runner()
+    workflow = _workflow(module)
+    predecessor = _revision("revision-0", 0)
+    successor = _revision("revision-1", 1)
+    first_artifacts = tuple(
+        {
+            "id": f"artifact-session-1-{target_id}",
+            "target_id": target_id,
+            "produced_revision": successor,
+            "selected": True,
+            "release_enabled": True,
+        }
+        for target_id in module.REQUIRED_TARGET_IDS
+    )
+    first = module.SessionObservation(
+        evidence={},
+        run={"pinned_revision": predecessor},
+        context={
+            "artifacts": [
+                {
+                    "artifact_id": first_artifacts[0]["id"],
+                    "artifact_type": first_artifacts[0]["target_id"],
+                    "target_id": first_artifacts[0]["target_id"],
+                    "revision": successor,
+                }
+            ]
+        },
+        artifacts=first_artifacts,
+        document_sha256_by_target={
+            target_id: "1" * 64 for target_id in module.REQUIRED_TARGET_IDS
+        },
+        runtime_context_receipt_sha256=None,
+    )
+    second = module.SessionObservation(
+        evidence={},
+        run={
+            "pinned_revision": successor,
+            "required_revision": {"revision": successor},
+        },
+        context={
+            "artifacts": [
+                {
+                    "artifact_id": artifact["id"],
+                    "artifact_type": artifact["target_id"],
+                    "target_id": artifact["target_id"],
+                    "revision": successor,
+                }
+                for artifact in first_artifacts
+            ]
+        },
+        artifacts=tuple(
+            {
+                "id": f"artifact-session-2-{target_id}",
+                "target_id": target_id,
+                "lineage": {
+                    "source_artifact_ids": [f"artifact-session-1-{target_id}"]
+                },
+            }
+            for target_id in module.REQUIRED_TARGET_IDS
+        ),
+        document_sha256_by_target={
+            target_id: "2" * 64 for target_id in module.REQUIRED_TARGET_IDS
+        },
+        runtime_context_receipt_sha256="f" * 64,
+    )
+
+    with pytest.raises(module.E2EFailure, match="first_session_consumed_own_successor"):
+        workflow._assert_successor_reuse(first, second)
+
+
+def test_successful_session_requires_real_harness_execution_phase() -> None:
+    module = _load_runner()
+    workflow = _workflow(module)
+    revision = _revision("revision-0", 0)
+    observation = module.SessionObservation(
+        evidence={
+            "timeline": {
+                "phase_values": ["evolution", "revision", "terminal"],
+            },
+            "logs": {"count": 1},
+        },
+        run={"status": "succeeded", "pinned_revision": revision},
+        context={
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+        },
+        artifacts=tuple(
+            {
+                "id": f"artifact-{target_id}",
+                "target_id": target_id,
+                "produced_revision": _revision("revision-1", 1),
+            }
+            for target_id in module.REQUIRED_TARGET_IDS
+        ),
+        document_sha256_by_target={
+            target_id: "1" * 64 for target_id in module.REQUIRED_TARGET_IDS
+        },
+        runtime_context_receipt_sha256=None,
+    )
+
+    with pytest.raises(module.E2EFailure, match="terminal_evidence_missing"):
+        workflow._assert_successful_session(observation, ordinal=1)
 
 
 @pytest.mark.parametrize(
@@ -297,7 +404,9 @@ def test_closed_evidence_schema_accepts_runtime_receipt_shape() -> None:
             }
         ],
         "reuse": {
+            "session_1_excluded_own_successor": True,
             "session_2_runtime_injection_verified": True,
+            "session_2_harness_context_consumed": True,
             "session_2_lineage_verified": True,
             "runtime_context_receipt_sha256": digest,
         },
