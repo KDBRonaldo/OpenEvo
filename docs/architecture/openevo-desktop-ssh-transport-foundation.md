@@ -316,9 +316,14 @@ Linux monitors the exact socket and ancestor bindings with inotify. Darwin
 cannot open a Unix-domain socket pathname with `O_EVTONLY`, so it registers
 kqueue vnode events only on the already-held ancestor directory FDs. Ancestor
 rename, revoke, attribute, delete, or kqueue error events fail closed. Immediate
-parent namespace writes force another exact socket identity check; that identity
-includes ctime, so target rename-and-restore is rejected while unrelated sibling
-churn can continue. The connected Darwin peer is independently bound with libc
+parent namespace writes force another exact socket identity check. Darwin can
+coalesce `NOTE_ATTRIB` with `NOTE_WRITE` when a child directory is created or
+removed because the parent's link count changes; that combined parent event is
+treated as namespace churn and receives the same exact revalidation, while a
+standalone attribute event or any rename/delete/revoke event still fails closed.
+The socket identity includes ctime, so target rename-and-restore is rejected
+while unrelated sibling churn can continue. The connected Darwin peer is
+independently bound with libc
 `getpeereid`, `LOCAL_PEERPID`, and the complete 32-byte `LOCAL_PEERTOKEN` audit
 token. The token's effective UID, GID, and PID must agree with the other two
 kernel results, and every later connection must match the complete baseline

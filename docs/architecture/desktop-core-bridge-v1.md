@@ -134,19 +134,29 @@ make one connection the only writer/reader owner. Forked children reject the
 inherited store and do not explicitly unlock the parent's lease.
 
 The database is opened no-follow relative to the held root and remains pinned by
-that FD. SQLite receives a `file:/dev/fd/<fd>?mode=rw` URI through the native
-macOS/Linux VFS. Before SQLite receives that target URI, the release runtime
-opens a separate new in-memory connection and requires the current SQLite
-library's default numeric `PRAGMA synchronous` value to be `FULL`. The target
-connection must report the same default immediately after connect and must
-retain `FULL` after explicit configuration. A non-`FULL` library default fails
-before SQLite opens or recovers the target database, so hot-journal rollback
-does not depend on a host's incidental SQLite build default. Before any SQLite
-configuration or schema write, the store
-requires the connection-reported database inode, held descriptor inode, and
-managed pathname inode to equal the original pin. A pathname replacement at the
-`sqlite3.connect` boundary therefore opens the pinned inode or fails, and the
-replacement inode is never initialized.
+that FD. Linux SQLite receives a `file:/dev/fd/<fd>?mode=rw` URI. Darwin SQLite
+instead receives the managed database pathname: its native VFS derives rollback
+journal names from the supplied database name, and `/dev/fd/<fd>` would derive
+the unusable `/dev/fd/<fd>-journal` rather than a journal beside the database.
+Before SQLite receives either target, the release runtime opens a separate new
+in-memory connection and requires the current SQLite library's default numeric
+`PRAGMA synchronous` value to be `FULL`. The target connection must report the
+same default immediately after connect and must retain `FULL` after explicit
+configuration. A non-`FULL` library default fails before SQLite opens or
+recovers the target database, so hot-journal rollback does not depend on a
+host's incidental SQLite build default. Before any SQLite configuration or
+schema write, the store requires the connection-reported database inode, held
+descriptor inode, and managed pathname inode to equal the original pin. A
+pathname replacement at the `sqlite3.connect` boundary therefore opens the
+pinned Linux inode or opens a different Darwin inode that is rejected before
+initialization. Darwin accepts an OS-canonical ancestor alias only when all
+three references identify that same inode.
+
+This owner-private persistence boundary detects accidental replacement and
+cooperating-process conflicts. The unsigned preview does not claim isolation
+from an arbitrary malicious process running as the same UID and able to perform
+and restore pathname replacement between validation points; that requires a
+platform credential boundary outside the store.
 
 SQLite private schema v3 uses DELETE journaling and `synchronous=FULL`; WAL and SHM are
 forbidden. The store enforces 1-GiB database and 2-GiB journal limits, exact

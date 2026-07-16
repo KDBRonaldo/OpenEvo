@@ -1805,6 +1805,64 @@ def test_bound_store_rejects_corrupt_only_published_marker(
         DesktopCoreBridgeStoreV1(root)
 
 
+def test_darwin_sqlite_connection_uses_managed_path_and_persists_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DarwinPlatform:
+        platform = "darwin"
+
+    monkeypatch.setattr(store_module, "sys", DarwinPlatform())
+    root = tmp_path / "state"
+    store = DesktopCoreBridgeStoreV1(root)
+    database_rows = store._connection.execute("PRAGMA database_list").fetchall()
+    operation = _bound_create(store)
+
+    assert Path(database_rows[0][2]).resolve() == store.database_path.resolve()
+    store.close()
+    assert not (root / store_module.JOURNAL_FILENAME).exists()
+
+    reopened = DesktopCoreBridgeStoreV1(root)
+    assert reopened.load_create(operation.local_project_id) == operation
+    reopened.close()
+
+
+def test_sqlite_connection_accepts_an_inode_identical_ancestor_alias(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir(mode=0o700)
+    (real_parent / "container").mkdir(mode=0o700)
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+    store = DesktopCoreBridgeStoreV1(alias_parent / "container" / "state")
+    database_rows = store._connection.execute("PRAGMA database_list").fetchall()
+    opened_path = Path(database_rows[0][2])
+
+    assert opened_path.is_absolute()
+    assert os.stat(opened_path).st_ino == os.stat(store.database_path).st_ino
+    operation = _bound_create(store)
+    assert store.load_create(operation.local_project_id) == operation
+    store.close()
+
+
+def test_open_store_rejects_database_pathname_replacement(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopCoreBridgeStoreV1(root)
+    operation = _bound_create(store)
+    managed = store.database_path
+    displaced = tmp_path / "held-core-bridge.sqlite3"
+    os.replace(managed, displaced)
+    managed.touch(mode=0o600)
+    os.chmod(managed, 0o600)
+    try:
+        with pytest.raises(CoreBridgeStoreStateRootError, match="identity changed"):
+            store.load_create(operation.local_project_id)
+    finally:
+        managed.unlink()
+        os.replace(displaced, managed)
+        store.close()
+
+
 def test_database_connect_path_swap_fails_without_writing_replacement_inode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1835,8 +1893,12 @@ def test_database_connect_path_swap_fails_without_writing_replacement_inode(
     with pytest.raises(CoreBridgeStoreStateRootError, match="bridge file|database"):
         DesktopCoreBridgeStoreV1(root)
 
-    displaced_stat = displaced.stat()
-    assert opened_database_identity == (displaced_stat.st_dev, displaced_stat.st_ino)
+    opened_target = database if sys.platform == "darwin" else displaced
+    opened_target_stat = opened_target.stat()
+    assert opened_database_identity == (
+        opened_target_stat.st_dev,
+        opened_target_stat.st_ino,
+    )
     assert database.read_bytes() == b""
     assert displaced.read_bytes() == b""
 

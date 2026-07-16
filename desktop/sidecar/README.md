@@ -759,14 +759,20 @@ callback protocol. It owns a dedicated sidecar-private state directory rather
 than extending the public provider database. The directory must remain a real,
 owner-held mode-`0700` inode. Its database and owner-lock files are no-follow,
 link-count-one mode-`0600` regular files whose device/inode identities are pinned
-for the store lifetime. The database remains held by a no-follow descriptor and
-SQLite opens `/dev/fd/<fd>` in `mode=rw`; the connection-reported inode, held FD,
-and managed pathname must all match before configuration or schema writes. This
-uses the native SQLite VFS on macOS and Linux and closes the pathname swap window
-around `sqlite3.connect`. A nonblocking `flock` permits one process owner, a
-process-local reentrant lock serializes SQLite use. Every public read, write, and
-close checks the creator PID before it can acquire an inherited lock, so a
-post-fork child fails closed without deadlocking or unlocking its parent owner.
+for the store lifetime. The database remains held by a no-follow descriptor.
+Linux SQLite opens `/dev/fd/<fd>` in `mode=rw`; Darwin SQLite opens the managed
+database pathname so its standard rollback journal is created beside the
+database rather than under `/dev/fd`. Before configuration or schema writes, the
+connection-reported inode, held FD, and managed pathname must all match. A
+connect-time replacement therefore either retains the pinned Linux inode or
+opens a different Darwin inode that is rejected before initialization. A
+nonblocking `flock` permits one process owner, and a process-local reentrant lock
+serializes SQLite use. Every public read, write, and close checks the creator PID
+before it can acquire an inherited lock, so a post-fork child fails closed
+without deadlocking or unlocking its parent owner. As with the provider store,
+the unsigned preview does not claim protection from an arbitrary malicious
+same-UID process able to race and restore the owner-private pathname between
+checks.
 
 Before SQLite receives the target database URI, the store probes a separate new
 in-memory connection and requires the current library's default numeric

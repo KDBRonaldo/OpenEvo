@@ -153,6 +153,10 @@ jobs:
             tests/openevo/sidecar/test_native_workspace.py \
             tests/openevo/sidecar/test_provider_store.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
             tests/openevo/sidecar/test_provider_store.py::test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_darwin_sqlite_connection_uses_managed_path_and_persists_writes \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_open_store_rejects_database_pathname_replacement \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_fresh_initial_schema_hot_journal_rolls_back_then_bootstraps \
             tests/openevo/sidecar/test_workspace_imports.py \
             tests/openevo/sidecar/test_workspace_import_lifecycle.py \
             -q

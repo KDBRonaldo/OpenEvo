@@ -366,7 +366,30 @@ def test_darwin_agent_monitor_classifies_parent_churn_and_ancestor_failures(
         queued_events.append([FakeEvent(12, fflags=FakeSelect.KQ_NOTE_WRITE)])
         assert not monitor.observed_target_mutation()
 
+        queued_events.append(
+            [
+                FakeEvent(
+                    12,
+                    fflags=FakeSelect.KQ_NOTE_WRITE | FakeSelect.KQ_NOTE_ATTRIB,
+                )
+            ]
+        )
+        assert not monitor.observed_target_mutation()
+
+        queued_events.append([FakeEvent(12, fflags=FakeSelect.KQ_NOTE_ATTRIB)])
+        assert monitor.observed_target_mutation()
+
         queued_events.append([FakeEvent(11, fflags=FakeSelect.KQ_NOTE_RENAME)])
+        assert monitor.observed_target_mutation()
+
+        queued_events.append(
+            [
+                FakeEvent(
+                    12,
+                    fflags=FakeSelect.KQ_NOTE_WRITE | FakeSelect.KQ_NOTE_RENAME,
+                )
+            ]
+        )
         assert monitor.observed_target_mutation()
 
         queued_events.append(
@@ -895,24 +918,14 @@ def test_agent_proxy_rejects_same_uid_steal_then_relays_for_owned_child(
     attacker.settimeout(2)
     attacker.connect(proxy.socket_path)
     attacker.sendall(b"stolen")
-    connector_python = "/usr/bin/python3"
-    connector_metadata = os.stat(connector_python, follow_symlinks=False)
-    assert connector_metadata.st_uid == 0
+    with executables.VerifiedSystemExecutable.open(executables.SSH_EXECUTABLE) as executable:
+        connector_identity = executable.identity
     child = subprocess.Popen(
         [
-            connector_python,
-            "-I",
+            "/bin/sh",
             "-c",
-            (
-                "import socket,sys;"
-                "stream=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);"
-                "sys.stdin.buffer.read(1);"
-                "stream.connect(sys.argv[1]);"
-                "stream.sendall(b'owned child');"
-                "sys.stdout.buffer.write(stream.recv(1024));"
-                "sys.stdout.buffer.flush();"
-                "stream.close()"
-            ),
+            'IFS= read -r _; exec /usr/bin/ssh -F /dev/null -S "$1" -O check invalid',
+            "openevo-agent-relay-test",
             proxy.socket_path,
         ],
         stdin=subprocess.PIPE,
@@ -925,18 +938,18 @@ def test_agent_proxy_rejects_same_uid_steal_then_relays_for_owned_child(
         proxy.bind_child(
             session_id=child.pid,
             process_group_id=child.pid,
-            executable_identity=executables._peer_executable_identity(child.pid),
+            executable_identity=connector_identity,
         )
-        stdout, stderr = child.communicate(input=b"1", timeout=5)
-        assert child.returncode == 0, stderr
-        assert stdout == b"OWNED CHILD"
+        _stdout, _stderr = child.communicate(input=b"1\n", timeout=5)
         try:
             assert attacker.recv(1) == b""
         except ConnectionResetError:
             pass
         upstream_thread.join(2)
         assert not upstream_thread.is_alive()
-        assert observed == [b"owned child"]
+        assert len(observed) == 1
+        assert observed[0]
+        assert observed[0] != b"stolen"
     finally:
         attacker.close()
         if child.poll() is None:

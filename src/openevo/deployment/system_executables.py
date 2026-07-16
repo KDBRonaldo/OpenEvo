@@ -655,7 +655,18 @@ class _AgentTargetMutationMonitor:
                 return True
             if event.ident != self._darwin_parent_descriptor:
                 return True
-            if event.fflags != select.KQ_NOTE_WRITE:
+            hard_mutation_flags = (
+                select.KQ_NOTE_DELETE
+                | select.KQ_NOTE_RENAME
+                | select.KQ_NOTE_REVOKE
+            )
+            if event.fflags & hard_mutation_flags:
+                return True
+            # Creating and removing a child directory can coalesce NOTE_ATTRIB
+            # with NOTE_WRITE on Darwin because the parent's link count changes.
+            # The caller immediately revalidates the held directory chain and
+            # exact socket identity after every accepted namespace-write event.
+            if not event.fflags & select.KQ_NOTE_WRITE:
                 return True
         return False
 
