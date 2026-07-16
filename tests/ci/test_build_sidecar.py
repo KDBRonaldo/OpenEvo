@@ -527,6 +527,59 @@ def test_fd_bound_bootloader_patch_is_exact_and_cross_platform(
     assert "pyi_utils_openevo_native_handoff_prepare" in patched_header
 
 
+def test_fd_bound_bootloader_rejections_emit_closed_startup_diagnostics(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    source_root = tmp_path / "pyinstaller"
+    source = source_root / "bootloader/src/pyi_main.c"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        builder._BOOTLOADER_MACOS_INCLUDE_NEEDLE
+        + builder._BOOTLOADER_RESOLVER_NEEDLE
+        + builder._BOOTLOADER_ARCHIVE_NEEDLE
+        + builder._BOOTLOADER_RESTART_NEEDLE
+        + builder._BOOTLOADER_CHILD_MAIN_NEEDLE,
+        encoding="utf-8",
+    )
+    utils_source = source_root / "bootloader/src/pyi_utils_posix.c"
+    utils_source.write_text(
+        builder._BOOTLOADER_POSIX_INCLUDE_NEEDLE
+        + builder._BOOTLOADER_NATIVE_HANDOFF_NEEDLE
+        + builder._BOOTLOADER_CHILD_EXEC_NEEDLE,
+        encoding="utf-8",
+    )
+    utils_header = source_root / "bootloader/src/pyi_utils.h"
+    utils_header.write_text(builder._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
+
+    builder._patch_fd_bound_bootloader(source_root)
+
+    patched_sources = (
+        source.read_text(encoding="utf-8"),
+        utils_source.read_text(encoding="utf-8"),
+    )
+    for patched in patched_sources:
+        lines = patched.splitlines()
+        for index, line in enumerate(lines):
+            if line.strip() not in {"return -1;", "exit(-1);"}:
+                continue
+            assert "OPENEVO_STARTUP_FAILURE(" in lines[index - 1], line
+        assert "OPENEVO_STARTUP_V1 stage=" in patched
+        assert "%s" not in "\n".join(line for line in lines if "OPENEVO_STARTUP_V1" in line)
+
+    combined = "\n".join(patched_sources)
+    for stage in (
+        "bootloader_resolver",
+        "bootloader_archive",
+        "bootloader_handoff",
+        "bootloader_restore",
+        "bootloader_exec",
+        "bootloader_restart",
+        "bootloader_child",
+    ):
+        assert f'OPENEVO_STARTUP_FAILURE("{stage}",' in combined
+
+
 @pytest.mark.parametrize(
     ("platform", "platform_markers"),
     [

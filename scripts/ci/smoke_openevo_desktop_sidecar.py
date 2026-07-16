@@ -62,6 +62,55 @@ NATIVE_LISTENER_FD = 3
 NATIVE_ARCHIVE_FD = 4
 NATIVE_GUARD_MIN_FD = 64
 NATIVE_SIDECAR_BASENAME = "openevo-desktop-sidecar"
+STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES = 32 * 1024
+STARTUP_DIAGNOSTIC_MAX_LINES = 8
+_STARTUP_DIAGNOSTIC_PATTERN = re.compile(
+    rb"OPENEVO_STARTUP_V1 stage=([a-z][a-z0-9_]*) "
+    rb"code=([a-z][a-z0-9_]*)(?: errno=([1-9][0-9]{0,9}))?"
+)
+_STARTUP_DIAGNOSTIC_CODES = {
+    "bootloader_resolver": frozenset(
+        {
+            "native_env_invalid",
+            "native_path_unexpected",
+            "native_path_invalid",
+            "native_path_length_invalid",
+            "native_path_not_canonical",
+            "native_basename_invalid",
+            "native_path_character_invalid",
+            "native_path_resolve_failed",
+            "native_identity_invalid",
+            "resolved_path_length_invalid",
+            "platform_unsupported",
+            "handoff_prepare_failed",
+            "native_env_incomplete",
+        }
+    ),
+    "bootloader_archive": frozenset(
+        {"native_fd_invalid", "platform_unsupported", "archive_open_failed"}
+    ),
+    "bootloader_handoff": frozenset(
+        {
+            "native_fds_invalid",
+            "guard_state_invalid",
+            "listener_guard_failed",
+            "archive_guard_failed",
+        }
+    ),
+    "bootloader_restore": frozenset(
+        {"cloexec_clear_failed", "descriptor_restore_failed", "finish_failed"}
+    ),
+    "bootloader_exec": frozenset({"restore_failed"}),
+    "bootloader_restart": frozenset({"restore_failed"}),
+    "bootloader_child": frozenset({"handoff_finish_failed"}),
+    "python_import": frozenset(
+        {"owned_subprocess_import_failed", "launcher_import_failed"}
+    ),
+    "python_owned_subprocess": frozenset({"execution_failed"}),
+    "python_handoff": frozenset({"listener_fd_invalid", "archive_fd_invalid"}),
+    "python_metadata": frozenset({"load_failed"}),
+    "python_launcher": frozenset({"execution_failed"}),
+}
 _LOCAL_HTTP_OPENER = build_opener(ProxyHandler({}))
 
 
@@ -525,7 +574,7 @@ def smoke_sidecar(
 
     with TemporaryDirectory(prefix="openevo-sidecar-smoke-") as temporary_root:
         root = Path(temporary_root)
-        with TemporaryFile(mode="w+", encoding="utf-8") as process_log:
+        with TemporaryFile(mode="w+b") as process_log:
             process, base_url, credentials = _launch_native_sidecar(
                 sidecar,
                 config_root=root / "config",
@@ -605,13 +654,37 @@ def smoke_sidecar(
 
 def _process_failure(process: subprocess.Popen[Any], process_log) -> str:
     process.wait(timeout=2)
+    diagnostics = _read_startup_diagnostics(process_log)
+    detail = (
+        "startup diagnostics:\n" + "\n".join(diagnostics)
+        if diagnostics
+        else "no valid OPENEVO_STARTUP_V1 diagnostic was emitted"
+    )
+    return f"sidecar exited before serving /health (exit {process.returncode}).\n{detail}"
+
+
+def _read_startup_diagnostics(process_log) -> tuple[str, ...]:
     process_log.flush()
     process_log.seek(0)
-    output = process_log.read()
-    return (
-        "sidecar exited before serving /health "
-        f"(exit {process.returncode}).\noutput:\n{output}"
-    )
+    payload = process_log.read(STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES + 1)
+    bounded = payload[:STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES]
+    final_newline = bounded.rfind(b"\n")
+    if final_newline < 0:
+        return ()
+
+    diagnostics: list[str] = []
+    for line in bounded[:final_newline].split(b"\n"):
+        match = _STARTUP_DIAGNOSTIC_PATTERN.fullmatch(line)
+        if match is None:
+            continue
+        stage = match.group(1).decode("ascii")
+        code = match.group(2).decode("ascii")
+        if code not in _STARTUP_DIAGNOSTIC_CODES.get(stage, ()):
+            continue
+        diagnostics.append(line.decode("ascii"))
+        if len(diagnostics) == STARTUP_DIAGNOSTIC_MAX_LINES:
+            break
+    return tuple(diagnostics)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -52,7 +52,13 @@ macOS native smoke with a short pytest base directory, private umask, and no
 ambient runner agent. The focused macOS job must retain the real relay node and
 must not be reduced to metadata-only tests. The stable-only Desktop candidate
 gate runs the complete macOS SSH suite under the same private, agent-free,
-short-path environment before packaging a DMG.
+short-path environment before packaging a DMG. On GitHub macOS runners, the
+complete suite creates that short root directly below `$HOME` with mode
+`0700`; it must not place SSH authority fixtures below the pre-existing
+`$RUNNER_TEMP` ancestry. Injected Core-child fixtures retain the transferred
+socket peer for the fake child's lifetime, and short-leader fixtures synchronize
+observer installation before allowing the leader to exit. These rules model the
+production ownership lifecycle without weakening its fail-closed checks.
 
 Native workspace tests reject sparse allocation through deterministic metadata
 and extent-map contract tests. Filesystem integration fixtures skip only when
@@ -88,6 +94,14 @@ Release gate tests are stricter than local smoke tests. Their output must identi
 the candidate commit, exact inputs, configuration, result, and produced release
 artifact where applicable. Use the smallest durable report that proves the
 behavior; do not create a schema/validator/report stack for every check.
+
+Packaged-sidecar startup failures are the exception to ordinary process-log
+capture: the smoke test consumes a fixed amount of child output and publishes
+only closed `OPENEVO_STARTUP_V1` records. Tests must include path, token, URL,
+traceback, malformed-record, and oversized-output canaries and prove that none
+can enter the rendered CI failure. A silent bootloader exit is a failed gate,
+not permission to print arbitrary child output or fall back from descriptor
+authority to a pathname.
 
 Required release-gate families are:
 

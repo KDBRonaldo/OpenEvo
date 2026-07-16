@@ -73,7 +73,19 @@ jobs:
         run: |
           unset SSH_AUTH_SOCK
           umask 077
-          uv run python -m pytest --basetemp="$RUNNER_TEMP/oe-candidate-ssh" \
+          case "${HOME:-}" in
+            /*) ;;
+            *) echo "HOME must be an absolute path" >&2; exit 1 ;;
+          esac
+          ssh_test_prefix="$HOME/.oe-ssh."
+          ssh_test_root="$(mktemp -d "${ssh_test_prefix}XXXXXX")"
+          case "$ssh_test_root" in
+            "$ssh_test_prefix"??????) ;;
+            *) echo "Unexpected SSH test root" >&2; exit 1 ;;
+          esac
+          trap 'rm -rf -- "$ssh_test_root"' EXIT
+          chmod 700 "$ssh_test_root"
+          uv run python -m pytest --basetemp="$ssh_test_root/pytest" \
             tests/openevo/remote/test_system_executables.py \
             tests/openevo/remote/test_host_keys.py \
             tests/openevo/remote/test_ssh_transport.py \

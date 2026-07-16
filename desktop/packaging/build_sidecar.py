@@ -198,6 +198,8 @@ _BOOTLOADER_MACOS_INCLUDE_REPLACEMENT = """#if defined(__APPLE__)
     #include <mach-o/dyld.h>  /* _NSGetExecutablePath() */
     #include <sys/stat.h>  /* fstat(), lstat(), struct stat */
 #endif
+#define OPENEVO_STARTUP_FAILURE(stage, code) \\
+    fprintf(stderr, "OPENEVO_STARTUP_V1 stage=" stage " code=" code "\\n")
 """
 _BOOTLOADER_RESOLVER_NEEDLE = """static int
 _pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
@@ -217,10 +219,12 @@ _pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
             strcmp(openevo_native_listener_fd, \"{NATIVE_LISTENER_FD}\") != 0 ||
             strcmp(openevo_native_fd, \"{NATIVE_EXECUTABLE_FD}\") != 0
         ) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_env_invalid");
             return -1;
         }}
 #if defined(__linux__)
         if (openevo_native_path != NULL) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_path_unexpected");
             return -1;
         }}
         snprintf(pyi_ctx->executable_filename, PYI_PATH_MAX, \"/proc/self/fd/{NATIVE_EXECUTABLE_FD}\");
@@ -234,10 +238,12 @@ _pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
         size_t openevo_index;
 
         if (openevo_native_path == NULL || openevo_native_path[0] != '/') {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_path_invalid");
             return -1;
         }}
         openevo_path_length = strnlen(openevo_native_path, PYI_PATH_MAX);
         if (openevo_path_length == 0 || openevo_path_length >= PYI_PATH_MAX) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_path_length_invalid");
             return -1;
         }}
         if (
@@ -245,19 +251,23 @@ _pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
             strstr(openevo_native_path, \"/./\") != NULL ||
             strstr(openevo_native_path, \"/../\") != NULL
         ) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_path_not_canonical");
             return -1;
         }}
         openevo_basename = strrchr(openevo_native_path, '/');
         if (openevo_basename == NULL || strcmp(openevo_basename + 1, \"{NATIVE_EXECUTABLE_BASENAME}\") != 0) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_basename_invalid");
             return -1;
         }}
         for (openevo_index = 0; openevo_index < openevo_path_length; openevo_index++) {{
             unsigned char character = (unsigned char)openevo_native_path[openevo_index];
             if (character < 0x20 || character == 0x7f) {{
+                OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_path_character_invalid");
                 return -1;
             }}
         }}
         if (realpath(openevo_native_path, openevo_resolved_path) == NULL) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_path_resolve_failed");
             return -1;
         }}
         if (
@@ -279,20 +289,25 @@ _pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
             (openevo_path_stat.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
             (openevo_path_stat.st_uid != 0 && openevo_path_stat.st_uid != geteuid())
         ) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_identity_invalid");
             return -1;
         }}
         if (snprintf(pyi_ctx->executable_filename, PYI_PATH_MAX, \"%s\", openevo_resolved_path) >= PYI_PATH_MAX) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "resolved_path_length_invalid");
             return -1;
         }}
 #else
+        OPENEVO_STARTUP_FAILURE("bootloader_resolver", "platform_unsupported");
         return -1;
 #endif
         if (pyi_utils_openevo_native_handoff_prepare() != 0) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_resolver", "handoff_prepare_failed");
             return -1;
         }}
         return 0;
     }}
     if (openevo_native_listener_fd != NULL || openevo_native_path != NULL) {{
+        OPENEVO_STARTUP_FAILURE("bootloader_resolver", "native_env_incomplete");
         return -1;
     }}
 
@@ -315,6 +330,7 @@ _pyi_main_resolve_pkg_archive(struct PYI_CONTEXT *pyi_ctx)
         const char *openevo_archive_path;
 
         if (strcmp(openevo_native_fd, \"{NATIVE_EXECUTABLE_FD}\") != 0) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_archive", "native_fd_invalid");
             return -1;
         }}
 #if defined(__linux__)
@@ -322,10 +338,12 @@ _pyi_main_resolve_pkg_archive(struct PYI_CONTEXT *pyi_ctx)
 #elif defined(__APPLE__)
         openevo_archive_path = \"/dev/fd/{NATIVE_EXECUTABLE_FD}\";
 #else
+        OPENEVO_STARTUP_FAILURE("bootloader_archive", "platform_unsupported");
         return -1;
 #endif
         pyi_ctx->archive = pyi_archive_open(openevo_archive_path);
         if (pyi_ctx->archive == NULL) {{
+            OPENEVO_STARTUP_FAILURE("bootloader_archive", "archive_open_failed");
             return -1;
         }}
         snprintf(pyi_ctx->archive_filename, PYI_PATH_MAX, \"%s\", openevo_archive_path);
@@ -353,6 +371,8 @@ _BOOTLOADER_NATIVE_HANDOFF_REPLACEMENT = """/* OpenEvo native onefile FD handoff
 #define OPENEVO_NATIVE_LISTENER_FD 3
 #define OPENEVO_NATIVE_ARCHIVE_FD 4
 #define OPENEVO_NATIVE_GUARD_MIN_FD 64
+#define OPENEVO_STARTUP_FAILURE(stage, code) \\
+    fprintf(stderr, "OPENEVO_STARTUP_V1 stage=" stage " code=" code "\\n")
 
 static int openevo_listener_guard_fd = -1;
 static int openevo_archive_guard_fd = -1;
@@ -380,6 +400,7 @@ _pyi_utils_openevo_validate_native_fds(void)
         accepting_size != sizeof(accepting) ||
         accepting != 1
     ) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "native_fds_invalid");
         return -1;
     }
     return 0;
@@ -390,6 +411,7 @@ _pyi_utils_openevo_clear_cloexec(int fd)
 {
     int flags = fcntl(fd, F_GETFD);
     if (flags == -1 || fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC) == -1) {
+        OPENEVO_STARTUP_FAILURE("bootloader_restore", "cloexec_clear_failed");
         return -1;
     }
     return 0;
@@ -399,9 +421,11 @@ int
 pyi_utils_openevo_native_handoff_prepare(void)
 {
     if (openevo_listener_guard_fd != -1 || openevo_archive_guard_fd != -1) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "guard_state_invalid");
         return -1;
     }
     if (_pyi_utils_openevo_validate_native_fds() != 0) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "native_fds_invalid");
         return -1;
     }
     openevo_listener_guard_fd = fcntl(
@@ -410,6 +434,7 @@ pyi_utils_openevo_native_handoff_prepare(void)
         OPENEVO_NATIVE_GUARD_MIN_FD
     );
     if (openevo_listener_guard_fd == -1) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_guard_failed");
         return -1;
     }
     openevo_archive_guard_fd = fcntl(
@@ -420,6 +445,7 @@ pyi_utils_openevo_native_handoff_prepare(void)
     if (openevo_archive_guard_fd == -1) {
         close(openevo_listener_guard_fd);
         openevo_listener_guard_fd = -1;
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "archive_guard_failed");
         return -1;
     }
     return 0;
@@ -440,6 +466,7 @@ pyi_utils_openevo_native_handoff_restore(void)
         _pyi_utils_openevo_clear_cloexec(OPENEVO_NATIVE_ARCHIVE_FD) != 0 ||
         _pyi_utils_openevo_validate_native_fds() != 0
     ) {
+        OPENEVO_STARTUP_FAILURE("bootloader_restore", "descriptor_restore_failed");
         return -1;
     }
     return 0;
@@ -449,6 +476,7 @@ int
 pyi_utils_openevo_native_handoff_finish(void)
 {
     if (pyi_utils_openevo_native_handoff_restore() != 0) {
+        OPENEVO_STARTUP_FAILURE("bootloader_restore", "finish_failed");
         return -1;
     }
     if (openevo_listener_guard_fd != -1) {
@@ -469,6 +497,7 @@ _BOOTLOADER_CHILD_EXEC_NEEDLE = """        /* Modify the LISTEN_PID environment 
 """
 _BOOTLOADER_CHILD_EXEC_REPLACEMENT = """        if (pyi_utils_openevo_native_handoff_restore() != 0) {
             PYI_ERROR("LOADER: failed to restore OpenEvo native descriptors!\\n");
+            OPENEVO_STARTUP_FAILURE("bootloader_exec", "restore_failed");
             exit(-1);
         }
 
@@ -490,6 +519,7 @@ _BOOTLOADER_RESTART_REPLACEMENT = """        if (needs_restart) {
             PYI_DEBUG("LOADER: process needs to restart itself to apply modifications to library search path.\\n");
             if (pyi_utils_openevo_native_handoff_restore() != 0) {
                 PYI_ERROR("LOADER: failed to restore OpenEvo native descriptors for restart!\\n");
+                OPENEVO_STARTUP_FAILURE("bootloader_restart", "restore_failed");
                 return -1;
             }
 """
@@ -503,6 +533,7 @@ _BOOTLOADER_CHILD_MAIN_REPLACEMENT = """_pyi_main_onedir_or_onefile_child(struct
 
     if (pyi_utils_openevo_native_handoff_finish() != 0) {
         PYI_ERROR("LOADER: failed to finalize OpenEvo native descriptor handoff!\\n");
+        OPENEVO_STARTUP_FAILURE("bootloader_child", "handoff_finish_failed");
         return -1;
     }
 """

@@ -222,6 +222,14 @@ for the process lifetime and
 requires the native host to supply a Desktop session token, native instance ID,
 readiness key, source commit, and private state root.
 
+Before the Local API reaches readiness, packaged startup failures use the closed
+`OPENEVO_STARTUP_V1` stderr contract. Only fixed stage/code pairs and an
+optional numeric errno are permitted. Paths, argv, environment values,
+credentials, URLs, exception messages, tracebacks, and arbitrary process output
+are forbidden. Release smoke tooling scans at most 32 KiB and surfaces at most
+eight allowlisted records, so this contract does not create telemetry or a
+secret-bearing diagnostics channel.
+
 The current provider implements:
 
 - public `GET /version` with `provider_kind=desktop_sidecar` and the canonical

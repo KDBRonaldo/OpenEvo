@@ -1269,7 +1269,13 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     )[0]
     assert "unset SSH_AUTH_SOCK" in candidate_ssh_step
     assert "umask 077" in candidate_ssh_step
-    assert '--basetemp="$RUNNER_TEMP/oe-candidate-ssh"' in candidate_ssh_step
+    assert 'case "${HOME:-}" in' in candidate_ssh_step
+    assert 'ssh_test_prefix="$HOME/.oe-ssh."' in candidate_ssh_step
+    assert 'mktemp -d "${ssh_test_prefix}XXXXXX"' in candidate_ssh_step
+    assert 'chmod 700 "$ssh_test_root"' in candidate_ssh_step
+    assert 'trap \'rm -rf -- "$ssh_test_root"\' EXIT' in candidate_ssh_step
+    assert '--basetemp="$ssh_test_root/pytest"' in candidate_ssh_step
+    assert "$RUNNER_TEMP" not in candidate_ssh_step
 
     for marker in (
         "unsigned and not notarized",

@@ -228,6 +228,16 @@ status, or logs; only `start_sidecar` returns the session token directly to the
 renderer. The non-secret instance ID is returned only as part of the
 challenge-bound health response.
 
+Failures before readiness use the local-only `OPENEVO_STARTUP_V1` diagnostic
+contract. The bootloader and packaged Python entry point may write only a closed,
+fixed `stage` and `code`, plus an optional numeric errno, to the inherited
+standard-error stream. They must not include a path, argv, environment value,
+credential, URL, exception message, traceback, or arbitrary child output. The
+release smoke scans at most 32 KiB and reports at most eight syntactically valid
+allowlisted diagnostic records. Missing diagnostics are reported as such;
+unstructured output is never copied into CI logs. This is a local startup aid,
+not telemetry, crash reporting, or a diagnostics upload path.
+
 Readiness sends a fresh 256-bit challenge to `/health`. The closed Rust response
 model requires the exact protocol and instance ID and verifies HMAC-SHA256 over
 `protocol NUL instance_id NUL challenge`. Unknown fields, stale challenge

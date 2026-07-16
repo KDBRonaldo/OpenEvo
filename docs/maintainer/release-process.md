@@ -86,6 +86,14 @@ wheel and runs `openevo-core-service`. It must not rebuild the wheel or lock, an
 those final candidate bytes after the service smoke. Conversely, the macOS
 packaging job must not run the Linux-only Core service lifecycle.
 
+If the packaged sidecar exits before readiness, inspect only the bounded
+`OPENEVO_STARTUP_V1` stage/code emitted by the bootloader or Python entry
+point. A candidate with a missing, malformed, unknown, or non-allowlisted
+startup diagnostic remains failed. Maintainers must fix the identified
+descriptor/executable/startup stage and rerun from a new commit; they must not
+publish arbitrary process output, disclose paths or credentials, or replace an
+FD-bound archive read with a pathname fallback.
+
 The manual candidate uses the same producer/consumer rule for the complete
 release inventory. `release-candidate.json` and `core-install-artifact.json`
 bind the exact Core wheel and framework lock; the former also binds the DMG,

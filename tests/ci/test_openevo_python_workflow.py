@@ -130,6 +130,7 @@ def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:
     assert '"desktop/**"' in text
     assert '"src/openevo/deployment/**"' in text
     assert '"tests/ci/test_openevo_python_workflow.py"' in text
+    assert '"tests/ci/test_sidecar_startup_diagnostics.py"' in text
     assert '"tests/openevo/remote/**"' in text
     assert '"tests/openevo/sidecar/test_fd_xattrs.py"' in text
     assert '"scripts/ci/smoke_openevo_desktop_bundle.py"' in text
@@ -172,7 +173,13 @@ def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:
     assert "tests/openevo/sidecar/test_fd_xattrs.py" in workspace_step
     assert "unset SSH_AUTH_SOCK" in ssh_step
     assert "umask 077" in ssh_step
-    assert '--basetemp="$RUNNER_TEMP/oe-ssh"' in ssh_step
+    assert 'case "${HOME:-}" in' in ssh_step
+    assert 'ssh_test_prefix="$HOME/.oe-ssh."' in ssh_step
+    assert 'mktemp -d "${ssh_test_prefix}XXXXXX"' in ssh_step
+    assert 'chmod 700 "$ssh_test_root"' in ssh_step
+    assert 'trap \'rm -rf -- "$ssh_test_root"\' EXIT' in ssh_step
+    assert '--basetemp="$ssh_test_root/pytest"' in ssh_step
+    assert "$RUNNER_TEMP" not in ssh_step
 
 
 def test_release_smoke_path_filter_and_platform_separation_guard() -> None:
