@@ -205,10 +205,14 @@ IPv4 loopback listener on inherited FD 3, and a regular executable FD 4 whose
 device, inode, and size match the native marker whose verified digest binds it
 to the bundled externalBin. The marker PID's Darwin birth identity is re-read
 with `proc_pidinfo(PROC_PIDTBSDINFO)` before FD observation.
-The private launch pathname is intentionally unlinked after spawn, so the
-smoke must not try to reopen the pathname reported by `lsof`. It also requires
+The private launch pathname remains within the documented same-UID trust
+boundary until native cleanup. The smoke does not reopen the pathname reported
+by `lsof`; it trusts only the marker-bound live FD identity. Its macOS probes
+share the readiness deadline, kill and reap their own private process groups on
+timeout, and cap each observed sidecar group. It also requires bounded
 disappearance of every captured app/sidecar process group after main-app
-termination. Candidate runs retain separate `app-bundle-smoke.json` and
+termination on success or failure. Candidate runs retain separate
+`app-bundle-smoke.json` and
 `dmg-copy-smoke.json` outputs. The former declares `launch_origin=mounted_dmg`;
 the latter declares `launch_origin=detached_copy` after `ditto` and a successful
 DMG detach. Both schema-v3 reports bind the exact source DMG, Tauri executable,

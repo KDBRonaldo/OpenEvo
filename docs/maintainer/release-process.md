@@ -176,12 +176,16 @@ process group, session, and live Darwin birth identity; requires FD 3 to be an
 IPv4 loopback listener; and requires FD 4 in the same process to match the
 declared regular-file device, inode, and size. It also requires both the
 renderer-ready marker and a visible window. It does not reopen the private
-executable pathname because the native host intentionally unlinks it after
-spawn. Both packaged paths are rechecked after process cleanup. Native stderr
-uses a nonblocking bounded pipe, parsing remains byte/line bounded, and timeout
-output uses only closed readiness stage names. Only the app process group is
-signalled; native cleanup and the parent-liveness watchdog own sidecar
-termination, while the smoke verifies every observed group disappears.
+executable pathname: the pathname remains in the documented same-UID trust
+boundary until native cleanup, while the marker and live FD identity are the
+observer's authority. Both packaged paths are rechecked after process cleanup.
+Native stderr uses a nonblocking bounded pipe, parsing remains byte/line bounded,
+and timeout output uses only closed readiness stage names. Probe subprocesses share one
+readiness deadline and are launched in private groups that are killed and
+reaped on timeout. Only the app process group is signalled; native cleanup and
+the parent-liveness watchdog own sidecar termination, while both success and
+failure paths verify every observed group disappears within a bounded cleanup
+period.
 Candidate JSON parsing
 rejects duplicate keys at every nesting level, so a last-key-wins parser cannot
 reinterpret the closed evidence contract.

@@ -279,6 +279,52 @@ def test_bundle_smoke_launches_tauri_main_and_requires_native_evidence(
     assert json.loads(evidence_path.read_text(encoding="utf-8")) == evidence
 
 
+def test_bundle_smoke_failure_still_runs_bounded_group_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    monkeypatch.setattr(smoke.sys, "platform", "linux")
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "OpenEvo Desktop"
+    sidecar = executable.with_name("openevo-desktop-sidecar")
+    executable.parent.mkdir(parents=True)
+    executable.write_text(
+        "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    sidecar.write_bytes(b"packaged externalBin")
+    sidecar.chmod(0o755)
+    with (app / "Contents" / "Info.plist").open("wb") as stream:
+        plistlib.dump({"CFBundleExecutable": executable.name}, stream)
+    source_dmg = tmp_path / "candidate.dmg"
+    source_dmg.write_bytes(b"dmg")
+    cleanup_calls: list[set[int]] = []
+    original_cleanup = smoke._cleanup_launched_app
+
+    def tracked_cleanup(process, process_groups, *, timeout_seconds):
+        cleanup_calls.append(set(process_groups))
+        return original_cleanup(
+            process,
+            process_groups,
+            timeout_seconds=timeout_seconds,
+        )
+
+    monkeypatch.setattr(smoke, "_cleanup_launched_app", tracked_cleanup)
+
+    with pytest.raises(smoke.SmokeFailure, match="Timed out waiting"):
+        smoke.smoke_bundle(
+            tmp_path,
+            launch_origin="mounted_dmg",
+            source_dmg=source_dmg,
+            timeout_seconds=0.2,
+        )
+
+    assert len(cleanup_calls) == 1
+    assert len(cleanup_calls[0]) == 1
+
+
 def test_bundle_smoke_inspects_mach_o_with_file_and_lipo(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -517,7 +563,7 @@ def test_bundle_smoke_bounds_native_log_and_resets_stale_renderer_ack() -> None:
         )
 
 
-def test_bundle_smoke_observes_unlinked_fd_from_native_digest_marker(
+def test_bundle_smoke_observes_verified_fd_from_native_digest_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -529,7 +575,7 @@ def test_bundle_smoke_observes_unlinked_fd_from_native_digest_marker(
     monkeypatch.setattr(
         smoke,
         "_descendants",
-        lambda _pid: [(41, 40, 41, "openevo-desktop-sidecar")],
+        lambda _pid, _deadline: [(41, 40, 41, "openevo-desktop-sidecar")],
     )
     monkeypatch.setattr(smoke.os, "getpgid", lambda _pid: 41)
     monkeypatch.setattr(smoke.os, "getsid", lambda _pid: 41)
@@ -541,12 +587,12 @@ def test_bundle_smoke_observes_unlinked_fd_from_native_digest_marker(
     monkeypatch.setattr(
         smoke,
         "_lsof_fd",
-        lambda _pid, descriptor: smoke.NativeFileDescriptorObservation(
+        lambda _pid, descriptor, _deadline: smoke.NativeFileDescriptorObservation(
             file_type="IPv4" if descriptor == 3 else "REG",
             name=(
                 "127.0.0.1:1234"
                 if descriptor == 3
-                else "/private/tmp/openevo-sidecar (deleted)"
+                else "/private/tmp/openevo-sidecar"
             ),
             size=None if descriptor == 3 else len(sidecar.read_bytes()),
             tcp_state="LISTEN" if descriptor == 3 else None,
@@ -554,7 +600,7 @@ def test_bundle_smoke_observes_unlinked_fd_from_native_digest_marker(
             inode=None if descriptor == 3 else 99,
         ),
     )
-    monkeypatch.setattr(smoke, "_macos_renderer_ready", lambda _pid: True)
+    monkeypatch.setattr(smoke, "_macos_renderer_ready", lambda _pid, _deadline: True)
     digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
     observation = smoke.NativeHostObservation(
         active_process=smoke.NativeSidecarProcessMarker(
@@ -578,6 +624,7 @@ def test_bundle_smoke_observes_unlinked_fd_from_native_digest_marker(
         {},
         digest,
         observation,
+        smoke.time.monotonic() + 5,
     )
 
     assert evidence is not None
@@ -589,9 +636,13 @@ def test_bundle_smoke_observes_unlinked_fd_from_native_digest_marker(
     monkeypatch.setattr(
         smoke,
         "_lsof_fd",
-        lambda _pid, descriptor: smoke.NativeFileDescriptorObservation(
+        lambda _pid, descriptor, _deadline: smoke.NativeFileDescriptorObservation(
             file_type="IPv4" if descriptor == 3 else "REG",
-            name="127.0.0.1:1234" if descriptor == 3 else "(deleted)",
+            name=(
+                "127.0.0.1:1234"
+                if descriptor == 3
+                else "/private/tmp/openevo-sidecar"
+            ),
             size=None if descriptor == 3 else len(sidecar.read_bytes()),
             tcp_state="LISTEN" if descriptor == 3 else None,
             device=None if descriptor == 3 else 42,
@@ -605,6 +656,7 @@ def test_bundle_smoke_observes_unlinked_fd_from_native_digest_marker(
         {},
         digest,
         observation,
+        smoke.time.monotonic() + 5,
     )
     assert rejected is None
     assert rejected_stage == "executable_fd_unavailable"
@@ -615,8 +667,8 @@ def test_bundle_smoke_parses_lsof_machine_fields(
 ) -> None:
     smoke = _load_bundle_smoke_module()
     monkeypatch.setattr(
-        smoke.subprocess,
-        "run",
+        smoke,
+        "_run_probe",
         lambda arguments, **_kwargs: subprocess.CompletedProcess(
             arguments,
             0,
@@ -625,7 +677,7 @@ def test_bundle_smoke_parses_lsof_machine_fields(
         ),
     )
 
-    observation = smoke._lsof_fd(41, 3)
+    observation = smoke._lsof_fd(41, 3, smoke.time.monotonic() + 5)
 
     assert observation == smoke.NativeFileDescriptorObservation(
         file_type="IPv4",
@@ -643,14 +695,13 @@ def test_bundle_smoke_bounds_native_probe_timeouts(
 ) -> None:
     smoke = _load_bundle_smoke_module()
     monkeypatch.setattr(
-        smoke.subprocess,
-        "run",
-        lambda arguments, **_kwargs: (_ for _ in ()).throw(
-            subprocess.TimeoutExpired(arguments, 5)
-        ),
+        smoke,
+        "_run_probe",
+        lambda _arguments, **_kwargs: None,
     )
 
-    assert smoke._lsof_fd(41, 4) == smoke.NativeFileDescriptorObservation(
+    deadline = smoke.time.monotonic() + 5
+    assert smoke._lsof_fd(41, 4, deadline) == smoke.NativeFileDescriptorObservation(
         None,
         None,
         None,
@@ -658,7 +709,186 @@ def test_bundle_smoke_bounds_native_probe_timeouts(
         None,
         None,
     )
-    assert smoke._macos_renderer_ready(40) is False
+    assert smoke._macos_renderer_ready(40, deadline) is False
+
+
+def test_bundle_smoke_probe_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    pid_file = tmp_path / "probe-pids"
+    probe_script = "\n".join(
+        [
+            "import os",
+            "from pathlib import Path",
+            "import subprocess",
+            "import sys",
+            "import time",
+            (
+                "descendant = subprocess.Popen("
+                "[sys.executable, '-c', 'import time; time.sleep(60)'])"
+            ),
+            f"Path({str(pid_file)!r}).write_text(f'{{os.getpid()}} {{descendant.pid}}')",
+            "time.sleep(60)",
+        ]
+    )
+    started = smoke.time.monotonic()
+
+    result = smoke._run_probe(
+        [smoke.sys.executable, "-c", probe_script],
+        deadline=started + 1.0,
+        timeout_cap=0.75,
+    )
+
+    assert result is None
+    assert smoke.time.monotonic() - started < 4.0
+    probe_pid, descendant_pid = (
+        int(value) for value in pid_file.read_text(encoding="utf-8").split()
+    )
+
+    def is_running(pid: int) -> bool:
+        observed = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout.strip()
+        return bool(observed) and not observed.startswith("Z")
+
+    disappearance_deadline = smoke.time.monotonic() + 2
+    while smoke.time.monotonic() < disappearance_deadline and any(
+        is_running(pid) for pid in (probe_pid, descendant_pid)
+    ):
+        smoke.time.sleep(0.05)
+    assert all(not is_running(pid) for pid in (probe_pid, descendant_pid))
+
+
+def test_bundle_smoke_does_not_launch_probe_after_shared_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    monkeypatch.setattr(
+        smoke.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("expired probe was launched"),
+    )
+
+    assert (
+        smoke._run_probe(
+            ["expired-probe"],
+            deadline=smoke.time.monotonic() - 1,
+            timeout_cap=5,
+        )
+        is None
+    )
+
+
+def test_bundle_smoke_caps_observed_sidecar_group_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    sidecar = tmp_path / "openevo-desktop-sidecar"
+    sidecar.write_bytes(b"observed sidecar")
+    executable = tmp_path / "OpenEvo Desktop"
+    executable.write_bytes(b"native executable")
+    digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    marker = smoke.NativeSidecarProcessMarker(
+        pid=41,
+        process_group=41,
+        session_id=41,
+        birth_identity="darwin:1700000000:123",
+        executable_device=42,
+        executable_inode=99,
+        executable_sha256=digest,
+        executable_size=sidecar.stat().st_size,
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_descendants",
+        lambda _pid, _deadline: [
+            (41 + index, 40, 41, "openevo-desktop-sidecar")
+            for index in range(smoke.NATIVE_GROUP_MAX_PROCESSES + 1)
+        ],
+    )
+    monkeypatch.setattr(smoke.os, "getpgid", lambda _pid: 41)
+    monkeypatch.setattr(smoke.os, "getsid", lambda _pid: 41)
+    monkeypatch.setattr(
+        smoke,
+        "_darwin_process_birth_identity",
+        lambda _pid: "darwin:1700000000:123",
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="exceeded the observation limit"):
+        smoke._macos_native_evidence(
+            40,
+            executable,
+            sidecar,
+            {},
+            digest,
+            smoke.NativeHostObservation(marker, True, frozenset({41})),
+            smoke.time.monotonic() + 5,
+        )
+
+
+def test_bundle_smoke_cleanup_waits_for_parent_watched_sidecar(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    sidecar_pid_path = tmp_path / "sidecar-pid"
+    sidecar_script = "\n".join(
+        [
+            "import os",
+            "import sys",
+            "import time",
+            "expected_parent = int(sys.argv[1])",
+            "while os.getppid() == expected_parent:",
+            "    time.sleep(0.02)",
+        ]
+    )
+    app_script = "\n".join(
+        [
+            "from pathlib import Path",
+            "import os",
+            "import subprocess",
+            "import sys",
+            "import time",
+            (
+                "sidecar = subprocess.Popen("
+                f"[sys.executable, '-c', {sidecar_script!r}, str(os.getpid())], "
+                "start_new_session=True)"
+            ),
+            f"Path({str(sidecar_pid_path)!r}).write_text(str(sidecar.pid))",
+            "time.sleep(60)",
+        ]
+    )
+    app = subprocess.Popen(
+        [smoke.sys.executable, "-c", app_script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        deadline = smoke.time.monotonic() + 3
+        while smoke.time.monotonic() < deadline and not sidecar_pid_path.is_file():
+            smoke.time.sleep(0.02)
+        sidecar_pid = int(sidecar_pid_path.read_text(encoding="utf-8"))
+
+        assert smoke._cleanup_launched_app(
+            app,
+            {app.pid, sidecar_pid},
+            timeout_seconds=2,
+        )
+    finally:
+        smoke._kill_groups({app.pid}, smoke.signal.SIGKILL)
+        if sidecar_pid_path.is_file():
+            smoke._kill_groups(
+                {int(sidecar_pid_path.read_text(encoding="utf-8"))},
+                smoke.signal.SIGKILL,
+            )
+        try:
+            app.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            app.kill()
+            app.wait(timeout=2)
 
 
 def test_bundle_smoke_uses_the_darwin_proc_bsdinfo_layout() -> None:
@@ -684,7 +914,11 @@ def test_bundle_smoke_darwin_native_probes_match_live_kernel_state(
     payload.write_bytes(b"verified fd payload")
     with payload.open("rb") as stream:
         metadata = smoke.os.fstat(stream.fileno())
-        observed = smoke._lsof_fd(smoke.os.getpid(), stream.fileno())
+        observed = smoke._lsof_fd(
+            smoke.os.getpid(),
+            stream.fileno(),
+            smoke.time.monotonic() + 5,
+        )
         assert observed.file_type == "REG"
         assert observed.device == metadata.st_dev
         assert observed.inode == metadata.st_ino
@@ -693,7 +927,11 @@ def test_bundle_smoke_darwin_native_probes_match_live_kernel_state(
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
-        observed = smoke._lsof_fd(smoke.os.getpid(), listener.fileno())
+        observed = smoke._lsof_fd(
+            smoke.os.getpid(),
+            listener.fileno(),
+            smoke.time.monotonic() + 5,
+        )
         assert smoke._is_loopback_listener(observed) is True
 
 
@@ -728,6 +966,7 @@ def test_bundle_smoke_rejects_native_marker_for_different_sidecar(
             {},
             hashlib.sha256(sidecar.read_bytes()).hexdigest(),
             observation,
+            smoke.time.monotonic() + 5,
         )
 
 
@@ -754,7 +993,7 @@ def test_bundle_smoke_rejects_reused_darwin_pid(
     monkeypatch.setattr(
         smoke,
         "_descendants",
-        lambda _pid: [(41, 40, 41, "openevo-desktop-sidecar")],
+        lambda _pid, _deadline: [(41, 40, 41, "openevo-desktop-sidecar")],
     )
     monkeypatch.setattr(smoke.os, "getpgid", lambda _pid: 41)
     monkeypatch.setattr(smoke.os, "getsid", lambda _pid: 41)
@@ -772,6 +1011,7 @@ def test_bundle_smoke_rejects_reused_darwin_pid(
             {},
             digest,
             smoke.NativeHostObservation(marker, True, frozenset({41})),
+            smoke.time.monotonic() + 5,
         )
 
 
@@ -789,6 +1029,7 @@ def test_bundle_smoke_reports_closed_native_readiness_stage() -> None:
             renderer_ready=False,
             process_groups=frozenset(),
         ),
+        smoke.time.monotonic() + 5,
     )
 
     assert evidence is None
@@ -2462,6 +2703,7 @@ def _write_fake_tauri_release_smoke(path: Path) -> None:
                 "import os",
                 "from pathlib import Path",
                 "import subprocess",
+                "import time",
                 "",
                 "subprocess.Popen(['/bin/sh', '-c', 'sleep 60'])",
                 "evidence = {",
@@ -2489,6 +2731,7 @@ def _write_fake_tauri_release_smoke(path: Path) -> None:
                 "Path(os.environ['OPENEVO_RELEASE_SMOKE_EVIDENCE_PATH']).write_text(",
                 "    json.dumps(evidence, sort_keys=True) + '\\n', encoding='utf-8'",
                 ")",
+                "time.sleep(60)",
             ]
         )
         + "\n",

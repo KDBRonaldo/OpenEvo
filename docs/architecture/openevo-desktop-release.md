@@ -216,14 +216,19 @@ birth identity returned by `proc_pidinfo(PROC_PIDTBSDINFO)`. It then locates a
 single process in that group holding both an IPv4 `127.0.0.1` listening FD 3
 and a regular FD 4 with the marker-bound device, inode, and size. The SHA-256
 binding comes from the native host's already verified instance of that exact
-FD; `lsof` is not treated as a readable path capability after the private
-pathname has been unlinked. The separate
+FD. The private pathname remains inside the documented same-UID trust boundary
+until native cleanup; the smoke does not reopen an `lsof` pathname because the
+marker and live FD identity, rather than that pathname, are the observation
+authority. The separate
 `OPENEVO_DESKTOP_RENDERER_READY_V1` acknowledgement and an on-screen non-empty
 window are both required. Timeout output is restricted to a closed readiness
 stage and does not include process commands, paths, or credentials. The smoke
 signals only the still-live app process group that it created. Sidecar groups
-are terminated by the native host and parent-liveness watchdog; the smoke
-observes their disappearance but never signals a historical numeric PGID.
+are terminated by the native host and parent-liveness watchdog; on success and
+failure the smoke performs a bounded disappearance check but never signals a
+historical numeric PGID. All macOS probes share the launch readiness deadline,
+run in private process groups that are killed and reaped on timeout, and cap the
+number of sidecar-group members inspected in one observation pass.
 
 Every verified packaged launch also removes all inherited environment names with
 the PyInstaller-private `_PYI_` prefix and forces

@@ -45,6 +45,8 @@ NATIVE_PROCESS_MARKER_PREFIX = b"OPENEVO_DESKTOP_SIDECAR_PROCESS_"
 NATIVE_RENDERER_MARKER_PREFIX = b"OPENEVO_DESKTOP_RENDERER_READY_"
 NATIVE_HOST_LOG_MAX_BYTES = 64 * 1024
 NATIVE_HOST_LOG_MAX_LINES = 512
+NATIVE_GROUP_MAX_PROCESSES = 16
+PROBE_REAP_TIMEOUT_SECONDS = 2.0
 _NATIVE_PROCESS_MARKER_PATTERN = re.compile(
     rb"OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
     rb"pid=([1-9][0-9]{0,9}) pgid=([1-9][0-9]{0,9}) "
@@ -326,12 +328,34 @@ def _process_group_exists(process_group: int) -> bool:
     return True
 
 
+def _live_process_groups(process_groups: set[int], deadline: float) -> set[int]:
+    result = _run_probe(
+        ["ps", "-axo", "pgid=,stat="],
+        deadline=deadline,
+        timeout_cap=0.5,
+    )
+    if result is None or result.returncode != 0:
+        return {group for group in process_groups if _process_group_exists(group)}
+    live_groups: set[int] = set()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) != 2 or parts[1].startswith("Z"):
+            continue
+        try:
+            process_group = int(parts[0])
+        except ValueError:
+            continue
+        if process_group in process_groups:
+            live_groups.add(process_group)
+    return live_groups
+
+
 def _wait_for_groups_to_exit(process_groups: set[int], deadline: float) -> bool:
     while time.monotonic() < deadline:
-        if not any(_process_group_exists(group) for group in process_groups):
+        if not _live_process_groups(process_groups, deadline):
             return True
         time.sleep(0.05)
-    return not any(_process_group_exists(group) for group in process_groups)
+    return not _live_process_groups(process_groups, time.monotonic() + 0.5)
 
 
 def _kill_groups(process_groups: set[int], sig: signal.Signals) -> None:
@@ -342,18 +366,47 @@ def _kill_groups(process_groups: set[int], sig: signal.Signals) -> None:
             pass
 
 
-def _process_rows() -> list[tuple[int, int, int, str]]:
+def _run_probe(
+    arguments: list[str],
+    *,
+    deadline: float,
+    timeout_cap: float,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str] | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
     try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,pgid=,command="],
-            check=False,
-            capture_output=True,
+        process = subprocess.Popen(
+            arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
+            env=env,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SmokeFailure("Native process inventory is unavailable") from exc
-    if result.returncode != 0:
+    except OSError:
+        return None
+    try:
+        stdout, stderr = process.communicate(timeout=min(timeout_cap, remaining))
+    except subprocess.TimeoutExpired:
+        _kill_groups({process.pid}, signal.SIGKILL)
+        try:
+            process.communicate(timeout=PROBE_REAP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=PROBE_REAP_TIMEOUT_SECONDS)
+        return None
+    return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+
+
+def _process_rows(deadline: float) -> list[tuple[int, int, int, str]]:
+    result = _run_probe(
+        ["ps", "-axo", "pid=,ppid=,pgid=,command="],
+        deadline=deadline,
+        timeout_cap=5,
+    )
+    if result is None or result.returncode != 0:
         raise SmokeFailure("Native process inventory is unavailable")
     rows: list[tuple[int, int, int, str]] = []
     for line in result.stdout.splitlines():
@@ -367,8 +420,8 @@ def _process_rows() -> list[tuple[int, int, int, str]]:
     return rows
 
 
-def _descendants(root_pid: int) -> list[tuple[int, int, int, str]]:
-    rows = _process_rows()
+def _descendants(root_pid: int, deadline: float) -> list[tuple[int, int, int, str]]:
+    rows = _process_rows(deadline)
     descendants: set[int] = {root_pid}
     changed = True
     while changed:
@@ -498,7 +551,7 @@ def _darwin_process_birth_identity(pid: int) -> str | None:
     return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
 
 
-def _macos_renderer_ready(app_pid: int) -> bool:
+def _macos_renderer_ready(app_pid: int, deadline: float) -> bool:
     swift_probe = """
 import CoreGraphics
 import Foundation
@@ -518,17 +571,12 @@ print(ready ? "1" : "0")
 """
     environment = os.environ.copy()
     environment["OPENEVO_SMOKE_APP_PID"] = str(app_pid)
-    try:
-        swift = subprocess.run(
-            ["swift", "-e", swift_probe],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=environment,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        swift = None
+    swift = _run_probe(
+        ["swift", "-e", swift_probe],
+        deadline=deadline,
+        timeout_cap=10,
+        env=environment,
+    )
     if swift is not None and swift.returncode == 0:
         return swift.stdout.strip() == "1"
 
@@ -536,15 +584,12 @@ print(ready ? "1" : "0")
         'tell application "System Events" to tell first application process '
         f"whose unix id is {app_pid} to count windows"
     )
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    result = _run_probe(
+        ["osascript", "-e", script],
+        deadline=deadline,
+        timeout_cap=5,
+    )
+    if result is None:
         return False
     if result.returncode != 0:
         return False
@@ -557,26 +602,24 @@ print(ready ? "1" : "0")
 def _lsof_fd(
     pid: int,
     descriptor: int,
+    deadline: float,
 ) -> NativeFileDescriptorObservation:
     empty = NativeFileDescriptorObservation(None, None, None, None, None, None)
-    try:
-        result = subprocess.run(
-            [
-                "lsof",
-                "-nP",
-                "-a",
-                "-p",
-                str(pid),
-                "-d",
-                str(descriptor),
-                "-FnftsTDi",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    result = _run_probe(
+        [
+            "lsof",
+            "-nP",
+            "-a",
+            "-p",
+            str(pid),
+            "-d",
+            str(descriptor),
+            "-FnftsTDi",
+        ],
+        deadline=deadline,
+        timeout_cap=5,
+    )
+    if result is None:
         return empty
     if result.returncode != 0:
         return empty
@@ -639,9 +682,17 @@ def _macos_native_evidence(
     mach_o: dict[str, object],
     expected_sidecar_digest: str,
     native_observation: NativeHostObservation,
+    deadline: float,
 ) -> tuple[dict[str, object] | None, set[int], str]:
-    rows = _descendants(app_pid)
     process_groups = set(native_observation.process_groups)
+    if time.monotonic() >= deadline:
+        return None, process_groups, "probe_deadline_exhausted"
+    try:
+        rows = _descendants(app_pid, deadline)
+    except SmokeFailure:
+        if time.monotonic() >= deadline:
+            return None, process_groups, "probe_deadline_exhausted"
+        raise
     process_groups.update(row[2] for row in rows if row[2] > 0)
     marker = native_observation.active_process
     if marker is None:
@@ -676,9 +727,13 @@ def _macos_native_evidence(
 
     listener_seen = False
     sidecar_rows = [row for row in rows if row[2] == marker.process_group]
+    if len(sidecar_rows) > NATIVE_GROUP_MAX_PROCESSES:
+        raise SmokeFailure("Native host sidecar process group exceeded the observation limit")
     for pid, _parent, _group, _command in sidecar_rows:
-        listener = _lsof_fd(pid, 3)
-        executable_fd = _lsof_fd(pid, 4)
+        if time.monotonic() >= deadline:
+            return None, process_groups, "probe_deadline_exhausted"
+        listener = _lsof_fd(pid, 3, deadline)
+        executable_fd = _lsof_fd(pid, 4, deadline)
         listener_ready = _is_loopback_listener(listener)
         listener_seen = listener_seen or listener_ready
         if not listener_ready:
@@ -692,7 +747,7 @@ def _macos_native_evidence(
             continue
         if not native_observation.renderer_ready:
             return None, process_groups, "renderer_ack_absent"
-        if not _macos_renderer_ready(app_pid):
+        if not _macos_renderer_ready(app_pid, deadline):
             return None, process_groups, "renderer_window_absent"
         return (
             {
@@ -714,6 +769,32 @@ def _macos_native_evidence(
         process_groups,
         "executable_fd_unavailable" if listener_seen else "listener_fd_unavailable",
     )
+
+
+def _cleanup_launched_app(
+    process: subprocess.Popen[bytes],
+    process_groups: set[int],
+    *,
+    timeout_seconds: float,
+) -> bool:
+    termination_deadline = time.monotonic() + min(5.0, max(0.1, timeout_seconds))
+    if _live_process_groups({process.pid}, termination_deadline):
+        _kill_groups({process.pid}, signal.SIGTERM)
+    if process.poll() is None:
+        try:
+            process.wait(timeout=max(0.1, termination_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+    if _live_process_groups({process.pid}, termination_deadline):
+        _kill_groups({process.pid}, signal.SIGKILL)
+    if process.poll() is None:
+        try:
+            process.wait(timeout=max(0.1, termination_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=PROBE_REAP_TIMEOUT_SECONDS)
+    cleanup_deadline = time.monotonic() + min(15.0, max(2.0, timeout_seconds))
+    return _wait_for_groups_to_exit(process_groups, cleanup_deadline)
 
 
 def _read_emitted_evidence(
@@ -825,6 +906,7 @@ def smoke_bundle(
         evidence: dict[str, object] | None = None
         readiness_stage = "native_marker_absent"
         deadline = time.monotonic() + timeout_seconds
+        captured_error: BaseException | None = None
         try:
             while time.monotonic() < deadline:
                 native_observation = _drain_native_host_stderr(
@@ -840,6 +922,7 @@ def smoke_bundle(
                             mach_o,
                             binary_sha256["bundled_external_bin"],
                             native_observation,
+                            deadline,
                         )
                         process_groups.update(observed_groups)
                         if evidence is not None:
@@ -863,43 +946,43 @@ def smoke_bundle(
                     "Timed out waiting for OpenEvo Desktop app smoke evidence "
                     f"(stage={readiness_stage})"
                 )
-
-            _kill_groups({process.pid}, signal.SIGTERM)
-            cleanup_deadline = time.monotonic() + min(15.0, max(2.0, timeout_seconds))
-            try:
-                process.wait(timeout=min(5.0, max(0.1, cleanup_deadline - time.monotonic())))
-            except subprocess.TimeoutExpired:
-                pass
-            process_group_cleanup = _wait_for_groups_to_exit(process_groups, cleanup_deadline)
-            if not process_group_cleanup:
-                raise SmokeFailure("OpenEvo Desktop left an app or sidecar process group running")
-            _verify_binary_unchanged(
-                executable,
-                expected_identity=binary_identities["native_executable"],
-                expected_digest=binary_sha256["native_executable"],
-            )
-            _verify_binary_unchanged(
-                sidecar,
-                expected_identity=binary_identities["bundled_external_bin"],
-                expected_digest=binary_sha256["bundled_external_bin"],
-            )
-            evidence.pop("nonce", None)
-            evidence["process_group_cleanup"] = True
-            evidence["launch_origin"] = launch_origin
-            evidence["source_dmg"] = source_dmg_identity
-            evidence["binary_sha256"] = binary_sha256
-            if evidence_out is not None:
-                _write_evidence(evidence_out, evidence)
-            return evidence
+        except BaseException as exc:
+            captured_error = exc
         finally:
-            if process.poll() is None:
-                _kill_groups({process.pid}, signal.SIGKILL)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+            process_group_cleanup = _cleanup_launched_app(
+                process,
+                process_groups,
+                timeout_seconds=timeout_seconds,
+            )
             process.stderr.close()
+        if not process_group_cleanup:
+            cleanup_error = SmokeFailure(
+                "OpenEvo Desktop left an app or sidecar process group running"
+            )
+            if captured_error is not None:
+                raise cleanup_error from captured_error
+            raise cleanup_error
+        if captured_error is not None:
+            raise captured_error
+        assert evidence is not None
+        _verify_binary_unchanged(
+            executable,
+            expected_identity=binary_identities["native_executable"],
+            expected_digest=binary_sha256["native_executable"],
+        )
+        _verify_binary_unchanged(
+            sidecar,
+            expected_identity=binary_identities["bundled_external_bin"],
+            expected_digest=binary_sha256["bundled_external_bin"],
+        )
+        evidence.pop("nonce", None)
+        evidence["process_group_cleanup"] = True
+        evidence["launch_origin"] = launch_origin
+        evidence["source_dmg"] = source_dmg_identity
+        evidence["binary_sha256"] = binary_sha256
+        if evidence_out is not None:
+            _write_evidence(evidence_out, evidence)
+        return evidence
 
 
 def main(argv: list[str] | None = None) -> int:
