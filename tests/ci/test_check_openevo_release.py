@@ -436,7 +436,88 @@ def test_bundle_smoke_rejects_binary_replacement_during_launch(
         )
 
 
-def test_bundle_smoke_fd_observation_uses_prelaunch_sidecar_digest(
+def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credentials(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    native_log = tmp_path / "native-host.stderr"
+    native_log.write_text(
+        "\n".join(
+            [
+                "unrelated bounded native diagnostic",
+                (
+                    "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
+                    "pid=41 pgid=41 sid=41 birth=darwin:1700000000:123 "
+                    "executable_device=42 executable_inode=98 "
+                    f"executable_sha256={'a' * 64} executable_size=17"
+                ),
+                (
+                    "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
+                    "pid=42 pgid=42 sid=42 birth=darwin:1700000001:456 "
+                    "executable_device=42 executable_inode=99 "
+                    f"executable_sha256={'b' * 64} executable_size=19"
+                ),
+                f"OPENEVO_DESKTOP_RENDERER_READY_V1 {RELEASE_OPENAPI_SHA256}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    observation = smoke._parse_native_host_observation(native_log.read_bytes())
+
+    assert observation.active_process.pid == 42
+    assert observation.active_process.executable_sha256 == "b" * 64
+    assert observation.active_process.executable_size == 19
+    assert observation.active_process.executable_device == 42
+    assert observation.active_process.executable_inode == 99
+    assert observation.renderer_ready is True
+    assert observation.process_groups == frozenset({41, 42})
+    assert "readiness" not in repr(observation)
+    assert "session_token" not in repr(observation)
+
+
+def test_bundle_smoke_rejects_malformed_native_process_marker(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    native_log = tmp_path / "native-host.stderr"
+    native_log.write_text(
+        "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 pid=41 secret=do-not-accept\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="process marker is malformed"):
+        smoke._parse_native_host_observation(native_log.read_bytes())
+
+
+def test_bundle_smoke_bounds_native_log_and_resets_stale_renderer_ack() -> None:
+    smoke = _load_bundle_smoke_module()
+    process_marker = (
+        "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
+        "pid={pid} pgid={pid} sid={pid} birth=darwin:{seconds}:123 "
+        "executable_device=42 executable_inode={inode} "
+        f"executable_sha256={'a' * 64} executable_size=17"
+    )
+    payload = "\n".join(
+        [
+            process_marker.format(pid=41, seconds=1700000000, inode=98),
+            f"OPENEVO_DESKTOP_RENDERER_READY_V1 {RELEASE_OPENAPI_SHA256}",
+            process_marker.format(pid=42, seconds=1700000001, inode=99),
+        ]
+    ).encode("ascii") + b"\n"
+
+    observation = smoke._parse_native_host_observation(payload)
+
+    assert observation.active_process.pid == 42
+    assert observation.renderer_ready is False
+    with pytest.raises(smoke.SmokeFailure, match="exceeded the byte limit"):
+        smoke._parse_native_host_observation(b"x" * (smoke.NATIVE_HOST_LOG_MAX_BYTES + 1))
+    with pytest.raises(smoke.SmokeFailure, match="renderer marker is malformed"):
+        smoke._parse_native_host_observation(
+            payload + f"OPENEVO_DESKTOP_RENDERER_READY_V1 {'b' * 64}\n".encode("ascii")
+        )
+
+
+def test_bundle_smoke_observes_unlinked_fd_from_native_digest_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,26 +531,269 @@ def test_bundle_smoke_fd_observation_uses_prelaunch_sidecar_digest(
         "_descendants",
         lambda _pid: [(41, 40, 41, "openevo-desktop-sidecar")],
     )
+    monkeypatch.setattr(smoke.os, "getpgid", lambda _pid: 41)
+    monkeypatch.setattr(smoke.os, "getsid", lambda _pid: 41)
+    monkeypatch.setattr(
+        smoke,
+        "_darwin_process_birth_identity",
+        lambda _pid: "darwin:1700000000:123",
+    )
     monkeypatch.setattr(
         smoke,
         "_lsof_fd",
-        lambda _pid, descriptor: (
-            ("IPv4", "127.0.0.1:1234 (LISTEN)")
-            if descriptor == 3
-            else ("REG", str(sidecar))
+        lambda _pid, descriptor: smoke.NativeFileDescriptorObservation(
+            file_type="IPv4" if descriptor == 3 else "REG",
+            name=(
+                "127.0.0.1:1234"
+                if descriptor == 3
+                else "/private/tmp/openevo-sidecar (deleted)"
+            ),
+            size=None if descriptor == 3 else len(sidecar.read_bytes()),
+            tcp_state="LISTEN" if descriptor == 3 else None,
+            device=None if descriptor == 3 else 42,
+            inode=None if descriptor == 3 else 99,
         ),
     )
+    monkeypatch.setattr(smoke, "_macos_renderer_ready", lambda _pid: True)
+    digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    observation = smoke.NativeHostObservation(
+        active_process=smoke.NativeSidecarProcessMarker(
+            pid=41,
+            process_group=41,
+            session_id=41,
+            birth_identity="darwin:1700000000:123",
+            executable_device=42,
+            executable_inode=99,
+            executable_sha256=digest,
+            executable_size=len(sidecar.read_bytes()),
+        ),
+        renderer_ready=True,
+        process_groups=frozenset({41}),
+    )
 
-    evidence, process_groups = smoke._macos_native_evidence(
+    evidence, process_groups, stage = smoke._macos_native_evidence(
         40,
         executable,
         sidecar,
         {},
-        "f" * 64,
+        digest,
+        observation,
+    )
+
+    assert evidence is not None
+    assert evidence["native_listener_fd_handoff"] is True
+    assert evidence["native_executable_fd_handoff"] is True
+    assert process_groups == {41}
+    assert stage == "ready"
+
+    monkeypatch.setattr(
+        smoke,
+        "_lsof_fd",
+        lambda _pid, descriptor: smoke.NativeFileDescriptorObservation(
+            file_type="IPv4" if descriptor == 3 else "REG",
+            name="127.0.0.1:1234" if descriptor == 3 else "(deleted)",
+            size=None if descriptor == 3 else len(sidecar.read_bytes()),
+            tcp_state="LISTEN" if descriptor == 3 else None,
+            device=None if descriptor == 3 else 42,
+            inode=None if descriptor == 3 else 100,
+        ),
+    )
+    rejected, _groups, rejected_stage = smoke._macos_native_evidence(
+        40,
+        executable,
+        sidecar,
+        {},
+        digest,
+        observation,
+    )
+    assert rejected is None
+    assert rejected_stage == "executable_fd_unavailable"
+
+
+def test_bundle_smoke_parses_lsof_machine_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    monkeypatch.setattr(
+        smoke.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments,
+            0,
+            "p41\nf3\ntIPv4\nD0x2a\ns17\ni99\nn127.0.0.1:1234\nTST=LISTEN\n",
+            "",
+        ),
+    )
+
+    observation = smoke._lsof_fd(41, 3)
+
+    assert observation == smoke.NativeFileDescriptorObservation(
+        file_type="IPv4",
+        name="127.0.0.1:1234",
+        size=17,
+        tcp_state="LISTEN",
+        device=42,
+        inode=99,
+    )
+    assert smoke._is_loopback_listener(observation) is True
+
+
+def test_bundle_smoke_bounds_native_probe_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    monkeypatch.setattr(
+        smoke.subprocess,
+        "run",
+        lambda arguments, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(arguments, 5)
+        ),
+    )
+
+    assert smoke._lsof_fd(41, 4) == smoke.NativeFileDescriptorObservation(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    assert smoke._macos_renderer_ready(40) is False
+
+
+def test_bundle_smoke_uses_the_darwin_proc_bsdinfo_layout() -> None:
+    smoke = _load_bundle_smoke_module()
+
+    assert smoke.ctypes.sizeof(smoke._DarwinProcBsdInfo) == 136
+
+
+def test_bundle_smoke_darwin_native_probes_match_live_kernel_state(
+    tmp_path: Path,
+) -> None:
+    import socket
+
+    smoke = _load_bundle_smoke_module()
+    if smoke.sys.platform != "darwin":
+        pytest.skip("requires macOS libproc and lsof")
+
+    birth_identity = smoke._darwin_process_birth_identity(smoke.os.getpid())
+    assert birth_identity is not None
+    assert smoke.re.fullmatch(r"darwin:[1-9][0-9]*:[0-9]{1,6}", birth_identity)
+
+    payload = tmp_path / "fd-payload"
+    payload.write_bytes(b"verified fd payload")
+    with payload.open("rb") as stream:
+        metadata = smoke.os.fstat(stream.fileno())
+        observed = smoke._lsof_fd(smoke.os.getpid(), stream.fileno())
+        assert observed.file_type == "REG"
+        assert observed.device == metadata.st_dev
+        assert observed.inode == metadata.st_ino
+        assert observed.size == metadata.st_size
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        observed = smoke._lsof_fd(smoke.os.getpid(), listener.fileno())
+        assert smoke._is_loopback_listener(observed) is True
+
+
+def test_bundle_smoke_rejects_native_marker_for_different_sidecar(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    sidecar = tmp_path / "openevo-desktop-sidecar"
+    sidecar.write_bytes(b"observed sidecar")
+    executable = tmp_path / "OpenEvo Desktop"
+    executable.write_bytes(b"native executable")
+    observation = smoke.NativeHostObservation(
+        active_process=smoke.NativeSidecarProcessMarker(
+            pid=41,
+            process_group=41,
+            session_id=41,
+            birth_identity="darwin:1700000000:123",
+            executable_device=42,
+            executable_inode=99,
+            executable_sha256="f" * 64,
+            executable_size=sidecar.stat().st_size,
+        ),
+        renderer_ready=True,
+        process_groups=frozenset({41}),
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="different packaged sidecar"):
+        smoke._macos_native_evidence(
+            40,
+            executable,
+            sidecar,
+            {},
+            hashlib.sha256(sidecar.read_bytes()).hexdigest(),
+            observation,
+        )
+
+
+def test_bundle_smoke_rejects_reused_darwin_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    sidecar = tmp_path / "openevo-desktop-sidecar"
+    sidecar.write_bytes(b"observed sidecar")
+    executable = tmp_path / "OpenEvo Desktop"
+    executable.write_bytes(b"native executable")
+    digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    marker = smoke.NativeSidecarProcessMarker(
+        pid=41,
+        process_group=41,
+        session_id=41,
+        birth_identity="darwin:1700000000:123",
+        executable_device=42,
+        executable_inode=99,
+        executable_sha256=digest,
+        executable_size=sidecar.stat().st_size,
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_descendants",
+        lambda _pid: [(41, 40, 41, "openevo-desktop-sidecar")],
+    )
+    monkeypatch.setattr(smoke.os, "getpgid", lambda _pid: 41)
+    monkeypatch.setattr(smoke.os, "getsid", lambda _pid: 41)
+    monkeypatch.setattr(
+        smoke,
+        "_darwin_process_birth_identity",
+        lambda _pid: "darwin:1700000001:456",
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="birth identity changed"):
+        smoke._macos_native_evidence(
+            40,
+            executable,
+            sidecar,
+            {},
+            digest,
+            smoke.NativeHostObservation(marker, True, frozenset({41})),
+        )
+
+
+def test_bundle_smoke_reports_closed_native_readiness_stage() -> None:
+    smoke = _load_bundle_smoke_module()
+
+    evidence, process_groups, stage = smoke._macos_native_evidence(
+        40,
+        Path("OpenEvo Desktop"),
+        Path("openevo-desktop-sidecar"),
+        {},
+        "a" * 64,
+        smoke.NativeHostObservation(
+            active_process=None,
+            renderer_ready=False,
+            process_groups=frozenset(),
+        ),
     )
 
     assert evidence is None
-    assert process_groups == {41}
+    assert process_groups == set()
+    assert stage == "native_marker_absent"
 
 
 def test_accepts_valid_openevo_release_wheel(tmp_path: Path) -> None:

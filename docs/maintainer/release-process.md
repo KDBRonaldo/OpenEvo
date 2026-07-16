@@ -168,11 +168,23 @@ path because the DMG bundler may remove that directory after packaging.
 reports by size and SHA256.
 Before launch, the smoke rejects symbolic links in the app root, `Info.plist`
 path, Tauri executable path, sidecar path, and their in-bundle ancestors. It
-captures each binary's pre-launch device/inode/size identity and digest, uses
-that digest for the sidecar FD observation, and rechecks both paths after
-process cleanup. Candidate JSON parsing rejects duplicate keys at every nesting
-level, so a last-key-wins parser cannot reinterpret the closed evidence
-contract.
+captures each binary's pre-launch device/inode/size identity and digest. The
+Rust native host emits a credential-free V2 marker binding its verified
+private executable FD to that sidecar digest plus its private device, inode,
+and size. The smoke binds the marker PID to the current app descendant,
+process group, session, and live Darwin birth identity; requires FD 3 to be an
+IPv4 loopback listener; and requires FD 4 in the same process to match the
+declared regular-file device, inode, and size. It also requires both the
+renderer-ready marker and a visible window. It does not reopen the private
+executable pathname because the native host intentionally unlinks it after
+spawn. Both packaged paths are rechecked after process cleanup. Native stderr
+uses a nonblocking bounded pipe, parsing remains byte/line bounded, and timeout
+output uses only closed readiness stage names. Only the app process group is
+signalled; native cleanup and the parent-liveness watchdog own sidecar
+termination, while the smoke verifies every observed group disappears.
+Candidate JSON parsing
+rejects duplicate keys at every nesting level, so a last-key-wins parser cannot
+reinterpret the closed evidence contract.
 The preceding tool probe locates an executable `lipo` through
 `xcrun --find lipo`; it does not use the unsupported `lipo -version` flag.
 Availability alone is not release evidence: both real app launches still run

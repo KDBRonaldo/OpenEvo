@@ -4,23 +4,29 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+from typing import NamedTuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from smoke_openevo_desktop_sidecar import SmokeFailure  # noqa: E402
+from smoke_openevo_desktop_sidecar import (  # noqa: E402
+    EXPECTED_DESKTOP_OPENAPI_SHA256,
+    SmokeFailure,
+)
 
 
 SIDECAR_NAME = "openevo-desktop-sidecar"
@@ -35,6 +41,73 @@ REQUIRED_BOOLEAN_EVIDENCE = (
     "native_executable_fd_handoff",
 )
 MACH_O_ARCHITECTURES = {"arm64", "x86_64"}
+NATIVE_PROCESS_MARKER_PREFIX = b"OPENEVO_DESKTOP_SIDECAR_PROCESS_"
+NATIVE_RENDERER_MARKER_PREFIX = b"OPENEVO_DESKTOP_RENDERER_READY_"
+NATIVE_HOST_LOG_MAX_BYTES = 64 * 1024
+NATIVE_HOST_LOG_MAX_LINES = 512
+_NATIVE_PROCESS_MARKER_PATTERN = re.compile(
+    rb"OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
+    rb"pid=([1-9][0-9]{0,9}) pgid=([1-9][0-9]{0,9}) "
+    rb"sid=([1-9][0-9]{0,9}) birth=(darwin:([1-9][0-9]{0,19}):([0-9]{1,6})) "
+    rb"executable_device=([1-9][0-9]{0,19}) executable_inode=([1-9][0-9]{0,19}) "
+    rb"executable_sha256=([0-9a-f]{64}) executable_size=([1-9][0-9]{0,19})"
+)
+_NATIVE_RENDERER_MARKER_PATTERN = re.compile(
+    rb"OPENEVO_DESKTOP_RENDERER_READY_V1 ([0-9a-f]{64})"
+)
+
+
+class NativeSidecarProcessMarker(NamedTuple):
+    pid: int
+    process_group: int
+    session_id: int
+    birth_identity: str
+    executable_device: int
+    executable_inode: int
+    executable_sha256: str
+    executable_size: int
+
+
+class NativeHostObservation(NamedTuple):
+    active_process: NativeSidecarProcessMarker | None
+    renderer_ready: bool
+    process_groups: frozenset[int]
+
+
+class NativeFileDescriptorObservation(NamedTuple):
+    file_type: str | None
+    name: str | None
+    size: int | None
+    tcp_state: str | None
+    device: int | None
+    inode: int | None
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
 
 
 def _bundle_path_metadata(
@@ -270,12 +343,18 @@ def _kill_groups(process_groups: set[int], sig: signal.Signals) -> None:
 
 
 def _process_rows() -> list[tuple[int, int, int, str]]:
-    result = subprocess.run(
-        ["ps", "-axo", "pid=,ppid=,pgid=,command="],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SmokeFailure("Native process inventory is unavailable") from exc
+    if result.returncode != 0:
+        raise SmokeFailure("Native process inventory is unavailable")
     rows: list[tuple[int, int, int, str]] = []
     for line in result.stdout.splitlines():
         parts = line.strip().split(maxsplit=3)
@@ -301,6 +380,124 @@ def _descendants(root_pid: int) -> list[tuple[int, int, int, str]]:
     return [row for row in rows if row[0] in descendants and row[0] != root_pid]
 
 
+def _parse_native_host_observation(payload: bytes) -> NativeHostObservation:
+    if len(payload) > NATIVE_HOST_LOG_MAX_BYTES:
+        raise SmokeFailure("Native host smoke diagnostics exceeded the byte limit")
+    lines = payload.splitlines()
+    if payload and not payload.endswith((b"\n", b"\r")):
+        lines = lines[:-1]
+    if len(lines) > NATIVE_HOST_LOG_MAX_LINES:
+        raise SmokeFailure("Native host smoke diagnostics exceeded the line limit")
+
+    active_process: NativeSidecarProcessMarker | None = None
+    renderer_ready = False
+    process_groups: set[int] = set()
+    for line in lines:
+        if line.startswith(NATIVE_PROCESS_MARKER_PREFIX):
+            matched = _NATIVE_PROCESS_MARKER_PATTERN.fullmatch(line)
+            if matched is None:
+                raise SmokeFailure("Native host sidecar process marker is malformed")
+            pid, process_group, session_id = (
+                int(matched.group(index)) for index in (1, 2, 3)
+            )
+            birth_seconds = int(matched.group(5))
+            birth_microseconds = int(matched.group(6))
+            executable_device = int(matched.group(7))
+            executable_inode = int(matched.group(8))
+            executable_size = int(matched.group(10))
+            if (
+                pid > 2**31 - 1
+                or process_group != pid
+                or session_id != pid
+                or birth_seconds <= 0
+                or birth_microseconds >= 1_000_000
+                or executable_device > 2**64 - 1
+                or executable_inode > 2**64 - 1
+                or executable_size > 2**63 - 1
+            ):
+                raise SmokeFailure("Native host sidecar process marker is malformed")
+            active_process = NativeSidecarProcessMarker(
+                pid=pid,
+                process_group=process_group,
+                session_id=session_id,
+                birth_identity=matched.group(4).decode("ascii"),
+                executable_device=executable_device,
+                executable_inode=executable_inode,
+                executable_sha256=matched.group(9).decode("ascii"),
+                executable_size=executable_size,
+            )
+            process_groups.add(process_group)
+            renderer_ready = False
+            continue
+        if line.startswith(NATIVE_RENDERER_MARKER_PREFIX):
+            matched = _NATIVE_RENDERER_MARKER_PATTERN.fullmatch(line)
+            if (
+                matched is None
+                or active_process is None
+                or matched.group(1).decode("ascii") != EXPECTED_DESKTOP_OPENAPI_SHA256
+            ):
+                raise SmokeFailure("Native host renderer marker is malformed")
+            renderer_ready = True
+
+    return NativeHostObservation(
+        active_process=active_process,
+        renderer_ready=renderer_ready,
+        process_groups=frozenset(process_groups),
+    )
+
+
+def _drain_native_host_stderr(
+    stream: object,
+    buffer: bytearray,
+) -> NativeHostObservation:
+    fileno = getattr(stream, "fileno", None)
+    if not callable(fileno):
+        raise SmokeFailure("Native host smoke diagnostics are unavailable")
+    while True:
+        try:
+            chunk = os.read(fileno(), 4096)
+        except BlockingIOError:
+            break
+        except OSError as exc:
+            raise SmokeFailure("Native host smoke diagnostics are unreadable") from exc
+        if not chunk:
+            break
+        if len(buffer) + len(chunk) > NATIVE_HOST_LOG_MAX_BYTES:
+            raise SmokeFailure("Native host smoke diagnostics exceeded the byte limit")
+        buffer.extend(chunk)
+    return _parse_native_host_observation(bytes(buffer))
+
+
+def _darwin_process_birth_identity(pid: int) -> str | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidinfo = library.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+        info = _DarwinProcBsdInfo()
+        size = ctypes.sizeof(info)
+        result = proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+    except (AttributeError, OSError, ValueError):
+        return None
+    if (
+        result != size
+        or info.pbi_pid != pid
+        or info.pbi_pgid == 0
+        or info.pbi_start_tvsec == 0
+        or info.pbi_start_tvusec >= 1_000_000
+    ):
+        return None
+    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+
+
 def _macos_renderer_ready(app_pid: int) -> bool:
     swift_probe = """
 import CoreGraphics
@@ -321,28 +518,34 @@ print(ready ? "1" : "0")
 """
     environment = os.environ.copy()
     environment["OPENEVO_SMOKE_APP_PID"] = str(app_pid)
-    swift = subprocess.run(
-        ["swift", "-e", swift_probe],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        env=environment,
-    )
-    if swift.returncode == 0:
+    try:
+        swift = subprocess.run(
+            ["swift", "-e", swift_probe],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        swift = None
+    if swift is not None and swift.returncode == 0:
         return swift.stdout.strip() == "1"
 
     script = (
         'tell application "System Events" to tell first application process '
         f"whose unix id is {app_pid} to count windows"
     )
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     if result.returncode != 0:
         return False
     try:
@@ -351,19 +554,82 @@ print(ready ? "1" : "0")
         return False
 
 
-def _lsof_fd(pid: int, descriptor: int) -> tuple[str | None, str | None]:
-    result = subprocess.run(
-        ["lsof", "-nP", "-a", "-p", str(pid), "-d", str(descriptor), "-Fnft"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+def _lsof_fd(
+    pid: int,
+    descriptor: int,
+) -> NativeFileDescriptorObservation:
+    empty = NativeFileDescriptorObservation(None, None, None, None, None, None)
+    try:
+        result = subprocess.run(
+            [
+                "lsof",
+                "-nP",
+                "-a",
+                "-p",
+                str(pid),
+                "-d",
+                str(descriptor),
+                "-FnftsTDi",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return empty
     if result.returncode != 0:
-        return None, None
+        return empty
     file_type = next((line[1:] for line in result.stdout.splitlines() if line.startswith("t")), None)
     name = next((line[1:] for line in result.stdout.splitlines() if line.startswith("n")), None)
-    return file_type, name
+    size_text = next(
+        (line[1:] for line in result.stdout.splitlines() if line.startswith("s")),
+        None,
+    )
+    try:
+        size = int(size_text) if size_text is not None else None
+    except ValueError:
+        size = None
+    tcp_state = next(
+        (
+            line.removeprefix("TST=")
+            for line in result.stdout.splitlines()
+            if line.startswith("TST=")
+        ),
+        None,
+    )
+    device_text = next(
+        (line[1:] for line in result.stdout.splitlines() if line.startswith("D")),
+        None,
+    )
+    inode_text = next(
+        (line[1:] for line in result.stdout.splitlines() if line.startswith("i")),
+        None,
+    )
+    try:
+        device = int(device_text, 16) if device_text is not None else None
+        inode = int(inode_text) if inode_text is not None else None
+    except ValueError:
+        device = None
+        inode = None
+    return NativeFileDescriptorObservation(
+        file_type=file_type,
+        name=name,
+        size=size,
+        tcp_state=tcp_state,
+        device=device,
+        inode=inode,
+    )
+
+
+def _is_loopback_listener(observation: NativeFileDescriptorObservation) -> bool:
+    if observation.file_type != "IPv4" or observation.name is None:
+        return False
+    if observation.tcp_state != "LISTEN" and not observation.name.endswith(" (LISTEN)"):
+        return False
+    normalized_name = observation.name.removesuffix(" (LISTEN)")
+    matched = re.search(r"(?:^|\s)127\.0\.0\.1:([1-9][0-9]{0,4})$", normalized_name)
+    return matched is not None and int(matched.group(1)) <= 65_535
 
 
 def _macos_native_evidence(
@@ -372,31 +638,68 @@ def _macos_native_evidence(
     sidecar: Path,
     mach_o: dict[str, object],
     expected_sidecar_digest: str,
-) -> tuple[dict[str, object] | None, set[int]]:
-    sidecar_rows = [row for row in _descendants(app_pid) if SIDECAR_NAME in row[3]]
-    process_groups = {row[2] for row in sidecar_rows if row[2] > 0}
+    native_observation: NativeHostObservation,
+) -> tuple[dict[str, object] | None, set[int], str]:
+    rows = _descendants(app_pid)
+    process_groups = set(native_observation.process_groups)
+    process_groups.update(row[2] for row in rows if row[2] > 0)
+    marker = native_observation.active_process
+    if marker is None:
+        return None, process_groups, "native_marker_absent"
+
+    expected_sidecar_size = _file_identity(sidecar)[2]
+    if (
+        marker.executable_sha256 != expected_sidecar_digest
+        or marker.executable_size != expected_sidecar_size
+    ):
+        raise SmokeFailure("Native host process marker identifies a different packaged sidecar")
+
+    marker_row = next((row for row in rows if row[0] == marker.pid), None)
+    if marker_row is None:
+        return None, process_groups, "native_process_unavailable"
+    try:
+        observed_group = os.getpgid(marker.pid)
+        observed_session = os.getsid(marker.pid)
+    except (OSError, ProcessLookupError):
+        return None, process_groups, "native_process_unavailable"
+    if (
+        marker_row[2] != marker.process_group
+        or observed_group != marker.process_group
+        or observed_session != marker.session_id
+    ):
+        raise SmokeFailure("Native host sidecar process identity changed during smoke")
+    observed_birth_identity = _darwin_process_birth_identity(marker.pid)
+    if observed_birth_identity is None:
+        return None, process_groups, "native_process_unavailable"
+    if observed_birth_identity != marker.birth_identity:
+        raise SmokeFailure("Native host sidecar birth identity changed during smoke")
+
+    listener_seen = False
+    sidecar_rows = [row for row in rows if row[2] == marker.process_group]
     for pid, _parent, _group, _command in sidecar_rows:
-        listener_type, listener_name = _lsof_fd(pid, 3)
-        executable_type, executable_name = _lsof_fd(pid, 4)
-        if listener_type not in {"IPv4", "IPv6"} or not listener_name:
+        listener = _lsof_fd(pid, 3)
+        executable_fd = _lsof_fd(pid, 4)
+        listener_ready = _is_loopback_listener(listener)
+        listener_seen = listener_seen or listener_ready
+        if not listener_ready:
             continue
-        if "(LISTEN)" not in listener_name:
+        if (
+            executable_fd.file_type != "REG"
+            or executable_fd.size != marker.executable_size
+            or executable_fd.device != marker.executable_device
+            or executable_fd.inode != marker.executable_inode
+        ):
             continue
-        if executable_type != "REG" or not executable_name:
-            continue
-        executable_fd_path = Path(executable_name)
-        try:
-            fd_digest = _sha256(executable_fd_path)
-        except OSError:
-            continue
-        if fd_digest != expected_sidecar_digest:
-            continue
+        if not native_observation.renderer_ready:
+            return None, process_groups, "renderer_ack_absent"
+        if not _macos_renderer_ready(app_pid):
+            return None, process_groups, "renderer_window_absent"
         return (
             {
                 "schema_version": EVIDENCE_SCHEMA_VERSION,
                 "native_executable": executable.name,
                 "bundled_external_bin": sidecar.name,
-                "renderer_ready": _macos_renderer_ready(app_pid),
+                "renderer_ready": True,
                 "sidecar_ready": True,
                 "bundled_external_bin_resolved": True,
                 "native_listener_fd_handoff": True,
@@ -404,8 +707,13 @@ def _macos_native_evidence(
                 "mach_o": mach_o,
             },
             process_groups,
+            "ready",
         )
-    return None, process_groups
+    return (
+        None,
+        process_groups,
+        "executable_fd_unavailable" if listener_seen else "listener_fd_unavailable",
+    )
 
 
 def _read_emitted_evidence(
@@ -489,31 +797,52 @@ def smoke_bundle(
                 "OPENEVO_RELEASE_SMOKE_NONCE": nonce,
             }
         )
-        process = subprocess.Popen(
-            [str(executable)],
-            cwd=app.parent,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        try:
+            process = subprocess.Popen(
+                [str(executable)],
+                cwd=app.parent,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise SmokeFailure("OpenEvo Desktop native executable could not be launched") from exc
+        if process.stderr is None:
+            process.kill()
+            process.wait(timeout=5)
+            raise SmokeFailure("Native host smoke diagnostics are unavailable")
+        try:
+            os.set_blocking(process.stderr.fileno(), False)
+        except OSError as exc:
+            process.kill()
+            process.wait(timeout=5)
+            process.stderr.close()
+            raise SmokeFailure("Native host smoke diagnostics are unavailable") from exc
+        native_stderr_buffer = bytearray()
         process_groups = {process.pid}
         evidence: dict[str, object] | None = None
+        readiness_stage = "native_marker_absent"
         deadline = time.monotonic() + timeout_seconds
         try:
             while time.monotonic() < deadline:
+                native_observation = _drain_native_host_stderr(
+                    process.stderr,
+                    native_stderr_buffer,
+                )
                 if sys.platform == "darwin":
                     if process.poll() is None:
-                        evidence, observed_groups = _macos_native_evidence(
+                        evidence, observed_groups, readiness_stage = _macos_native_evidence(
                             process.pid,
                             executable,
                             sidecar,
                             mach_o,
                             binary_sha256["bundled_external_bin"],
+                            native_observation,
                         )
                         process_groups.update(observed_groups)
-                        if evidence is not None and evidence["renderer_ready"] is True:
+                        if evidence is not None:
                             break
                 else:
                     evidence = _read_emitted_evidence(
@@ -530,7 +859,10 @@ def smoke_bundle(
                     )
                 time.sleep(0.1)
             if evidence is None:
-                raise SmokeFailure("Timed out waiting for OpenEvo Desktop app smoke evidence")
+                raise SmokeFailure(
+                    "Timed out waiting for OpenEvo Desktop app smoke evidence "
+                    f"(stage={readiness_stage})"
+                )
 
             _kill_groups({process.pid}, signal.SIGTERM)
             cleanup_deadline = time.monotonic() + min(15.0, max(2.0, timeout_seconds))
@@ -560,12 +892,14 @@ def smoke_bundle(
                 _write_evidence(evidence_out, evidence)
             return evidence
         finally:
-            _kill_groups(process_groups, signal.SIGKILL)
+            if process.poll() is None:
+                _kill_groups({process.pid}, signal.SIGKILL)
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+            process.stderr.close()
 
 
 def main(argv: list[str] | None = None) -> int:

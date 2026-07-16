@@ -81,8 +81,12 @@ The repository currently provides:
   only the architecture reported by `rustc --print host-tuple`. Both the app
   inside the mounted exact candidate DMG and its detached copy launch the real
   `Contents/MacOS` Tauri executable. The smoke records a visible renderer
-  window, packaged sidecar readiness, inherited listener FD 3, executable FD 4
-  matching the bundled externalBin bytes, and bounded process-group cleanup.
+  window, the renderer's native-ready acknowledgement, packaged sidecar
+  readiness, inherited listener FD 3, executable FD 4, and bounded
+  process-group cleanup. A credential-free native process marker binds the
+  observed process group and FD 4 device, inode, and size to the digest that
+  Rust computed from the verified bundled externalBin bytes; the observer
+  never reopens the intentionally unlinked private launch pathname.
   The dependent Linux job downloads the complete candidate manifest and
   installs, framework-verifies, and service-smokes the same final Core wheel
   bytes. Only after both jobs pass does a write-scoped job create an unsigned
@@ -198,6 +202,28 @@ macOS pathname is still inside the phase-one same-UID trust boundary: a same-UID
 process can race replacement after identity validation and before a later
 pathname-based `execvp`. Code signing or notarization alone does not close this
 pathname TOCTOU, and this design does not claim otherwise.
+
+For release observation, the native host emits the closed
+`OPENEVO_DESKTOP_SIDECAR_PROCESS_V2` marker only for a packaged launch. It
+contains PID, process-group ID, session ID, Darwin birth identity, verified
+executable device/inode/size, and executable SHA-256; it contains no instance,
+readiness, session, or handoff credential. The macOS app smoke drains this
+marker through a nonblocking size-bounded pipe, follows the latest lifecycle
+when React
+StrictMode cancels an earlier bootstrap, and requires the live marker PID to
+remain a descendant with the same process group, session, and exact Darwin
+birth identity returned by `proc_pidinfo(PROC_PIDTBSDINFO)`. It then locates a
+single process in that group holding both an IPv4 `127.0.0.1` listening FD 3
+and a regular FD 4 with the marker-bound device, inode, and size. The SHA-256
+binding comes from the native host's already verified instance of that exact
+FD; `lsof` is not treated as a readable path capability after the private
+pathname has been unlinked. The separate
+`OPENEVO_DESKTOP_RENDERER_READY_V1` acknowledgement and an on-screen non-empty
+window are both required. Timeout output is restricted to a closed readiness
+stage and does not include process commands, paths, or credentials. The smoke
+signals only the still-live app process group that it created. Sidecar groups
+are terminated by the native host and parent-liveness watchdog; the smoke
+observes their disappearance but never signals a historical numeric PGID.
 
 Every verified packaged launch also removes all inherited environment names with
 the PyInstaller-private `_PYI_` prefix and forces

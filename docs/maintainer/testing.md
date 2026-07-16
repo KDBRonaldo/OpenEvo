@@ -199,9 +199,15 @@ The packaging-level native smoke is
 `scripts/ci/smoke_openevo_desktop_bundle.py`. It reads
 `CFBundleExecutable` from `Info.plist` and launches that exact
 `Contents/MacOS` process; directly executing the bundled sidecar is not app
-evidence. On macOS it requires a renderer window, the packaged sidecar listener
-on inherited FD 3, executable FD 4 whose bytes match the bundled externalBin,
-and disappearance of the captured app/sidecar process groups after main-app
+evidence. On macOS it requires the credential-free V2 native process marker,
+the renderer-ready marker, a visible renderer window, the packaged sidecar's
+IPv4 loopback listener on inherited FD 3, and a regular executable FD 4 whose
+device, inode, and size match the native marker whose verified digest binds it
+to the bundled externalBin. The marker PID's Darwin birth identity is re-read
+with `proc_pidinfo(PROC_PIDTBSDINFO)` before FD observation.
+The private launch pathname is intentionally unlinked after spawn, so the
+smoke must not try to reopen the pathname reported by `lsof`. It also requires
+disappearance of every captured app/sidecar process group after main-app
 termination. Candidate runs retain separate `app-bundle-smoke.json` and
 `dmg-copy-smoke.json` outputs. The former declares `launch_origin=mounted_dmg`;
 the latter declares `launch_origin=detached_copy` after `ditto` and a successful
@@ -217,8 +223,19 @@ temporary-directory alias before exercising no-follow path traversal; the
 production traversal remains strict. The bundle smoke also rejects symbolic
 links in the app, `Info.plist`, Tauri executable, sidecar, or their in-bundle
 ancestors and revalidates binary identity and digest after cleanup. Candidate
-JSON fixtures cover duplicate keys at both top-level and nested locations. Both
-macOS gates additionally repeat the
+JSON fixtures cover duplicate keys at both top-level and nested locations.
+Native stderr is drained through a nonblocking bounded pipe and marker parsing
+is byte/line bounded. StrictMode lifecycle
+replacement selects the latest process marker while retaining all observed
+process groups for disappearance checks. Only the live app group created by
+the smoke may be signalled; historical sidecar PGIDs are never signalled. A
+failure reports only one closed stage:
+`native_marker_absent`, `native_process_unavailable`,
+`listener_fd_unavailable`, `executable_fd_unavailable`,
+`renderer_ack_absent`, or `renderer_window_absent`. A macOS-only contract test
+calls `proc_pidinfo` for the live test process and compares `lsof -FDiT` output
+against a real regular file and loopback listener before packaging. Both macOS
+gates additionally repeat the
 blocked pre-exec cancellation test's internal scenario twenty times so serial
 suite scheduling does not hide the watchdog, handoff, and bounded-cleanup
 transition. The suite also covers Darwin's `EPERM` response when a retained
