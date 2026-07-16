@@ -123,6 +123,9 @@ Release gate tests are stricter than local smoke tests. Their output must identi
 the candidate commit, exact inputs, configuration, result, and produced release
 artifact where applicable. Use the smallest durable report that proves the
 behavior; do not create a schema/validator/report stack for every check.
+Desktop and release workflows pin `setup-uv` to `uv 0.11.29`; they must not
+resolve a moving `latest` release through the GitHub API during a candidate run.
+Upgrade that pin explicitly and keep the workflow contract test in sync.
 
 Packaged-sidecar startup failures are the exception to ordinary process-log
 capture: the smoke directs combined child output to a bounded OS pipe, reads at

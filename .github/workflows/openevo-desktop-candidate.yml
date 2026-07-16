@@ -51,6 +51,8 @@ jobs:
           python-version: "3.11"
 
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -323,6 +325,8 @@ jobs:
           python-version: "3.11"
 
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
 
       - name: Install locked smoke dependencies
         run: uv sync --frozen --group dev

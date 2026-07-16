@@ -44,6 +44,8 @@ jobs:
           python-version: "3.11"
 
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -140,6 +142,8 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
 
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
 
       - uses: dtolnay/rust-toolchain@stable
 
