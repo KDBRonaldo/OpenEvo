@@ -3477,8 +3477,12 @@ fn terminate_process_group_with<C: ProcessControl>(
             .ok_or_else(sidecar_stop_error);
     }
     let mut control_failed = false;
-    if signal_verified_process_group(control, child, process_group, libc::SIGTERM).is_err() {
-        control_failed = true;
+    match signal_verified_process_group(control, child, process_group, libc::SIGTERM) {
+        Ok(VerifiedGroupSignalOutcome::Accepted) => {}
+        // Darwin returns EPERM when the retained group contains only unsignalable zombies.
+        // It remains inconclusive until the bounded group inspection below proves absence.
+        Ok(VerifiedGroupSignalOutcome::PermissionDenied) => {}
+        Err(_) => control_failed = true,
     }
     let terminated =
         match wait_for_process_group_exit_with(control, child, process_group, term_timeout) {
@@ -3491,8 +3495,10 @@ fn terminate_process_group_with<C: ProcessControl>(
     if terminated && !control_failed {
         return finalize_process_group_leader(control, child, signal_authority);
     }
-    if signal_verified_process_group(control, child, process_group, libc::SIGKILL).is_err() {
-        control_failed = true;
+    match signal_verified_process_group(control, child, process_group, libc::SIGKILL) {
+        Ok(VerifiedGroupSignalOutcome::Accepted) => {}
+        Ok(VerifiedGroupSignalOutcome::PermissionDenied) => {}
+        Err(_) => control_failed = true,
     }
     let killed = match wait_for_process_group_exit_with(control, child, process_group, kill_timeout)
     {
@@ -3508,14 +3514,25 @@ fn terminate_process_group_with<C: ProcessControl>(
     Err(sidecar_stop_error())
 }
 
+enum VerifiedGroupSignalOutcome {
+    Accepted,
+    PermissionDenied,
+}
+
 fn signal_verified_process_group<C: ProcessControl>(
     control: &C,
     child: &Child,
     process_group: i32,
     signal: libc::c_int,
-) -> std::io::Result<()> {
+) -> std::io::Result<VerifiedGroupSignalOutcome> {
     control.leader_exited(child)?;
-    control.signal_group(process_group, signal)
+    match control.signal_group(process_group, signal) {
+        Ok(()) => Ok(VerifiedGroupSignalOutcome::Accepted),
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            Ok(VerifiedGroupSignalOutcome::PermissionDenied)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn wait_for_process_group_exit_with<C: ProcessControl>(
@@ -4104,6 +4121,7 @@ fn spawn_sidecar_gated(
     let identity_verified = managed.process_group == pid
         && managed.session_id == pid
         && managed.birth_identity.is_some();
+    let startup_was_cancelled = startup_cancelled(state, startup_epoch);
     if identity_verified {
         eprintln!(
             "{SIDECAR_PROCESS_MARKER} {} {pid} {} {} {}",
@@ -4116,13 +4134,13 @@ fn spawn_sidecar_gated(
                 .expect("verified sidecar identity has a birth identity"),
         );
     }
-    if !identity_verified {
+    if !identity_verified && !startup_was_cancelled {
         managed.mark_cleanup_pending();
         Err(sidecar_inspection_error())
     } else if sidecar_was_poisoned {
         managed.mark_cleanup_pending();
         Err(sidecar_state_error())
-    } else if startup_cancelled(state, startup_epoch) {
+    } else if startup_was_cancelled {
         managed.mark_cleanup_pending();
         Err(sidecar_start_cancelled_error())
     } else {
@@ -5609,8 +5627,12 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn test_temp_root(temp: &TempDir) -> PathBuf {
+        fs::canonicalize(temp.path()).unwrap()
+    }
+
     fn test_run_retry_recovery_root(temp: &TempDir) -> PathBuf {
-        temp.path().join("app-data")
+        test_temp_root(temp).join("app-data")
     }
 
     fn run_retry_recovery_target(root: &Path) -> PathBuf {
@@ -5780,14 +5802,15 @@ mod tests {
     #[test]
     fn run_retry_recovery_rejects_symlinked_or_non_private_root() {
         let temp = tempfile::tempdir().unwrap();
-        let actual = temp.path().join("actual");
+        let temp_root = test_temp_root(&temp);
+        let actual = temp_root.join("actual");
         fs::create_dir(&actual).unwrap();
         fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).unwrap();
-        let linked = temp.path().join("linked");
+        let linked = temp_root.join("linked");
         symlink(&actual, &linked).unwrap();
         assert!(read_run_retry_recovery_at(&linked).is_err());
 
-        let non_private = temp.path().join("non-private");
+        let non_private = temp_root.join("non-private");
         fs::create_dir(&non_private).unwrap();
         fs::set_permissions(&non_private, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(read_run_retry_recovery_at(&non_private).is_err());
@@ -6467,7 +6490,7 @@ mod tests {
             prepare_packaged_sidecar(fixture.path()).unwrap();
         let allocated = allocate_sidecar_listener().unwrap();
         let launch = SidecarLaunchSpec {
-            program: fd_execution_path(),
+            program: release_execution_path(&private_launch_dir),
             args: vec![
                 "-c".to_string(),
                 concat!(
@@ -6502,7 +6525,7 @@ mod tests {
             (NATIVE_EXECUTABLE_FD_ENV, "99"),
             (NATIVE_EXECUTABLE_PATH_ENV, "/tmp/attacker-sidecar"),
         ]);
-        let fixture = SidecarFixture::from_existing(Path::new("/bin/true"));
+        let fixture = SidecarFixture::from_existing(Path::new("/usr/bin/true"));
         let allocated = allocate_sidecar_listener().unwrap();
         let launch = release_sidecar_launch_spec(Some(fixture.path()), allocated.port).unwrap();
         let prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
@@ -8069,6 +8092,166 @@ mod tests {
     }
 
     #[test]
+    fn permission_denied_group_signal_requires_and_accepts_empty_group_proof() {
+        let mut leader = spawn_test_process_group("exit 0");
+        let process_group = leader.id() as i32;
+        wait_for_leader_exit(&leader);
+        let control = ScriptedSignalProofControl::new([Some(libc::EPERM)], [Ok(false)]);
+        let mut authority = GroupSignalAuthority::Anchored;
+
+        let status = terminate_process_group_with(
+            &control,
+            &mut leader,
+            process_group,
+            &mut authority,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(status.success());
+        assert_eq!(authority, GroupSignalAuthority::Finalizing);
+        assert_eq!(*control.signals.lock().unwrap(), [libc::SIGTERM]);
+        assert_eq!(
+            *control.events.lock().unwrap(),
+            [
+                "leader_exited",
+                "signal_term",
+                "leader_exited",
+                "group_has_members",
+                "reap_leader"
+            ]
+        );
+        control.assert_consumed();
+    }
+
+    #[test]
+    fn permission_denied_group_signal_cannot_finalize_a_live_leader() {
+        let mut leader = spawn_test_process_group("sleep 30");
+        let process_group = leader.id() as i32;
+        let control = ScriptedSignalProofControl::new(
+            [Some(libc::EPERM), Some(libc::EPERM)],
+            [Ok(false), Ok(false)],
+        );
+        let mut authority = GroupSignalAuthority::Anchored;
+
+        let error = terminate_process_group_with(
+            &control,
+            &mut leader,
+            process_group,
+            &mut authority,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "sidecar_stop_failed_owned");
+        assert_eq!(authority, GroupSignalAuthority::Anchored);
+        assert!(leader.try_wait().unwrap().is_none());
+        control.assert_consumed();
+        terminate_process_group(
+            &mut leader,
+            process_group,
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn permission_denied_leader_inspection_is_not_a_signal_outcome() {
+        let mut leader = spawn_test_process_group("exit 0");
+        let process_group = leader.id() as i32;
+        wait_for_leader_exit(&leader);
+        let control = ScriptedSignalProofControl::with_leader_results(
+            [Err(libc::EPERM)],
+            [None],
+            [Ok(false), Ok(false)],
+        );
+        let mut authority = GroupSignalAuthority::Anchored;
+
+        let error = terminate_process_group_with(
+            &control,
+            &mut leader,
+            process_group,
+            &mut authority,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "sidecar_stop_failed_owned");
+        assert_eq!(authority, GroupSignalAuthority::Anchored);
+        assert_eq!(*control.signals.lock().unwrap(), [libc::SIGKILL]);
+        assert!(!control.events.lock().unwrap().contains(&"reap_leader"));
+        control.assert_consumed();
+        leader.wait().unwrap();
+    }
+
+    #[test]
+    fn permission_denied_group_signal_retains_ownership_with_a_reported_descendant() {
+        let mut leader = spawn_test_process_group("exit 0");
+        let process_group = leader.id() as i32;
+        wait_for_leader_exit(&leader);
+        let control = ScriptedSignalProofControl::new(
+            [Some(libc::EPERM), Some(libc::EPERM)],
+            [Ok(true), Ok(true)],
+        );
+        let mut authority = GroupSignalAuthority::Anchored;
+
+        let error = terminate_process_group_with(
+            &control,
+            &mut leader,
+            process_group,
+            &mut authority,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "sidecar_stop_failed_owned");
+        assert_eq!(authority, GroupSignalAuthority::Anchored);
+        assert_eq!(
+            *control.signals.lock().unwrap(),
+            [libc::SIGTERM, libc::SIGKILL]
+        );
+        control.assert_consumed();
+        leader.wait().unwrap();
+    }
+
+    #[test]
+    fn permission_denied_group_signal_does_not_override_inspection_failure() {
+        let mut leader = spawn_test_process_group("exit 0");
+        let process_group = leader.id() as i32;
+        wait_for_leader_exit(&leader);
+        let control = ScriptedSignalProofControl::new(
+            [Some(libc::EPERM), Some(libc::EPERM)],
+            [Err(libc::EIO), Err(libc::EIO)],
+        );
+        let mut authority = GroupSignalAuthority::Anchored;
+
+        let error = terminate_process_group_with(
+            &control,
+            &mut leader,
+            process_group,
+            &mut authority,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "sidecar_stop_failed_owned");
+        assert_eq!(authority, GroupSignalAuthority::Anchored);
+        assert_eq!(
+            *control.signals.lock().unwrap(),
+            [libc::SIGTERM, libc::SIGKILL]
+        );
+        control.assert_consumed();
+        leader.wait().unwrap();
+    }
+
+    #[test]
     fn signal_failure_returns_within_the_configured_bound() {
         let mut child = Command::new("sleep")
             .arg("30")
@@ -8722,8 +8905,7 @@ mod tests {
         stop_sidecar_inner(&state).unwrap();
     }
 
-    #[test]
-    fn blocked_exec_handoff_is_owned_and_stop_remains_bounded() {
+    fn exercise_blocked_exec_handoff_is_owned_and_stop_remains_bounded() {
         let state = Arc::new(DesktopHostState::default());
         let (reserved_tx, reserved_rx) = mpsc::channel();
         let (begin_spawn_tx, begin_spawn_rx) = mpsc::channel();
@@ -8852,6 +9034,13 @@ mod tests {
         assert!(state.spawn_handoff.lock().unwrap().is_none());
         assert!(state.parent_liveness.lock().unwrap().is_none());
         assert!(wait_for_pid_exit(child_pid, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn blocked_exec_handoff_is_owned_and_stop_remains_bounded() {
+        for _attempt in 0..20 {
+            exercise_blocked_exec_handoff_is_owned_and_stop_remains_bounded();
+        }
     }
 
     #[test]
@@ -9482,6 +9671,98 @@ mod tests {
         signals: Mutex<Vec<i32>>,
         leader_reaped: AtomicBool,
         signalled_after_reap: AtomicBool,
+    }
+
+    struct ScriptedSignalProofControl {
+        leader_results: Mutex<VecDeque<Result<bool, i32>>>,
+        signal_errnos: Mutex<VecDeque<Option<i32>>>,
+        group_results: Mutex<VecDeque<Result<bool, i32>>>,
+        signals: Mutex<Vec<i32>>,
+        events: Mutex<Vec<&'static str>>,
+    }
+
+    impl ScriptedSignalProofControl {
+        fn new(
+            signal_errnos: impl IntoIterator<Item = Option<i32>>,
+            group_results: impl IntoIterator<Item = Result<bool, i32>>,
+        ) -> Self {
+            Self::with_leader_results([], signal_errnos, group_results)
+        }
+
+        fn with_leader_results(
+            leader_results: impl IntoIterator<Item = Result<bool, i32>>,
+            signal_errnos: impl IntoIterator<Item = Option<i32>>,
+            group_results: impl IntoIterator<Item = Result<bool, i32>>,
+        ) -> Self {
+            Self {
+                leader_results: Mutex::new(leader_results.into_iter().collect()),
+                signal_errnos: Mutex::new(signal_errnos.into_iter().collect()),
+                group_results: Mutex::new(group_results.into_iter().collect()),
+                signals: Mutex::new(Vec::new()),
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn assert_consumed(&self) {
+            assert!(self.leader_results.lock().unwrap().is_empty());
+            assert!(self.signal_errnos.lock().unwrap().is_empty());
+            assert!(self.group_results.lock().unwrap().is_empty());
+        }
+    }
+
+    impl ProcessControl for ScriptedSignalProofControl {
+        fn leader_exited(&self, child: &Child) -> std::io::Result<bool> {
+            self.events.lock().unwrap().push("leader_exited");
+            match self.leader_results.lock().unwrap().pop_front() {
+                Some(Ok(exited)) => Ok(exited),
+                Some(Err(errno)) => Err(std::io::Error::from_raw_os_error(errno)),
+                None => OsProcessControl.leader_exited(child),
+            }
+        }
+
+        fn reap_leader(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+            self.events.lock().unwrap().push("reap_leader");
+            OsProcessControl.reap_leader(child)
+        }
+
+        fn signal_group(&self, _process_group: i32, signal: libc::c_int) -> std::io::Result<()> {
+            self.events.lock().unwrap().push(match signal {
+                libc::SIGTERM => "signal_term",
+                libc::SIGKILL => "signal_kill",
+                _ => "signal_other",
+            });
+            self.signals.lock().unwrap().push(signal);
+            match self
+                .signal_errnos
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?
+            {
+                Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+                None => Ok(()),
+            }
+        }
+
+        fn group_has_members_except_leader(
+            &self,
+            _process_group: i32,
+            _leader: i32,
+        ) -> std::io::Result<bool> {
+            self.events.lock().unwrap().push("group_has_members");
+            match self
+                .group_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(libc::EIO))
+            {
+                Ok(has_members) => Ok(has_members),
+                Err(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+            }
+        }
+
+        fn sleep(&self, _duration: Duration) {}
     }
 
     impl ScriptedProcessControl {

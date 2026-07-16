@@ -205,7 +205,20 @@ and disappearance of the captured app/sidecar process groups after main-app
 termination. Candidate runs retain separate `app-bundle-smoke.json` and
 `dmg-copy-smoke.json` outputs. The preceding release-mode Clippy gate compiles
 all Tauri targets with warnings denied, so test-only platform helpers cannot
-leak into the shipped host binary as dead code.
+leak into the shipped host binary as dead code. The macOS PR and candidate
+gates run the complete release Rust suite with one test thread because its
+native process-lifecycle cases mutate process-global environment and load the
+shared OS process table. Security-path fixtures canonicalize the macOS system
+temporary-directory alias before exercising no-follow path traversal; the
+production traversal remains strict. Both macOS gates additionally repeat the
+blocked pre-exec cancellation test's internal scenario twenty times so serial
+suite scheduling does not hide the watchdog, handoff, and bounded-cleanup
+transition. The suite also covers Darwin's `EPERM` response when a retained
+process group has no signalable member, requiring a separate empty-group proof
+before reap. It separately rejects `EPERM` from leader inspection, a live leader,
+a reported descendant, and failed group inspection. PyInstaller environment
+sanitization runs through the platform's real release execution path: inherited
+FD execution on Linux and the identity-bound private named path on macOS.
 
 `scripts/ci/openevo_release_candidate.py` creates and validates the closed
 candidate inventory. Validation includes the source commit, actual runner

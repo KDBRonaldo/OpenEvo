@@ -1212,6 +1212,10 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
 
     text = workflow.read_text(encoding="utf-8")
     candidate_tool_text = candidate_tool.read_text(encoding="utf-8")
+    macos_candidate = text[
+        text.index("  macos-candidate:") : text.index("  linux-core-candidate:")
+    ]
+    release_test_command = "cargo test --locked --release -- --test-threads=1"
 
     for marker in (
         "workflow_dispatch:",
@@ -1248,7 +1252,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "openevo-core-service",
         "cargo fmt --check",
         "cargo clippy --locked --release --all-targets -- -D warnings",
-        "cargo test --locked --release",
+        release_test_command,
         "npm run tauri:build -- --ci",
         "hdiutil attach",
         "smoke_openevo_desktop_bundle.py",
@@ -1290,6 +1294,10 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "gh api --method DELETE",
     ):
         assert marker in text
+    assert release_test_command in macos_candidate
+    assert macos_candidate.index("- name: Check release-mode Tauri host") < (
+        macos_candidate.index(release_test_command)
+    ) < macos_candidate.index("- name: Build unsigned Desktop DMG")
 
     candidate_ssh_step = text.split(
         "      - name: Exercise macOS SSH agent relay and fixed executable authority\n",
@@ -1609,7 +1617,24 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
     cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
     main = Path("desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
+    poisoned_environment_test = main[
+        main.index(
+            "fn verified_packaged_launch_rejects_poisoned_pyinstaller_environment"
+        ) : main.index("fn packaged_launch_owns_the_native_executable_environment")
+    ]
+    process_group_termination = main[
+        main.index("fn terminate_process_group_with") : main.index(
+            "fn signal_verified_process_group"
+        )
+    ]
+    verified_group_signal = main[
+        main.index("fn signal_verified_process_group") : main.index(
+            "fn wait_for_process_group_exit_with"
+        )
+    ]
     workflow = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
+    macos_workflow = workflow[workflow.index("  macos-native-launch-smoke:") :]
+    release_test_command = "cargo test --locked --release -- --test-threads=1"
     sidecar_builder = Path("desktop/packaging/build_sidecar.py")
     sidecar_entry = Path("desktop/packaging/sidecar_entry.py")
     release_contract = json.loads(Path("desktop/release-contract.json").read_text(encoding="utf-8"))
@@ -1650,6 +1675,14 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "acl_get_fd_np" in main
     assert '#[cfg(target_os = "linux")]\nfn fd_execution_path()' in main
     assert '#[cfg(all(target_os = "macos", test))]\nfn fd_execution_path()' in main
+    assert "fn test_temp_root(temp: &TempDir) -> PathBuf" in main
+    assert "fs::canonicalize(temp.path()).unwrap()" in main
+    assert 'test_temp_root(temp).join("app-data")' in main
+    assert "let temp_root = test_temp_root(&temp);" in main
+    assert "for _attempt in 0..20" in main
+    assert "exercise_blocked_exec_handoff_is_owned_and_stop_remains_bounded" in main
+    assert 'SidecarFixture::from_existing(Path::new("/usr/bin/true"))' in main
+    assert 'Path::new("/bin/true")' not in main
     assert "struct SpawnHandoff" in main
     assert "run_parent_liveness_watchdog" in main
     assert "libc::WNOWAIT" in main
@@ -1660,6 +1693,22 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert RELEASE_OPENAPI_SHA256 == DESKTOP_OPENAPI_SHA256
     assert f'    "{RELEASE_OPENAPI_SHA256}";' in main
     assert "fn macos_proc_listpgrppids_call(" in main
+    assert process_group_termination.count(
+        "Ok(VerifiedGroupSignalOutcome::PermissionDenied)"
+    ) == 2
+    assert "terminated && !control_failed" in process_group_termination
+    assert "killed && !control_failed" in process_group_termination
+    assert verified_group_signal.index("control.leader_exited(child)?") < (
+        verified_group_signal.index("control.signal_group(process_group, signal)")
+    )
+    assert 'error.raw_os_error() == Some(libc::EPERM)' in verified_group_signal
+    assert "permission_denied_group_signal_requires_and_accepts_empty_group_proof" in main
+    assert "permission_denied_group_signal_cannot_finalize_a_live_leader" in main
+    assert "permission_denied_leader_inspection_is_not_a_signal_outcome" in main
+    assert "permission_denied_group_signal_retains_ownership_with_a_reported_descendant" in main
+    assert "permission_denied_group_signal_does_not_override_inspection_failure" in main
+    assert "program: release_execution_path(&private_launch_dir)" in poisoned_environment_test
+    assert "program: fd_execution_path()" not in poisoned_environment_test
     assert "fn sanitize_pyinstaller_launch_environment(" in main
     assert 'command.env(PYINSTALLER_RESET_ENVIRONMENT, "1")' in main
     assert "fn monitor_running_sidecar(" in main
@@ -1682,7 +1731,10 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "tauri::RunEvent::ExitRequested" in main
     assert "cargo check --locked --release --all-targets" in workflow
     assert "cargo clippy --locked --release --all-targets -- -D warnings" in workflow
-    assert "cargo test --locked --release" in workflow
+    assert release_test_command in macos_workflow
+    assert macos_workflow.index("npm run build:sidecar") < macos_workflow.index(
+        release_test_command
+    ) < macos_workflow.index("tests::macos_release_spawns_from_the_populated_private_path")
     assert workflow.index("npm run build:sidecar") < workflow.index(
         "tests::packaged_external_bin_native_launch_smoke"
     )
