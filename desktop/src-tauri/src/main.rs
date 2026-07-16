@@ -6898,7 +6898,7 @@ mod tests {
     #[test]
     fn macos_release_spawns_from_the_populated_private_path() {
         assert_eq!(fd_execution_path(), PathBuf::from("/dev/fd/4"));
-        let fixture = SidecarFixture::from_existing(Path::new("/bin/true"));
+        let fixture = SidecarFixture::from_existing(Path::new("/usr/bin/true"));
         let (verified_executable, private) = prepare_packaged_sidecar(fixture.path()).unwrap();
         let initial_directory_identity = private.identity.clone();
         let populated_directory_identity = file_identity(&private.directory).unwrap();
