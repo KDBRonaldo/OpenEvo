@@ -1617,6 +1617,21 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
     cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
     main = Path("desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
+    poisoned_environment_test = main[
+        main.index(
+            "fn verified_packaged_launch_rejects_poisoned_pyinstaller_environment"
+        ) : main.index("fn packaged_launch_owns_the_native_executable_environment")
+    ]
+    process_group_termination = main[
+        main.index("fn terminate_process_group_with") : main.index(
+            "fn signal_verified_process_group"
+        )
+    ]
+    verified_group_signal = main[
+        main.index("fn signal_verified_process_group") : main.index(
+            "fn wait_for_process_group_exit_with"
+        )
+    ]
     workflow = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     macos_workflow = workflow[workflow.index("  macos-native-launch-smoke:") :]
     release_test_command = "cargo test --locked --release -- --test-threads=1"
@@ -1678,6 +1693,22 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert RELEASE_OPENAPI_SHA256 == DESKTOP_OPENAPI_SHA256
     assert f'    "{RELEASE_OPENAPI_SHA256}";' in main
     assert "fn macos_proc_listpgrppids_call(" in main
+    assert process_group_termination.count(
+        "Ok(VerifiedGroupSignalOutcome::PermissionDenied)"
+    ) == 2
+    assert "terminated && !control_failed" in process_group_termination
+    assert "killed && !control_failed" in process_group_termination
+    assert verified_group_signal.index("control.leader_exited(child)?") < (
+        verified_group_signal.index("control.signal_group(process_group, signal)")
+    )
+    assert 'error.raw_os_error() == Some(libc::EPERM)' in verified_group_signal
+    assert "permission_denied_group_signal_requires_and_accepts_empty_group_proof" in main
+    assert "permission_denied_group_signal_cannot_finalize_a_live_leader" in main
+    assert "permission_denied_leader_inspection_is_not_a_signal_outcome" in main
+    assert "permission_denied_group_signal_retains_ownership_with_a_reported_descendant" in main
+    assert "permission_denied_group_signal_does_not_override_inspection_failure" in main
+    assert "program: release_execution_path(&private_launch_dir)" in poisoned_environment_test
+    assert "program: fd_execution_path()" not in poisoned_environment_test
     assert "fn sanitize_pyinstaller_launch_environment(" in main
     assert 'command.env(PYINSTALLER_RESET_ENVIRONMENT, "1")' in main
     assert "fn monitor_running_sidecar(" in main

@@ -578,6 +578,13 @@ Zero with nonzero `errno`, impossible sizes, over-counts, or persistent
 truncation fail closed.
 Both platforms therefore retain ownership when the leader has exited but a
 descendant remains in the process group.
+Darwin can return `EPERM` when group signaling finds only unsignalable zombie
+members. Only `EPERM` returned by the signal operation receives the typed
+inconclusive outcome; an identical error from the preceding leader inspection
+remains a hard inspection failure. Cleanup may proceed only if the subsequent
+non-reaping leader check and process-group enumeration independently prove that
+the leader exited and no non-leader member remains. Any other signal error,
+absent proof, or inspection error retains ownership.
 Only after the leader has exited and the rest of the group is absent does cleanup
 switch irreversibly to `Finalizing` and call `Child::try_wait`. A final reap
 error retains ownership for retry, but every retry in `Finalizing` is reap-only:

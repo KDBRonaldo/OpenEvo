@@ -213,7 +213,12 @@ temporary-directory alias before exercising no-follow path traversal; the
 production traversal remains strict. Both macOS gates additionally repeat the
 blocked pre-exec cancellation test's internal scenario twenty times so serial
 suite scheduling does not hide the watchdog, handoff, and bounded-cleanup
-transition.
+transition. The suite also covers Darwin's `EPERM` response when a retained
+process group has no signalable member, requiring a separate empty-group proof
+before reap. It separately rejects `EPERM` from leader inspection, a live leader,
+a reported descendant, and failed group inspection. PyInstaller environment
+sanitization runs through the platform's real release execution path: inherited
+FD execution on Linux and the identity-bound private named path on macOS.
 
 `scripts/ci/openevo_release_candidate.py` creates and validates the closed
 candidate inventory. Validation includes the source commit, actual runner
