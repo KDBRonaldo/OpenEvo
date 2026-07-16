@@ -87,6 +87,34 @@ _FILE_READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 _LOCK_CANCEL_POLL_SECONDS = 0.01
 
 
+def _canonical_darwin_system_alias(path: str) -> str:
+    if sys.platform != "darwin":
+        return path
+    for alias in ("/tmp", "/var"):
+        if path == alias or path.startswith(f"{alias}{os.sep}"):
+            return f"/private{path}"
+    return path
+
+
+def _validate_darwin_system_alias_binding(
+    requested: str,
+    canonical: str,
+    opened: os.stat_result,
+) -> None:
+    if requested == canonical:
+        return
+    try:
+        observed = os.stat(requested)
+    except OSError as exc:
+        raise WorkspaceImportStoreConfigurationError(
+            "workspace import system alias could not be verified"
+        ) from exc
+    if (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino):
+        raise WorkspaceImportStoreConfigurationError(
+            "workspace import system alias changed during open"
+        )
+
+
 class WorkspaceImportError(RuntimeError):
     """Base error for the private workspace import store."""
 
@@ -843,7 +871,10 @@ class WorkspaceImportStore:
         )
         if required_nodes > reconcile_max_nodes or required_bytes > reconcile_max_bytes:
             raise ValueError("retained workspace import limits exceed reconciliation budgets")
-        self._root = os.path.abspath(os.fspath(root))
+        requested_root = os.path.abspath(os.fspath(root))
+        self._root = _canonical_darwin_system_alias(requested_root)
+        self._requested_parent = os.path.dirname(requested_root)
+        self._canonical_parent = os.path.dirname(self._root)
         self._max_archive_bytes = max_archive_bytes
         self._max_entries = max_entries
         self._max_extracted_bytes = max_extracted_bytes
@@ -932,6 +963,11 @@ class WorkspaceImportStore:
                         "workspace import no-follow ancestor is not a directory"
                     )
                 identities.append((value.st_dev, value.st_ino))
+            _validate_darwin_system_alias_binding(
+                self._requested_parent,
+                self._canonical_parent,
+                os.fstat(descriptor),
+            )
             return descriptor, tuple(identities)
         except BaseException:
             os.close(descriptor)

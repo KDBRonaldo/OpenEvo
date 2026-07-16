@@ -822,6 +822,7 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "tests/ci/test_build_sidecar.py" in macos_job
     assert "tests/ci/test_check_openevo_release.py" in macos_job
     assert "test_store_accepts_inode_bound_macos_var_alias" in macos_job
+    assert "test_workspace_store_accepts_inode_bound_macos_var_alias" in macos_job
     assert "uv run python desktop/packaging/build_sidecar.py" in macos_job
     assert 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' in macos_job
     assert 'test "$RUNNER_ENVIRONMENT" = "github-hosted"' in macos_job

@@ -365,10 +365,12 @@ timeouts. Connection ownership is generation-bound: replacing A with B first
 persists A as disconnected, cancels A's obsolete local operation, and closes its
 transport before B's synchronous credential or trust parsing can fail.
 On macOS, the provider normalizes only Apple's fixed `/var` and `/tmp` system
-aliases to their `/private/...` forms before opening the known-host store's
-secure ancestor. It verifies that the requested alias and the held no-follow
-descriptor identify the same inode. Arbitrary symlinked ancestors remain
-invalid.
+aliases to their `/private/...` forms before opening the known-host and
+workspace-import stores' secure ancestors. The known-host store verifies the
+requested alias against its held descriptor during initialization and then
+reopens only the canonical ancestor; the workspace-import store repeats the
+alias-to-held-inode check on every parent-chain open. Arbitrary symlinked
+ancestors remain invalid.
 Unconfirmed host-key candidates are process-only review data and are never a
 verified profile fingerprint. Connect, host-key accept, and disconnect return
 the frozen operation ETag in the response header as well as the body.

@@ -11,6 +11,8 @@ import multiprocessing
 import os
 from pathlib import Path
 import stat
+import sys
+import tempfile
 import threading
 import unicodedata
 
@@ -1363,6 +1365,65 @@ def test_ancestor_replacement_and_symlinked_ancestor_fail_closed(tmp_path: Path)
     symlink_parent.symlink_to(moved_parent, target_is_directory=True)
     with pytest.raises(WorkspaceImportStoreConfigurationError, match="no-follow ancestor"):
         WorkspaceImportStore(symlink_parent / "other-imports")
+
+
+def test_macos_workspace_paths_normalize_only_fixed_system_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workspace_imports_module.sys, "platform", "darwin")
+
+    assert workspace_imports_module._canonical_darwin_system_alias(
+        "/var/folders/user/imports"
+    ) == "/private/var/folders/user/imports"
+    assert workspace_imports_module._canonical_darwin_system_alias(
+        "/tmp/openevo/imports"
+    ) == "/private/tmp/openevo/imports"
+    assert workspace_imports_module._canonical_darwin_system_alias(
+        "/private/var/folders/user/imports"
+    ) == "/private/var/folders/user/imports"
+    assert workspace_imports_module._canonical_darwin_system_alias(
+        "/Users/alice/imports"
+    ) == "/Users/alice/imports"
+    assert workspace_imports_module._canonical_darwin_system_alias(
+        "/var-link/imports"
+    ) == "/var-link/imports"
+
+
+def test_workspace_system_alias_binding_must_match_held_parent(tmp_path: Path) -> None:
+    requested = tmp_path / "requested"
+    canonical = tmp_path / "canonical"
+    requested.mkdir(mode=0o700)
+    canonical.mkdir(mode=0o700)
+
+    with pytest.raises(WorkspaceImportStoreConfigurationError, match="changed"):
+        workspace_imports_module._validate_darwin_system_alias_binding(
+            os.fspath(requested),
+            os.fspath(canonical),
+            os.stat(canonical),
+        )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS system aliases")
+def test_workspace_store_accepts_inode_bound_macos_var_alias() -> None:
+    with tempfile.TemporaryDirectory(prefix="openevo-workspace-", dir="/var/tmp") as value:
+        requested_parent = Path(value)
+        assert os.fspath(requested_parent).startswith("/var/tmp/")
+
+        store = WorkspaceImportStore(
+            requested_parent / "imports",
+            reconcile_on_open=False,
+        )
+        try:
+            expected = Path("/private") / requested_parent.relative_to("/") / "imports"
+            assert store._root == os.fspath(expected)
+            requested = os.stat(requested_parent)
+            opened = os.fstat(store._parent_descriptor)
+            assert (requested.st_dev, requested.st_ino) == (
+                opened.st_dev,
+                opened.st_ino,
+            )
+        finally:
+            store.close()
 
 
 def test_fresh_root_marker_recovers_after_parent_entry_fsync_crash(
