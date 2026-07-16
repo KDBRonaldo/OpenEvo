@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Annotated, Callable
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
 import secrets
+import signal
 import socket
 import sys
 import threading
+from types import FrameType
 from typing import Literal
 
 from fastapi import FastAPI, Request, Response
@@ -52,6 +56,44 @@ _NATIVE_WORKSPACE_DISCARD_ROUTE = "/openevo-native/workspace-imports/discard"
 _NATIVE_WORKSPACE_REQUEST_MAX_BYTES = 8192
 _MAX_NATIVE_WORKSPACE_OPERATIONS = 64
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{7,40}")
+_PACKAGED_STARTUP_PHASES = frozenset(
+    {
+        "bundled_core_assets",
+        "contract_app",
+        "core_adapter",
+        "core_assets",
+        "core_bridge",
+        "core_bridge_store",
+        "core_runtime",
+        "credential_reset",
+        "event_broker",
+        "listener",
+        "native_frame",
+        "native_routes",
+        "provider_store",
+        "release_provider",
+        "release_routes",
+        "remote_lifecycle",
+        "static_app",
+        "server",
+        "server_import",
+        "shutdown",
+        "workspace_store",
+    }
+)
+_PACKAGED_STARTUP_CODES = frozenset(
+    {"execution_failed", *(f"{phase}_failed" for phase in _PACKAGED_STARTUP_PHASES)}
+)
+
+
+class PackagedLauncherStartupError(RuntimeError):
+    """Carry one fixed, redacted packaged-launcher failure code."""
+
+    def __init__(self, code: str) -> None:
+        if code not in _PACKAGED_STARTUP_CODES:
+            raise ValueError("invalid packaged startup diagnostic code")
+        self.code = code
+        super().__init__("OpenEvo Desktop packaged startup failed")
 
 
 @dataclass(frozen=True)
@@ -209,6 +251,65 @@ class _NativeWorkspaceOperations:
                 del self._active[operation.action_id]
 
 
+def _close_startup_app(app: FastAPI) -> None:
+    provider = getattr(app.state, "desktop_release_provider", None)
+    close = getattr(provider, "close", None)
+    if not callable(close):
+        return
+    close()
+
+
+def _close_listener(listener: socket.socket) -> None:
+    listener.close()
+
+
+def _close_server_resources(listener: socket.socket | None, app: FastAPI) -> None:
+    failure: BaseException | None = None
+    if listener is not None:
+        try:
+            _close_listener(listener)
+        except BaseException as exc:
+            failure = exc
+    try:
+        _close_startup_app(app)
+    except BaseException as exc:
+        if failure is None:
+            failure = exc
+    if failure is not None:
+        raise failure
+
+
+@contextmanager
+def _defer_packaged_server_signal_replay(
+    *,
+    enabled: bool,
+    request_exit: Callable[[], None],
+) -> Iterator[None]:
+    if not enabled or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    original_handlers: list[tuple[int, signal.Handlers]] = []
+
+    def defer_replayed_signal(_signum: int, _frame: FrameType | None) -> None:
+        request_exit()
+
+    try:
+        for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+            original_handlers.append(
+                (shutdown_signal, signal.signal(shutdown_signal, defer_replayed_signal))
+            )
+    except BaseException:
+        for shutdown_signal, handler in reversed(original_handlers):
+            signal.signal(shutdown_signal, handler)
+        raise
+    try:
+        yield
+    finally:
+        for shutdown_signal, handler in reversed(original_handlers):
+            signal.signal(shutdown_signal, handler)
+
+
 def create_app(
     *,
     static_root: Path | str | None = None,
@@ -219,22 +320,77 @@ def create_app(
     core_assets_root: Path | str | None = None,
 ) -> FastAPI:
     _validate_source_commit(source_commit, build_channel=build_channel)
+    owned_apps: list[FastAPI] = []
+    try:
+        return _create_app(
+            static_root=static_root,
+            desktop_config_root=desktop_config_root,
+            native_frame=native_frame,
+            source_commit=source_commit,
+            build_channel=build_channel,
+            core_assets_root=core_assets_root,
+            owned_apps=owned_apps,
+        )
+    except PackagedLauncherStartupError:
+        if owned_apps:
+            try:
+                _close_startup_app(owned_apps[0])
+            except BaseException:
+                pass
+        raise
+    except Exception as exc:
+        if owned_apps:
+            try:
+                _close_startup_app(owned_apps[0])
+            except BaseException:
+                pass
+        if build_channel == "release":
+            raise PackagedLauncherStartupError("native_routes_failed") from exc
+        raise
+
+
+def _create_app(
+    *,
+    static_root: Path | str | None = None,
+    desktop_config_root: Path | str | None = None,
+    native_frame: _NativeLauncherFrame,
+    source_commit: str,
+    build_channel: Literal["release", "development", "test"],
+    core_assets_root: Path | str | None = None,
+    owned_apps: list[FastAPI],
+) -> FastAPI:
+    startup_phase = "bundled_core_assets"
+
+    def record_startup_phase(value: str) -> None:
+        nonlocal startup_phase
+        if value not in _PACKAGED_STARTUP_PHASES:
+            raise ValueError("invalid packaged startup phase")
+        startup_phase = value
+
     config_root = (
         Path(desktop_config_root).expanduser()
         if desktop_config_root is not None
         else DEFAULT_DESKTOP_CONFIG_ROOT.expanduser()
     )
-    if build_channel == "release" and core_assets_root is None:
-        core_assets_root = bundled_core_asset_root()
-    app = create_release_desktop_local_api_app(
-        state_root=config_root / LOCAL_API_STATE_DIRECTORY,
-        session_token=native_frame.session_token,
-        instance_id=native_frame.instance_id,
-        readiness_key=native_frame.readiness_key,
-        source_commit=source_commit,
-        build_channel=build_channel,
-        core_assets_root=core_assets_root,
-    )
+    try:
+        if build_channel == "release" and core_assets_root is None:
+            core_assets_root = bundled_core_asset_root()
+        app = create_release_desktop_local_api_app(
+            state_root=config_root / LOCAL_API_STATE_DIRECTORY,
+            session_token=native_frame.session_token,
+            instance_id=native_frame.instance_id,
+            readiness_key=native_frame.readiness_key,
+            source_commit=source_commit,
+            build_channel=build_channel,
+            core_assets_root=core_assets_root,
+            startup_phase=record_startup_phase if build_channel == "release" else None,
+            close_on_shutdown=build_channel != "release",
+        )
+    except Exception as exc:
+        if build_channel == "release":
+            raise PackagedLauncherStartupError(f"{startup_phase}_failed") from exc
+        raise
+    owned_apps.append(app)
     expected_session_token = native_frame.session_token.encode("ascii")
     expected_handoff_token = native_frame.handoff_token.encode("ascii")
     workspace_import_store = app.state.desktop_release_provider.workspace_import_store
@@ -387,7 +543,14 @@ def create_app(
             return _native_workspace_error(status_code=409)
         return Response(status_code=204)
 
-    return create_desktop_app(app, static_root=static_root)
+    try:
+        if build_channel == "release":
+            record_startup_phase("static_app")
+        return create_desktop_app(app, static_root=static_root)
+    except Exception as exc:
+        if build_channel == "release":
+            raise PackagedLauncherStartupError(f"{startup_phase}_failed") from exc
+        raise
 
 
 def _native_credential_matches(
@@ -558,7 +721,12 @@ def main(
 
     if args.listener_fd < 3:
         parser.error("--listener-fd must identify an inherited non-standard descriptor")
-    native_frame = _read_native_instance_frame()
+    try:
+        native_frame = _read_native_instance_frame()
+    except Exception as exc:
+        if packaged_source_commit is not None:
+            raise PackagedLauncherStartupError("native_frame_failed") from exc
+        raise
     if packaged_source_commit is None:
         source_commit = args.source_commit
         build_channel = args.build_channel
@@ -566,7 +734,12 @@ def main(
         source_commit = packaged_source_commit
         build_channel = "release"
 
-    import uvicorn
+    try:
+        import uvicorn
+    except Exception as exc:
+        if packaged_source_commit is not None:
+            raise PackagedLauncherStartupError("server_import_failed") from exc
+        raise
 
     app = create_app(
         static_root=args.static_root,
@@ -575,15 +748,58 @@ def main(
         source_commit=source_commit,
         build_channel=build_channel,
     )
-    listener = socket.socket(fileno=args.listener_fd)
-    listener.set_inheritable(False)
-    listener.setblocking(False)
-    config = uvicorn.Config(
-        app,
-        host="127.0.0.1",
-        port=0,
-    )
-    uvicorn.Server(config).run(sockets=[listener])
+    listener: socket.socket | None = None
+    try:
+        listener = socket.socket(fileno=args.listener_fd)
+        listener.set_inheritable(False)
+        listener.setblocking(False)
+        config = uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=0,
+        )
+    except Exception as exc:
+        try:
+            _close_server_resources(listener, app)
+        except BaseException:
+            pass
+        if packaged_source_commit is not None:
+            raise PackagedLauncherStartupError("listener_failed") from exc
+        raise
+    try:
+        server = uvicorn.Server(config)
+        with _defer_packaged_server_signal_replay(
+            enabled=packaged_source_commit is not None,
+            request_exit=lambda: setattr(server, "should_exit", True),
+        ):
+            try:
+                server.run(sockets=[listener])
+                if not server.started:
+                    raise RuntimeError("Desktop sidecar server did not reach startup")
+            except BaseException as exc:
+                try:
+                    _close_server_resources(listener, app)
+                except BaseException:
+                    pass
+                if packaged_source_commit is not None and isinstance(exc, Exception):
+                    raise PackagedLauncherStartupError("server_failed") from exc
+                raise
+            try:
+                _close_server_resources(listener, app)
+            except Exception as exc:
+                if packaged_source_commit is not None:
+                    raise PackagedLauncherStartupError("shutdown_failed") from exc
+                raise
+    except PackagedLauncherStartupError:
+        raise
+    except BaseException as exc:
+        try:
+            _close_server_resources(listener, app)
+        except BaseException:
+            pass
+        if packaged_source_commit is not None and isinstance(exc, Exception):
+            raise PackagedLauncherStartupError("server_failed") from exc
+        raise
     return 0
 
 

@@ -221,6 +221,25 @@ application. It owns one `DesktopProviderStore` and one `WorkspaceImportStore`
 for the process lifetime and
 requires the native host to supply a Desktop session token, native instance ID,
 readiness key, source commit, and private state root.
+Embedded callers get an ASGI shutdown close hook by default. The packaged
+launcher explicitly sets `close_on_shutdown=False` and becomes the single
+provider shutdown owner so listener/provider cleanup failures can be converted
+to a fixed `shutdown_failed` process diagnostic instead of being absorbed by
+Uvicorn lifespan state.
+For the packaged process only, the launcher temporarily installs a signal
+replay handler around Uvicorn and explicit cleanup. Uvicorn can therefore turn
+Tauri's `SIGTERM` into graceful server exit without the replayed signal killing
+the process before provider cleanup completes.
+If app or Core-runtime construction already has a primary failure, all resources
+created so far are still given a best-effort close, but cleanup exceptions do
+not replace that primary exception.
+Runtime shutdown independently attempts relay stop/join, bridge, broker, and
+bridge-store cleanup. If several fail, callers receive the first failure only
+after every owned resource has been attempted.
+The stop/close sequence is linearized under the runtime close lock, so a second
+thread cannot report close completion while bridge shutdown or relay join is
+still active. Provider shutdown applies the same first-failure aggregation
+across executor, runtime, lifecycle, provider store, and workspace store.
 
 Before the Local API reaches readiness, packaged startup failures use the closed
 `OPENEVO_STARTUP_V1` stderr contract. Only fixed stage/code pairs and an
@@ -229,7 +248,12 @@ credentials, URLs, exception messages, tracebacks, and arbitrary process output
 are never surfaced. Release smoke tooling uses a bounded OS pipe, scans at most
 32 KiB, and emits at most eight allowlisted records, so this contract does not
 create telemetry, an unbounded process log, or a secret-bearing diagnostics
-channel.
+channel. The packaged Python launcher records only the last fixed release
+composition phase, covering embedded Core assets, provider/credential stores,
+SSH lifecycle, workspace storage, Core bridge composition, Local API routing,
+native Local API routing, static application mounting, native frame handoff,
+listener setup, and server startup. A failure emits that phase's closed
+`*_failed` code; the original exception and its cause remain private.
 
 The current provider implements:
 

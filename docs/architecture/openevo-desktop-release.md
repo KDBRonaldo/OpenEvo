@@ -266,7 +266,36 @@ bounded OS pipe rather than a disk-backed process log, scans at most 32 KiB, and
 reports at most eight records. One additional byte is read only as a truncation
 sentinel and is never parsed or rendered. Missing diagnostics are reported as
 such. This is a local startup aid, not telemetry, crash reporting, or a
-diagnostics upload path.
+diagnostics upload path. Python release composition tracks a closed phase set
+for the embedded Core pair, provider and workspace stores, SSH lifecycle, Core
+bridge/runtime, Local API provider/routes, and static app. It converts only the
+last phase, including native routing and native-frame/listener/server startup,
+into an allowlisted `python_launcher/*_failed` code. Exception types, messages,
+chained causes, and runtime values are not part of the contract.
+Provider and listener cleanup is attempted on every server exit. A cleanup
+failure without an earlier server failure becomes the fixed, redacted
+`python_launcher/shutdown_failed` diagnostic; cleanup errors never replace an
+already selected startup or server phase code.
+The packaged launcher disables the Local API app's optional ASGI shutdown close
+hook and is the sole owner of provider shutdown. This avoids Uvicorn converting
+a provider cleanup exception into internal lifespan state before the launcher
+can fail closed. Directly embedded Local API apps retain the shutdown hook by
+default and must opt out only when their host assumes the same explicit owner
+role.
+The packaged launcher also defers Uvicorn's replay of `SIGINT`/`SIGTERM` until
+the server has returned and explicit provider/listener cleanup has run. Signals
+received in the small pre-capture window set `Server.should_exit` rather than
+being lost. Development/test launchers keep Uvicorn's default signal behavior
+and their ASGI shutdown hook.
+Release app and Core-runtime construction use the same primary-failure rule:
+attempt every cleanup that has acquired ownership, suppress secondary cleanup
+exceptions, and propagate the original construction failure.
+The runtime's ordinary `close()` similarly attempts relay, bridge, broker, and
+bridge-store cleanup independently and propagates the first cleanup failure
+after all attempts complete.
+Runtime stop/close is linearized across callers, and provider close preserves
+the first failure while independently attempting executor, runtime, lifecycle,
+provider-store, and workspace-store cleanup.
 
 The smoke keeps the launched sidecar leader unreaped while health is pending and
 uses the Core non-reaping process-group observer for exit and cleanup. Normal

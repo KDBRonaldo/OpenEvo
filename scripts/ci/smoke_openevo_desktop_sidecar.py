@@ -51,9 +51,7 @@ EXPECTED_DESKTOP_METHOD_IDS = frozenset(
     }
 )
 CORE_OWNED_PROJECT_FIELDS = frozenset({"reflector_llm", "base_model"})
-EXPECTED_DESKTOP_TARGET_IDS = frozenset(
-    {"agent_system", "skill_bundle", "text_memory"}
-)
+EXPECTED_DESKTOP_TARGET_IDS = frozenset({"agent_system", "skill_bundle", "text_memory"})
 EXPECTED_ACTIVE_SELECTIONS = {
     "skill_bundle": "skill_bundle_reflector",
     "text_memory": "text_memory_reflector",
@@ -120,13 +118,36 @@ _STARTUP_DIAGNOSTIC_CODES = {
     "bootloader_exec": frozenset({"restore_failed"}),
     "bootloader_restart": frozenset({"restore_failed"}),
     "bootloader_child": frozenset({"handoff_finish_failed"}),
-    "python_import": frozenset(
-        {"owned_subprocess_import_failed", "launcher_import_failed"}
-    ),
+    "python_import": frozenset({"owned_subprocess_import_failed", "launcher_import_failed"}),
     "python_owned_subprocess": frozenset({"execution_failed"}),
     "python_handoff": frozenset({"listener_fd_invalid", "archive_fd_invalid"}),
     "python_metadata": frozenset({"load_failed"}),
-    "python_launcher": frozenset({"execution_failed"}),
+    "python_launcher": frozenset(
+        {
+            "execution_failed",
+            "bundled_core_assets_failed",
+            "provider_store_failed",
+            "credential_reset_failed",
+            "remote_lifecycle_failed",
+            "workspace_store_failed",
+            "core_assets_failed",
+            "core_bridge_store_failed",
+            "event_broker_failed",
+            "core_adapter_failed",
+            "core_bridge_failed",
+            "core_runtime_failed",
+            "release_provider_failed",
+            "contract_app_failed",
+            "release_routes_failed",
+            "static_app_failed",
+            "native_frame_failed",
+            "native_routes_failed",
+            "server_import_failed",
+            "listener_failed",
+            "server_failed",
+            "shutdown_failed",
+        }
+    ),
 }
 _LOCAL_HTTP_OPENER = build_opener(ProxyHandler({}))
 
@@ -473,9 +494,7 @@ def _read_url(
     except HTTPError as exc:
         if exc.code == expected_status:
             return exc.read()
-        raise SmokeFailure(
-            f"{url} returned HTTP {exc.code}; expected {expected_status}"
-        ) from exc
+        raise SmokeFailure(f"{url} returned HTTP {exc.code}; expected {expected_status}") from exc
     except (URLError, OSError) as exc:
         raise SmokeFailure(f"{url} was not reachable: {exc}") from exc
 
@@ -505,18 +524,17 @@ def _assert_capabilities(
     expected_core_version: str,
 ) -> None:
     expected_generic_mode = (
-        "subscription"
-        if execution_mode == "codex_subscription_transcript"
-        else "self_deployed"
+        "subscription" if execution_mode == "codex_subscription_transcript" else "self_deployed"
     )
     if payload.get("schema_version") != "1":
         raise SmokeFailure("capabilities response has an unexpected schema version")
     if payload.get("core_version") != expected_core_version:
         raise SmokeFailure("capabilities response did not come from the exact Core wheel")
     registry_digest = payload.get("registry_digest")
-    if not isinstance(registry_digest, str) or re.fullmatch(
-        r"[0-9a-f]{64}", registry_digest
-    ) is None:
+    if (
+        not isinstance(registry_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", registry_digest) is None
+    ):
         raise SmokeFailure("capabilities response has an invalid registry digest")
     if payload.get("evaluated_profile") != {
         "execution_mode": expected_generic_mode,
@@ -530,8 +548,7 @@ def _assert_capabilities(
     if (
         not isinstance(targets, list)
         or not all(isinstance(target, dict) for target in targets)
-        or {target.get("target_id") for target in targets}
-        != EXPECTED_DESKTOP_TARGET_IDS
+        or {target.get("target_id") for target in targets} != EXPECTED_DESKTOP_TARGET_IDS
     ):
         raise SmokeFailure("capabilities response has an unexpected target set")
     methods = [
@@ -545,10 +562,8 @@ def _assert_capabilities(
         raise SmokeFailure("capabilities response has an unexpected method set")
     for target in targets:
         if (
-            target.get("effective_default_method_id")
-            != target.get("configured_default_method_id")
-            or target.get("configured_default_support", {}).get("overall")
-            != "supported"
+            target.get("effective_default_method_id") != target.get("configured_default_method_id")
+            or target.get("configured_default_support", {}).get("overall") != "supported"
         ):
             raise SmokeFailure("capabilities response has an unsupported target default")
         for identity_key in (
@@ -566,12 +581,9 @@ def _assert_capabilities(
         active_selection = EXPECTED_ACTIVE_SELECTIONS.get(target.get("target_id"))
         if active_selection is not None and (
             active_selection not in accepted_methods
-            or accepted_methods[active_selection].get("support", {}).get("overall")
-            != "supported"
+            or accepted_methods[active_selection].get("support", {}).get("overall") != "supported"
         ):
-            raise SmokeFailure(
-                "capabilities response does not accept a current Science selection"
-            )
+            raise SmokeFailure("capabilities response does not accept a current Science selection")
         if target.get("target_id") == "agent_system":
             resolvers = {
                 resolver.get("selection_value"): resolver
@@ -589,9 +601,7 @@ def _assert_capabilities(
                 "agent_system_reflector",
                 "agent_system_history_reflector",
             }:
-                raise SmokeFailure(
-                    "capabilities response does not support agent_system auto"
-                )
+                raise SmokeFailure("capabilities response does not support agent_system auto")
     for method in methods:
         _assert_project_method_contract(method)
         identity = method.get("implementation_identity_digest")
@@ -610,22 +620,16 @@ def _assert_project_method_contract(method: dict[str, Any]) -> None:
         try:
             value = json.loads(encoded)
         except (TypeError, json.JSONDecodeError) as exc:
-            raise SmokeFailure(
-                f"capabilities method has invalid {field_name}"
-            ) from exc
+            raise SmokeFailure(f"capabilities method has invalid {field_name}") from exc
         if not isinstance(value, dict):
             raise SmokeFailure(f"capabilities method has non-object {field_name}")
         decoded[field_name] = value
 
     properties = decoded["config_schema_json"].get("properties")
     leaked_fields = set(
-        CORE_OWNED_PROJECT_FIELDS.intersection(
-            properties if isinstance(properties, dict) else {}
-        )
+        CORE_OWNED_PROJECT_FIELDS.intersection(properties if isinstance(properties, dict) else {})
     )
-    leaked_fields.update(
-        CORE_OWNED_PROJECT_FIELDS.intersection(decoded["default_config_json"])
-    )
+    leaked_fields.update(CORE_OWNED_PROJECT_FIELDS.intersection(decoded["default_config_json"]))
     if leaked_fields:
         raise SmokeFailure(
             "Core-owned field leaked into the Desktop project contract: "
@@ -756,8 +760,7 @@ def smoke_sidecar(
                         headers={NATIVE_CHALLENGE_HEADER: challenge},
                     )
                     domain = (
-                        f"{NATIVE_SIDECAR_PROTOCOL}\0"
-                        f"{credentials.instance_id}\0{challenge}"
+                        f"{NATIVE_SIDECAR_PROTOCOL}\0{credentials.instance_id}\0{challenge}"
                     ).encode("ascii")
                     expected_proof = hmac.new(
                         credentials.readiness_key,
@@ -775,9 +778,7 @@ def smoke_sidecar(
                 except SmokeFailure:
                     time.sleep(0.25)
             else:
-                raise SmokeFailure(
-                    f"sidecar did not become healthy within {timeout_seconds}s"
-                )
+                raise SmokeFailure(f"sidecar did not become healthy within {timeout_seconds}s")
 
             _assert_release_version(_read_json(f"{base_url}/version"))
 

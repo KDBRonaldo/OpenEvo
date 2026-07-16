@@ -21,6 +21,27 @@ _PYTHON_STARTUP_DIAGNOSTICS = frozenset(
         ("python_handoff", "archive_fd_invalid"),
         ("python_metadata", "load_failed"),
         ("python_launcher", "execution_failed"),
+        ("python_launcher", "bundled_core_assets_failed"),
+        ("python_launcher", "provider_store_failed"),
+        ("python_launcher", "credential_reset_failed"),
+        ("python_launcher", "remote_lifecycle_failed"),
+        ("python_launcher", "workspace_store_failed"),
+        ("python_launcher", "core_assets_failed"),
+        ("python_launcher", "core_bridge_store_failed"),
+        ("python_launcher", "event_broker_failed"),
+        ("python_launcher", "core_adapter_failed"),
+        ("python_launcher", "core_bridge_failed"),
+        ("python_launcher", "core_runtime_failed"),
+        ("python_launcher", "release_provider_failed"),
+        ("python_launcher", "contract_app_failed"),
+        ("python_launcher", "release_routes_failed"),
+        ("python_launcher", "static_app_failed"),
+        ("python_launcher", "native_frame_failed"),
+        ("python_launcher", "native_routes_failed"),
+        ("python_launcher", "server_import_failed"),
+        ("python_launcher", "listener_failed"),
+        ("python_launcher", "server_failed"),
+        ("python_launcher", "shutdown_failed"),
     }
 )
 
@@ -89,7 +110,7 @@ def _startup_main() -> int:
             return 1
         return 126
     try:
-        from desktop.server.launcher import main
+        from desktop.server.launcher import PackagedLauncherStartupError, main
     except (Exception, SystemExit):
         _emit_startup_diagnostic("python_import", "launcher_import_failed")
         return 1
@@ -108,6 +129,9 @@ def _startup_main() -> int:
         return 1
     try:
         return main(packaged_source_commit=metadata.source_commit)
+    except PackagedLauncherStartupError as exc:
+        _emit_startup_diagnostic("python_launcher", exc.code)
+        return 1
     except (Exception, SystemExit):
         _emit_startup_diagnostic("python_launcher", "execution_failed")
         return 1

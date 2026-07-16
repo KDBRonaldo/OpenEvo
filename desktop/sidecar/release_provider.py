@@ -134,6 +134,18 @@ class _ConnectionOutcome:
 ConnectionAction = Callable[[RemoteProfileV1], _ConnectionOutcome]
 
 
+def _collect_cleanup_failure(
+    cleanup: Callable[[], None],
+    first_failure: BaseException | None,
+) -> BaseException | None:
+    try:
+        cleanup()
+    except BaseException as exc:
+        if first_failure is None:
+            return exc
+    return first_failure
+
+
 class DesktopCoreRuntimeOwnerV1(Protocol):
     core_bridge: DesktopCoreBridgeV1
     event_broker: DesktopEventBrokerV1
@@ -421,28 +433,20 @@ class DesktopReleaseProvider:
             if self._closed:
                 return
             self._closed = True
-        try:
-            self._project_executor.close()
-        finally:
-            try:
-                if self._core_runtime is not None:
-                    self._core_runtime.stop()
-                elif self._core_bridge is not None:
-                    self._core_bridge.close()
-            finally:
-                try:
-                    if self._core_runtime is not None:
-                        self._core_runtime.close()
-                    elif self._event_broker is not None:
-                        self._event_broker.close()
-                finally:
-                    try:
-                        self._remote_lifecycle.close()
-                    finally:
-                        try:
-                            self._store.close()
-                        finally:
-                            self._workspace_import_store.close()
+        failure = _collect_cleanup_failure(self._project_executor.close, None)
+        if self._core_runtime is not None:
+            failure = _collect_cleanup_failure(self._core_runtime.stop, failure)
+        elif self._core_bridge is not None:
+            failure = _collect_cleanup_failure(self._core_bridge.close, failure)
+        if self._core_runtime is not None:
+            failure = _collect_cleanup_failure(self._core_runtime.close, failure)
+        elif self._event_broker is not None:
+            failure = _collect_cleanup_failure(self._event_broker.close, failure)
+        failure = _collect_cleanup_failure(self._remote_lifecycle.close, failure)
+        failure = _collect_cleanup_failure(self._store.close, failure)
+        failure = _collect_cleanup_failure(self._workspace_import_store.close, failure)
+        if failure is not None:
+            raise failure
 
     @property
     def workspace_import_store(self) -> WorkspaceImportStore:

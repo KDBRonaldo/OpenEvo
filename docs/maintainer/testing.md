@@ -79,6 +79,23 @@ not reinterpret a fully allocated file as sparse.
 
 Run relevant module suites when touching shared behavior:
 
+- Packaged launcher diagnostics must keep the producer, smoke allowlist, and
+  launcher phase set identical. Cover both primary failures with best-effort
+  cleanup and otherwise-normal exits that fail closed as `shutdown_failed`.
+  The launcher factory test must also prove that packaged ownership disables
+  the app-level ASGI shutdown close hook.
+- A real subprocess/Uvicorn regression must send `SIGTERM` to the packaged
+  launcher path and prove provider cleanup completes before a zero exit.
+- Factory failure tests must inject a simultaneous cleanup failure and prove the
+  app/Core-runtime factory preserves the original construction exception while
+  attempting each acquired resource close.
+- Runtime close tests must inject independent bridge, broker, and store failures,
+  assert every cleanup runs, and assert the first failure is propagated.
+  A concurrent-close test must hold bridge shutdown open and prove another
+  caller cannot close broker/store or return before relay join completes.
+- Provider close tests must prove later runtime/lifecycle/store failures neither
+  replace the first failure nor prevent remaining owned-resource cleanup.
+
 ```bash
 PYTHONPATH=src:. python -m pytest tests/backend tests/evolution tests/gateway tests/trajectory tests/rollout -q
 ```
@@ -116,6 +133,9 @@ traceback, malformed-record, and oversized-output canaries and prove that none
 can enter the rendered CI failure. A silent bootloader exit is a failed gate,
 not permission to print arbitrary child output or fall back from descriptor
 authority to a pathname.
+Tests must keep the packaged Python producer and smoke allowlists exactly equal,
+and must prove that a typed release-composition failure preserves only its fixed
+phase code while redacting the original exception and chained cause.
 The macOS packaged-sidecar gate must exercise the Darwin-native FD checks: the
 bootloader must prove FD 3 through `proc_pidfdinfo` plus its loopback endpoint,
 and the SSH gate must construct an agent source through kqueue directory

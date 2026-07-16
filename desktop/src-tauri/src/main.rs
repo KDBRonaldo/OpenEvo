@@ -303,6 +303,14 @@ const DIRECTORY_FILE_TYPE: u32 = libc::S_IFDIR as u32;
 const REGULAR_FILE_TYPE: u32 = libc::S_IFREG;
 #[cfg(target_os = "macos")]
 const REGULAR_FILE_TYPE: u32 = libc::S_IFREG as u32;
+#[cfg(target_os = "linux")]
+const SYMLINK_FILE_TYPE: u32 = libc::S_IFLNK;
+#[cfg(target_os = "macos")]
+const SYMLINK_FILE_TYPE: u32 = libc::S_IFLNK as u32;
+#[cfg(target_os = "linux")]
+const STICKY_MODE_BIT: u32 = libc::S_ISVTX;
+#[cfg(target_os = "macos")]
+const STICKY_MODE_BIT: u32 = libc::S_ISVTX as u32;
 
 #[cfg(any(test, target_os = "macos"))]
 fn same_identity_after_optional_unlink(actual: &FileIdentity, expected: &FileIdentity) -> bool {
@@ -1705,7 +1713,7 @@ fn validate_trusted_directory_for_user(
 ) -> HostResult<()> {
     let is_directory = identity.mode & FILE_TYPE_MASK == DIRECTORY_FILE_TYPE;
     let trusted_owner = identity.owner == 0 || identity.owner == effective_user;
-    let root_sticky_boundary = identity.owner == 0 && identity.mode & libc::S_ISVTX != 0;
+    let root_sticky_boundary = identity.owner == 0 && identity.mode & STICKY_MODE_BIT != 0;
     let world_writable = identity.mode & 0o002 != 0;
     let group_writable = identity.mode & 0o020 != 0;
     let macos_root_group_writable =
@@ -1724,8 +1732,8 @@ fn validate_packaged_source_identity(
     identity: &FileIdentity,
     owner_policy: PackagedSourceOwnerPolicy,
 ) -> HostResult<()> {
-    let kind = identity.mode & libc::S_IFMT;
-    if kind == libc::S_IFLNK {
+    let kind = identity.mode & FILE_TYPE_MASK;
+    if kind == SYMLINK_FILE_TYPE {
         return Err(NativeHostError::new(
             "bundled_sidecar_symlink",
             "The packaged OpenEvo Desktop bundled sidecar is an unsupported symbolic link.",
@@ -4891,7 +4899,7 @@ fn open_run_retry_recovery_root(
 fn validate_run_retry_recovery_parent(directory: &File) -> HostResult<()> {
     let identity = file_identity(directory).map_err(|_| run_retry_recovery_error())?;
     let effective_user = unsafe { libc::geteuid() };
-    let root_sticky_boundary = identity.owner == 0 && identity.mode & libc::S_ISVTX != 0;
+    let root_sticky_boundary = identity.owner == 0 && identity.mode & STICKY_MODE_BIT != 0;
     if identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
         || (identity.owner != 0 && identity.owner != effective_user)
         || (identity.mode & 0o022 != 0 && !root_sticky_boundary)
@@ -6564,7 +6572,7 @@ mod tests {
         )
         .is_ok());
 
-        identity.mode = libc::S_IFDIR | 0o770;
+        identity.mode = DIRECTORY_FILE_TYPE | 0o770;
         assert_eq!(
             validate_trusted_directory_for_user(&identity, 501, TrustedDirectoryPolicy::Strict,)
                 .unwrap_err()
@@ -6573,7 +6581,7 @@ mod tests {
         );
 
         identity.owner = 0;
-        identity.mode = libc::S_IFDIR | 0o775;
+        identity.mode = DIRECTORY_FILE_TYPE | 0o775;
         assert_eq!(
             validate_trusted_directory_for_user(&identity, 501, TrustedDirectoryPolicy::Strict,)
                 .unwrap_err()
@@ -6599,14 +6607,14 @@ mod tests {
         );
 
         identity.owner = 0;
-        identity.mode = libc::S_IFDIR | libc::S_ISVTX | 0o777;
+        identity.mode = DIRECTORY_FILE_TYPE | STICKY_MODE_BIT | 0o777;
         assert!(validate_trusted_directory_for_user(
             &identity,
             501,
             TrustedDirectoryPolicy::Strict,
         )
         .is_ok());
-        identity.mode = libc::S_IFDIR | 0o777;
+        identity.mode = DIRECTORY_FILE_TYPE | 0o777;
         assert_eq!(
             validate_trusted_directory_for_user(
                 &identity,
@@ -6619,7 +6627,7 @@ mod tests {
         );
 
         identity.owner = 502;
-        identity.mode = libc::S_IFDIR | 0o755;
+        identity.mode = DIRECTORY_FILE_TYPE | 0o755;
         assert_eq!(
             validate_trusted_directory_for_user(
                 &identity,

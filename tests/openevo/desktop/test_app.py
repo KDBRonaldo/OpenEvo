@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import hashlib
 import hmac
 from html.parser import HTMLParser
@@ -13,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -28,6 +30,7 @@ from desktop.server import (
 import desktop.server.launcher as desktop_launcher
 from desktop.server.launcher import DEFAULT_DESKTOP_CONFIG_ROOT, create_app
 import desktop.packaging.sidecar_entry as sidecar_entry
+import desktop.sidecar.release_app as release_app
 from desktop.sidecar.workspace_identity import project_id_for_native_import
 
 
@@ -533,6 +536,78 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
                 process.wait(timeout=2)
 
 
+def test_packaged_launcher_finishes_cleanup_after_real_sigterm(tmp_path: Path) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(128)
+    port = listener.getsockname()[1]
+    marker = tmp_path / "provider-closed"
+    child = """
+from pathlib import Path
+import sys
+
+from fastapi import FastAPI
+
+from desktop.server import launcher
+
+marker = Path(sys.argv[1])
+
+class Provider:
+    def close(self):
+        with marker.open("a", encoding="utf-8") as stream:
+            stream.write("closed\\n")
+
+app = FastAPI()
+app.state.desktop_release_provider = Provider()
+launcher.create_app = lambda **_kwargs: app
+raise SystemExit(
+    launcher.main(
+        ["--listener-fd", sys.argv[2], "--native-instance-stdin"],
+        packaged_source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+    )
+)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", child, str(marker), str(listener.fileno())],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        pass_fds=(listener.fileno(),),
+        start_new_session=True,
+    )
+    try:
+        assert process.stdin is not None
+        process.stdin.write(_native_instance_frame())
+        process.stdin.close()
+        process.stdin = None
+        listener.close()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+            try:
+                connection.request("GET", "/")
+                response = connection.getresponse()
+                response.read()
+                if response.status == 404:
+                    break
+            except OSError:
+                time.sleep(0.02)
+            finally:
+                connection.close()
+        else:
+            pytest.fail("packaged launcher did not become ready")
+
+        os.killpg(process.pid, signal.SIGTERM)
+        assert process.wait(timeout=5) == 0
+        assert marker.read_text(encoding="utf-8") == "closed\n"
+    finally:
+        listener.close()
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+
+
 def test_create_app_launcher_accepts_config_root_override(tmp_path: Path) -> None:
     config_root = tmp_path / "config"
     app = create_app(
@@ -748,6 +823,528 @@ def test_create_app_launcher_rejects_invalid_source_commit(
             source_commit=source_commit,
             build_channel=build_channel,
         )
+
+
+def test_release_create_app_reports_last_fixed_startup_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = "Traceback /Users/private token=secret"
+
+    def fail_release_app(**kwargs: object) -> FastAPI:
+        startup_phase = kwargs["startup_phase"]
+        assert callable(startup_phase)
+        assert kwargs["close_on_shutdown"] is False
+        startup_phase("core_bridge_store")
+        raise RuntimeError(canary)
+
+    monkeypatch.setattr(
+        desktop_launcher,
+        "create_release_desktop_local_api_app",
+        fail_release_app,
+    )
+
+    with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
+        create_app(
+            static_root=_static_root(tmp_path),
+            desktop_config_root=tmp_path / "config",
+            native_frame=desktop_launcher._NativeLauncherFrame(
+                instance_id="1a" * 16,
+                readiness_key=bytes.fromhex("5a" * 32),
+                session_token="7c" * 32,
+                handoff_token="8d" * 32,
+            ),
+            source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+            build_channel="release",
+            core_assets_root=tmp_path / "core-assets",
+        )
+
+    assert exc_info.value.code == "core_bridge_store_failed"
+    assert canary not in str(exc_info.value)
+    assert canary not in repr(exc_info.value)
+
+
+def test_non_release_create_app_keeps_asgi_shutdown_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ClosingProvider(workspace_import_store=object())
+    app = _app_with_provider(provider)
+
+    def create_release_app(**kwargs: object) -> FastAPI:
+        assert kwargs["close_on_shutdown"] is True
+        return app
+
+    monkeypatch.setattr(
+        desktop_launcher,
+        "create_release_desktop_local_api_app",
+        create_release_app,
+    )
+    monkeypatch.setattr(
+        desktop_launcher,
+        "create_desktop_app",
+        lambda candidate, **_kwargs: candidate,
+    )
+
+    result = create_app(
+        static_root=_static_root(tmp_path),
+        desktop_config_root=tmp_path / "config",
+        native_frame=desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token="7c" * 32,
+            handoff_token="8d" * 32,
+        ),
+        source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        build_channel="test",
+    )
+
+    assert result is app
+    provider.close()
+
+
+def test_packaged_launcher_reports_native_frame_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = "Traceback /Users/private token=secret"
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_read_native_instance_frame",
+        lambda: (_ for _ in ()).throw(ValueError(canary)),
+    )
+
+    with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
+        desktop_launcher.main(
+            ["--listener-fd", "3", "--native-instance-stdin"],
+            packaged_source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        )
+
+    assert exc_info.value.code == "native_frame_failed"
+    assert canary not in str(exc_info.value)
+
+
+def test_packaged_launcher_reports_server_import_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = "Traceback /Users/private token=secret"
+    real_import = builtins.__import__
+
+    def fail_uvicorn_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "uvicorn":
+            raise ImportError(canary)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_uvicorn_import)
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_read_native_instance_frame",
+        lambda: desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token="7c" * 32,
+            handoff_token="8d" * 32,
+        ),
+    )
+
+    with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
+        desktop_launcher.main(
+            ["--listener-fd", "3", "--native-instance-stdin"],
+            packaged_source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        )
+
+    assert exc_info.value.code == "server_import_failed"
+    assert canary not in str(exc_info.value)
+
+
+class _ClosingProvider:
+    def __init__(
+        self,
+        *,
+        workspace_import_store: object = None,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.workspace_import_store = workspace_import_store
+        self.close_calls = 0
+        self.close_error = close_error
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _app_with_provider(provider: _ClosingProvider) -> FastAPI:
+    app = FastAPI()
+    app.state.desktop_release_provider = provider
+    return app
+
+
+def test_release_app_credential_reset_failure_closes_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = RuntimeError("credential reset canary")
+    cleanup_canary = RuntimeError("credential store cleanup canary")
+
+    class FailingStore:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def reset_release_credential_slots(self) -> None:
+            raise canary
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise cleanup_canary
+
+    store = FailingStore()
+    monkeypatch.setattr(release_app, "DesktopProviderStore", lambda *_args, **_kwargs: store)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        release_app.create_release_desktop_local_api_app(
+            state_root=tmp_path,
+            session_token="7c" * 32,
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+            build_channel="test",
+        )
+
+    assert exc_info.value is canary
+    assert exc_info.value is not cleanup_canary
+    assert store.close_calls == 1
+
+
+def test_release_app_route_registration_failure_closes_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_canary = RuntimeError("provider cleanup canary")
+    provider = _ClosingProvider(close_error=cleanup_canary)
+    app = FastAPI()
+    canary = RuntimeError("route registration canary")
+
+    class FakeStore:
+        state_root = tmp_path
+
+        def reset_release_credential_slots(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        release_app,
+        "DesktopProviderStore",
+        lambda *_args, **_kwargs: FakeStore(),
+    )
+    monkeypatch.setattr(
+        release_app,
+        "WorkspaceImportStore",
+        lambda *_args, **_kwargs: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        app,
+        "middleware",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(canary),
+    )
+    monkeypatch.setattr(release_app, "create_contract_app", lambda _provider: app)
+    monkeypatch.setattr(
+        release_app,
+        "DesktopReleaseProvider",
+        lambda *_args, **_kwargs: provider,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        release_app.create_release_desktop_local_api_app(
+            state_root=tmp_path,
+            session_token="7c" * 32,
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+            build_channel="test",
+            remote_lifecycle=SimpleNamespace(close=lambda: None),
+        )
+
+    assert exc_info.value is canary
+    assert exc_info.value is not cleanup_canary
+    assert provider.close_calls == 1
+
+
+def test_release_app_can_delegate_shutdown_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ClosingProvider()
+    app = FastAPI()
+    shutdown_events: list[tuple[str, object]] = []
+
+    class FakeStore:
+        state_root = tmp_path
+
+        def reset_release_credential_slots(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        release_app,
+        "DesktopProviderStore",
+        lambda *_args, **_kwargs: FakeStore(),
+    )
+    monkeypatch.setattr(
+        release_app,
+        "WorkspaceImportStore",
+        lambda *_args, **_kwargs: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(release_app, "create_contract_app", lambda _provider: app)
+    monkeypatch.setattr(
+        release_app,
+        "DesktopReleaseProvider",
+        lambda *_args, **_kwargs: provider,
+    )
+    monkeypatch.setattr(
+        app.router,
+        "add_event_handler",
+        lambda event, handler: shutdown_events.append((event, handler)),
+    )
+
+    result = release_app.create_release_desktop_local_api_app(
+        state_root=tmp_path,
+        session_token="7c" * 32,
+        instance_id="1a" * 16,
+        readiness_key=bytes.fromhex("5a" * 32),
+        source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        build_channel="test",
+        remote_lifecycle=SimpleNamespace(close=lambda: None),
+        close_on_shutdown=False,
+    )
+
+    assert result is app
+    assert shutdown_events == []
+    provider.close()
+    assert provider.close_calls == 1
+
+
+def test_release_static_app_failure_closes_started_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ClosingProvider(workspace_import_store=object())
+    app = _app_with_provider(provider)
+    monkeypatch.setattr(
+        desktop_launcher,
+        "create_release_desktop_local_api_app",
+        lambda **_: app,
+    )
+    monkeypatch.setattr(
+        desktop_launcher,
+        "create_desktop_app",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("canary")),
+    )
+
+    with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
+        create_app(
+            static_root=_static_root(tmp_path),
+            desktop_config_root=tmp_path / "config",
+            native_frame=desktop_launcher._NativeLauncherFrame(
+                instance_id="1a" * 16,
+                readiness_key=bytes.fromhex("5a" * 32),
+                session_token="7c" * 32,
+                handoff_token="8d" * 32,
+            ),
+            source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+            build_channel="release",
+            core_assets_root=tmp_path / "core-assets",
+        )
+
+    assert exc_info.value.code == "static_app_failed"
+    assert provider.close_calls == 1
+
+
+def test_release_native_route_failure_closes_started_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ClosingProvider()
+    app = _app_with_provider(provider)
+    del provider.workspace_import_store
+    monkeypatch.setattr(
+        desktop_launcher,
+        "create_release_desktop_local_api_app",
+        lambda **_: app,
+    )
+
+    with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
+        create_app(
+            static_root=_static_root(tmp_path),
+            desktop_config_root=tmp_path / "config",
+            native_frame=desktop_launcher._NativeLauncherFrame(
+                instance_id="1a" * 16,
+                readiness_key=bytes.fromhex("5a" * 32),
+                session_token="7c" * 32,
+                handoff_token="8d" * 32,
+            ),
+            source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+            build_channel="release",
+            core_assets_root=tmp_path / "core-assets",
+        )
+
+    assert exc_info.value.code == "native_routes_failed"
+    assert provider.close_calls == 1
+
+
+@pytest.mark.parametrize(("server_raises", "started"), [(False, False), (True, False)])
+def test_packaged_launcher_server_failure_closes_started_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    server_raises: bool,
+    started: bool,
+) -> None:
+    provider = _ClosingProvider()
+    app = _app_with_provider(provider)
+    listener = SimpleNamespace(
+        set_inheritable=lambda _value: None,
+        setblocking=lambda _value: None,
+        close=lambda: None,
+    )
+
+    class FakeServer:
+        def __init__(self, _config: object) -> None:
+            self.started = started
+
+        def run(self, *, sockets: list[object]) -> None:
+            assert sockets == [listener]
+            if server_raises:
+                raise RuntimeError("server canary")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        SimpleNamespace(
+            Config=lambda *_args, **_kwargs: object(),
+            Server=FakeServer,
+        ),
+    )
+    monkeypatch.setattr(desktop_launcher, "create_app", lambda **_: app)
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_read_native_instance_frame",
+        lambda: desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token="7c" * 32,
+            handoff_token="8d" * 32,
+        ),
+    )
+    monkeypatch.setattr(desktop_launcher.socket, "socket", lambda **_: listener)
+
+    with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
+        desktop_launcher.main(
+            ["--listener-fd", "3", "--native-instance-stdin"],
+            packaged_source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        )
+
+    assert exc_info.value.code == "server_failed"
+    assert provider.close_calls == 1
+
+
+@pytest.mark.parametrize("failing_resource", ["listener", "provider"])
+def test_packaged_launcher_normal_exit_cleanup_failure_is_typed(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_resource: str,
+) -> None:
+    canary = RuntimeError(f"{failing_resource} cleanup canary")
+    provider = _ClosingProvider(
+        close_error=canary if failing_resource == "provider" else None,
+    )
+    app = _app_with_provider(provider)
+    listener_close_calls = 0
+
+    def close_listener() -> None:
+        nonlocal listener_close_calls
+        listener_close_calls += 1
+        if failing_resource == "listener":
+            raise canary
+
+    listener = SimpleNamespace(
+        set_inheritable=lambda _value: None,
+        setblocking=lambda _value: None,
+        close=close_listener,
+    )
+
+    class FakeServer:
+        started = True
+
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def run(self, *, sockets: list[object]) -> None:
+            assert sockets == [listener]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        SimpleNamespace(
+            Config=lambda *_args, **_kwargs: object(),
+            Server=FakeServer,
+        ),
+    )
+    monkeypatch.setattr(desktop_launcher, "create_app", lambda **_: app)
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_read_native_instance_frame",
+        lambda: desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token="7c" * 32,
+            handoff_token="8d" * 32,
+        ),
+    )
+    monkeypatch.setattr(desktop_launcher.socket, "socket", lambda **_: listener)
+
+    with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
+        desktop_launcher.main(
+            ["--listener-fd", "3", "--native-instance-stdin"],
+            packaged_source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        )
+
+    assert exc_info.value.code == "shutdown_failed"
+    assert canary.args[0] not in str(exc_info.value)
+    assert listener_close_calls == 1
+    assert provider.close_calls == 1
+
+
+def test_packaged_launcher_listener_failure_closes_started_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ClosingProvider()
+    app = _app_with_provider(provider)
+    monkeypatch.setattr(desktop_launcher, "create_app", lambda **_: app)
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_read_native_instance_frame",
+        lambda: desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token="7c" * 32,
+            handoff_token="8d" * 32,
+        ),
+    )
+    monkeypatch.setattr(
+        desktop_launcher.socket,
+        "socket",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("listener canary")),
+    )
+
+    with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
+        desktop_launcher.main(
+            ["--listener-fd", "3", "--native-instance-stdin"],
+            packaged_source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        )
+
+    assert exc_info.value.code == "listener_failed"
+    assert provider.close_calls == 1
 
 
 @pytest.mark.parametrize(

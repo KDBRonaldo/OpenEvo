@@ -83,6 +83,8 @@ def test_startup_producers_exactly_match_smoke_allowlist() -> None:
         "openevo_sidecar_smoke_startup_contract_test",
         "scripts/ci/smoke_openevo_desktop_sidecar.py",
     )
+    from desktop.server import launcher
+
     bootloader_source = "\n".join(
         (
             builder._BOOTLOADER_RESOLVER_REPLACEMENT,
@@ -101,12 +103,13 @@ def test_startup_producers_exactly_match_smoke_allowlist() -> None:
         )
     )
     allowlisted_pairs = {
-        (stage, code)
-        for stage, codes in smoke._STARTUP_DIAGNOSTIC_CODES.items()
-        for code in codes
+        (stage, code) for stage, codes in smoke._STARTUP_DIAGNOSTIC_CODES.items() for code in codes
     }
 
     assert producer_pairs == allowlisted_pairs
+    assert launcher._PACKAGED_STARTUP_CODES == {
+        code for stage, code in producer_pairs if stage == "python_launcher"
+    }
 
 
 def test_smoke_failure_exposes_only_bounded_allowlisted_startup_lines(tmp_path: Path) -> None:
@@ -317,9 +320,9 @@ def test_native_frame_cancellation_reaps_owned_process_group(tmp_path: Path) -> 
 
 
 def test_smoke_uses_bounded_pipe_instead_of_disk_backed_process_log() -> None:
-    source = (
-        REPOSITORY_ROOT / "scripts/ci/smoke_openevo_desktop_sidecar.py"
-    ).read_text(encoding="utf-8")
+    source = (REPOSITORY_ROOT / "scripts/ci/smoke_openevo_desktop_sidecar.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "stdout=subprocess.PIPE" in source
     assert "stderr=subprocess.STDOUT" in source
@@ -429,9 +432,7 @@ def test_python_startup_redacts_launcher_system_exit(
     monkeypatch.setattr(
         launcher,
         "main",
-        lambda **_: (_ for _ in ()).throw(
-            SystemExit("Traceback /Users/private token=secret")
-        ),
+        lambda **_: (_ for _ in ()).throw(SystemExit("Traceback /Users/private token=secret")),
     )
 
     assert entry._startup_main() == 1
@@ -441,3 +442,47 @@ def test_python_startup_redacts_launcher_system_exit(
     assert "Traceback" not in captured.err
     assert "/Users/private" not in captured.err
     assert "token=secret" not in captured.err
+
+
+def test_python_startup_preserves_typed_redacted_launcher_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    entry = _load_module(
+        "openevo_sidecar_entry_typed_launcher_failure_test",
+        "desktop/packaging/sidecar_entry.py",
+    )
+    from desktop.server import launcher
+
+    monkeypatch.setattr(entry.sys, "argv", ["openevo-desktop-sidecar"])
+    monkeypatch.setenv(entry.NATIVE_LISTENER_FD_ENV, "3")
+    monkeypatch.setenv(entry.NATIVE_EXECUTABLE_FD_ENV, "4")
+    monkeypatch.setattr(
+        entry,
+        "_load_packaged_build_metadata",
+        lambda: entry._PackagedBuildMetadata(source_commit="abcdef1"),
+    )
+    canary = "Traceback /Users/private token=secret"
+
+    def fail_launcher(**_: object) -> int:
+        try:
+            raise RuntimeError(canary)
+        except RuntimeError as exc:
+            raise launcher.PackagedLauncherStartupError("core_bridge_store_failed") from exc
+
+    monkeypatch.setattr(launcher, "main", fail_launcher)
+
+    assert entry._startup_main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        captured.err == "OPENEVO_STARTUP_V1 stage=python_launcher code=core_bridge_store_failed\n"
+    )
+    assert canary not in captured.err
+
+
+def test_packaged_launcher_startup_error_rejects_unknown_code() -> None:
+    from desktop.server import launcher
+
+    with pytest.raises(ValueError, match="startup diagnostic code"):
+        launcher.PackagedLauncherStartupError("unknown_failure")

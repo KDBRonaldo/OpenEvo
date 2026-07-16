@@ -92,7 +92,21 @@ point. A candidate with a missing, malformed, unknown, or non-allowlisted
 startup diagnostic remains failed. Maintainers must fix the identified
 descriptor/executable/startup stage and rerun from a new commit; they must not
 publish arbitrary process output, disclose paths or credentials, or replace an
-FD-bound archive read with a pathname fallback.
+FD-bound archive read with a pathname fallback. `python_launcher/*_failed`
+codes identify the last closed release-composition phase, such as Core assets,
+provider/workspace storage, SSH lifecycle, Core bridge/runtime, Local API, or
+static app mounting. They do not authorize printing the underlying exception.
+`python_launcher/shutdown_failed` means the packaged listener or release
+provider could not be closed after an otherwise normal server return. When a
+startup or server failure is already active, cleanup remains best effort and
+does not replace that earlier fixed phase code.
+The packaged launcher must pass `close_on_shutdown=False` to the Local API app
+factory and close the provider itself after `Server.run()` returns. Re-enabling
+the ASGI close hook in this path is invalid because Uvicorn records shutdown
+handler failures internally and can return without propagating them.
+The launcher must also retain its packaged signal-replay guard around both
+`Server.run()` and explicit cleanup. Without it, Uvicorn restores and replays
+Tauri's `SIGTERM`, terminating Python before launcher-owned cleanup runs.
 
 The manual candidate uses the same producer/consumer rule for the complete
 release inventory. `release-candidate.json` and `core-install-artifact.json`
