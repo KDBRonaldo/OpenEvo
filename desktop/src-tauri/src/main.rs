@@ -208,6 +208,24 @@ fn validate_extended_acl_entries(entries: &[ExtendedAclEntry]) -> HostResult<()>
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn macos_acl_entry_result(result: libc::c_int, error_number: libc::c_int) -> HostResult<bool> {
+    match (result, error_number) {
+        (0, 0) => Ok(true),
+        (-1, libc::EINVAL) => Ok(false),
+        _ => Err(packaged_path_error()),
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_acl_presence_result(is_null: bool, error_number: libc::c_int) -> HostResult<bool> {
+    match (is_null, error_number) {
+        (false, 0) => Ok(true),
+        (true, libc::ENOENT) => Ok(false),
+        _ => Err(packaged_path_error()),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn validate_anchored_extended_acl(_file: &File) -> HostResult<()> {
     Ok(())
@@ -245,19 +263,24 @@ fn validate_anchored_extended_acl(file: &File) -> HostResult<()> {
         }
     }
 
+    unsafe {
+        set_current_errno(0);
+    }
     let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        return Err(packaged_path_error());
+    if !macos_acl_presence_result(acl.is_null(), unsafe { current_errno() })? {
+        return Ok(());
     }
     let _guard = AclGuard(acl);
     let mut entries = Vec::new();
     let mut entry_id = ACL_FIRST_ENTRY;
     loop {
         let mut entry: AclEntry = ptr::null_mut();
-        match unsafe { acl_get_entry(acl, entry_id, &mut entry) } {
-            0 => break,
-            1 => {}
-            _ => return Err(packaged_path_error()),
+        unsafe {
+            set_current_errno(0);
+        }
+        let result = unsafe { acl_get_entry(acl, entry_id, &mut entry) };
+        if !macos_acl_entry_result(result, unsafe { current_errno() })? {
+            break;
         }
         let mut raw_tag = 0;
         let mut permissions = 0_u64;
@@ -1653,11 +1676,32 @@ fn open_trusted_source_parent(path: &Path) -> HostResult<(File, CString)> {
     if !path.is_absolute() {
         return Err(packaged_path_error());
     }
-    let parent = path.parent().ok_or_else(packaged_path_error)?;
-    let name = path.file_name().ok_or_else(packaged_path_error)?;
+    let trusted_path = trusted_packaged_path(path);
+    let parent = trusted_path.parent().ok_or_else(packaged_path_error)?;
+    let name = trusted_path.file_name().ok_or_else(packaged_path_error)?;
     let name = CString::new(name.as_bytes()).map_err(|_| packaged_path_error())?;
     let directory = open_directory_chain_no_follow(parent)?;
     Ok((directory, name))
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_packaged_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_packaged_path(path: &Path) -> PathBuf {
+    macos_trusted_path_alias(path)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_trusted_path_alias(path: &Path) -> PathBuf {
+    for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+        if let Ok(suffix) = path.strip_prefix(alias) {
+            return Path::new(target).join(suffix);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn open_directory_chain_no_follow(path: &Path) -> HostResult<File> {
@@ -6688,6 +6732,65 @@ mod tests {
 
         assert_eq!(unknown_tag.code, "bundled_sidecar_path_untrusted");
         assert_eq!(unknown_permission.code, "bundled_sidecar_path_untrusted");
+    }
+
+    #[test]
+    fn macos_acl_entry_results_accept_only_entries_and_exact_end_of_list() {
+        assert!(macos_acl_presence_result(false, 0).unwrap());
+        assert!(!macos_acl_presence_result(true, libc::ENOENT).unwrap());
+        assert!(macos_acl_entry_result(0, 0).unwrap());
+        assert!(!macos_acl_entry_result(-1, libc::EINVAL).unwrap());
+
+        for (is_null, error_number) in [(true, 0), (true, libc::EIO), (false, libc::ENOENT)] {
+            assert_eq!(
+                macos_acl_presence_result(is_null, error_number)
+                    .unwrap_err()
+                    .code,
+                "bundled_sidecar_path_untrusted"
+            );
+        }
+        for (result, error_number) in [(-1, 0), (-1, libc::EIO), (1, 0), (0, libc::EINVAL)] {
+            assert_eq!(
+                macos_acl_entry_result(result, error_number)
+                    .unwrap_err()
+                    .code,
+                "bundled_sidecar_path_untrusted"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_path_aliases_are_exact_and_leave_runner_paths_unchanged() {
+        assert_eq!(
+            macos_trusted_path_alias(Path::new("/var/folders/native/sidecar")),
+            PathBuf::from("/private/var/folders/native/sidecar")
+        );
+        assert_eq!(
+            macos_trusted_path_alias(Path::new("/tmp/native/sidecar")),
+            PathBuf::from("/private/tmp/native/sidecar")
+        );
+        assert_eq!(
+            macos_trusted_path_alias(Path::new(
+                "/Users/runner/work/OpenEvo/OpenEvo/desktop/src-tauri/binaries/sidecar"
+            )),
+            PathBuf::from("/Users/runner/work/OpenEvo/OpenEvo/desktop/src-tauri/binaries/sidecar")
+        );
+        assert_eq!(
+            macos_trusted_path_alias(Path::new("/var-link/native/sidecar")),
+            PathBuf::from("/var-link/native/sidecar")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_release_prepares_acl_free_source_through_system_temp_alias() {
+        let fixture = SidecarFixture::executable(b"acl-free-sidecar");
+
+        let (executable, private_dir) = prepare_packaged_sidecar(fixture.path()).unwrap();
+
+        executable.validate().unwrap();
+        private_dir.validate().unwrap();
+        assert_eq!(read_verified_file(&executable), b"acl-free-sidecar");
     }
 
     #[test]

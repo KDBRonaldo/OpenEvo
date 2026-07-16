@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import gc
 import hashlib
 import json
 import os
 import stat
 import struct
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -444,6 +447,89 @@ def test_store_rejects_insecure_or_symlinked_secure_ancestor(tmp_path: Path) -> 
             secure_ancestor=parent_link / "ancestor",
             runner=KeyscanRunner(""),
         )
+
+
+def test_macos_store_paths_normalize_only_fixed_system_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(host_keys_module.sys, "platform", "darwin")
+
+    assert host_keys_module._canonical_darwin_system_alias(
+        Path("/var/folders/user/state")
+    ) == Path("/private/var/folders/user/state")
+    assert host_keys_module._canonical_darwin_system_alias(
+        Path("/tmp/openevo/state")
+    ) == Path("/private/tmp/openevo/state")
+    assert host_keys_module._canonical_darwin_system_alias(
+        Path("/private/var/folders/user/state")
+    ) == Path("/private/var/folders/user/state")
+    assert host_keys_module._canonical_darwin_system_alias(
+        Path("/Users/alice/state")
+    ) == Path("/Users/alice/state")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS system aliases")
+def test_store_accepts_inode_bound_macos_var_alias() -> None:
+    with tempfile.TemporaryDirectory(prefix="openevo-host-keys-", dir="/var/tmp") as value:
+        requested_ancestor = Path(value)
+        assert os.fspath(requested_ancestor).startswith("/var/tmp/")
+
+        store = ProviderKnownHostStore(
+            requested_ancestor / "known-hosts",
+            secure_ancestor=requested_ancestor,
+            runner=KeyscanRunner(""),
+        )
+
+        expected = (
+            Path("/private")
+            / requested_ancestor.relative_to("/")
+            / "known-hosts"
+        )
+        assert store._root == expected
+        requested = os.stat(requested_ancestor)
+        opened = os.fstat(store._anchor._ancestor_fd)
+        assert (requested.st_dev, requested.st_ino) == (opened.st_dev, opened.st_ino)
+
+
+def test_store_alias_validation_failure_closes_ancestor_fd_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    real_close = os.close
+    closed: list[int] = []
+
+    monkeypatch.setattr(
+        host_keys_module,
+        "_open_secure_ancestor",
+        lambda _path: descriptor,
+    )
+
+    def reject_alias(*_args: object) -> None:
+        raise ValueError("injected alias mismatch")
+
+    def record_close(value: int) -> None:
+        if value == descriptor:
+            closed.append(value)
+        real_close(value)
+
+    monkeypatch.setattr(
+        host_keys_module,
+        "_validate_darwin_system_alias_binding",
+        reject_alias,
+    )
+    monkeypatch.setattr(host_keys_module.os, "close", record_close)
+
+    with pytest.raises(ValueError, match="injected alias mismatch"):
+        host_keys_module._StoreAnchor(
+            tmp_path / "known-hosts",
+            tmp_path,
+            requested_secure_ancestor=tmp_path,
+            lock_timeout_seconds=1.0,
+        )
+    gc.collect()
+
+    assert closed == [descriptor]
 
 
 def test_load_requires_explicit_matching_fingerprint(tmp_path: Path) -> None:

@@ -115,11 +115,18 @@ that is not world-writable; this covers the standard root:admin `0775`
 `/Applications` directory. User-owned group-writable components and every
 non-sticky world-writable component remain invalid. Set-user-ID execution is
 rejected by requiring the real and effective UID to match.
+Darwin's fixed `/var` and `/tmp` aliases are mapped to `/private/var` and
+`/private/tmp` before this traversal. The native host does not call `realpath`
+or accept any other symlink; every mapped component is still opened from the
+root FD with `O_NOFOLLOW`.
 
 On macOS, mode and owner checks are not the complete write policy. Native code
 reads the extended ACL from every held component FD and from the held sidecar
-source FD with `acl_get_fd_np`. A NULL ACL result, malformed entry, unknown tag,
-unknown ALLOW permission, or ALLOW entry containing write-data, append, delete,
+source FD with `acl_get_fd_np`. A NULL result with `ENOENT` means the held file
+has no extended ACL and is accepted; every other NULL result fails closed.
+Enumeration follows Darwin's `acl_get_entry` contract, where zero returns an
+entry and `-1/EINVAL` marks the end. A malformed entry, unknown tag, unknown
+ALLOW permission, or ALLOW entry containing write-data, append, delete,
 delete-child, write-attribute, write-extended-attribute, write-security, or
 change-owner permission fails closed. Read/execute-only ALLOW entries and DENY
 entries are accepted,
@@ -357,6 +364,11 @@ share one 12-second monotonic deadline rather than receiving independent
 timeouts. Connection ownership is generation-bound: replacing A with B first
 persists A as disconnected, cancels A's obsolete local operation, and closes its
 transport before B's synchronous credential or trust parsing can fail.
+On macOS, the provider normalizes only Apple's fixed `/var` and `/tmp` system
+aliases to their `/private/...` forms before opening the known-host store's
+secure ancestor. It verifies that the requested alias and the held no-follow
+descriptor identify the same inode. Arbitrary symlinked ancestors remain
+invalid.
 Unconfirmed host-key candidates are process-only review data and are never a
 verified profile fingerprint. Connect, host-key accept, and disconnect return
 the frozen operation ETag in the response header as well as the body.
