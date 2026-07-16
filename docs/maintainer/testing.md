@@ -287,7 +287,17 @@ it is not candidate artifact evidence and does not replace the macOS packaged or
 app-bundle smokes. The Linux remote smoke combines that fixture with the exact
 transferred wheel and lock. The macOS job owns candidate sidecar packaging and
 exact-pair publication on its GitHub-hosted ephemeral runner; it does not call
-the Linux-only Core service lifecycle.
+the Linux-only Core service lifecycle. Installed framework verification follows
+the same boundary: macOS explicitly runs `smoke_evolution_framework_wheel.py
+--mode installed-registry`, while Linux runs the strict superset
+`--mode linux-context-projection` against the transferred bytes. The latter
+must report both its mode and a passed context-projection result before its
+registry digest is accepted as candidate evidence; no platform-driven implicit
+skip is allowed. Tests behaviorally prove that only the Linux mode invokes the
+context-projection helper. Hostile Python site bootstrap and concurrent
+same-owner install replacement are a separate final-publication hardening gate,
+tracked in GitHub issue #193 rather than claimed by this packaging-only
+candidate.
 
 The sidecar process smoke loads `desktop/release-contract.json`, validates the
 closed `VersionV1` and `DesktopStateV1` models, requires the frozen OpenAPI digest
