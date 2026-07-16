@@ -158,6 +158,10 @@ and requires both binaries to contain exactly the slice represented by the
 runner architecture. `release-candidate.json` repeats those normalized slice
 lists under `macos.native_architectures`, while the file inventory binds both
 complete smoke reports by size and SHA256.
+The preceding tool probe locates an executable `lipo` through
+`xcrun --find lipo`; it does not use the unsupported `lipo -version` flag.
+Availability alone is not release evidence: both real app launches still run
+`lipo -archs` against the Tauri executable and packaged sidecar.
 
 The portable app-smoke unit fixture uses an emitted evidence record because its
 executable is a test script, not Mach-O. It never substitutes for candidate

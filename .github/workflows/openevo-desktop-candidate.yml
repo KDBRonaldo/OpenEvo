@@ -213,7 +213,7 @@ jobs:
       - name: Require native binary inspection tools
         run: |
           file --version
-          lipo -version
+          test -x "$(xcrun --find lipo)"
 
       - name: Copy exact candidate bytes
         run: |
