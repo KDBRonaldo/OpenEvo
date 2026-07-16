@@ -1240,7 +1240,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "--pip-requirements",
         "cargo-audit --locked --version 0.22.2",
         "file --version",
-        "lipo -version",
+        'test -x "$(xcrun --find lipo)"',
         "collect_openevo_release_evidence.py",
         "Retain failed supply-chain summaries",
         "npm test -- --run",
@@ -1295,6 +1295,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     ):
         assert marker in text
     assert release_test_command in macos_candidate
+    assert "lipo -version" not in macos_candidate
     assert macos_candidate.index("- name: Check release-mode Tauri host") < (
         macos_candidate.index(release_test_command)
     ) < macos_candidate.index("- name: Build unsigned Desktop DMG")
