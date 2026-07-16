@@ -13,10 +13,11 @@ from the disabled placeholder workflows.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
-architecture, launches the real Tauri app before and after DMG copy, verifies
-the Tauri executable and sidecar Mach-O slices in both copies with `file` and
-`lipo`, verifies the same final Core wheel on Linux, and creates an unsigned
-draft prerelease.
+architecture, mounts the exact candidate DMG, launches its real Tauri app,
+copies that app to a temporary installation location, detaches the image, and
+launches the copied app again. It verifies the Tauri executable and sidecar
+Mach-O slices in both launches with `file` and `lipo`, verifies the same final
+Core wheel on Linux, and creates an unsigned draft prerelease.
 It uploads all assets, downloads them into a clean directory, and validates the
 exact closed manifest before leaving the draft for review. Passing this
 packaging rehearsal does not satisfy the science E2E, benchmark,
@@ -135,9 +136,10 @@ Tauri's `SIGTERM`, terminating Python before launcher-owned cleanup runs.
 The manual candidate uses the same producer/consumer rule for the complete
 release inventory. `release-candidate.json` and `core-install-artifact.json`
 bind the exact Core wheel and framework lock; the former also binds the DMG,
-`SHA256SUMS`, commit, runner architecture, app/DMG native evidence, and Python,
-npm, and Cargo dependency/license/security summaries. Those summaries are
-checked against the candidate checkout's four lock/license files. The Python
+`SHA256SUMS`, commit, runner architecture, mounted-DMG/detached-copy native
+evidence, and Python, npm, and Cargo dependency/license/security summaries.
+Those summaries are checked against the candidate checkout's four lock/license
+files. The Python
 export uses `uv export --no-emit-project`; the collector requires the
 `pip-audit` package/version set to equal every applicable exact requirement,
 rejects OpenEvo itself, and records the requirements digest and audited package
@@ -146,18 +148,31 @@ is parseable; malformed or incomplete JSON still fails in the collector and no
 advisory is ignored. The final draft job alone receives `contents: write`;
 build and Linux verification retain read-only permissions.
 
-The dependency and security summaries, native smoke evidence, Core descriptor,
-and release candidate manifest use schema version 2 for these closed contracts.
-The unchanged license inventory remains version 1; `framework-lock.json`
-retains its independent string-valued version 1 contract.
+The dependency and security summaries, Core descriptor, and release candidate
+manifest use schema version 2 for those closed contracts. Native smoke evidence
+uses version 3 so every report declares its `mounted_dmg` or `detached_copy`
+launch origin and binds the source DMG and both packaged binaries by SHA256. The
+unchanged license inventory remains version 1; `framework-lock.json` retains its
+independent string-valued version 1 contract.
 
 Each native smoke records closed `mach_o` evidence for the Tauri executable and
 packaged sidecar: bounded `file -b` output plus the sorted `lipo -archs` slice
-list. Candidate creation requires raw-app and DMG-copy observations to match
-and requires both binaries to contain exactly the slice represented by the
-runner architecture. `release-candidate.json` repeats those normalized slice
-lists under `macos.native_architectures`, while the file inventory binds both
-complete smoke reports by size and SHA256.
+list. Candidate creation requires the mounted-DMG and detached-copy
+observations, binary SHA256 values, and source-DMG SHA256 values to match the
+candidate bytes, and requires both binaries to contain exactly the slice
+represented by the runner architecture. Old untyped app evidence is rejected.
+The workflow deliberately does not inspect Tauri's intermediate `bundle/macos`
+path because the DMG bundler may remove that directory after packaging.
+`release-candidate.json` repeats those normalized slice lists under
+`macos.native_architectures`, while the file inventory binds both complete smoke
+reports by size and SHA256.
+Before launch, the smoke rejects symbolic links in the app root, `Info.plist`
+path, Tauri executable path, sidecar path, and their in-bundle ancestors. It
+captures each binary's pre-launch device/inode/size identity and digest, uses
+that digest for the sidecar FD observation, and rechecks both paths after
+process cleanup. Candidate JSON parsing rejects duplicate keys at every nesting
+level, so a last-key-wins parser cannot reinterpret the closed evidence
+contract.
 The preceding tool probe locates an executable `lipo` through
 `xcrun --find lipo`; it does not use the unsupported `lipo -version` flag.
 Availability alone is not release evidence: both real app launches still run

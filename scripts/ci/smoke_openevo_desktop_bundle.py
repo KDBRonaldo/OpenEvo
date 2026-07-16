@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import plistlib
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,8 @@ from smoke_openevo_desktop_sidecar import SmokeFailure  # noqa: E402
 
 SIDECAR_NAME = "openevo-desktop-sidecar"
 APP_BUNDLE_NAME = "OpenEvo Desktop.app"
-EVIDENCE_SCHEMA_VERSION = 2
+EVIDENCE_SCHEMA_VERSION = 3
+LAUNCH_ORIGINS = {"mounted_dmg", "detached_copy"}
 REQUIRED_BOOLEAN_EVIDENCE = (
     "renderer_ready",
     "sidecar_ready",
@@ -35,11 +37,46 @@ REQUIRED_BOOLEAN_EVIDENCE = (
 MACH_O_ARCHITECTURES = {"arm64", "x86_64"}
 
 
+def _bundle_path_metadata(
+    app: Path,
+    path: Path,
+    *,
+    subject: str,
+    required: bool,
+) -> os.stat_result | None:
+    try:
+        relative = path.relative_to(app)
+    except ValueError as exc:
+        raise SmokeFailure(f"{subject} escapes the app bundle") from exc
+    current = app
+    components = (None, *relative.parts)
+    for index, component in enumerate(components):
+        if component is not None:
+            current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            if required:
+                raise SmokeFailure(f"{subject} is missing: {path}") from None
+            return None
+        except OSError as exc:
+            raise SmokeFailure(f"Could not inspect {subject}: {path}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise SmokeFailure(f"{subject} must not traverse a symbolic link: {current}")
+        if index < len(components) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise SmokeFailure(f"{subject} has a non-directory ancestor: {current}")
+    return metadata
+
+
 def _app_bundle(bundle_root: Path) -> Path:
-    if not bundle_root.exists():
-        raise SmokeFailure(f"OpenEvo Desktop bundle root does not exist: {bundle_root}")
     app = bundle_root if bundle_root.name == APP_BUNDLE_NAME else bundle_root / APP_BUNDLE_NAME
-    if not app.is_dir():
+    metadata = _bundle_path_metadata(
+        app,
+        app,
+        subject="OpenEvo Desktop app bundle",
+        required=False,
+    )
+    if metadata is None or not stat.S_ISDIR(metadata.st_mode):
         raise SmokeFailure(f"No {APP_BUNDLE_NAME} bundle found under {bundle_root}")
     return app
 
@@ -47,6 +84,15 @@ def _app_bundle(bundle_root: Path) -> Path:
 def find_app_executable(bundle_root: Path) -> Path:
     app = _app_bundle(bundle_root)
     info_plist = app / "Contents" / "Info.plist"
+    info_metadata = _bundle_path_metadata(
+        app,
+        info_plist,
+        subject="App Info.plist",
+        required=True,
+    )
+    assert info_metadata is not None
+    if not stat.S_ISREG(info_metadata.st_mode):
+        raise SmokeFailure(f"App Info.plist is not a regular file: {info_plist}")
     try:
         with info_plist.open("rb") as stream:
             payload = plistlib.load(stream)
@@ -62,7 +108,14 @@ def find_app_executable(bundle_root: Path) -> Path:
     ):
         raise SmokeFailure("App Info.plist has an invalid CFBundleExecutable")
     executable = app / "Contents" / "MacOS" / executable_name
-    if not executable.is_file() or not os.access(executable, os.X_OK):
+    executable_metadata = _bundle_path_metadata(
+        app,
+        executable,
+        subject="App CFBundleExecutable",
+        required=True,
+    )
+    assert executable_metadata is not None
+    if not stat.S_ISREG(executable_metadata.st_mode) or not os.access(executable, os.X_OK):
         raise SmokeFailure(f"App CFBundleExecutable is missing or not executable: {executable}")
     return executable
 
@@ -75,7 +128,16 @@ def find_bundled_sidecar(bundle_root: Path) -> Path:
         contents / "Resources" / SIDECAR_NAME,
         contents / "Resources" / "binaries" / SIDECAR_NAME,
     ]
-    found = [path for path in candidates if path.is_file()]
+    found: list[Path] = []
+    for path in candidates:
+        metadata = _bundle_path_metadata(
+            app,
+            path,
+            subject="Packaged sidecar",
+            required=False,
+        )
+        if metadata is not None and stat.S_ISREG(metadata.st_mode):
+            found.append(path)
     executable = [path for path in found if os.access(path, os.X_OK)]
     if len(executable) != 1:
         raise SmokeFailure(
@@ -91,6 +153,32 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _source_dmg_identity(path: Path) -> dict[str, str]:
+    if path.is_symlink() or not path.is_file():
+        raise SmokeFailure("App smoke source DMG must be a regular non-symlink file")
+    return {"filename": path.name, "sha256": _sha256(path)}
+
+
+def _file_identity(path: Path) -> tuple[int, int, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise SmokeFailure(f"Could not inspect packaged binary identity: {path.name}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SmokeFailure(f"Packaged binary is no longer a regular file: {path.name}")
+    return metadata.st_dev, metadata.st_ino, metadata.st_size
+
+
+def _verify_binary_unchanged(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int, int],
+    expected_digest: str,
+) -> None:
+    if _file_identity(path) != expected_identity or _sha256(path) != expected_digest:
+        raise SmokeFailure(f"Packaged binary changed during native smoke: {path.name}")
 
 
 def _validate_mach_o_observation(payload: object) -> dict[str, object]:
@@ -283,8 +371,8 @@ def _macos_native_evidence(
     executable: Path,
     sidecar: Path,
     mach_o: dict[str, object],
+    expected_sidecar_digest: str,
 ) -> tuple[dict[str, object] | None, set[int]]:
-    sidecar_digest = _sha256(sidecar)
     sidecar_rows = [row for row in _descendants(app_pid) if SIDECAR_NAME in row[3]]
     process_groups = {row[2] for row in sidecar_rows if row[2] > 0}
     for pid, _parent, _group, _command in sidecar_rows:
@@ -301,7 +389,7 @@ def _macos_native_evidence(
             fd_digest = _sha256(executable_fd_path)
         except OSError:
             continue
-        if fd_digest != sidecar_digest:
+        if fd_digest != expected_sidecar_digest:
             continue
         return (
             {
@@ -358,6 +446,8 @@ def _write_evidence(path: Path, payload: dict[str, object]) -> None:
 def smoke_bundle(
     bundle_root: Path,
     *,
+    launch_origin: str,
+    source_dmg: Path,
     timeout_seconds: float,
     evidence_out: Path | None = None,
 ) -> dict[str, object]:
@@ -365,6 +455,17 @@ def smoke_bundle(
         raise SmokeFailure("Bundle smoke timeout must be positive")
     executable = find_app_executable(bundle_root)
     sidecar = find_bundled_sidecar(bundle_root)
+    if launch_origin not in LAUNCH_ORIGINS:
+        raise SmokeFailure("App smoke launch origin is unsupported")
+    source_dmg_identity = _source_dmg_identity(source_dmg)
+    binary_sha256 = {
+        "native_executable": _sha256(executable),
+        "bundled_external_bin": _sha256(sidecar),
+    }
+    binary_identities = {
+        "native_executable": _file_identity(executable),
+        "bundled_external_bin": _file_identity(sidecar),
+    }
     mach_o = (
         {
             "native_executable": inspect_mach_o(executable),
@@ -409,6 +510,7 @@ def smoke_bundle(
                             executable,
                             sidecar,
                             mach_o,
+                            binary_sha256["bundled_external_bin"],
                         )
                         process_groups.update(observed_groups)
                         if evidence is not None and evidence["renderer_ready"] is True:
@@ -439,8 +541,21 @@ def smoke_bundle(
             process_group_cleanup = _wait_for_groups_to_exit(process_groups, cleanup_deadline)
             if not process_group_cleanup:
                 raise SmokeFailure("OpenEvo Desktop left an app or sidecar process group running")
+            _verify_binary_unchanged(
+                executable,
+                expected_identity=binary_identities["native_executable"],
+                expected_digest=binary_sha256["native_executable"],
+            )
+            _verify_binary_unchanged(
+                sidecar,
+                expected_identity=binary_identities["bundled_external_bin"],
+                expected_digest=binary_sha256["bundled_external_bin"],
+            )
             evidence.pop("nonce", None)
             evidence["process_group_cleanup"] = True
+            evidence["launch_origin"] = launch_origin
+            evidence["source_dmg"] = source_dmg_identity
+            evidence["binary_sha256"] = binary_sha256
             if evidence_out is not None:
                 _write_evidence(evidence_out, evidence)
             return evidence
@@ -456,6 +571,8 @@ def smoke_bundle(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle_root", type=Path)
+    parser.add_argument("--launch-origin", choices=sorted(LAUNCH_ORIGINS), required=True)
+    parser.add_argument("--source-dmg", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     parser.add_argument("--evidence-out", type=Path)
     args = parser.parse_args(argv)
@@ -463,6 +580,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         evidence = smoke_bundle(
             args.bundle_root,
+            launch_origin=args.launch_origin,
+            source_dmg=args.source_dmg,
             timeout_seconds=args.timeout_seconds,
             evidence_out=args.evidence_out,
         )

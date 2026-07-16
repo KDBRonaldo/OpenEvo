@@ -78,8 +78,8 @@ The repository currently provides:
 - `.github/workflows/openevo-desktop-candidate.yml`, a stable-only manual
   candidate workflow. Its macOS job uses locked inputs, clean-installs the exact
   embedded Core wheel, runs renderer and release-mode Rust checks, and builds
-  only the architecture reported by `rustc --print host-tuple`. Both the raw app
-  bundle and the app copied from the mounted DMG launch the real
+  only the architecture reported by `rustc --print host-tuple`. Both the app
+  inside the mounted exact candidate DMG and its detached copy launch the real
   `Contents/MacOS` Tauri executable. The smoke records a visible renderer
   window, packaged sidecar readiness, inherited listener FD 3, executable FD 4
   matching the bundled externalBin bytes, and bounded process-group cleanup.
@@ -775,7 +775,8 @@ commit:
   by Desktop;
 - `release-candidate.json` and canonical `SHA256SUMS` binding the DMG, Core
   wheel, framework lock, Core descriptor, source commit, actual architecture,
-  raw/DMG-copy Mach-O evidence, native app smokes, and supply-chain evidence;
+  mounted-DMG/detached-copy Mach-O evidence, native app smokes, and supply-chain
+  evidence;
 - `python-requirements.txt`, exported without the OpenEvo project itself and
   digest-bound to the exact third-party `pip-audit` report summary;
 - release notes and the dependency/security evidence required by the canonical
@@ -783,9 +784,10 @@ commit:
 
 PyPI is not part of the External Beta release.
 
-The changed closed contracts use version 2 for dependency/security summaries,
-native smoke evidence, the Core descriptor, and the release candidate manifest.
-The unchanged license inventory and framework lock keep their existing versions.
+The dependency/security summaries, Core descriptor, and release candidate
+manifest use version 2. Native smoke evidence uses version 3 to bind its launch
+origin, exact source-DMG SHA256, and both packaged binary SHA256 values. The
+unchanged license inventory and framework lock keep their existing versions.
 
 ## Build Inputs
 
@@ -833,10 +835,11 @@ The replacement workflow must:
    lock without a pre-staged artifact;
 4. build the sidecar, Vite assets, Tauri app bundle, and DMG on a supported
    macOS runner;
-5. mount the DMG, copy the app into a clean location, and launch that copied
-   application with a clean user profile; before each launch, inspect the Tauri
-   executable and sidecar with `file -b` and `lipo -archs`, then require the raw
-   and copied observations to match the declared candidate architecture;
+5. mount the exact candidate DMG and launch its app with a clean user profile;
+   copy that app into a clean location, detach the image, and launch the copy
+   with a second clean user profile. Before each launch, inspect the Tauri
+   executable and sidecar with `file -b` and `lipo -archs`, then require the
+   mounted and copied observations to match the declared candidate architecture;
 6. exercise first-run through a descriptor-matched remote Core health check;
 7. use the authenticated paginated release inventory to require the candidate
    release, including a private draft, and real Git tag to be absent; create a
@@ -887,8 +890,10 @@ flow as pending and does not satisfy that final Gatekeeper requirement.
 Release evidence must cover:
 
 - supported architecture and minimum macOS version;
-- exact Mach-O slices for both the Tauri executable and sidecar in the raw app
-  and the app copied from the mounted DMG;
+- exact Mach-O slices for both the Tauri executable and sidecar in the app
+  inside the mounted candidate DMG and in its detached copy;
+- symlink-rejecting app/`Info.plist`/binary paths plus stable pre/post binary
+  identity and SHA256 across each native launch;
 - Core Python/platform compatibility and a Linux verifier selected from the
   descriptor's closed supported-platform list;
 - sidecar start, crash recovery, tunnel loss, quit, and relaunch;

@@ -105,10 +105,23 @@ def _write_private_new(path: Path, payload: bytes) -> None:
 
 
 def _load_json(path: Path) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in payload:
+                raise CandidateError(
+                    f"Candidate JSON contains a duplicate key in {path.name}: {key}"
+                )
+            payload[key] = value
+        return payload
+
     try:
         if path.stat().st_size > 1024 * 1024:
             raise CandidateError(f"Candidate JSON exceeds 1 MiB: {path.name}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+        )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CandidateError(f"Candidate JSON is unreadable: {path.name}") from exc
 
@@ -175,7 +188,7 @@ def render_candidate_release_notes(
             "Trajectory-to-skill pass@1 rescue count: pending.",
             "Agent-system pass@1 rescue count: pending.",
             "No benchmark performance claim is made by this draft.",
-            "The exact Core wheel, app bundle, copied DMG app, dependency evidence, and downloaded draft assets are validated by this workflow.",
+            "The exact Core wheel, candidate DMG, its mounted app and detached copy, dependency evidence, and downloaded draft assets are validated by this workflow.",
             "",
             "## Security And Privacy",
             "",
@@ -335,7 +348,12 @@ def _validate_mach_o_observation(payload: object, *, subject: str) -> list[str]:
     return slices
 
 
-def _validate_evidence(root: Path, *, architecture: str) -> dict[str, list[str]]:
+def _validate_evidence(
+    root: Path,
+    *,
+    architecture: str,
+    dmg_path: Path,
+) -> dict[str, list[str]]:
     dependency = _load_json(root / "dependency-inventory.json")
     license_inventory = _load_json(root / "license-inventory.json")
     security = _load_json(root / "security-audit.json")
@@ -425,14 +443,34 @@ def _validate_evidence(root: Path, *, architecture: str) -> dict[str, list[str]]
         "native_executable_fd_handoff",
         "process_group_cleanup",
         "mach_o",
+        "launch_origin",
+        "source_dmg",
+        "binary_sha256",
     }
     smoke_payloads: list[dict[str, object]] = []
-    for filename in ("app-bundle-smoke.json", "dmg-copy-smoke.json"):
+    expected_dmg_identity = {"filename": dmg_path.name, "sha256": _sha256(dmg_path)}
+    smoke_contracts = (
+        ("app-bundle-smoke.json", "mounted_dmg"),
+        ("dmg-copy-smoke.json", "detached_copy"),
+    )
+    for filename, launch_origin in smoke_contracts:
         smoke = _load_json(root / filename)
         if type(smoke) is not dict or set(smoke) != smoke_keys:
             raise CandidateError(f"{filename} does not use the closed smoke evidence schema")
-        if smoke.get("schema_version") != 2:
+        if smoke.get("schema_version") != 3:
             raise CandidateError(f"{filename} schema version is invalid")
+        if smoke.get("launch_origin") != launch_origin:
+            raise CandidateError(f"{filename} launch origin is invalid")
+        if smoke.get("source_dmg") != expected_dmg_identity:
+            raise CandidateError(f"{filename} does not bind the exact source DMG")
+        binary_sha256 = smoke.get("binary_sha256")
+        if type(binary_sha256) is not dict or set(binary_sha256) != {
+            "native_executable",
+            "bundled_external_bin",
+        }:
+            raise CandidateError(f"{filename} binary digests do not use the closed schema")
+        for binary, digest in binary_sha256.items():
+            _require_digest(digest, f"{filename} {binary} digest")
         if smoke.get("native_executable") != "OpenEvo Desktop":
             raise CandidateError(f"{filename} did not launch the Tauri executable")
         if smoke.get("bundled_external_bin") != "openevo-desktop-sidecar":
@@ -442,6 +480,9 @@ def _validate_evidence(root: Path, *, architecture: str) -> dict[str, list[str]]
             "native_executable",
             "bundled_external_bin",
             "mach_o",
+            "launch_origin",
+            "source_dmg",
+            "binary_sha256",
         }
         if any(smoke.get(key) is not True for key in boolean_keys):
             raise CandidateError(f"{filename} contains failing native evidence")
@@ -455,7 +496,13 @@ def _validate_evidence(root: Path, *, architecture: str) -> dict[str, list[str]]
             _validate_mach_o_observation(mach_o[binary], subject=f"{filename} {binary}")
         smoke_payloads.append(smoke)
     if smoke_payloads[0]["mach_o"] != smoke_payloads[1]["mach_o"]:
-        raise CandidateError("Raw app and DMG-copy Mach-O evidence do not match")
+        raise CandidateError(
+            "Mounted-DMG app and detached-copy Mach-O evidence do not match"
+        )
+    if smoke_payloads[0]["binary_sha256"] != smoke_payloads[1]["binary_sha256"]:
+        raise CandidateError(
+            "Mounted-DMG app and detached-copy binary digests do not match"
+        )
     expected_slice = ARCHITECTURE_SLICES[architecture]
     mach_o = smoke_payloads[0]["mach_o"]
     assert isinstance(mach_o, dict)
@@ -692,7 +739,11 @@ def create_candidate_manifest(
     wheel = paths["core_wheel"]
     _validate_wheel(wheel, version=version)
     _validate_framework_lock(paths["framework_lock"], wheel, version=version)
-    native_architectures = _validate_evidence(root, architecture=architecture)
+    native_architectures = _validate_evidence(
+        root,
+        architecture=architecture,
+        dmg_path=paths["desktop_dmg"],
+    )
     _validate_release_notes(
         paths["release_notes"],
         source_commit=source_commit,
@@ -890,7 +941,11 @@ def _validate_candidate_manifest(
     lock_path = root / str(by_role["framework_lock"]["filename"])
     _validate_wheel(wheel_path, version=version)
     _validate_framework_lock(lock_path, wheel_path, version=version)
-    observed_native_architectures = _validate_evidence(root, architecture=architecture)
+    observed_native_architectures = _validate_evidence(
+        root,
+        architecture=architecture,
+        dmg_path=root / str(by_role["desktop_dmg"]["filename"]),
+    )
     if observed_native_architectures != native_architectures:
         raise CandidateError("candidate manifest Mach-O slices do not match native evidence")
     _validate_release_notes(
