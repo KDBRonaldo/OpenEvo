@@ -243,7 +243,7 @@ jobs:
             "$mounted_app" \
             --launch-origin mounted_dmg \
             --source-dmg "$dmg" \
-            --timeout-seconds 60 \
+            --timeout-seconds 120 \
             --evidence-out candidate-artifacts/app-bundle-smoke.json
           ditto "$mounted_app" "$copied_app"
           hdiutil detach "$mount_dir" -quiet
@@ -251,7 +251,7 @@ jobs:
             "$copied_app" \
             --launch-origin detached_copy \
             --source-dmg "$dmg" \
-            --timeout-seconds 60 \
+            --timeout-seconds 120 \
             --evidence-out candidate-artifacts/dmg-copy-smoke.json
 
       - name: Write release notes and authoritative candidate manifest

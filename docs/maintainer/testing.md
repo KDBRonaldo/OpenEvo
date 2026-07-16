@@ -208,7 +208,11 @@ with `proc_pidinfo(PROC_PIDTBSDINFO)` before FD observation.
 The private launch pathname remains within the documented same-UID trust
 boundary until native cleanup. The smoke does not reopen the pathname reported
 by `lsof`; it trusts only the marker-bound live FD identity. Its macOS probes
-share the readiness deadline and run in private sessions. Timeout cleanup uses
+share the 120-second app-smoke readiness deadline and run in private sessions.
+The native host retains a separate 60-second bounded allowance for a cold
+PyInstaller onefile startup; the larger outer deadline also covers renderer,
+FD, and window observation. Cleanup subsequently keeps its separate 5-second
+termination and 15-second process-group disappearance bounds. Timeout cleanup uses
 a bounded ancestry snapshot to kill an observed child that escaped with
 `setsid`, then kills the root group and reaps the direct leader. Observation
 also caps each sidecar group. It requires bounded

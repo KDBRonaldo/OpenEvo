@@ -2155,7 +2155,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         '            "$mounted_app" \\\n'
         "            --launch-origin mounted_dmg \\\n"
         '            --source-dmg "$dmg" \\\n'
-        "            --timeout-seconds 60 \\\n"
+        "            --timeout-seconds 120 \\\n"
         "            --evidence-out candidate-artifacts/app-bundle-smoke.json"
     )
     copied_smoke = (
@@ -2163,7 +2163,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         '            "$copied_app" \\\n'
         "            --launch-origin detached_copy \\\n"
         '            --source-dmg "$dmg" \\\n'
-        "            --timeout-seconds 60 \\\n"
+        "            --timeout-seconds 120 \\\n"
         "            --evidence-out candidate-artifacts/dmg-copy-smoke.json"
     )
     assert shipped_app_smoke.count(

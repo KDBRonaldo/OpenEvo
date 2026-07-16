@@ -54,7 +54,8 @@ const SESSION_TOKEN_BYTES: usize = 32;
 const HANDOFF_TOKEN_BYTES: usize = 32;
 const WORKSPACE_CANCELLATION_TOKEN_BYTES: usize = 32;
 const NATIVE_INSTANCE_FRAME_MAX_BYTES: usize = 512;
-const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+// A cold PyInstaller onefile launch can approach 15 seconds on macOS runners.
+const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const SIDECAR_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const SIDECAR_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
@@ -8338,6 +8339,11 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn release_startup_budget_covers_cold_onefile_bootstrap() {
+        assert_eq!(SIDECAR_STARTUP_TIMEOUT, Duration::from_secs(60));
     }
 
     #[test]
