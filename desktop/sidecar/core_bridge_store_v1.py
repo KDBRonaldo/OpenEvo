@@ -16,6 +16,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import sys
 import threading
 from typing import Any, TypeVar, cast
 import unicodedata
@@ -1408,13 +1409,22 @@ class DesktopCoreBridgeStoreV1:
     def _open_database_connection(self) -> sqlite3.Connection:
         self._verify_storage_files()
         try:
-            descriptor_path = f"/dev/fd/{self._database_fd}"
+            if sys.platform == "darwin":
+                database_target: str | Path = self.database_path
+                uri = False
+            elif sys.platform.startswith("linux"):
+                database_target = f"file:/dev/fd/{self._database_fd}?mode=rw"
+                uri = True
+            else:
+                raise CoreBridgeStoreStateRootError(
+                    "bridge SQLite platform is unsupported"
+                )
             connection = sqlite3.connect(
-                f"file:{descriptor_path}?mode=rw",
+                database_target,
                 timeout=30,
                 isolation_level=None,
                 check_same_thread=False,
-                uri=True,
+                uri=uri,
             )
             if connection.execute("PRAGMA synchronous").fetchone() != (_SQLITE_SYNCHRONOUS_FULL,):
                 raise CoreBridgeStoreStateRootError(
@@ -1425,6 +1435,10 @@ class DesktopCoreBridgeStoreV1:
             if len(database_rows) != 1:
                 raise CoreBridgeStoreStateRootError("SQLite opened an unexpected database set")
             opened_path = cast(str, database_rows[0][2])
+            if type(opened_path) is not str or not os.path.isabs(opened_path):
+                raise CoreBridgeStoreStateRootError(
+                    "SQLite returned an invalid bridge database path"
+                )
             try:
                 opened_stat = os.stat(opened_path)
             except OSError as exc:

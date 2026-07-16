@@ -60,40 +60,68 @@ the remote server.
 8. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
    dependency checks.
 
-The exact Core wheel export parent and directory must be owned by the build user
-and must not be group/world writable. On macOS the held parent must not grant
-mutation through an extended ACL. A newly created directory is `0700` and may
-have an inherited ACL normalized once; any later ACL addition fails closed.
-The packaged `openevo/wheels` inventory must be exactly the Core wheel plus its
-canonical `framework-lock.json`, both verified through Core's lock loader. After
-an interrupted build, rerun the same builder with the same wheel inputs so its
-durable transaction recovery can complete. The builder takes a non-blocking
-exclusive lock on the held output-directory inode before inventory or recovery;
-an active same-output build therefore fails explicitly instead of being treated
-as crash residue. Recoverable cleanup uses one output-identity-bound sibling
-tombstone/purge state plus one durable receipt that binds its exact inode and
-inputs. Recovery never adopts the current same-name inode; a mismatch or renamed
-authorized inode is preserved and fails closed. A successful export and the
-candidate workflow must leave exactly the wheel/lock pair with no receipt or
-sibling cleanup state. Final macOS cleanup uses an `FSRef` prepared from the held
-object FD and `FSUnlinkObject`; the removal call does not resolve the quarantine,
-purge, or receipt name. A same-name replacement at that syscall boundary is
-therefore preserved and causes an explicit failure. If the platform or filesystem
-does not provide that identity-bound operation, the builder preserves the durable
-cleanup state and fails closed. Do not manually remove a preserved unknown path,
-hardlink, symlink, identity-mismatched replacement, or failed-cleanup tombstone
-without first investigating the release workspace.
+The exact Core wheel export runs only on a GitHub-hosted ephemeral runner or an
+equivalently controlled one-shot build account. Its requested output path must
+not exist. The builder verifies the generated wheel and canonical
+`framework-lock.json`, writes the exact pair into a private random sibling
+staging directory, fsyncs and revalidates both files, and atomically publishes
+the complete directory with no-replace semantics. It never adopts, overwrites,
+or automatically deletes stale output. A failed job publishes no manifest or
+artifact; a local maintainer must use a new output path and inspect any
+non-authoritative staging residue before removing it.
+
+The generated target-triple sidecar uses a separate same-directory atomic
+replacement. The builder verifies and fsyncs a random staging file before
+replacing the Tauri externalBin target. A failure before replacement keeps the
+previous target intact; any retained staging file is non-authoritative and must
+be inspected before removal.
 
 The pull-request release smoke keeps platform responsibilities separate. Its
 macOS packaging job builds the wheel/lock pair once, verifies a two-member
-SHA-256 manifest, runs the APFS held-FD/`FSRef`/`FSUnlinkObject` probe, and
-uploads the exact inputs under an artifact name bound to the source commit. The
-Linux Core job depends on that producer, verifies the downloaded manifest
-against the digest passed through the job output, rechecks both member digests,
-and only then installs the wheel and runs `openevo-core-service`. It must not
+SHA-256 manifest, and uploads the exact inputs under an artifact name bound to
+the source commit, workflow run, and run attempt. The Linux Core job depends on
+that producer, verifies the downloaded manifest against the digest passed
+through the job output, rechecks both member digests, and only then installs the
+wheel and runs `openevo-core-service`. GitHub artifact transfer does not preserve
+Unix file modes, so the pull-request consumer restores its release-input
+directory to `0700` and the wheel, framework lock, and checksum inventory to
+`0600` before verification. The candidate consumer likewise restores the
+transferred wheel and framework lock to `0600`. Consumers must not weaken the
+Core supervisor's owner-only framework-lock requirement. The Linux job must not
 rebuild the wheel or lock, and it rechecks those final candidate bytes after the
 service smoke. Conversely, the macOS packaging job must not run the Linux-only
 Core service lifecycle.
+
+On macOS, the native host copies the verified sidecar into an owner-only private
+directory and executes the named private copy while retaining its verified file
+descriptor. The directory's full execution-time identity is captured only after
+that named executable is published and revalidated. `pre_exec` compares that
+current snapshot against both the held directory descriptor and pathname; the
+long-lived creation identity remains a device/inode anchor. This preserves the
+anti-swap check without comparing a populated directory to its stale empty-state
+metadata.
+
+If the packaged sidecar exits before readiness, inspect only the bounded
+`OPENEVO_STARTUP_V1` stage/code emitted by the bootloader or Python entry
+point. A candidate with a missing, malformed, unknown, or non-allowlisted
+startup diagnostic remains failed. Maintainers must fix the identified
+descriptor/executable/startup stage and rerun from a new commit; they must not
+publish arbitrary process output, disclose paths or credentials, or replace an
+FD-bound archive read with a pathname fallback. `python_launcher/*_failed`
+codes identify the last closed release-composition phase, such as Core assets,
+provider/workspace storage, SSH lifecycle, Core bridge/runtime, Local API, or
+static app mounting. They do not authorize printing the underlying exception.
+`python_launcher/shutdown_failed` means the packaged listener or release
+provider could not be closed after an otherwise normal server return. When a
+startup or server failure is already active, cleanup remains best effort and
+does not replace that earlier fixed phase code.
+The packaged launcher must pass `close_on_shutdown=False` to the Local API app
+factory and close the provider itself after `Server.run()` returns. Re-enabling
+the ASGI close hook in this path is invalid because Uvicorn records shutdown
+handler failures internally and can return without propagating them.
+The launcher must also retain its packaged signal-replay guard around both
+`Server.run()` and explicit cleanup. Without it, Uvicorn restores and replays
+Tauri's `SIGTERM`, terminating Python before launcher-owned cleanup runs.
 
 The manual candidate uses the same producer/consumer rule for the complete
 release inventory. `release-candidate.json` and `core-install-artifact.json`
@@ -126,7 +154,6 @@ The portable app-smoke unit fixture uses an emitted evidence record because its
 executable is a test script, not Mach-O. It never substitutes for candidate
 evidence: macOS candidate runs always inspect and launch the real Tauri binary
 and packaged sidecar with `file`, `lipo`, native window, and FD checks.
-
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
 best stochastic result.
@@ -134,31 +161,62 @@ best stochastic result.
 ## Draft Release Validation
 
 The manual workflow creates a uniquely tagged GitHub draft prerelease only after
-its macOS and Linux candidate jobs succeed. It uploads the required outputs,
-downloads every asset into a clean directory, and verifies:
+its macOS and Linux candidate jobs succeed. Cross-job Actions artifact names
+bind source commit, workflow run, and run attempt so a full rerun cannot collide
+with immutable v4 artifacts from an earlier attempt. It uploads the required
+outputs, downloads every asset into a clean directory, and verifies:
 
 - asset names and architectures are expected;
 - SHA256 files match downloaded bytes;
 - the Core descriptor references the uploaded Core artifact;
 - the DMG version and bundled/fetched descriptor match the candidate commit;
-- release notes state unsigned/not-notarized status, supported modes, known
-  limitations, benchmark counts, privacy/security behavior, and
-  install/upgrade/uninstall steps;
+- release notes exactly match the release-tool-owned canonical packaging
+  document. The GitHub body adds only a release-tool-generated, 128-bit random
+  ownership marker used by failure cleanup. The document states
+  unsigned/not-notarized status, available and unavailable execution
+  modes, known limitations, `0 of 3` benchmark gates with all three rescue
+  counts `pending`, privacy/security behavior, and install/upgrade/uninstall
+  retention for `~/.openevo/desktop`, the Tauri native host app-data directory
+  for `org.openevo.desktop`, and remote data;
+- the GitHub draft title, tag, target commit, body, draft state, and prerelease
+  state match the candidate at the discrete API read immediately after asset
+  redownload. Its repository-bound API URL supplies the immutable numeric
+  release ID; cleanup persists that authority once with mode `0600`. This is not
+  an atomic assertion about later workflow completion;
 - no unclassified development, secret, benchmark-private, or source-checkout
   files are present.
 
-If upload or redownload validation fails after draft creation, the workflow
-deletes that draft and its candidate tag. A successful run leaves the draft and
-candidate tag for review; it does not publish the release.
+Before creation, the workflow validates the exact candidate tag name as a Git
+ref and uses the authenticated, paginated release inventory so private drafts
+are included when requiring both a same-name release and remote Git tag to be
+absent. If creation, upload, redownload, metadata validation, or
+verification-record upload fails or is cancelled, an `always()` cleanup deletes
+only a draft whose complete metadata and random ownership marker still match
+this workflow attempt. Cleanup deletes the validated immutable release ID, not a
+second lookup by mutable tag name. It does
+not delete Git tags, and it fails unless both the owned draft and any same-name
+remote Git tag are absent afterward. A successful run leaves the draft for
+review but proves that no real Git tag exists; the draft's `tagName` is release
+metadata only. It does not publish the release.
+
+A GitHub draft remains administratively mutable after the workflow. The
+workflow provides point-in-time verification, not an immutable GitHub object.
+Any later edit, asset replacement, or tag movement invalidates the candidate;
+delete it and run a new candidate rather than attempting to repair or promote
+the edited draft.
 
 Two fresh-context `gpt-5.6-sol` high-effort reviews must approve product/spec
-compliance and release risk before publication.
+compliance and release risk before a candidate reaches `stable`.
 
 ## Publication
 
-After validation, create the final annotated tag at the candidate commit and
-publish the already-validated draft release without rebuilding assets. Record
-the release URL and final asset checksums in the release issue.
+Final External Beta publication remains disabled. The packaging-only draft from
+this workflow is review evidence only and must not be edited, retagged, or
+promoted. After the science, benchmark, privacy, signing-policy, and final
+product gates are implemented and
+pass, create a new final candidate from a reviewed `stable` commit. That future
+path must generate final release notes and a new manifest/checksum inventory,
+roundtrip every asset again, and publish only those unchanged revalidated bytes.
 
 ## Rollback
 

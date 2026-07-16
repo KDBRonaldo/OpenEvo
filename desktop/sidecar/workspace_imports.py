@@ -26,6 +26,7 @@ import time
 from typing import BinaryIO, Callable, Iterator, Mapping
 import unicodedata
 
+from desktop.sidecar import fd_xattrs as _xattrs
 from openevo.backend.contracts.v1.models import (
     MAX_WORKSPACE_ENTRIES,
     MAX_WORKSPACE_UPLOAD_BYTES,
@@ -84,6 +85,34 @@ _ROOT_OPEN_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 _DIR_OPEN_FLAGS = _ROOT_OPEN_FLAGS
 _FILE_READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 _LOCK_CANCEL_POLL_SECONDS = 0.01
+
+
+def _canonical_darwin_system_alias(path: str) -> str:
+    if sys.platform != "darwin":
+        return path
+    for alias in ("/tmp", "/var"):
+        if path == alias or path.startswith(f"{alias}{os.sep}"):
+            return f"/private{path}"
+    return path
+
+
+def _validate_darwin_system_alias_binding(
+    requested: str,
+    canonical: str,
+    opened: os.stat_result,
+) -> None:
+    if requested == canonical:
+        return
+    try:
+        observed = os.stat(requested)
+    except OSError as exc:
+        raise WorkspaceImportStoreConfigurationError(
+            "workspace import system alias could not be verified"
+        ) from exc
+    if (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino):
+        raise WorkspaceImportStoreConfigurationError(
+            "workspace import system alias changed during open"
+        )
 
 
 class WorkspaceImportError(RuntimeError):
@@ -842,7 +871,10 @@ class WorkspaceImportStore:
         )
         if required_nodes > reconcile_max_nodes or required_bytes > reconcile_max_bytes:
             raise ValueError("retained workspace import limits exceed reconciliation budgets")
-        self._root = os.path.abspath(os.fspath(root))
+        requested_root = os.path.abspath(os.fspath(root))
+        self._root = _canonical_darwin_system_alias(requested_root)
+        self._requested_parent = os.path.dirname(requested_root)
+        self._canonical_parent = os.path.dirname(self._root)
         self._max_archive_bytes = max_archive_bytes
         self._max_entries = max_entries
         self._max_extracted_bytes = max_extracted_bytes
@@ -931,6 +963,11 @@ class WorkspaceImportStore:
                         "workspace import no-follow ancestor is not a directory"
                     )
                 identities.append((value.st_dev, value.st_ino))
+            _validate_darwin_system_alias_binding(
+                self._requested_parent,
+                self._canonical_parent,
+                os.fstat(descriptor),
+            )
             return descriptor, tuple(identities)
         except BaseException:
             os.close(descriptor)
@@ -1411,13 +1448,17 @@ class WorkspaceImportStore:
         root_status = os.fstat(root_descriptor)
         self._require_private_directory(root_status, label="workspace import root")
         try:
-            observed_token = os.getxattr(root_descriptor, _ROOT_TOKEN_XATTR)
+            observed_token = _xattrs.getxattr(root_descriptor, _ROOT_TOKEN_XATTR)
         except OSError as exc:
             if exc.errno not in {errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)}:
                 raise WorkspaceImportStoreConfigurationError(
                     "workspace import root identity token is unavailable"
                 ) from exc
-            os.setxattr(root_descriptor, _ROOT_TOKEN_XATTR, bytes.fromhex(pending.store_token))
+            _xattrs.setxattr(
+                root_descriptor,
+                _ROOT_TOKEN_XATTR,
+                bytes.fromhex(pending.store_token),
+            )
         else:
             if observed_token != bytes.fromhex(pending.store_token):
                 raise WorkspaceImportStoreConfigurationError(
@@ -1627,7 +1668,7 @@ class WorkspaceImportStore:
                     "workspace import root binding changed"
                 )
             try:
-                token = os.getxattr(root_descriptor, _ROOT_TOKEN_XATTR)
+                token = _xattrs.getxattr(root_descriptor, _ROOT_TOKEN_XATTR)
             except OSError as exc:
                 raise WorkspaceImportStoreConfigurationError(
                     "workspace import root identity token is unavailable"
@@ -1775,7 +1816,7 @@ class WorkspaceImportStore:
                 raise WorkspaceImportIntegrityError(
                     "workspace import authentication key binding changed"
                 )
-            token = os.getxattr(self._root_descriptor, _ROOT_TOKEN_XATTR)
+            token = _xattrs.getxattr(self._root_descriptor, _ROOT_TOKEN_XATTR)
             assert self._root_marker is not None
             if token != bytes.fromhex(self._root_marker.store_token):
                 raise WorkspaceImportIntegrityError("workspace import root identity token changed")
@@ -1831,7 +1872,7 @@ class WorkspaceImportStore:
         ownership: WorkspaceImportOwnership,
     ) -> bool:
         try:
-            marker = os.getxattr(archive_descriptor, _PENDING_LEASE_XATTR)
+            marker = _xattrs.getxattr(archive_descriptor, _PENDING_LEASE_XATTR)
         except OSError as exc:
             missing_xattr = {errno.ENODATA}
             if hasattr(errno, "ENOATTR"):
@@ -2031,13 +2072,13 @@ class WorkspaceImportStore:
                     extracted_byte_size=result.extracted_byte_size,
                 )
                 archive_token = secrets.token_hex(32)
-                os.setxattr(
+                _xattrs.setxattr(
                     archive_descriptor,
                     _ARCHIVE_TOKEN_XATTR,
                     bytes.fromhex(archive_token),
                 )
                 if pending:
-                    os.setxattr(
+                    _xattrs.setxattr(
                         archive_descriptor,
                         _PENDING_LEASE_XATTR,
                         self._pending_lease_marker(import_ref, ownership),
@@ -2483,7 +2524,7 @@ class WorkspaceImportStore:
             if (before.st_dev, before.st_ino) != archive_identity:
                 raise _DeterministicImportCorruption("workspace import archive identity changed")
             try:
-                observed_token = os.getxattr(descriptor, _ARCHIVE_TOKEN_XATTR)
+                observed_token = _xattrs.getxattr(descriptor, _ARCHIVE_TOKEN_XATTR)
             except OSError as exc:
                 raise WorkspaceImportIntegrityError(
                     "workspace import archive storage token is unavailable"
@@ -2890,7 +2931,7 @@ class WorkspaceImportStore:
             try:
                 if not self._archive_is_pending(archive_descriptor, import_ref, ownership):
                     return
-                os.removexattr(archive_descriptor, _PENDING_LEASE_XATTR)
+                _xattrs.removexattr(archive_descriptor, _PENDING_LEASE_XATTR)
                 os.fsync(archive_descriptor)
                 if self._archive_is_pending(archive_descriptor, import_ref, ownership):
                     raise WorkspaceImportIntegrityError(
@@ -3221,7 +3262,7 @@ class WorkspaceImportStore:
                             import_ref,
                             ownership,
                         ):
-                            os.removexattr(archive_descriptor, _PENDING_LEASE_XATTR)
+                            _xattrs.removexattr(archive_descriptor, _PENDING_LEASE_XATTR)
                             os.fsync(archive_descriptor)
                             if self._archive_is_pending(
                                 archive_descriptor,

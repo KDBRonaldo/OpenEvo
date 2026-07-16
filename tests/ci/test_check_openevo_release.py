@@ -57,6 +57,16 @@ def _load_module():
     return module
 
 
+def _load_release_candidate_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/openevo_release_candidate.py"
+    spec = importlib.util.spec_from_file_location("openevo_release_candidate", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_desktop_wheel_smoke_module():
     path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_desktop_wheel.py"
     spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_wheel", path)
@@ -811,27 +821,26 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "uv sync --frozen --group dev" in macos_job
     assert "tests/ci/test_build_sidecar.py" in macos_job
     assert "tests/ci/test_check_openevo_release.py" in macos_job
+    assert "test_store_accepts_inode_bound_macos_var_alias" in macos_job
+    assert "test_workspace_store_accepts_inode_bound_macos_var_alias" in macos_job
     assert "uv run python desktop/packaging/build_sidecar.py" in macos_job
-    assert "--core-wheel-output-dir .openevo-release-inputs" in macos_job
+    assert 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' in macos_job
+    assert 'test "$RUNNER_ENVIRONMENT" = "github-hosted"' in macos_job
+    assert "macOS packaging + exact Core pair publication" in macos_job
+    assert "APFS held-FD cleanup" not in macos_job
+    assert '--core-wheel-output-dir "$RUNNER_TEMP/openevo-release-inputs"' in macos_job
     assert "scripts/ci/smoke_openevo_desktop_sidecar.py" in macos_job
-    assert text.count("desktop/packaging/build_sidecar.py") == 2
+    assert text.count("desktop/packaging/build_sidecar.py") == 1
     assert "uv run python packaging/build_sidecar.py" in linux_job
 
-    assert "name: Probe APFS held-FD to FSRef to FSUnlinkObject cleanup" in macos_job
-    assert 'diskutil info "$RUNNER_TEMP"' in macos_job
-    assert "File System Personality|Type \\(Bundle\\)" in macos_job
-    assert "_core_release_fd_removal_supported" in macos_job
-    assert "_remove_core_release_fd_bound_entry" in macos_job
-    assert "prepare_fsref = builder._prepare_core_release_fd_removal" in macos_job
-    assert "execute_fsunlink = builder._execute_core_release_fd_removal" in macos_job
-    assert 'native_calls.append("FSPathMakeRef")' in macos_job
-    assert 'native_calls.append("FSUnlinkObject")' in macos_job
-    assert "object_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)" in macos_job
-    assert 'subject="APFS held-FD FSRef probe"' in macos_job
-    assert "FSUnlinkObject did not unlink the held object" in macos_job
+    assert "FSPathMakeRef" not in macos_job
+    assert "FSUnlinkObject" not in macos_job
     assert "openevo-core-service ensure" not in macos_job
 
-    artifact_name = "openevo-core-release-inputs-${{ github.sha }}"
+    artifact_name = (
+        "openevo-core-release-inputs-${{ github.sha }}-"
+        "${{ github.run_id }}-${{ github.run_attempt }}"
+    )
     assert "outputs:\n      manifest_sha256: " in macos_job
     assert "steps.release_inputs.outputs.manifest_sha256" in macos_job
     assert "id: release_inputs" in macos_job
@@ -840,14 +849,26 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert macos_job.count("-mindepth 1 -maxdepth 1") == 1
     assert "actions/upload-artifact@v4" in macos_job
     assert f"name: {artifact_name}" in macos_job
-    assert ".openevo-release-inputs/openevo-*.whl" in macos_job
-    assert ".openevo-release-inputs/framework-lock.json" in macos_job
-    assert ".openevo-release-inputs/SHA256SUMS" in macos_job
+    assert "${{ runner.temp }}/openevo-release-inputs/openevo-*.whl" in macos_job
+    assert "${{ runner.temp }}/openevo-release-inputs/framework-lock.json" in macos_job
+    assert "${{ runner.temp }}/openevo-release-inputs/SHA256SUMS" in macos_job
     assert "include-hidden-files: true" in macos_job
 
     assert "actions/download-artifact@v4" in linux_job
     assert f"name: {artifact_name}" in linux_job
     assert "path: .openevo-release-inputs" in linux_job
+    assert "name: Restore private Core release input modes" in linux_job
+    assert "chmod 0700 .openevo-release-inputs" in linux_job
+    release_mode_step = linux_job.split(
+        "      - name: Restore private Core release input modes\n", maxsplit=1
+    )[1].split(
+        "      - name: Verify transferred Core release input manifest\n", maxsplit=1
+    )[0]
+    assert "chmod 0600 \\" in release_mode_step
+    assert ".openevo-release-inputs/openevo-*.whl" in release_mode_step
+    assert ".openevo-release-inputs/framework-lock.json" in release_mode_step
+    assert ".openevo-release-inputs/SHA256SUMS" in release_mode_step
+    assert "stat -c '%a' .openevo-release-inputs/framework-lock.json" in release_mode_step
     assert (
         "EXPECTED_MANIFEST_SHA256: "
         "${{ needs.macos-packaging-smoke.outputs.manifest_sha256 }}"
@@ -857,6 +878,9 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert linux_job.count("-mindepth 1 -maxdepth 1") == 2
     assert "uv sync --frozen --group dev" in linux_job
     assert linux_job.index("actions/download-artifact@v4") < linux_job.index(
+        "Restore private Core release input modes"
+    )
+    assert linux_job.index("Restore private Core release input modes") < linux_job.index(
         "Verify transferred Core release input manifest"
     )
     assert linux_job.index("Verify transferred Core release input manifest") < linux_job.index(
@@ -1172,8 +1196,10 @@ def test_pre_external_beta_release_artifact_workflow_is_disabled() -> None:
 
 def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease() -> None:
     workflow = Path(".github/workflows/openevo-desktop-candidate.yml")
+    candidate_tool = Path("scripts/ci/openevo_release_candidate.py")
 
     text = workflow.read_text(encoding="utf-8")
+    candidate_tool_text = candidate_tool.read_text(encoding="utf-8")
 
     for marker in (
         "workflow_dispatch:",
@@ -1181,6 +1207,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "runs-on: ubuntu-latest",
         "timeout-minutes:",
         'test "$GITHUB_REF" = "refs/heads/stable"',
+        'RUNNER_ENVIRONMENT: ${{ runner.environment }}',
+        'test "$RUNNER_ENVIRONMENT" = "github-hosted"',
         "uv sync --frozen --group dev",
         "tests/ci/test_build_sidecar.py",
         "tests/ci/test_openevo_release_candidate.py",
@@ -1220,8 +1248,12 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "SHA256SUMS",
         "actions/upload-artifact@v4",
         "actions/download-artifact@v4",
+        "Restore private Core candidate input modes",
+        "stat -c '%a' candidate-artifacts/framework-lock.json",
         "retention-days: 14",
-        "unsigned and not notarized",
+        "openevo_release_candidate.py write-notes",
+        "openevo_release_candidate.py write-draft-body",
+        "openevo_release_candidate.py assert-release-absent",
         "permissions:\n      contents: write",
         "gh release create",
         "--draft",
@@ -1229,9 +1261,68 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "gh release upload",
         "gh release download",
         "diff -qr candidate-artifacts downloaded-draft",
-        "gh release delete",
+        "validate-draft",
+        "--expected-owner",
+        "--expected-repository",
+        "--release-id-output",
+        "apiUrl",
+        "gh release view",
+        "gh api --paginate",
+        ".tag_name | @json",
+        "secrets.token_hex(16)",
+        "git check-ref-format",
+        "steps.verified.outputs.complete != 'true'",
+        "if: ${{ always()",
+        "git ls-remote --exit-code --tags origin",
+        "Refusing to delete a draft not owned by this workflow attempt",
+        "gh api --method DELETE",
     ):
         assert marker in text
+
+    candidate_ssh_step = text.split(
+        "      - name: Exercise macOS SSH agent relay and fixed executable authority\n",
+        maxsplit=1,
+    )[1].split(
+        "      - name: Resolve exact product version and runner architecture\n",
+        maxsplit=1,
+    )[0]
+    assert "unset SSH_AUTH_SOCK" in candidate_ssh_step
+    assert "umask 077" in candidate_ssh_step
+    assert 'case "${HOME:-}" in' in candidate_ssh_step
+    assert 'ssh_test_prefix="$HOME/.oe-ssh."' in candidate_ssh_step
+    assert 'mktemp -d "${ssh_test_prefix}XXXXXX"' in candidate_ssh_step
+    assert 'chmod 700 "$ssh_test_root"' in candidate_ssh_step
+    assert 'trap \'rm -rf -- "$ssh_test_root"\' EXIT' in candidate_ssh_step
+    assert '--basetemp="$ssh_test_root/pytest"' in candidate_ssh_step
+    assert "$RUNNER_TEMP" not in candidate_ssh_step
+
+    for marker in (
+        "unsigned and not notarized",
+        "## Supported Workflows",
+        "Codex subscription transcript mode: available in this candidate.",
+        "Self-Deployed Reference mode: unavailable in this candidate.",
+        "## Known Limitations",
+        "Parameter evolution is not included in this candidate.",
+        "PyPI is not used for this release.",
+        "Only the declared architecture was built.",
+        "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.",
+        "## Validation Results",
+        "Benchmark gates completed by this packaging candidate: 0 of 3.",
+        "Textual-memory pass@1 rescue count: pending.",
+        "Trajectory-to-skill pass@1 rescue count: pending.",
+        "Agent-system pass@1 rescue count: pending.",
+        "## Security And Privacy",
+        "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
+        "Credential-canary verification for release assets: pending.",
+        "Local Desktop data under ~/.openevo/desktop is retained",
+        "org.openevo.desktop",
+        "run-retry recovery",
+        "## Install, Upgrade, And Uninstall",
+        "Install:",
+        "Upgrade:",
+        "Uninstall:",
+    ):
+        assert marker in candidate_tool_text
 
     assert "smoke_openevo_remote_capabilities.py" not in text
 
@@ -1240,9 +1331,45 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "scripts/ci/openevo_release_candidate.py create"
     )
     assert text.index("linux-core-candidate:") < text.index("draft-prerelease-roundtrip:")
+    candidate_mode_step = text.split(
+        "      - name: Restore private Core candidate input modes\n", maxsplit=1
+    )[1].split(
+        "      - name: Verify candidate manifest and transferred manifest bytes\n", maxsplit=1
+    )[0]
+    assert "chmod 0600 \\" in candidate_mode_step
+    assert "candidate-artifacts/openevo-*.whl" in candidate_mode_step
+    assert "candidate-artifacts/framework-lock.json" in candidate_mode_step
+    assert text.index("Download exact final candidate bytes") < text.index(
+        "Restore private Core candidate input modes"
+    )
+    assert text.index("Restore private Core candidate input modes") < text.index(
+        "Verify candidate manifest and transferred manifest bytes"
+    )
     assert "needs: [macos-candidate, linux-core-candidate]" in text
     assert text.index("gh release create") < text.index("gh release upload")
     assert text.index("gh release upload") < text.index("gh release download")
+    cleanup = text.split(
+        "      - name: Delete an owned unverified draft", maxsplit=1
+    )[1]
+    assert cleanup.index("validate-draft") < cleanup.index("gh api --method DELETE")
+    assert "--cleanup-tag" not in cleanup
+    assert "gh release delete" not in cleanup
+    assert cleanup.index("--release-id-output") < cleanup.index(
+        '"repos/${GITHUB_REPOSITORY}/releases/${release_id}"'
+    )
+    assert "/releases/tags/" not in text
+    assert text.count("assert-release-absent") >= 2
+    assert text.count("git ls-remote --exit-code --tags origin") >= 3
+    assert text.index("Verify every draft asset and review-facing field") < text.index(
+        "Mark draft roundtrip complete"
+    )
+    candidate_artifact_name = (
+        "openevo-desktop-candidate-${{ github.sha }}-"
+        "${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+    assert text.count(candidate_artifact_name) == 3
+    assert "openevo-desktop-candidate-${{ github.sha }}\n" not in text
+    assert "if: failure() && steps.release.outputs.tag != ''" not in text
     assert text.count("contents: write") == 1
     assert "softprops/action-gh-release" not in text
     assert "cargo audit --ignore" not in text
@@ -1253,14 +1380,34 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert "matrix:" not in text
     assert "Build distributable Core wheel" not in text
     assert "python -m build --wheel" not in text
-    assert "cp .candidate-core/openevo-*.whl candidate-artifacts/" in text
+    assert 'cp "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl candidate-artifacts/' in text
     assert 'pip install candidate-artifacts/openevo-*.whl' in text
     assert text.index("openevo_release_candidate.py validate") < text.index(
         'pip install candidate-artifacts/openevo-*.whl'
     )
-
     desktop_checks = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     assert '".github/workflows/openevo-desktop-candidate.yml"' in desktop_checks
+    assert "Exercise macOS Core release publication contract" in desktop_checks
+    assert "Core release ACL and cleanup policy" not in desktop_checks
+
+
+def test_candidate_cleanup_deletes_only_the_validated_immutable_release_id() -> None:
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+    cleanup = workflow.split(
+        "      - name: Delete an owned unverified draft", maxsplit=1
+    )[1]
+
+    assert "--json apiUrl,body," in cleanup
+    assert cleanup.index("validate-draft") < cleanup.index("--release-id-output")
+    assert cleanup.index("--release-id-output") < cleanup.index(
+        "IFS= read -r release_id"
+    )
+    assert cleanup.index("IFS= read -r release_id") < cleanup.index(
+        '"repos/${GITHUB_REPOSITORY}/releases/${release_id}"'
+    )
+    assert 'gh release delete "$RELEASE_TAG"' not in cleanup
 
 
 def test_python_runtime_dependencies_pin_security_fixed_minimums() -> None:
@@ -1305,6 +1452,29 @@ def test_release_execution_mode_authority_has_no_renderer_fixture_fallback() -> 
     assert "self_deployed_release_unavailable" not in product_app
     assert "RELEASE_EXECUTION_MODE_CAPABILITIES" not in product_app
     assert "self_deployed_release_unavailable" in release_capabilities
+
+
+def test_release_docs_and_notes_match_execution_mode_and_native_storage_authority() -> None:
+    by_mode = {
+        capability.mode: capability
+        for capability in RELEASE_EXECUTION_MODE_CAPABILITIES_V1.modes
+    }
+    readme = Path("README.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+    notes = _load_release_candidate_module().render_candidate_release_notes(
+        source_commit="a" * 40,
+        version="0.1.0",
+        architecture="aarch64",
+    )
+
+    assert by_mode["codex_subscription_transcript"].support_state == "supported"
+    assert by_mode["self-deployed"].support_state == "unavailable"
+    assert "Codex subscription transcript mode: available in this candidate." in notes
+    assert "Self-Deployed Reference mode: unavailable in this candidate." in notes
+    assert "current Desktop release marks it unavailable and blocks" in normalized_readme
+    assert "persistent WebView storage" not in readme
+    assert "Tauri native host app data directory" in normalized_readme
+    assert "org.openevo.desktop" in normalized_readme
 
 
 def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
@@ -1389,7 +1559,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
         "tests::packaged_external_bin_native_launch_smoke"
     )
     assert "macOS FD-bound packaged sidecar launch smoke" in workflow
-    assert "tests::macos_release_uses_private_path_and_keeps_the_verified_fd" in workflow
+    assert "tests::macos_release_spawns_from_the_populated_private_path" in workflow
     assert "if: always()" in workflow
     assert 'rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"' in workflow
     assert "cargo build --locked --release" in workflow
@@ -1439,11 +1609,18 @@ def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
     )
     utils_header = tmp_path / "bootloader/src/pyi_utils.h"
     utils_header.write_text(module._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
+    wscript = tmp_path / "bootloader/wscript"
+    wscript.write_text(
+        module._BOOTLOADER_DARWIN_LIB_NEEDLE
+        + module._BOOTLOADER_PROGRAM_LIBS_NEEDLE,
+        encoding="utf-8",
+    )
 
     module._patch_fd_bound_bootloader(tmp_path)
 
     patched = source.read_text(encoding="utf-8")
     patched_utils = utils_source.read_text(encoding="utf-8")
+    patched_wscript = wscript.read_text(encoding="utf-8")
     assert patched.count('getenv("OPENEVO_NATIVE_EXECUTABLE_PATH")') == 1
     assert patched.count('getenv("OPENEVO_NATIVE_LISTENER_FD")') == 1
     assert patched.count("pyi_archive_open(openevo_archive_path)") == 1
@@ -1451,6 +1628,8 @@ def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
     assert patched.count("lstat(openevo_native_path, &openevo_path_stat)") == 1
     assert patched.count("lstat(openevo_resolved_path, &openevo_resolved_stat)") == 1
     assert "SO_ACCEPTCONN" in patched_utils
+    assert "proc_pidfdinfo" in patched_utils
+    assert "uselib_store='PROC'" in patched_wscript
     assert "pyi_utils_openevo_native_handoff_restore()" in patched_utils
 
 
@@ -1661,28 +1840,6 @@ def _desktop_state_payload() -> dict[str, object]:
             "host_key_review": None,
             "core": None,
             "failure": None,
-        },
-        "execution_mode_capabilities": {
-            "schema_version": "1",
-            "modes": [
-                {
-                    "mode": "codex_subscription_transcript",
-                    "display_name": "Subscription",
-                    "support_state": "supported",
-                    "reason_code": None,
-                    "message": "Available in this OpenEvo Desktop release.",
-                },
-                {
-                    "mode": "self-deployed",
-                    "display_name": "Self-deployed",
-                    "support_state": "unavailable",
-                    "reason_code": "self_deployed_release_unavailable",
-                    "message": (
-                        "Self-deployed execution is not available in this OpenEvo "
-                        "Desktop release. Choose Subscription to save or run this project."
-                    ),
-                },
-            ],
         },
         "active_project": None,
         "pending_operation_ids": [],

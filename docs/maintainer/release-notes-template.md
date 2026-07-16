@@ -3,6 +3,12 @@
 Replace every placeholder and remove sections that do not apply before
 publishing a GitHub Release.
 
+This template is for a future final External Beta candidate. The automated
+packaging-only draft uses a smaller closed note contract, is checksum-bound to
+its `0 of 3` and `pending` results, and must never be edited or promoted. After
+all final gates pass, populate this template and generate a new candidate,
+manifest, checksum inventory, and draft roundtrip from reviewed source.
+
 ## Release
 
 - Version:
@@ -69,6 +75,9 @@ publishing a GitHub Release.
 - Upgrade steps and compatibility:
 - Rollback limitations:
 - Desktop uninstall steps:
+- Local `~/.openevo/desktop` data retention and cleanup:
+- Tauri native host app-data for `org.openevo.desktop`, including run-retry
+  recovery state, retention and cleanup:
 - Remote state/model/runtime cache cleanup:
 - Troubleshooting guide:
 - Support issue link:

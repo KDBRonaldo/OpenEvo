@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   macos-packaging-smoke:
-    name: macOS packaging + APFS held-FD cleanup
+    name: macOS packaging + exact Core pair publication
     runs-on: macos-14
     outputs:
       manifest_sha256: ${{ steps.release_inputs.outputs.manifest_sha256 }}
@@ -47,6 +47,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Require an ephemeral GitHub-hosted release runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: test "$RUNNER_ENVIRONMENT" = "github-hosted"
+
       - name: Test release validator and packaging contracts
         run: |
           uv sync --frozen --group dev
@@ -55,6 +60,14 @@ jobs:
             tests/ci/test_check_openevo_release.py \
             tests/ci/test_openevo_productization_workflow.py \
             tests/ci/test_productization_spec.py \
+            tests/openevo/sidecar/test_provider_store.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
+            tests/openevo/sidecar/test_provider_store.py::test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction \
+            tests/openevo/remote/test_host_keys.py::test_store_accepts_inode_bound_macos_var_alias \
+            tests/openevo/sidecar/test_workspace_imports.py::test_workspace_store_accepts_inode_bound_macos_var_alias \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_darwin_sqlite_connection_uses_managed_path_and_persists_writes \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_open_store_rejects_database_pathname_replacement \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_fresh_initial_schema_hot_journal_rolls_back_then_bootstraps \
             -q
           uv run python scripts/ci/audit_openevo_identity.py
 
@@ -74,103 +87,37 @@ jobs:
       - name: Build and smoke packaged macOS Desktop sidecar
         run: |
           uv run python desktop/packaging/build_sidecar.py \
-            --core-wheel-output-dir .openevo-release-inputs
+            --core-wheel-output-dir "$RUNNER_TEMP/openevo-release-inputs"
+          echo "OPENEVO_RELEASE_INPUTS=$RUNNER_TEMP/openevo-release-inputs" >> "$GITHUB_ENV"
           sidecar="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
           uv run python scripts/ci/smoke_openevo_desktop_sidecar.py \
             "$sidecar" \
             --timeout-seconds 60
 
-      - name: Probe APFS held-FD to FSRef to FSUnlinkObject cleanup
-        run: |
-          diskutil info "$RUNNER_TEMP" \
-            | grep -Eiq '^[[:space:]]*(File System Personality|Type \(Bundle\)):[[:space:]]*APFS'
-          uv run python - <<'PY'
-          import importlib.util
-          import os
-          from pathlib import Path
-          import tempfile
-
-          path = Path("desktop/packaging/build_sidecar.py").resolve()
-          spec = importlib.util.spec_from_file_location("openevo_build_sidecar_probe", path)
-          if spec is None or spec.loader is None:
-              raise SystemExit("could not load the sidecar builder")
-          builder = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(builder)
-          if not builder._core_release_fd_removal_supported():
-              raise SystemExit("macOS identity-bound cleanup is unavailable")
-
-          native_calls = []
-          prepare_fsref = builder._prepare_core_release_fd_removal
-          execute_fsunlink = builder._execute_core_release_fd_removal
-
-          def record_prepare(object_fd, *, is_directory):
-              token = prepare_fsref(object_fd, is_directory=is_directory)
-              native_calls.append("FSPathMakeRef")
-              return token
-
-          def record_execute(token, parent_fd, name, object_fd, *, is_directory):
-              execute_fsunlink(
-                  token,
-                  parent_fd,
-                  name,
-                  object_fd,
-                  is_directory=is_directory,
-              )
-              native_calls.append("FSUnlinkObject")
-
-          builder._prepare_core_release_fd_removal = record_prepare
-          builder._execute_core_release_fd_removal = record_execute
-
-          with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temporary:
-              root = Path(temporary)
-              target = root / "held-fd-fsref-probe"
-              target.write_bytes(b"openevo-fsref-probe")
-              target.chmod(0o600)
-              parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-              object_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
-              try:
-                  descriptor = os.fstat(object_fd)
-                  builder._remove_core_release_fd_bound_entry(
-                      parent_fd,
-                      target.name,
-                      object_fd,
-                      identity=(descriptor.st_dev, descriptor.st_ino),
-                      is_directory=False,
-                      subject="APFS held-FD FSRef probe",
-                  )
-              finally:
-                  os.close(object_fd)
-                  os.close(parent_fd)
-              if target.exists():
-                  raise SystemExit("FSUnlinkObject did not unlink the held object")
-          if native_calls != ["FSPathMakeRef", "FSUnlinkObject"]:
-              raise SystemExit(f"unexpected native cleanup calls: {native_calls}")
-          PY
-
       - name: Create and verify exact Core release input manifest
         id: release_inputs
         run: |
-          test "$(find .openevo-release-inputs -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
-          test -f .openevo-release-inputs/framework-lock.json
+          test "$(find "$OPENEVO_RELEASE_INPUTS" -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          test -f "$OPENEVO_RELEASE_INPUTS/framework-lock.json"
           (
-            cd .openevo-release-inputs
+            cd "$OPENEVO_RELEASE_INPUTS"
             shasum -a 256 openevo-*.whl framework-lock.json > SHA256SUMS
             test "$(wc -l < SHA256SUMS | tr -d ' ')" = 2
             shasum -a 256 --check SHA256SUMS
           )
-          test "$(find .openevo-release-inputs -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 3
-          manifest_sha256="$(shasum -a 256 .openevo-release-inputs/SHA256SUMS | awk '{print $1}')"
+          test "$(find "$OPENEVO_RELEASE_INPUTS" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 3
+          manifest_sha256="$(shasum -a 256 "$OPENEVO_RELEASE_INPUTS/SHA256SUMS" | awk '{print $1}')"
           test "${#manifest_sha256}" = 64
           echo "manifest_sha256=$manifest_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload exact Core release inputs
         uses: actions/upload-artifact@v4
         with:
-          name: openevo-core-release-inputs-${{ github.sha }}
+          name: openevo-core-release-inputs-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            .openevo-release-inputs/openevo-*.whl
-            .openevo-release-inputs/framework-lock.json
-            .openevo-release-inputs/SHA256SUMS
+            ${{ runner.temp }}/openevo-release-inputs/openevo-*.whl
+            ${{ runner.temp }}/openevo-release-inputs/framework-lock.json
+            ${{ runner.temp }}/openevo-release-inputs/SHA256SUMS
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 1
@@ -202,8 +149,18 @@ jobs:
       - name: Download exact Core release inputs
         uses: actions/download-artifact@v4
         with:
-          name: openevo-core-release-inputs-${{ github.sha }}
+          name: openevo-core-release-inputs-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .openevo-release-inputs
+
+      - name: Restore private Core release input modes
+        run: |
+          chmod 0700 .openevo-release-inputs
+          chmod 0600 \
+            .openevo-release-inputs/openevo-*.whl \
+            .openevo-release-inputs/framework-lock.json \
+            .openevo-release-inputs/SHA256SUMS
+          test "$(stat -c '%a' .openevo-release-inputs)" = 700
+          test "$(stat -c '%a' .openevo-release-inputs/framework-lock.json)" = 600
 
       - name: Verify transferred Core release input manifest
         env:

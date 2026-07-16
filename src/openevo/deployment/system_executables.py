@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import ctypes
+from dataclasses import dataclass
+import errno
 import os
 from pathlib import Path
 import secrets
@@ -38,7 +40,11 @@ _AGENT_PROXY_CHUNK_BYTES = 64 * 1024
 _AGENT_PROXY_CREATE_ATTEMPTS = 32
 _AGENT_PROXY_RANDOM_BYTES = 12
 _MAX_PENDING_AGENT_PROXY_CLEANUPS = 32
-_DARWIN_LOCAL_PEERPID = 0x002
+_DARWIN_SOL_LOCAL = getattr(socket, "SOL_LOCAL", 0)
+_DARWIN_LOCAL_PEERPID = getattr(socket, "LOCAL_PEERPID", 0x002)
+_DARWIN_LOCAL_PEERTOKEN = getattr(socket, "LOCAL_PEERTOKEN", 0x006)
+_DARWIN_PROCESS_ID = struct.Struct("=i")
+_DARWIN_AUDIT_TOKEN = struct.Struct("=8I")
 _LINUX_INOTIFY_ATTRIB = 0x00000004
 _LINUX_INOTIFY_DELETE_SELF = 0x00000400
 _LINUX_INOTIFY_MOVE_SELF = 0x00000800
@@ -66,6 +72,17 @@ _ExecutableIdentity = tuple[int, int, int, int, int, int, int, int]
 _DirectoryIdentity = tuple[int, int, int, int]
 _SocketIdentity = tuple[int, int, int, int, int, int]
 _AuthorityResult = TypeVar("_AuthorityResult")
+
+
+@dataclass(frozen=True, slots=True)
+class _UnixPeerAuthority:
+    process_id: int
+    user_id: int
+    audit_token: bytes | None
+
+    @property
+    def process(self) -> tuple[int, int]:
+        return self.process_id, self.user_id
 
 
 class SshAgentAuthorityError(RuntimeError):
@@ -172,7 +189,7 @@ class VerifiedSystemExecutable:
 
     @property
     def execution_path(self) -> str:
-        return f"/dev/fd/{self._descriptor}"
+        return _verified_execution_path(self._path, self._descriptor)
 
     @property
     def display_path(self) -> str:
@@ -335,13 +352,19 @@ class VerifiedSshAgentSocket:
         *,
         expected_peer: tuple[int, int] | None = None,
     ) -> tuple[socket.socket, tuple[int, int]]:
-        return _run_agent_authority_operation(lambda: self._connect(expected_peer=expected_peer))
+        upstream, peer = _run_agent_authority_operation(
+            lambda: self._connect_authority(expected_process=expected_peer)
+        )
+        return upstream, peer.process
 
-    def _connect(
+    def _connect_authority(
         self,
         *,
-        expected_peer: tuple[int, int] | None,
-    ) -> tuple[socket.socket, tuple[int, int]]:
+        expected_peer: _UnixPeerAuthority | None = None,
+        expected_process: tuple[int, int] | None = None,
+    ) -> tuple[socket.socket, _UnixPeerAuthority]:
+        if expected_peer is not None and expected_process is not None:
+            raise ValueError("SSH agent socket peer authority is ambiguous")
         mutation_monitor = _AgentTargetMutationMonitor.open(
             self._directories,
             socket_name=self._name,
@@ -355,14 +378,24 @@ class VerifiedSshAgentSocket:
                 upstream.settimeout(_AGENT_CONNECT_TIMEOUT_SECONDS)
                 upstream.connect(self._path)
                 self._verify_path_binding()
+                # The second drain catches events queued during the first exact recheck.
+                for _ in range(2):
+                    target_mutated = mutation_monitor.observed_target_mutation()
+                    self._verify_path_binding()
+                    if target_mutated:
+                        raise ValueError("SSH agent socket target changed during connect")
+                peer = _unix_peer_authority(upstream)
+                if peer.user_id != os.geteuid():
+                    raise ValueError("SSH agent socket peer identity changed")
+                if expected_peer is not None and peer != expected_peer:
+                    raise ValueError("SSH agent socket peer identity changed")
+                if expected_process is not None and peer.process != expected_process:
+                    raise ValueError("SSH agent socket peer identity changed")
+                self._verify_path_binding()
                 if mutation_monitor.observed_target_mutation():
                     self._verify_path_binding()
                     raise ValueError("SSH agent socket target changed during connect")
-                peer = _unix_peer_process(upstream)
-                if peer[1] != os.geteuid() or (
-                    expected_peer is not None and peer != expected_peer
-                ):
-                    raise ValueError("SSH agent socket peer identity changed")
+                self._verify_path_binding()
                 upstream.settimeout(None)
                 return upstream, peer
             except BaseException:
@@ -398,7 +431,7 @@ class SshAgentSocketSource:
         self,
         path: str,
         identity: _SocketIdentity,
-        peer: tuple[int, int],
+        peer: _UnixPeerAuthority,
     ) -> None:
         self._path = path
         self._identity = identity
@@ -427,7 +460,7 @@ class SshAgentSocketSource:
             authority.verify_path_binding()
             canonical_path = authority.path
             identity = authority.identity
-            baseline, peer = authority.connect()
+            baseline, peer = authority._connect_authority()
             baseline.close()
         return cls(canonical_path, identity, peer)
 
@@ -481,11 +514,11 @@ def _linux_inotify_payload_has_target_mutation(
 
 class _AgentTargetMutationMonitor:
     __slots__ = (
+        "_darwin_parent_descriptor",
         "_darwin_queue",
         "_descriptor",
         "_linux_target_kinds",
         "_max_events",
-        "_owned_descriptors",
     )
 
     def __init__(
@@ -493,15 +526,15 @@ class _AgentTargetMutationMonitor:
         *,
         descriptor: int = -1,
         darwin_queue: object | None = None,
+        darwin_parent_descriptor: int = -1,
         linux_target_kinds: dict[int, bool] | None = None,
         max_events: int = 0,
-        owned_descriptors: tuple[int, ...] = (),
     ) -> None:
         self._descriptor = descriptor
         self._darwin_queue = darwin_queue
+        self._darwin_parent_descriptor = darwin_parent_descriptor
         self._linux_target_kinds = linux_target_kinds or {}
         self._max_events = max_events
-        self._owned_descriptors = owned_descriptors
 
     @classmethod
     def open(
@@ -519,11 +552,7 @@ class _AgentTargetMutationMonitor:
                 socket_name=socket_name,
             )
         if sys.platform == "darwin":
-            return cls._open_darwin(
-                directories,
-                socket_name=socket_name,
-                socket_identity=socket_identity,
-            )
+            return cls._open_darwin(directories)
         raise RuntimeError("SSH agent socket mutation monitoring is unsupported")
 
     @classmethod
@@ -581,24 +610,12 @@ class _AgentTargetMutationMonitor:
     def _open_darwin(
         cls,
         directories: tuple[tuple[int, str | None, _DirectoryIdentity], ...],
-        *,
-        socket_name: str,
-        socket_identity: _SocketIdentity,
     ) -> _AgentTargetMutationMonitor:
-        event_only = getattr(os, "O_EVTONLY", None)
-        if not isinstance(event_only, int):
+        watched_directories = directories[1:]
+        if not watched_directories:
             raise RuntimeError("SSH agent socket mutation monitoring is unsupported")
-        socket_descriptor = os.open(
-            socket_name,
-            event_only | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=directories[-1][0],
-        )
         kqueue: object | None = None
         try:
-            metadata = os.fstat(socket_descriptor)
-            _require_agent_socket(metadata)
-            if _agent_socket_identity(metadata) != socket_identity:
-                raise ValueError("SSH agent socket monitor identity changed")
             kqueue = select.kqueue()
             directory_flags = (
                 select.KQ_NOTE_ATTRIB
@@ -606,35 +623,52 @@ class _AgentTargetMutationMonitor:
                 | select.KQ_NOTE_RENAME
                 | select.KQ_NOTE_REVOKE
             )
-            socket_flags = directory_flags | select.KQ_NOTE_LINK
-            changes = [
-                select.kevent(
-                    held,
-                    filter=select.KQ_FILTER_VNODE,
-                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                    fflags=directory_flags,
+            parent_descriptor = watched_directories[-1][0]
+            changes = []
+            for held, _name, _identity in watched_directories:
+                flags = directory_flags
+                if held == parent_descriptor:
+                    flags |= select.KQ_NOTE_WRITE
+                changes.append(
+                    select.kevent(
+                        held,
+                        filter=select.KQ_FILTER_VNODE,
+                        flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                        fflags=flags,
+                    )
                 )
-                for held, _name, _identity in directories[1:]
-            ]
-            changes.append(
-                select.kevent(
-                    socket_descriptor,
-                    filter=select.KQ_FILTER_VNODE,
-                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                    fflags=socket_flags,
-                )
-            )
             kqueue.control(changes, 0, 0)
         except BaseException:
             if kqueue is not None:
                 kqueue.close()
-            os.close(socket_descriptor)
             raise
         return cls(
             darwin_queue=kqueue,
+            darwin_parent_descriptor=parent_descriptor,
             max_events=len(changes),
-            owned_descriptors=(socket_descriptor,),
         )
+
+    def _darwin_observed_target_mutation(self) -> bool:
+        events = self._darwin_queue.control(None, self._max_events, 0)
+        for event in events:
+            if event.flags & select.KQ_EV_ERROR:
+                return True
+            if event.ident != self._darwin_parent_descriptor:
+                return True
+            hard_mutation_flags = (
+                select.KQ_NOTE_DELETE
+                | select.KQ_NOTE_RENAME
+                | select.KQ_NOTE_REVOKE
+            )
+            if event.fflags & hard_mutation_flags:
+                return True
+            # Creating and removing a child directory can coalesce NOTE_ATTRIB
+            # with NOTE_WRITE on Darwin because the parent's link count changes.
+            # The caller immediately revalidates the held directory chain and
+            # exact socket identity after every accepted namespace-write event.
+            if not event.fflags & select.KQ_NOTE_WRITE:
+                return True
+        return False
 
     def observed_target_mutation(self) -> bool:
         if self._descriptor >= 0:
@@ -656,7 +690,7 @@ class _AgentTargetMutationMonitor:
                     return True
         if self._darwin_queue is None:
             raise RuntimeError("SSH agent socket mutation monitor is unavailable")
-        return bool(self._darwin_queue.control(None, self._max_events, 0))
+        return self._darwin_observed_target_mutation()
 
     def close(self) -> None:
         descriptor, self._descriptor = self._descriptor, -1
@@ -665,9 +699,6 @@ class _AgentTargetMutationMonitor:
         darwin_queue, self._darwin_queue = self._darwin_queue, None
         if darwin_queue is not None:
             darwin_queue.close()
-        owned_descriptors, self._owned_descriptors = self._owned_descriptors, ()
-        for owned in owned_descriptors:
-            os.close(owned)
 
     def __repr__(self) -> str:
         return "_AgentTargetMutationMonitor(<redacted>)"
@@ -972,7 +1003,7 @@ class SshAgentProxy:
         cls,
         upstream_authority: VerifiedSshAgentSocket,
         *,
-        expected_upstream_peer: tuple[int, int] | None = None,
+        expected_upstream_peer: _UnixPeerAuthority | tuple[int, int] | None = None,
     ) -> SshAgentProxy:
         with _AGENT_PROXY_SETUP_GUARD:
             _retry_pending_proxy_cleanups()
@@ -988,7 +1019,7 @@ class SshAgentProxy:
         cls,
         upstream_authority: VerifiedSshAgentSocket,
         *,
-        expected_upstream_peer: tuple[int, int] | None,
+        expected_upstream_peer: _UnixPeerAuthority | tuple[int, int] | None,
     ) -> SshAgentProxy:
         upstream: socket.socket | None = None
         root: _PrivateProxyRoot | None = None
@@ -996,8 +1027,15 @@ class SshAgentProxy:
         name: str | None = None
         cleanup_identity: tuple[int, int, int, int] | None = None
         try:
-            upstream, _peer = upstream_authority.connect(
-                expected_peer=expected_upstream_peer,
+            upstream, _peer = upstream_authority._connect_authority(
+                expected_peer=(
+                    expected_upstream_peer
+                    if isinstance(expected_upstream_peer, _UnixPeerAuthority)
+                    else None
+                ),
+                expected_process=(
+                    expected_upstream_peer if isinstance(expected_upstream_peer, tuple) else None
+                ),
             )
             root = _PrivateProxyRoot.create()
             name = f"agent-{secrets.token_hex(_AGENT_PROXY_RANDOM_BYTES)}.sock"
@@ -1127,17 +1165,19 @@ class SshAgentProxy:
         if session_id is None or process_group_id is None or executable_identity is None:
             return False
         try:
-            process_id, user_id = _unix_peer_process(downstream)
-            if user_id != os.geteuid():
+            peer = _unix_peer_authority(downstream)
+            if peer.user_id != os.geteuid():
                 return False
-            if os.getsid(process_id) != session_id:
+            if os.getsid(peer.process_id) != session_id:
                 return False
-            if os.getpgid(process_id) != process_group_id:
+            if os.getpgid(peer.process_id) != process_group_id:
                 return False
-            if _peer_executable_identity(process_id) != executable_identity:
+            if _peer_executable_identity(peer.process_id) != executable_identity:
                 return False
             return (
-                os.getsid(process_id) == session_id and os.getpgid(process_id) == process_group_id
+                _unix_peer_authority(downstream) == peer
+                and os.getsid(peer.process_id) == session_id
+                and os.getpgid(peer.process_id) == process_group_id
             )
         except (OSError, RuntimeError, ValueError):
             return False
@@ -1247,11 +1287,20 @@ def run_packaged_owned_subprocess_birth(arguments: list[str]) -> None:
     agent_socket = os.environ.get("SSH_AUTH_SOCK")
     if agent_socket is not None:
         environment["SSH_AUTH_SOCK"] = agent_socket
+    execution_path = _verified_execution_path(payload[2], executable_descriptor)
     os.execve(
-        f"/dev/fd/{executable_descriptor}",
+        execution_path,
         payload[2:],
         environment,
     )
+
+
+def _verified_execution_path(path: str, descriptor: int) -> str:
+    if sys.platform.startswith("linux"):
+        return f"/dev/fd/{descriptor}"
+    if sys.platform == "darwin":
+        return path
+    raise OSError(errno.ENOTSUP, "verified system execution is unsupported")
 
 
 def _canonical_descriptor(value: str) -> int:
@@ -1477,7 +1526,51 @@ def _retry_pending_proxy_cleanups() -> None:
         _PENDING_AGENT_PROXY_CLEANUPS.pop(key, None)
 
 
-def _unix_peer_process(stream: socket.socket) -> tuple[int, int]:
+def _darwin_peer_authority(stream: socket.socket) -> _UnixPeerAuthority:
+    libc = ctypes.CDLL(None, use_errno=True)
+    getpeereid = libc.getpeereid
+    getpeereid.argtypes = [
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    getpeereid.restype = ctypes.c_int
+    user_id = ctypes.c_uint32()
+    group_id = ctypes.c_uint32()
+    ctypes.set_errno(0)
+    if getpeereid(stream.fileno(), ctypes.byref(user_id), ctypes.byref(group_id)) != 0:
+        error = ctypes.get_errno() or errno.EIO
+        raise OSError(error, "SSH agent socket peer credentials are unavailable")
+
+    process_payload = stream.getsockopt(
+        _DARWIN_SOL_LOCAL,
+        _DARWIN_LOCAL_PEERPID,
+        _DARWIN_PROCESS_ID.size,
+    )
+    if not isinstance(process_payload, bytes) or len(process_payload) != _DARWIN_PROCESS_ID.size:
+        raise ValueError("SSH agent socket peer PID is invalid")
+    (process_id,) = _DARWIN_PROCESS_ID.unpack(process_payload)
+    if process_id <= 0:
+        raise ValueError("SSH agent socket peer PID is invalid")
+
+    audit_token = stream.getsockopt(
+        _DARWIN_SOL_LOCAL,
+        _DARWIN_LOCAL_PEERTOKEN,
+        _DARWIN_AUDIT_TOKEN.size,
+    )
+    if not isinstance(audit_token, bytes) or len(audit_token) != _DARWIN_AUDIT_TOKEN.size:
+        raise ValueError("SSH agent socket peer audit token is invalid")
+    token_fields = _DARWIN_AUDIT_TOKEN.unpack(audit_token)
+    if (
+        token_fields[1] != user_id.value
+        or token_fields[2] != group_id.value
+        or token_fields[5] != process_id
+    ):
+        raise ValueError("SSH agent socket peer audit token is invalid")
+    return _UnixPeerAuthority(process_id, user_id.value, audit_token)
+
+
+def _unix_peer_authority(stream: socket.socket) -> _UnixPeerAuthority:
     if sys.platform.startswith("linux"):
         credential_size = struct.calcsize("3i")
         payload = stream.getsockopt(
@@ -1486,14 +1579,14 @@ def _unix_peer_process(stream: socket.socket) -> tuple[int, int]:
             credential_size,
         )
         process_id, user_id, _group_id = struct.unpack("3i", payload)
-        return process_id, user_id
+        return _UnixPeerAuthority(process_id, user_id, None)
     if sys.platform == "darwin":
-        level = getattr(socket, "SOL_LOCAL", 0)
-        option = getattr(socket, "LOCAL_PEERPID", _DARWIN_LOCAL_PEERPID)
-        process_id = stream.getsockopt(level, option)
-        user_id, _group_id = stream.getpeereid()
-        return process_id, user_id
+        return _darwin_peer_authority(stream)
     raise RuntimeError("SSH agent proxy peer credentials are unsupported")
+
+
+def _unix_peer_process(stream: socket.socket) -> tuple[int, int]:
+    return _unix_peer_authority(stream).process
 
 
 def _peer_executable_identity(process_id: int) -> _ExecutableIdentity:
@@ -1502,7 +1595,8 @@ def _peer_executable_identity(process_id: int) -> _ExecutableIdentity:
         _require_root_owned_executable(metadata)
         return _executable_identity(metadata)
     if sys.platform == "darwin":
-        buffer = ctypes.create_string_buffer(_MAX_AUTHORITY_PATH_BYTES + 1)
+        # libproc rejects buffers larger than PROC_PIDPATHINFO_MAXSIZE.
+        buffer = ctypes.create_string_buffer(_MAX_AUTHORITY_PATH_BYTES)
         libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
         proc_pidpath = libproc.proc_pidpath
         proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]

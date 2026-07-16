@@ -1934,10 +1934,26 @@ def test_core_tunnel_verify_authority_failure_permanently_poisons_endpoint(
         authority_fails = False
         cleanup_fails = True
 
+        def __init__(self) -> None:
+            super().__init__()
+            self.owned_stream: socket.socket | None = None
+
+        def own_stream_fd(self, stream_fd: int) -> None:
+            assert self.owned_stream is None
+            self.owned_stream = socket.socket(fileno=os.dup(stream_fd))
+
+        def close_owned_stream(self) -> None:
+            if self.owned_stream is not None:
+                self.owned_stream.close()
+                self.owned_stream = None
+
         def poll(self) -> int | None:
             if self.authority_fails:
                 raise OSError("authority probe failed")
-            return None if self.cleanup_fails else super().poll()
+            result = None if self.cleanup_fails else super().poll()
+            if result is not None:
+                self.close_owned_stream()
+            return result
 
         def terminate(self) -> None:
             self.terminated = True
@@ -1949,50 +1965,57 @@ def test_core_tunnel_verify_authority_failure_permanently_poisons_endpoint(
             if self.cleanup_fails:
                 raise subprocess.TimeoutExpired("ssh", timeout)
             assert self.return_code is not None
+            self.close_owned_stream()
             return self.return_code
 
         def kill(self) -> None:
             self.killed = True
             if not self.cleanup_fails:
                 self.return_code = -9
+                self.close_owned_stream()
 
     process = RecoverableAuthorityProcess()
     starts = 0
 
-    def start(_argv: list[str], _stream_fd: int) -> FakeTunnelProcess:
+    def start(_argv: list[str], stream_fd: int) -> FakeTunnelProcess:
         nonlocal starts
         starts += 1
+        process.own_stream_fd(stream_fd)
         return process
 
-    tunnel = _transport(
-        tmp_path,
-        core_connection_starter=start,
-    ).open_core_tunnel(remote_port=8765)
-    connection = tunnel.open_verified_socket(timeout_seconds=1.0)
-    connection.close()
-    process.authority_fails = True
+    try:
+        tunnel = _transport(
+            tmp_path,
+            core_connection_starter=start,
+        ).open_core_tunnel(remote_port=8765)
+        connection = tunnel.open_verified_socket(timeout_seconds=1.0)
+        connection.close()
+        process.authority_fails = True
 
-    with pytest.raises(SshTransportError) as rejected:
-        tunnel.verify_authority()
+        with pytest.raises(SshTransportError) as rejected:
+            tunnel.verify_authority()
 
-    assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
-    assert process.terminated is True
-    assert process.waited is True
-    assert process.killed is True
-    assert tunnel._endpoint._close_requested is True
-    assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
+        assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+        assert process.terminated is True
+        assert process.waited is True
+        assert process.killed is True
+        assert tunnel._endpoint._close_requested is True
+        assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
 
-    process.authority_fails = False
-    with pytest.raises(SshTransportError) as poisoned:
-        tunnel.open_verified_socket(timeout_seconds=1.0)
+        process.authority_fails = False
+        with pytest.raises(SshTransportError) as poisoned:
+            tunnel.open_verified_socket(timeout_seconds=1.0)
 
-    assert poisoned.value.code is SshTransportErrorCode.CONNECTION_FAILED
-    assert starts == 1
+        assert poisoned.value.code is SshTransportErrorCode.CONNECTION_FAILED
+        assert starts == 1
 
-    process.cleanup_fails = False
-    ssh_module._retry_orphaned_tunnel_cleanup()
-    assert tunnel.closed is True
-    assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+        process.cleanup_fails = False
+        ssh_module._retry_orphaned_tunnel_cleanup()
+        assert tunnel.closed is True
+        assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+        assert process.owned_stream is None
+    finally:
+        process.close_owned_stream()
 
 
 def test_core_tunnel_identity_failure_poisons_endpoint_when_child_exit_is_unconfirmed(
@@ -2343,6 +2366,16 @@ def test_core_connection_authority_passes_birth_and_peer_fds_to_exact_ssh_child(
     assert authority.release() is True
 
 
+def test_source_birth_launcher_uses_platform_bound_execution_target() -> None:
+    launcher = ssh_module._SUBPROCESS_BIRTH_LAUNCHER
+
+    assert "os.stat(argv[0], follow_symlinks=True)" in launcher
+    assert 'if sys.platform == "darwin":\n    execution_path = argv[0]' in launcher
+    assert 'elif sys.platform.startswith("linux"):' in launcher
+    assert "execution_path = f\"/dev/fd/{executable_fd}\"" in launcher
+    assert "os.execve(execution_path, argv, environment)" in launcher
+
+
 def test_owned_ssh_spawn_exposes_only_private_agent_proxy_and_cleans_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2514,7 +2547,7 @@ def test_agent_proxy_is_closed_when_spawn_fails_or_is_cancelled(
             authority.release()
 
 
-def test_rsync_nested_ssh_executes_held_fd_and_inherits_pass_fd(
+def test_rsync_nested_ssh_uses_verified_platform_target_and_inherits_fd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2552,12 +2585,41 @@ def test_rsync_nested_ssh_executes_held_fd_and_inherits_pass_fd(
     spawned_argv = actual_argv[marker_index + 3 :]
     assert spawned_argv[0] == ssh_module.RSYNC_EXECUTABLE
     remote_shell = shlex.split(spawned_argv[spawned_argv.index("-e") + 1])
-    assert remote_shell[0].startswith("/dev/fd/")
-    nested_ssh_fd = int(remote_shell[0].removeprefix("/dev/fd/"))
     pass_fds = kwargs["pass_fds"]
     assert isinstance(pass_fds, tuple)
-    assert nested_ssh_fd in pass_fds
+    assert len(pass_fds) == 3
+    assert len(set(pass_fds)) == 3
+    if sys.platform == "darwin":
+        assert remote_shell[0] == ssh_module.SSH_EXECUTABLE
+    else:
+        assert remote_shell[0].startswith("/dev/fd/")
+        nested_ssh_fd = int(remote_shell[0].removeprefix("/dev/fd/"))
+        assert nested_ssh_fd in pass_fds
     assert int(actual_argv[marker_index + 2]) in pass_fds
+
+
+def test_darwin_rsync_nested_ssh_uses_revalidated_fixed_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ssh_module.sys, "platform", "darwin")
+    executable, nested, spawn_argv = ssh_module._prepare_verified_spawn(
+        [
+            ssh_module.RSYNC_EXECUTABLE,
+            "-e",
+            f"{ssh_module.SSH_EXECUTABLE} -V",
+            "/tmp/source",
+            "host:/tmp/target",
+        ]
+    )
+    try:
+        remote_shell = shlex.split(spawn_argv[spawn_argv.index("-e") + 1])
+        assert remote_shell[0] == ssh_module.SSH_EXECUTABLE
+        assert len(nested) == 1
+        nested[0].verify_path_binding()
+    finally:
+        for authority in reversed(nested):
+            authority.close()
+        executable.close()
 
 
 def test_core_connection_subprocess_bridges_a_real_parent_owned_af_unix_stream() -> None:
@@ -2598,44 +2660,62 @@ def test_core_tunnel_close_quarantines_unconfirmed_connection_child(
         def __init__(self) -> None:
             super().__init__()
             self.cleanup_fails = True
+            self.owned_stream: socket.socket | None = None
+
+        def own_stream_fd(self, stream_fd: int) -> None:
+            assert self.owned_stream is None
+            self.owned_stream = socket.socket(fileno=os.dup(stream_fd))
+
+        def close_owned_stream(self) -> None:
+            if self.owned_stream is not None:
+                self.owned_stream.close()
+                self.owned_stream = None
 
         def terminate(self) -> None:
             if self.cleanup_fails:
                 raise OSError("terminate failed")
             self.return_code = -15
+            self.close_owned_stream()
 
         def wait(self, timeout: float | None = None) -> int:
             if self.cleanup_fails:
                 raise subprocess.TimeoutExpired("ssh", timeout)
             assert self.return_code is not None
+            self.close_owned_stream()
             return self.return_code
 
         def kill(self) -> None:
             if self.cleanup_fails:
                 raise OSError("kill failed")
             self.return_code = -9
+            self.close_owned_stream()
 
     process = RecoverableProcess()
 
-    def start(_argv: list[str], _stream_fd: int) -> FakeTunnelProcess:
+    def start(_argv: list[str], stream_fd: int) -> FakeTunnelProcess:
+        process.own_stream_fd(stream_fd)
         return process
 
-    tunnel = _transport(
-        tmp_path,
-        core_connection_starter=start,
-    ).open_core_tunnel(remote_port=8765)
-    connection = tunnel.open_verified_socket(timeout_seconds=1.0)
-    connection.close()
+    try:
+        tunnel = _transport(
+            tmp_path,
+            core_connection_starter=start,
+        ).open_core_tunnel(remote_port=8765)
+        connection = tunnel.open_verified_socket(timeout_seconds=1.0)
+        connection.close()
 
-    with pytest.raises(OSError):
-        tunnel.close()
+        with pytest.raises(OSError):
+            tunnel.close()
 
-    assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
-    assert tunnel.closed is False
-    process.cleanup_fails = False
-    ssh_module._retry_orphaned_tunnel_cleanup()
-    assert tunnel.closed is True
-    assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+        assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
+        assert tunnel.closed is False
+        process.cleanup_fails = False
+        ssh_module._retry_orphaned_tunnel_cleanup()
+        assert tunnel.closed is True
+        assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+        assert process.owned_stream is None
+    finally:
+        process.close_owned_stream()
 
 
 def test_core_tunnel_close_quarantines_lease_cleanup_cancellation() -> None:
@@ -3147,6 +3227,174 @@ def test_default_runner_does_not_require_os_waitid(
     _assert_processes_gone(int(pid_path.read_text(encoding="ascii")))
 
 
+def test_kqueue_observer_detects_leader_that_exited_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 424242
+        returncode = None
+
+    class Queue:
+        def __init__(self) -> None:
+            self.closed = False
+            self.registrations = 0
+
+        def control(
+            self,
+            changes: list[object] | None,
+            _max_events: int,
+            _timeout: int,
+        ) -> list[object]:
+            if changes:
+                self.registrations += 1
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    queue = Queue()
+    monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
+    monkeypatch.setattr(ssh_module.os.path, "isfile", lambda _path: False)
+    monkeypatch.setattr(ssh_module.select, "kqueue", lambda: queue, raising=False)
+    monkeypatch.setattr(
+        ssh_module.select,
+        "kevent",
+        lambda *_args, **_kwargs: object(),
+        raising=False,
+    )
+    for name in (
+        "KQ_FILTER_PROC",
+        "KQ_EV_ADD",
+        "KQ_EV_ENABLE",
+        "KQ_EV_ONESHOT",
+        "KQ_NOTE_EXIT",
+    ):
+        monkeypatch.setattr(ssh_module.select, name, 1, raising=False)
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: {Process.pid: (Process.pid, "Z")},
+    )
+
+    observer = ssh_module._SubprocessExitObserver(Process())
+    try:
+        assert queue.registrations == 1
+        assert observer.supports_nonreaping_observation is True
+        assert observer.exited() is True
+        assert Process.returncode is None
+    finally:
+        observer.close()
+
+
+@pytest.mark.parametrize("state", ["X", "Z"])
+def test_owned_process_group_id_accepts_unreaped_darwin_zombie(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    class Process:
+        pid = 424242
+        returncode = None
+
+    monkeypatch.setattr(ssh_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ssh_module.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: {Process.pid: (Process.pid, state)},
+    )
+
+    assert ssh_module._owned_process_group_id(Process()) == Process.pid
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        None,
+        (424243, "Z"),
+        (424242, "S"),
+    ],
+)
+def test_owned_process_group_id_rejects_unproven_darwin_zombie(
+    monkeypatch: pytest.MonkeyPatch,
+    identity: tuple[int, str] | None,
+) -> None:
+    class Process:
+        pid = 424242
+        returncode = None
+
+    monkeypatch.setattr(ssh_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ssh_module.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: {} if identity is None else {Process.pid: identity},
+    )
+
+    with pytest.raises(RuntimeError, match="process group"):
+        ssh_module._owned_process_group_id(Process())
+
+
+@pytest.mark.parametrize(
+    ("platform", "returncode"),
+    [("linux", None), ("darwin", 0)],
+)
+def test_owned_process_group_id_does_not_recover_ineligible_missing_leader(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    returncode: int | None,
+) -> None:
+    class Process:
+        pid = 424242
+
+    process = Process()
+    process.returncode = returncode
+    monkeypatch.setattr(ssh_module.sys, "platform", platform)
+    monkeypatch.setattr(
+        ssh_module.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected ps fallback")),
+    )
+
+    with pytest.raises(ProcessLookupError):
+        ssh_module._owned_process_group_id(process)
+
+
+def test_owned_process_group_id_does_not_recover_other_getpgid_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 424242
+        returncode = None
+
+    monkeypatch.setattr(ssh_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ssh_module.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(PermissionError),
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected ps fallback")),
+    )
+
+    with pytest.raises(PermissionError):
+        ssh_module._owned_process_group_id(Process())
+
+
 def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3208,6 +3456,7 @@ def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
 def test_portable_observer_never_reaps_before_group_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    original_observer_init = ssh_module._SubprocessExitObserver.__init__
     original_isfile = os.path.isfile
     original_signal_group = ssh_module._signal_owned_process_group
     original_observe_group = ssh_module._observe_owned_process_group_states
@@ -3216,6 +3465,21 @@ def test_portable_observer_never_reaps_before_group_cleanup(
 
     def fail_kqueue() -> object:
         raise OSError("kqueue unavailable")
+
+    def init_without_kqueue(
+        observer: ssh_module._SubprocessExitObserver,
+        process: subprocess.Popen[bytes],
+    ) -> None:
+        # Simulate an unavailable observer backend without poisoning the
+        # selectors used later by subprocess output capture on macOS.
+        with monkeypatch.context() as observer_patch:
+            observer_patch.setattr(
+                ssh_module.select,
+                "kqueue",
+                fail_kqueue,
+                raising=False,
+            )
+            original_observer_init(observer, process)
 
     def record_signal_group(*args: object, **kwargs: object) -> None:
         process = args[0]
@@ -3230,7 +3494,11 @@ def test_portable_observer_never_reaps_before_group_cleanup(
         return original_observe_group(*args, **kwargs)
 
     monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
-    monkeypatch.setattr(ssh_module.select, "kqueue", fail_kqueue, raising=False)
+    monkeypatch.setattr(
+        ssh_module._SubprocessExitObserver,
+        "__init__",
+        init_without_kqueue,
+    )
     monkeypatch.setattr(
         ssh_module.os.path,
         "isfile",
@@ -3388,7 +3656,7 @@ def test_secret_popen_return_cancellation_publishes_one_recoverable_owner(
                 pass
 
 
-def test_recovered_poll_cannot_reap_short_leader_before_retryable_group_cleanup(
+def test_recovered_observer_detects_exit_before_retryable_group_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3410,15 +3678,21 @@ def test_recovered_poll_cannot_reap_short_leader_before_retryable_group_cleanup(
     signal_count = 0
 
     leader_program = (
-        "import subprocess,sys;"
+        "import subprocess,sys\n"
+        "from pathlib import Path\n"
         "child=subprocess.Popen([sys.executable,'-c',"
-        "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)']);"
-        "open(sys.argv[1],'w',encoding='ascii').write(str(child.pid))"
+        "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)'])\n"
+        "Path(sys.argv[1]).write_text(str(child.pid),encoding='ascii')\n"
     )
 
     def local_argv(_command: str, known_hosts_file: Path) -> list[str]:
         lease_paths.append(known_hosts_file)
-        return [sys.executable, "-c", leader_program, str(child_path)]
+        return [
+            sys.executable,
+            "-c",
+            leader_program,
+            str(child_path),
+        ]
 
     def spawn_then_cancel(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
         process = original_popen(*args, **kwargs)
@@ -3470,12 +3744,23 @@ def test_recovered_poll_cannot_reap_short_leader_before_retryable_group_cleanup(
         assert isinstance(process, ssh_module._RecoveredSubprocess)
         child_id = int(child_path.read_text(encoding="ascii"))
 
-        authority.initialize_observer()
         deadline = time.monotonic() + 3
-        while not authority.leader_exited():
+        while True:
+            if os.path.isfile(f"/proc/{process.pid}/stat"):
+                leader_state = ssh_module._read_proc_process_group_states(
+                    process.pid
+                ).get(process.pid)
+            else:
+                identity = ssh_module._read_ps_process_group_states().get(process.pid)
+                leader_state = None if identity is None else identity[1]
+            if leader_state in {"X", "Z"}:
+                break
             if time.monotonic() >= deadline:
-                pytest.fail("short-lived recovered leader did not exit")
+                pytest.fail("recovered leader did not exit before observer registration")
             time.sleep(0.01)
+
+        authority.initialize_observer()
+        assert authority.leader_exited() is True
 
         with pytest.raises(RuntimeError, match="non-reaping observer"):
             process.poll()
@@ -3615,6 +3900,77 @@ def test_secret_runner_retains_lease_until_group_termination_is_observed(
         )
         if authority is not None and id(authority) in ssh_module._ORPHANED_SUBPROCESSES:
             authority.cleanup()
+
+
+def test_group_signal_skips_kill_when_only_zombie_members_remain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = os.getpid() + 100_000
+
+    process = Process()
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        ssh_module,
+        "_observe_owned_process_group_states",
+        lambda _process, *, process_group_id: {process_group_id: "Z"},
+    )
+    monkeypatch.setattr(
+        ssh_module.os,
+        "killpg",
+        lambda process_group_id, signal_number: signals.append(
+            (process_group_id, signal_number)
+        ),
+    )
+
+    ssh_module._signal_owned_process_group(
+        process,
+        process_group_id=process.pid,
+        signal_number=signal.SIGTERM,
+    )
+
+    assert signals == []
+
+
+@pytest.mark.parametrize("live_after_permission_error", [False, True])
+def test_group_signal_permission_error_requires_state_recheck(
+    monkeypatch: pytest.MonkeyPatch,
+    live_after_permission_error: bool,
+) -> None:
+    class Process:
+        pid = os.getpid() + 100_001
+
+    process = Process()
+    observations = iter(
+        (
+            {process.pid: "S"},
+            {process.pid: "S" if live_after_permission_error else "Z"},
+        )
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_observe_owned_process_group_states",
+        lambda _process, *, process_group_id: next(observations),
+    )
+
+    def deny_signal(_process_group_id: int, _signal_number: int) -> None:
+        raise PermissionError(errno.EPERM, "injected signal race")
+
+    monkeypatch.setattr(ssh_module.os, "killpg", deny_signal)
+
+    if live_after_permission_error:
+        with pytest.raises(PermissionError, match="signal race"):
+            ssh_module._signal_owned_process_group(
+                process,
+                process_group_id=process.pid,
+                signal_number=signal.SIGTERM,
+            )
+    else:
+        ssh_module._signal_owned_process_group(
+            process,
+            process_group_id=process.pid,
+            signal_number=signal.SIGTERM,
+        )
 
 
 def test_group_signal_failure_retains_slot_registry_and_trust_lease(

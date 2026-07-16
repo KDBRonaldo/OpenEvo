@@ -95,6 +95,8 @@ if sys.argv[1] != "--openevo-owned-subprocess-birth-v1":
 birth_fd = int(sys.argv[2])
 executable_fd = int(sys.argv[3])
 argv = sys.argv[4:]
+if not argv:
+    raise SystemExit(126)
 try:
     os.fchmod(birth_fd, 0o600)
     os.ftruncate(birth_fd, 0)
@@ -106,12 +108,34 @@ try:
     os.fsync(birth_fd)
 finally:
     os.close(birth_fd)
+identity_fields = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_uid",
+    "st_nlink",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+opened_identity = os.fstat(executable_fd)
+path_identity = os.stat(argv[0], follow_symlinks=True)
+if tuple(getattr(opened_identity, field) for field in identity_fields) != tuple(
+    getattr(path_identity, field) for field in identity_fields
+):
+    raise SystemExit(126)
 os.set_inheritable(executable_fd, False)
 environment = {}
 agent_socket = os.environ.get("SSH_AUTH_SOCK")
 if agent_socket is not None:
     environment["SSH_AUTH_SOCK"] = agent_socket
-os.execve(f"/dev/fd/{executable_fd}", argv, environment)
+if sys.platform == "darwin":
+    execution_path = argv[0]
+elif sys.platform.startswith("linux"):
+    execution_path = f"/dev/fd/{executable_fd}"
+else:
+    raise SystemExit(126)
+os.execve(execution_path, argv, environment)
 """
 
 
@@ -2642,11 +2666,20 @@ def _capture_subprocess_output(
 
 def _owned_process_group_id(process: _OwnedSubprocessProcess) -> int:
     process_group_id = process.pid
-    if (
-        process_group_id <= 1
-        or process_group_id == os.getpgrp()
-        or os.getpgid(process.pid) != process_group_id
-    ):
+    if process_group_id <= 1 or process_group_id == os.getpgrp():
+        raise RuntimeError("subprocess did not receive an independent process group")
+    try:
+        observed_group_id = os.getpgid(process.pid)
+    except ProcessLookupError:
+        if sys.platform != "darwin" or process.returncode is not None:
+            raise
+        identity = _read_ps_process_group_states().get(process.pid)
+        if identity is None:
+            raise RuntimeError("subprocess process group is unavailable") from None
+        observed_group_id, state = identity
+        if observed_group_id != process_group_id or state not in {"X", "Z"}:
+            raise RuntimeError("subprocess process group is not an unreaped leader") from None
+    if observed_group_id != process_group_id:
         raise RuntimeError("subprocess did not receive an independent process group")
     return process_group_id
 
@@ -2666,6 +2699,7 @@ class _SubprocessExitObserver:
         self._kqueue: select.kqueue | None = None
         proc_stat_path = f"/proc/{process.pid}/stat"
         self._proc_stat_path = proc_stat_path if os.path.isfile(proc_stat_path) else None
+        self._ps_process_group_id = process.pid if self._proc_stat_path is None else None
         self._observed = False
         if callable(self._waitid):
             return
@@ -2687,12 +2721,26 @@ class _SubprocessExitObserver:
                     raise
             else:
                 self._kqueue = queue
-                return
+        if self._ps_process_group_id is not None:
+            try:
+                self._observed = self._ps_leader_exited()
+            except BaseException:
+                if self._kqueue is not None:
+                    self._kqueue.close()
+                    self._kqueue = None
+                raise
+            if self._kqueue is not None and not self._observed:
+                # The snapshot closes the attach-before-exit gap. Future exits
+                # are delivered by the registered one-shot kqueue event.
+                self._ps_process_group_id = None
 
     @property
     def supports_nonreaping_observation(self) -> bool:
         return (
-            callable(self._waitid) or self._kqueue is not None or self._proc_stat_path is not None
+            callable(self._waitid)
+            or self._kqueue is not None
+            or self._proc_stat_path is not None
+            or self._ps_process_group_id is not None
         )
 
     def exited(self) -> bool:
@@ -2709,7 +2757,8 @@ class _SubprocessExitObserver:
             return self._observed
         if self._kqueue is not None:
             self._observed = bool(self._kqueue.control(None, 1, 0))
-            return self._observed
+            if self._observed:
+                return True
         if self._proc_stat_path is not None:
             try:
                 with open(self._proc_stat_path, "rb") as stream:
@@ -2727,7 +2776,22 @@ class _SubprocessExitObserver:
                 raise RuntimeError("subprocess proc status is malformed")
             self._observed = status_fields[0] in {b"Z", b"X"}
             return self._observed
+        if self._ps_process_group_id is not None:
+            self._observed = self._ps_leader_exited()
+            return self._observed
         return False
+
+    def _ps_leader_exited(self) -> bool:
+        process_group_id = self._ps_process_group_id
+        if process_group_id is None:
+            raise RuntimeError("subprocess ps observer is unavailable")
+        identity = _read_ps_process_group_states().get(self._process.pid)
+        if identity is None:
+            return True
+        observed_group_id, state = identity
+        if observed_group_id != process_group_id:
+            raise RuntimeError("subprocess process-group leader identity changed")
+        return state in {"X", "Z"}
 
     def wait_until(self, deadline: float) -> bool:
         while True:
@@ -2756,10 +2820,23 @@ def _signal_owned_process_group(
         or process_group_id == os.getpgrp()
     ):
         raise RuntimeError("subprocess process-group ownership is invalid")
+    states = _observe_owned_process_group_states(
+        process,
+        process_group_id=process_group_id,
+    )
+    if not any(state not in {"X", "Z"} for state in states.values()):
+        return
     try:
         os.killpg(process_group_id, signal_number)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        states = _observe_owned_process_group_states(
+            process,
+            process_group_id=process_group_id,
+        )
+        if any(state not in {"X", "Z"} for state in states.values()):
+            raise
 
 
 def _confirm_owned_process_group_terminated(

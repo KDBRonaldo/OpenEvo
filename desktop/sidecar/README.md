@@ -86,6 +86,12 @@ ancestor/root/marker/xattr replacement is detected while the separate key
 remains confidential and unmodified and the owner-only state directory has
 retained its integrity.
 
+Extended attributes are accessed only through verified file descriptors. Linux
+uses Python's descriptor xattr API; macOS binds libc `fgetxattr`, `fsetxattr`,
+and `fremovexattr` directly, with no pathname or `/dev/fd` fallback. Reads and
+writes are bounded, and native errno values remain available to store recovery
+logic.
+
 The store root and import directories are mode `0700`; archive and closed
 metadata files are mode `0600` and link-count one. The store normally creates a
 random opaque import ID. The native route instead supplies an action-derived,
@@ -215,6 +221,39 @@ application. It owns one `DesktopProviderStore` and one `WorkspaceImportStore`
 for the process lifetime and
 requires the native host to supply a Desktop session token, native instance ID,
 readiness key, source commit, and private state root.
+Embedded callers get an ASGI shutdown close hook by default. The packaged
+launcher explicitly sets `close_on_shutdown=False` and becomes the single
+provider shutdown owner so listener/provider cleanup failures can be converted
+to a fixed `shutdown_failed` process diagnostic instead of being absorbed by
+Uvicorn lifespan state.
+For the packaged process only, the launcher temporarily installs a signal
+replay handler around Uvicorn and explicit cleanup. Uvicorn can therefore turn
+Tauri's `SIGTERM` into graceful server exit without the replayed signal killing
+the process before provider cleanup completes.
+If app or Core-runtime construction already has a primary failure, all resources
+created so far are still given a best-effort close, but cleanup exceptions do
+not replace that primary exception.
+Runtime shutdown independently attempts relay stop/join, bridge, broker, and
+bridge-store cleanup. If several fail, callers receive the first failure only
+after every owned resource has been attempted.
+The stop/close sequence is linearized under the runtime close lock, so a second
+thread cannot report close completion while bridge shutdown or relay join is
+still active. Provider shutdown applies the same first-failure aggregation
+across executor, runtime, lifecycle, provider store, and workspace store.
+
+Before the Local API reaches readiness, packaged startup failures use the closed
+`OPENEVO_STARTUP_V1` stderr contract. Only fixed stage/code pairs and an
+optional numeric errno are recognized. Paths, argv, environment values,
+credentials, URLs, exception messages, tracebacks, and arbitrary process output
+are never surfaced. Release smoke tooling uses a bounded OS pipe, scans at most
+32 KiB, and emits at most eight allowlisted records, so this contract does not
+create telemetry, an unbounded process log, or a secret-bearing diagnostics
+channel. The packaged Python launcher records only the last fixed release
+composition phase, covering embedded Core assets, provider/credential stores,
+SSH lifecycle, workspace storage, Core bridge composition, Local API routing,
+native Local API routing, static application mounting, native frame handoff,
+listener setup, and server startup. A failure emits that phase's closed
+`*_failed` code; the original exception and its cause remain private.
 
 The current provider implements:
 
@@ -744,14 +783,20 @@ callback protocol. It owns a dedicated sidecar-private state directory rather
 than extending the public provider database. The directory must remain a real,
 owner-held mode-`0700` inode. Its database and owner-lock files are no-follow,
 link-count-one mode-`0600` regular files whose device/inode identities are pinned
-for the store lifetime. The database remains held by a no-follow descriptor and
-SQLite opens `/dev/fd/<fd>` in `mode=rw`; the connection-reported inode, held FD,
-and managed pathname must all match before configuration or schema writes. This
-uses the native SQLite VFS on macOS and Linux and closes the pathname swap window
-around `sqlite3.connect`. A nonblocking `flock` permits one process owner, a
-process-local reentrant lock serializes SQLite use. Every public read, write, and
-close checks the creator PID before it can acquire an inherited lock, so a
-post-fork child fails closed without deadlocking or unlocking its parent owner.
+for the store lifetime. The database remains held by a no-follow descriptor.
+Linux SQLite opens `/dev/fd/<fd>` in `mode=rw`; Darwin SQLite opens the managed
+database pathname so its standard rollback journal is created beside the
+database rather than under `/dev/fd`. Before configuration or schema writes, the
+connection-reported inode, held FD, and managed pathname must all match. A
+connect-time replacement therefore either retains the pinned Linux inode or
+opens a different Darwin inode that is rejected before initialization. A
+nonblocking `flock` permits one process owner, and a process-local reentrant lock
+serializes SQLite use. Every public read, write, and close checks the creator PID
+before it can acquire an inherited lock, so a post-fork child fails closed
+without deadlocking or unlocking its parent owner. As with the provider store,
+the unsigned preview does not claim protection from an arbitrary malicious
+same-UID process able to race and restore the owner-private pathname between
+checks.
 
 Before SQLite receives the target database URI, the store probes a separate new
 in-memory connection and requires the current library's default numeric

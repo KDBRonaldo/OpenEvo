@@ -93,6 +93,13 @@ ErrorCategory = Literal[
 ]
 
 
+def _cleanup_after_primary_failure(cleanup: Callable[[], None]) -> None:
+    try:
+        cleanup()
+    except BaseException:
+        pass
+
+
 def _error_response(
     request: Request,
     *,
@@ -282,6 +289,8 @@ def create_release_desktop_local_api_app(
     core_assets_root: Path | str | None = None,
     core_bridge: DesktopCoreBridgeV1 | None = None,
     event_broker: DesktopEventBrokerV1 | None = None,
+    startup_phase: Callable[[str], None] | None = None,
+    close_on_shutdown: bool = True,
 ) -> FastAPI:
     """Create the release Desktop Local API v1 app and own its durable store."""
 
@@ -294,19 +303,27 @@ def create_release_desktop_local_api_app(
     if core_assets_root is not None and (core_bridge is not None or event_broker is not None):
         raise ValueError("packaged Core assets cannot be combined with injected Core resources")
     encoded_session_token = session_token.encode("utf-8")
+    if startup_phase is not None:
+        startup_phase("provider_store")
     store = DesktopProviderStore(state_root, clock=clock)
-    store.reset_release_credential_slots()
     lifecycle = remote_lifecycle
     workspace_import_store: WorkspaceImportStore | None = None
     core_runtime: DesktopReleaseCoreRuntimeV1 | None = None
     try:
+        if startup_phase is not None:
+            startup_phase("credential_reset")
+        store.reset_release_credential_slots()
         if lifecycle is None:
+            if startup_phase is not None:
+                startup_phase("remote_lifecycle")
             lifecycle = DesktopRemoteLifecycle(
                 ProviderKnownHostStore(
                     store.state_root / "ssh-host-keys",
                     secure_ancestor=store.state_root,
                 )
             )
+        if startup_phase is not None:
+            startup_phase("workspace_store")
         workspace_import_store = WorkspaceImportStore(
             store.state_root / "workspace-imports",
             reconcile_on_open=False,
@@ -318,7 +335,10 @@ def create_release_desktop_local_api_app(
                 remote_lifecycle=lifecycle,
                 asset_root=core_assets_root,
                 source_commit=source_commit,
+                startup_phase=startup_phase,
             )
+        if startup_phase is not None:
+            startup_phase("release_provider")
         provider = DesktopReleaseProvider(
             store,
             workspace_import_store,
@@ -334,31 +354,48 @@ def create_release_desktop_local_api_app(
             event_broker=event_broker,
             clock=clock,
         )
+        if startup_phase is not None:
+            startup_phase("contract_app")
         app = create_contract_app(provider)
     except BaseException:
-        try:
-            if core_runtime is not None:
-                core_runtime.close()
-            elif event_broker is not None:
-                event_broker.close()
-        finally:
-            try:
-                if core_runtime is None and core_bridge is not None:
-                    core_bridge.close()
-            finally:
-                try:
-                    if lifecycle is not None:
-                        lifecycle.close()
-                finally:
-                    try:
-                        store.close()
-                    finally:
-                        if workspace_import_store is not None:
-                            workspace_import_store.close()
+        if core_runtime is not None:
+            _cleanup_after_primary_failure(core_runtime.close)
+        elif event_broker is not None:
+            _cleanup_after_primary_failure(event_broker.close)
+        if core_runtime is None and core_bridge is not None:
+            _cleanup_after_primary_failure(core_bridge.close)
+        if lifecycle is not None:
+            _cleanup_after_primary_failure(lifecycle.close)
+        _cleanup_after_primary_failure(store.close)
+        if workspace_import_store is not None:
+            _cleanup_after_primary_failure(workspace_import_store.close)
         raise
-    app.state.desktop_release_provider = provider
 
-    @app.middleware("http")
+    def register_release_handler(registrar, key):
+        try:
+            decorator = registrar(key)
+        except BaseException:
+            _cleanup_after_primary_failure(provider.close)
+            raise
+
+        def register(handler):
+            try:
+                return decorator(handler)
+            except BaseException:
+                _cleanup_after_primary_failure(provider.close)
+                raise
+
+        return register
+
+    try:
+        if startup_phase is not None:
+            startup_phase("release_routes")
+        app.state.desktop_release_provider = provider
+    except BaseException:
+        _cleanup_after_primary_failure(provider.close)
+        raise
+
+    @register_release_handler(app.middleware, "http")
     async def authenticate_desktop_session(request: Request, call_next):
         import secrets
 
@@ -379,7 +416,7 @@ def create_release_desktop_local_api_app(
                 )
         return await call_next(request)
 
-    @app.exception_handler(ProviderCapabilityUnavailableError)
+    @register_release_handler(app.exception_handler, ProviderCapabilityUnavailableError)
     async def handle_unavailable(
         request: Request, exc: ProviderCapabilityUnavailableError
     ) -> JSONResponse:
@@ -392,7 +429,7 @@ def create_release_desktop_local_api_app(
             repair_action="none",
         )
 
-    @app.exception_handler(ExecutionModeReleaseUnavailableError)
+    @register_release_handler(app.exception_handler, ExecutionModeReleaseUnavailableError)
     async def handle_execution_mode_unavailable(
         request: Request, exc: ExecutionModeReleaseUnavailableError
     ) -> JSONResponse:
@@ -407,7 +444,7 @@ def create_release_desktop_local_api_app(
             next_action="Choose a supported execution mode and save the project before continuing.",
         )
 
-    @app.exception_handler(ActiveProjectMismatchError)
+    @register_release_handler(app.exception_handler, ActiveProjectMismatchError)
     async def handle_active_project_mismatch(
         request: Request, exc: ActiveProjectMismatchError
     ) -> JSONResponse:
@@ -421,7 +458,7 @@ def create_release_desktop_local_api_app(
             next_action="Reconnect and activate the saved project.",
         )
 
-    @app.exception_handler(EvolutionConfigurationPendingError)
+    @register_release_handler(app.exception_handler, EvolutionConfigurationPendingError)
     async def handle_evolution_configuration_pending(
         request: Request, exc: EvolutionConfigurationPendingError
     ) -> JSONResponse:
@@ -436,7 +473,7 @@ def create_release_desktop_local_api_app(
             next_action="Finish or disable the evolution targets, then save the project.",
         )
 
-    @app.exception_handler(InvalidNativeChallengeError)
+    @register_release_handler(app.exception_handler, InvalidNativeChallengeError)
     async def handle_invalid_challenge(
         request: Request, exc: InvalidNativeChallengeError
     ) -> JSONResponse:
@@ -449,7 +486,7 @@ def create_release_desktop_local_api_app(
             category="authentication",
         )
 
-    @app.exception_handler(RemoteLifecycleError)
+    @register_release_handler(app.exception_handler, RemoteLifecycleError)
     async def handle_remote_lifecycle(request: Request, exc: RemoteLifecycleError) -> JSONResponse:
         if isinstance(exc, RemoteCredentialUnavailableError):
             return _error_response(
@@ -483,7 +520,7 @@ def create_release_desktop_local_api_app(
             next_action="Check the server and SSH settings, then retry.",
         )
 
-    @app.exception_handler(DesktopCoreBridgeErrorV1)
+    @register_release_handler(app.exception_handler, DesktopCoreBridgeErrorV1)
     async def handle_core_bridge_error(
         request: Request, exc: DesktopCoreBridgeErrorV1
     ) -> JSONResponse:
@@ -493,7 +530,7 @@ def create_release_desktop_local_api_app(
             content=exc.error.model_dump(mode="json"),
         )
 
-    @app.exception_handler(CoreClientErrorV1)
+    @register_release_handler(app.exception_handler, CoreClientErrorV1)
     async def handle_core_client_error(request: Request, exc: CoreClientErrorV1) -> JSONResponse:
         if isinstance(exc.error, ApiErrorV1):
             return JSONResponse(
@@ -528,7 +565,7 @@ def create_release_desktop_local_api_app(
             repair_action=("openevo_can_retry" if exc.error.retryable else "none"),
         )
 
-    @app.exception_handler(CoreMutationOutcomeUnknownV1)
+    @register_release_handler(app.exception_handler, CoreMutationOutcomeUnknownV1)
     async def handle_core_mutation_outcome_unknown(
         request: Request, exc: CoreMutationOutcomeUnknownV1
     ) -> JSONResponse:
@@ -544,7 +581,7 @@ def create_release_desktop_local_api_app(
             next_action="Retry only the exact saved mutation while Desktop reconciles Core state.",
         )
 
-    @app.exception_handler(DesktopEventCursorExpiredError)
+    @register_release_handler(app.exception_handler, DesktopEventCursorExpiredError)
     async def handle_event_cursor_expired(
         request: Request, exc: DesktopEventCursorExpiredError
     ) -> JSONResponse:
@@ -559,7 +596,7 @@ def create_release_desktop_local_api_app(
             next_action="Refresh Desktop state and reconnect the event stream.",
         )
 
-    @app.exception_handler(DesktopEventBrokerError)
+    @register_release_handler(app.exception_handler, DesktopEventBrokerError)
     async def handle_event_broker_error(
         request: Request, exc: DesktopEventBrokerError
     ) -> JSONResponse:
@@ -581,7 +618,7 @@ def create_release_desktop_local_api_app(
             repair_action="openevo_can_retry" if retryable else "none",
         )
 
-    @app.exception_handler(RequestValidationError)
+    @register_release_handler(app.exception_handler, RequestValidationError)
     async def handle_validation(request: Request, exc: RequestValidationError) -> JSONResponse:
         challenge_error = any(
             len(location := tuple(error.get("loc", ()))) == 2
@@ -606,11 +643,11 @@ def create_release_desktop_local_api_app(
             repair_action="user_input_required",
         )
 
-    @app.exception_handler(ProviderStoreError)
+    @register_release_handler(app.exception_handler, ProviderStoreError)
     async def handle_store_error(request: Request, exc: ProviderStoreError) -> JSONResponse:
         return _store_error_response(request, exc)
 
-    @app.exception_handler(WorkspaceImportError)
+    @register_release_handler(app.exception_handler, WorkspaceImportError)
     async def handle_workspace_import_error(
         request: Request, exc: WorkspaceImportError
     ) -> JSONResponse:
@@ -633,7 +670,7 @@ def create_release_desktop_local_api_app(
             else None,
         )
 
-    @app.exception_handler(sqlite3.Error)
+    @register_release_handler(app.exception_handler, sqlite3.Error)
     async def handle_sqlite_error(request: Request, exc: sqlite3.Error) -> JSONResponse:
         del exc
         return _error_response(
@@ -644,7 +681,12 @@ def create_release_desktop_local_api_app(
             category="service",
         )
 
-    app.router.add_event_handler("shutdown", provider.close)
+    if close_on_shutdown:
+        try:
+            app.router.add_event_handler("shutdown", provider.close)
+        except BaseException:
+            _cleanup_after_primary_failure(provider.close)
+            raise
     return app
 
 

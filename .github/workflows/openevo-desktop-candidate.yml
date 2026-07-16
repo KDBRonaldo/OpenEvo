@@ -28,13 +28,17 @@ jobs:
       - name: Require a reviewed stable commit and safe label
         env:
           CANDIDATE_LABEL: ${{ inputs.candidate_label }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           test "$GITHUB_REF" = "refs/heads/stable"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$RUNNER_ENVIRONMENT" = "github-hosted"
           if [[ ! "$CANDIDATE_LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]; then
             echo "candidate_label must be a short filename-safe identifier" >&2
             exit 1
           fi
+          git check-ref-format \
+            "refs/tags/openevo-desktop-v0-${CANDIDATE_LABEL}.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
 
       - uses: actions/setup-node@v4
         with:
@@ -62,12 +66,32 @@ jobs:
             tests/ci/test_check_openevo_release.py \
             tests/ci/test_openevo_release_candidate.py \
             tests/ci/test_openevo_release_evidence.py \
+            tests/openevo/sidecar/test_provider_store.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
+            tests/openevo/sidecar/test_provider_store.py::test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_darwin_sqlite_connection_uses_managed_path_and_persists_writes \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_open_store_rejects_database_pathname_replacement \
+            tests/openevo/sidecar/test_core_bridge_store_v1.py::test_fresh_initial_schema_hot_journal_rolls_back_then_bootstraps \
             -q
           uv run python scripts/ci/audit_openevo_identity.py
 
       - name: Exercise macOS SSH agent relay and fixed executable authority
         run: |
-          uv run python -m pytest \
+          unset SSH_AUTH_SOCK
+          umask 077
+          case "${HOME:-}" in
+            /*) ;;
+            *) echo "HOME must be an absolute path" >&2; exit 1 ;;
+          esac
+          ssh_test_prefix="$HOME/.oe-ssh."
+          ssh_test_root="$(mktemp -d "${ssh_test_prefix}XXXXXX")"
+          case "$ssh_test_root" in
+            "$ssh_test_prefix"??????) ;;
+            *) echo "Unexpected SSH test root" >&2; exit 1 ;;
+          esac
+          trap 'rm -rf -- "$ssh_test_root"' EXIT
+          chmod 700 "$ssh_test_root"
+          uv run python -m pytest --basetemp="$ssh_test_root/pytest" \
             tests/openevo/remote/test_system_executables.py \
             tests/openevo/remote/test_host_keys.py \
             tests/openevo/remote/test_ssh_transport.py \
@@ -144,26 +168,26 @@ jobs:
       - name: Build packaged sidecar and final exact Core wheel
         working-directory: desktop
         run: |
-          mkdir "$GITHUB_WORKSPACE/.candidate-core"
           python packaging/build_sidecar.py \
-            --core-wheel-output-dir "$GITHUB_WORKSPACE/.candidate-core"
+            --core-wheel-output-dir "$RUNNER_TEMP/openevo-candidate-core"
+          echo "OPENEVO_CANDIDATE_CORE=$RUNNER_TEMP/openevo-candidate-core" >> "$GITHUB_ENV"
           sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-${OPENEVO_RUST_TARGET}"
           test -x "$sidecar"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
 
       - name: Clean-install and verify final Core wheel and framework lock
         run: |
-          test "$(find .candidate-core -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
-          test -f .candidate-core/framework-lock.json
+          test "$(find "$OPENEVO_CANDIDATE_CORE" -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          test -f "$OPENEVO_CANDIDATE_CORE/framework-lock.json"
           python -m venv "$RUNNER_TEMP/openevo-core-wheel-smoke"
           "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/python" -m pip install .candidate-core/openevo-*.whl
+          "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/python" -m pip install "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl
           PYTHONPATH= "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/openevo-backend" --help
           PYTHONPATH= "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/openevo-core-service" --help
           PYTHONPATH= "$RUNNER_TEMP/openevo-core-wheel-smoke/bin/python" \
             scripts/ci/smoke_evolution_framework_wheel.py \
-            --wheel .candidate-core/openevo-*.whl \
-            --framework-lock .candidate-core/framework-lock.json \
+            --wheel "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl \
+            --framework-lock "$OPENEVO_CANDIDATE_CORE/framework-lock.json" \
             > "$RUNNER_TEMP/framework-smoke.json"
           registry_digest="$(uv run python -c \
             'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["registry_digest"])' \
@@ -197,8 +221,8 @@ jobs:
           dmg_source="$(find desktop/src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print)"
           cp "$dmg_source" \
             "candidate-artifacts/OpenEvo-Desktop-${OPENEVO_VERSION}-${OPENEVO_ARCHITECTURE}.dmg"
-          cp .candidate-core/openevo-*.whl candidate-artifacts/
-          cp .candidate-core/framework-lock.json candidate-artifacts/
+          cp "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl candidate-artifacts/
+          cp "$OPENEVO_CANDIDATE_CORE/framework-lock.json" candidate-artifacts/
 
       - name: Launch real app bundle and record native evidence
         run: |
@@ -229,18 +253,11 @@ jobs:
       - name: Write release notes and authoritative candidate manifest
         id: candidate
         run: |
-          cat > candidate-artifacts/release-notes.md <<EOF
-          # OpenEvo Desktop ${OPENEVO_VERSION} unsigned draft prerelease
-
-          Source commit: ${GITHUB_SHA}
-          Architecture: ${OPENEVO_ARCHITECTURE}
-          Minimum macOS: 12.0
-
-          This candidate is unsigned and not notarized. macOS users must manually
-          allow OpenEvo Desktop in Privacy & Security after the first launch.
-          Only the architecture above was built and validated by this run.
-          This draft is not a published release and PyPI is not used.
-          EOF
+          uv run python scripts/ci/openevo_release_candidate.py write-notes \
+            candidate-artifacts/release-notes.md \
+            --source-commit "$GITHUB_SHA" \
+            --version "$OPENEVO_VERSION" \
+            --architecture "$OPENEVO_ARCHITECTURE"
           uv run python scripts/ci/openevo_release_candidate.py create \
             candidate-artifacts \
             --source-commit "$GITHUB_SHA" \
@@ -261,7 +278,7 @@ jobs:
       - name: Upload exact candidate for cross-platform verification
         uses: actions/upload-artifact@v4
         with:
-          name: openevo-desktop-candidate-${{ github.sha }}
+          name: openevo-desktop-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: candidate-artifacts/*
           if-no-files-found: error
           retention-days: 14
@@ -270,7 +287,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: openevo-desktop-candidate-failure-evidence-${{ github.sha }}
+          name: openevo-desktop-candidate-failure-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             candidate-artifacts/dependency-inventory.json
             candidate-artifacts/license-inventory.json
@@ -309,8 +326,15 @@ jobs:
       - name: Download exact final candidate bytes
         uses: actions/download-artifact@v4
         with:
-          name: openevo-desktop-candidate-${{ github.sha }}
+          name: openevo-desktop-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: candidate-artifacts
+
+      - name: Restore private Core candidate input modes
+        run: |
+          chmod 0600 \
+            candidate-artifacts/openevo-*.whl \
+            candidate-artifacts/framework-lock.json
+          test "$(stat -c '%a' candidate-artifacts/framework-lock.json)" = 600
 
       - name: Verify candidate manifest and transferred manifest bytes
         env:
@@ -417,7 +441,7 @@ jobs:
       - name: Download validated candidate bytes
         uses: actions/download-artifact@v4
         with:
-          name: openevo-desktop-candidate-${{ github.sha }}
+          name: openevo-desktop-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: candidate-artifacts
 
       - name: Revalidate candidate before draft creation
@@ -430,28 +454,69 @@ jobs:
             candidate-artifacts/release-candidate.json \
             --expected-source-commit "$GITHUB_SHA"
 
-      - name: Create unsigned draft prerelease and upload exact assets
+      - name: Prepare unique draft release identity
         id: release
-        env:
-          CANDIDATE_LABEL: ${{ inputs.candidate_label }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           version="$(python -c \
             'import json; print(json.load(open("candidate-artifacts/release-candidate.json"))["version"])')"
           tag="openevo-desktop-v${version}-${CANDIDATE_LABEL}.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          gh release create "$tag" \
-            --target "$GITHUB_SHA" \
-            --title "OpenEvo Desktop ${version} unsigned candidate" \
-            --notes-file candidate-artifacts/release-notes.md \
-            --draft \
-            --prerelease
-          gh release upload "$tag" candidate-artifacts/*
+          title="OpenEvo Desktop ${version} unsigned candidate"
+          owner="$(python -c 'import secrets; print(secrets.token_hex(16))')"
+          git check-ref-format "refs/tags/$tag"
 
-      - name: Download every draft asset into a clean directory and verify exact bytes
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[].tag_name | @json' \
+            > "$RUNNER_TEMP/releases-before-candidate.jsonl"
+          python scripts/ci/openevo_release_candidate.py assert-release-absent \
+            "$RUNNER_TEMP/releases-before-candidate.jsonl" \
+            --expected-tag "$tag"
+
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "Candidate Git tag already exists: $tag" >&2
+            exit 1
+          fi
+          if [ "$tag_status" -ne 2 ]; then
+            echo "Could not prove candidate Git tag absence: $tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+        env:
+          CANDIDATE_LABEL: ${{ inputs.candidate_label }}
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create unsigned draft prerelease and upload exact assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
+          RELEASE_OWNER: ${{ steps.release.outputs.owner }}
+        run: |
+          python scripts/ci/openevo_release_candidate.py write-draft-body \
+            "$RUNNER_TEMP/draft-release-body.md" \
+            --release-notes candidate-artifacts/release-notes.md \
+            --ownership-token "$RELEASE_OWNER"
+          gh release create "$RELEASE_TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TITLE" \
+            --notes-file "$RUNNER_TEMP/draft-release-body.md" \
+            --draft \
+            --prerelease
+          gh release upload "$RELEASE_TAG" candidate-artifacts/*
+
+      - name: Verify every draft asset and review-facing field
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
+          RELEASE_OWNER: ${{ steps.release.outputs.owner }}
         run: |
           mkdir downloaded-draft
           gh release download "$RELEASE_TAG" --dir downloaded-draft --pattern '*'
@@ -460,9 +525,112 @@ jobs:
             --expected-source-commit "$GITHUB_SHA"
           diff -qr candidate-artifacts downloaded-draft
 
-      - name: Delete an unverified draft and its candidate tag
-        if: failure() && steps.release.outputs.tag != ''
+          gh release view "$RELEASE_TAG" \
+            --json apiUrl,body,isDraft,isPrerelease,name,tagName,targetCommitish,url \
+            > "$RUNNER_TEMP/draft-release.json"
+          python scripts/ci/openevo_release_candidate.py validate-draft \
+            "$RUNNER_TEMP/draft-release.json" \
+            --release-notes candidate-artifacts/release-notes.md \
+            --expected-tag "$RELEASE_TAG" \
+            --expected-target "$GITHUB_SHA" \
+            --expected-title "$RELEASE_TITLE" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-owner "$RELEASE_OWNER"
+
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "Draft unexpectedly created a real Git tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [ "$tag_status" -ne 2 ]; then
+            echo "Could not prove candidate Git tag absence: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Retain point-in-time draft verification record
+        uses: actions/upload-artifact@v4
+        with:
+          name: openevo-desktop-draft-verification-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/draft-release.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Mark draft roundtrip complete
+        id: verified
+        run: echo "complete=true" >> "$GITHUB_OUTPUT"
+
+      - name: Delete an owned unverified draft and verify no candidate tag
+        if: ${{ always() && steps.release.outputs.tag != '' && steps.verified.outputs.complete != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: gh release delete "$RELEASE_TAG" --yes --cleanup-tag
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
+          RELEASE_OWNER: ${{ steps.release.outputs.owner }}
+        run: |
+          release_found=false
+          for attempt in 1 2 3; do
+            if gh release view "$RELEASE_TAG" \
+              --json apiUrl,body,isDraft,isPrerelease,name,tagName,targetCommitish,url \
+              > "$RUNNER_TEMP/cleanup-draft-release.json"; then
+              release_found=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$release_found" = "true" ]; then
+            if ! python scripts/ci/openevo_release_candidate.py validate-draft \
+              "$RUNNER_TEMP/cleanup-draft-release.json" \
+              --release-notes candidate-artifacts/release-notes.md \
+              --expected-tag "$RELEASE_TAG" \
+              --expected-target "$GITHUB_SHA" \
+              --expected-title "$RELEASE_TITLE" \
+              --expected-repository "$GITHUB_REPOSITORY" \
+              --expected-owner "$RELEASE_OWNER" \
+              --release-id-output "$RUNNER_TEMP/cleanup-release-id"; then
+              echo "Refusing to delete a draft not owned by this workflow attempt" >&2
+              exit 1
+            fi
+            IFS= read -r release_id < "$RUNNER_TEMP/cleanup-release-id"
+            for attempt in 1 2 3; do
+              if gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/${release_id}"; then
+                break
+              fi
+              sleep "$attempt"
+            done
+          fi
+
+          release_absent=false
+          for attempt in 1 2 3; do
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[].tag_name | @json' \
+              > "$RUNNER_TEMP/releases-after-cleanup.jsonl"
+            if python scripts/ci/openevo_release_candidate.py assert-release-absent \
+              "$RUNNER_TEMP/releases-after-cleanup.jsonl" \
+              --expected-tag "$RELEASE_TAG"; then
+              release_absent=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$release_absent" != "true" ]; then
+            echo "Could not prove unverified draft absence: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "Unverified candidate tag still exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [ "$tag_status" -ne 2 ]; then
+            echo "Could not prove unverified candidate tag absence: $RELEASE_TAG" >&2
+            exit 1
+          fi

@@ -208,6 +208,24 @@ fn validate_extended_acl_entries(entries: &[ExtendedAclEntry]) -> HostResult<()>
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn macos_acl_entry_result(result: libc::c_int, error_number: libc::c_int) -> HostResult<bool> {
+    match (result, error_number) {
+        (0, 0) => Ok(true),
+        (-1, libc::EINVAL) => Ok(false),
+        _ => Err(packaged_path_error()),
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_acl_presence_result(is_null: bool, error_number: libc::c_int) -> HostResult<bool> {
+    match (is_null, error_number) {
+        (false, 0) => Ok(true),
+        (true, libc::ENOENT) => Ok(false),
+        _ => Err(packaged_path_error()),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn validate_anchored_extended_acl(_file: &File) -> HostResult<()> {
     Ok(())
@@ -245,19 +263,24 @@ fn validate_anchored_extended_acl(file: &File) -> HostResult<()> {
         }
     }
 
+    unsafe {
+        set_current_errno(0);
+    }
     let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        return Err(packaged_path_error());
+    if !macos_acl_presence_result(acl.is_null(), unsafe { current_errno() })? {
+        return Ok(());
     }
     let _guard = AclGuard(acl);
     let mut entries = Vec::new();
     let mut entry_id = ACL_FIRST_ENTRY;
     loop {
         let mut entry: AclEntry = ptr::null_mut();
-        match unsafe { acl_get_entry(acl, entry_id, &mut entry) } {
-            0 => break,
-            1 => {}
-            _ => return Err(packaged_path_error()),
+        unsafe {
+            set_current_errno(0);
+        }
+        let result = unsafe { acl_get_entry(acl, entry_id, &mut entry) };
+        if !macos_acl_entry_result(result, unsafe { current_errno() })? {
+            break;
         }
         let mut raw_tag = 0;
         let mut permissions = 0_u64;
@@ -303,6 +326,14 @@ const DIRECTORY_FILE_TYPE: u32 = libc::S_IFDIR as u32;
 const REGULAR_FILE_TYPE: u32 = libc::S_IFREG;
 #[cfg(target_os = "macos")]
 const REGULAR_FILE_TYPE: u32 = libc::S_IFREG as u32;
+#[cfg(target_os = "linux")]
+const SYMLINK_FILE_TYPE: u32 = libc::S_IFLNK;
+#[cfg(target_os = "macos")]
+const SYMLINK_FILE_TYPE: u32 = libc::S_IFLNK as u32;
+#[cfg(target_os = "linux")]
+const STICKY_MODE_BIT: u32 = libc::S_ISVTX;
+#[cfg(target_os = "macos")]
+const STICKY_MODE_BIT: u32 = libc::S_ISVTX as u32;
 
 #[cfg(any(test, target_os = "macos"))]
 fn same_identity_after_optional_unlink(actual: &FileIdentity, expected: &FileIdentity) -> bool {
@@ -1645,11 +1676,32 @@ fn open_trusted_source_parent(path: &Path) -> HostResult<(File, CString)> {
     if !path.is_absolute() {
         return Err(packaged_path_error());
     }
-    let parent = path.parent().ok_or_else(packaged_path_error)?;
-    let name = path.file_name().ok_or_else(packaged_path_error)?;
+    let trusted_path = trusted_packaged_path(path);
+    let parent = trusted_path.parent().ok_or_else(packaged_path_error)?;
+    let name = trusted_path.file_name().ok_or_else(packaged_path_error)?;
     let name = CString::new(name.as_bytes()).map_err(|_| packaged_path_error())?;
     let directory = open_directory_chain_no_follow(parent)?;
     Ok((directory, name))
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_packaged_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_packaged_path(path: &Path) -> PathBuf {
+    macos_trusted_path_alias(path)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_trusted_path_alias(path: &Path) -> PathBuf {
+    for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+        if let Ok(suffix) = path.strip_prefix(alias) {
+            return Path::new(target).join(suffix);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn open_directory_chain_no_follow(path: &Path) -> HostResult<File> {
@@ -1705,7 +1757,7 @@ fn validate_trusted_directory_for_user(
 ) -> HostResult<()> {
     let is_directory = identity.mode & FILE_TYPE_MASK == DIRECTORY_FILE_TYPE;
     let trusted_owner = identity.owner == 0 || identity.owner == effective_user;
-    let root_sticky_boundary = identity.owner == 0 && identity.mode & libc::S_ISVTX != 0;
+    let root_sticky_boundary = identity.owner == 0 && identity.mode & STICKY_MODE_BIT != 0;
     let world_writable = identity.mode & 0o002 != 0;
     let group_writable = identity.mode & 0o020 != 0;
     let macos_root_group_writable =
@@ -1724,8 +1776,8 @@ fn validate_packaged_source_identity(
     identity: &FileIdentity,
     owner_policy: PackagedSourceOwnerPolicy,
 ) -> HostResult<()> {
-    let kind = identity.mode & libc::S_IFMT;
-    if kind == libc::S_IFLNK {
+    let kind = identity.mode & FILE_TYPE_MASK;
+    if kind == SYMLINK_FILE_TYPE {
         return Err(NativeHostError::new(
             "bundled_sidecar_symlink",
             "The packaged OpenEvo Desktop bundled sidecar is an unsupported symbolic link.",
@@ -2253,6 +2305,22 @@ fn command_from_launch_spec(
             let fd = duplicate_fd_at_least(directory.directory.as_raw_fd(), 10)
                 .map_err(|_| private_sidecar_error())?;
             let guard = unsafe { File::from_raw_fd(fd) };
+            let current_identity = file_identity(&guard).map_err(|_| private_sidecar_error())?;
+            let source_identity =
+                file_identity(&directory.directory).map_err(|_| private_sidecar_error())?;
+            let path_identity = fs::symlink_metadata(directory.path())
+                .map(|metadata| file_identity_from_metadata(&metadata))
+                .map_err(|_| private_sidecar_error())?;
+            if current_identity != source_identity
+                || current_identity != path_identity
+                || current_identity.device != directory.identity.device
+                || current_identity.inode != directory.identity.inode
+                || current_identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
+                || current_identity.owner != unsafe { libc::geteuid() }
+                || current_identity.mode & 0o777 != 0o700
+            {
+                return Err(private_sidecar_error());
+            }
             let directory_path = CString::new(directory.path().as_os_str().as_bytes())
                 .map_err(|_| private_sidecar_error())?;
             let executable_name =
@@ -2261,7 +2329,7 @@ fn command_from_launch_spec(
                 .map_err(|_| private_sidecar_error())?;
             (
                 Some(guard),
-                Some(directory.identity.clone()),
+                Some(current_identity),
                 Some(directory_path),
                 Some(executable_name),
                 Some(program_path),
@@ -4891,7 +4959,7 @@ fn open_run_retry_recovery_root(
 fn validate_run_retry_recovery_parent(directory: &File) -> HostResult<()> {
     let identity = file_identity(directory).map_err(|_| run_retry_recovery_error())?;
     let effective_user = unsafe { libc::geteuid() };
-    let root_sticky_boundary = identity.owner == 0 && identity.mode & libc::S_ISVTX != 0;
+    let root_sticky_boundary = identity.owner == 0 && identity.mode & STICKY_MODE_BIT != 0;
     if identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
         || (identity.owner != 0 && identity.owner != effective_user)
         || (identity.mode & 0o022 != 0 && !root_sticky_boundary)
@@ -6564,7 +6632,7 @@ mod tests {
         )
         .is_ok());
 
-        identity.mode = libc::S_IFDIR | 0o770;
+        identity.mode = DIRECTORY_FILE_TYPE | 0o770;
         assert_eq!(
             validate_trusted_directory_for_user(&identity, 501, TrustedDirectoryPolicy::Strict,)
                 .unwrap_err()
@@ -6573,7 +6641,7 @@ mod tests {
         );
 
         identity.owner = 0;
-        identity.mode = libc::S_IFDIR | 0o775;
+        identity.mode = DIRECTORY_FILE_TYPE | 0o775;
         assert_eq!(
             validate_trusted_directory_for_user(&identity, 501, TrustedDirectoryPolicy::Strict,)
                 .unwrap_err()
@@ -6599,14 +6667,14 @@ mod tests {
         );
 
         identity.owner = 0;
-        identity.mode = libc::S_IFDIR | libc::S_ISVTX | 0o777;
+        identity.mode = DIRECTORY_FILE_TYPE | STICKY_MODE_BIT | 0o777;
         assert!(validate_trusted_directory_for_user(
             &identity,
             501,
             TrustedDirectoryPolicy::Strict,
         )
         .is_ok());
-        identity.mode = libc::S_IFDIR | 0o777;
+        identity.mode = DIRECTORY_FILE_TYPE | 0o777;
         assert_eq!(
             validate_trusted_directory_for_user(
                 &identity,
@@ -6619,7 +6687,7 @@ mod tests {
         );
 
         identity.owner = 502;
-        identity.mode = libc::S_IFDIR | 0o755;
+        identity.mode = DIRECTORY_FILE_TYPE | 0o755;
         assert_eq!(
             validate_trusted_directory_for_user(
                 &identity,
@@ -6680,6 +6748,65 @@ mod tests {
 
         assert_eq!(unknown_tag.code, "bundled_sidecar_path_untrusted");
         assert_eq!(unknown_permission.code, "bundled_sidecar_path_untrusted");
+    }
+
+    #[test]
+    fn macos_acl_entry_results_accept_only_entries_and_exact_end_of_list() {
+        assert!(macos_acl_presence_result(false, 0).unwrap());
+        assert!(!macos_acl_presence_result(true, libc::ENOENT).unwrap());
+        assert!(macos_acl_entry_result(0, 0).unwrap());
+        assert!(!macos_acl_entry_result(-1, libc::EINVAL).unwrap());
+
+        for (is_null, error_number) in [(true, 0), (true, libc::EIO), (false, libc::ENOENT)] {
+            assert_eq!(
+                macos_acl_presence_result(is_null, error_number)
+                    .unwrap_err()
+                    .code,
+                "bundled_sidecar_path_untrusted"
+            );
+        }
+        for (result, error_number) in [(-1, 0), (-1, libc::EIO), (1, 0), (0, libc::EINVAL)] {
+            assert_eq!(
+                macos_acl_entry_result(result, error_number)
+                    .unwrap_err()
+                    .code,
+                "bundled_sidecar_path_untrusted"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_path_aliases_are_exact_and_leave_runner_paths_unchanged() {
+        assert_eq!(
+            macos_trusted_path_alias(Path::new("/var/folders/native/sidecar")),
+            PathBuf::from("/private/var/folders/native/sidecar")
+        );
+        assert_eq!(
+            macos_trusted_path_alias(Path::new("/tmp/native/sidecar")),
+            PathBuf::from("/private/tmp/native/sidecar")
+        );
+        assert_eq!(
+            macos_trusted_path_alias(Path::new(
+                "/Users/runner/work/OpenEvo/OpenEvo/desktop/src-tauri/binaries/sidecar"
+            )),
+            PathBuf::from("/Users/runner/work/OpenEvo/OpenEvo/desktop/src-tauri/binaries/sidecar")
+        );
+        assert_eq!(
+            macos_trusted_path_alias(Path::new("/var-link/native/sidecar")),
+            PathBuf::from("/var-link/native/sidecar")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_release_prepares_acl_free_source_through_system_temp_alias() {
+        let fixture = SidecarFixture::executable(b"acl-free-sidecar");
+
+        let (executable, private_dir) = prepare_packaged_sidecar(fixture.path()).unwrap();
+
+        executable.validate().unwrap();
+        private_dir.validate().unwrap();
+        assert_eq!(read_verified_file(&executable), b"acl-free-sidecar");
     }
 
     #[test]
@@ -6769,13 +6896,58 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_release_uses_private_path_and_keeps_the_verified_fd() {
+    fn macos_release_spawns_from_the_populated_private_path() {
         assert_eq!(fd_execution_path(), PathBuf::from("/dev/fd/4"));
-        let private = PrivateLaunchDirectory::create().unwrap();
+        let fixture = SidecarFixture::from_existing(Path::new("/usr/bin/true"));
+        let (verified_executable, private) = prepare_packaged_sidecar(fixture.path()).unwrap();
+        let initial_directory_identity = private.identity.clone();
+        let populated_directory_identity = file_identity(&private.directory).unwrap();
+        assert_eq!(
+            (
+                populated_directory_identity.device,
+                populated_directory_identity.inode,
+            ),
+            (
+                initial_directory_identity.device,
+                initial_directory_identity.inode,
+            )
+        );
+        assert_ne!(populated_directory_identity, initial_directory_identity);
+        let private_root = private.path().to_path_buf();
         assert_eq!(
             release_execution_path(&private),
             private.path().join(BUNDLED_SIDECAR_BINARY)
         );
+        let allocated = allocate_sidecar_listener().unwrap();
+        let launch = SidecarLaunchSpec {
+            program: release_execution_path(&private),
+            args: Vec::new(),
+            current_dir: None,
+            remove_env: &[],
+            private_launch_dir: Some(private),
+            verified_executable: Some(verified_executable),
+        };
+
+        let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
+        let mut child = prepared.spawn().unwrap();
+        drop(child.stdin.take());
+
+        assert!(child.wait().unwrap().success());
+        launch
+            .private_launch_dir
+            .as_ref()
+            .unwrap()
+            .validate()
+            .unwrap();
+        launch
+            .verified_executable
+            .as_ref()
+            .unwrap()
+            .validate()
+            .unwrap();
+        drop(prepared);
+        drop(launch);
+        assert!(!private_root.exists());
     }
 
     #[cfg(debug_assertions)]

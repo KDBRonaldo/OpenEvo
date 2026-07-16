@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import inspect
 import json
 from pathlib import Path
 
+from fastapi import APIRouter, FastAPI
 import pytest
 from pydantic import ValidationError
 
@@ -50,6 +52,8 @@ from desktop.sidecar.contracts.v1 import (
     verify_contract_snapshots,
 )
 from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
+import desktop.sidecar.contracts.v1.app as contract_app_module
+from desktop.sidecar.contracts.v1.app import create_contract_app
 
 
 _DIGEST = "a" * 64
@@ -107,6 +111,52 @@ _EXPECTED_OPERATIONS = {
     ("post", "/desktop/v1/maintenance/cache-cleanup"),
     ("get", "/desktop/v1/events"),
 }
+
+
+def test_provider_route_iteration_recurses_deferred_included_router() -> None:
+    app = FastAPI()
+    router = APIRouter(prefix="/desktop/v1")
+
+    @app.get("/version", operation_id="topLevelOperation")
+    def top_level() -> None:
+        return None
+
+    @router.get("/state", operation_id="nestedOperation")
+    def nested() -> None:
+        return None
+
+    class DeferredIncludedRouter:
+        original_router = router
+
+    routes = [app.routes[-1], DeferredIncludedRouter()]
+
+    assert {route.operation_id for route in contract_app_module._iter_api_routes(routes)} == {
+        "topLevelOperation",
+        "nestedOperation",
+    }
+
+
+def test_provider_binding_preserves_frozen_endpoint_signatures() -> None:
+    class Provider:
+        def invoke(self, _operation_id: str, _arguments: dict[str, object]) -> object:
+            raise AssertionError("provider dispatch is not part of this test")
+
+    plain_app = create_contract_app()
+    provider_app = create_contract_app(Provider())
+    plain_routes = {
+        route.operation_id: route
+        for route in contract_app_module._iter_api_routes(plain_app.routes)
+    }
+    provider_routes = {
+        route.operation_id: route
+        for route in contract_app_module._iter_api_routes(provider_app.routes)
+    }
+
+    assert provider_routes.keys() == plain_routes.keys()
+    for operation_id, route in provider_routes.items():
+        assert inspect.signature(route.endpoint) == inspect.signature(
+            plain_routes[operation_id].endpoint
+        )
 
 
 def _operations(schema: dict) -> set[tuple[str, str]]:

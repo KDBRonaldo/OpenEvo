@@ -7,11 +7,13 @@ import argparse
 from email.parser import Parser
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import stat
 import sys
 from typing import Any
+from urllib.parse import urlsplit
 from zipfile import BadZipFile, ZipFile
 
 
@@ -29,6 +31,7 @@ ARCHITECTURE_TARGETS = {
 ARCHITECTURE_SLICES = {"aarch64": "arm64", "x64": "x86_64"}
 SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+OWNERSHIP_TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}")
 REQUIRED_INPUT_ROLES = (
     ("desktop_dmg", None),
     ("core_wheel", None),
@@ -45,6 +48,16 @@ FINAL_ROLES = tuple(role for role, _name in REQUIRED_INPUT_ROLES) + (
     "core_descriptor",
     "checksums",
 )
+DRAFT_RELEASE_METADATA_KEYS = {
+    "apiUrl",
+    "body",
+    "isDraft",
+    "isPrerelease",
+    "name",
+    "tagName",
+    "targetCommitish",
+    "url",
+}
 
 
 class CandidateError(RuntimeError):
@@ -78,6 +91,19 @@ def _write_new(path: Path, payload: bytes) -> None:
         raise CandidateError(f"Refusing to replace existing candidate file: {path.name}") from exc
 
 
+def _write_private_new(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise CandidateError(f"Refusing to replace existing candidate file: {path.name}") from exc
+    with os.fdopen(descriptor, "wb") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def _load_json(path: Path) -> Any:
     try:
         if path.stat().st_size > 1024 * 1024:
@@ -103,6 +129,134 @@ def _require_safe_basename(value: object, subject: str) -> str:
     ):
         raise CandidateError(f"{subject} must be one safe filename")
     return value
+
+
+def render_candidate_release_notes(
+    *,
+    source_commit: str,
+    version: str,
+    architecture: str,
+) -> str:
+    if SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
+        raise CandidateError("source_commit must be one full lowercase Git commit")
+    if not version or any(character.isspace() for character in version):
+        raise CandidateError("candidate version is invalid")
+    if architecture not in ARCHITECTURE_TARGETS:
+        raise CandidateError("candidate architecture must be an actual supported architecture")
+    return "\n".join(
+        (
+            f"# OpenEvo Desktop {version} unsigned draft prerelease",
+            "",
+            f"Source commit: {source_commit}",
+            f"Architecture: {architecture}",
+            f"Minimum macOS: {MINIMUM_MACOS_VERSION}",
+            "",
+            "This candidate is unsigned and not notarized. A browser-downloaded copy may require manual approval in Privacy & Security; that quarantined path is not validated by this packaging workflow.",
+            "",
+            "## Supported Workflows",
+            "",
+            "Codex subscription transcript mode: available in this candidate.",
+            "It runs subscription-authenticated Codex on the remote server with transcript capture and non-parametric evolution.",
+            "Self-Deployed Reference mode: unavailable in this candidate.",
+            "The shipped Desktop release authority blocks saving or running that mode; its Core-side reference architecture is not a Desktop product claim.",
+            "",
+            "## Known Limitations",
+            "",
+            "Parameter evolution is not included in this candidate.",
+            "PyPI is not used for this release.",
+            "Only the declared architecture was built.",
+            "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.",
+            "This packaging-only draft does not satisfy the science E2E, benchmark, secret-canary/privacy, signing, notarization, or final-publication gates.",
+            "",
+            "## Validation Results",
+            "",
+            "Benchmark gates completed by this packaging candidate: 0 of 3.",
+            "Textual-memory pass@1 rescue count: pending.",
+            "Trajectory-to-skill pass@1 rescue count: pending.",
+            "Agent-system pass@1 rescue count: pending.",
+            "No benchmark performance claim is made by this draft.",
+            "The exact Core wheel, app bundle, copied DMG app, dependency evidence, and downloaded draft assets are validated by this workflow.",
+            "",
+            "## Security And Privacy",
+            "",
+            "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
+            "Credential-canary verification for release assets: pending.",
+            "This workflow does not claim credential-free assets until the separate secret-canary gate passes.",
+            "Diagnostics sharing is explicit. Science data can be sent to the remote server and harness or model provider selected by the user. The full secret-canary/privacy release gate remains pending.",
+            "",
+            "## Install, Upgrade, And Uninstall",
+            "",
+            "Install: this workflow validates mounting and copying the DMG without browser-download quarantine. For maintainer testing, copy OpenEvo Desktop to Applications; the Privacy & Security allow flow remains unvalidated.",
+            "Upgrade: this draft has no automatic updater; quit the app and replace it with a newer reviewed DMG. Remote Core upgrade compatibility is not proven by this packaging-only candidate.",
+            "Uninstall: quit OpenEvo Desktop and remove it from Applications. Local Desktop data under ~/.openevo/desktop is retained unless deleted separately. The Tauri native host app data directory for org.openevo.desktop, including run-retry recovery state, is also retained unless deleted separately. Remote Core state, task data, model downloads, and runtime caches are also retained.",
+            "",
+        )
+    )
+
+
+def write_candidate_release_notes(
+    path: Path,
+    *,
+    source_commit: str,
+    version: str,
+    architecture: str,
+) -> None:
+    payload = render_candidate_release_notes(
+        source_commit=source_commit,
+        version=version,
+        architecture=architecture,
+    )
+    _write_new(path, payload.encode("utf-8"))
+
+
+def render_draft_release_body(*, release_notes: str, ownership_token: str) -> str:
+    if OWNERSHIP_TOKEN_PATTERN.fullmatch(ownership_token) is None:
+        raise CandidateError("draft ownership token must be 128-bit lowercase hex")
+    if not release_notes:
+        raise CandidateError("draft release notes must not be empty")
+    return (
+        release_notes.rstrip("\n")
+        + f"\n\n<!-- openevo-draft-owner:{ownership_token} -->\n"
+    )
+
+
+def write_draft_release_body(
+    path: Path,
+    *,
+    release_notes: Path,
+    ownership_token: str,
+) -> None:
+    try:
+        notes = release_notes.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CandidateError("Release notes are unreadable") from exc
+    body = render_draft_release_body(
+        release_notes=notes,
+        ownership_token=ownership_token,
+    )
+    _write_new(path, body.encode("utf-8"))
+
+
+def assert_release_tag_absent(inventory_path: Path, *, expected_tag: str) -> None:
+    if not expected_tag or "\n" in expected_tag or "\r" in expected_tag:
+        raise CandidateError("Expected release tag is invalid")
+    try:
+        lines = inventory_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CandidateError("GitHub release inventory is unreadable") from exc
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            tag = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CandidateError(
+                f"GitHub release inventory line {line_number} is invalid"
+            ) from exc
+        if type(tag) is not str or not tag:
+            raise CandidateError(
+                f"GitHub release inventory line {line_number} is not a tag name"
+            )
+        if tag == expected_tag:
+            raise CandidateError(f"GitHub release already exists: {expected_tag}")
 
 
 def _single_match(root: Path, pattern: str, subject: str) -> Path:
@@ -343,9 +497,141 @@ def _validate_release_notes(
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise CandidateError("Release notes are unreadable") from exc
-    required = (source_commit, version, architecture, "unsigned", "not notarized")
-    if any(value.lower() not in text.lower() for value in required):
-        raise CandidateError("Release notes do not bind commit, version, architecture, and signing status")
+    expected = render_candidate_release_notes(
+        source_commit=source_commit,
+        version=version,
+        architecture=architecture,
+    )
+    if text != expected:
+        raise CandidateError("Release notes do not match the canonical packaging draft")
+
+
+def _validate_draft_release_metadata(
+    metadata_path: Path,
+    *,
+    release_notes: Path,
+    expected_tag: str,
+    expected_target: str,
+    expected_title: str,
+    expected_repository: str,
+    expected_owner: str,
+) -> int:
+    metadata = _load_json(metadata_path)
+    if type(metadata) is not dict or set(metadata) != DRAFT_RELEASE_METADATA_KEYS:
+        raise CandidateError("Draft release metadata does not use the closed review schema")
+    try:
+        body = release_notes.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CandidateError("Release notes are unreadable") from exc
+    expected_body = render_draft_release_body(
+        release_notes=body,
+        ownership_token=expected_owner,
+    )
+    release_body = metadata.get("body")
+    if (
+        type(release_body) is not str
+        or release_body.rstrip("\n") != expected_body.rstrip("\n")
+    ):
+        raise CandidateError("Draft release body does not match the candidate release notes")
+    expected = {
+        "isDraft": True,
+        "isPrerelease": True,
+        "name": expected_title,
+        "tagName": expected_tag,
+        "targetCommitish": expected_target,
+    }
+    if any(metadata.get(field) != value for field, value in expected.items()):
+        raise CandidateError("Draft release identity or state does not match the candidate")
+    url = metadata.get("url")
+    repository_parts = expected_repository.split("/")
+    if (
+        len(repository_parts) != 2
+        or not all(repository_parts)
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+            for character in expected_repository.replace("/", "")
+        )
+    ):
+        raise CandidateError("Expected GitHub repository is invalid")
+    api_url = metadata.get("apiUrl")
+    if type(api_url) is not str:
+        raise CandidateError("Draft release API URL is invalid")
+    parsed_api_url = urlsplit(api_url)
+    expected_api_prefix = f"/repos/{expected_repository}/releases/"
+    release_id_text = parsed_api_url.path[len(expected_api_prefix) :]
+    if (
+        parsed_api_url.scheme != "https"
+        or parsed_api_url.netloc.casefold() != "api.github.com"
+        or not parsed_api_url.path.startswith(expected_api_prefix)
+        or not release_id_text.isascii()
+        or not release_id_text.isdigit()
+        or release_id_text.startswith("0")
+        or parsed_api_url.query
+        or parsed_api_url.fragment
+    ):
+        raise CandidateError("Draft release API URL does not bind an immutable release ID")
+    if type(url) is not str:
+        raise CandidateError("Draft release URL is invalid")
+    parsed_url = urlsplit(url)
+    expected_prefix = f"/{expected_repository}/releases/tag/"
+    release_slug = parsed_url.path[len(expected_prefix) :]
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.netloc.casefold() != "github.com"
+        or not parsed_url.path.startswith(expected_prefix)
+        or not release_slug
+        or "/" in release_slug
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise CandidateError("Draft release URL does not belong to the expected repository")
+    return int(release_id_text)
+
+
+def validated_draft_release_id(
+    metadata_path: Path,
+    *,
+    release_notes: Path,
+    expected_tag: str,
+    expected_target: str,
+    expected_title: str,
+    expected_repository: str,
+    expected_owner: str,
+) -> int:
+    return _validate_draft_release_metadata(
+        metadata_path,
+        release_notes=release_notes,
+        expected_tag=expected_tag,
+        expected_target=expected_target,
+        expected_title=expected_title,
+        expected_repository=expected_repository,
+        expected_owner=expected_owner,
+    )
+
+
+def validate_draft_release_metadata(
+    metadata_path: Path,
+    *,
+    release_notes: Path,
+    expected_tag: str,
+    expected_target: str,
+    expected_title: str,
+    expected_repository: str,
+    expected_owner: str,
+) -> list[str]:
+    try:
+        validated_draft_release_id(
+            metadata_path,
+            release_notes=release_notes,
+            expected_tag=expected_tag,
+            expected_target=expected_target,
+            expected_title=expected_title,
+            expected_repository=expected_repository,
+            expected_owner=expected_owner,
+        )
+    except CandidateError as exc:
+        return [str(exc)]
+    return []
 
 
 def _file_entry(role: str, path: Path) -> dict[str, object]:
@@ -648,6 +934,18 @@ def validate_candidate_manifest(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    write_notes = subparsers.add_parser("write-notes")
+    write_notes.add_argument("output", type=Path)
+    write_notes.add_argument("--source-commit", required=True)
+    write_notes.add_argument("--version", required=True)
+    write_notes.add_argument("--architecture", required=True)
+    write_draft_body = subparsers.add_parser("write-draft-body")
+    write_draft_body.add_argument("output", type=Path)
+    write_draft_body.add_argument("--release-notes", type=Path, required=True)
+    write_draft_body.add_argument("--ownership-token", required=True)
+    assert_release_absent = subparsers.add_parser("assert-release-absent")
+    assert_release_absent.add_argument("inventory", type=Path)
+    assert_release_absent.add_argument("--expected-tag", required=True)
     create = subparsers.add_parser("create")
     create.add_argument("candidate_root", type=Path)
     create.add_argument("--source-commit", required=True)
@@ -659,8 +957,41 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("manifest", type=Path)
     validate.add_argument("--expected-source-commit")
     validate.add_argument("--expected-core-platform")
+    validate_draft = subparsers.add_parser("validate-draft")
+    validate_draft.add_argument("metadata", type=Path)
+    validate_draft.add_argument("--release-notes", type=Path, required=True)
+    validate_draft.add_argument("--expected-tag", required=True)
+    validate_draft.add_argument("--expected-target", required=True)
+    validate_draft.add_argument("--expected-title", required=True)
+    validate_draft.add_argument("--expected-repository", required=True)
+    validate_draft.add_argument("--expected-owner", required=True)
+    validate_draft.add_argument("--release-id-output", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.command == "write-notes":
+            write_candidate_release_notes(
+                args.output,
+                source_commit=args.source_commit,
+                version=args.version,
+                architecture=args.architecture,
+            )
+            print(args.output)
+            return 0
+        if args.command == "write-draft-body":
+            write_draft_release_body(
+                args.output,
+                release_notes=args.release_notes,
+                ownership_token=args.ownership_token,
+            )
+            print(args.output)
+            return 0
+        if args.command == "assert-release-absent":
+            assert_release_tag_absent(
+                args.inventory,
+                expected_tag=args.expected_tag,
+            )
+            print(f"GitHub release tag is absent: {args.expected_tag}")
+            return 0
         if args.command == "create":
             path = create_candidate_manifest(
                 args.candidate_root,
@@ -671,6 +1002,23 @@ def main(argv: list[str] | None = None) -> int:
                 registry_digest=args.registry_digest,
             )
             print(path)
+            return 0
+        if args.command == "validate-draft":
+            release_id = validated_draft_release_id(
+                args.metadata,
+                release_notes=args.release_notes,
+                expected_tag=args.expected_tag,
+                expected_target=args.expected_target,
+                expected_title=args.expected_title,
+                expected_repository=args.expected_repository,
+                expected_owner=args.expected_owner,
+            )
+            if args.release_id_output is not None:
+                _write_private_new(
+                    args.release_id_output,
+                    f"{release_id}\n".encode("ascii"),
+                )
+            print(f"OpenEvo draft release metadata validation passed: {args.metadata}")
             return 0
         errors = validate_candidate_manifest(
             args.manifest,

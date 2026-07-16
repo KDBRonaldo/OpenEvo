@@ -40,7 +40,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .
-          python -m pip install pytest pytest-asyncio ruff build twine
+          python -m pip install pytest pytest-asyncio ruff build twine wheel
 
       - name: Lint OpenEvo package
         run: |
@@ -48,6 +48,7 @@ jobs:
 
       - name: Run OpenEvo regression tests
         run: |
+          umask 077
           python -m pytest \
             tests/ci \
             tests/config \
@@ -101,7 +102,7 @@ jobs:
             tests/runtime/test_docker_runtime.py::test_real_docker_cancel_after_cidfile_is_recoverably_owned
 
   macos-ssh-transport:
-    name: macOS anonymous Core SSH transport
+    name: macOS fixed executable and anonymous Core SSH transport
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -117,7 +118,28 @@ jobs:
           python -m pip install pytest
 
       - name: Test anonymous AF_UNIX Core transport
-        run: python -m pytest tests/openevo/remote/test_ssh_transport.py -q
+        run: |
+          unset SSH_AUTH_SOCK
+          umask 077
+          python -m pytest -q \
+            tests/openevo/remote/test_ssh_transport.py::test_core_tunnel_uses_parent_owned_socketpair_and_per_connection_ssh_child \
+            tests/openevo/remote/test_ssh_transport.py::test_core_tunnel_connection_start_cancellation_closes_parent_stream_and_propagates \
+            tests/openevo/remote/test_ssh_transport.py::test_core_tunnel_never_fchmods_anonymous_socketpair_on_darwin \
+            tests/openevo/remote/test_ssh_transport.py::test_core_tunnel_rejects_non_stream_socketpair \
+            tests/openevo/remote/test_ssh_transport.py::test_core_tunnel_rejects_socketpair_not_owned_by_effective_uid \
+            tests/openevo/remote/test_ssh_transport.py::test_core_tunnel_rejects_peer_fd_replacement_after_child_spawn \
+            tests/openevo/remote/test_ssh_transport.py::test_core_tunnel_rejects_child_that_exits_during_connection_start \
+            tests/openevo/remote/test_ssh_transport.py::test_core_connection_authority_passes_birth_and_peer_fds_to_exact_ssh_child \
+            tests/openevo/remote/test_ssh_transport.py::test_core_connection_subprocess_bridges_a_real_parent_owned_af_unix_stream \
+            tests/openevo/remote/test_ssh_transport.py::test_source_birth_launcher_uses_platform_bound_execution_target \
+            tests/openevo/remote/test_ssh_transport.py::test_rsync_nested_ssh_uses_verified_platform_target_and_inherits_fd \
+            tests/openevo/remote/test_ssh_transport.py::test_darwin_rsync_nested_ssh_uses_revalidated_fixed_path \
+            tests/openevo/remote/test_ssh_transport.py::test_group_signal_skips_kill_when_only_zombie_members_remain \
+            tests/openevo/remote/test_ssh_transport.py::test_group_signal_permission_error_requires_state_recheck \
+            tests/openevo/remote/test_system_executables.py::test_darwin_system_executable_uses_revalidated_root_owned_path \
+            tests/openevo/remote/test_system_executables.py::test_owned_subprocess_birth_uses_platform_execution_authority \
+            tests/openevo/remote/test_system_executables.py::test_malicious_path_ssh_is_never_executed \
+            tests/openevo/remote/test_system_executables.py::test_keyscan_executes_only_the_held_fixed_binary
 
   terminal-bench-tests:
     name: standalone Terminal Bench package

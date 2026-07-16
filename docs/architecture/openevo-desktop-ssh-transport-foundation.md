@@ -297,14 +297,38 @@ release capability.
 
 Release process launches use fixed `/usr/bin/ssh`, `/usr/bin/ssh-keyscan`, and
 `/usr/bin/rsync` identities after root-owner, mode, type, ancestor, and pathname
-binding verification. The exact main executable is invoked through its held FD;
-the ordinary environment is empty. In agent mode the original host
+binding verification. Linux invokes the exact main executable through its held
+FD. macOS does not support the same Mach-O `/dev/fd` execution contract, so the
+isolated birth child for top-level SSH/rsync revalidates the held FD against the
+fixed root-owned, non-writable ancestor/path binding immediately before
+executing that system path. The parent repeats the binding check after process
+birth. On macOS, ssh-keyscan instead has the same path/FD binding verified before
+launch and after completion. The ordinary environment is empty. In agent mode
+the original host
 `SSH_AUTH_SOCK` pathname never enters child env or argv. Before each command,
 rsync, or tunnel spawn, the parent holds every upstream directory identity,
 connects one upstream FD, and revalidates the socket pathname/inode after
 connect. It then creates a fresh owner-private one-shot relay and gives OpenSSH
 only that private relay path. `PATH`, shell configuration, askpass variables,
 and ambient proxy values are not inherited.
+
+Linux monitors the exact socket and ancestor bindings with inotify. Darwin
+cannot open a Unix-domain socket pathname with `O_EVTONLY`, so it registers
+kqueue vnode events only on the already-held ancestor directory FDs. Ancestor
+rename, revoke, attribute, delete, or kqueue error events fail closed. Immediate
+parent namespace writes force another exact socket identity check. Darwin can
+coalesce `NOTE_ATTRIB` with `NOTE_WRITE` when a child directory is created or
+removed because the parent's link count changes; that combined parent event is
+treated as namespace churn and receives the same exact revalidation, while a
+standalone attribute event or any rename/delete/revoke event still fails closed.
+The socket identity includes ctime, so target rename-and-restore is rejected
+while unrelated sibling churn can continue. The connected Darwin peer is
+independently bound with libc
+`getpeereid`, `LOCAL_PEERPID`, and the complete 32-byte `LOCAL_PEERTOKEN` audit
+token. The token's effective UID, GID, and PID must agree with the other two
+kernel results, and every later connection must match the complete baseline
+token, including its process-generation value. Missing or partial credentials
+are not downgraded to PID-only authority.
 
 The relay accepts only a peer whose kernel-reported PID belongs to the exact new
 session/process group owned for that spawn and whose executable vnode is the
@@ -317,10 +341,14 @@ inode identities; uncertain cleanup is retained in bounded retry ownership and
 never deletes a replacement pathname.
 
 For rsync, the remote-shell string names the verified SSH authority as
-`/dev/fd/<ssh-fd>`. That FD is included in `pass_fds`, remains inherited through
-the held rsync exec and its nested SSH exec, and both executable identities are
-verified immediately before and after rsync process birth. There is no
-`/usr/bin/ssh` pathname fallback in the nested command.
+`/dev/fd/<ssh-fd>` on Linux. On macOS it names the same fixed `/usr/bin/ssh`
+path whose root-owned, non-writable chain and held FD identity were verified;
+Darwin cannot execute that Mach-O image through `/dev/fd`. The SSH FD remains
+in the inherited descriptor set on both platforms, and both executable
+identities are verified immediately before and after rsync process birth.
+The Darwin nested SSH exec itself is path-based; concurrent privileged
+replacement of the root-owned `/usr/bin` chain is outside this unsigned Desktop
+threat boundary.
 
 ## Command Execution
 
@@ -378,6 +406,15 @@ retains the same bounded slot and lease fail closed. There is no semaphore to
 registry handoff and no portable waiter thread that can call `wait()` early.
 Process-group validation, `waitid`, Darwin `kqueue`, Linux
 `/proc/<pid>/stat` fallback setup, and capture all execute under that authority.
+Darwin may return `ESRCH` from `getpgid` after a very short-lived leader has
+already become an unreaped zombie. That race is accepted only while the owning
+`Popen` still has no return code and a bounded `ps` snapshot contains the exact
+PID with `PGID == PID` and state `X` or `Z`; every other missing, live,
+wrong-group, non-Darwin, or non-`ESRCH` result remains a hard failure.
+After Darwin registers the one-shot kqueue event, it takes a bounded, non-reaping
+`ps` snapshot of the pinned PID/PGID. That snapshot detects a leader that became
+a zombie before registration; when kqueue registration is unavailable, the same
+strict snapshot remains the bounded polling fallback.
 Production tunnel readiness, exit monitoring, Core connection verification, and
 close use only this non-reaping observer. Both `_NonReapingPopen.poll()` and the
 birth-record-recovered wait handle reject a live unreaped child, preventing an
@@ -385,11 +422,14 @@ accidental `waitpid(WNOHANG)` from consuming the leader status before group
 cleanup.
 If no non-reaping observer is available, closed capture pipes or the operation
 deadline initiate cleanup conservatively. Error and cancellation cleanup keeps
-the direct child unreaped while that PID fixes the group identity, sends
-`SIGTERM`, and then escalates to `SIGKILL`. Successful signals do not mark group
-cleanup confirmed. A bounded observer enumerates process state through Linux
-`/proc` or portable `ps`, requires the pinned leader to remain observable, and
-requires every member of that PGID to be dead or a zombie. Only then may the
+the direct child unreaped while that PID fixes the group identity. It enumerates
+the exact PGID before each signal, sends `SIGTERM` only while a live member
+remains, and then escalates to `SIGKILL`. A Darwin `EPERM` signal result is
+re-observed: it is accepted only if every member is now dead or zombie;
+otherwise cleanup remains failed and owned. Successful signals do not mark
+group cleanup confirmed. A bounded observer enumerates process state through
+Linux `/proc` or portable `ps`, requires the pinned leader to remain observable,
+and requires every member of that PGID to be dead or a zombie. Only then may the
 owner wait/reap the direct child; it subsequently requires the exact PGID to be
 absent before closing its birth-record FD, removing the registry entry,
 releasing capacity, and closing the known-host lease. Any group signal,
@@ -399,7 +439,8 @@ entries synchronously. Full ownership capacity rejects a new command before
 `Popen`, so it cannot create an unrecorded process. All waits remain bounded.
 
 Capture polls the unreaped leader at a bounded interval through `waitid`,
-`kqueue`, or Linux proc status instead of reaping it. Once the leader exits,
+gap-closed Darwin `kqueue` observation, Linux proc status, or the Darwin `ps`
+fallback instead of reaping it. Once the leader exits,
 inherited descendant pipes receive a 100 ms drain grace; capture keeps bytes
 already delivered, kills the still-pinned process group, closes any remaining
 pipes, and returns the leader's actual exit code. This ordering prevents

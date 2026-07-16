@@ -15,6 +15,7 @@ import secrets
 import stat
 import struct
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -198,25 +199,32 @@ class ProviderKnownHostStore:
         runner: KeyscanRunner | None = None,
         lock_timeout_seconds: float = 1.0,
     ) -> None:
-        self._root = Path(root).expanduser()
-        if not self._root.is_absolute():
+        requested_root = Path(root).expanduser()
+        if not requested_root.is_absolute():
             raise ValueError("provider known-host store root must be absolute")
-        _validate_path_text(self._root)
-        ancestor = (
+        _validate_path_text(requested_root)
+        requested_ancestor = (
             Path(secure_ancestor).expanduser()
             if secure_ancestor is not None
-            else self._root.parent
+            else requested_root.parent
         )
-        if not ancestor.is_absolute():
+        if not requested_ancestor.is_absolute():
             raise ValueError("provider known-host secure ancestor must be absolute")
-        _validate_path_text(ancestor)
-        if self._root.parent != ancestor:
+        _validate_path_text(requested_ancestor)
+        if requested_root.parent != requested_ancestor:
             raise ValueError(
                 "provider known-host store root must be a direct child of its secure ancestor"
+            )
+        self._root = _canonical_darwin_system_alias(requested_root)
+        ancestor = _canonical_darwin_system_alias(requested_ancestor)
+        if self._root.parent != ancestor:
+            raise ValueError(
+                "provider known-host store root must remain a direct child after canonicalization"
             )
         self._anchor = _StoreAnchor(
             self._root,
             ancestor,
+            requested_secure_ancestor=requested_ancestor,
             lock_timeout_seconds=_validate_lock_timeout(lock_timeout_seconds),
         )
         self._runner = runner or _run_keyscan
@@ -678,11 +686,22 @@ class _StoreAnchor:
         root: Path,
         secure_ancestor: Path,
         *,
+        requested_secure_ancestor: Path,
         lock_timeout_seconds: float,
     ) -> None:
         self.root = root
         self.secure_ancestor = secure_ancestor
-        self._ancestor_fd = _open_secure_ancestor(secure_ancestor)
+        ancestor_fd = _open_secure_ancestor(secure_ancestor)
+        try:
+            _validate_darwin_system_alias_binding(
+                requested_secure_ancestor,
+                secure_ancestor,
+                os.fstat(ancestor_fd),
+            )
+        except BaseException:
+            os.close(ancestor_fd)
+            raise
+        self._ancestor_fd = ancestor_fd
         self._root_fd: int | None = None
         self._lock_anchor_fd: int | None = None
         self._guard = threading.Lock()
@@ -1458,6 +1477,36 @@ def _open_secure_ancestor(path: Path) -> int:
         os.close(current_fd)
         raise
     return current_fd
+
+
+def _canonical_darwin_system_alias(path: Path) -> Path:
+    """Map only Apple's fixed /tmp and /var aliases to no-follow paths."""
+
+    if sys.platform != "darwin":
+        return path
+    parts = path.parts
+    if len(parts) >= 2 and parts[0] == os.sep and parts[1] in {"tmp", "var"}:
+        return Path("/private").joinpath(*parts[1:])
+    return path
+
+
+def _validate_darwin_system_alias_binding(
+    requested: Path,
+    canonical: Path,
+    opened: os.stat_result,
+) -> None:
+    if requested == canonical:
+        return
+    try:
+        observed = os.stat(requested)
+    except OSError as exc:
+        raise ValueError(
+            "provider known-host secure ancestor system alias could not be verified"
+        ) from exc
+    if (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError(
+            "provider known-host secure ancestor system alias changed during open"
+        )
 
 
 def _validate_secure_path_component_stat(result: os.stat_result) -> None:

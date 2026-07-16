@@ -38,7 +38,63 @@ PYTHONPATH=src:. python -m pytest \
   -q
 ```
 
+The Core CI regression step runs with `umask 077` so security-boundary tests
+create provider, store, and session state with owner-private permissions. Its
+test dependencies explicitly include `wheel`, which is required by regression
+coverage that invokes `python -m build --no-isolation`.
+Desktop contract regressions exercise both materialized and deferred FastAPI
+included-router representations and require provider binding to preserve the
+frozen endpoint signatures. This is a compatibility gate, not permission to pin
+away a newer supported FastAPI release when nested routes would otherwise remain
+contract-only. The macOS packaging, native smoke, and candidate jobs also run the
+provider-store ancestor-alias regression before building: SQLite may canonicalize
+`/var` as `/private/var`, but the opened and managed database must still be the
+same verified device/inode. The same jobs perform a durable mutation through the
+alias and recover a subprocess-crash rollback journal. This prevents Linux
+`/dev/fd` behavior from masking Darwin's pathname-based journal semantics.
+
+The dedicated macOS anonymous Core transport job clears the runner's ambient
+`SSH_AUTH_SOCK` and runs the exact anonymous socketpair metadata, identity,
+FD-transfer, cancellation, fail-closed, and real child-relay nodes. The child
+relay node is not an end-to-end OpenSSH authentication gate. The full SSH
+transport suite remains in the Linux Core job and also runs in the Desktop
+macOS native smoke with a short pytest base directory, private umask, and no
+ambient runner agent. The focused macOS job must retain the real relay node and
+must not be reduced to metadata-only tests. The stable-only Desktop candidate
+gate runs the complete macOS SSH suite under the same private, agent-free,
+short-path environment before packaging a DMG. On GitHub macOS runners, the
+complete suite creates that short root directly below `$HOME` with mode
+`0700`; it must not place SSH authority fixtures below the pre-existing
+`$RUNNER_TEMP` ancestry. Injected Core-child fixtures retain the transferred
+socket peer only for the fake child's lifetime and close it as soon as simulated
+exit is established. Short-leader fixtures deterministically let the leader
+become a zombie before observer installation, proving that Darwin's kqueue plus
+non-reaping `ps` snapshot closes the registration gap. These rules model the
+production ownership lifecycle without weakening its fail-closed checks.
+
+Native workspace tests reject sparse allocation through deterministic metadata
+and extent-map contract tests. Filesystem integration fixtures skip only when
+the host filesystem physically allocates the complete logical file; they must
+not reinterpret a fully allocated file as sparse.
+
 Run relevant module suites when touching shared behavior:
+
+- Packaged launcher diagnostics must keep the producer, smoke allowlist, and
+  launcher phase set identical. Cover both primary failures with best-effort
+  cleanup and otherwise-normal exits that fail closed as `shutdown_failed`.
+  The launcher factory test must also prove that packaged ownership disables
+  the app-level ASGI shutdown close hook.
+- A real subprocess/Uvicorn regression must send `SIGTERM` to the packaged
+  launcher path and prove provider cleanup completes before a zero exit.
+- Factory failure tests must inject a simultaneous cleanup failure and prove the
+  app/Core-runtime factory preserves the original construction exception while
+  attempting each acquired resource close.
+- Runtime close tests must inject independent bridge, broker, and store failures,
+  assert every cleanup runs, and assert the first failure is propagated.
+  A concurrent-close test must hold bridge shutdown open and prove another
+  caller cannot close broker/store or return before relay join completes.
+- Provider close tests must prove later runtime/lifecycle/store failures neither
+  replace the first failure nor prevent remaining owned-resource cleanup.
 
 ```bash
 PYTHONPATH=src:. python -m pytest tests/backend tests/evolution tests/gateway tests/trajectory tests/rollout -q
@@ -67,6 +123,28 @@ Release gate tests are stricter than local smoke tests. Their output must identi
 the candidate commit, exact inputs, configuration, result, and produced release
 artifact where applicable. Use the smallest durable report that proves the
 behavior; do not create a schema/validator/report stack for every check.
+
+Packaged-sidecar startup failures are the exception to ordinary process-log
+capture: the smoke directs combined child output to a bounded OS pipe, reads at
+most 32 KiB for parsing plus one unrendered truncation sentinel byte, and
+publishes only closed `OPENEVO_STARTUP_V1` records. It does not create a
+disk-backed process log. Tests must include path, token, URL,
+traceback, malformed-record, and oversized-output canaries and prove that none
+can enter the rendered CI failure. A silent bootloader exit is a failed gate,
+not permission to print arbitrary child output or fall back from descriptor
+authority to a pathname.
+Tests must keep the packaged Python producer and smoke allowlists exactly equal,
+and must prove that a typed release-composition failure preserves only its fixed
+phase code while redacting the original exception and chained cause.
+The macOS packaged-sidecar gate must exercise the Darwin-native FD checks: the
+bootloader must prove FD 3 through `proc_pidfdinfo` plus its loopback endpoint,
+and the SSH gate must construct an agent source through kqueue directory
+monitoring, `getpeereid`, `LOCAL_PEERPID`, and `LOCAL_PEERTOKEN`. Passing only the
+Linux `SO_ACCEPTCONN`/inotify branches is not macOS release evidence.
+The smoke must also retain the unreaped leader while checking readiness and
+prove full process-group cleanup. Tests force process-table observation failure
+and require the anchored whole-group `SIGKILL` fallback to remove a descendant
+that retains the output pipe while the candidate gate still fails closed.
 
 Required release-gate families are:
 
@@ -136,6 +214,41 @@ redownloaded draft run the same validator before using any Core bytes. A valid
 packaging manifest is not evidence for the still-separate science, benchmark,
 privacy, signing, or notarization gates.
 
+Release notes are generated by one release-tool-owned renderer, and validation
+requires an exact byte-for-byte match; extra sections or contradictory claims fail. The
+canonical packaging-only draft explicitly reports zero
+of three benchmark gates complete and all textual-memory,
+trajectory-to-skill, and agent-system rescue counts as pending; it cannot imply
+that packaging smoke is algorithm-performance evidence. The same notes must
+report Self-Deployed Reference mode, credential-canary verification, and the
+browser-download quarantine/Gatekeeper path as unavailable or pending. This
+checksum-bound packaging draft is never edited into a final release; a future
+final path must create and revalidate a new candidate inventory.
+It also states that uninstalling the application retains local data under
+`~/.openevo/desktop`, the Tauri native host app-data directory for
+`org.openevo.desktop` (including run-retry recovery state), and remote Core
+state, task data, models, and caches.
+
+After asset redownload, the candidate workflow queries the GitHub draft and
+validates its exact body, title, tag, target commit, draft flag, and prerelease
+flag. Its HTTPS review URL must belong to the expected repository; GitHub uses
+an opaque `untagged-*` URL slug for drafts, so the separately validated
+`tagName` remains the candidate tag-name authority. The repository-bound API
+URL must contain the immutable numeric release ID used for cleanup, preventing a
+same-tag replacement between validation and deletion from being deleted. The ID
+authority file must be created once with mode `0600` and must never be replaced.
+The body must contain the canonical notes followed only by the 128-bit random
+ownership marker generated for that workflow attempt. It stores that discrete,
+point-in-time record as a run-attempt-qualified immutable Actions artifact; this
+does not make an atomic claim about workflow completion. The
+GitHub draft itself remains administratively mutable, so any post-run edit
+invalidates it. Tests require exact Git-ref validation, pre-creation release/tag
+absence, ownership-bound cleanup, and real-tag absence after both success and
+failure. Release absence comes from the authenticated paginated inventory,
+because GitHub's single-release-by-tag REST endpoint returns `404` for private
+drafts. Tests also require cleanup to delete only the immutable ID emitted by
+metadata validation. Cleanup never deletes a Git tag.
+
 Remote capability discovery has an additional artifact-level gate. In a clean
 environment containing the exact Core wheel, run
 `scripts/ci/smoke_openevo_remote_capabilities.py --wheel <exact-core-wheel>
@@ -162,7 +275,8 @@ The pull-request release workflow splits this coverage across operating systems
 without splitting artifact identity. `macos-packaging-smoke` is the only job
 that builds the exact Core wheel and `framework-lock.json`; it writes and
 verifies `SHA256SUMS`, exports the manifest digest, and uploads those three files
-under a source-commit-qualified artifact name. `linux-core-smoke` has an
+under an artifact name qualified by source commit, workflow run, and run
+attempt. `linux-core-smoke` has an
 explicit dependency on that job, downloads the same artifact, verifies the
 manifest digest and both payload digests before installation, then owns the
 actual Core service ensure/attachment/capability/stop smoke. It never rebuilds
@@ -171,13 +285,9 @@ sidecar cannot execute on the Linux Core runner, Linux rebuilds a packaged Linux
 sidecar from the same checkout solely as the executable native-process fixture;
 it is not candidate artifact evidence and does not replace the macOS packaged or
 app-bundle smokes. The Linux remote smoke combines that fixture with the exact
-transferred wheel and lock. The macOS job owns candidate sidecar packaging and runs a direct probe
-on APFS through the held object FD, `FSPathMakeRef`/`FSRef`, and
-`FSUnlinkObject` implementation; it does not call the Linux-only Core service
-lifecycle. Linux focused tests exercise the unsupported-platform fail-closed
-behavior and their explicit conditional-removal testkit, but cannot establish
-that the Carbon/APFS primitive works. That final boundary remains pending until
-the `macos-14` job passes.
+transferred wheel and lock. The macOS job owns candidate sidecar packaging and
+exact-pair publication on its GitHub-hosted ephemeral runner; it does not call
+the Linux-only Core service lifecycle.
 
 The sidecar process smoke loads `desktop/release-contract.json`, validates the
 closed `VersionV1` and `DesktopStateV1` models, requires the frozen OpenAPI digest
@@ -185,108 +295,31 @@ and every renderer-required feature flag, and checks that state negotiation bind
 the same digest. The renderer imports that JSON directly; anti-drift tests bind
 the Rust native-host digest to it.
 
-The exact Core wheel/lock export keeps the output directory open for the whole
-sidecar build and verifies its pathname/inode binding before and after writes.
-Before creating the output, it holds and validates the immediate parent's owner,
-group/world write bits, and macOS ACL. A newly created child may clear a valid
-inherited ACL once; an ACL added to an existing output, transaction, marker, or
-member must be rejected without mutation.
-Darwin reports an absent extended ACL as `acl_get_fd_np` returning null with
-`ENOENT`; that exact result is normalized to an empty ACL inventory. Every other
-lookup error, and every unknown, unreadable, or mutating ACL entry, fails closed.
-Darwin ACL iteration accepts only `acl_get_entry` success `0` and treats only
-`-1/EINVAL` as the end of the held ACL; all other result/errno combinations fail
-closed before any artifact export or recovery.
-After opening and validating the child, but before its first inventory or any
-recovery, the builder takes a non-blocking exclusive `flock` on that same held
-output-directory descriptor. Contention fails closed with an explicit
-active-builder error. The lock remains held until the complete output context,
-including commit or rollback and all transaction/source descriptor cleanup, has
-exited. A paused real subprocess test proves a second builder cannot classify or
-recover the first builder's live transaction.
-It stages under a private transaction directory, publishes without replacement,
-keeps every source/export descriptor open, and exits the output context last so
-a `TemporaryDirectory` cleanup failure rolls the pair back. Before success, the
-test gate requires an exact wheel/lock root inventory and rechecks each pathname,
-inode/device, regular-file type, link count, owner/mode, byte size, and SHA-256
-against the source and canonical lock.
-The generated and embedded lock must load through Core's authoritative
-`FrameworkDistributionLock` loader, bind the exact wheel filename/version/digest,
-and be the only non-wheel member below PyInstaller's `openevo/wheels` directory.
-The wheel build fixes `SOURCE_DATE_EPOCH` to the trusted candidate commit time;
-reproducibility tests must build twice from the same source and compare exact
-wheel and generated lock bytes so a post-commit retry can recognize the pair.
+The exact Core wheel/lock export test contract is intentionally small. The
+requested output must not exist, and existing directories or symlinks are
+rejected without mutation. Tests verify that the builder opens stable private
+regular-file inputs, validates the canonical lock against the wheel filename and
+SHA-256, copies both files into a private random sibling directory, fsyncs and
+revalidates the exact two-member inventory, and publishes the directory with an
+atomic no-replace rename. An injected publish failure leaves the requested path
+absent and preserves only a clearly non-authoritative random staging directory.
+A successful publish contains exactly the verified wheel and lock; a second
+publish fails without changing them.
 
-Failure injection covers partial copy, second-member failure, output-path
-replacement, exported-member unlink/rename/same-name replacement, and extra
-members. A real child-process crash after the wheel name is published but before
-the lock name is published must leave a bounded marker-authorized state that the
-next run reconciles and replaces with one complete pair. Recovery and rollback
-move the canonical marker to a monotonic `cleaning` phase before removing any
-member. Its identity prefix records every cleanup-owned inode and its
-`cleanup_index` durably authorizes only an ordered prefix to have zero remaining
-links. Each progress update is file-fsynced, directory-fsynced, atomically
-installed through `transaction.ready`, and directory-fsynced again before the
-identity-bound removal. Restart may adopt that temporary marker only when both
-files are closed, canonical, identity-bound markers and they describe the exact
-next phase or cleanup index.
-Marker replacement tests also interrupt after the prior marker has moved to its
-inode-named retired entry and race the source pathname after identity validation.
-Both the checked inode and a same-name replacement must remain preserved; marker
-publication never uses an overwrite-capable rename.
+Sidecar target publication has a separate fault-injection contract. Tests prove
+that a verified staging file atomically replaces an existing externalBin with
+mode `0755`, and that a replacement failure preserves the old target byte for
+byte while leaving the new file only under a non-authoritative staging name.
 
-An unauthorized member must retain at least one canonical binding. An authorized
-member may be absent or may still have names after an interrupted removal, but
-every remaining name must resolve no-follow to the recorded inode and must still
-pass owner, mode, aggregate link-count, byte-size, and SHA-256 checks. Rollback
-may remove only an inode it recorded; its held descriptor is the only additional
-proof allowed to authorize an already-unlinked member or a bounded same-inode
-rename. If a pathname contains an identity-mismatched replacement or an owned
-inode has an unbound residual link, cleanup reports an unverifiable rollback,
-preserves the unknown entry and transaction marker, and subsequent retries remain
-fail closed until a maintainer resolves that output directory. Real subprocess
-tests interrupt initial publication, interrupt the following recovery after
-wheel or lock cleanup, and require a third process to finish; the same wheel/lock
-cleanup points are exercised through live rollback.
-The same preservation rule applies to a `preparing` transaction containing a
-staged entry whose inode has not yet reached the ready marker; only empty and
-marker-only bootstrap remnants are automatically reclaimed before readiness.
-
-After root members are quarantined, cleanup prepares to move the held transaction
-inode out of the output. Before that rename, the builder file-fsyncs a canonical
-receipt that binds the held parent/output, exact wheel/lock inputs, and cleanup
-inode; directory-fsyncs its candidate; publishes it no-replace under a name that
-also binds the receipt inode; and directory-fsyncs again. Only then does the held
-transaction inode move by atomic no-replace rename to one deterministic sibling
-tombstone bound to the output device/inode. Cleanup moves each authorized entry
-to an identity-named quarantine, clears member payloads through the held descriptor,
-and removes the transaction marker last. The empty held tombstone is then moved
-no-replace to one deterministic purge name and checked against the receipt.
-For final member, marker, directory, and receipt removal, macOS prepares an opaque
-`FSRef` from the held FD before entering the syscall boundary and calls
-`FSUnlinkObject`; the final call does not receive the mutable cleanup name.
-Unsupported platforms and rejected filesystems preserve the object and fail
-closed. Linux unit and subprocess tests install a test-only conditional-removal
-model so portable transaction and crash cases remain executable; macOS CI uses
-the production primitive.
-
-Recovery accepts at most one receipt and one of those two exact sibling states; it
-must not adopt the inode currently found at a known name. Real `os._exit` tests at
-the empty-tombstone and purge windows rename the authorized directory, install a
-different empty inode at the expected name, and require restart to preserve both
-objects and fail explicitly. A double-snapshot no-follow parent identity scan is
-capped at 4096 entries and detects the renamed authorized inode; exceeding that
-budget also fails closed. Additional repeated crashes cover receipt candidate,
-publication while the transaction remains marker-authorized in the output,
-directory removal, and receipt quarantine. Twenty successful exports prove that
-normal and recovered operation leaves no receipt/sibling state or wheel/lock byte
-growth. Candidate builds have the same zero-residue requirement.
-Three syscall-boundary races run after the native removal token is prepared and
-immediately before execution: one replaces a tombstone regular member, one
-replaces the empty purge directory, and one replaces the cleanup receipt. Every
-replacement must remain present and the export must fail explicitly. On macOS
-these cases exercise the real `FSRef` operation; on a platform without it, the
-test-only conditional model refuses the mismatched binding before any delete.
+The workflow guard requires a GitHub-hosted ephemeral runner. The build UID and
+its processes are part of the release-build trust boundary; this publisher does
+not claim protection from malicious same-UID code or provide restart recovery
+for a persistent shared workspace. The Actions artifact manifest, candidate
+manifest, Linux clean install, embedded-archive checks, and final draft-asset
+roundtrip remain the durable cross-job identity evidence. Tests also retain the
+reproducible wheel build, authoritative `FrameworkDistributionLock` loader,
+raw PyInstaller TOC multiplicity, embedded byte equality, output-overlap, and
+failure-before-artifact gates.
 
 ## Release Identity
 

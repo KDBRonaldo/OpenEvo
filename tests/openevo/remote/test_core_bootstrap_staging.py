@@ -763,13 +763,14 @@ def test_remote_asset_consumer_rejects_same_name_replacement_after_handoff(
     final_root = service_root / "assets" / BUNDLE_ID
     displaced = service_root / "assets" / f"{BUNDLE_ID}.displaced"
     final_root.rename(displaced)
-    final_root.mkdir(mode=0o500)
+    final_root.mkdir(mode=0o700)
     for source, target in (
         (assets[0], final_root / WHEEL_NAME),
         (assets[2], final_root / "framework-lock.json"),
     ):
         target.write_bytes(source.read_bytes())
         target.chmod(0o400)
+    final_root.chmod(0o500)
 
     with pytest.raises(SystemExit):
         _execute_remote_script(
@@ -1607,6 +1608,13 @@ def test_core_python_runtime_bootstraps_verified_uv_when_python_and_uv_are_absen
     script = core_runtime._REMOTE_SELECTION_SCRIPT.replace(
         "home = pwd.getpwuid(uid).pw_dir",
         f"home = {str(home)!r}",
+        1,
+    )
+    system_prefixes = 'for prefix in ("/usr/local/bin", "/usr/bin", home + "/.local/bin"):'
+    assert script.count(system_prefixes) == 1
+    script = script.replace(
+        system_prefixes,
+        f"for prefix in ({str(empty_path)!r},):",
         1,
     )
     script = script.replace(

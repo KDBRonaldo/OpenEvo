@@ -11,13 +11,16 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 import pytest
 
+import desktop.sidecar.release_runtime as release_runtime
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1
 from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError
 from desktop.sidecar.provider_store import DesktopProviderStore
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
+from desktop.sidecar.release_provider import DesktopReleaseProvider
 from desktop.sidecar.release_runtime import (
     CoreRuntimeSessionBinding,
     DesktopCoreEventRelayV1,
+    DesktopReleaseCoreRuntimeV1,
     ReleaseRuntimeConfigurationError,
     bundled_core_asset_root,
     create_release_core_runtime,
@@ -130,6 +133,214 @@ def test_release_runtime_composes_and_closes_owned_resources(tmp_path: Path) -> 
     lifecycle.close()
     workspace_store.close()
     provider_store.close()
+
+
+def test_release_runtime_cleanup_does_not_replace_composition_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = RuntimeError("runtime composition canary")
+    cleanup_canary = RuntimeError("bridge store cleanup canary")
+
+    class FailingBridgeStore:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise cleanup_canary
+
+    bridge_store = FailingBridgeStore()
+    monkeypatch.setattr(
+        release_runtime,
+        "load_core_bootstrap_config",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        release_runtime,
+        "DesktopCoreBridgeStoreV1",
+        lambda *_args, **_kwargs: bridge_store,
+    )
+
+    def startup_phase(phase: str) -> None:
+        if phase == "event_broker":
+            raise canary
+
+    with pytest.raises(RuntimeError) as exc_info:
+        create_release_core_runtime(
+            provider_store=SimpleNamespace(state_root=tmp_path),
+            workspace_store=SimpleNamespace(),
+            remote_lifecycle=SimpleNamespace(),
+            asset_root=tmp_path / "unused-assets",
+            source_commit=SOURCE_COMMIT,
+            startup_phase=startup_phase,
+        )
+
+    assert exc_info.value is canary
+    assert exc_info.value is not cleanup_canary
+    assert bridge_store.close_calls == 1
+
+
+def test_release_runtime_close_attempts_every_owned_resource_and_keeps_first_failure() -> None:
+    calls: list[str] = []
+    bridge_canary = RuntimeError("bridge close canary")
+    broker_canary = RuntimeError("broker close canary")
+    store_canary = RuntimeError("bridge store close canary")
+
+    class Bridge:
+        def close(self) -> None:
+            calls.append("bridge")
+            raise bridge_canary
+
+    class Broker:
+        def close(self) -> None:
+            calls.append("broker")
+            raise broker_canary
+
+    class BridgeStore:
+        def close(self) -> None:
+            calls.append("store")
+            raise store_canary
+
+    class Relay:
+        def request_stop(self) -> None:
+            calls.append("relay_stop")
+
+        def join(self) -> None:
+            calls.append("relay_join")
+
+    runtime = DesktopReleaseCoreRuntimeV1(
+        bridge=Bridge(),
+        event_broker=Broker(),
+        bridge_store=BridgeStore(),
+    )
+    runtime._relay = Relay()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        runtime.close()
+
+    assert exc_info.value is bridge_canary
+    assert exc_info.value is not broker_canary
+    assert exc_info.value is not store_canary
+    assert calls == ["relay_stop", "bridge", "relay_join", "broker", "store"]
+
+    runtime.close()
+    assert calls == ["relay_stop", "bridge", "relay_join", "broker", "store"]
+
+
+def test_release_runtime_close_is_linearized_across_threads() -> None:
+    calls: list[str] = []
+    bridge_entered = threading.Event()
+    release_bridge = threading.Event()
+    second_close_returned = threading.Event()
+
+    class Bridge:
+        def close(self) -> None:
+            calls.append("bridge_enter")
+            bridge_entered.set()
+            assert release_bridge.wait(2)
+            calls.append("bridge_exit")
+
+    class Closable:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            calls.append(self.name)
+
+    class Relay:
+        def request_stop(self) -> None:
+            calls.append("relay_stop")
+
+        def join(self) -> None:
+            calls.append("relay_join")
+
+    runtime = DesktopReleaseCoreRuntimeV1(
+        bridge=Bridge(),
+        event_broker=Closable("broker"),
+        bridge_store=Closable("store"),
+    )
+    runtime._relay = Relay()
+    failures: list[BaseException] = []
+
+    def close_runtime(*, completed: threading.Event | None = None) -> None:
+        try:
+            runtime.close()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            if completed is not None:
+                completed.set()
+
+    first = threading.Thread(target=close_runtime)
+    second = threading.Thread(
+        target=close_runtime,
+        kwargs={"completed": second_close_returned},
+    )
+    first.start()
+    assert bridge_entered.wait(2)
+    second.start()
+    assert not second_close_returned.wait(0.1)
+    assert calls == ["relay_stop", "bridge_enter"]
+
+    release_bridge.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert failures == []
+    assert calls == ["relay_stop", "bridge_enter", "bridge_exit", "relay_join", "broker", "store"]
+
+
+def test_release_provider_close_attempts_all_resources_and_keeps_first_failure() -> None:
+    calls: list[str] = []
+    bridge_canary = RuntimeError("runtime stop canary")
+    broker_canary = RuntimeError("runtime close canary")
+
+    def close(name: str, failure: BaseException | None = None) -> None:
+        calls.append(name)
+        if failure is not None:
+            raise failure
+
+    runtime = SimpleNamespace(
+        stop=lambda: close("runtime_stop", bridge_canary),
+        close=lambda: close("runtime_close", broker_canary),
+    )
+    provider = object.__new__(DesktopReleaseProvider)
+    provider._close_lock = threading.RLock()
+    provider._closed = False
+    provider._project_executor = SimpleNamespace(close=lambda: close("executor"))
+    provider._core_runtime = runtime
+    provider._core_bridge = None
+    provider._event_broker = None
+    provider._remote_lifecycle = SimpleNamespace(close=lambda: close("lifecycle"))
+    provider._store = SimpleNamespace(close=lambda: close("store"))
+    provider._workspace_import_store = SimpleNamespace(close=lambda: close("workspace"))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        provider.close()
+
+    assert exc_info.value is bridge_canary
+    assert exc_info.value is not broker_canary
+    assert calls == [
+        "executor",
+        "runtime_stop",
+        "runtime_close",
+        "lifecycle",
+        "store",
+        "workspace",
+    ]
+
+    provider.close()
+    assert calls == [
+        "executor",
+        "runtime_stop",
+        "runtime_close",
+        "lifecycle",
+        "store",
+        "workspace",
+    ]
 
 
 def test_asset_directory_budget_is_checked_without_accepting_late_entries(
@@ -287,17 +498,10 @@ def test_core_event_relay_reports_typed_session_loss_with_captured_authority() -
     assert observed == [(binding, error)]
 
 
-def test_core_event_relay_commits_cursor_only_after_publication_and_replays_after_fault(
-) -> None:
-    frame_1 = SimpleNamespace(
-        id="event-1", data=SimpleNamespace(root=SimpleNamespace(sequence=1))
-    )
-    frame_2 = SimpleNamespace(
-        id="event-2", data=SimpleNamespace(root=SimpleNamespace(sequence=2))
-    )
-    frame_3 = SimpleNamespace(
-        id="event-3", data=SimpleNamespace(root=SimpleNamespace(sequence=3))
-    )
+def test_core_event_relay_commits_cursor_only_after_publication_and_replays_after_fault() -> None:
+    frame_1 = SimpleNamespace(id="event-1", data=SimpleNamespace(root=SimpleNamespace(sequence=1)))
+    frame_2 = SimpleNamespace(id="event-2", data=SimpleNamespace(root=SimpleNamespace(sequence=2)))
+    frame_3 = SimpleNamespace(id="event-3", data=SimpleNamespace(root=SimpleNamespace(sequence=3)))
 
     class EventContext:
         def __init__(self, frames: tuple[object, ...], failure: BaseException | None = None):

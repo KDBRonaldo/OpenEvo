@@ -8,7 +8,7 @@ import yaml
 from pydantic import ValidationError
 
 from openevo import experiments
-from openevo.runtime.managed import MANAGED_CODEX_HOME, MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import MANAGED_CODEX_HOME, MANAGED_RUNTIME_RELEASES
 
 ExperimentConfig = experiments.ExperimentConfig
 load_experiment_config = experiments.load_experiment_config
@@ -168,7 +168,7 @@ def test_agents_normalize_transcript_capture_aliases(
     }
     payload["runtime"] = {
         "profile": "managed_science",
-        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "image": MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
         "container_user": "host",
     }
 
@@ -187,7 +187,7 @@ def test_subscription_agent_rejects_image_user_runtime() -> None:
     }
     payload["runtime"] = {
         "profile": "managed_science",
-        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "image": MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
         "container_user": "image",
     }
 
@@ -215,7 +215,9 @@ def test_subscription_agent_requires_exact_managed_runtime_profile_and_image() -
     with pytest.raises(ValidationError, match="exact Core-managed image"):
         ExperimentConfig.model_validate(payload)
 
-    payload["runtime"]["image"] = MANAGED_RUNTIME_IMAGES["managed_science"]
+    payload["runtime"]["image"] = MANAGED_RUNTIME_RELEASES[
+        "managed_science"
+    ].immutable_reference
     config = ExperimentConfig.model_validate(payload)
 
     assert config.runtime.profile == "managed_science"
@@ -237,7 +239,7 @@ def test_self_deployed_managed_science_requires_exact_runtime_binding(
     payload["runtime"] = {
         "kind": "docker",
         "profile": "managed_science",
-        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "image": MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
         "container_user": "host",
         **override,
     }
@@ -251,7 +253,7 @@ def test_self_deployed_managed_science_accepts_exact_runtime_binding() -> None:
     payload["runtime"] = {
         "kind": "docker",
         "profile": "managed_science",
-        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "image": MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
         "container_user": "host",
     }
 
@@ -281,7 +283,7 @@ def test_subscription_agent_cannot_supply_codex_home(codex_home: str) -> None:
     }
     payload["runtime"] = {
         "profile": "managed_science",
-        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "image": MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
         "container_user": "host",
     }
 
@@ -304,7 +306,7 @@ def test_subscription_closed_environment_rejects_caller_overrides(
     }
     payload["runtime"] = {
         "profile": "managed_science",
-        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "image": MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
         "container_user": "host",
     }
     if env_owner == "agent":
@@ -330,7 +332,7 @@ def test_subscription_agents_cannot_enable_parametric_memory() -> None:
     }
     payload["runtime"] = {
         "profile": "managed_science",
-        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "image": MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
         "container_user": "host",
     }
     payload["evolution"] = {

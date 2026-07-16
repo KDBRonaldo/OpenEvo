@@ -55,6 +55,22 @@ class _CoreEventSequenceGapError(RuntimeError):
     """Force replay when a stream skips past the committed event sequence."""
 
 
+def _collect_cleanup_failure(
+    cleanup: Callable[[], None],
+    first_failure: BaseException | None,
+) -> BaseException | None:
+    try:
+        cleanup()
+    except BaseException as exc:
+        if first_failure is None:
+            return exc
+    return first_failure
+
+
+def _cleanup_after_primary_failure(cleanup: Callable[[], None]) -> None:
+    _collect_cleanup_failure(cleanup, None)
+
+
 @dataclass(frozen=True, slots=True)
 class _SealedFile:
     asset: SealedCoreBootstrapAssetV1
@@ -246,7 +262,7 @@ class DesktopReleaseCoreRuntimeV1:
         ],
     ) -> None:
         with self._close_lock:
-            if self._closed:
+            if self._closed or self._stopped:
                 raise RuntimeError("release Core runtime is closed")
             self._relay.start(
                 active_project=active_project,
@@ -259,22 +275,22 @@ class DesktopReleaseCoreRuntimeV1:
             if self._stopped:
                 return
             self._stopped = True
-        self._relay.request_stop()
-        try:
-            self.core_bridge.close()
-        finally:
-            self._relay.join()
+            failure = _collect_cleanup_failure(self._relay.request_stop, None)
+            failure = _collect_cleanup_failure(self.core_bridge.close, failure)
+            failure = _collect_cleanup_failure(self._relay.join, failure)
+            if failure is not None:
+                raise failure
 
     def close(self) -> None:
-        self.stop()
         with self._close_lock:
             if self._closed:
                 return
             self._closed = True
-        try:
-            self.event_broker.close()
-        finally:
-            self._bridge_store.close()
+            failure = _collect_cleanup_failure(self.stop, None)
+            failure = _collect_cleanup_failure(self.event_broker.close, failure)
+            failure = _collect_cleanup_failure(self._bridge_store.close, failure)
+            if failure is not None:
+                raise failure
 
 
 def bundled_core_asset_root() -> Path:
@@ -356,17 +372,28 @@ def create_release_core_runtime(
     remote_lifecycle: DesktopRemoteLifecycle,
     asset_root: Path | str,
     source_commit: str,
+    startup_phase: Callable[[str], None] | None = None,
 ) -> DesktopReleaseCoreRuntimeV1:
     """Compose the production Core runtime used by the packaged Desktop sidecar."""
 
+    if startup_phase is not None:
+        startup_phase("core_assets")
     bootstrap = load_core_bootstrap_config(asset_root, source_commit=source_commit)
+    if startup_phase is not None:
+        startup_phase("core_bridge_store")
     bridge_store = DesktopCoreBridgeStoreV1(provider_store.state_root / "core-bridge-v1")
     broker: DesktopEventBrokerV1 | None = None
     bridge: DesktopCoreBridgeV1 | None = None
     try:
+        if startup_phase is not None:
+            startup_phase("event_broker")
         broker = DesktopEventBrokerV1()
+        if startup_phase is not None:
+            startup_phase("core_adapter")
         adapter = DesktopCoreSshBridgeAdapterV1(remote_lifecycle, bootstrap)
         archive_source = ProviderWorkspaceArchiveSourceV1(provider_store, workspace_store)
+        if startup_phase is not None:
+            startup_phase("core_bridge")
         bridge = DesktopCoreBridgeV1(
             host_service=adapter,
             tunnel_factory=adapter,
@@ -374,21 +401,19 @@ def create_release_core_runtime(
             archive_source=archive_source,
             transport_factory=adapter.new_http_transport,
         )
+        if startup_phase is not None:
+            startup_phase("core_runtime")
         return DesktopReleaseCoreRuntimeV1(
             bridge=bridge,
             event_broker=broker,
             bridge_store=bridge_store,
         )
     except BaseException:
-        try:
-            if bridge is not None:
-                bridge.close()
-        finally:
-            try:
-                if broker is not None:
-                    broker.close()
-            finally:
-                bridge_store.close()
+        if bridge is not None:
+            _cleanup_after_primary_failure(bridge.close)
+        if broker is not None:
+            _cleanup_after_primary_failure(broker.close)
+        _cleanup_after_primary_failure(bridge_store.close)
         raise
 
 
