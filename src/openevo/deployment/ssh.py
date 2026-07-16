@@ -2690,6 +2690,7 @@ class _SubprocessExitObserver:
         self._kqueue: select.kqueue | None = None
         proc_stat_path = f"/proc/{process.pid}/stat"
         self._proc_stat_path = proc_stat_path if os.path.isfile(proc_stat_path) else None
+        self._ps_process_group_id = process.pid if self._proc_stat_path is None else None
         self._observed = False
         if callable(self._waitid):
             return
@@ -2711,12 +2712,26 @@ class _SubprocessExitObserver:
                     raise
             else:
                 self._kqueue = queue
-                return
+        if self._ps_process_group_id is not None:
+            try:
+                self._observed = self._ps_leader_exited()
+            except BaseException:
+                if self._kqueue is not None:
+                    self._kqueue.close()
+                    self._kqueue = None
+                raise
+            if self._kqueue is not None and not self._observed:
+                # The snapshot closes the attach-before-exit gap. Future exits
+                # are delivered by the registered one-shot kqueue event.
+                self._ps_process_group_id = None
 
     @property
     def supports_nonreaping_observation(self) -> bool:
         return (
-            callable(self._waitid) or self._kqueue is not None or self._proc_stat_path is not None
+            callable(self._waitid)
+            or self._kqueue is not None
+            or self._proc_stat_path is not None
+            or self._ps_process_group_id is not None
         )
 
     def exited(self) -> bool:
@@ -2733,7 +2748,8 @@ class _SubprocessExitObserver:
             return self._observed
         if self._kqueue is not None:
             self._observed = bool(self._kqueue.control(None, 1, 0))
-            return self._observed
+            if self._observed:
+                return True
         if self._proc_stat_path is not None:
             try:
                 with open(self._proc_stat_path, "rb") as stream:
@@ -2751,7 +2767,22 @@ class _SubprocessExitObserver:
                 raise RuntimeError("subprocess proc status is malformed")
             self._observed = status_fields[0] in {b"Z", b"X"}
             return self._observed
+        if self._ps_process_group_id is not None:
+            self._observed = self._ps_leader_exited()
+            return self._observed
         return False
+
+    def _ps_leader_exited(self) -> bool:
+        process_group_id = self._ps_process_group_id
+        if process_group_id is None:
+            raise RuntimeError("subprocess ps observer is unavailable")
+        identity = _read_ps_process_group_states().get(self._process.pid)
+        if identity is None:
+            return True
+        observed_group_id, state = identity
+        if observed_group_id != process_group_id:
+            raise RuntimeError("subprocess process-group leader identity changed")
+        return state in {"X", "Z"}
 
     def wait_until(self, deadline: float) -> bool:
         while True:

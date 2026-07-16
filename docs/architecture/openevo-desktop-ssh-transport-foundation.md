@@ -388,6 +388,10 @@ retains the same bounded slot and lease fail closed. There is no semaphore to
 registry handoff and no portable waiter thread that can call `wait()` early.
 Process-group validation, `waitid`, Darwin `kqueue`, Linux
 `/proc/<pid>/stat` fallback setup, and capture all execute under that authority.
+After Darwin registers the one-shot kqueue event, it takes a bounded, non-reaping
+`ps` snapshot of the pinned PID/PGID. That snapshot detects a leader that became
+a zombie before registration; when kqueue registration is unavailable, the same
+strict snapshot remains the bounded polling fallback.
 Production tunnel readiness, exit monitoring, Core connection verification, and
 close use only this non-reaping observer. Both `_NonReapingPopen.poll()` and the
 birth-record-recovered wait handle reject a live unreaped child, preventing an
@@ -412,7 +416,8 @@ entries synchronously. Full ownership capacity rejects a new command before
 `Popen`, so it cannot create an unrecorded process. All waits remain bounded.
 
 Capture polls the unreaped leader at a bounded interval through `waitid`,
-`kqueue`, or Linux proc status instead of reaping it. Once the leader exits,
+gap-closed Darwin `kqueue` observation, Linux proc status, or the Darwin `ps`
+fallback instead of reaping it. Once the leader exits,
 inherited descendant pipes receive a 100 ms drain grace; capture keeps bytes
 already delivered, kills the still-pinned process group, closes any remaining
 pipes, and returns the leader's actual exit code. This ordering prevents

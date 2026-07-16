@@ -1934,10 +1934,26 @@ def test_core_tunnel_verify_authority_failure_permanently_poisons_endpoint(
         authority_fails = False
         cleanup_fails = True
 
+        def __init__(self) -> None:
+            super().__init__()
+            self.owned_stream: socket.socket | None = None
+
+        def own_stream_fd(self, stream_fd: int) -> None:
+            assert self.owned_stream is None
+            self.owned_stream = socket.socket(fileno=os.dup(stream_fd))
+
+        def close_owned_stream(self) -> None:
+            if self.owned_stream is not None:
+                self.owned_stream.close()
+                self.owned_stream = None
+
         def poll(self) -> int | None:
             if self.authority_fails:
                 raise OSError("authority probe failed")
-            return None if self.cleanup_fails else super().poll()
+            result = None if self.cleanup_fails else super().poll()
+            if result is not None:
+                self.close_owned_stream()
+            return result
 
         def terminate(self) -> None:
             self.terminated = True
@@ -1949,21 +1965,22 @@ def test_core_tunnel_verify_authority_failure_permanently_poisons_endpoint(
             if self.cleanup_fails:
                 raise subprocess.TimeoutExpired("ssh", timeout)
             assert self.return_code is not None
+            self.close_owned_stream()
             return self.return_code
 
         def kill(self) -> None:
             self.killed = True
             if not self.cleanup_fails:
                 self.return_code = -9
+                self.close_owned_stream()
 
     process = RecoverableAuthorityProcess()
     starts = 0
-    retained_streams: list[socket.socket] = []
 
     def start(_argv: list[str], stream_fd: int) -> FakeTunnelProcess:
         nonlocal starts
         starts += 1
-        retained_streams.append(socket.socket(fileno=os.dup(stream_fd)))
+        process.own_stream_fd(stream_fd)
         return process
 
     try:
@@ -1996,9 +2013,9 @@ def test_core_tunnel_verify_authority_failure_permanently_poisons_endpoint(
         ssh_module._retry_orphaned_tunnel_cleanup()
         assert tunnel.closed is True
         assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+        assert process.owned_stream is None
     finally:
-        for retained_stream in retained_streams:
-            retained_stream.close()
+        process.close_owned_stream()
 
 
 def test_core_tunnel_identity_failure_poisons_endpoint_when_child_exit_is_unconfirmed(
@@ -2643,28 +2660,40 @@ def test_core_tunnel_close_quarantines_unconfirmed_connection_child(
         def __init__(self) -> None:
             super().__init__()
             self.cleanup_fails = True
+            self.owned_stream: socket.socket | None = None
+
+        def own_stream_fd(self, stream_fd: int) -> None:
+            assert self.owned_stream is None
+            self.owned_stream = socket.socket(fileno=os.dup(stream_fd))
+
+        def close_owned_stream(self) -> None:
+            if self.owned_stream is not None:
+                self.owned_stream.close()
+                self.owned_stream = None
 
         def terminate(self) -> None:
             if self.cleanup_fails:
                 raise OSError("terminate failed")
             self.return_code = -15
+            self.close_owned_stream()
 
         def wait(self, timeout: float | None = None) -> int:
             if self.cleanup_fails:
                 raise subprocess.TimeoutExpired("ssh", timeout)
             assert self.return_code is not None
+            self.close_owned_stream()
             return self.return_code
 
         def kill(self) -> None:
             if self.cleanup_fails:
                 raise OSError("kill failed")
             self.return_code = -9
+            self.close_owned_stream()
 
     process = RecoverableProcess()
-    retained_streams: list[socket.socket] = []
 
     def start(_argv: list[str], stream_fd: int) -> FakeTunnelProcess:
-        retained_streams.append(socket.socket(fileno=os.dup(stream_fd)))
+        process.own_stream_fd(stream_fd)
         return process
 
     try:
@@ -2684,9 +2713,9 @@ def test_core_tunnel_close_quarantines_unconfirmed_connection_child(
         ssh_module._retry_orphaned_tunnel_cleanup()
         assert tunnel.closed is True
         assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+        assert process.owned_stream is None
     finally:
-        for retained_stream in retained_streams:
-            retained_stream.close()
+        process.close_owned_stream()
 
 
 def test_core_tunnel_close_quarantines_lease_cleanup_cancellation() -> None:
@@ -3198,6 +3227,65 @@ def test_default_runner_does_not_require_os_waitid(
     _assert_processes_gone(int(pid_path.read_text(encoding="ascii")))
 
 
+def test_kqueue_observer_detects_leader_that_exited_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 424242
+        returncode = None
+
+    class Queue:
+        def __init__(self) -> None:
+            self.closed = False
+            self.registrations = 0
+
+        def control(
+            self,
+            changes: list[object] | None,
+            _max_events: int,
+            _timeout: int,
+        ) -> list[object]:
+            if changes:
+                self.registrations += 1
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    queue = Queue()
+    monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
+    monkeypatch.setattr(ssh_module.os.path, "isfile", lambda _path: False)
+    monkeypatch.setattr(ssh_module.select, "kqueue", lambda: queue, raising=False)
+    monkeypatch.setattr(
+        ssh_module.select,
+        "kevent",
+        lambda *_args, **_kwargs: object(),
+        raising=False,
+    )
+    for name in (
+        "KQ_FILTER_PROC",
+        "KQ_EV_ADD",
+        "KQ_EV_ENABLE",
+        "KQ_EV_ONESHOT",
+        "KQ_NOTE_EXIT",
+    ):
+        monkeypatch.setattr(ssh_module.select, name, 1, raising=False)
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: {Process.pid: (Process.pid, "Z")},
+    )
+
+    observer = ssh_module._SubprocessExitObserver(Process())
+    try:
+        assert queue.registrations == 1
+        assert observer.supports_nonreaping_observation is True
+        assert observer.exited() is True
+        assert Process.returncode is None
+    finally:
+        observer.close()
+
+
 def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3459,7 +3547,7 @@ def test_secret_popen_return_cancellation_publishes_one_recoverable_owner(
                 pass
 
 
-def test_recovered_poll_cannot_reap_short_leader_before_retryable_group_cleanup(
+def test_recovered_observer_detects_exit_before_retryable_group_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3476,19 +3564,16 @@ def test_recovered_poll_cannot_reap_short_leader_before_retryable_group_cleanup(
     lease_paths: list[Path] = []
     started: list[subprocess.Popen[bytes]] = []
     child_path = tmp_path / "recovered-child.pid"
-    leader_release_path = tmp_path / "release-recovered-leader"
     cleanup_blocked = True
     defer_disappearance_once = True
     signal_count = 0
 
     leader_program = (
-        "import subprocess,sys,time\n"
+        "import subprocess,sys\n"
         "from pathlib import Path\n"
         "child=subprocess.Popen([sys.executable,'-c',"
         "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)'])\n"
         "Path(sys.argv[1]).write_text(str(child.pid),encoding='ascii')\n"
-        "while not Path(sys.argv[2]).exists():\n"
-        "    time.sleep(0.01)\n"
     )
 
     def local_argv(_command: str, known_hosts_file: Path) -> list[str]:
@@ -3498,7 +3583,6 @@ def test_recovered_poll_cannot_reap_short_leader_before_retryable_group_cleanup(
             "-c",
             leader_program,
             str(child_path),
-            str(leader_release_path),
         ]
 
     def spawn_then_cancel(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
@@ -3551,14 +3635,23 @@ def test_recovered_poll_cannot_reap_short_leader_before_retryable_group_cleanup(
         assert isinstance(process, ssh_module._RecoveredSubprocess)
         child_id = int(child_path.read_text(encoding="ascii"))
 
-        os.kill(process.pid, 0)
-        authority.initialize_observer()
-        leader_release_path.touch()
         deadline = time.monotonic() + 3
-        while not authority.leader_exited():
+        while True:
+            if os.path.isfile(f"/proc/{process.pid}/stat"):
+                leader_state = ssh_module._read_proc_process_group_states(
+                    process.pid
+                ).get(process.pid)
+            else:
+                identity = ssh_module._read_ps_process_group_states().get(process.pid)
+                leader_state = None if identity is None else identity[1]
+            if leader_state in {"X", "Z"}:
+                break
             if time.monotonic() >= deadline:
-                pytest.fail("short-lived recovered leader did not exit")
+                pytest.fail("recovered leader did not exit before observer registration")
             time.sleep(0.01)
+
+        authority.initialize_observer()
+        assert authority.leader_exited() is True
 
         with pytest.raises(RuntimeError, match="non-reaping observer"):
             process.poll()
@@ -3598,7 +3691,6 @@ def test_recovered_poll_cannot_reap_short_leader_before_retryable_group_cleanup(
         assert not lease_paths[0].exists()
     finally:
         cleanup_blocked = False
-        leader_release_path.touch(exist_ok=True)
         monkeypatch.setattr(ssh_module, "_OWNED_SUBPROCESS_POPEN", original_popen)
         monkeypatch.setattr(ssh_module, "_terminate_and_reap_subprocess", original_cleanup)
         monkeypatch.setattr(

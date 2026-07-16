@@ -20,7 +20,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from tempfile import TemporaryDirectory, TemporaryFile
+from tempfile import TemporaryDirectory
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -35,6 +35,12 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from desktop.sidecar.contracts.v1 import DesktopStateV1, VersionV1  # noqa: E402
+from openevo.deployment.ssh import (  # noqa: E402
+    _SubprocessExitObserver,
+    _confirm_owned_process_group_disappeared,
+    _owned_process_group_id,
+    _terminate_and_reap_subprocess,
+)
 
 
 EXPECTED_DESKTOP_METHOD_IDS = frozenset(
@@ -260,12 +266,50 @@ def _fixed_native_descriptors(listener_fd: int, archive_fd: int):
         os.close(listener_guard)
 
 
+def _abort_unobserved_sidecar(process: subprocess.Popen[Any]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def _force_kill_anchored_process_group(
+    process: subprocess.Popen[Any],
+    *,
+    process_group_id: int,
+) -> None:
+    if process.returncode is not None:
+        return
+    if (
+        process.pid != process_group_id
+        or process_group_id <= 1
+        or process_group_id == os.getpgrp()
+        or os.getpgid(process.pid) != process_group_id
+    ):
+        raise RuntimeError("native sidecar process-group authority changed")
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=10)
+
+
 def _launch_native_sidecar(
     sidecar: Path,
     *,
     config_root: Path,
-    process_log,
-) -> tuple[subprocess.Popen[bytes], str, _NativeCredentials]:
+) -> tuple[
+    subprocess.Popen[bytes],
+    str,
+    _NativeCredentials,
+    int,
+    _SubprocessExitObserver,
+]:
     launch_path = config_root.parent / NATIVE_SIDECAR_BASENAME
     shutil.copyfile(sidecar, launch_path)
     launch_path.chmod(0o500)
@@ -296,30 +340,88 @@ def _launch_native_sidecar(
         "--desktop-config-root",
         str(config_root),
     ]
-    process_log_guard = _duplicate_fd(process_log.fileno())
     try:
         with _fixed_native_descriptors(listener.fileno(), archive_fd):
             process = subprocess.Popen(
                 command,
                 executable=str(execution_path),
                 stdin=subprocess.PIPE,
-                stdout=process_log_guard,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env=child_env,
                 pass_fds=(NATIVE_LISTENER_FD, NATIVE_ARCHIVE_FD),
                 start_new_session=True,
             )
     finally:
-        os.close(process_log_guard)
         os.close(archive_fd)
         listener.close()
+    if process.stdout is None:
+        _abort_unobserved_sidecar(process)
+        raise SmokeFailure("native sidecar output channel was not created")
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+    except OSError:
+        _abort_unobserved_sidecar(process)
+        process.stdout.close()
+        raise SmokeFailure("native sidecar output channel could not be bounded") from None
     if process.stdin is None:
-        _terminate(process)
+        _abort_unobserved_sidecar(process)
+        process.stdout.close()
         raise SmokeFailure("native sidecar frame channel was not created")
-    process.stdin.write(credentials.frame())
-    process.stdin.close()
+    try:
+        process_group_id = _owned_process_group_id(process)
+        exit_observer = _SubprocessExitObserver(process)
+    except BaseException as exc:
+        _abort_unobserved_sidecar(process)
+        process.stdout.close()
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise SmokeFailure("native sidecar process authority could not be created") from None
+    _send_native_frame(
+        process,
+        credentials,
+        process_group_id=process_group_id,
+        exit_observer=exit_observer,
+    )
+    return (
+        process,
+        f"http://127.0.0.1:{port}",
+        credentials,
+        process_group_id,
+        exit_observer,
+    )
+
+
+def _send_native_frame(
+    process: subprocess.Popen[bytes],
+    credentials: _NativeCredentials,
+    *,
+    process_group_id: int,
+    exit_observer: _SubprocessExitObserver,
+) -> None:
+    stream = process.stdin
+    if stream is None:
+        raise SmokeFailure("native sidecar frame channel was not created")
+    frame = credentials.frame()
+    try:
+        if stream.write(frame) != len(frame):
+            raise BrokenPipeError
+        stream.close()
+    except (OSError, ValueError):
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+        process.stdin = None
+        failure = _process_failure(
+            process,
+            process_group_id=process_group_id,
+            exit_observer=exit_observer,
+        )
+        if process.stdout is not None:
+            process.stdout.close()
+        raise SmokeFailure(failure) from None
     process.stdin = None
-    return process, f"http://127.0.0.1:{port}", credentials
 
 
 def _read_url(
@@ -541,27 +643,44 @@ def _assert_desktop_state(payload: dict[str, Any]) -> None:
         raise SmokeFailure("packaged sidecar state does not bind the release contract")
 
 
-def _terminate(process: subprocess.Popen[Any]) -> None:
-    if process.poll() is not None:
-        return
+def _terminate(
+    process: subprocess.Popen[Any],
+    *,
+    process_group_id: int,
+    exit_observer: _SubprocessExitObserver,
+) -> None:
+    authority_failure: BaseException | None = None
     try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
+        if process.returncode is None:
+            _terminate_and_reap_subprocess(
+                process,
+                process_group_id=process_group_id,
+                exit_observer=exit_observer,
+                on_group_cleanup_confirmed=lambda: None,
+            )
         else:
-            process.terminate()
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
+            _confirm_owned_process_group_disappeared(
+                process_group_id=process_group_id,
+            )
+    except BaseException as exc:
+        authority_failure = exc
         try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=10)
+            _force_kill_anchored_process_group(
+                process,
+                process_group_id=process_group_id,
+            )
+        except BaseException as cleanup_exc:
+            if isinstance(cleanup_exc, (KeyboardInterrupt, SystemExit)):
+                raise cleanup_exc
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise exc
+            raise SmokeFailure("native sidecar process-group cleanup failed") from None
+    finally:
+        exit_observer.close()
+    if authority_failure is not None:
+        if isinstance(authority_failure, (KeyboardInterrupt, SystemExit)):
+            raise authority_failure
+        raise SmokeFailure("native sidecar process-group authority failed closed") from None
 
 
 def smoke_sidecar(
@@ -574,99 +693,152 @@ def smoke_sidecar(
 
     with TemporaryDirectory(prefix="openevo-sidecar-smoke-") as temporary_root:
         root = Path(temporary_root)
-        with TemporaryFile(mode="w+b") as process_log:
-            process, base_url, credentials = _launch_native_sidecar(
-                sidecar,
-                config_root=root / "config",
-                process_log=process_log,
-            )
-            try:
-                deadline = time.monotonic() + timeout_seconds
-                while time.monotonic() < deadline:
-                    if process.poll() is not None:
-                        raise SmokeFailure(_process_failure(process, process_log))
-                    try:
-                        challenge = secrets.token_hex(32)
-                        health = _read_json(
-                            f"{base_url}/health",
-                            headers={NATIVE_CHALLENGE_HEADER: challenge},
-                        )
-                        domain = (
-                            f"{NATIVE_SIDECAR_PROTOCOL}\0"
-                            f"{credentials.instance_id}\0{challenge}"
-                        ).encode("ascii")
-                        expected_proof = hmac.new(
-                            credentials.readiness_key,
-                            domain,
-                            hashlib.sha256,
-                        ).hexdigest()
-                        if health == {
-                            "service": "openevo-sidecar",
-                            "status": "ok",
-                            "protocol": NATIVE_SIDECAR_PROTOCOL,
-                            "instance_id": credentials.instance_id,
-                            "instance_proof": expected_proof,
-                        }:
-                            break
-                    except SmokeFailure:
-                        time.sleep(0.25)
-                else:
+        (
+            process,
+            base_url,
+            credentials,
+            process_group_id,
+            exit_observer,
+        ) = _launch_native_sidecar(
+            sidecar,
+            config_root=root / "config",
+        )
+        try:
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                try:
+                    exited = exit_observer.exited()
+                except Exception:
+                    raise SmokeFailure("native sidecar exit observation failed") from None
+                if exited:
                     raise SmokeFailure(
-                        f"sidecar did not become healthy within {timeout_seconds}s"
+                        _process_failure(
+                            process,
+                            process_group_id=process_group_id,
+                            exit_observer=exit_observer,
+                        )
                     )
-
-                _assert_release_version(_read_json(f"{base_url}/version"))
-
-                session_headers = {DESKTOP_SESSION_HEADER: credentials.session_token}
-                _assert_desktop_state(
-                    _read_json(
-                        f"{base_url}/desktop/v1/state",
-                        headers=session_headers,
+                try:
+                    challenge = secrets.token_hex(32)
+                    health = _read_json(
+                        f"{base_url}/health",
+                        headers={NATIVE_CHALLENGE_HEADER: challenge},
                     )
+                    domain = (
+                        f"{NATIVE_SIDECAR_PROTOCOL}\0"
+                        f"{credentials.instance_id}\0{challenge}"
+                    ).encode("ascii")
+                    expected_proof = hmac.new(
+                        credentials.readiness_key,
+                        domain,
+                        hashlib.sha256,
+                    ).hexdigest()
+                    if health == {
+                        "service": "openevo-sidecar",
+                        "status": "ok",
+                        "protocol": NATIVE_SIDECAR_PROTOCOL,
+                        "instance_id": credentials.instance_id,
+                        "instance_proof": expected_proof,
+                    }:
+                        break
+                except SmokeFailure:
+                    time.sleep(0.25)
+            else:
+                raise SmokeFailure(
+                    f"sidecar did not become healthy within {timeout_seconds}s"
                 )
-                _read_url(
+
+            _assert_release_version(_read_json(f"{base_url}/version"))
+
+            session_headers = {DESKTOP_SESSION_HEADER: credentials.session_token}
+            _assert_desktop_state(
+                _read_json(
                     f"{base_url}/desktop/v1/state",
-                    expected_status=401,
-                )
-                _read_url(
-                    f"{base_url}/openevo-native/session",
                     headers=session_headers,
-                    expected_status=204,
                 )
-                _read_url(
-                    f"{base_url}/openevo-native/session",
-                    expected_status=403,
-                )
-                _read_url(
-                    f"{base_url}/openevo-api/desktop/shell",
-                    expected_status=404,
-                )
+            )
+            _read_url(
+                f"{base_url}/desktop/v1/state",
+                expected_status=401,
+            )
+            _read_url(
+                f"{base_url}/openevo-native/session",
+                headers=session_headers,
+                expected_status=204,
+            )
+            _read_url(
+                f"{base_url}/openevo-native/session",
+                expected_status=403,
+            )
+            _read_url(
+                f"{base_url}/openevo-api/desktop/shell",
+                expected_status=404,
+            )
 
-                index_html = _read_url(f"{base_url}/openevo").decode("utf-8")
-                assets = _asset_references(index_html)
-                if not assets:
-                    raise SmokeFailure("/openevo did not reference any packaged assets")
-                for asset in assets:
-                    _read_url(f"{base_url}/{asset}")
+            index_html = _read_url(f"{base_url}/openevo").decode("utf-8")
+            assets = _asset_references(index_html)
+            if not assets:
+                raise SmokeFailure("/openevo did not reference any packaged assets")
+            for asset in assets:
+                _read_url(f"{base_url}/{asset}")
+        finally:
+            assert process.stdout is not None
+            try:
+                _terminate(
+                    process,
+                    process_group_id=process_group_id,
+                    exit_observer=exit_observer,
+                )
             finally:
-                _terminate(process)
+                process.stdout.close()
 
 
-def _process_failure(process: subprocess.Popen[Any], process_log) -> str:
-    process.wait(timeout=2)
-    diagnostics = _read_startup_diagnostics(process_log)
+def _process_failure(
+    process: subprocess.Popen[Any],
+    *,
+    process_group_id: int,
+    exit_observer: _SubprocessExitObserver,
+) -> str:
+    authority_failed = False
+    try:
+        _terminate(
+            process,
+            process_group_id=process_group_id,
+            exit_observer=exit_observer,
+        )
+    except SmokeFailure:
+        authority_failed = True
+    failure = _render_process_failure(process.returncode, process.stdout)
+    if authority_failed:
+        failure += "\nnative sidecar process-group authority also failed closed"
+    return failure
+
+
+def _render_process_failure(returncode: int | None, output) -> str:
+    diagnostics = _read_startup_diagnostics(output) if output is not None else ()
     detail = (
         "startup diagnostics:\n" + "\n".join(diagnostics)
         if diagnostics
         else "no valid OPENEVO_STARTUP_V1 diagnostic was emitted"
     )
-    return f"sidecar exited before serving /health (exit {process.returncode}).\n{detail}"
+    return f"sidecar exited before serving /health (exit {returncode}).\n{detail}"
 
 
-def _read_startup_diagnostics(process_log) -> tuple[str, ...]:
-    process_log.flush()
-    process_log.seek(0)
-    payload = process_log.read(STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES + 1)
+def _read_startup_diagnostics(process_output) -> tuple[str, ...]:
+    payload = bytearray()
+    while len(payload) <= STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES:
+        try:
+            chunk = os.read(
+                process_output.fileno(),
+                STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES + 1 - len(payload),
+            )
+        except BlockingIOError:
+            break
+        except OSError:
+            return ()
+        if not chunk:
+            break
+        payload.extend(chunk)
     bounded = payload[:STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES]
     final_newline = bounded.rfind(b"\n")
     if final_newline < 0:

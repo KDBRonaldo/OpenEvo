@@ -56,8 +56,10 @@ short-path environment before packaging a DMG. On GitHub macOS runners, the
 complete suite creates that short root directly below `$HOME` with mode
 `0700`; it must not place SSH authority fixtures below the pre-existing
 `$RUNNER_TEMP` ancestry. Injected Core-child fixtures retain the transferred
-socket peer for the fake child's lifetime, and short-leader fixtures synchronize
-observer installation before allowing the leader to exit. These rules model the
+socket peer only for the fake child's lifetime and close it as soon as simulated
+exit is established. Short-leader fixtures deterministically let the leader
+become a zombie before observer installation, proving that Darwin's kqueue plus
+non-reaping `ps` snapshot closes the registration gap. These rules model the
 production ownership lifecycle without weakening its fail-closed checks.
 
 Native workspace tests reject sparse allocation through deterministic metadata
@@ -96,12 +98,18 @@ artifact where applicable. Use the smallest durable report that proves the
 behavior; do not create a schema/validator/report stack for every check.
 
 Packaged-sidecar startup failures are the exception to ordinary process-log
-capture: the smoke test consumes a fixed amount of child output and publishes
-only closed `OPENEVO_STARTUP_V1` records. Tests must include path, token, URL,
+capture: the smoke directs combined child output to a bounded OS pipe, reads at
+most 32 KiB for parsing plus one unrendered truncation sentinel byte, and
+publishes only closed `OPENEVO_STARTUP_V1` records. It does not create a
+disk-backed process log. Tests must include path, token, URL,
 traceback, malformed-record, and oversized-output canaries and prove that none
 can enter the rendered CI failure. A silent bootloader exit is a failed gate,
 not permission to print arbitrary child output or fall back from descriptor
 authority to a pathname.
+The smoke must also retain the unreaped leader while checking readiness and
+prove full process-group cleanup. Tests force process-table observation failure
+and require the anchored whole-group `SIGKILL` fallback to remove a descendant
+that retains the output pipe while the candidate gate still fails closed.
 
 Required release-gate families are:
 

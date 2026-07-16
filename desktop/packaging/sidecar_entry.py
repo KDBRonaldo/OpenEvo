@@ -77,20 +77,20 @@ def _startup_main() -> int:
             OWNED_SUBPROCESS_BIRTH_ARGUMENT,
             run_packaged_owned_subprocess_birth,
         )
-    except Exception:
+    except (Exception, SystemExit):
         _emit_startup_diagnostic("python_import", "owned_subprocess_import_failed")
         return 1
 
     if OWNED_SUBPROCESS_BIRTH_ARGUMENT in sys.argv:
         try:
             run_packaged_owned_subprocess_birth(sys.argv)
-        except Exception:
+        except (Exception, SystemExit):
             _emit_startup_diagnostic("python_owned_subprocess", "execution_failed")
             return 1
         return 126
     try:
         from desktop.server.launcher import main
-    except Exception:
+    except (Exception, SystemExit):
         _emit_startup_diagnostic("python_import", "launcher_import_failed")
         return 1
 
@@ -103,12 +103,12 @@ def _startup_main() -> int:
     os.environ.pop(NATIVE_EXECUTABLE_PATH_ENV, None)
     try:
         metadata = _load_packaged_build_metadata()
-    except Exception:
+    except (Exception, SystemExit):
         _emit_startup_diagnostic("python_metadata", "load_failed")
         return 1
     try:
         return main(packaged_source_commit=metadata.source_commit)
-    except Exception:
+    except (Exception, SystemExit):
         _emit_startup_diagnostic("python_launcher", "execution_failed")
         return 1
 

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import re
+import signal
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -22,11 +26,34 @@ def _load_module(name: str, relative_path: str):
 
 
 class _ExitedProcess:
-    returncode = 255
+    def __init__(self, stdout) -> None:
+        self.stdout = stdout
+        self.returncode = 255
 
     def wait(self, *, timeout: float) -> int:
         assert timeout == 2
         return self.returncode
+
+    def poll(self) -> int:
+        return self.returncode
+
+
+class _BrokenPipeInput:
+    def __init__(self, canary: str) -> None:
+        self._canary = canary
+        self.closed = False
+
+    def write(self, _payload: bytes) -> int:
+        raise BrokenPipeError(self._canary)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _BrokenPipeProcess(_ExitedProcess):
+    def __init__(self, stdout, canary: str) -> None:
+        super().__init__(stdout)
+        self.stdin = _BrokenPipeInput(canary)
 
 
 def test_startup_producers_exactly_match_smoke_allowlist() -> None:
@@ -91,7 +118,7 @@ def test_smoke_failure_exposes_only_bounded_allowlisted_startup_lines(tmp_path: 
     process_log.write_bytes(payload)
 
     with process_log.open("rb") as stream:
-        failure = smoke._process_failure(_ExitedProcess(), stream)
+        failure = smoke._render_process_failure(255, stream)
 
     assert failure == (
         "sidecar exited before serving /health (exit 255).\n"
@@ -113,7 +140,7 @@ def test_smoke_failure_caps_valid_diagnostic_lines(tmp_path: Path) -> None:
     process_log.write_bytes(line * (smoke.STARTUP_DIAGNOSTIC_MAX_LINES + 20))
 
     with process_log.open("rb") as stream:
-        failure = smoke._process_failure(_ExitedProcess(), stream)
+        failure = smoke._render_process_failure(255, stream)
 
     assert failure.count("OPENEVO_STARTUP_V1") == smoke.STARTUP_DIAGNOSTIC_MAX_LINES
 
@@ -137,7 +164,7 @@ def test_smoke_failure_rejects_non_contract_diagnostics(tmp_path: Path, line: by
     process_log.write_bytes(line)
 
     with process_log.open("rb") as stream:
-        failure = smoke._process_failure(_ExitedProcess(), stream)
+        failure = smoke._render_process_failure(255, stream)
 
     assert failure.endswith("no valid OPENEVO_STARTUP_V1 diagnostic was emitted")
     assert "archive_open_failed" not in failure
@@ -166,7 +193,140 @@ def test_python_startup_failure_is_redacted(monkeypatch: pytest.MonkeyPatch, cap
     assert canary not in captured.err
 
 
-def test_python_startup_preserves_launcher_system_exit(
+def test_native_frame_broken_pipe_surfaces_only_closed_startup_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_module(
+        "openevo_sidecar_smoke_broken_pipe_test",
+        "scripts/ci/smoke_openevo_desktop_sidecar.py",
+    )
+    canary = "Traceback /Users/private token=secret"
+    process_log = tmp_path / "process.log"
+    process_log.write_bytes(
+        b"OPENEVO_STARTUP_V1 stage=bootloader_archive code=archive_open_failed\n"
+    )
+
+    with process_log.open("rb") as stream:
+        process = _BrokenPipeProcess(stream, canary)
+        monkeypatch.setattr(
+            smoke,
+            "_process_failure",
+            lambda active_process, **_: smoke._render_process_failure(
+                active_process.returncode,
+                active_process.stdout,
+            ),
+        )
+        with pytest.raises(smoke.SmokeFailure) as rejected:
+            smoke._send_native_frame(
+                process,
+                smoke._NativeCredentials.create(),
+                process_group_id=424242,
+                exit_observer=object(),
+            )
+
+    assert str(rejected.value) == (
+        "sidecar exited before serving /health (exit 255).\n"
+        "startup diagnostics:\n"
+        "OPENEVO_STARTUP_V1 stage=bootloader_archive code=archive_open_failed"
+    )
+    assert canary not in str(rejected.value)
+    assert process.stdin is None
+
+
+def test_smoke_uses_bounded_pipe_instead_of_disk_backed_process_log() -> None:
+    source = (
+        REPOSITORY_ROOT / "scripts/ci/smoke_openevo_desktop_sidecar.py"
+    ).read_text(encoding="utf-8")
+
+    assert "stdout=subprocess.PIPE" in source
+    assert "stderr=subprocess.STDOUT" in source
+    assert "TemporaryFile" not in source
+
+
+@pytest.mark.parametrize(
+    "force_authority_failure",
+    [False, True],
+    ids=("normal", "observer-failure"),
+)
+def test_terminate_reaps_descendant_that_retains_output_pipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force_authority_failure: bool,
+) -> None:
+    smoke = _load_module(
+        "openevo_sidecar_smoke_group_cleanup_test",
+        "scripts/ci/smoke_openevo_desktop_sidecar.py",
+    )
+    child_path = tmp_path / "descendant.pid"
+    leader_program = (
+        "import os,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)'])\n"
+        "pending=Path(str(sys.argv[1])+'.pending')\n"
+        "pending.write_text(str(child.pid),encoding='ascii')\n"
+        "os.replace(pending,sys.argv[1])\n"
+        "time.sleep(30)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", leader_program, str(child_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    process_group_id = smoke._owned_process_group_id(process)
+    observer = smoke._SubprocessExitObserver(process)
+    child_id: int | None = None
+    try:
+        deadline = time.monotonic() + 3
+        while not child_path.exists():
+            if time.monotonic() >= deadline:
+                pytest.fail("descendant identity was not published")
+            time.sleep(0.01)
+        child_id = int(child_path.read_text(encoding="ascii"))
+
+        if force_authority_failure:
+            monkeypatch.setattr(
+                smoke,
+                "_terminate_and_reap_subprocess",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("process-group observation failed")
+                ),
+            )
+            with pytest.raises(
+                smoke.SmokeFailure,
+                match="process-group authority failed closed",
+            ):
+                smoke._terminate(
+                    process,
+                    process_group_id=process_group_id,
+                    exit_observer=observer,
+                )
+        else:
+            smoke._terminate(
+                process,
+                process_group_id=process_group_id,
+                exit_observer=observer,
+            )
+
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_id, 0)
+    finally:
+        observer.close()
+        if process.returncode is None:
+            try:
+                os.killpg(process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=3)
+        process.stdout.close()
+
+
+def test_python_startup_redacts_launcher_system_exit(
     monkeypatch: pytest.MonkeyPatch,
     capsys,
 ) -> None:
@@ -187,11 +347,15 @@ def test_python_startup_preserves_launcher_system_exit(
     monkeypatch.setattr(
         launcher,
         "main",
-        lambda **_: (_ for _ in ()).throw(SystemExit(37)),
+        lambda **_: (_ for _ in ()).throw(
+            SystemExit("Traceback /Users/private token=secret")
+        ),
     )
 
-    with pytest.raises(SystemExit) as exc:
-        entry._startup_main()
-
-    assert exc.value.code == 37
-    assert capsys.readouterr().err == ""
+    assert entry._startup_main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "OPENEVO_STARTUP_V1 stage=python_launcher code=execution_failed\n"
+    assert "Traceback" not in captured.err
+    assert "/Users/private" not in captured.err
+    assert "token=secret" not in captured.err

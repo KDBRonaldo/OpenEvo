@@ -229,14 +229,23 @@ renderer. The non-secret instance ID is returned only as part of the
 challenge-bound health response.
 
 Failures before readiness use the local-only `OPENEVO_STARTUP_V1` diagnostic
-contract. The bootloader and packaged Python entry point may write only a closed,
-fixed `stage` and `code`, plus an optional numeric errno, to the inherited
-standard-error stream. They must not include a path, argv, environment value,
-credential, URL, exception message, traceback, or arbitrary child output. The
-release smoke scans at most 32 KiB and reports at most eight syntactically valid
-allowlisted diagnostic records. Missing diagnostics are reported as such;
-unstructured output is never copied into CI logs. This is a local startup aid,
-not telemetry, crash reporting, or a diagnostics upload path.
+contract. The bootloader and packaged Python entry point emit a closed, fixed
+`stage` and `code`, plus an optional numeric errno, for handled startup failures.
+Only those exact allowlisted records are eligible for surfacing: paths, argv,
+environment values, credentials, URLs, exception messages, tracebacks, and
+arbitrary child output are never copied into CI logs. The release smoke uses a
+bounded OS pipe rather than a disk-backed process log, scans at most 32 KiB, and
+reports at most eight records. One additional byte is read only as a truncation
+sentinel and is never parsed or rendered. Missing diagnostics are reported as
+such. This is a local startup aid, not telemetry, crash reporting, or a
+diagnostics upload path.
+
+The smoke keeps the launched sidecar leader unreaped while health is pending and
+uses the Core non-reaping process-group observer for exit and cleanup. Normal
+cleanup proves the complete PGID dead and absent before reaping. If that
+observation authority fails, the still-unreaped leader authorizes a direct
+whole-group `SIGKILL` fallback and leader reap; the candidate remains failed even
+when this emergency cleanup succeeds.
 
 Readiness sends a fresh 256-bit challenge to `/health`. The closed Rust response
 model requires the exact protocol and instance ID and verifies HMAC-SHA256 over

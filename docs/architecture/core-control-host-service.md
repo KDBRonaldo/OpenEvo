@@ -12,14 +12,17 @@ document or add compatibility routes.
 The Desktop-side launcher and its local SSH/rsync subprocesses support both
 macOS and Linux hosts. Local leader-exit observation uses Linux
 `waitid(..., WNOWAIT)` when available and Darwin `kqueue` process-exit events
-otherwise, with non-reaping Linux proc status as the fallback. No portable
-waiter may reap the leader before group cleanup. All paths retain the 100 ms
-descendant-pipe drain and signal the owned process group on leader exit,
-timeout, or cancellation. Signal success is not termination evidence. A bounded
-Linux `/proc` or portable `ps` observer must still find the pinned leader and
-must prove that every member of that PGID is dead or a zombie before the leader
-is reaped. Before `Popen`, one subprocess authority is constructed, inserted in
-the bounded ownership registry, and given the entered known-host lease. The
+otherwise. Darwin closes the pre-registration exit gap with an immediate
+non-reaping `ps` PID/PGID snapshot and uses the same bounded snapshot as a
+fallback if kqueue registration is unavailable; Linux uses proc status as its
+fallback. No portable waiter may reap the leader before group cleanup. All paths
+retain the 100 ms descendant-pipe drain and signal the owned process group on
+leader exit, timeout, or cancellation. Signal success is not termination
+evidence. A bounded Linux `/proc` or portable `ps` observer must still find the
+pinned leader and must prove that every member of that PGID is dead or a zombie
+before the leader is reaped. Before `Popen`, one subprocess authority is
+constructed, inserted in the bounded ownership registry, and given the entered
+known-host lease. The
 child first publishes its PID, PGID, and SID to that authority's anonymous birth
 record FD and then execs the requested command. Losing the `Popen` return to a
 `BaseException` therefore leaves the same pre-published owner able to recover
