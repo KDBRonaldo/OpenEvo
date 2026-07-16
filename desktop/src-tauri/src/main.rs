@@ -33,7 +33,7 @@ const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V1";
-const SIDECAR_PROCESS_MARKER: &str = "OPENEVO_DESKTOP_SIDECAR_PROCESS_V1";
+const SIDECAR_PROCESS_MARKER: &str = "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
 const NATIVE_WORKSPACE_IMPORT_ROUTE: &str = "/openevo-native/workspace-imports";
@@ -3601,6 +3601,33 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+struct ReleaseProcessMarkerFields<'a> {
+    pid: i32,
+    process_group: i32,
+    session_id: i32,
+    birth_identity: &'a str,
+    executable_digest: &'a [u8; 32],
+    executable_device: u64,
+    executable_inode: u64,
+    executable_size: u64,
+}
+
+fn release_sidecar_process_marker(fields: &ReleaseProcessMarkerFields<'_>) -> String {
+    format!(
+        "{SIDECAR_PROCESS_MARKER} pid={} pgid={} sid={} birth={} \
+         executable_device={} executable_inode={} executable_sha256={} \
+         executable_size={}",
+        fields.pid,
+        fields.process_group,
+        fields.session_id,
+        fields.birth_identity,
+        fields.executable_device,
+        fields.executable_inode,
+        encode_hex(fields.executable_digest),
+        fields.executable_size,
+    )
+}
+
 fn is_lower_hex(value: u8) -> bool {
     value.is_ascii_digit() || (b'a'..=b'f').contains(&value)
 }
@@ -4123,16 +4150,24 @@ fn spawn_sidecar_gated(
         && managed.birth_identity.is_some();
     let startup_was_cancelled = startup_cancelled(state, startup_epoch);
     if identity_verified {
-        eprintln!(
-            "{SIDECAR_PROCESS_MARKER} {} {pid} {} {} {}",
-            encode_hex(&managed.instance_id),
-            managed.process_group,
-            managed.session_id,
-            managed
-                .birth_identity
-                .as_deref()
-                .expect("verified sidecar identity has a birth identity"),
-        );
+        if let Some(executable) = managed.verified_executable.as_ref() {
+            eprintln!(
+                "{}",
+                release_sidecar_process_marker(&ReleaseProcessMarkerFields {
+                    pid,
+                    process_group: managed.process_group,
+                    session_id: managed.session_id,
+                    birth_identity: managed
+                        .birth_identity
+                        .as_deref()
+                        .expect("verified sidecar identity has a birth identity"),
+                    executable_digest: &executable.digest,
+                    executable_device: executable.identity.device,
+                    executable_inode: executable.identity.inode,
+                    executable_size: executable.identity.size,
+                })
+            );
+        }
     }
     if !identity_verified && !startup_was_cancelled {
         managed.mark_cleanup_pending();
@@ -6111,6 +6146,34 @@ mod tests {
             "sidecar_contract_incompatible"
         );
         stop_sidecar_inner(&state).unwrap();
+    }
+
+    #[test]
+    fn release_sidecar_process_marker_is_closed_and_digest_bound() {
+        let marker = release_sidecar_process_marker(&ReleaseProcessMarkerFields {
+            pid: 41,
+            process_group: 41,
+            session_id: 41,
+            birth_identity: "darwin:1700000000:123",
+            executable_digest: &[0xab; 32],
+            executable_device: 42,
+            executable_inode: 99,
+            executable_size: 1234,
+        });
+
+        assert_eq!(
+            marker,
+            concat!(
+                "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 ",
+                "pid=41 pgid=41 sid=41 birth=darwin:1700000000:123 ",
+                "executable_device=42 executable_inode=99 ",
+                "executable_sha256=abababababababababababababababab",
+                "abababababababababababababababab executable_size=1234",
+            )
+        );
+        assert!(!marker.contains("instance_id"));
+        assert!(!marker.contains("readiness"));
+        assert!(!marker.contains("session"));
     }
 
     #[test]

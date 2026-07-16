@@ -81,8 +81,13 @@ The repository currently provides:
   only the architecture reported by `rustc --print host-tuple`. Both the app
   inside the mounted exact candidate DMG and its detached copy launch the real
   `Contents/MacOS` Tauri executable. The smoke records a visible renderer
-  window, packaged sidecar readiness, inherited listener FD 3, executable FD 4
-  matching the bundled externalBin bytes, and bounded process-group cleanup.
+  window, the renderer's native-ready acknowledgement, packaged sidecar
+  readiness, inherited listener FD 3, executable FD 4, and bounded
+  process-group cleanup. A credential-free native process marker binds the
+  observed process group and FD 4 device, inode, and size to the digest that
+  Rust computed from the verified bundled externalBin bytes. The observer never
+  reopens the private launch pathname retained for the macOS PyInstaller
+  lifecycle; it trusts the marker-bound live FD identity instead.
   The dependent Linux job downloads the complete candidate manifest and
   installs, framework-verifies, and service-smokes the same final Core wheel
   bytes. Only after both jobs pass does a write-scoped job create an unsigned
@@ -156,12 +161,14 @@ copies and hashes it, then hashes it again. Before and after those reads it
 requires the source FD and parent-relative pathname to retain the same device,
 inode, size, mode, link count, owner, mtime, and ctime. All three digests must
 match. The private destination is created exclusively in a native-created
-`0700` directory, opened once for writing and separately read-only, and
-inode-bound unlinked before use. After `fsync` and mode `0500`, writer and reader
-identity, size, link count zero, and digest are checked again; only the read-only
-FD survives. The `0700` directory is not treated as protection from another
-same-UID process. Its owner retains a directory FD and performs only an
-identity-checked, non-recursive `rmdir`, so pathname replacement cannot cause
+`0700` directory and opened once for writing and separately read-only. After
+`fsync` and mode `0500`, writer and reader identity, size, platform-specific link
+count, and digest are checked again. Linux then unlinks the inode before use and
+retains only the read-only FD. macOS retains the link-count-one private pathname
+for the PyInstaller lifecycle described below and unlinks it during verified
+native cleanup. The `0700` directory is not treated as protection from another
+same-UID process. Its owner retains a directory FD and performs only
+identity-checked non-recursive cleanup, so pathname replacement cannot cause
 recursive deletion.
 
 Linux execution and archive reads use inherited FD 4 through `/proc/self/fd/4`.
@@ -198,6 +205,44 @@ macOS pathname is still inside the phase-one same-UID trust boundary: a same-UID
 process can race replacement after identity validation and before a later
 pathname-based `execvp`. Code signing or notarization alone does not close this
 pathname TOCTOU, and this design does not claim otherwise.
+
+For release observation, the native host emits the closed
+`OPENEVO_DESKTOP_SIDECAR_PROCESS_V2` marker only for a packaged launch. It
+contains PID, process-group ID, session ID, Darwin birth identity, verified
+executable device/inode/size, and executable SHA-256; it contains no instance,
+readiness, session, or handoff credential. The macOS app smoke drains this
+marker through a nonblocking size-bounded pipe. Before a byte/line overflow
+fails the smoke, every complete valid marker inside the budget is retained for
+cleanup observation. The parser follows the latest lifecycle when React
+StrictMode cancels an earlier bootstrap, and requires the live marker PID to
+remain a descendant with the same process group, session, and exact Darwin
+birth identity returned by `proc_pidinfo(PROC_PIDTBSDINFO)`. It then locates a
+single process in that group holding both an IPv4 `127.0.0.1` listening FD 3
+and a regular FD 4 with the marker-bound device, inode, and size. The SHA-256
+binding comes from the native host's already verified instance of that exact
+FD. The private pathname remains inside the documented same-UID trust boundary
+until native cleanup; the smoke does not reopen an `lsof` pathname because the
+marker and live FD identity, rather than that pathname, are the observation
+authority. The separate
+`OPENEVO_DESKTOP_RENDERER_READY_V1` acknowledgement and an on-screen non-empty
+window are both required. Failure or timeout of the CoreGraphics window probe
+fails closed; there is no weaker window-count fallback. Timeout output is
+restricted to a closed readiness stage and does not include process commands,
+paths, or credentials. The smoke
+signals the app process group only while its unreaped `Popen` child reserves the
+leader PID; once `poll` or `wait` has reaped that child, the numeric group is
+observation-only. Sidecar groups are terminated by the native host and
+parent-liveness watchdog; on success and failure the smoke performs a bounded
+disappearance check but never signals a historical numeric PGID. All macOS
+probes share the launch readiness deadline and run in private sessions. On
+timeout, while the direct probe leader remains unreaped, the driver takes a
+bounded `/bin/ps` ancestry snapshot, kills any currently observed descendant
+groups that escaped through `setsid` before killing the root group, and then
+reaps the direct leader. These fixed platform probes are not an extension
+boundary. Observation also caps the number of sidecar-group members inspected
+in one pass. Cleanup
+evidence requires every observed numeric process group to cease existing;
+zombie-only groups are not reported as cleaned.
 
 Every verified packaged launch also removes all inherited environment names with
 the PyInstaller-private `_PYI_` prefix and forces

@@ -168,11 +168,31 @@ path because the DMG bundler may remove that directory after packaging.
 reports by size and SHA256.
 Before launch, the smoke rejects symbolic links in the app root, `Info.plist`
 path, Tauri executable path, sidecar path, and their in-bundle ancestors. It
-captures each binary's pre-launch device/inode/size identity and digest, uses
-that digest for the sidecar FD observation, and rechecks both paths after
-process cleanup. Candidate JSON parsing rejects duplicate keys at every nesting
-level, so a last-key-wins parser cannot reinterpret the closed evidence
-contract.
+captures each binary's pre-launch device/inode/size identity and digest. The
+Rust native host emits a credential-free V2 marker binding its verified
+private executable FD to that sidecar digest plus its private device, inode,
+and size. The smoke binds the marker PID to the current app descendant,
+process group, session, and live Darwin birth identity; requires FD 3 to be an
+IPv4 loopback listener; and requires FD 4 in the same process to match the
+declared regular-file device, inode, and size. It also requires both the
+renderer-ready marker and a visible window. It does not reopen the private
+executable pathname: the pathname remains in the documented same-UID trust
+boundary until native cleanup, while the marker and live FD identity are the
+observer's authority. Both packaged paths are rechecked after process cleanup.
+Native stderr uses a nonblocking bounded pipe, parsing remains byte/line bounded,
+and timeout output uses only closed readiness stage names. Probe subprocesses
+share one readiness deadline and run in private sessions. Timeout cleanup takes
+a bounded ancestry snapshot while the direct leader is unreaped, kills observed
+escaped descendant groups before the root group, and then reaps the direct
+leader. The app process group is signalled only while the unreaped
+child reserves its leader PID; after `poll` or `wait`, that numeric group is
+observation-only. Native cleanup and the parent-liveness watchdog own sidecar
+termination, while both success and failure paths verify every observed group
+ceases to exist within a bounded cleanup period; a zombie-only group is still a
+cleanup failure.
+Candidate JSON parsing
+rejects duplicate keys at every nesting level, so a last-key-wins parser cannot
+reinterpret the closed evidence contract.
 The preceding tool probe locates an executable `lipo` through
 `xcrun --find lipo`; it does not use the unsupported `lipo -version` flag.
 Availability alone is not release evidence: both real app launches still run
