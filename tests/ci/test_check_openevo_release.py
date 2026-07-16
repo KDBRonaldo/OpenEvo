@@ -1648,6 +1648,8 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "fn prepare_packaged_sidecar(" in main
     assert "libc::O_NOFOLLOW" in main
     assert "acl_get_fd_np" in main
+    assert '#[cfg(target_os = "linux")]\nfn fd_execution_path()' in main
+    assert '#[cfg(all(target_os = "macos", test))]\nfn fd_execution_path()' in main
     assert "struct SpawnHandoff" in main
     assert "run_parent_liveness_watchdog" in main
     assert "libc::WNOWAIT" in main
