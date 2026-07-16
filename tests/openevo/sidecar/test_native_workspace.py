@@ -156,10 +156,13 @@ def test_native_workspace_rejects_links_special_files_and_noncanonical_names(
 
     sparse = tmp_path / "sparse"
     sparse.mkdir()
-    with (sparse / "sparse.bin").open("wb") as stream:
+    sparse_file = sparse / "sparse.bin"
+    with sparse_file.open("wb") as stream:
         stream.seek(1024 * 1024 - 1)
         stream.write(b"\0")
-    cases.append(sparse)
+    sparse_status = sparse_file.stat()
+    if sparse_status.st_blocks * 512 < sparse_status.st_size:
+        cases.append(sparse)
 
     for index, source in enumerate(cases):
         with pytest.raises(NativeWorkspaceArchiveError):
@@ -201,6 +204,19 @@ def test_native_workspace_fails_closed_without_extent_queries(
     with pytest.raises(NativeWorkspaceArchiveError, match="detection is unavailable"):
         with _prepare(source, private_root, "native-source-no-extent-query-0001"):
             pass
+
+
+def test_native_workspace_rejects_low_allocation_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SparseStatus:
+        st_size = 8 * 1024 * 1024
+        st_blocks = 8
+
+    monkeypatch.setattr(native_workspace_module.os, "fstat", lambda _descriptor: SparseStatus())
+
+    with pytest.raises(NativeWorkspaceArchiveError, match="allocation"):
+        native_workspace_module._require_non_sparse_file(17, SparseStatus.st_size)
 
 
 def test_native_workspace_extent_fallback_cannot_hide_low_allocation(
@@ -277,7 +293,8 @@ def test_macos_apfs_rejects_a_low_allocation_sparse_file(tmp_path: Path) -> None
         stream.write(b"x" * 4096)
         stream.truncate(8 * 1024 * 1024)
     status = sparse_file.stat()
-    assert status.st_blocks * 512 < status.st_size
+    if status.st_blocks * 512 >= status.st_size:
+        pytest.skip("APFS allocated the complete logical file")
     private_root = tmp_path / "private"
     private_root.mkdir(mode=0o700)
 

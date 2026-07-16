@@ -45,13 +45,19 @@ coverage that invokes `python -m build --no-isolation`.
 
 The dedicated macOS anonymous Core transport job clears the runner's ambient
 `SSH_AUTH_SOCK` and runs the exact anonymous socketpair metadata, identity,
-FD-transfer, cancellation, fail-closed, and real child-relay nodes. The full SSH
+FD-transfer, cancellation, fail-closed, and real child-relay nodes. The child
+relay node is not an end-to-end OpenSSH authentication gate. The full SSH
 transport suite remains in the Linux Core job and also runs in the Desktop
 macOS native smoke with a short pytest base directory, private umask, and no
 ambient runner agent. The focused macOS job must retain the real relay node and
 must not be reduced to metadata-only tests. The stable-only Desktop candidate
 gate runs the complete macOS SSH suite under the same private, agent-free,
 short-path environment before packaging a DMG.
+
+Native workspace tests reject sparse allocation through deterministic metadata
+and extent-map contract tests. Filesystem integration fixtures skip only when
+the host filesystem physically allocates the complete logical file; they must
+not reinterpret a fully allocated file as sparse.
 
 Run relevant module suites when touching shared behavior:
 

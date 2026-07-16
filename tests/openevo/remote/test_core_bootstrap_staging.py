@@ -763,13 +763,14 @@ def test_remote_asset_consumer_rejects_same_name_replacement_after_handoff(
     final_root = service_root / "assets" / BUNDLE_ID
     displaced = service_root / "assets" / f"{BUNDLE_ID}.displaced"
     final_root.rename(displaced)
-    final_root.mkdir(mode=0o500)
+    final_root.mkdir(mode=0o700)
     for source, target in (
         (assets[0], final_root / WHEEL_NAME),
         (assets[2], final_root / "framework-lock.json"),
     ):
         target.write_bytes(source.read_bytes())
         target.chmod(0o400)
+    final_root.chmod(0o500)
 
     with pytest.raises(SystemExit):
         _execute_remote_script(
