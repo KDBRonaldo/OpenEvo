@@ -407,20 +407,40 @@ def _send_native_frame(
         if stream.write(frame) != len(frame):
             raise BrokenPipeError
         stream.close()
-    except (OSError, ValueError):
+    except BaseException as exc:
+        cancellation = exc if isinstance(exc, (KeyboardInterrupt, SystemExit)) else None
         try:
             stream.close()
-        except (OSError, ValueError):
-            pass
+        except BaseException as close_exc:
+            if cancellation is None and isinstance(
+                close_exc,
+                (KeyboardInterrupt, SystemExit),
+            ):
+                cancellation = close_exc
         process.stdin = None
-        failure = _process_failure(
-            process,
-            process_group_id=process_group_id,
-            exit_observer=exit_observer,
-        )
-        if process.stdout is not None:
-            process.stdout.close()
-        raise SmokeFailure(failure) from None
+        if cancellation is None and isinstance(exc, Exception):
+            try:
+                failure = _process_failure(
+                    process,
+                    process_group_id=process_group_id,
+                    exit_observer=exit_observer,
+                )
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
+            raise SmokeFailure(failure) from None
+        try:
+            _terminate(
+                process,
+                process_group_id=process_group_id,
+                exit_observer=exit_observer,
+            )
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+        if cancellation is not None and cancellation is not exc:
+            raise cancellation
+        raise
     process.stdin = None
 
 

@@ -242,10 +242,13 @@ diagnostics upload path.
 
 The smoke keeps the launched sidecar leader unreaped while health is pending and
 uses the Core non-reaping process-group observer for exit and cleanup. Normal
-cleanup proves the complete PGID dead and absent before reaping. If that
-observation authority fails, the still-unreaped leader authorizes a direct
-whole-group `SIGKILL` fallback and leader reap; the candidate remains failed even
-when this emergency cleanup succeeds.
+cleanup first proves that the complete PGID has no live members, then reaps the
+leader and proves the PGID absent. If that observation authority fails, the
+still-unreaped leader authorizes a direct whole-group `SIGKILL` fallback and
+leader reap; the candidate remains failed even when this emergency cleanup
+succeeds. The launch owner also covers native credential-frame handoff, so
+cancellation or any other `BaseException` during the write/close interval cleans
+the owned process group before the exception propagates.
 
 Readiness sends a fresh 256-bit challenge to `/health`. The closed Rust response
 model requires the exact protocol and instance ID and verifies HMAC-SHA256 over

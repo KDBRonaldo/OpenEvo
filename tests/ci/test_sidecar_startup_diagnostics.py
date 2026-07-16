@@ -56,6 +56,20 @@ class _BrokenPipeProcess(_ExitedProcess):
         self.stdin = _BrokenPipeInput(canary)
 
 
+class _CancellingInput:
+    def __init__(self, stream, canary: str) -> None:
+        self._stream = stream
+        self._canary = canary
+        self.closed = False
+
+    def write(self, _payload: bytes) -> int:
+        raise SystemExit(self._canary)
+
+    def close(self) -> None:
+        self.closed = True
+        self._stream.close()
+
+
 def test_startup_producers_exactly_match_smoke_allowlist() -> None:
     builder = _load_module(
         "openevo_sidecar_builder_startup_contract_test",
@@ -232,6 +246,74 @@ def test_native_frame_broken_pipe_surfaces_only_closed_startup_diagnostic(
     )
     assert canary not in str(rejected.value)
     assert process.stdin is None
+
+
+def test_native_frame_cancellation_reaps_owned_process_group(tmp_path: Path) -> None:
+    smoke = _load_module(
+        "openevo_sidecar_smoke_frame_cancellation_test",
+        "scripts/ci/smoke_openevo_desktop_sidecar.py",
+    )
+    child_path = tmp_path / "descendant.pid"
+    leader_program = (
+        "import os,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)'])\n"
+        "pending=Path(str(sys.argv[1])+'.pending')\n"
+        "pending.write_text(str(child.pid),encoding='ascii')\n"
+        "os.replace(pending,sys.argv[1])\n"
+        "time.sleep(30)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", leader_program, str(child_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    process_group_id = smoke._owned_process_group_id(process)
+    observer = smoke._SubprocessExitObserver(process)
+    cancellation = _CancellingInput(
+        process.stdin,
+        "Traceback /Users/private token=secret",
+    )
+    process.stdin = cancellation
+    child_id: int | None = None
+    try:
+        deadline = time.monotonic() + 3
+        while not child_path.exists():
+            if time.monotonic() >= deadline:
+                pytest.fail("descendant identity was not published")
+            time.sleep(0.01)
+        child_id = int(child_path.read_text(encoding="ascii"))
+
+        with pytest.raises(SystemExit, match="token=secret"):
+            smoke._send_native_frame(
+                process,
+                smoke._NativeCredentials.create(),
+                process_group_id=process_group_id,
+                exit_observer=observer,
+            )
+
+        assert process.stdin is None
+        assert process.stdout.closed is True
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_id, 0)
+    finally:
+        observer.close()
+        if process.returncode is None:
+            try:
+                os.killpg(process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=3)
+        if not cancellation.closed:
+            cancellation.close()
+        if not process.stdout.closed:
+            process.stdout.close()
 
 
 def test_smoke_uses_bounded_pipe_instead_of_disk_backed_process_log() -> None:
