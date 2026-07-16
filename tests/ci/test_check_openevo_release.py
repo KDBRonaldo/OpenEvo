@@ -67,6 +67,16 @@ def _load_release_candidate_module():
     return module
 
 
+def _load_framework_wheel_smoke_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_evolution_framework_wheel.py"
+    spec = importlib.util.spec_from_file_location("smoke_evolution_framework_wheel", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_desktop_wheel_smoke_module():
     path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_desktop_wheel.py"
     spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_wheel", path)
@@ -898,6 +908,8 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "scripts/ci/smoke_openevo_remote_capabilities.py" in linux_job
     assert "--wheel .openevo-release-inputs/openevo-*.whl" in linux_job
     assert "--framework-lock .openevo-release-inputs/framework-lock.json" in linux_job
+    assert "--mode linux-context-projection" in linux_job
+    assert "--mode installed-registry" not in linux_job
     assert '--sidecar "$OPENEVO_LINUX_PACKAGED_SIDECAR"' in linux_job
     assert "openevo-remote-smoke-home" not in linux_job
 
@@ -1389,6 +1401,120 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert '".github/workflows/openevo-desktop-candidate.yml"' in desktop_checks
     assert "Exercise macOS Core release publication contract" in desktop_checks
     assert "Core release ACL and cleanup policy" not in desktop_checks
+
+
+def test_desktop_candidate_assigns_platform_safe_framework_smoke_modes() -> None:
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(encoding="utf-8")
+    framework_smoke = Path("scripts/ci/smoke_evolution_framework_wheel.py").read_text(
+        encoding="utf-8"
+    )
+    macos_job, linux_and_release_jobs = workflow.split("  linux-core-candidate:\n", maxsplit=1)
+    linux_job = linux_and_release_jobs.split("  draft-prerelease-roundtrip:\n", maxsplit=1)[0]
+
+    smoke_command = "scripts/ci/smoke_evolution_framework_wheel.py"
+    assert "Clean-install and verify final Core wheel, lock, and registry" in macos_job
+    assert macos_job.count(smoke_command) == 1
+    assert "--mode installed-registry" in macos_job
+    assert "--mode linux-context-projection" not in macos_job
+    assert "Smoke Linux migration and context projection from exact Core wheel" in linux_job
+    assert linux_job.count(smoke_command) == 1
+    assert "--mode linux-context-projection" in linux_job
+    assert "--mode installed-registry" not in linux_job
+    assert linux_job.index("actions/download-artifact@v4") < linux_job.index(smoke_command)
+    assert linux_job.index("Restore private Core candidate input modes") < linux_job.index(
+        smoke_command
+    )
+    assert linux_job.index("openevo_release_candidate.py validate") < linux_job.index(
+        smoke_command
+    )
+    assert linux_job.index("pip install candidate-artifacts/openevo-*.whl") < linux_job.index(
+        smoke_command
+    )
+    assert '"--mode",' in framework_smoke
+    assert 'choices=("installed-registry", "linux-context-projection")' in framework_smoke
+    assert 'if mode == "linux-context-projection" and sys.platform != "linux":' in (
+        framework_smoke
+    )
+    assert 'evidence["verification_mode"] = mode' in framework_smoke
+    assert '"passed" if mode == "linux-context-projection" else "not-run"' in (framework_smoke)
+    assert 'smoke.get("verification_mode") != "linux-context-projection"' in linux_job
+    assert 'smoke.get("linux_context_projection") != "passed"' in linux_job
+    assert "needs: macos-candidate" in linux_job
+    assert "needs: [macos-candidate, linux-core-candidate]" in workflow
+
+
+def test_linux_context_projection_mode_fails_closed_off_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    framework_smoke = _load_framework_wheel_smoke_module()
+    monkeypatch.setattr(framework_smoke.sys, "platform", "darwin")
+
+    with pytest.raises(
+        RuntimeError,
+        match="linux-context-projection framework smoke requires Linux",
+    ):
+        framework_smoke.smoke(
+            Path("missing.whl"),
+            Path("missing-framework-lock.json"),
+            mode="linux-context-projection",
+        )
+
+
+def test_framework_wheel_smoke_dispatches_only_the_selected_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    framework_smoke = _load_framework_wheel_smoke_module()
+    loaded_registry = object()
+    projection_calls: list[object] = []
+
+    def verify_registry(_wheel: Path, _lock: Path):
+        return {"registry_digest": "a" * 64}, loaded_registry
+
+    monkeypatch.setattr(framework_smoke, "_verify_installed_registry", verify_registry)
+    monkeypatch.setattr(
+        framework_smoke,
+        "_smoke_linux_context_projection",
+        projection_calls.append,
+    )
+    monkeypatch.setattr(framework_smoke.sys, "platform", "linux")
+
+    installed = framework_smoke.smoke(
+        Path("wheel.whl"),
+        Path("framework-lock.json"),
+        mode="installed-registry",
+    )
+    assert installed["verification_mode"] == "installed-registry"
+    assert installed["linux_context_projection"] == "not-run"
+    assert projection_calls == []
+
+    projected = framework_smoke.smoke(
+        Path("wheel.whl"),
+        Path("framework-lock.json"),
+        mode="linux-context-projection",
+    )
+    assert projected["verification_mode"] == "linux-context-projection"
+    assert projected["linux_context_projection"] == "passed"
+    assert projection_calls == [loaded_registry]
+
+
+def test_framework_wheel_smoke_cli_requires_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    framework_smoke = _load_framework_wheel_smoke_module()
+    monkeypatch.setattr(
+        framework_smoke.sys,
+        "argv",
+        [
+            "smoke_evolution_framework_wheel.py",
+            "--wheel",
+            "wheel.whl",
+            "--framework-lock",
+            "framework-lock.json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        framework_smoke.main()
+
+    assert exc_info.value.code == 2
 
 
 def test_candidate_cleanup_deletes_only_the_validated_immutable_release_id() -> None:

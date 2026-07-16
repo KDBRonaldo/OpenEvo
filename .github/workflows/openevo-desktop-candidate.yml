@@ -175,7 +175,7 @@ jobs:
           test -x "$sidecar"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
 
-      - name: Clean-install and verify final Core wheel and framework lock
+      - name: Clean-install and verify final Core wheel, lock, and registry
         run: |
           test "$(find "$OPENEVO_CANDIDATE_CORE" -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
           test -f "$OPENEVO_CANDIDATE_CORE/framework-lock.json"
@@ -188,10 +188,11 @@ jobs:
             scripts/ci/smoke_evolution_framework_wheel.py \
             --wheel "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl \
             --framework-lock "$OPENEVO_CANDIDATE_CORE/framework-lock.json" \
-            > "$RUNNER_TEMP/framework-smoke.json"
+            --mode installed-registry \
+            > "$RUNNER_TEMP/installed-registry-smoke.json"
           registry_digest="$(uv run python -c \
             'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["registry_digest"])' \
-            "$RUNNER_TEMP/framework-smoke.json")"
+            "$RUNNER_TEMP/installed-registry-smoke.json")"
           test "${#registry_digest}" = 64
           echo "OPENEVO_REGISTRY_DIGEST=$registry_digest" >> "$GITHUB_ENV"
 
@@ -348,7 +349,7 @@ jobs:
             --expected-source-commit "$GITHUB_SHA" \
             --expected-core-platform linux-x86_64
 
-      - name: Install and verify the exact candidate Core wheel
+      - name: Smoke Linux migration and context projection from exact Core wheel
         run: |
           python -m venv "$RUNNER_TEMP/openevo-candidate-core"
           "$RUNNER_TEMP/openevo-candidate-core/bin/python" -m pip install --upgrade pip
@@ -359,8 +360,9 @@ jobs:
             scripts/ci/smoke_evolution_framework_wheel.py \
             --wheel candidate-artifacts/openevo-*.whl \
             --framework-lock candidate-artifacts/framework-lock.json \
-            > "$RUNNER_TEMP/linux-framework-smoke.json"
-          uv run python - "$RUNNER_TEMP/linux-framework-smoke.json" \
+            --mode linux-context-projection \
+            > "$RUNNER_TEMP/linux-context-projection-smoke.json"
+          uv run python - "$RUNNER_TEMP/linux-context-projection-smoke.json" \
             candidate-artifacts/release-candidate.json <<'PY'
           import json
           from pathlib import Path
@@ -368,6 +370,10 @@ jobs:
 
           smoke = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           candidate = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          if smoke.get("verification_mode") != "linux-context-projection":
+              raise SystemExit("Linux candidate did not run the context-projection smoke")
+          if smoke.get("linux_context_projection") != "passed":
+              raise SystemExit("Linux candidate context-projection evidence is incomplete")
           if smoke["registry_digest"] != candidate["core"]["registry_digest"]:
               raise SystemExit("Linux registry digest differs from the candidate manifest")
           PY

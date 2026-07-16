@@ -90,7 +90,16 @@ transferred wheel and framework lock to `0600`. Consumers must not weaken the
 Core supervisor's owner-only framework-lock requirement. The Linux job must not
 rebuild the wheel or lock, and it rechecks those final candidate bytes after the
 service smoke. Conversely, the macOS packaging job must not run the Linux-only
-Core service lifecycle.
+Core service lifecycle. Framework wheel verification also has explicit platform
+scopes: macOS uses `--mode installed-registry` to verify the installed wheel,
+exact lock, distribution inventory, entry points, target handlers, and frozen
+registry; Linux uses `--mode linux-context-projection` to repeat those checks
+and then exercise the `O_PATH`-dependent artifact migration and
+context-projection path. The full Linux scope must remain on the exact
+downloaded candidate bytes and cannot be replaced by the cross-platform
+registry scope. The stronger hostile-install bootstrap threat model is tracked
+in GitHub issue #193 and is not a claim of this unsigned packaging-only
+candidate.
 
 On macOS, the native host copies the verified sidecar into an owner-only private
 directory and executes the named private copy while retaining its verified file

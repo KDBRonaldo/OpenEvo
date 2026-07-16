@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import tempfile
 from importlib import metadata
 from pathlib import Path
+from typing import Any
 
 import openevo
 
@@ -50,7 +52,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def smoke(wheel_path: Path, framework_lock_path: Path) -> dict[str, object]:
+def _verify_installed_registry(
+    wheel_path: Path,
+    framework_lock_path: Path,
+) -> tuple[dict[str, object], Any]:
     wheel = wheel_path.resolve(strict=True)
     framework_lock = framework_lock_path.resolve(strict=True)
     repository_src = Path(__file__).resolve().parents[2] / "src"
@@ -97,6 +102,47 @@ def smoke(wheel_path: Path, framework_lock_path: Path) -> dict[str, object]:
     if set(loaded.descriptor_anchors) != expected_anchor_keys:
         raise RuntimeError("installed target anchors are incomplete")
 
+    return (
+        {
+            "distribution": "openevo",
+            "framework_lock_sha256": _sha256(framework_lock),
+            "version": version,
+            "wheel_sha256": verified.expectation.distribution_digest,
+            "inventory_digest": verified.inventory_digest,
+            "registry_digest": loaded.snapshot.registry_digest,
+            "method_count": len(loaded.method_handles),
+            "handler_handle_count": len(loaded.handler_handles),
+            "anchor_count": len(loaded.descriptor_anchors),
+            "target_count": len(loaded.snapshot.targets),
+            "handler_count": len(loaded.snapshot.target_handlers),
+            "import_path": str(import_path),
+        },
+        loaded,
+    )
+
+
+def smoke(
+    wheel_path: Path,
+    framework_lock_path: Path,
+    *,
+    mode: str,
+) -> dict[str, object]:
+    if mode not in {"installed-registry", "linux-context-projection"}:
+        raise ValueError("framework wheel smoke mode is invalid")
+    if mode == "linux-context-projection" and sys.platform != "linux":
+        raise RuntimeError("linux-context-projection framework smoke requires Linux")
+
+    evidence, loaded = _verify_installed_registry(wheel_path, framework_lock_path)
+    if mode == "linux-context-projection":
+        _smoke_linux_context_projection(loaded)
+    evidence["linux_context_projection"] = (
+        "passed" if mode == "linux-context-projection" else "not-run"
+    )
+    evidence["verification_mode"] = mode
+    return evidence
+
+
+def _smoke_linux_context_projection(loaded: Any) -> None:
     from openevo.evolution.context_projection import ContextProjectionResolveRequest
     from openevo.evolution.framework import (
         EvolutionExecutionProfile,
@@ -165,28 +211,19 @@ def smoke(wheel_path: Path, framework_lock_path: Path) -> dict[str, object]:
             raise RuntimeError("installed migrated store did not project current artifact")
         if projection.selection.skipped_artifact_ids != (legacy_artifact.artifact_id,):
             raise RuntimeError("installed migrated store did not quarantine legacy artifact")
-    return {
-        "distribution": "openevo",
-        "framework_lock_sha256": _sha256(framework_lock),
-        "version": version,
-        "wheel_sha256": verified.expectation.distribution_digest,
-        "inventory_digest": verified.inventory_digest,
-        "registry_digest": loaded.snapshot.registry_digest,
-        "method_count": len(loaded.method_handles),
-        "handler_handle_count": len(loaded.handler_handles),
-        "anchor_count": len(loaded.descriptor_anchors),
-        "target_count": len(loaded.snapshot.targets),
-        "handler_count": len(loaded.snapshot.target_handlers),
-        "import_path": str(import_path),
-    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wheel", required=True, type=Path)
     parser.add_argument("--framework-lock", required=True, type=Path)
+    parser.add_argument(
+        "--mode",
+        choices=("installed-registry", "linux-context-projection"),
+        required=True,
+    )
     args = parser.parse_args()
-    print(json.dumps(smoke(args.wheel, args.framework_lock), sort_keys=True))
+    print(json.dumps(smoke(args.wheel, args.framework_lock, mode=args.mode), sort_keys=True))
     return 0
 
 

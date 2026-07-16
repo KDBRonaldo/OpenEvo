@@ -188,7 +188,8 @@ jobs:
           PYTHONPATH= .openevo-core-smoke/bin/openevo-backend run --help
           PYTHONPATH= .openevo-core-smoke/bin/python scripts/ci/smoke_evolution_framework_wheel.py \
             --wheel .openevo-release-inputs/openevo-*.whl \
-            --framework-lock .openevo-release-inputs/framework-lock.json
+            --framework-lock .openevo-release-inputs/framework-lock.json \
+            --mode linux-context-projection
 
       - name: Build executable Linux packaged sidecar fixture
         run: |
