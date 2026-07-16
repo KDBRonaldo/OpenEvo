@@ -857,6 +857,18 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert "actions/download-artifact@v4" in linux_job
     assert f"name: {artifact_name}" in linux_job
     assert "path: .openevo-release-inputs" in linux_job
+    assert "name: Restore private Core release input modes" in linux_job
+    assert "chmod 0700 .openevo-release-inputs" in linux_job
+    release_mode_step = linux_job.split(
+        "      - name: Restore private Core release input modes\n", maxsplit=1
+    )[1].split(
+        "      - name: Verify transferred Core release input manifest\n", maxsplit=1
+    )[0]
+    assert "chmod 0600 \\" in release_mode_step
+    assert ".openevo-release-inputs/openevo-*.whl" in release_mode_step
+    assert ".openevo-release-inputs/framework-lock.json" in release_mode_step
+    assert ".openevo-release-inputs/SHA256SUMS" in release_mode_step
+    assert "stat -c '%a' .openevo-release-inputs/framework-lock.json" in release_mode_step
     assert (
         "EXPECTED_MANIFEST_SHA256: "
         "${{ needs.macos-packaging-smoke.outputs.manifest_sha256 }}"
@@ -866,6 +878,9 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
     assert linux_job.count("-mindepth 1 -maxdepth 1") == 2
     assert "uv sync --frozen --group dev" in linux_job
     assert linux_job.index("actions/download-artifact@v4") < linux_job.index(
+        "Restore private Core release input modes"
+    )
+    assert linux_job.index("Restore private Core release input modes") < linux_job.index(
         "Verify transferred Core release input manifest"
     )
     assert linux_job.index("Verify transferred Core release input manifest") < linux_job.index(
@@ -1233,6 +1248,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "SHA256SUMS",
         "actions/upload-artifact@v4",
         "actions/download-artifact@v4",
+        "Restore private Core candidate input modes",
+        "stat -c '%a' candidate-artifacts/framework-lock.json",
         "retention-days: 14",
         "openevo_release_candidate.py write-notes",
         "openevo_release_candidate.py write-draft-body",
@@ -1314,6 +1331,20 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "scripts/ci/openevo_release_candidate.py create"
     )
     assert text.index("linux-core-candidate:") < text.index("draft-prerelease-roundtrip:")
+    candidate_mode_step = text.split(
+        "      - name: Restore private Core candidate input modes\n", maxsplit=1
+    )[1].split(
+        "      - name: Verify candidate manifest and transferred manifest bytes\n", maxsplit=1
+    )[0]
+    assert "chmod 0600 \\" in candidate_mode_step
+    assert "candidate-artifacts/openevo-*.whl" in candidate_mode_step
+    assert "candidate-artifacts/framework-lock.json" in candidate_mode_step
+    assert text.index("Download exact final candidate bytes") < text.index(
+        "Restore private Core candidate input modes"
+    )
+    assert text.index("Restore private Core candidate input modes") < text.index(
+        "Verify candidate manifest and transferred manifest bytes"
+    )
     assert "needs: [macos-candidate, linux-core-candidate]" in text
     assert text.index("gh release create") < text.index("gh release upload")
     assert text.index("gh release upload") < text.index("gh release download")
@@ -1528,7 +1559,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
         "tests::packaged_external_bin_native_launch_smoke"
     )
     assert "macOS FD-bound packaged sidecar launch smoke" in workflow
-    assert "tests::macos_release_uses_private_path_and_keeps_the_verified_fd" in workflow
+    assert "tests::macos_release_spawns_from_the_populated_private_path" in workflow
     assert "if: always()" in workflow
     assert 'rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"' in workflow
     assert "cargo build --locked --release" in workflow

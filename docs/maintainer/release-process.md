@@ -82,9 +82,24 @@ SHA-256 manifest, and uploads the exact inputs under an artifact name bound to
 the source commit, workflow run, and run attempt. The Linux Core job depends on
 that producer, verifies the downloaded manifest against the digest passed
 through the job output, rechecks both member digests, and only then installs the
-wheel and runs `openevo-core-service`. It must not rebuild the wheel or lock, and it rechecks
-those final candidate bytes after the service smoke. Conversely, the macOS
-packaging job must not run the Linux-only Core service lifecycle.
+wheel and runs `openevo-core-service`. GitHub artifact transfer does not preserve
+Unix file modes, so the pull-request consumer restores its release-input
+directory to `0700` and the wheel, framework lock, and checksum inventory to
+`0600` before verification. The candidate consumer likewise restores the
+transferred wheel and framework lock to `0600`. Consumers must not weaken the
+Core supervisor's owner-only framework-lock requirement. The Linux job must not
+rebuild the wheel or lock, and it rechecks those final candidate bytes after the
+service smoke. Conversely, the macOS packaging job must not run the Linux-only
+Core service lifecycle.
+
+On macOS, the native host copies the verified sidecar into an owner-only private
+directory and executes the named private copy while retaining its verified file
+descriptor. The directory's full execution-time identity is captured only after
+that named executable is published and revalidated. `pre_exec` compares that
+current snapshot against both the held directory descriptor and pathname; the
+long-lived creation identity remains a device/inode anchor. This preserves the
+anti-swap check without comparing a populated directory to its stale empty-state
+metadata.
 
 If the packaged sidecar exits before readiness, inspect only the bounded
 `OPENEVO_STARTUP_V1` stage/code emitted by the bootloader or Python entry

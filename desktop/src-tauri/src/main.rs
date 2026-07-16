@@ -2305,6 +2305,22 @@ fn command_from_launch_spec(
             let fd = duplicate_fd_at_least(directory.directory.as_raw_fd(), 10)
                 .map_err(|_| private_sidecar_error())?;
             let guard = unsafe { File::from_raw_fd(fd) };
+            let current_identity = file_identity(&guard).map_err(|_| private_sidecar_error())?;
+            let source_identity =
+                file_identity(&directory.directory).map_err(|_| private_sidecar_error())?;
+            let path_identity = fs::symlink_metadata(directory.path())
+                .map(|metadata| file_identity_from_metadata(&metadata))
+                .map_err(|_| private_sidecar_error())?;
+            if current_identity != source_identity
+                || current_identity != path_identity
+                || current_identity.device != directory.identity.device
+                || current_identity.inode != directory.identity.inode
+                || current_identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
+                || current_identity.owner != unsafe { libc::geteuid() }
+                || current_identity.mode & 0o777 != 0o700
+            {
+                return Err(private_sidecar_error());
+            }
             let directory_path = CString::new(directory.path().as_os_str().as_bytes())
                 .map_err(|_| private_sidecar_error())?;
             let executable_name =
@@ -2313,7 +2329,7 @@ fn command_from_launch_spec(
                 .map_err(|_| private_sidecar_error())?;
             (
                 Some(guard),
-                Some(directory.identity.clone()),
+                Some(current_identity),
                 Some(directory_path),
                 Some(executable_name),
                 Some(program_path),
@@ -6880,13 +6896,58 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_release_uses_private_path_and_keeps_the_verified_fd() {
+    fn macos_release_spawns_from_the_populated_private_path() {
         assert_eq!(fd_execution_path(), PathBuf::from("/dev/fd/4"));
-        let private = PrivateLaunchDirectory::create().unwrap();
+        let fixture = SidecarFixture::from_existing(Path::new("/bin/true"));
+        let (verified_executable, private) = prepare_packaged_sidecar(fixture.path()).unwrap();
+        let initial_directory_identity = private.identity.clone();
+        let populated_directory_identity = file_identity(&private.directory).unwrap();
+        assert_eq!(
+            (
+                populated_directory_identity.device,
+                populated_directory_identity.inode,
+            ),
+            (
+                initial_directory_identity.device,
+                initial_directory_identity.inode,
+            )
+        );
+        assert_ne!(populated_directory_identity, initial_directory_identity);
+        let private_root = private.path().to_path_buf();
         assert_eq!(
             release_execution_path(&private),
             private.path().join(BUNDLED_SIDECAR_BINARY)
         );
+        let allocated = allocate_sidecar_listener().unwrap();
+        let launch = SidecarLaunchSpec {
+            program: release_execution_path(&private),
+            args: Vec::new(),
+            current_dir: None,
+            remove_env: &[],
+            private_launch_dir: Some(private),
+            verified_executable: Some(verified_executable),
+        };
+
+        let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
+        let mut child = prepared.spawn().unwrap();
+        drop(child.stdin.take());
+
+        assert!(child.wait().unwrap().success());
+        launch
+            .private_launch_dir
+            .as_ref()
+            .unwrap()
+            .validate()
+            .unwrap();
+        launch
+            .verified_executable
+            .as_ref()
+            .unwrap()
+            .validate()
+            .unwrap();
+        drop(prepared);
+        drop(launch);
+        assert!(!private_root.exists());
     }
 
     #[cfg(debug_assertions)]

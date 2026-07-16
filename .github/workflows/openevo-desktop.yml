@@ -202,7 +202,7 @@ jobs:
       - name: Exercise macOS private executable and FD handoff lifecycle
         working-directory: desktop/src-tauri
         run: |
-          cargo test --locked tests::macos_release_uses_private_path_and_keeps_the_verified_fd -- --exact
+          cargo test --locked tests::macos_release_spawns_from_the_populated_private_path -- --exact
           cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
 
       - name: Exercise packaged fixed-executable birth dispatch

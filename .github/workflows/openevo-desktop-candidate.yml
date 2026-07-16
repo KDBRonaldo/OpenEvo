@@ -329,6 +329,13 @@ jobs:
           name: openevo-desktop-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: candidate-artifacts
 
+      - name: Restore private Core candidate input modes
+        run: |
+          chmod 0600 \
+            candidate-artifacts/openevo-*.whl \
+            candidate-artifacts/framework-lock.json
+          test "$(stat -c '%a' candidate-artifacts/framework-lock.json)" = 600
+
       - name: Verify candidate manifest and transferred manifest bytes
         env:
           EXPECTED_MANIFEST_SHA256: ${{ needs.macos-candidate.outputs.manifest_sha256 }}

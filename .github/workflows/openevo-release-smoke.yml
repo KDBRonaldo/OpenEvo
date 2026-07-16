@@ -152,6 +152,16 @@ jobs:
           name: openevo-core-release-inputs-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .openevo-release-inputs
 
+      - name: Restore private Core release input modes
+        run: |
+          chmod 0700 .openevo-release-inputs
+          chmod 0600 \
+            .openevo-release-inputs/openevo-*.whl \
+            .openevo-release-inputs/framework-lock.json \
+            .openevo-release-inputs/SHA256SUMS
+          test "$(stat -c '%a' .openevo-release-inputs)" = 700
+          test "$(stat -c '%a' .openevo-release-inputs/framework-lock.json)" = 600
+
       - name: Verify transferred Core release input manifest
         env:
           EXPECTED_MANIFEST_SHA256: ${{ needs.macos-packaging-smoke.outputs.manifest_sha256 }}
