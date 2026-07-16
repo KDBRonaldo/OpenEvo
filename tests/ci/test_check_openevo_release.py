@@ -1576,11 +1576,18 @@ def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
     )
     utils_header = tmp_path / "bootloader/src/pyi_utils.h"
     utils_header.write_text(module._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
+    wscript = tmp_path / "bootloader/wscript"
+    wscript.write_text(
+        module._BOOTLOADER_DARWIN_LIB_NEEDLE
+        + module._BOOTLOADER_PROGRAM_LIBS_NEEDLE,
+        encoding="utf-8",
+    )
 
     module._patch_fd_bound_bootloader(tmp_path)
 
     patched = source.read_text(encoding="utf-8")
     patched_utils = utils_source.read_text(encoding="utf-8")
+    patched_wscript = wscript.read_text(encoding="utf-8")
     assert patched.count('getenv("OPENEVO_NATIVE_EXECUTABLE_PATH")') == 1
     assert patched.count('getenv("OPENEVO_NATIVE_LISTENER_FD")') == 1
     assert patched.count("pyi_archive_open(openevo_archive_path)") == 1
@@ -1588,6 +1595,8 @@ def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
     assert patched.count("lstat(openevo_native_path, &openevo_path_stat)") == 1
     assert patched.count("lstat(openevo_resolved_path, &openevo_resolved_stat)") == 1
     assert "SO_ACCEPTCONN" in patched_utils
+    assert "proc_pidfdinfo" in patched_utils
+    assert "uselib_store='PROC'" in patched_wscript
     assert "pyi_utils_openevo_native_handoff_restore()" in patched_utils
 
 

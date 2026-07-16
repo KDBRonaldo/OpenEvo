@@ -363,6 +363,23 @@ _BOOTLOADER_POSIX_INCLUDE_REPLACEMENT = """#include <errno.h>
 #include <sys/socket.h> /* getsockopt, SOL_SOCKET, SO_ACCEPTCONN */
 #include <sys/stat.h> /* struct stat */
 #include <sys/wait.h>
+#if defined(__APPLE__)
+    #include <arpa/inet.h> /* ntohl */
+    #include <libproc.h> /* proc_pidfdinfo */
+    #include <netinet/in.h> /* sockaddr_in, IPPROTO_TCP */
+    #include <sys/proc_info.h> /* socket_fdinfo, PROC_PIDFDSOCKETINFO */
+#endif
+"""
+_BOOTLOADER_DARWIN_LIB_NEEDLE = """        ctx.check_cc(lib='m', mandatory=True)
+"""
+_BOOTLOADER_DARWIN_LIB_REPLACEMENT = """        ctx.check_cc(lib='m', mandatory=True)
+        if ctx.env.DEST_OS == 'darwin':
+            ctx.check_cc(lib='proc', mandatory=True, uselib_store='PROC')
+"""
+_BOOTLOADER_PROGRAM_LIBS_NEEDLE = """            'THR',  # may be used on FreBSD
+"""
+_BOOTLOADER_PROGRAM_LIBS_REPLACEMENT = """            'THR',  # may be used on FreBSD
+            'PROC',  # macOS process and descriptor inspection
 """
 _BOOTLOADER_NATIVE_HANDOFF_NEEDLE = """/*
  * If the program is activated by a systemd socket, systemd will set
@@ -382,27 +399,96 @@ _pyi_utils_openevo_validate_native_fds(void)
 {
     struct stat listener_stat;
     struct stat archive_stat;
+#if defined(__APPLE__)
+    struct socket_fdinfo listener_info;
+    struct sockaddr_in listener_address;
+    socklen_t listener_address_size = sizeof(listener_address);
+    int listener_info_size;
+#else
     int accepting = 0;
     socklen_t accepting_size = sizeof(accepting);
+#endif
 
+    if (fstat(OPENEVO_NATIVE_LISTENER_FD, &listener_stat) != 0) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_fstat_failed");
+        return -1;
+    }
+    if (fstat(OPENEVO_NATIVE_ARCHIVE_FD, &archive_stat) != 0) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "archive_fstat_failed");
+        return -1;
+    }
+    if (!S_ISSOCK(listener_stat.st_mode)) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_type_invalid");
+        return -1;
+    }
+    if (!S_ISREG(archive_stat.st_mode)) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "archive_type_invalid");
+        return -1;
+    }
+#if defined(__APPLE__)
+    memset(&listener_info, 0, sizeof(listener_info));
+    listener_info_size = proc_pidfdinfo(
+        getpid(),
+        OPENEVO_NATIVE_LISTENER_FD,
+        PROC_PIDFDSOCKETINFO,
+        &listener_info,
+        (int)sizeof(listener_info)
+    );
+    if (listener_info_size != (int)sizeof(listener_info)) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_info_probe_failed");
+        return -1;
+    }
     if (
-        fstat(OPENEVO_NATIVE_LISTENER_FD, &listener_stat) != 0 ||
-        fstat(OPENEVO_NATIVE_ARCHIVE_FD, &archive_stat) != 0 ||
-        !S_ISSOCK(listener_stat.st_mode) ||
-        !S_ISREG(archive_stat.st_mode) ||
-        getsockopt(
+        listener_info.psi.soi_type != SOCK_STREAM ||
+        listener_info.psi.soi_family != AF_INET ||
+        listener_info.psi.soi_protocol != IPPROTO_TCP ||
+        listener_info.psi.soi_kind != SOCKINFO_TCP ||
+        (listener_info.psi.soi_options & SO_ACCEPTCONN) == 0
+    ) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_identity_invalid");
+        return -1;
+    }
+    memset(&listener_address, 0, sizeof(listener_address));
+    if (getsockname(
+            OPENEVO_NATIVE_LISTENER_FD,
+            (struct sockaddr *)&listener_address,
+            &listener_address_size
+        ) != 0) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_endpoint_probe_failed");
+        return -1;
+    }
+    if (listener_address_size != sizeof(listener_address)) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_endpoint_size_invalid");
+        return -1;
+    }
+    if (
+        listener_address.sin_family != AF_INET ||
+        listener_address.sin_port == 0 ||
+        ntohl(listener_address.sin_addr.s_addr) != INADDR_LOOPBACK
+    ) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_endpoint_invalid");
+        return -1;
+    }
+#else
+    if (getsockopt(
             OPENEVO_NATIVE_LISTENER_FD,
             SOL_SOCKET,
             SO_ACCEPTCONN,
             &accepting,
             &accepting_size
-        ) != 0 ||
-        accepting_size != sizeof(accepting) ||
-        accepting != 1
-    ) {
-        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "native_fds_invalid");
+        ) != 0) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_accept_probe_failed");
         return -1;
     }
+    if (accepting_size != sizeof(accepting)) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_accept_size_invalid");
+        return -1;
+    }
+    if (accepting != 1) {
+        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "listener_not_accepting");
+        return -1;
+    }
+#endif
     return 0;
 }
 
@@ -425,7 +511,6 @@ pyi_utils_openevo_native_handoff_prepare(void)
         return -1;
     }
     if (_pyi_utils_openevo_validate_native_fds() != 0) {
-        OPENEVO_STARTUP_FAILURE("bootloader_handoff", "native_fds_invalid");
         return -1;
     }
     openevo_listener_guard_fd = fcntl(
@@ -1419,6 +1504,8 @@ def _patch_fd_bound_bootloader(source_root: Path) -> None:
     utils_text = utils_source.read_text(encoding="utf-8")
     utils_header = source_root / "bootloader/src/pyi_utils.h"
     utils_header_text = utils_header.read_text(encoding="utf-8")
+    wscript = source_root / "bootloader/wscript"
+    wscript_text = wscript.read_text(encoding="utf-8")
     if (
         text.count(_BOOTLOADER_MACOS_INCLUDE_NEEDLE) != 1
         or text.count(_BOOTLOADER_RESOLVER_NEEDLE) != 1
@@ -1429,6 +1516,8 @@ def _patch_fd_bound_bootloader(source_root: Path) -> None:
         or utils_text.count(_BOOTLOADER_NATIVE_HANDOFF_NEEDLE) != 1
         or utils_text.count(_BOOTLOADER_CHILD_EXEC_NEEDLE) != 1
         or utils_header_text.count(_BOOTLOADER_UTILS_HEADER_NEEDLE) != 1
+        or wscript_text.count(_BOOTLOADER_DARWIN_LIB_NEEDLE) != 1
+        or wscript_text.count(_BOOTLOADER_PROGRAM_LIBS_NEEDLE) != 1
     ):
         raise RuntimeError("PyInstaller bootloader resolver does not match the audited patch")
     source.write_text(
@@ -1473,6 +1562,16 @@ def _patch_fd_bound_bootloader(source_root: Path) -> None:
         utils_header_text.replace(
             _BOOTLOADER_UTILS_HEADER_NEEDLE,
             _BOOTLOADER_UTILS_HEADER_REPLACEMENT,
+        ),
+        encoding="utf-8",
+    )
+    wscript.write_text(
+        wscript_text.replace(
+            _BOOTLOADER_DARWIN_LIB_NEEDLE,
+            _BOOTLOADER_DARWIN_LIB_REPLACEMENT,
+        ).replace(
+            _BOOTLOADER_PROGRAM_LIBS_NEEDLE,
+            _BOOTLOADER_PROGRAM_LIBS_REPLACEMENT,
         ),
         encoding="utf-8",
     )
@@ -1531,6 +1630,8 @@ def _validate_fd_bound_bootloader(executable: Path) -> None:
             (
                 f"/dev/fd/{NATIVE_EXECUTABLE_FD}".encode("ascii"),
                 NATIVE_EXECUTABLE_BASENAME.encode("ascii"),
+                b"listener_info_probe_failed",
+                b"listener_endpoint_invalid",
             )
         )
     else:

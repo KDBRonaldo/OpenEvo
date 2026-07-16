@@ -106,6 +106,11 @@ traceback, malformed-record, and oversized-output canaries and prove that none
 can enter the rendered CI failure. A silent bootloader exit is a failed gate,
 not permission to print arbitrary child output or fall back from descriptor
 authority to a pathname.
+The macOS packaged-sidecar gate must exercise the Darwin-native FD checks: the
+bootloader must prove FD 3 through `proc_pidfdinfo` plus its loopback endpoint,
+and the SSH gate must construct an agent source through kqueue directory
+monitoring, `getpeereid`, `LOCAL_PEERPID`, and `LOCAL_PEERTOKEN`. Passing only the
+Linux `SO_ACCEPTCONN`/inotify branches is not macOS release evidence.
 The smoke must also retain the unreaped leader while checking readiness and
 prove full process-group cleanup. Tests force process-table observation failure
 and require the anchored whole-group `SIGKILL` fallback to remove a descendant

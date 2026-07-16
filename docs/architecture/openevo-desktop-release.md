@@ -209,6 +209,19 @@ the child's stdin and then closes the pipe. Its exact keys are `protocol`,
 `openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and all three
 credentials are independently generated 256-bit values. Duplicate, missing, unknown,
 malformed, or trailing input is rejected by the strict sidecar integration.
+
+The custom bootloader validates FD 3 before every onefile handoff and after
+descriptor restoration. Both platforms require a socket descriptor and a
+regular FD 4 archive. Linux reads `SO_ACCEPTCONN` directly. macOS, where that
+getter is not available, uses the system `libproc` API
+`proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` and requires an IPv4 TCP stream with
+`SO_ACCEPTCONN` in the kernel-reported socket options. It then uses
+`getsockname` to require a non-zero `127.0.0.1` endpoint. The audited
+PyInstaller source patch links `libproc` only for Darwin; an unavailable API,
+short structure, wrong socket kind, non-listening socket, or non-loopback
+endpoint fails with a closed startup diagnostic rather than falling back to a
+pathname or rebinding a port.
+
 The packaged Python launcher applies the same 512-byte bound, requires the
 closed five-key object and lowercase fixed-width hex values, and passes the
 readiness/session values to `create_release_desktop_local_api_app` while retaining

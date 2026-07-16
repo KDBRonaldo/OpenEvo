@@ -312,6 +312,19 @@ connect. It then creates a fresh owner-private one-shot relay and gives OpenSSH
 only that private relay path. `PATH`, shell configuration, askpass variables,
 and ambient proxy values are not inherited.
 
+Linux monitors the exact socket and ancestor bindings with inotify. Darwin
+cannot open a Unix-domain socket pathname with `O_EVTONLY`, so it registers
+kqueue vnode events only on the already-held ancestor directory FDs. Ancestor
+rename, revoke, attribute, delete, or kqueue error events fail closed. Immediate
+parent namespace writes force another exact socket identity check; that identity
+includes ctime, so target rename-and-restore is rejected while unrelated sibling
+churn can continue. The connected Darwin peer is independently bound with libc
+`getpeereid`, `LOCAL_PEERPID`, and the complete 32-byte `LOCAL_PEERTOKEN` audit
+token. The token's effective UID, GID, and PID must agree with the other two
+kernel results, and every later connection must match the complete baseline
+token, including its process-generation value. Missing or partial credentials
+are not downgraded to PID-only authority.
+
 The relay accepts only a peer whose kernel-reported PID belongs to the exact new
 session/process group owned for that spawn and whose executable vnode is the
 held `/usr/bin/ssh` identity. This rejects a same-UID connector that reaches the
@@ -388,6 +401,11 @@ retains the same bounded slot and lease fail closed. There is no semaphore to
 registry handoff and no portable waiter thread that can call `wait()` early.
 Process-group validation, `waitid`, Darwin `kqueue`, Linux
 `/proc/<pid>/stat` fallback setup, and capture all execute under that authority.
+Darwin may return `ESRCH` from `getpgid` after a very short-lived leader has
+already become an unreaped zombie. That race is accepted only while the owning
+`Popen` still has no return code and a bounded `ps` snapshot contains the exact
+PID with `PGID == PID` and state `X` or `Z`; every other missing, live,
+wrong-group, non-Darwin, or non-`ESRCH` result remains a hard failure.
 After Darwin registers the one-shot kqueue event, it takes a bounded, non-reaping
 `ps` snapshot of the pinned PID/PGID. That snapshot detects a leader that became
 a zombie before registration; when kqueue registration is unavailable, the same

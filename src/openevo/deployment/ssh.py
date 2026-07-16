@@ -2666,11 +2666,20 @@ def _capture_subprocess_output(
 
 def _owned_process_group_id(process: _OwnedSubprocessProcess) -> int:
     process_group_id = process.pid
-    if (
-        process_group_id <= 1
-        or process_group_id == os.getpgrp()
-        or os.getpgid(process.pid) != process_group_id
-    ):
+    if process_group_id <= 1 or process_group_id == os.getpgrp():
+        raise RuntimeError("subprocess did not receive an independent process group")
+    try:
+        observed_group_id = os.getpgid(process.pid)
+    except ProcessLookupError:
+        if sys.platform != "darwin" or process.returncode is not None:
+            raise
+        identity = _read_ps_process_group_states().get(process.pid)
+        if identity is None:
+            raise RuntimeError("subprocess process group is unavailable") from None
+        observed_group_id, state = identity
+        if observed_group_id != process_group_id or state not in {"X", "Z"}:
+            raise RuntimeError("subprocess process group is not an unreaped leader") from None
+    if observed_group_id != process_group_id:
         raise RuntimeError("subprocess did not receive an independent process group")
     return process_group_id
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import os
 from pathlib import Path
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -234,6 +236,301 @@ def test_missing_agent_socket_path_is_absent_from_full_exception_chain(
         executables.SshAgentSocketSource.from_environment("ssh_agent")
 
     _assert_sanitized_agent_authority_error(exc_info.value, canary)
+
+
+def test_darwin_agent_monitor_registers_only_held_ancestor_directories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered: list[object] = []
+    closed_descriptors: list[int] = []
+
+    class FakeKqueue:
+        def control(
+            self,
+            changes: list[object] | None,
+            _max_events: int,
+            _timeout: int,
+        ) -> list[object]:
+            if changes is not None:
+                registered.extend(changes)
+            return []
+
+        def close(self) -> None:
+            pass
+
+    class FakeSelect:
+        KQ_FILTER_VNODE = -4
+        KQ_EV_ADD = 1
+        KQ_EV_CLEAR = 2
+        KQ_EV_ERROR = 4
+        KQ_NOTE_WRITE = 0x01
+        KQ_NOTE_DELETE = 0x02
+        KQ_NOTE_EXTEND = 0x04
+        KQ_NOTE_ATTRIB = 0x08
+        KQ_NOTE_LINK = 0x10
+        KQ_NOTE_RENAME = 0x20
+        KQ_NOTE_REVOKE = 0x40
+
+        @staticmethod
+        def kqueue() -> FakeKqueue:
+            return FakeKqueue()
+
+        @staticmethod
+        def kevent(ident: int, **values: int) -> tuple[int, dict[str, int]]:
+            return ident, values
+
+    def reject_socket_open(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("Darwin must not open the Unix socket vnode")
+
+    monkeypatch.setattr(executables, "select", FakeSelect)
+    monkeypatch.setattr(executables.os, "open", reject_socket_open)
+    monkeypatch.setattr(executables.os, "close", closed_descriptors.append)
+    directories = (
+        (10, None, (1, 1, stat.S_IFDIR | 0o755, 0)),
+        (11, "private", (1, 2, stat.S_IFDIR | 0o755, 0)),
+        (12, "tmp", (1, 3, stat.S_IFDIR | 0o1777, 0)),
+    )
+
+    monitor = executables._AgentTargetMutationMonitor._open_darwin(
+        directories,
+    )
+    monitor.close()
+
+    assert [event[0] for event in registered] == [11, 12]
+    assert registered[-1][1]["fflags"] & FakeSelect.KQ_NOTE_WRITE
+    assert not registered[0][1]["fflags"] & FakeSelect.KQ_NOTE_WRITE
+    assert closed_descriptors == []
+
+
+def test_darwin_agent_monitor_classifies_parent_churn_and_ancestor_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queued_events: list[list[object]] = []
+
+    class FakeEvent:
+        def __init__(self, ident: int, *, fflags: int, flags: int = 0) -> None:
+            self.ident = ident
+            self.fflags = fflags
+            self.flags = flags
+
+    class FakeKqueue:
+        def control(
+            self,
+            changes: list[object] | None,
+            _max_events: int,
+            _timeout: int,
+        ) -> list[object]:
+            if changes is not None:
+                return []
+            return queued_events.pop(0)
+
+        def close(self) -> None:
+            pass
+
+    class FakeSelect:
+        KQ_FILTER_VNODE = -4
+        KQ_EV_ADD = 1
+        KQ_EV_CLEAR = 2
+        KQ_EV_ERROR = 4
+        KQ_NOTE_WRITE = 0x01
+        KQ_NOTE_DELETE = 0x02
+        KQ_NOTE_EXTEND = 0x04
+        KQ_NOTE_ATTRIB = 0x08
+        KQ_NOTE_LINK = 0x10
+        KQ_NOTE_RENAME = 0x20
+        KQ_NOTE_REVOKE = 0x40
+
+        @staticmethod
+        def kqueue() -> FakeKqueue:
+            return FakeKqueue()
+
+        @staticmethod
+        def kevent(ident: int, **values: int) -> tuple[int, dict[str, int]]:
+            return ident, values
+
+    monkeypatch.setattr(executables, "select", FakeSelect)
+    directories = (
+        (10, None, (1, 1, stat.S_IFDIR | 0o755, 0)),
+        (11, "private", (1, 2, stat.S_IFDIR | 0o755, 0)),
+        (12, "tmp", (1, 3, stat.S_IFDIR | 0o1777, 0)),
+    )
+    monitor = executables._AgentTargetMutationMonitor._open_darwin(
+        directories,
+    )
+    try:
+        queued_events.append([FakeEvent(12, fflags=FakeSelect.KQ_NOTE_WRITE)])
+        assert not monitor.observed_target_mutation()
+
+        queued_events.append([FakeEvent(11, fflags=FakeSelect.KQ_NOTE_RENAME)])
+        assert monitor.observed_target_mutation()
+
+        queued_events.append(
+            [FakeEvent(12, fflags=FakeSelect.KQ_NOTE_WRITE, flags=FakeSelect.KQ_EV_ERROR)]
+        )
+        assert monitor.observed_target_mutation()
+    finally:
+        monitor.close()
+
+
+def test_darwin_peer_authority_uses_libc_pid_and_exact_audit_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process_id = 4242
+    user_id = os.geteuid()
+    group_id = os.getegid()
+    audit_token = struct.pack(
+        "=8I",
+        7,
+        user_id,
+        group_id,
+        user_id,
+        group_id,
+        process_id,
+        8,
+        9,
+    )
+    requested: list[tuple[int, int, int]] = []
+
+    class FakeGetPeerId:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, descriptor: int, uid: object, gid: object) -> int:
+            assert descriptor == 17
+            ctypes.cast(uid, ctypes.POINTER(ctypes.c_uint32)).contents.value = user_id
+            ctypes.cast(gid, ctypes.POINTER(ctypes.c_uint32)).contents.value = group_id
+            return 0
+
+    class FakeLibc:
+        getpeereid = FakeGetPeerId()
+
+    class FakeStream:
+        @staticmethod
+        def fileno() -> int:
+            return 17
+
+        @staticmethod
+        def getsockopt(level: int, option: int, size: int) -> bytes:
+            requested.append((level, option, size))
+            if option == executables._DARWIN_LOCAL_PEERPID:
+                return struct.pack("=i", process_id)
+            if option == executables._DARWIN_LOCAL_PEERTOKEN:
+                return audit_token
+            raise AssertionError("unexpected Darwin peer option")
+
+    monkeypatch.setattr(executables.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
+
+    authority = executables._darwin_peer_authority(FakeStream())
+
+    assert authority.process_id == process_id
+    assert authority.user_id == user_id
+    assert authority.audit_token == audit_token
+    assert requested == [
+        (executables._DARWIN_SOL_LOCAL, executables._DARWIN_LOCAL_PEERPID, 4),
+        (executables._DARWIN_SOL_LOCAL, executables._DARWIN_LOCAL_PEERTOKEN, 32),
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["getpeereid", "short_pid", "missing_token", "short_token", "mismatched_token"],
+)
+def test_darwin_peer_authority_fails_closed_on_incomplete_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    process_id = 4242
+    user_id = os.geteuid()
+    group_id = os.getegid()
+    audit_token = struct.pack(
+        "=8I",
+        7,
+        user_id,
+        group_id,
+        user_id,
+        group_id,
+        process_id,
+        8,
+        9,
+    )
+
+    class FakeGetPeerId:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, _descriptor: int, uid: object, gid: object) -> int:
+            if failure == "getpeereid":
+                ctypes.set_errno(errno.EPERM)
+                return -1
+            ctypes.cast(uid, ctypes.POINTER(ctypes.c_uint32)).contents.value = user_id
+            ctypes.cast(gid, ctypes.POINTER(ctypes.c_uint32)).contents.value = group_id
+            return 0
+
+    class FakeLibc:
+        getpeereid = FakeGetPeerId()
+
+    class FakeStream:
+        @staticmethod
+        def fileno() -> int:
+            return 17
+
+        @staticmethod
+        def getsockopt(_level: int, option: int, _size: int) -> bytes:
+            if option == executables._DARWIN_LOCAL_PEERPID:
+                if failure == "short_pid":
+                    return b"\x00"
+                return struct.pack("=i", process_id)
+            if failure == "missing_token":
+                raise OSError(errno.ENOPROTOOPT, "LOCAL_PEERTOKEN unavailable")
+            if failure == "short_token":
+                return audit_token[:-1]
+            if failure == "mismatched_token":
+                values = list(struct.unpack("=8I", audit_token))
+                values[5] = process_id + 1
+                return struct.pack("=8I", *values)
+            return audit_token
+
+    monkeypatch.setattr(executables.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
+
+    with pytest.raises((OSError, ValueError)):
+        executables._darwin_peer_authority(FakeStream())
+
+
+def test_darwin_reconnect_requires_the_exact_baseline_audit_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = tmp_path / "agent.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    socket_path.chmod(0o600)
+    authority = executables.VerifiedSshAgentSocket.open(str(socket_path))
+    expected = executables._UnixPeerAuthority(os.getpid(), os.geteuid(), b"a" * 32)
+    replacement = executables._UnixPeerAuthority(os.getpid(), os.geteuid(), b"b" * 32)
+
+    class StableMonitor:
+        @staticmethod
+        def observed_target_mutation() -> bool:
+            return False
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    monkeypatch.setattr(executables.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        executables._AgentTargetMutationMonitor,
+        "open",
+        staticmethod(lambda *_args, **_kwargs: StableMonitor()),
+    )
+    monkeypatch.setattr(executables, "_unix_peer_authority", lambda _stream: replacement)
+    try:
+        with pytest.raises(ValueError, match="peer identity changed"):
+            authority._connect_authority(expected_peer=expected)
+    finally:
+        authority.close()
+        listener.close()
 
 
 def test_agent_socket_authority_rejects_ancestor_path_replacement(tmp_path: Path) -> None:

@@ -500,12 +500,19 @@ def test_fd_bound_bootloader_patch_is_exact_and_cross_platform(
     )
     utils_header = source_root / "bootloader/src/pyi_utils.h"
     utils_header.write_text(builder._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
+    wscript = source_root / "bootloader/wscript"
+    wscript.write_text(
+        builder._BOOTLOADER_DARWIN_LIB_NEEDLE
+        + builder._BOOTLOADER_PROGRAM_LIBS_NEEDLE,
+        encoding="utf-8",
+    )
 
     builder._patch_fd_bound_bootloader(source_root)
 
     patched = source.read_text(encoding="utf-8")
     patched_utils = utils_source.read_text(encoding="utf-8")
     patched_header = utils_header.read_text(encoding="utf-8")
+    patched_wscript = wscript.read_text(encoding="utf-8")
     assert 'getenv("OPENEVO_NATIVE_EXECUTABLE_FD")' in patched
     assert 'getenv("OPENEVO_NATIVE_LISTENER_FD")' in patched
     assert 'strcmp(openevo_native_fd, "4")' in patched
@@ -523,6 +530,13 @@ def test_fd_bound_bootloader_patch_is_exact_and_cross_platform(
     assert "dup2(openevo_archive_guard_fd, OPENEVO_NATIVE_ARCHIVE_FD)" in patched_utils
     assert "FD_CLOEXEC" in patched_utils
     assert "SO_ACCEPTCONN" in patched_utils
+    assert "proc_pidfdinfo" in patched_utils
+    assert "PROC_PIDFDSOCKETINFO" in patched_utils
+    assert "SOCKINFO_TCP" in patched_utils
+    assert "INADDR_LOOPBACK" in patched_utils
+    assert "listener_info.psi.soi_options & SO_ACCEPTCONN" in patched_utils
+    assert "ctx.check_cc(lib='proc', mandatory=True, uselib_store='PROC')" in patched_wscript
+    assert "'PROC',  # macOS process and descriptor inspection" in patched_wscript
     assert "pyi_utils_openevo_native_handoff_restore()" in patched_utils
     assert "pyi_utils_openevo_native_handoff_prepare" in patched_header
 
@@ -551,6 +565,12 @@ def test_fd_bound_bootloader_rejections_emit_closed_startup_diagnostics(
     )
     utils_header = source_root / "bootloader/src/pyi_utils.h"
     utils_header.write_text(builder._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
+    wscript = source_root / "bootloader/wscript"
+    wscript.write_text(
+        builder._BOOTLOADER_DARWIN_LIB_NEEDLE
+        + builder._BOOTLOADER_PROGRAM_LIBS_NEEDLE,
+        encoding="utf-8",
+    )
 
     builder._patch_fd_bound_bootloader(source_root)
 
@@ -563,7 +583,10 @@ def test_fd_bound_bootloader_rejections_emit_closed_startup_diagnostics(
         for index, line in enumerate(lines):
             if line.strip() not in {"return -1;", "exit(-1);"}:
                 continue
-            assert "OPENEVO_STARTUP_FAILURE(" in lines[index - 1], line
+            assert (
+                "OPENEVO_STARTUP_FAILURE(" in lines[index - 1]
+                or "_pyi_utils_openevo_validate_native_fds()" in lines[index - 1]
+            ), line
         assert "OPENEVO_STARTUP_V1 stage=" in patched
         assert "%s" not in "\n".join(line for line in lines if "OPENEVO_STARTUP_V1" in line)
 
@@ -584,7 +607,15 @@ def test_fd_bound_bootloader_rejections_emit_closed_startup_diagnostics(
     ("platform", "platform_markers"),
     [
         ("linux", (b"/proc/self/fd/4",)),
-        ("darwin", (b"/dev/fd/4", b"openevo-desktop-sidecar")),
+        (
+            "darwin",
+            (
+                b"/dev/fd/4",
+                b"openevo-desktop-sidecar",
+                b"listener_info_probe_failed",
+                b"listener_endpoint_invalid",
+            ),
+        ),
     ],
 )
 def test_native_bootloader_validation_uses_the_compiled_platform_branch(

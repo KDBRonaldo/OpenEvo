@@ -3286,6 +3286,115 @@ def test_kqueue_observer_detects_leader_that_exited_before_registration(
         observer.close()
 
 
+@pytest.mark.parametrize("state", ["X", "Z"])
+def test_owned_process_group_id_accepts_unreaped_darwin_zombie(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    class Process:
+        pid = 424242
+        returncode = None
+
+    monkeypatch.setattr(ssh_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ssh_module.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: {Process.pid: (Process.pid, state)},
+    )
+
+    assert ssh_module._owned_process_group_id(Process()) == Process.pid
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        None,
+        (424243, "Z"),
+        (424242, "S"),
+    ],
+)
+def test_owned_process_group_id_rejects_unproven_darwin_zombie(
+    monkeypatch: pytest.MonkeyPatch,
+    identity: tuple[int, str] | None,
+) -> None:
+    class Process:
+        pid = 424242
+        returncode = None
+
+    monkeypatch.setattr(ssh_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ssh_module.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: {} if identity is None else {Process.pid: identity},
+    )
+
+    with pytest.raises(RuntimeError, match="process group"):
+        ssh_module._owned_process_group_id(Process())
+
+
+@pytest.mark.parametrize(
+    ("platform", "returncode"),
+    [("linux", None), ("darwin", 0)],
+)
+def test_owned_process_group_id_does_not_recover_ineligible_missing_leader(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    returncode: int | None,
+) -> None:
+    class Process:
+        pid = 424242
+
+    process = Process()
+    process.returncode = returncode
+    monkeypatch.setattr(ssh_module.sys, "platform", platform)
+    monkeypatch.setattr(
+        ssh_module.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected ps fallback")),
+    )
+
+    with pytest.raises(ProcessLookupError):
+        ssh_module._owned_process_group_id(process)
+
+
+def test_owned_process_group_id_does_not_recover_other_getpgid_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 424242
+        returncode = None
+
+    monkeypatch.setattr(ssh_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ssh_module.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(PermissionError),
+    )
+    monkeypatch.setattr(
+        ssh_module,
+        "_read_ps_process_group_states",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected ps fallback")),
+    )
+
+    with pytest.raises(PermissionError):
+        ssh_module._owned_process_group_id(Process())
+
+
 def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
