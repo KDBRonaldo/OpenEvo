@@ -503,7 +503,7 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
                     "executable_device=42 executable_inode=99 "
                     f"executable_sha256={'b' * 64} executable_size=19"
                 ),
-                f"OPENEVO_DESKTOP_RENDERER_READY_V1 {RELEASE_OPENAPI_SHA256}",
+                f"OPENEVO_DESKTOP_RENDERER_READY_V2 {RELEASE_OPENAPI_SHA256}",
             ]
         )
         + "\n",
@@ -601,7 +601,7 @@ def test_bundle_smoke_bounds_native_log_and_resets_stale_renderer_ack() -> None:
     payload = "\n".join(
         [
             process_marker.format(pid=41, seconds=1700000000, inode=98),
-            f"OPENEVO_DESKTOP_RENDERER_READY_V1 {RELEASE_OPENAPI_SHA256}",
+            f"OPENEVO_DESKTOP_RENDERER_READY_V2 {RELEASE_OPENAPI_SHA256}",
             process_marker.format(pid=42, seconds=1700000001, inode=99),
         ]
     ).encode("ascii") + b"\n"
@@ -614,7 +614,7 @@ def test_bundle_smoke_bounds_native_log_and_resets_stale_renderer_ack() -> None:
         smoke._parse_native_host_observation(b"x" * (smoke.NATIVE_HOST_LOG_MAX_BYTES + 1))
     with pytest.raises(smoke.SmokeFailure, match="renderer marker is malformed"):
         smoke._parse_native_host_observation(
-            payload + f"OPENEVO_DESKTOP_RENDERER_READY_V1 {'b' * 64}\n".encode("ascii")
+            payload + f"OPENEVO_DESKTOP_RENDERER_READY_V2 {'b' * 64}\n".encode("ascii")
         )
 
 
@@ -655,7 +655,6 @@ def test_bundle_smoke_observes_verified_fd_from_native_digest_marker(
             inode=None if descriptor == 3 else 99,
         ),
     )
-    monkeypatch.setattr(smoke, "_macos_renderer_ready", lambda _pid, _deadline: True)
     digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
     observation = smoke.NativeHostObservation(
         active_process=smoke.NativeSidecarProcessMarker(
@@ -745,7 +744,7 @@ def test_bundle_smoke_parses_lsof_machine_fields(
     assert smoke._is_loopback_listener(observation) is True
 
 
-def test_bundle_smoke_bounds_native_probe_timeouts(
+def test_bundle_smoke_bounds_native_lsof_probe_timeouts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     smoke = _load_bundle_smoke_module()
@@ -770,9 +769,68 @@ def test_bundle_smoke_bounds_native_probe_timeouts(
         None,
         None,
     )
-    probe_calls.clear()
-    assert smoke._macos_renderer_ready(40, deadline) is False
-    assert probe_calls == ["swift"]
+    assert probe_calls == ["lsof"]
+
+
+def test_bundle_smoke_lsof_deadline_does_not_replace_product_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    sidecar = tmp_path / "openevo-desktop-sidecar"
+    sidecar.write_bytes(b"observed sidecar")
+    executable = tmp_path / "OpenEvo Desktop"
+    executable.write_bytes(b"native executable")
+    digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    marker = smoke.NativeSidecarProcessMarker(
+        pid=41,
+        process_group=41,
+        session_id=41,
+        birth_identity="darwin:1700000000:123",
+        executable_device=42,
+        executable_inode=99,
+        executable_sha256=digest,
+        executable_size=sidecar.stat().st_size,
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_descendants",
+        lambda _pid, _deadline: [(41, 40, 41, "openevo-desktop-sidecar")],
+    )
+    monkeypatch.setattr(smoke.os, "getpgid", lambda _pid: 41)
+    monkeypatch.setattr(smoke.os, "getsid", lambda _pid: 41)
+    monkeypatch.setattr(
+        smoke,
+        "_darwin_process_birth_identity",
+        lambda _pid: marker.birth_identity,
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_lsof_fd",
+        lambda _pid, _descriptor, _deadline: smoke.NativeFileDescriptorObservation(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    clock = iter((0.0, 0.0, 0.0, 0.0, 2.0))
+    monkeypatch.setattr(smoke.time, "monotonic", lambda: next(clock))
+
+    evidence, _groups, stage = smoke._macos_native_evidence(
+        40,
+        executable,
+        sidecar,
+        {},
+        digest,
+        smoke.NativeHostObservation(marker, False, frozenset({41})),
+        1.0,
+    )
+
+    assert evidence is None
+    assert stage == smoke.PROBE_DEADLINE_STAGE
 
 
 def test_bundle_smoke_probe_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
@@ -1172,8 +1230,49 @@ def test_bundle_smoke_reports_closed_native_readiness_stage() -> None:
         "listener_fd_unavailable",
         "executable_fd_unavailable",
         "renderer_ack_absent",
-        "renderer_window_absent",
-        "probe_deadline_exhausted",
+    }
+    assert smoke.PROBE_DEADLINE_STAGE == "probe_deadline_exhausted"
+
+
+def test_bundle_smoke_probe_deadline_preserves_the_deepest_product_stage() -> None:
+    smoke = _load_bundle_smoke_module()
+    observed = {"native_marker_absent"}
+
+    current = smoke._advance_readiness_stage(
+        "native_marker_absent",
+        observed,
+        "renderer_ack_absent",
+    )
+    current = smoke._advance_readiness_stage(
+        current,
+        observed,
+        smoke.PROBE_DEADLINE_STAGE,
+    )
+
+    assert current == "renderer_ack_absent"
+    assert observed == {"native_marker_absent", "renderer_ack_absent"}
+
+
+def test_bundle_smoke_transient_probe_failure_preserves_the_deepest_product_stage() -> None:
+    smoke = _load_bundle_smoke_module()
+    observed = {"native_marker_absent"}
+
+    current = smoke._advance_readiness_stage(
+        "native_marker_absent",
+        observed,
+        "renderer_ack_absent",
+    )
+    current = smoke._advance_readiness_stage(
+        current,
+        observed,
+        "listener_fd_unavailable",
+    )
+
+    assert current == "renderer_ack_absent"
+    assert observed == {
+        "native_marker_absent",
+        "listener_fd_unavailable",
+        "renderer_ack_absent",
     }
 
 

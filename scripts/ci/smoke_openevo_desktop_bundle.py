@@ -48,17 +48,18 @@ NATIVE_HOST_LOG_MAX_LINES = 512
 NATIVE_GROUP_MAX_PROCESSES = 16
 PROBE_REAP_TIMEOUT_SECONDS = 2.0
 PROBE_DESCENDANT_SNAPSHOT_TIMEOUT_SECONDS = 0.5
-NATIVE_FAILURE_STAGES = frozenset(
-    {
-        "native_marker_absent",
-        "native_process_unavailable",
-        "listener_fd_unavailable",
-        "executable_fd_unavailable",
-        "renderer_ack_absent",
-        "renderer_window_absent",
-        "probe_deadline_exhausted",
-    }
+NATIVE_READINESS_STAGES = (
+    "native_marker_absent",
+    "native_process_unavailable",
+    "listener_fd_unavailable",
+    "executable_fd_unavailable",
+    "renderer_ack_absent",
 )
+NATIVE_FAILURE_STAGES = frozenset(NATIVE_READINESS_STAGES)
+_NATIVE_READINESS_STAGE_RANK = {
+    stage: rank for rank, stage in enumerate(NATIVE_READINESS_STAGES)
+}
+PROBE_DEADLINE_STAGE = "probe_deadline_exhausted"
 _NATIVE_PROCESS_MARKER_PATTERN = re.compile(
     rb"OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
     rb"pid=([1-9][0-9]{0,9}) pgid=([1-9][0-9]{0,9}) "
@@ -67,7 +68,7 @@ _NATIVE_PROCESS_MARKER_PATTERN = re.compile(
     rb"executable_sha256=([0-9a-f]{64}) executable_size=([1-9][0-9]{0,19})"
 )
 _NATIVE_RENDERER_MARKER_PATTERN = re.compile(
-    rb"OPENEVO_DESKTOP_RENDERER_READY_V1 ([0-9a-f]{64})"
+    rb"OPENEVO_DESKTOP_RENDERER_READY_V2 ([0-9a-f]{64})"
 )
 
 
@@ -626,35 +627,6 @@ def _darwin_process_birth_identity(pid: int) -> str | None:
     return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
 
 
-def _macos_renderer_ready(app_pid: int, deadline: float) -> bool:
-    swift_probe = """
-import CoreGraphics
-import Foundation
-let expected = Int(ProcessInfo.processInfo.environment["OPENEVO_SMOKE_APP_PID"]!)!
-let windows = CGWindowListCopyWindowInfo(
-    [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
-) as? [[String: Any]] ?? []
-let ready = windows.contains { window in
-    let owner = (window[kCGWindowOwnerPID as String] as? NSNumber)?.intValue
-    let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue
-    let bounds = window[kCGWindowBounds as String] as? [String: Any]
-    let width = (bounds?["Width"] as? NSNumber)?.doubleValue ?? 0
-    let height = (bounds?["Height"] as? NSNumber)?.doubleValue ?? 0
-    return owner == expected && layer == 0 && width > 0 && height > 0
-}
-print(ready ? "1" : "0")
-"""
-    environment = os.environ.copy()
-    environment["OPENEVO_SMOKE_APP_PID"] = str(app_pid)
-    swift = _run_probe(
-        ["swift", "-e", swift_probe],
-        deadline=deadline,
-        timeout_cap=10,
-        env=environment,
-    )
-    return swift is not None and swift.returncode == 0 and swift.stdout.strip() == "1"
-
-
 def _lsof_fd(
     pid: int,
     descriptor: int,
@@ -745,13 +717,15 @@ def _macos_native_evidence(
     if cleanup_process_groups is not None:
         cleanup_process_groups.update(process_groups)
     if time.monotonic() >= deadline:
-        return None, process_groups, "probe_deadline_exhausted"
+        return None, process_groups, PROBE_DEADLINE_STAGE
     try:
         rows = _descendants(app_pid, deadline)
     except SmokeFailure:
         if time.monotonic() >= deadline:
-            return None, process_groups, "probe_deadline_exhausted"
+            return None, process_groups, PROBE_DEADLINE_STAGE
         raise
+    if time.monotonic() >= deadline:
+        return None, process_groups, PROBE_DEADLINE_STAGE
     process_groups.update(row[2] for row in rows if row[2] > 0)
     if cleanup_process_groups is not None:
         cleanup_process_groups.update(process_groups)
@@ -781,6 +755,8 @@ def _macos_native_evidence(
     ):
         raise SmokeFailure("Native host sidecar process identity changed during smoke")
     observed_birth_identity = _darwin_process_birth_identity(marker.pid)
+    if time.monotonic() >= deadline:
+        return None, process_groups, PROBE_DEADLINE_STAGE
     if observed_birth_identity is None:
         return None, process_groups, "native_process_unavailable"
     if observed_birth_identity != marker.birth_identity:
@@ -792,9 +768,13 @@ def _macos_native_evidence(
         raise SmokeFailure("Native host sidecar process group exceeded the observation limit")
     for pid, _parent, _group, _command in sidecar_rows:
         if time.monotonic() >= deadline:
-            return None, process_groups, "probe_deadline_exhausted"
+            return None, process_groups, PROBE_DEADLINE_STAGE
         listener = _lsof_fd(pid, 3, deadline)
+        if time.monotonic() >= deadline:
+            return None, process_groups, PROBE_DEADLINE_STAGE
         executable_fd = _lsof_fd(pid, 4, deadline)
+        if time.monotonic() >= deadline:
+            return None, process_groups, PROBE_DEADLINE_STAGE
         listener_ready = _is_loopback_listener(listener)
         listener_seen = listener_seen or listener_ready
         if not listener_ready:
@@ -808,8 +788,6 @@ def _macos_native_evidence(
             continue
         if not native_observation.renderer_ready:
             return None, process_groups, "renderer_ack_absent"
-        if not _macos_renderer_ready(app_pid, deadline):
-            return None, process_groups, "renderer_window_absent"
         return (
             {
                 "schema_version": EVIDENCE_SCHEMA_VERSION,
@@ -830,6 +808,21 @@ def _macos_native_evidence(
         process_groups,
         "executable_fd_unavailable" if listener_seen else "listener_fd_unavailable",
     )
+
+
+def _advance_readiness_stage(
+    current: str,
+    observed: set[str],
+    candidate: str,
+) -> str:
+    if candidate == PROBE_DEADLINE_STAGE:
+        return current
+    if current not in NATIVE_FAILURE_STAGES or candidate not in NATIVE_FAILURE_STAGES:
+        raise SmokeFailure("Native host readiness stage is invalid")
+    observed.add(candidate)
+    if _NATIVE_READINESS_STAGE_RANK[candidate] > _NATIVE_READINESS_STAGE_RANK[current]:
+        return candidate
+    return current
 
 
 def _cleanup_launched_app(
@@ -965,6 +958,7 @@ def smoke_bundle(
         process_groups = {process.pid}
         evidence: dict[str, object] | None = None
         readiness_stage = "native_marker_absent"
+        observed_readiness_stages = {readiness_stage}
         deadline = time.monotonic() + timeout_seconds
         captured_error: BaseException | None = None
         try:
@@ -976,7 +970,7 @@ def smoke_bundle(
                 )
                 if sys.platform == "darwin":
                     if process.poll() is None:
-                        evidence, observed_groups, readiness_stage = _macos_native_evidence(
+                        evidence, observed_groups, candidate_stage = _macos_native_evidence(
                             process.pid,
                             executable,
                             sidecar,
@@ -989,6 +983,11 @@ def smoke_bundle(
                         process_groups.update(observed_groups)
                         if evidence is not None:
                             break
+                        readiness_stage = _advance_readiness_stage(
+                            readiness_stage,
+                            observed_readiness_stages,
+                            candidate_stage,
+                        )
                 else:
                     evidence = _read_emitted_evidence(
                         emitted_path,
@@ -1004,11 +1003,10 @@ def smoke_bundle(
                     )
                 time.sleep(0.1)
             if evidence is None:
-                if readiness_stage not in NATIVE_FAILURE_STAGES:
-                    raise SmokeFailure("Native host readiness stage is invalid")
                 raise SmokeFailure(
                     "Timed out waiting for OpenEvo Desktop app smoke evidence "
-                    f"(stage={readiness_stage})"
+                    f"(stage={readiness_stage}; observed_stages="
+                    f"{','.join(sorted(observed_readiness_stages))})"
                 )
         except BaseException as exc:
             captured_error = exc
