@@ -230,6 +230,21 @@ mounts only that release Local API and the audited product web. It does not
 construct the legacy sidecar app, expose `/openevo-api/*`, translate the Desktop
 session header into a legacy mutation token, or accept a backend base URL. Its
 durable provider state is isolated under `<Desktop config root>/local-api-v1`.
+SQLite may report an OS-canonical spelling of that database path, including the
+macOS `/var` to `/private/var` alias. The provider therefore requires an absolute
+`PRAGMA database_list` path and requires the SQLite-reported path and managed
+pathname to share one verified device/inode before and after connection
+configuration. This preserves SQLite's normal same-directory rollback-journal
+and hot-journal recovery behavior while accepting inode-identical ancestor
+aliases. A different inode, unsafe file metadata, or changed managed pathname
+fails closed; pathname string equality is not an authority check. The state root
+is owner-private and process-locked. An arbitrary malicious process already
+running as the same macOS user and able to rewrite that private root is outside
+the unsigned preview threat boundary.
+Provider binding traverses both materialized FastAPI routes and deferred included
+routers, while preserving every frozen endpoint signature. This keeps the same
+Desktop Local API provider contract across supported FastAPI router
+representations instead of silently leaving nested product routes contract-only.
 The hidden `/openevo-native/session` probe accepts exactly one matching
 `X-OpenEvo-Desktop-Session` value and returns an empty 204; missing, duplicate,
 or incorrect values return 403. The probe is excluded from the frozen public

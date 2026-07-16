@@ -42,6 +42,16 @@ The Core CI regression step runs with `umask 077` so security-boundary tests
 create provider, store, and session state with owner-private permissions. Its
 test dependencies explicitly include `wheel`, which is required by regression
 coverage that invokes `python -m build --no-isolation`.
+Desktop contract regressions exercise both materialized and deferred FastAPI
+included-router representations and require provider binding to preserve the
+frozen endpoint signatures. This is a compatibility gate, not permission to pin
+away a newer supported FastAPI release when nested routes would otherwise remain
+contract-only. The macOS packaging, native smoke, and candidate jobs also run the
+provider-store ancestor-alias regression before building: SQLite may canonicalize
+`/var` as `/private/var`, but the opened and managed database must still be the
+same verified device/inode. The same jobs perform a durable mutation through the
+alias and recover a subprocess-crash rollback journal. This prevents Linux
+`/dev/fd` behavior from masking Darwin's pathname-based journal semantics.
 
 The dedicated macOS anonymous Core transport job clears the runner's ambient
 `SSH_AUTH_SOCK` and runs the exact anonymous socketpair metadata, identity,

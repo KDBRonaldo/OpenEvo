@@ -1584,7 +1584,8 @@ def _peer_executable_identity(process_id: int) -> _ExecutableIdentity:
         _require_root_owned_executable(metadata)
         return _executable_identity(metadata)
     if sys.platform == "darwin":
-        buffer = ctypes.create_string_buffer(_MAX_AUTHORITY_PATH_BYTES + 1)
+        # libproc rejects buffers larger than PROC_PIDPATHINFO_MAXSIZE.
+        buffer = ctypes.create_string_buffer(_MAX_AUTHORITY_PATH_BYTES)
         libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
         proc_pidpath = libproc.proc_pidpath
         proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]

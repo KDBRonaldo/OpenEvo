@@ -40,16 +40,21 @@ def _serve_agent_connections(
     errors: list[BaseException],
 ) -> None:
     listener.settimeout(0.05)
-    while not stop.is_set():
-        try:
-            connection, _address = listener.accept()
-        except socket.timeout:
-            continue
-        except OSError as error:
-            if not stop.is_set():
-                errors.append(error)
-            return
-        connection.close()
+    connections: list[socket.socket] = []
+    try:
+        while not stop.is_set():
+            try:
+                connection, _address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError as error:
+                if not stop.is_set():
+                    errors.append(error)
+                return
+            connections.append(connection)
+    finally:
+        for connection in connections:
+            connection.close()
 
 
 @pytest.mark.parametrize(
@@ -494,6 +499,40 @@ def test_darwin_peer_authority_fails_closed_on_incomplete_credentials(
 
     with pytest.raises((OSError, ValueError)):
         executables._darwin_peer_authority(FakeStream())
+
+
+def test_darwin_peer_executable_uses_libproc_maximum_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable_path = executables.SSH_EXECUTABLE
+    encoded_path = os.fsencode(executable_path)
+    requested_sizes: list[int] = []
+
+    class FakeProcPidPath:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, process_id: int, buffer: object, size: int) -> int:
+            assert process_id == 4242
+            requested_sizes.append(size)
+            assert len(encoded_path) + 1 <= size
+            ctypes.memmove(buffer, encoded_path + b"\x00", len(encoded_path) + 1)
+            return len(encoded_path)
+
+    class FakeLibproc:
+        proc_pidpath = FakeProcPidPath()
+
+    monkeypatch.setattr(executables.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        executables.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: FakeLibproc(),
+    )
+
+    identity = executables._peer_executable_identity(4242)
+
+    assert identity == executables._executable_identity(os.stat(executable_path))
+    assert requested_sizes == [executables._MAX_AUTHORITY_PATH_BYTES]
 
 
 def test_darwin_reconnect_requires_the_exact_baseline_audit_token(

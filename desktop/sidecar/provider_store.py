@@ -1538,6 +1538,8 @@ class DesktopProviderStore:
             self._acquire_owner_lock()
             self._ensure_empty_private_file(DATABASE_FILENAME)
             self._cursor_key = self._load_or_create_cursor_key()
+            database_stat = self._verify_private_file(DATABASE_FILENAME)
+            self._database_identity = (database_stat.st_dev, database_stat.st_ino)
             self._verify_storage_files()
             self._connection = self._open_database_connection()
             self._migrate()
@@ -1745,9 +1747,8 @@ class DesktopProviderStore:
             database_rows = connection.execute("PRAGMA database_list").fetchall()
             if len(database_rows) != 1:
                 raise ProviderStateRootError("SQLite opened an unexpected database set")
-            opened_path = os.path.abspath(cast(str, database_rows[0][2]))
-            if opened_path != os.path.abspath(self.database_path):
-                raise ProviderStateRootError("SQLite opened an unexpected provider database")
+            opened_path = database_rows[0][2]
+            self._verify_sqlite_database_identity(opened_path)
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA busy_timeout = 30000")
             journal_mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
@@ -1778,10 +1779,31 @@ class DesktopProviderStore:
             if configured_journal != self._journal_size_limit:
                 raise ProviderStateRootError("SQLite journal_size_limit could not be enforced")
             self._verify_storage_files()
+            self._verify_sqlite_database_identity(opened_path)
         except BaseException:
             connection.close()
             raise
         return connection
+
+    def _verify_sqlite_database_identity(
+        self,
+        opened_path: object,
+    ) -> None:
+        if type(opened_path) is not str or not os.path.isabs(opened_path):
+            raise ProviderStateRootError("SQLite returned an invalid provider database path")
+        try:
+            opened_stat = os.stat(opened_path, follow_symlinks=False)
+        except OSError as exc:
+            raise ProviderStateRootError(
+                "SQLite provider database identity could not be verified"
+            ) from exc
+        self._validate_private_file_stat(DATABASE_FILENAME, opened_stat)
+        managed_stat = self._verify_private_file(DATABASE_FILENAME)
+        if (
+            (opened_stat.st_dev, opened_stat.st_ino) != self._database_identity
+            or (managed_stat.st_dev, managed_stat.st_ino) != self._database_identity
+        ):
+            raise ProviderStateRootError("SQLite opened an unexpected provider database inode")
 
     def _load_or_create_cursor_key(self) -> bytes:
         self._verify_root()
@@ -1910,7 +1932,10 @@ class DesktopProviderStore:
     def _verify_storage_files(self) -> None:
         self._verify_root()
         for name in (DATABASE_FILENAME, OWNER_LOCK_FILENAME, CURSOR_KEY_FILENAME):
-            self._verify_private_file(name)
+            file_stat = self._verify_private_file(name)
+            if name == DATABASE_FILENAME and hasattr(self, "_database_identity"):
+                if (file_stat.st_dev, file_stat.st_ino) != self._database_identity:
+                    raise ProviderStateRootError("provider database pathname identity changed")
         for name in (JOURNAL_FILENAME, WAL_FILENAME, SHM_FILENAME):
             self._optional_private_file(name)
         for name in (WAL_FILENAME, SHM_FILENAME):

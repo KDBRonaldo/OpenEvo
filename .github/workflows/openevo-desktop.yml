@@ -151,6 +151,8 @@ jobs:
           uv run python -m pytest --basetemp="$RUNNER_TEMP/oe-workspace" \
             tests/openevo/sidecar/test_fd_xattrs.py \
             tests/openevo/sidecar/test_native_workspace.py \
+            tests/openevo/sidecar/test_provider_store.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
+            tests/openevo/sidecar/test_provider_store.py::test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction \
             tests/openevo/sidecar/test_workspace_imports.py \
             tests/openevo/sidecar/test_workspace_import_lifecycle.py \
             -q

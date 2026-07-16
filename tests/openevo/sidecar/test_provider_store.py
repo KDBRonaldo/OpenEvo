@@ -646,6 +646,62 @@ def test_sqlite_connection_uses_the_canonical_database_path(tmp_path: Path) -> N
     assert not hasattr(store, "_database_fd")
 
 
+def test_sqlite_connection_accepts_an_inode_identical_ancestor_alias(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir(mode=0o700)
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+    store = DesktopProviderStore(alias_parent / "state")
+    database_list = store._connection.execute("PRAGMA database_list").fetchall()
+    opened_path = Path(database_list[0][2])
+
+    assert opened_path.is_absolute()
+    assert os.stat(opened_path).st_ino == os.stat(store.database_path).st_ino
+    profile = _create_profile(store)
+    assert store.get_profile(profile.profile_id) == profile
+    store.close()
+
+
+def test_sqlite_connection_rejects_a_different_database_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    store.close()
+    decoy = tmp_path / "decoy.sqlite3"
+    original_connect = sqlite3.connect
+    original_connect(decoy).close()
+    os.chmod(decoy, 0o600)
+
+    def connect(database: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        del database
+        return original_connect(decoy, *args, **kwargs)
+
+    monkeypatch.setattr(provider_store_module.sqlite3, "connect", connect)
+
+    with pytest.raises(ProviderStateRootError, match="unexpected provider database inode"):
+        DesktopProviderStore(root)
+
+
+def test_open_store_rejects_database_pathname_replacement(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    managed = root / "provider.sqlite3"
+    held_name = tmp_path / "held-provider.sqlite3"
+    os.replace(managed, held_name)
+    managed.touch(mode=0o600)
+    os.chmod(managed, 0o600)
+    try:
+        with pytest.raises(ProviderStateRootError, match="pathname identity changed"):
+            store.list_profiles()
+    finally:
+        managed.unlink()
+        os.replace(held_name, managed)
+        store.close()
+
+
 def test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction(
     tmp_path: Path,
 ) -> None:

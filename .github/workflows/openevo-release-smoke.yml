@@ -60,6 +60,8 @@ jobs:
             tests/ci/test_check_openevo_release.py \
             tests/ci/test_openevo_productization_workflow.py \
             tests/ci/test_productization_spec.py \
+            tests/openevo/sidecar/test_provider_store.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
+            tests/openevo/sidecar/test_provider_store.py::test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction \
             -q
           uv run python scripts/ci/audit_openevo_identity.py
 
