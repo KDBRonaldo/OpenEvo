@@ -4104,6 +4104,7 @@ fn spawn_sidecar_gated(
     let identity_verified = managed.process_group == pid
         && managed.session_id == pid
         && managed.birth_identity.is_some();
+    let startup_was_cancelled = startup_cancelled(state, startup_epoch);
     if identity_verified {
         eprintln!(
             "{SIDECAR_PROCESS_MARKER} {} {pid} {} {} {}",
@@ -4116,13 +4117,13 @@ fn spawn_sidecar_gated(
                 .expect("verified sidecar identity has a birth identity"),
         );
     }
-    if !identity_verified {
+    if !identity_verified && !startup_was_cancelled {
         managed.mark_cleanup_pending();
         Err(sidecar_inspection_error())
     } else if sidecar_was_poisoned {
         managed.mark_cleanup_pending();
         Err(sidecar_state_error())
-    } else if startup_cancelled(state, startup_epoch) {
+    } else if startup_was_cancelled {
         managed.mark_cleanup_pending();
         Err(sidecar_start_cancelled_error())
     } else {
@@ -5609,8 +5610,12 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn test_temp_root(temp: &TempDir) -> PathBuf {
+        fs::canonicalize(temp.path()).unwrap()
+    }
+
     fn test_run_retry_recovery_root(temp: &TempDir) -> PathBuf {
-        temp.path().join("app-data")
+        test_temp_root(temp).join("app-data")
     }
 
     fn run_retry_recovery_target(root: &Path) -> PathBuf {
@@ -5780,14 +5785,15 @@ mod tests {
     #[test]
     fn run_retry_recovery_rejects_symlinked_or_non_private_root() {
         let temp = tempfile::tempdir().unwrap();
-        let actual = temp.path().join("actual");
+        let temp_root = test_temp_root(&temp);
+        let actual = temp_root.join("actual");
         fs::create_dir(&actual).unwrap();
         fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).unwrap();
-        let linked = temp.path().join("linked");
+        let linked = temp_root.join("linked");
         symlink(&actual, &linked).unwrap();
         assert!(read_run_retry_recovery_at(&linked).is_err());
 
-        let non_private = temp.path().join("non-private");
+        let non_private = temp_root.join("non-private");
         fs::create_dir(&non_private).unwrap();
         fs::set_permissions(&non_private, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(read_run_retry_recovery_at(&non_private).is_err());
@@ -6502,7 +6508,7 @@ mod tests {
             (NATIVE_EXECUTABLE_FD_ENV, "99"),
             (NATIVE_EXECUTABLE_PATH_ENV, "/tmp/attacker-sidecar"),
         ]);
-        let fixture = SidecarFixture::from_existing(Path::new("/bin/true"));
+        let fixture = SidecarFixture::from_existing(Path::new("/usr/bin/true"));
         let allocated = allocate_sidecar_listener().unwrap();
         let launch = release_sidecar_launch_spec(Some(fixture.path()), allocated.port).unwrap();
         let prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
@@ -8722,8 +8728,7 @@ mod tests {
         stop_sidecar_inner(&state).unwrap();
     }
 
-    #[test]
-    fn blocked_exec_handoff_is_owned_and_stop_remains_bounded() {
+    fn exercise_blocked_exec_handoff_is_owned_and_stop_remains_bounded() {
         let state = Arc::new(DesktopHostState::default());
         let (reserved_tx, reserved_rx) = mpsc::channel();
         let (begin_spawn_tx, begin_spawn_rx) = mpsc::channel();
@@ -8852,6 +8857,13 @@ mod tests {
         assert!(state.spawn_handoff.lock().unwrap().is_none());
         assert!(state.parent_liveness.lock().unwrap().is_none());
         assert!(wait_for_pid_exit(child_pid, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn blocked_exec_handoff_is_owned_and_stop_remains_bounded() {
+        for _attempt in 0..20 {
+            exercise_blocked_exec_handoff_is_owned_and_stop_remains_bounded();
+        }
     }
 
     #[test]

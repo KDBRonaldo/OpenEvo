@@ -203,7 +203,7 @@ jobs:
           cargo fmt --check
           cargo check --locked --release --all-targets
           cargo clippy --locked --release --all-targets -- -D warnings
-          cargo test --locked --release
+          cargo test --locked --release -- --test-threads=1
           cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
 
       - name: Build unsigned Desktop DMG for the runner architecture

@@ -603,6 +603,9 @@ retained state, cleanup failure changes the manager to `cleanup_pending`, and a
 lock timeout leaves ownership unchanged. Restart remains blocked, while explicit
 stop can retry. No failure path uses `mem::forget`, leaks a `Child`, performs an
 unbounded `Child::wait`, or drops a live manager-owned process as cleanup.
+When cancellation has already advanced, a child that exits before birth-identity
+inspection still reports typed startup cancellation after cleanup succeeds;
+cleanup failure continues to take precedence and retain retryable ownership.
 
 Stop and exit advance cancellation with an atomic compare-exchange before any
 bounded mutex access; neither waits for `Command::spawn` or a launch mutex. They
