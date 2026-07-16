@@ -1992,7 +1992,7 @@ fn fd_execution_path() -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{INHERITED_EXECUTABLE_FD}"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn fd_execution_path() -> PathBuf {
     PathBuf::from(format!("/dev/fd/{INHERITED_EXECUTABLE_FD}"))
 }

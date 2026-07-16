@@ -203,7 +203,9 @@ evidence. On macOS it requires a renderer window, the packaged sidecar listener
 on inherited FD 3, executable FD 4 whose bytes match the bundled externalBin,
 and disappearance of the captured app/sidecar process groups after main-app
 termination. Candidate runs retain separate `app-bundle-smoke.json` and
-`dmg-copy-smoke.json` outputs.
+`dmg-copy-smoke.json` outputs. The preceding release-mode Clippy gate compiles
+all Tauri targets with warnings denied, so test-only platform helpers cannot
+leak into the shipped host binary as dead code.
 
 `scripts/ci/openevo_release_candidate.py` creates and validates the closed
 candidate inventory. Validation includes the source commit, actual runner
