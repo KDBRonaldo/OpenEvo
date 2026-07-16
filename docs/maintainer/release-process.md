@@ -181,8 +181,10 @@ boundary until native cleanup, while the marker and live FD identity are the
 observer's authority. Both packaged paths are rechecked after process cleanup.
 Native stderr uses a nonblocking bounded pipe, parsing remains byte/line bounded,
 and timeout output uses only closed readiness stage names. Probe subprocesses
-share one readiness deadline and are launched in private groups that are killed
-and reaped on timeout. The app process group is signalled only while the unreaped
+share one readiness deadline and run in private sessions. Timeout cleanup takes
+a bounded ancestry snapshot while the direct leader is unreaped, kills observed
+escaped descendant groups before the root group, and then reaps the direct
+leader. The app process group is signalled only while the unreaped
 child reserves its leader PID; after `poll` or `wait`, that numeric group is
 observation-only. Native cleanup and the parent-liveness watchdog own sidecar
 termination, while both success and failure paths verify every observed group

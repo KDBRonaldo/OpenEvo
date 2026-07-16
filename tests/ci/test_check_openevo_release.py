@@ -552,6 +552,44 @@ def test_bundle_smoke_retains_valid_group_before_later_malformed_marker() -> Non
     assert observed_groups == {40, 41}
 
 
+def test_bundle_smoke_retains_valid_group_before_line_limit_failure() -> None:
+    smoke = _load_bundle_smoke_module()
+    observed_groups = {40}
+    marker = (
+        "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
+        "pid=41 pgid=41 sid=41 birth=darwin:1700000000:123 "
+        "executable_device=42 executable_inode=98 "
+        f"executable_sha256={'a' * 64} executable_size=17\n"
+    ).encode("ascii")
+    payload = marker + b"noise\n" * (smoke.NATIVE_HOST_LOG_MAX_LINES + 1)
+
+    with pytest.raises(smoke.SmokeFailure, match="exceeded the line limit"):
+        smoke._parse_native_host_observation(payload, observed_groups)
+
+    assert observed_groups == {40, 41}
+
+
+def test_bundle_smoke_drain_retains_valid_group_before_byte_limit_failure(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    observed_groups = {40}
+    marker = (
+        "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
+        "pid=41 pgid=41 sid=41 birth=darwin:1700000000:123 "
+        "executable_device=42 executable_inode=98 "
+        f"executable_sha256={'a' * 64} executable_size=17\n"
+    ).encode("ascii")
+    native_log = tmp_path / "native-host.stderr"
+    native_log.write_bytes(marker + b"x" * smoke.NATIVE_HOST_LOG_MAX_BYTES)
+
+    with native_log.open("rb") as stream:
+        with pytest.raises(smoke.SmokeFailure, match="exceeded the byte limit"):
+            smoke._drain_native_host_stderr(stream, bytearray(), observed_groups)
+
+    assert observed_groups == {40, 41}
+
+
 def test_bundle_smoke_bounds_native_log_and_resets_stale_renderer_ack() -> None:
     smoke = _load_bundle_smoke_module()
     process_marker = (
@@ -748,16 +786,25 @@ def test_bundle_smoke_probe_timeout_kills_and_reaps_descendants(tmp_path: Path) 
             "import sys",
             "import time",
             (
-                "descendant = subprocess.Popen("
+                "inherited = subprocess.Popen("
                 "[sys.executable, '-c', 'import time; time.sleep(60)'])"
             ),
-            f"Path({str(pid_file)!r}).write_text(f'{{os.getpid()}} {{descendant.pid}}')",
+            (
+                "escaped = subprocess.Popen("
+                "[sys.executable, '-c', 'import time; time.sleep(60)'], "
+                "start_new_session=True)"
+            ),
+            (
+                f"Path({str(pid_file)!r}).write_text("
+                "f'{os.getpid()} {inherited.pid} {escaped.pid}')"
+            ),
             "time.sleep(60)",
         ]
     )
     started = smoke.time.monotonic()
 
     probe_pid: int | None = None
+    escaped_pid: int | None = None
     try:
         result = smoke._run_probe(
             [smoke.sys.executable, "-c", probe_script],
@@ -767,7 +814,7 @@ def test_bundle_smoke_probe_timeout_kills_and_reaps_descendants(tmp_path: Path) 
 
         assert result is None
         assert smoke.time.monotonic() - started < 4.0
-        probe_pid, descendant_pid = (
+        probe_pid, inherited_pid, escaped_pid = (
             int(value) for value in pid_file.read_text(encoding="utf-8").split()
         )
 
@@ -783,15 +830,21 @@ def test_bundle_smoke_probe_timeout_kills_and_reaps_descendants(tmp_path: Path) 
 
         disappearance_deadline = smoke.time.monotonic() + 2
         while smoke.time.monotonic() < disappearance_deadline and any(
-            is_running(pid) for pid in (probe_pid, descendant_pid)
+            is_running(pid) for pid in (probe_pid, inherited_pid, escaped_pid)
         ):
             smoke.time.sleep(0.05)
-        assert all(not is_running(pid) for pid in (probe_pid, descendant_pid))
+        assert all(
+            not is_running(pid) for pid in (probe_pid, inherited_pid, escaped_pid)
+        )
     finally:
         if probe_pid is None and pid_file.is_file():
             probe_pid = int(pid_file.read_text(encoding="utf-8").split()[0])
         if probe_pid is not None:
             smoke._kill_groups({probe_pid}, smoke.signal.SIGKILL)
+        if escaped_pid is None and pid_file.is_file():
+            escaped_pid = int(pid_file.read_text(encoding="utf-8").split()[2])
+        if escaped_pid is not None:
+            smoke._kill_groups({escaped_pid}, smoke.signal.SIGKILL)
 
 
 def test_bundle_smoke_does_not_launch_probe_after_shared_deadline(

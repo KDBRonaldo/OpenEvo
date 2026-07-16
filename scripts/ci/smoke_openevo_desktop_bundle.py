@@ -47,6 +47,7 @@ NATIVE_HOST_LOG_MAX_BYTES = 64 * 1024
 NATIVE_HOST_LOG_MAX_LINES = 512
 NATIVE_GROUP_MAX_PROCESSES = 16
 PROBE_REAP_TIMEOUT_SECONDS = 2.0
+PROBE_DESCENDANT_SNAPSHOT_TIMEOUT_SECONDS = 0.5
 NATIVE_FAILURE_STAGES = frozenset(
     {
         "native_marker_absent",
@@ -377,6 +378,51 @@ def _kill_groups(process_groups: set[int], sig: signal.Signals) -> None:
             pass
 
 
+def _probe_descendant_process_groups(root_pid: int) -> set[int]:
+    try:
+        inventory = subprocess.Popen(
+            ["/bin/ps", "-axo", "pid=,ppid=,pgid="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError:
+        return set()
+    try:
+        stdout, _stderr = inventory.communicate(
+            timeout=PROBE_DESCENDANT_SNAPSHOT_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        inventory.kill()
+        inventory.wait(timeout=PROBE_REAP_TIMEOUT_SECONDS)
+        return set()
+    if inventory.returncode != 0:
+        return set()
+    rows: list[tuple[int, int, int]] = []
+    for line in stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 3:
+            continue
+        try:
+            rows.append((int(parts[0]), int(parts[1]), int(parts[2])))
+        except ValueError:
+            continue
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent, _group in rows:
+            if parent in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    return {
+        group
+        for pid, _parent, group in rows
+        if pid != root_pid and pid in descendants and group > 0
+    }
+
+
 def _run_probe(
     arguments: list[str],
     *,
@@ -401,6 +447,9 @@ def _run_probe(
     try:
         stdout, stderr = process.communicate(timeout=min(timeout_cap, remaining))
     except subprocess.TimeoutExpired:
+        descendant_groups = _probe_descendant_process_groups(process.pid)
+        descendant_groups.discard(process.pid)
+        _kill_groups(descendant_groups, signal.SIGKILL)
         _kill_groups({process.pid}, signal.SIGKILL)
         try:
             process.communicate(timeout=PROBE_REAP_TIMEOUT_SECONDS)
@@ -448,13 +497,13 @@ def _parse_native_host_observation(
     payload: bytes,
     observed_process_groups: set[int] | None = None,
 ) -> NativeHostObservation:
-    if len(payload) > NATIVE_HOST_LOG_MAX_BYTES:
-        raise SmokeFailure("Native host smoke diagnostics exceeded the byte limit")
-    lines = payload.splitlines()
-    if payload and not payload.endswith((b"\n", b"\r")):
+    byte_limit_exceeded = len(payload) > NATIVE_HOST_LOG_MAX_BYTES
+    bounded_payload = payload[:NATIVE_HOST_LOG_MAX_BYTES]
+    lines = bounded_payload.splitlines()
+    if bounded_payload and not bounded_payload.endswith((b"\n", b"\r")):
         lines = lines[:-1]
-    if len(lines) > NATIVE_HOST_LOG_MAX_LINES:
-        raise SmokeFailure("Native host smoke diagnostics exceeded the line limit")
+    line_limit_exceeded = len(lines) > NATIVE_HOST_LOG_MAX_LINES
+    lines = lines[:NATIVE_HOST_LOG_MAX_LINES]
 
     active_process: NativeSidecarProcessMarker | None = None
     renderer_ready = False
@@ -508,6 +557,11 @@ def _parse_native_host_observation(
                 raise SmokeFailure("Native host renderer marker is malformed")
             renderer_ready = True
 
+    if byte_limit_exceeded:
+        raise SmokeFailure("Native host smoke diagnostics exceeded the byte limit")
+    if line_limit_exceeded:
+        raise SmokeFailure("Native host smoke diagnostics exceeded the line limit")
+
     return NativeHostObservation(
         active_process=active_process,
         renderer_ready=renderer_ready,
@@ -533,6 +587,10 @@ def _drain_native_host_stderr(
         if not chunk:
             break
         if len(buffer) + len(chunk) > NATIVE_HOST_LOG_MAX_BYTES:
+            remaining = NATIVE_HOST_LOG_MAX_BYTES - len(buffer)
+            if remaining > 0:
+                buffer.extend(chunk[:remaining])
+            _parse_native_host_observation(bytes(buffer), observed_process_groups)
             raise SmokeFailure("Native host smoke diagnostics exceeded the byte limit")
         buffer.extend(chunk)
     return _parse_native_host_observation(bytes(buffer), observed_process_groups)

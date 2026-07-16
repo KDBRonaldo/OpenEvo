@@ -208,8 +208,10 @@ with `proc_pidinfo(PROC_PIDTBSDINFO)` before FD observation.
 The private launch pathname remains within the documented same-UID trust
 boundary until native cleanup. The smoke does not reopen the pathname reported
 by `lsof`; it trusts only the marker-bound live FD identity. Its macOS probes
-share the readiness deadline, kill and reap their own private process groups on
-timeout, and cap each observed sidecar group. It also requires bounded
+share the readiness deadline and run in private sessions. Timeout cleanup uses
+a bounded ancestry snapshot to kill an observed child that escaped with
+`setsid`, then kills the root group and reaps the direct leader. Observation
+also caps each sidecar group. It requires bounded
 disappearance of every captured app/sidecar process group after main-app
 termination on success or failure. The smoke signals the app group only while
 its unreaped child reserves the leader PID; already reaped app groups and all
@@ -231,7 +233,9 @@ links in the app, `Info.plist`, Tauri executable, sidecar, or their in-bundle
 ancestors and revalidates binary identity and digest after cleanup. Candidate
 JSON fixtures cover duplicate keys at both top-level and nested locations.
 Native stderr is drained through a nonblocking bounded pipe and marker parsing
-is byte/line bounded. StrictMode lifecycle
+is byte/line bounded. Before reporting a byte or line overflow, the parser
+registers every complete valid process marker still inside those budgets so
+failure cleanup cannot lose an already observed sidecar group. StrictMode lifecycle
 replacement selects the latest process marker while retaining all observed
 process groups for disappearance checks. Only the app group backed by an
 unreaped child authority may be signalled; reaped app groups and historical

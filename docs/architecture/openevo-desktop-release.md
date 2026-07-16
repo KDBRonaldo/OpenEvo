@@ -211,8 +211,9 @@ For release observation, the native host emits the closed
 contains PID, process-group ID, session ID, Darwin birth identity, verified
 executable device/inode/size, and executable SHA-256; it contains no instance,
 readiness, session, or handoff credential. The macOS app smoke drains this
-marker through a nonblocking size-bounded pipe, follows the latest lifecycle
-when React
+marker through a nonblocking size-bounded pipe. Before a byte/line overflow
+fails the smoke, every complete valid marker inside the budget is retained for
+cleanup observation. The parser follows the latest lifecycle when React
 StrictMode cancels an earlier bootstrap, and requires the live marker PID to
 remain a descendant with the same process group, session, and exact Darwin
 birth identity returned by `proc_pidinfo(PROC_PIDTBSDINFO)`. It then locates a
@@ -233,9 +234,13 @@ leader PID; once `poll` or `wait` has reaped that child, the numeric group is
 observation-only. Sidecar groups are terminated by the native host and
 parent-liveness watchdog; on success and failure the smoke performs a bounded
 disappearance check but never signals a historical numeric PGID. All macOS
-probes share the launch readiness deadline, run in private process groups that
-are killed and reaped on timeout, and cap the number of sidecar-group members
-inspected in one observation pass. Cleanup
+probes share the launch readiness deadline and run in private sessions. On
+timeout, while the direct probe leader remains unreaped, the driver takes a
+bounded `/bin/ps` ancestry snapshot, kills any currently observed descendant
+groups that escaped through `setsid` before killing the root group, and then
+reaps the direct leader. These fixed platform probes are not an extension
+boundary. Observation also caps the number of sidecar-group members inspected
+in one pass. Cleanup
 evidence requires every observed numeric process group to cease existing;
 zombie-only groups are not reported as cleaned.
 
