@@ -203,14 +203,22 @@ evidence. On macOS it requires a renderer window, the packaged sidecar listener
 on inherited FD 3, executable FD 4 whose bytes match the bundled externalBin,
 and disappearance of the captured app/sidecar process groups after main-app
 termination. Candidate runs retain separate `app-bundle-smoke.json` and
-`dmg-copy-smoke.json` outputs. The preceding release-mode Clippy gate compiles
-all Tauri targets with warnings denied, so test-only platform helpers cannot
-leak into the shipped host binary as dead code. The macOS PR and candidate
-gates run the complete release Rust suite with one test thread because its
+`dmg-copy-smoke.json` outputs. The former declares `launch_origin=mounted_dmg`;
+the latter declares `launch_origin=detached_copy` after `ditto` and a successful
+DMG detach. Both schema-v3 reports bind the exact source DMG, Tauri executable,
+and packaged sidecar SHA256 values, and candidate validation requires the
+reports to agree. The preceding release-mode Clippy gate compiles all Tauri
+targets with warnings denied, so test-only platform helpers cannot leak into
+the shipped host binary as dead code. The macOS PR and candidate gates run the
+complete release Rust suite with one test thread because its
 native process-lifecycle cases mutate process-global environment and load the
 shared OS process table. Security-path fixtures canonicalize the macOS system
 temporary-directory alias before exercising no-follow path traversal; the
-production traversal remains strict. Both macOS gates additionally repeat the
+production traversal remains strict. The bundle smoke also rejects symbolic
+links in the app, `Info.plist`, Tauri executable, sidecar, or their in-bundle
+ancestors and revalidates binary identity and digest after cleanup. Candidate
+JSON fixtures cover duplicate keys at both top-level and nested locations. Both
+macOS gates additionally repeat the
 blocked pre-exec cancellation test's internal scenario twenty times so serial
 suite scheduling does not hide the watchdog, handoff, and bounded-cleanup
 transition. The suite also covers Darwin's `EPERM` response when a retained

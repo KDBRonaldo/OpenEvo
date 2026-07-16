@@ -463,9 +463,105 @@ def test_candidate_manifest_rejects_mismatched_dmg_mach_o_slices(tmp_path: Path)
             registry_digest="f" * 64,
         )
     except candidate.CandidateError as exc:
-        assert "Mach-O" in str(exc)
+        assert str(exc) == (
+            "Mounted-DMG app and detached-copy Mach-O evidence do not match"
+        )
     else:
-        raise AssertionError("mismatched DMG-copy Mach-O slices must fail closed")
+        raise AssertionError("mismatched detached-copy Mach-O slices must fail closed")
+
+
+def test_candidate_manifest_rejects_smoke_bound_to_different_dmg(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    evidence_path = tmp_path / "app-bundle-smoke.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["source_dmg"]["sha256"] = "f" * 64
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(candidate.CandidateError, match="source DMG"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="f" * 64,
+        )
+
+
+def test_candidate_manifest_rejects_wrong_smoke_launch_origin(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    evidence_path = tmp_path / "dmg-copy-smoke.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["launch_origin"] = "mounted_dmg"
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(candidate.CandidateError, match="launch origin"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="f" * 64,
+        )
+
+
+def test_candidate_manifest_rejects_legacy_native_smoke_schema(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    evidence_path = tmp_path / "app-bundle-smoke.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["schema_version"] = 2
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(candidate.CandidateError, match="schema version"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="f" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"schema_version":2,"schema_version":3}\n',
+        '{"source_dmg":{"sha256":"' + "a" * 64 + '","sha256":"' + "b" * 64 + '"}}\n',
+    ],
+)
+def test_candidate_json_rejects_duplicate_keys(tmp_path: Path, payload: str) -> None:
+    candidate = _load_module()
+    path = tmp_path / "duplicate.json"
+    path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(candidate.CandidateError, match="duplicate key"):
+        candidate._load_json(path)
+
+
+def test_candidate_manifest_rejects_mismatched_smoke_binary_digests(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    evidence_path = tmp_path / "dmg-copy-smoke.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["binary_sha256"]["native_executable"] = "f" * 64
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(candidate.CandidateError, match="binary digests"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="f" * 64,
+        )
 
 
 def test_candidate_manifest_rejects_open_core_compatibility_schema(tmp_path: Path) -> None:
@@ -633,8 +729,17 @@ def _write_candidate_inputs(
             },
         },
     )
-    raw_smoke_evidence = {
-        "schema_version": 2,
+    mounted_smoke_evidence = {
+        "schema_version": 3,
+        "launch_origin": "mounted_dmg",
+        "source_dmg": {
+            "filename": dmg.name,
+            "sha256": _sha256(dmg),
+        },
+        "binary_sha256": {
+            "native_executable": "1" * 64,
+            "bundled_external_bin": "2" * 64,
+        },
         "native_executable": "OpenEvo Desktop",
         "bundled_external_bin": "openevo-desktop-sidecar",
         "renderer_ready": True,
@@ -654,10 +759,11 @@ def _write_candidate_inputs(
             },
         },
     }
-    copied_smoke_evidence = json.loads(json.dumps(raw_smoke_evidence))
+    copied_smoke_evidence = json.loads(json.dumps(mounted_smoke_evidence))
+    copied_smoke_evidence["launch_origin"] = "detached_copy"
     for binary in ("native_executable", "bundled_external_bin"):
         copied_smoke_evidence["mach_o"][binary]["slices"] = dmg_slices or ["arm64"]
-    _write_json(root / "app-bundle-smoke.json", raw_smoke_evidence)
+    _write_json(root / "app-bundle-smoke.json", mounted_smoke_evidence)
     _write_json(root / "dmg-copy-smoke.json", copied_smoke_evidence)
     return {"wheel": wheel, "framework_lock": framework_lock, "dmg": dmg}
 

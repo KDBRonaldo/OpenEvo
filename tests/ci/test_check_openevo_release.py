@@ -239,12 +239,26 @@ def test_bundle_smoke_launches_tauri_main_and_requires_native_evidence(
         plistlib.dump({"CFBundleExecutable": executable.name}, stream)
 
     evidence_path = tmp_path / "native-evidence.json"
+    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
+    source_dmg.write_bytes(b"exact candidate dmg")
     evidence = smoke.smoke_bundle(
         tmp_path,
+        launch_origin="mounted_dmg",
+        source_dmg=source_dmg,
         timeout_seconds=5,
         evidence_out=evidence_path,
     )
 
+    assert evidence["schema_version"] == 3
+    assert evidence["launch_origin"] == "mounted_dmg"
+    assert evidence["source_dmg"] == {
+        "filename": source_dmg.name,
+        "sha256": hashlib.sha256(source_dmg.read_bytes()).hexdigest(),
+    }
+    assert evidence["binary_sha256"] == {
+        "native_executable": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "bundled_external_bin": hashlib.sha256(sidecar.read_bytes()).hexdigest(),
+    }
     assert evidence["native_executable"] == executable.name
     assert evidence["bundled_external_bin"] == sidecar.name
     assert evidence["renderer_ready"] is True
@@ -329,13 +343,133 @@ def test_bundle_smoke_requires_openevo_desktop_app_bundle(tmp_path: Path) -> Non
         raise AssertionError("Expected missing OpenEvo Desktop.app bundle to fail")
 
 
+def test_bundle_smoke_rejects_symbolic_app_bundle(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    external_app = tmp_path / "external" / "OpenEvo Desktop.app"
+    external_app.mkdir(parents=True)
+    (tmp_path / "OpenEvo Desktop.app").symlink_to(
+        external_app,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="symbolic link"):
+        smoke.find_app_executable(tmp_path)
+
+
+def test_bundle_smoke_rejects_symbolic_tauri_executable(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "OpenEvo Desktop"
+    external_executable = tmp_path / "external-openevo-desktop"
+    _write_fake_sidecar(external_executable)
+    executable.parent.mkdir(parents=True)
+    executable.symlink_to(external_executable)
+    with (app / "Contents" / "Info.plist").open("wb") as stream:
+        plistlib.dump({"CFBundleExecutable": executable.name}, stream)
+
+    with pytest.raises(smoke.SmokeFailure, match="symbolic link"):
+        smoke.find_app_executable(tmp_path)
+
+
+def test_bundle_smoke_rejects_symbolic_bundled_sidecar(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "OpenEvo Desktop"
+    sidecar = executable.with_name("openevo-desktop-sidecar")
+    external_sidecar = tmp_path / "external-openevo-desktop-sidecar"
+    _write_fake_sidecar(executable)
+    _write_fake_sidecar(external_sidecar)
+    sidecar.symlink_to(external_sidecar)
+    with (app / "Contents" / "Info.plist").open("wb") as stream:
+        plistlib.dump({"CFBundleExecutable": executable.name}, stream)
+
+    with pytest.raises(smoke.SmokeFailure, match="symbolic link"):
+        smoke.find_bundled_sidecar(tmp_path)
+
+
 def test_bundle_smoke_rejects_sidecar_only_bundle(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
     sidecar = tmp_path / "OpenEvo Desktop.app" / "Contents" / "MacOS" / "openevo-desktop-sidecar"
     _write_fake_sidecar(sidecar)
 
     with pytest.raises(smoke.SmokeFailure, match="Info.plist"):
-        smoke.smoke_bundle(tmp_path, timeout_seconds=1)
+        smoke.smoke_bundle(
+            tmp_path,
+            launch_origin="mounted_dmg",
+            source_dmg=tmp_path / "candidate.dmg",
+            timeout_seconds=1,
+        )
+
+
+def test_bundle_smoke_rejects_binary_replacement_during_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    monkeypatch.setattr(smoke.sys, "platform", "linux")
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "OpenEvo Desktop"
+    sidecar = app / "Contents" / "MacOS" / "openevo-desktop-sidecar"
+    _write_fake_tauri_release_smoke(executable)
+    executable.write_text(
+        executable.read_text(encoding="utf-8").replace(
+            "evidence = {\n",
+            "Path(__file__).with_name('openevo-desktop-sidecar').write_bytes(b'replaced')\n"
+            "evidence = {\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    sidecar.write_bytes(b"packaged externalBin")
+    sidecar.chmod(0o755)
+    with (app / "Contents" / "Info.plist").open("wb") as stream:
+        plistlib.dump({"CFBundleExecutable": executable.name}, stream)
+    source_dmg = tmp_path / "candidate.dmg"
+    source_dmg.write_bytes(b"dmg")
+
+    with pytest.raises(smoke.SmokeFailure, match="changed during native smoke"):
+        smoke.smoke_bundle(
+            tmp_path,
+            launch_origin="detached_copy",
+            source_dmg=source_dmg,
+            timeout_seconds=5,
+        )
+
+
+def test_bundle_smoke_fd_observation_uses_prelaunch_sidecar_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    sidecar = tmp_path / "openevo-desktop-sidecar"
+    sidecar.write_bytes(b"observed sidecar")
+    executable = tmp_path / "OpenEvo Desktop"
+    executable.write_bytes(b"native executable")
+    monkeypatch.setattr(
+        smoke,
+        "_descendants",
+        lambda _pid: [(41, 40, 41, "openevo-desktop-sidecar")],
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_lsof_fd",
+        lambda _pid, descriptor: (
+            ("IPv4", "127.0.0.1:1234 (LISTEN)")
+            if descriptor == 3
+            else ("REG", str(sidecar))
+        ),
+    )
+
+    evidence, process_groups = smoke._macos_native_evidence(
+        40,
+        executable,
+        sidecar,
+        {},
+        "f" * 64,
+    )
+
+    assert evidence is None
+    assert process_groups == {41}
 
 
 def test_accepts_valid_openevo_release_wheel(tmp_path: Path) -> None:
@@ -1296,9 +1430,63 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         assert marker in text
     assert release_test_command in macos_candidate
     assert "lipo -version" not in macos_candidate
+    assert "bundle/macos" not in macos_candidate
+    assert macos_candidate.count(
+        "scripts/ci/smoke_openevo_desktop_bundle.py"
+    ) == 2
     assert macos_candidate.index("- name: Check release-mode Tauri host") < (
         macos_candidate.index(release_test_command)
     ) < macos_candidate.index("- name: Build unsigned Desktop DMG")
+
+    shipped_app_smoke = macos_candidate.split(
+        "      - name: Mount, launch, copy, detach, and relaunch the exact DMG app\n",
+        maxsplit=1,
+    )[1].split(
+        "      - name: Write release notes and authoritative candidate manifest\n",
+        maxsplit=1,
+    )[0]
+    mounted_smoke = (
+        "uv run python scripts/ci/smoke_openevo_desktop_bundle.py \\\n"
+        '            "$mounted_app" \\\n'
+        "            --launch-origin mounted_dmg \\\n"
+        '            --source-dmg "$dmg" \\\n'
+        "            --timeout-seconds 60 \\\n"
+        "            --evidence-out candidate-artifacts/app-bundle-smoke.json"
+    )
+    copied_smoke = (
+        "uv run python scripts/ci/smoke_openevo_desktop_bundle.py \\\n"
+        '            "$copied_app" \\\n'
+        "            --launch-origin detached_copy \\\n"
+        '            --source-dmg "$dmg" \\\n'
+        "            --timeout-seconds 60 \\\n"
+        "            --evidence-out candidate-artifacts/dmg-copy-smoke.json"
+    )
+    assert shipped_app_smoke.count(
+        "uv run python scripts/ci/smoke_openevo_desktop_bundle.py"
+    ) == 2
+    assert shipped_app_smoke.count('dmg="candidate-artifacts/OpenEvo-Desktop-') == 1
+    assert (
+        'hdiutil attach "$dmg" -mountpoint "$mount_dir" -nobrowse -readonly'
+        in shipped_app_smoke
+    )
+    assert 'mounted_app="$mount_dir/OpenEvo Desktop.app"' in shipped_app_smoke
+    assert 'copied_app="$copy_dir/OpenEvo Desktop.app"' in shipped_app_smoke
+    assert macos_candidate.count("mounted_app=") == 1
+    assert macos_candidate.count("copied_app=") == 1
+    assert mounted_smoke in shipped_app_smoke
+    assert copied_smoke in shipped_app_smoke
+    mounted_smoke_position = shipped_app_smoke.index(mounted_smoke)
+    copy_position = shipped_app_smoke.index('ditto "$mounted_app" "$copied_app"')
+    release_detach = shipped_app_smoke.index('hdiutil detach "$mount_dir" -quiet\n')
+    copied_smoke_position = shipped_app_smoke.index(copied_smoke)
+    assert mounted_smoke_position < copy_position < release_detach
+    assert release_detach < copied_smoke_position
+    assert "trap cleanup EXIT" in shipped_app_smoke
+    assert (
+        'hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true'
+        in shipped_app_smoke
+    )
+    assert 'rm -rf "$mount_dir" "$copy_dir"' in shipped_app_smoke
 
     candidate_ssh_step = text.split(
         "      - name: Exercise macOS SSH agent relay and fixed executable authority\n",
@@ -1953,7 +2141,7 @@ def _write_fake_tauri_release_smoke(path: Path) -> None:
                 "",
                 "subprocess.Popen(['/bin/sh', '-c', 'sleep 60'])",
                 "evidence = {",
-                "    'schema_version': 2,",
+                "    'schema_version': 3,",
                 "    'nonce': os.environ['OPENEVO_RELEASE_SMOKE_NONCE'],",
                 "    'native_executable': 'OpenEvo Desktop',",
                 "    'bundled_external_bin': 'openevo-desktop-sidecar',",

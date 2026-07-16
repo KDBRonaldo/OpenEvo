@@ -225,29 +225,32 @@ jobs:
           cp "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl candidate-artifacts/
           cp "$OPENEVO_CANDIDATE_CORE/framework-lock.json" candidate-artifacts/
 
-      - name: Launch real app bundle and record native evidence
-        run: |
-          uv run python scripts/ci/smoke_openevo_desktop_bundle.py \
-            "desktop/src-tauri/target/release/bundle/macos/OpenEvo Desktop.app" \
-            --timeout-seconds 60 \
-            --evidence-out candidate-artifacts/app-bundle-smoke.json
-
-      - name: Mount, copy, detach, and launch the real DMG app
+      - name: Mount, launch, copy, detach, and relaunch the exact DMG app
         run: |
           mount_dir="$(mktemp -d)"
           copy_dir="$(mktemp -d)"
           cleanup() {
-            hdiutil detach "$mount_dir" -quiet || true
+            hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true
             rm -rf "$mount_dir" "$copy_dir"
           }
           trap cleanup EXIT
           dmg="candidate-artifacts/OpenEvo-Desktop-${OPENEVO_VERSION}-${OPENEVO_ARCHITECTURE}.dmg"
           hdiutil attach "$dmg" -mountpoint "$mount_dir" -nobrowse -readonly
-          test -d "$mount_dir/OpenEvo Desktop.app"
-          ditto "$mount_dir/OpenEvo Desktop.app" "$copy_dir/OpenEvo Desktop.app"
+          mounted_app="$mount_dir/OpenEvo Desktop.app"
+          copied_app="$copy_dir/OpenEvo Desktop.app"
+          test -d "$mounted_app"
+          uv run python scripts/ci/smoke_openevo_desktop_bundle.py \
+            "$mounted_app" \
+            --launch-origin mounted_dmg \
+            --source-dmg "$dmg" \
+            --timeout-seconds 60 \
+            --evidence-out candidate-artifacts/app-bundle-smoke.json
+          ditto "$mounted_app" "$copied_app"
           hdiutil detach "$mount_dir" -quiet
           uv run python scripts/ci/smoke_openevo_desktop_bundle.py \
-            "$copy_dir/OpenEvo Desktop.app" \
+            "$copied_app" \
+            --launch-origin detached_copy \
+            --source-dmg "$dmg" \
             --timeout-seconds 60 \
             --evidence-out candidate-artifacts/dmg-copy-smoke.json
 
