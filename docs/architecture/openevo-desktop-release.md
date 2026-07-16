@@ -614,11 +614,12 @@ are likewise reserved and unavailable; HTTP(S) proxy URLs without user-info
 remain supported.
 
 Release SSH, ssh-keyscan, and rsync calls use platform-fixed allowlisted absolute
-binaries. Core verifies root ownership, regular-file type, executable mode, link
-count one, non-group/world-writable ancestors and file metadata. Linux launches
-through the held executable FD. On macOS, the top-level SSH/rsync birth child
-compares that FD with the fixed system path immediately before execution;
-ssh-keyscan is verified before launch and again after completion. The original host
+binaries. The Desktop sidecar deployment transport verifies root ownership,
+regular-file type, executable mode, link count one, non-group/world-writable
+ancestors and file metadata. Linux launches through the held executable FD. On
+macOS, the top-level SSH/rsync birth child compares that FD with the fixed system
+path immediately before execution; ssh-keyscan is verified before launch and
+again after completion. The original host
 `SSH_AUTH_SOCK` path is never supplied to OpenSSH. Every SSH/rsync/tunnel spawn
 first connects and revalidates the held upstream socket, then exposes only a
 fresh owner-private one-shot relay. Kernel peer PID, the owned child session and
