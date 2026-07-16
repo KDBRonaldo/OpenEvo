@@ -3247,6 +3247,7 @@ def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
 def test_portable_observer_never_reaps_before_group_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    original_observer_init = ssh_module._SubprocessExitObserver.__init__
     original_isfile = os.path.isfile
     original_signal_group = ssh_module._signal_owned_process_group
     original_observe_group = ssh_module._observe_owned_process_group_states
@@ -3255,6 +3256,21 @@ def test_portable_observer_never_reaps_before_group_cleanup(
 
     def fail_kqueue() -> object:
         raise OSError("kqueue unavailable")
+
+    def init_without_kqueue(
+        observer: ssh_module._SubprocessExitObserver,
+        process: subprocess.Popen[bytes],
+    ) -> None:
+        # Simulate an unavailable observer backend without poisoning the
+        # selectors used later by subprocess output capture on macOS.
+        with monkeypatch.context() as observer_patch:
+            observer_patch.setattr(
+                ssh_module.select,
+                "kqueue",
+                fail_kqueue,
+                raising=False,
+            )
+            original_observer_init(observer, process)
 
     def record_signal_group(*args: object, **kwargs: object) -> None:
         process = args[0]
@@ -3269,7 +3285,11 @@ def test_portable_observer_never_reaps_before_group_cleanup(
         return original_observe_group(*args, **kwargs)
 
     monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
-    monkeypatch.setattr(ssh_module.select, "kqueue", fail_kqueue, raising=False)
+    monkeypatch.setattr(
+        ssh_module._SubprocessExitObserver,
+        "__init__",
+        init_without_kqueue,
+    )
     monkeypatch.setattr(
         ssh_module.os.path,
         "isfile",
