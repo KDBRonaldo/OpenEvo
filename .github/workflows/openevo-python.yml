@@ -14,6 +14,7 @@ on:
       - ".github/workflows/openevo-python.yml"
       - ".github/workflows/openevo-desktop.yml"
       - ".github/workflows/openevo-desktop-candidate.yml"
+      - ".github/workflows/openevo-release-smoke.yml"
       - ".github/workflows/openevo-release-artifact.yml"
       - ".github/workflows/openevo-publish-pypi.yml"
       - "pyproject.toml"

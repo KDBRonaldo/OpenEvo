@@ -190,6 +190,12 @@ observation-only. Native cleanup and the parent-liveness watchdog own sidecar
 termination, while both success and failure paths verify every observed group
 ceases to exist within a bounded cleanup period; a zombie-only group is still a
 cleanup failure.
+The release host gives a cold packaged sidecar up to 60 seconds to complete its
+bounded PyInstaller onefile startup. Each mounted-DMG or detached-copy smoke has
+a separate 120-second readiness deadline so renderer, FD, and window probes
+cannot expire merely because the inner cold-start budget was consumed. Cleanup
+then retains its independent 5-second termination and 15-second group-
+disappearance maximum bounds.
 Candidate JSON parsing
 rejects duplicate keys at every nesting level, so a last-key-wins parser cannot
 reinterpret the closed evidence contract.

@@ -456,6 +456,11 @@ relying on macOS Mach-O execution through `/dev/fd` while preserving
 descriptor-bound archive reads. The pathname is private native-host state and is
 never renderer-visible, but it intentionally remains available for PyInstaller's
 later child `execvp` until the owned process lifecycle has ended.
+The release host bounds that cold onefile initialization at 60 seconds. Release
+candidate app smokes use a 120-second readiness deadline so renderer
+acknowledgement and FD/window observation still have time after a cold start.
+Termination and process-group disappearance then use their separate existing
+5-second and 15-second maximum bounds.
 Debug-only override and source-launcher code is absent under production cfg;
 the Desktop workflow compiles, lints, and tests both debug and release cfg.
 

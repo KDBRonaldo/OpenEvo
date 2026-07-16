@@ -1,6 +1,31 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+
+def test_release_workflows_pin_the_uv_toolchain() -> None:
+    setup_pattern = re.compile(
+        r"(?m)^\s*- uses: astral-sh/setup-uv@[^\s]+\n"
+        r"\s+with:\n"
+        r"\s+version: \"0\.11\.29\"$"
+    )
+    setup_reference = re.compile(r"(?m)^\s*- uses: astral-sh/setup-uv@[^\s]+$")
+    workflows = sorted(
+        {
+            *Path(".github/workflows").glob("*.yml"),
+            *Path(".github/workflows").glob("*.yaml"),
+        }
+    )
+    setup_total = 0
+
+    for workflow in workflows:
+        text = workflow.read_text(encoding="utf-8")
+        setup_count = len(setup_reference.findall(text))
+        setup_total += setup_count
+        if setup_count:
+            assert len(setup_pattern.findall(text)) == setup_count, workflow
+    assert setup_total > 0
 
 
 def test_openevo_python_workflow_runs_focused_regressions() -> None:
@@ -11,6 +36,7 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
     assert "name: OpenEvo Core Backend checks" in text
     assert '".github/workflows/openevo-desktop.yml"' in text
     assert '".github/workflows/openevo-desktop-candidate.yml"' in text
+    assert '".github/workflows/openevo-release-smoke.yml"' in text
     assert '".github/workflows/openevo-release-artifact.yml"' in text
     assert '".github/workflows/openevo-publish-pypi.yml"' in text
     assert '"src/openevo/**"' in text

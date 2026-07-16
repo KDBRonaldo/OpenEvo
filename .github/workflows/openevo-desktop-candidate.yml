@@ -51,6 +51,8 @@ jobs:
           python-version: "3.11"
 
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -243,7 +245,7 @@ jobs:
             "$mounted_app" \
             --launch-origin mounted_dmg \
             --source-dmg "$dmg" \
-            --timeout-seconds 60 \
+            --timeout-seconds 120 \
             --evidence-out candidate-artifacts/app-bundle-smoke.json
           ditto "$mounted_app" "$copied_app"
           hdiutil detach "$mount_dir" -quiet
@@ -251,7 +253,7 @@ jobs:
             "$copied_app" \
             --launch-origin detached_copy \
             --source-dmg "$dmg" \
-            --timeout-seconds 60 \
+            --timeout-seconds 120 \
             --evidence-out candidate-artifacts/dmg-copy-smoke.json
 
       - name: Write release notes and authoritative candidate manifest
@@ -323,6 +325,8 @@ jobs:
           python-version: "3.11"
 
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
 
       - name: Install locked smoke dependencies
         run: uv sync --frozen --group dev
