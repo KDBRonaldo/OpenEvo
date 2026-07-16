@@ -180,12 +180,14 @@ executable pathname: the pathname remains in the documented same-UID trust
 boundary until native cleanup, while the marker and live FD identity are the
 observer's authority. Both packaged paths are rechecked after process cleanup.
 Native stderr uses a nonblocking bounded pipe, parsing remains byte/line bounded,
-and timeout output uses only closed readiness stage names. Probe subprocesses share one
-readiness deadline and are launched in private groups that are killed and
-reaped on timeout. Only the app process group is signalled; native cleanup and
-the parent-liveness watchdog own sidecar termination, while both success and
-failure paths verify every observed group disappears within a bounded cleanup
-period.
+and timeout output uses only closed readiness stage names. Probe subprocesses
+share one readiness deadline and are launched in private groups that are killed
+and reaped on timeout. The app process group is signalled only while the unreaped
+child reserves its leader PID; after `poll` or `wait`, that numeric group is
+observation-only. Native cleanup and the parent-liveness watchdog own sidecar
+termination, while both success and failure paths verify every observed group
+ceases to exist within a bounded cleanup period; a zombie-only group is still a
+cleanup failure.
 Candidate JSON parsing
 rejects duplicate keys at every nesting level, so a last-key-wins parser cannot
 reinterpret the closed evidence contract.

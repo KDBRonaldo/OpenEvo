@@ -47,6 +47,17 @@ NATIVE_HOST_LOG_MAX_BYTES = 64 * 1024
 NATIVE_HOST_LOG_MAX_LINES = 512
 NATIVE_GROUP_MAX_PROCESSES = 16
 PROBE_REAP_TIMEOUT_SECONDS = 2.0
+NATIVE_FAILURE_STAGES = frozenset(
+    {
+        "native_marker_absent",
+        "native_process_unavailable",
+        "listener_fd_unavailable",
+        "executable_fd_unavailable",
+        "renderer_ack_absent",
+        "renderer_window_absent",
+        "probe_deadline_exhausted",
+    }
+)
 _NATIVE_PROCESS_MARKER_PATTERN = re.compile(
     rb"OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
     rb"pid=([1-9][0-9]{0,9}) pgid=([1-9][0-9]{0,9}) "
@@ -328,7 +339,7 @@ def _process_group_exists(process_group: int) -> bool:
     return True
 
 
-def _live_process_groups(process_groups: set[int], deadline: float) -> set[int]:
+def _running_process_groups(process_groups: set[int], deadline: float) -> set[int]:
     result = _run_probe(
         ["ps", "-axo", "pgid=,stat="],
         deadline=deadline,
@@ -352,10 +363,10 @@ def _live_process_groups(process_groups: set[int], deadline: float) -> set[int]:
 
 def _wait_for_groups_to_exit(process_groups: set[int], deadline: float) -> bool:
     while time.monotonic() < deadline:
-        if not _live_process_groups(process_groups, deadline):
+        if not any(_process_group_exists(group) for group in process_groups):
             return True
         time.sleep(0.05)
-    return not _live_process_groups(process_groups, time.monotonic() + 0.5)
+    return not any(_process_group_exists(group) for group in process_groups)
 
 
 def _kill_groups(process_groups: set[int], sig: signal.Signals) -> None:
@@ -433,7 +444,10 @@ def _descendants(root_pid: int, deadline: float) -> list[tuple[int, int, int, st
     return [row for row in rows if row[0] in descendants and row[0] != root_pid]
 
 
-def _parse_native_host_observation(payload: bytes) -> NativeHostObservation:
+def _parse_native_host_observation(
+    payload: bytes,
+    observed_process_groups: set[int] | None = None,
+) -> NativeHostObservation:
     if len(payload) > NATIVE_HOST_LOG_MAX_BYTES:
         raise SmokeFailure("Native host smoke diagnostics exceeded the byte limit")
     lines = payload.splitlines()
@@ -480,6 +494,8 @@ def _parse_native_host_observation(payload: bytes) -> NativeHostObservation:
                 executable_size=executable_size,
             )
             process_groups.add(process_group)
+            if observed_process_groups is not None:
+                observed_process_groups.add(process_group)
             renderer_ready = False
             continue
         if line.startswith(NATIVE_RENDERER_MARKER_PREFIX):
@@ -502,6 +518,7 @@ def _parse_native_host_observation(payload: bytes) -> NativeHostObservation:
 def _drain_native_host_stderr(
     stream: object,
     buffer: bytearray,
+    observed_process_groups: set[int] | None = None,
 ) -> NativeHostObservation:
     fileno = getattr(stream, "fileno", None)
     if not callable(fileno):
@@ -518,7 +535,7 @@ def _drain_native_host_stderr(
         if len(buffer) + len(chunk) > NATIVE_HOST_LOG_MAX_BYTES:
             raise SmokeFailure("Native host smoke diagnostics exceeded the byte limit")
         buffer.extend(chunk)
-    return _parse_native_host_observation(bytes(buffer))
+    return _parse_native_host_observation(bytes(buffer), observed_process_groups)
 
 
 def _darwin_process_birth_identity(pid: int) -> str | None:
@@ -577,26 +594,7 @@ print(ready ? "1" : "0")
         timeout_cap=10,
         env=environment,
     )
-    if swift is not None and swift.returncode == 0:
-        return swift.stdout.strip() == "1"
-
-    script = (
-        'tell application "System Events" to tell first application process '
-        f"whose unix id is {app_pid} to count windows"
-    )
-    result = _run_probe(
-        ["osascript", "-e", script],
-        deadline=deadline,
-        timeout_cap=5,
-    )
-    if result is None:
-        return False
-    if result.returncode != 0:
-        return False
-    try:
-        return int(result.stdout.strip()) > 0
-    except ValueError:
-        return False
+    return swift is not None and swift.returncode == 0 and swift.stdout.strip() == "1"
 
 
 def _lsof_fd(
@@ -683,8 +681,11 @@ def _macos_native_evidence(
     expected_sidecar_digest: str,
     native_observation: NativeHostObservation,
     deadline: float,
+    cleanup_process_groups: set[int] | None = None,
 ) -> tuple[dict[str, object] | None, set[int], str]:
     process_groups = set(native_observation.process_groups)
+    if cleanup_process_groups is not None:
+        cleanup_process_groups.update(process_groups)
     if time.monotonic() >= deadline:
         return None, process_groups, "probe_deadline_exhausted"
     try:
@@ -694,6 +695,8 @@ def _macos_native_evidence(
             return None, process_groups, "probe_deadline_exhausted"
         raise
     process_groups.update(row[2] for row in rows if row[2] > 0)
+    if cleanup_process_groups is not None:
+        cleanup_process_groups.update(process_groups)
     marker = native_observation.active_process
     if marker is None:
         return None, process_groups, "native_marker_absent"
@@ -778,18 +781,17 @@ def _cleanup_launched_app(
     timeout_seconds: float,
 ) -> bool:
     termination_deadline = time.monotonic() + min(5.0, max(0.1, timeout_seconds))
-    if _live_process_groups({process.pid}, termination_deadline):
+    has_unreaped_child_authority = process.returncode is None
+    if has_unreaped_child_authority:
         _kill_groups({process.pid}, signal.SIGTERM)
-    if process.poll() is None:
+        while time.monotonic() < termination_deadline:
+            if not _running_process_groups({process.pid}, termination_deadline):
+                break
+            time.sleep(0.05)
+        if _running_process_groups({process.pid}, time.monotonic() + 0.5):
+            _kill_groups({process.pid}, signal.SIGKILL)
         try:
-            process.wait(timeout=max(0.1, termination_deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            pass
-    if _live_process_groups({process.pid}, termination_deadline):
-        _kill_groups({process.pid}, signal.SIGKILL)
-    if process.poll() is None:
-        try:
-            process.wait(timeout=max(0.1, termination_deadline - time.monotonic()))
+            process.wait(timeout=PROBE_REAP_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=PROBE_REAP_TIMEOUT_SECONDS)
@@ -912,6 +914,7 @@ def smoke_bundle(
                 native_observation = _drain_native_host_stderr(
                     process.stderr,
                     native_stderr_buffer,
+                    process_groups,
                 )
                 if sys.platform == "darwin":
                     if process.poll() is None:
@@ -923,6 +926,7 @@ def smoke_bundle(
                             binary_sha256["bundled_external_bin"],
                             native_observation,
                             deadline,
+                            process_groups,
                         )
                         process_groups.update(observed_groups)
                         if evidence is not None:
@@ -942,6 +946,8 @@ def smoke_bundle(
                     )
                 time.sleep(0.1)
             if evidence is None:
+                if readiness_stage not in NATIVE_FAILURE_STAGES:
+                    raise SmokeFailure("Native host readiness stage is invalid")
                 raise SmokeFailure(
                     "Timed out waiting for OpenEvo Desktop app smoke evidence "
                     f"(stage={readiness_stage})"

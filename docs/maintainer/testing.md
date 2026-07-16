@@ -211,9 +211,11 @@ by `lsof`; it trusts only the marker-bound live FD identity. Its macOS probes
 share the readiness deadline, kill and reap their own private process groups on
 timeout, and cap each observed sidecar group. It also requires bounded
 disappearance of every captured app/sidecar process group after main-app
-termination on success or failure. Candidate runs retain separate
-`app-bundle-smoke.json` and
-`dmg-copy-smoke.json` outputs. The former declares `launch_origin=mounted_dmg`;
+termination on success or failure. The smoke signals the app group only while
+its unreaped child reserves the leader PID; already reaped app groups and all
+historical sidecar group numbers are observation-only. Candidate runs retain
+separate `app-bundle-smoke.json` and `dmg-copy-smoke.json` outputs. The former
+declares `launch_origin=mounted_dmg`;
 the latter declares `launch_origin=detached_copy` after `ditto` and a successful
 DMG detach. Both schema-v3 reports bind the exact source DMG, Tauri executable,
 and packaged sidecar SHA256 values, and candidate validation requires the
@@ -231,12 +233,14 @@ JSON fixtures cover duplicate keys at both top-level and nested locations.
 Native stderr is drained through a nonblocking bounded pipe and marker parsing
 is byte/line bounded. StrictMode lifecycle
 replacement selects the latest process marker while retaining all observed
-process groups for disappearance checks. Only the live app group created by
-the smoke may be signalled; historical sidecar PGIDs are never signalled. A
+process groups for disappearance checks. Only the app group backed by an
+unreaped child authority may be signalled; reaped app groups and historical
+sidecar PGIDs are never signalled. A
 failure reports only one closed stage:
 `native_marker_absent`, `native_process_unavailable`,
 `listener_fd_unavailable`, `executable_fd_unavailable`,
-`renderer_ack_absent`, or `renderer_window_absent`. A macOS-only contract test
+`renderer_ack_absent`, `renderer_window_absent`, or
+`probe_deadline_exhausted`. A macOS-only contract test
 calls `proc_pidinfo` for the live test process and compares `lsof -FDiT` output
 against a real regular file and loopback listener before packaging. Both macOS
 gates additionally repeat the

@@ -535,6 +535,23 @@ def test_bundle_smoke_rejects_malformed_native_process_marker(tmp_path: Path) ->
         smoke._parse_native_host_observation(native_log.read_bytes())
 
 
+def test_bundle_smoke_retains_valid_group_before_later_malformed_marker() -> None:
+    smoke = _load_bundle_smoke_module()
+    observed_groups = {40}
+    payload = (
+        "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
+        "pid=41 pgid=41 sid=41 birth=darwin:1700000000:123 "
+        "executable_device=42 executable_inode=98 "
+        f"executable_sha256={'a' * 64} executable_size=17\n"
+        "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 pid=42 malformed=true\n"
+    ).encode("ascii")
+
+    with pytest.raises(smoke.SmokeFailure, match="process marker is malformed"):
+        smoke._parse_native_host_observation(payload, observed_groups)
+
+    assert observed_groups == {40, 41}
+
+
 def test_bundle_smoke_bounds_native_log_and_resets_stale_renderer_ack() -> None:
     smoke = _load_bundle_smoke_module()
     process_marker = (
@@ -694,10 +711,16 @@ def test_bundle_smoke_bounds_native_probe_timeouts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     smoke = _load_bundle_smoke_module()
+    probe_calls: list[str] = []
+
+    def unavailable_probe(arguments, **_kwargs):
+        probe_calls.append(arguments[0])
+        return None
+
     monkeypatch.setattr(
         smoke,
         "_run_probe",
-        lambda _arguments, **_kwargs: None,
+        unavailable_probe,
     )
 
     deadline = smoke.time.monotonic() + 5
@@ -709,7 +732,9 @@ def test_bundle_smoke_bounds_native_probe_timeouts(
         None,
         None,
     )
+    probe_calls.clear()
     assert smoke._macos_renderer_ready(40, deadline) is False
+    assert probe_calls == ["swift"]
 
 
 def test_bundle_smoke_probe_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
@@ -732,34 +757,41 @@ def test_bundle_smoke_probe_timeout_kills_and_reaps_descendants(tmp_path: Path) 
     )
     started = smoke.time.monotonic()
 
-    result = smoke._run_probe(
-        [smoke.sys.executable, "-c", probe_script],
-        deadline=started + 1.0,
-        timeout_cap=0.75,
-    )
+    probe_pid: int | None = None
+    try:
+        result = smoke._run_probe(
+            [smoke.sys.executable, "-c", probe_script],
+            deadline=started + 1.0,
+            timeout_cap=0.75,
+        )
 
-    assert result is None
-    assert smoke.time.monotonic() - started < 4.0
-    probe_pid, descendant_pid = (
-        int(value) for value in pid_file.read_text(encoding="utf-8").split()
-    )
+        assert result is None
+        assert smoke.time.monotonic() - started < 4.0
+        probe_pid, descendant_pid = (
+            int(value) for value in pid_file.read_text(encoding="utf-8").split()
+        )
 
-    def is_running(pid: int) -> bool:
-        observed = subprocess.run(
-            ["ps", "-o", "stat=", "-p", str(pid)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        ).stdout.strip()
-        return bool(observed) and not observed.startswith("Z")
+        def is_running(pid: int) -> bool:
+            observed = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            ).stdout.strip()
+            return bool(observed) and not observed.startswith("Z")
 
-    disappearance_deadline = smoke.time.monotonic() + 2
-    while smoke.time.monotonic() < disappearance_deadline and any(
-        is_running(pid) for pid in (probe_pid, descendant_pid)
-    ):
-        smoke.time.sleep(0.05)
-    assert all(not is_running(pid) for pid in (probe_pid, descendant_pid))
+        disappearance_deadline = smoke.time.monotonic() + 2
+        while smoke.time.monotonic() < disappearance_deadline and any(
+            is_running(pid) for pid in (probe_pid, descendant_pid)
+        ):
+            smoke.time.sleep(0.05)
+        assert all(not is_running(pid) for pid in (probe_pid, descendant_pid))
+    finally:
+        if probe_pid is None and pid_file.is_file():
+            probe_pid = int(pid_file.read_text(encoding="utf-8").split()[0])
+        if probe_pid is not None:
+            smoke._kill_groups({probe_pid}, smoke.signal.SIGKILL)
 
 
 def test_bundle_smoke_does_not_launch_probe_after_shared_deadline(
@@ -830,7 +862,7 @@ def test_bundle_smoke_caps_observed_sidecar_group_members(
         )
 
 
-def test_bundle_smoke_cleanup_waits_for_parent_watched_sidecar(tmp_path: Path) -> None:
+def test_bundle_smoke_cleanup_waits_for_parent_owned_sidecar(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
     sidecar_pid_path = tmp_path / "sidecar-pid"
     sidecar_script = "\n".join(
@@ -847,6 +879,7 @@ def test_bundle_smoke_cleanup_waits_for_parent_watched_sidecar(tmp_path: Path) -
         [
             "from pathlib import Path",
             "import os",
+            "import signal",
             "import subprocess",
             "import sys",
             "import time",
@@ -855,6 +888,12 @@ def test_bundle_smoke_cleanup_waits_for_parent_watched_sidecar(tmp_path: Path) -
                 f"[sys.executable, '-c', {sidecar_script!r}, str(os.getpid())], "
                 "start_new_session=True)"
             ),
+            "def shutdown(_signal, _frame):",
+            "    if sidecar.poll() is None:",
+            "        sidecar.terminate()",
+            "    sidecar.wait(timeout=5)",
+            "    raise SystemExit(0)",
+            "signal.signal(signal.SIGTERM, shutdown)",
             f"Path({str(sidecar_pid_path)!r}).write_text(str(sidecar.pid))",
             "time.sleep(60)",
         ]
@@ -889,6 +928,42 @@ def test_bundle_smoke_cleanup_waits_for_parent_watched_sidecar(tmp_path: Path) -
         except subprocess.TimeoutExpired:
             app.kill()
             app.wait(timeout=2)
+
+
+def test_bundle_smoke_cleanup_never_signals_a_reaped_app_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    signalled: list[tuple[set[int], object]] = []
+    monkeypatch.setattr(
+        smoke,
+        "_kill_groups",
+        lambda groups, sig: signalled.append((set(groups), sig)),
+    )
+    monkeypatch.setattr(smoke, "_wait_for_groups_to_exit", lambda _groups, _deadline: True)
+    reaped_process = SimpleNamespace(pid=4242, returncode=0)
+
+    assert smoke._cleanup_launched_app(
+        reaped_process,
+        {4242, 4343},
+        timeout_seconds=1,
+    )
+    assert signalled == []
+
+
+def test_bundle_smoke_does_not_report_an_existing_zombie_group_as_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    monkeypatch.setattr(smoke, "_process_group_exists", lambda _group: True)
+
+    assert (
+        smoke._wait_for_groups_to_exit(
+            {4242},
+            smoke.time.monotonic(),
+        )
+        is False
+    )
 
 
 def test_bundle_smoke_uses_the_darwin_proc_bsdinfo_layout() -> None:
@@ -958,6 +1033,7 @@ def test_bundle_smoke_rejects_native_marker_for_different_sidecar(
         process_groups=frozenset({41}),
     )
 
+    cleanup_groups = {40}
     with pytest.raises(smoke.SmokeFailure, match="different packaged sidecar"):
         smoke._macos_native_evidence(
             40,
@@ -967,7 +1043,9 @@ def test_bundle_smoke_rejects_native_marker_for_different_sidecar(
             hashlib.sha256(sidecar.read_bytes()).hexdigest(),
             observation,
             smoke.time.monotonic() + 5,
+            cleanup_groups,
         )
+    assert 41 in cleanup_groups
 
 
 def test_bundle_smoke_rejects_reused_darwin_pid(
@@ -1035,6 +1113,15 @@ def test_bundle_smoke_reports_closed_native_readiness_stage() -> None:
     assert evidence is None
     assert process_groups == set()
     assert stage == "native_marker_absent"
+    assert smoke.NATIVE_FAILURE_STAGES == {
+        "native_marker_absent",
+        "native_process_unavailable",
+        "listener_fd_unavailable",
+        "executable_fd_unavailable",
+        "renderer_ack_absent",
+        "renderer_window_absent",
+        "probe_deadline_exhausted",
+    }
 
 
 def test_accepts_valid_openevo_release_wheel(tmp_path: Path) -> None:
@@ -2702,10 +2789,21 @@ def _write_fake_tauri_release_smoke(path: Path) -> None:
                 "import json",
                 "import os",
                 "from pathlib import Path",
+                "import signal",
                 "import subprocess",
+                "import sys",
                 "import time",
                 "",
-                "subprocess.Popen(['/bin/sh', '-c', 'sleep 60'])",
+                (
+                    "child = subprocess.Popen("
+                    "[sys.executable, '-c', 'import time; time.sleep(60)'])"
+                ),
+                "def shutdown(_signal, _frame):",
+                "    if child.poll() is None:",
+                "        child.terminate()",
+                "    child.wait(timeout=5)",
+                "    raise SystemExit(0)",
+                "signal.signal(signal.SIGTERM, shutdown)",
                 "evidence = {",
                 "    'schema_version': 3,",
                 "    'nonce': os.environ['OPENEVO_RELEASE_SMOKE_NONCE'],",
