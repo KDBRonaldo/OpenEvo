@@ -147,21 +147,28 @@ runtime image is present; it is never dropped while falling back to the rollout
 node default runtime.
 
 OpenEvo-managed Science profiles use `host`; user-supplied custom images keep
-`image`. Every `managed_science` runtime, including subscription and
-self-deployed execution, is bound to Docker and the profile's exact
-Core-managed image alias at experiment config, `RuntimeSpec`, launcher, and
-Gateway admission boundaries. The release contract separately binds that alias
-to a full trusted `sha256` digest; the tag is never an identity proof. Bootstrap
-pulls the immutable `repository@digest` reference and verifies Docker
-`RepoDigests`/image ID. Immediately before `docker create`, DockerRuntime repeats
-that inspection and creates from the matched immutable reference, before adding
-any subscription credential volume. A missing digest, tag drift, empty
-`RepoDigests` with a different image ID, or malformed inspect response fails
-closed. Custom runtime loaders/options are forbidden for that profile. It is not
-a general compatibility
-promise that arbitrary images can run under a replaced user identity. A custom
-image, loader, option/volume, entrypoint, image-user runtime, or non-literal
-transcript capture mode is rejected before credential bytes are staged.
+`image`. The first Science Preview supports only Codex subscription execution
+with explicit transcript capture. It does not claim a self-deployed or vLLM
+runtime path. Every Preview `managed_science` runtime is bound to Docker and the
+profile's exact Core-managed image alias at experiment config, `RuntimeSpec`,
+launcher, and Gateway admission boundaries.
+
+The release archive contract binds that alias to the exact release asset ID,
+filename, byte size, SHA-256, OCI config digest, OCI index digest, Linux/amd64
+platform, and managed-runtime label; the tag is never an identity proof. The
+offline loader starts from an archive with no published aliases, verifies the
+sealed local snapshot and loaded OCI identity, then explicitly publishes the
+closed alias set. Transfer leases, private receipts, cleanup authority, and
+startup reconciliation make interrupted uploads, loads, and alias publication
+retryable without accepting partial state. Missing authority, tag drift,
+unexpected OCI descriptor graphs, malformed responses, and unrecoverable
+cleanup fail closed. Immediately before `docker create`, DockerRuntime repeats
+the applicable image proof before adding any subscription credential volume.
+Custom runtime loaders/options are forbidden for that profile. It is not a
+general compatibility promise that arbitrary images can run under a replaced
+user identity. A custom image, loader, option/volume, entrypoint, image-user
+runtime, or non-literal transcript capture mode is rejected before credential
+bytes are staged.
 
 Managed Science fixes `HOME=/openevo/session/home` and a closed `PATH` beginning
 with `/home/openevo/.local/bin`, where the managed image installs the pinned
