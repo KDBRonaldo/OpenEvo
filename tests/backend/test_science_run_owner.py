@@ -1624,6 +1624,7 @@ def test_successor_context_is_pinned_into_the_next_session(
                 {
                     "task_id": task_id,
                     "instruction": "Use the exact successor memory.",
+                    "agent": {"harness": "codex"},
                     "metadata": {
                         "openevo": {"revision_id": successor_revision_id[0]},
                         "evolution": {"context_artifact_ids": ["memory-for-next-session"]},
@@ -1788,6 +1789,25 @@ def test_admitting_rollout_client_registers_and_sends_one_canonical_payload(
             registration.update(kwargs)
             return True
 
+        def input_context(self, _run_id: str) -> dict[str, list[str]]:
+            return {}
+
+        def artifacts_by_ids(self, artifact_ids: list[str]) -> list[object]:
+            assert artifact_ids == []
+            return []
+
+        def request_for_run(self, _run_id: str) -> object:
+            class Revision:
+                id = "revision-canonical-owner"
+
+            class RequiredRevision:
+                revision = Revision()
+
+            class RunRequest:
+                required_revision = RequiredRevision()
+
+            return RunRequest()
+
     class Owner:
         _ledger = Ledger()
 
@@ -1811,6 +1831,7 @@ def test_admitting_rollout_client_registers_and_sends_one_canonical_payload(
     canonical = canonicalize_task_request(raw)
     admitting = _AdmittingRolloutClient(
         client,
+        evolution_client=_FakeEvolutionClient(),
         owner=Owner(),  # type: ignore[arg-type]
         run_id="run-canonical-owner",
         binding=binding,

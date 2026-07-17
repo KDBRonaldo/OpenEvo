@@ -1395,7 +1395,7 @@ class _AdmittingRolloutClient:
     def submit_task(self, payload: dict[str, Any]) -> str:
         canonical = canonicalize_task_request(payload)
         task_id = canonical.request.task_id
-        payload_metadata = canonical.request.metadata
+        payload_metadata = canonical.payload.get("metadata")
         evolution_metadata = (
             payload_metadata.get("evolution") if isinstance(payload_metadata, dict) else None
         )
@@ -1414,7 +1414,7 @@ class _AdmittingRolloutClient:
         ):
             raise ValueError("rollout payload has invalid context artifact identity")
         self._expected_context_artifact_ids = tuple(context_artifact_ids)
-        instruction = payload.get("instruction")
+        instruction = canonical.payload.get("instruction")
         if not isinstance(instruction, str) or not instruction:
             raise ValueError("rollout payload has no instruction authority")
         self._instruction = instruction

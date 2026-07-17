@@ -189,7 +189,7 @@ def test_codex_subscription_auth_is_staged_into_private_credential_root(
     source.chmod(0o600)
     monkeypatch.setenv("HOME", str(home))
     session_dir = tmp_path / "session"
-    session_dir.mkdir()
+    session_dir.mkdir(mode=0o700)
     request = SessionDispatchRequest(
         session_id="session_1",
         task_id="task_1",
@@ -5744,8 +5744,9 @@ async def test_subscription_finalization_preserves_transcript_after_execution_bu
     expected_error: str,
 ) -> None:
     session_dir = tmp_path / "session"
-    session_dir.mkdir()
+    session_dir.mkdir(mode=0o700)
     authority_dir = tmp_path / "core-log-authority"
+    authority_dir.mkdir(mode=0o700)
     (authority_dir / "logs" / "agent").mkdir(parents=True)
     runtime = BindMountRuntime(session_dir)
     runtime.exec_results = [
