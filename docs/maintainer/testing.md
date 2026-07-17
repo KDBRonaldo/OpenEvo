@@ -274,6 +274,12 @@ A source-config regression requires `bundle.macOS.infoPlist` to name the
 checked-in plist and rejects broad ATS keys. The exact mounted-DMG smoke repeats
 that check against the final merged app bytes before launch, requiring only
 the `127.0.0.1` exception and rejecting local-network or broad allowances.
+A macOS-only native-host regression creates retry-recovery state through the
+lexical `/var` spelling of a directory under `/private/var`, proving that the
+fixed Darwin alias is normalized before no-follow traversal. The surrounding
+recovery tests continue to reject arbitrary symlink roots, non-private roots,
+hard-linked files, stale compare-and-swap authority, oversized records, and
+cross-process races.
 A macOS-only contract test
 calls `proc_pidinfo` for the live test process and compares `lsof -FDiT` output
 against a real regular file and loopback listener before packaging. Both macOS

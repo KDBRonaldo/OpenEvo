@@ -4983,6 +4983,16 @@ fn run_retry_recovery_root_path(app: &tauri::AppHandle) -> HostResult<PathBuf> {
         .map_err(|_| run_retry_recovery_error())
 }
 
+#[cfg(target_os = "linux")]
+fn trusted_run_retry_recovery_root_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_run_retry_recovery_root_path(path: &Path) -> PathBuf {
+    macos_trusted_path_alias(path)
+}
+
 fn with_run_retry_recovery_transaction<T>(
     state: &DesktopHostState,
     path: &Path,
@@ -5002,6 +5012,8 @@ fn open_run_retry_recovery_root(
     path: &Path,
     create: bool,
 ) -> HostResult<Option<RunRetryRecoveryRoot>> {
+    let trusted_path = trusted_run_retry_recovery_root_path(path);
+    let path = trusted_path.as_path();
     if !path.is_absolute() {
         return Err(run_retry_recovery_error());
     }
@@ -5064,7 +5076,7 @@ fn open_run_retry_recovery_root(
     }
     let identity = file_identity(&current).map_err(|_| run_retry_recovery_error())?;
     Ok(Some(RunRetryRecoveryRoot {
-        path: path.to_path_buf(),
+        path: trusted_path,
         directory: current,
         device: identity.device,
         inode: identity.inode,
@@ -5823,6 +5835,36 @@ mod tests {
         write_run_retry_recovery_at(&root, None).unwrap();
         assert_eq!(read_run_retry_recovery_at(&root).unwrap(), None);
         assert!(!run_retry_recovery_target(&root).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_retry_recovery_transaction_accepts_the_fixed_darwin_var_alias() {
+        let temp = tempfile::Builder::new()
+            .prefix("openevo-retry-alias-")
+            .tempdir_in("/private/var/tmp")
+            .unwrap();
+        let suffix = temp.path().strip_prefix("/private/var").unwrap();
+        let root = Path::new("/var").join(suffix).join("app-data");
+        let state = DesktopHostState::default();
+
+        compare_and_swap_run_retry_recovery_at(&state, &root, None, Some("durable")).unwrap();
+        assert_eq!(
+            with_run_retry_recovery_transaction(&state, &root, || {
+                read_run_retry_recovery_at(&root)
+            })
+            .unwrap()
+            .as_deref(),
+            Some("durable")
+        );
+        compare_and_swap_run_retry_recovery_at(&state, &root, Some("durable"), None).unwrap();
+        assert_eq!(
+            with_run_retry_recovery_transaction(&state, &root, || {
+                read_run_retry_recovery_at(&root)
+            })
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
