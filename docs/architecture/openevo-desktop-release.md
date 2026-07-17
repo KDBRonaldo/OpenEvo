@@ -83,11 +83,13 @@ The repository currently provides:
   embedded Core wheel, runs renderer and release-mode Rust checks, and builds
   only the architecture reported by `rustc --print host-tuple`. Both the app
   inside the mounted exact candidate DMG and its detached copy launch the real
-  `Contents/MacOS` Tauri executable. The smoke records a visible renderer
-  window, the renderer's native-ready acknowledgement, packaged sidecar
-  readiness, inherited listener FD 3, executable FD 4, and bounded
-  process-group cleanup. A credential-free native process marker binds the
-  observed process group and FD 4 device, inode, and size to the digest that
+  `Contents/MacOS/openevo-desktop` Tauri executable. `OpenEvo Desktop.app` is
+  the app bundle directory, `OpenEvo Desktop` is the product/display name, and
+  `openevo-desktop` is the `CFBundleExecutable` identity. The smoke records a
+  visible renderer window, the renderer's native-ready acknowledgement,
+  packaged sidecar readiness, inherited listener FD 3, executable FD 4, and
+  bounded process-group cleanup. A credential-free native process marker binds
+  the observed process group and FD 4 device, inode, and size to the digest that
   Rust computed from the verified bundled externalBin bytes. The observer never
   reopens the private launch pathname retained for the macOS PyInstaller
   lifecycle; it trusts the marker-bound live FD identity instead.

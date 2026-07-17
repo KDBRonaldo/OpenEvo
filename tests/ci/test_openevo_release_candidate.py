@@ -564,6 +564,32 @@ def test_candidate_manifest_rejects_mismatched_smoke_binary_digests(
         )
 
 
+@pytest.mark.parametrize(
+    "filename",
+    ("app-bundle-smoke.json", "dmg-copy-smoke.json"),
+)
+def test_candidate_manifest_rejects_the_display_name_as_executable_identity(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    evidence_path = tmp_path / filename
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["native_executable"] = "OpenEvo Desktop"
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(candidate.CandidateError, match="Tauri executable"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="f" * 64,
+        )
+
+
 def test_candidate_manifest_rejects_open_core_compatibility_schema(tmp_path: Path) -> None:
     candidate = _load_module()
 
@@ -740,7 +766,7 @@ def _write_candidate_inputs(
             "native_executable": "1" * 64,
             "bundled_external_bin": "2" * 64,
         },
-        "native_executable": "OpenEvo Desktop",
+        "native_executable": "openevo-desktop",
         "bundled_external_bin": "openevo-desktop-sidecar",
         "renderer_ready": True,
         "sidecar_ready": True,

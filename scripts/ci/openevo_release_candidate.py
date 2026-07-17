@@ -21,6 +21,7 @@ MANIFEST_NAME = "release-candidate.json"
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 MINIMUM_MACOS_VERSION = "12.0"
+TAURI_EXECUTABLE_NAME = "openevo-desktop"
 CORE_PYTHON_REQUIRES = ">=3.11"
 CORE_SUPPORTED_PLATFORMS = ("linux-x86_64",)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -471,7 +472,7 @@ def _validate_evidence(
             raise CandidateError(f"{filename} binary digests do not use the closed schema")
         for binary, digest in binary_sha256.items():
             _require_digest(digest, f"{filename} {binary} digest")
-        if smoke.get("native_executable") != "OpenEvo Desktop":
+        if smoke.get("native_executable") != TAURI_EXECUTABLE_NAME:
             raise CandidateError(f"{filename} did not launch the Tauri executable")
         if smoke.get("bundled_external_bin") != "openevo-desktop-sidecar":
             raise CandidateError(f"{filename} did not resolve the packaged externalBin")

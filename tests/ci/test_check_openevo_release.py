@@ -2720,6 +2720,25 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
 
     config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
     cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
+    cargo_config = tomllib.loads(cargo)
+    cargo_metadata = json.loads(
+        subprocess.run(
+            [
+                "cargo",
+                "metadata",
+                "--locked",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                "desktop/src-tauri/Cargo.toml",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    candidate_tool = _load_release_candidate_module()
     main = Path("desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
     poisoned_environment_test = main[
         main.index(
@@ -2745,6 +2764,17 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     gitignore = Path(".gitignore").read_text(encoding="utf-8")
 
     assert config["productName"] == "OpenEvo Desktop"
+    assert len(cargo_metadata["packages"]) == 1
+    cargo_package = cargo_metadata["packages"][0]
+    cargo_bin_targets = [
+        target for target in cargo_package["targets"] if target["kind"] == ["bin"]
+    ]
+    assert len(cargo_bin_targets) == 1
+    cargo_main_binary = cargo_bin_targets[0]["name"]
+    assert cargo_package["default_run"] in (None, cargo_main_binary)
+    effective_tauri_binary = config.get("mainBinaryName") or cargo_main_binary
+    assert effective_tauri_binary == candidate_tool.TAURI_EXECUTABLE_NAME == "openevo-desktop"
+    assert cargo_config["package"]["name"] == "openevo-desktop"
     assert config["version"] == "0.1.0"
     assert config["identifier"] == "org.openevo.desktop"
     assert config["build"]["beforeBuildCommand"] == "npm run build:openevo"
@@ -2780,7 +2810,6 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "_write_sidecar_build_metadata" in sidecar_builder_text
     assert "desktop.server.launcher" in sidecar_entry_text
     assert "_load_packaged_build_metadata" in sidecar_entry_text
-    assert 'name = "openevo-desktop"' in cargo
     assert 'serde = { version = "1", features = ["derive"] }' in cargo
     assert "tauri = " in cargo
     assert "struct ManagedSidecar" in main

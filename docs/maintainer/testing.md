@@ -202,7 +202,11 @@ The packaging-level native smoke is
 `scripts/ci/smoke_openevo_desktop_bundle.py`. It reads
 `CFBundleExecutable` from `Info.plist` and launches that exact
 `Contents/MacOS` process; directly executing the bundled sidecar is not app
-evidence. On macOS it requires the credential-free V2 native process marker,
+evidence. The release candidate requires this executable identity to be
+`openevo-desktop`, matching the effective Tauri main binary. The product/display
+name is `OpenEvo Desktop`, while the app bundle directory is
+`OpenEvo Desktop.app`; a source preflight test prevents those identities from
+drifting. On macOS it requires the credential-free V2 native process marker,
 the renderer-ready marker from the committed product shell, a non-empty `main`
 WebView, the packaged sidecar's
 IPv4 loopback listener on inherited FD 3, and a regular executable FD 4 whose
