@@ -189,6 +189,9 @@ path because the DMG bundler may remove that directory after packaging.
 reports by size and SHA256.
 Before launch, the smoke rejects symbolic links in the app root, `Info.plist`
 path, Tauri executable path, sidecar path, and their in-bundle ancestors. It
+also parses the final merged `Info.plist` and requires only the exact
+`127.0.0.1` ATS exception; local-network, broad, or additional transport
+exceptions fail the candidate. It
 captures each binary's pre-launch device/inode/size identity and digest. The
 Rust native host emits a credential-free V2 marker binding its verified
 private executable FD to that sidecar digest plus its private device, inode,
@@ -208,10 +211,13 @@ rechecked after process cleanup.
 Native stderr uses a nonblocking bounded pipe, parsing remains byte/line bounded,
 and timeout output uses only closed readiness and renderer stage names. Unknown
 renderer stages fail closed and never become success evidence. The renderer can
-report only `provider_created`, `provider_create_failed`,
-`initial_snapshot_failed`, and `product_committed` through its typed native
-command; these reports diagnose bootstrap progress and cannot replace the V2
-renderer-ready marker. A probe deadline or
+report only the fixed `bootstrap_context_{validated,failed}`,
+`local_api_version_{verified,failed}`, `retry_recovery_{ready,failed}`,
+`provider_adapter_{ready,failed}`, `provider_{created,create_failed}`,
+`initial_snapshot_failed`, and `product_committed` stages through its typed
+native command. These reports diagnose bootstrap progress without serializing
+errors or runtime values and cannot replace the V2 renderer-ready marker. A
+probe deadline or
 transient shallower probe result cannot overwrite the deepest product readiness
 stage reached. Probe subprocesses
 share one readiness deadline and run in private sessions. Timeout cleanup takes

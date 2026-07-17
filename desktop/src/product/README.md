@@ -20,13 +20,17 @@ loaded an authoritative snapshot and React has committed the actual product
 shell. A bootstrap placeholder or provider object alone cannot satisfy the
 packaged app smoke; acknowledgement failure tears down that exact sidecar
 session and returns to the explicit startup failure state.
-Packaged bootstrap also reports the closed diagnostic stages
-`provider_created`, `provider_create_failed`, `initial_snapshot_failed`, and
-`product_committed` through a typed native command. These stages distinguish
-provider negotiation from initial data loading and React publication, but are
+Packaged bootstrap also reports a closed diagnostic sequence through a typed
+native command. `bootstrap_context_*`, `local_api_version_*`,
+`retry_recovery_*`, and `provider_adapter_*` identify the exact provider
+construction boundary; `provider_created`, `provider_create_failed`,
+`initial_snapshot_failed`, and `product_committed` cover the surrounding shell,
+initial data load, and React publication. Every `*` pair is restricted to its
+fixed `validated`/`verified`/`ready` or `failed` value. These stages are
 diagnostic only: none can replace the final native renderer acknowledgement or
 make a candidate pass. Reporting is best effort and cannot change product
-readiness or error handling.
+readiness or error handling, and no error text, endpoint, credential, or user
+data crosses this diagnostic channel.
 The `openevo-desktop` Vite mode replaces the general provider-kind parser with
 `providerKinds.release.ts`, whose only accepted value is `desktop_sidecar`.
 Rollup can then remove simulator, scaffold, and dry-run provider definitions and

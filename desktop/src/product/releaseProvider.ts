@@ -1,10 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { DesktopApiClientV1, FetchLike } from "../api/v1/client";
-import { createDesktopApiClient, DesktopContractError } from "../api/v1/client";
+import {
+  createDesktopApiClient,
+  DesktopContractError,
+  validateDesktopBootstrapContext,
+} from "../api/v1/client";
 import {
   projectSourceV1Schema,
   type DesktopBootstrapContextV1,
   type ProjectSourceV1,
+  type VersionInfoV1,
 } from "../api/v1/schemas";
 import { createLocalApiDesktopProductProvider } from "./localApiProvider";
 import type { ProductRunRetryRecoveryStore } from "./runRetryRecovery";
@@ -34,11 +39,29 @@ export interface ReleaseProviderAdapterContext {
   };
 }
 
+export const RELEASE_DESKTOP_BOOTSTRAP_STAGES = [
+  "bootstrap_context_validated",
+  "bootstrap_context_failed",
+  "local_api_version_verified",
+  "local_api_version_failed",
+  "retry_recovery_ready",
+  "retry_recovery_failed",
+  "provider_adapter_ready",
+  "provider_adapter_failed",
+  "provider_created",
+  "provider_create_failed",
+  "initial_snapshot_failed",
+  "product_committed",
+] as const;
+
+export type ReleaseDesktopBootstrapStage = typeof RELEASE_DESKTOP_BOOTSTRAP_STAGES[number];
+
 export interface ReleaseProviderFactoryDependencies {
   readonly fetch?: FetchLike;
   readonly native?: ReleaseNativeBridge;
   readonly adapterFactory?: (context: ReleaseProviderAdapterContext) => Promise<DesktopProductProvider> | DesktopProductProvider;
   readonly retryRecoveryStore?: ProductRunRetryRecoveryStore;
+  readonly reportStage?: (stage: ReleaseDesktopBootstrapStage) => Promise<void> | void;
 }
 
 const tauriNativeBridge: ReleaseNativeBridge = {
@@ -71,15 +94,6 @@ export async function reportReleaseDesktopReady(): Promise<void> {
   });
 }
 
-export const RELEASE_DESKTOP_BOOTSTRAP_STAGES = [
-  "provider_created",
-  "provider_create_failed",
-  "initial_snapshot_failed",
-  "product_committed",
-] as const;
-
-export type ReleaseDesktopBootstrapStage = typeof RELEASE_DESKTOP_BOOTSTRAP_STAGES[number];
-
 export function reportReleaseDesktopBootstrapStage(stage: ReleaseDesktopBootstrapStage): void {
   try {
     void invoke("renderer_bootstrap_stage", { stage }).catch(() => {});
@@ -92,20 +106,41 @@ export async function createReleaseDesktopProductProvider(
   dependencies: ReleaseProviderFactoryDependencies = {},
 ): Promise<ReleaseDesktopProductProvider> {
   const native = dependencies.native ?? tauriNativeBridge;
+  const adapterFactory = dependencies.adapterFactory;
+  const reportStage = dependencies.reportStage ?? reportReleaseDesktopBootstrapStage;
+  let bootstrap: DesktopBootstrapContextV1;
+  try {
+    bootstrap = validateDesktopBootstrapContext(await native.bootstrap(), {
+      supportedMajors: [1],
+      acceptedOpenApiDigests: DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests,
+      allowedProviderKinds: DESKTOP_PRODUCT_RELEASE_CONTRACT.allowedProviderKinds,
+    });
+    reportStageBestEffort(reportStage, "bootstrap_context_validated");
+  } catch (error) {
+    reportStageBestEffort(reportStage, "bootstrap_context_failed");
+    throw error;
+  }
   const client = createDesktopApiClient({
     fetch: dependencies.fetch ?? globalThis.fetch.bind(globalThis),
-    bootstrap: () => native.bootstrap(),
+    bootstrap: async () => bootstrap,
     supportedMajors: [1],
     acceptedOpenApiDigests: DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests,
     allowedProviderKinds: DESKTOP_PRODUCT_RELEASE_CONTRACT.allowedProviderKinds,
   });
 
-  const version = await client.version();
-  const missingFeatures = DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags.filter(
-    (feature) => !version.feature_flags.includes(feature),
-  );
-  if (missingFeatures.length > 0) {
-    throw new DesktopContractError("Desktop Local API is missing required release features");
+  let version: VersionInfoV1;
+  try {
+    version = await client.version();
+    const missingFeatures = DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags.filter(
+      (feature) => !version.feature_flags.includes(feature),
+    );
+    if (missingFeatures.length > 0) {
+      throw new DesktopContractError("Desktop Local API is missing required release features");
+    }
+    reportStageBestEffort(reportStage, "local_api_version_verified");
+  } catch (error) {
+    reportStageBestEffort(reportStage, "local_api_version_failed");
+    throw error;
   }
   const context: ReleaseProviderAdapterContext = {
     client,
@@ -125,17 +160,51 @@ export async function createReleaseDesktopProductProvider(
       },
     },
   };
-  const provider = dependencies.adapterFactory
-    ? await dependencies.adapterFactory(context)
-    : createLocalApiDesktopProductProvider({
+  let retryRecoveryStore = dependencies.retryRecoveryStore;
+  if (adapterFactory === undefined && retryRecoveryStore === undefined) {
+    try {
+      retryRecoveryStore = await nativeRunRetryRecoveryStore(native);
+      reportStageBestEffort(reportStage, "retry_recovery_ready");
+    } catch (error) {
+      reportStageBestEffort(reportStage, "retry_recovery_failed");
+      throw error;
+    }
+  } else if (adapterFactory === undefined) {
+    reportStageBestEffort(reportStage, "retry_recovery_ready");
+  }
+  try {
+    let provider: DesktopProductProvider;
+    if (adapterFactory !== undefined) {
+      provider = await adapterFactory(context);
+    } else {
+      if (retryRecoveryStore === undefined) {
+        throw new DesktopContractError("Native Desktop run retry recovery is unavailable");
+      }
+      provider = createLocalApiDesktopProductProvider({
         client,
         native: context.native,
         fetch: dependencies.fetch,
-        retryRecoveryStore: dependencies.retryRecoveryStore
-          ?? await nativeRunRetryRecoveryStore(native),
+        retryRecoveryStore,
       });
-  assertReleaseProvider(provider);
-  return provider;
+    }
+    assertReleaseProvider(provider);
+    reportStageBestEffort(reportStage, "provider_adapter_ready");
+    return provider;
+  } catch (error) {
+    reportStageBestEffort(reportStage, "provider_adapter_failed");
+    throw error;
+  }
+}
+
+function reportStageBestEffort(
+  reportStage: (stage: ReleaseDesktopBootstrapStage) => Promise<void> | void,
+  stage: ReleaseDesktopBootstrapStage,
+): void {
+  try {
+    void Promise.resolve(reportStage(stage)).catch(() => {});
+  } catch {
+    // Closed diagnostics cannot alter provider construction.
+  }
 }
 
 export async function nativeRunRetryRecoveryStore(

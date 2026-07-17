@@ -66,6 +66,14 @@ NATIVE_RENDERER_STAGES = frozenset(
         "sidecar_start_requested",
         "sidecar_start_returned",
         "sidecar_start_failed",
+        "bootstrap_context_validated",
+        "bootstrap_context_failed",
+        "local_api_version_verified",
+        "local_api_version_failed",
+        "retry_recovery_ready",
+        "retry_recovery_failed",
+        "provider_adapter_ready",
+        "provider_adapter_failed",
         "provider_created",
         "provider_create_failed",
         "initial_snapshot_failed",
@@ -192,8 +200,7 @@ def _app_bundle(bundle_root: Path) -> Path:
     return app
 
 
-def find_app_executable(bundle_root: Path) -> Path:
-    app = _app_bundle(bundle_root)
+def _read_app_info_plist(app: Path) -> dict[str, object]:
     info_plist = app / "Contents" / "Info.plist"
     info_metadata = _bundle_path_metadata(
         app,
@@ -209,6 +216,29 @@ def find_app_executable(bundle_root: Path) -> Path:
             payload = plistlib.load(stream)
     except (OSError, plistlib.InvalidFileException) as exc:
         raise SmokeFailure(f"Could not read app Info.plist: {info_plist}") from exc
+    if type(payload) is not dict:
+        raise SmokeFailure("App Info.plist root must be a dictionary")
+    return payload
+
+
+def _validate_macos_loopback_transport(app: Path) -> None:
+    payload = _read_app_info_plist(app)
+    transport = payload.get("NSAppTransportSecurity")
+    if type(transport) is not dict or set(transport) != {"NSExceptionDomains"}:
+        raise SmokeFailure("App Info.plist does not contain the closed loopback ATS policy")
+    domains = transport.get("NSExceptionDomains")
+    if (
+        type(domains) is not dict
+        or set(domains) != {"127.0.0.1"}
+        or domains.get("127.0.0.1")
+        != {"NSExceptionAllowsInsecureHTTPLoads": True}
+    ):
+        raise SmokeFailure("App Info.plist loopback ATS policy is invalid")
+
+
+def find_app_executable(bundle_root: Path) -> Path:
+    app = _app_bundle(bundle_root)
+    payload = _read_app_info_plist(app)
     executable_name = payload.get("CFBundleExecutable")
     if (
         type(executable_name) is not str
@@ -949,6 +979,8 @@ def smoke_bundle(
         else None
     )
     app = _app_bundle(bundle_root)
+    if sys.platform == "darwin":
+        _validate_macos_loopback_transport(app)
     nonce = os.urandom(32).hex()
     with tempfile.TemporaryDirectory(prefix="openevo-desktop-app-smoke-") as temporary:
         smoke_root = Path(temporary)

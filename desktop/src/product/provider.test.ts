@@ -94,18 +94,29 @@ describe("Desktop product provider boundary", () => {
       settleProjectSource: vi.fn(),
     };
     const fetchMock = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(version));
+    const reportStage = vi.fn();
     const adapterFactory = vi.fn(async ({ native: bridge }) => {
       const source = await bridge.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0001", streamEpoch: 7 });
       expect(source).toMatchObject({ kind: "native_folder_snapshot", import_ref: { import_id: "source-opaque-1" } });
       return unavailableDesktopProductProvider;
     });
 
-    const provider = await createReleaseDesktopProductProvider({ fetch: fetchMock, native, adapterFactory });
+    const provider = await createReleaseDesktopProductProvider({
+      fetch: fetchMock,
+      native,
+      adapterFactory,
+      reportStage,
+    });
 
     expect(provider.providerKind).toBe("desktop_sidecar");
     expect(native.bootstrap).toHaveBeenCalledTimes(1);
     expect(adapterFactory).toHaveBeenCalledTimes(1);
     expect(native.selectProjectSource).toHaveBeenCalledWith(expect.objectContaining({ kind: "native_folder_snapshot" }));
+    expect(reportStage.mock.calls.map(([stage]) => stage)).toEqual([
+      "bootstrap_context_validated",
+      "local_api_version_verified",
+      "provider_adapter_ready",
+    ]);
   });
 
   it("constructs the real Local API provider by default", async () => {
@@ -137,14 +148,92 @@ describe("Desktop product provider boundary", () => {
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
     };
+    const reportStage = vi.fn();
 
     const provider = await createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
       native,
+      reportStage,
     });
 
     expect(provider.providerKind).toBe("desktop_sidecar");
     expect(native.readRunRetryRecovery).toHaveBeenCalledTimes(1);
+    expect(reportStage.mock.calls.map(([stage]) => stage)).toEqual([
+      "bootstrap_context_validated",
+      "local_api_version_verified",
+      "retry_recovery_ready",
+      "provider_adapter_ready",
+    ]);
+  });
+
+  it("reports the exact closed provider bootstrap failure boundary", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
+    const baseNative = {
+      bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+      stop: vi.fn().mockResolvedValue(undefined),
+      readRunRetryRecovery: vi.fn().mockResolvedValue(null),
+      writeRunRetryRecovery: vi.fn(),
+      selectProjectSource: vi.fn(),
+      cancelProjectSource: vi.fn(),
+      settleProjectSource: vi.fn(),
+    };
+
+    const bootstrapStages = vi.fn();
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>(),
+      native: {
+        ...baseNative,
+        bootstrap: vi.fn().mockResolvedValue({ invalid: true }),
+      },
+      adapterFactory: () => unavailableDesktopProductProvider,
+      reportStage: bootstrapStages,
+    })).rejects.toThrow();
+    expect(bootstrapStages.mock.calls.map(([stage]) => stage)).toEqual([
+      "bootstrap_context_failed",
+    ]);
+
+    const versionStages = vi.fn();
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockRejectedValue(new TypeError("blocked transport")),
+      native: baseNative,
+      adapterFactory: () => unavailableDesktopProductProvider,
+      reportStage: versionStages,
+    })).rejects.toThrow("blocked transport");
+    expect(versionStages.mock.calls.map(([stage]) => stage)).toEqual([
+      "bootstrap_context_validated",
+      "local_api_version_failed",
+    ]);
+
+    const recoveryStages = vi.fn();
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native: {
+        ...baseNative,
+        readRunRetryRecovery: vi.fn().mockRejectedValue(new Error("native recovery failed")),
+      },
+      reportStage: recoveryStages,
+    })).rejects.toThrow("native recovery failed");
+    expect(recoveryStages.mock.calls.map(([stage]) => stage)).toEqual([
+      "bootstrap_context_validated",
+      "local_api_version_verified",
+      "retry_recovery_failed",
+    ]);
+
+    const adapterStages = vi.fn();
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native: baseNative,
+      adapterFactory: () => {
+        throw new Error("adapter failed");
+      },
+      reportStage: adapterStages,
+    })).rejects.toThrow("adapter failed");
+    expect(adapterStages.mock.calls.map(([stage]) => stage)).toEqual([
+      "bootstrap_context_validated",
+      "local_api_version_verified",
+      "provider_adapter_failed",
+    ]);
   });
 
   it("uses native compare-and-swap authority and fails closed after a lost write response", async () => {
@@ -301,6 +390,7 @@ describe("Desktop product provider boundary", () => {
     const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
     const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
     const adapterFactory = vi.fn(() => unavailableDesktopProductProvider);
+    const simulatorStages = vi.fn();
     await expect(createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>(),
       native: {
@@ -314,9 +404,14 @@ describe("Desktop product provider boundary", () => {
         settleProjectSource: vi.fn(),
       },
       adapterFactory,
+      reportStage: simulatorStages,
     })).rejects.toThrow(/forbidden provider kind/i);
+    expect(simulatorStages.mock.calls.map(([stage]) => stage)).toEqual([
+      "bootstrap_context_failed",
+    ]);
 
     const incompleteFlags = flags.slice(0, -1);
+    const incompleteStages = vi.fn();
     await expect(createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, incompleteFlags))),
       native: {
@@ -327,7 +422,12 @@ describe("Desktop product provider boundary", () => {
         settleProjectSource: vi.fn(),
       },
       adapterFactory,
+      reportStage: incompleteStages,
     })).rejects.toThrow(/missing required release features/i);
+    expect(incompleteStages.mock.calls.map(([stage]) => stage)).toEqual([
+      "bootstrap_context_validated",
+      "local_api_version_failed",
+    ]);
     expect(adapterFactory).not.toHaveBeenCalled();
   });
 

@@ -34,10 +34,18 @@ const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V2";
 const RENDERER_STAGE_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_STAGE_V1";
-const RENDERER_STAGE_VOCABULARY: [&str; 14] = [
+const RENDERER_STAGE_VOCABULARY: [&str; 22] = [
     "sidecar_start_requested",
     "sidecar_start_returned",
     "sidecar_start_failed",
+    "bootstrap_context_validated",
+    "bootstrap_context_failed",
+    "local_api_version_verified",
+    "local_api_version_failed",
+    "retry_recovery_ready",
+    "retry_recovery_failed",
+    "provider_adapter_ready",
+    "provider_adapter_failed",
     "provider_created",
     "provider_create_failed",
     "initial_snapshot_failed",
@@ -54,6 +62,14 @@ const RENDERER_STAGE_VOCABULARY: [&str; 14] = [
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum RendererBootstrapStageV1 {
+    BootstrapContextValidated,
+    BootstrapContextFailed,
+    LocalApiVersionVerified,
+    LocalApiVersionFailed,
+    RetryRecoveryReady,
+    RetryRecoveryFailed,
+    ProviderAdapterReady,
+    ProviderAdapterFailed,
     ProviderCreated,
     ProviderCreateFailed,
     InitialSnapshotFailed,
@@ -63,6 +79,14 @@ enum RendererBootstrapStageV1 {
 impl RendererBootstrapStageV1 {
     fn as_str(self) -> &'static str {
         match self {
+            Self::BootstrapContextValidated => "bootstrap_context_validated",
+            Self::BootstrapContextFailed => "bootstrap_context_failed",
+            Self::LocalApiVersionVerified => "local_api_version_verified",
+            Self::LocalApiVersionFailed => "local_api_version_failed",
+            Self::RetryRecoveryReady => "retry_recovery_ready",
+            Self::RetryRecoveryFailed => "retry_recovery_failed",
+            Self::ProviderAdapterReady => "provider_adapter_ready",
+            Self::ProviderAdapterFailed => "provider_adapter_failed",
             Self::ProviderCreated => "provider_created",
             Self::ProviderCreateFailed => "provider_create_failed",
             Self::InitialSnapshotFailed => "initial_snapshot_failed",
@@ -6236,6 +6260,14 @@ mod tests {
                 "sidecar_start_requested",
                 "sidecar_start_returned",
                 "sidecar_start_failed",
+                "bootstrap_context_validated",
+                "bootstrap_context_failed",
+                "local_api_version_verified",
+                "local_api_version_failed",
+                "retry_recovery_ready",
+                "retry_recovery_failed",
+                "provider_adapter_ready",
+                "provider_adapter_failed",
                 "provider_created",
                 "provider_create_failed",
                 "initial_snapshot_failed",
@@ -6254,6 +6286,20 @@ mod tests {
     #[test]
     fn renderer_owned_bootstrap_stages_are_a_closed_subset() {
         for (encoded, expected) in [
+            (
+                "\"bootstrap_context_validated\"",
+                "bootstrap_context_validated",
+            ),
+            ("\"bootstrap_context_failed\"", "bootstrap_context_failed"),
+            (
+                "\"local_api_version_verified\"",
+                "local_api_version_verified",
+            ),
+            ("\"local_api_version_failed\"", "local_api_version_failed"),
+            ("\"retry_recovery_ready\"", "retry_recovery_ready"),
+            ("\"retry_recovery_failed\"", "retry_recovery_failed"),
+            ("\"provider_adapter_ready\"", "provider_adapter_ready"),
+            ("\"provider_adapter_failed\"", "provider_adapter_failed"),
             ("\"provider_created\"", "provider_created"),
             ("\"provider_create_failed\"", "provider_create_failed"),
             ("\"initial_snapshot_failed\"", "initial_snapshot_failed"),

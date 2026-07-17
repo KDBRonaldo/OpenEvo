@@ -389,6 +389,50 @@ def test_bundle_smoke_requires_openevo_desktop_app_bundle(tmp_path: Path) -> Non
         raise AssertionError("Expected missing OpenEvo Desktop.app bundle to fail")
 
 
+def test_bundle_smoke_requires_the_closed_macos_loopback_ats_policy(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    info_plist = app / "Contents" / "Info.plist"
+    info_plist.parent.mkdir(parents=True)
+    valid = {
+        "CFBundleExecutable": "OpenEvo Desktop",
+        "NSAppTransportSecurity": {
+            "NSExceptionDomains": {
+                "127.0.0.1": {
+                    "NSExceptionAllowsInsecureHTTPLoads": True,
+                }
+            },
+        },
+    }
+    with info_plist.open("wb") as stream:
+        plistlib.dump(valid, stream)
+
+    smoke._validate_macos_loopback_transport(app)
+
+    for invalid_transport in [
+        {"NSAllowsArbitraryLoads": True},
+        {
+            "NSExceptionDomains": {
+                "localhost": {"NSExceptionAllowsInsecureHTTPLoads": True}
+            },
+        },
+        {
+            "NSExceptionDomains": {
+                "127.0.0.1": {"NSExceptionAllowsInsecureHTTPLoads": False}
+            },
+        },
+    ]:
+        with info_plist.open("wb") as stream:
+            plistlib.dump(
+                {**valid, "NSAppTransportSecurity": invalid_transport},
+                stream,
+            )
+        with pytest.raises(smoke.SmokeFailure, match="loopback ATS policy"):
+            smoke._validate_macos_loopback_transport(app)
+
+
 def test_bundle_smoke_rejects_symbolic_app_bundle(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
     external_app = tmp_path / "external" / "OpenEvo Desktop.app"
@@ -505,6 +549,10 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
                     f"executable_sha256={'b' * 64} executable_size=19"
                 ),
                 "OPENEVO_DESKTOP_RENDERER_STAGE_V1 sidecar_start_returned",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 bootstrap_context_validated",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 local_api_version_verified",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 retry_recovery_ready",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 provider_adapter_ready",
                 "OPENEVO_DESKTOP_RENDERER_STAGE_V1 provider_created",
                 "OPENEVO_DESKTOP_RENDERER_STAGE_V1 product_committed",
                 "OPENEVO_DESKTOP_RENDERER_STAGE_V1 ready_requested",
@@ -529,6 +577,10 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
         {
             "sidecar_start_requested",
             "sidecar_start_returned",
+            "bootstrap_context_validated",
+            "local_api_version_verified",
+            "retry_recovery_ready",
+            "provider_adapter_ready",
             "provider_created",
             "product_committed",
             "ready_requested",
@@ -1261,6 +1313,14 @@ def test_bundle_smoke_reports_closed_native_readiness_stage() -> None:
         "sidecar_start_requested",
         "sidecar_start_returned",
         "sidecar_start_failed",
+        "bootstrap_context_validated",
+        "bootstrap_context_failed",
+        "local_api_version_verified",
+        "local_api_version_failed",
+        "retry_recovery_ready",
+        "retry_recovery_failed",
+        "provider_adapter_ready",
+        "provider_adapter_failed",
         "provider_created",
         "provider_create_failed",
         "initial_snapshot_failed",
@@ -2693,6 +2753,18 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert config["bundle"]["targets"] == ["dmg"]
     assert config["bundle"]["externalBin"] == ["binaries/openevo-desktop-sidecar"]
     assert config["bundle"]["macOS"]["minimumSystemVersion"] == "12.0"
+    assert config["bundle"]["macOS"]["infoPlist"] == "Info.plist"
+    with Path("desktop/src-tauri/Info.plist").open("rb") as stream:
+        info_plist = plistlib.load(stream)
+    assert info_plist == {
+        "NSAppTransportSecurity": {
+            "NSExceptionDomains": {
+                "127.0.0.1": {
+                    "NSExceptionAllowsInsecureHTTPLoads": True,
+                }
+            },
+        }
+    }
     assert sidecar_builder.is_file()
     assert sidecar_entry.is_file()
     assert "desktop/src-tauri/binaries/openevo-desktop-sidecar-*" in gitignore
