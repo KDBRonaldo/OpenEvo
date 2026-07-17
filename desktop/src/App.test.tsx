@@ -107,7 +107,11 @@ describe("ReleaseDesktopProductShell", () => {
       return provider!;
     });
     const stop = vi.fn(async () => { lifecycle.push("stop"); });
-    const reportReady = vi.fn(async () => { lifecycle.push("ready"); });
+    let productCommittedWhenReported = false;
+    const reportReady = vi.fn(async () => {
+      productCommittedWhenReported = document.body.textContent?.includes("Research brief") ?? false;
+      lifecycle.push("ready");
+    });
     const container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -134,6 +138,7 @@ describe("ReleaseDesktopProductShell", () => {
     expect(lifecycle.at(-1)).toBe("ready");
     expect(lifecycle.slice(0, -1)).toContain("stop");
     expect(reportReady).toHaveBeenCalledTimes(1);
+    expect(productCommittedWhenReported).toBe(true);
     expect(document.body.textContent).toContain("Research brief");
   });
 

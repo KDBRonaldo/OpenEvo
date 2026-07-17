@@ -491,6 +491,7 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
         "\n".join(
             [
                 "unrelated bounded native diagnostic",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 sidecar_start_requested",
                 (
                     "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
                     "pid=41 pgid=41 sid=41 birth=darwin:1700000000:123 "
@@ -503,6 +504,9 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
                     "executable_device=42 executable_inode=99 "
                     f"executable_sha256={'b' * 64} executable_size=19"
                 ),
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 sidecar_start_returned",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 ready_requested",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 window_not_visible",
                 f"OPENEVO_DESKTOP_RENDERER_READY_V2 {RELEASE_OPENAPI_SHA256}",
             ]
         )
@@ -519,6 +523,14 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
     assert observation.active_process.executable_inode == 99
     assert observation.renderer_ready is True
     assert observation.process_groups == frozenset({41, 42})
+    assert observation.renderer_stages == frozenset(
+        {
+            "sidecar_start_requested",
+            "sidecar_start_returned",
+            "ready_requested",
+            "window_not_visible",
+        }
+    )
     assert "readiness" not in repr(observation)
     assert "session_token" not in repr(observation)
 
@@ -533,6 +545,15 @@ def test_bundle_smoke_rejects_malformed_native_process_marker(tmp_path: Path) ->
 
     with pytest.raises(smoke.SmokeFailure, match="process marker is malformed"):
         smoke._parse_native_host_observation(native_log.read_bytes())
+
+
+def test_bundle_smoke_rejects_unknown_renderer_stage() -> None:
+    smoke = _load_bundle_smoke_module()
+
+    with pytest.raises(smoke.SmokeFailure, match="renderer stage is malformed"):
+        smoke._parse_native_host_observation(
+            b"OPENEVO_DESKTOP_RENDERER_STAGE_V1 credential_dumped\n"
+        )
 
 
 def test_bundle_smoke_retains_valid_group_before_later_malformed_marker() -> None:
@@ -1232,6 +1253,18 @@ def test_bundle_smoke_reports_closed_native_readiness_stage() -> None:
         "renderer_ack_absent",
     }
     assert smoke.PROBE_DEADLINE_STAGE == "probe_deadline_exhausted"
+    assert smoke.NATIVE_RENDERER_STAGES == {
+        "sidecar_start_requested",
+        "sidecar_start_returned",
+        "sidecar_start_failed",
+        "ready_requested",
+        "window_identity_valid",
+        "window_identity_invalid",
+        "window_visible",
+        "window_not_visible",
+        "window_visibility_unknown",
+        "ready_validation_failed",
+    }
 
 
 def test_bundle_smoke_probe_deadline_preserves_the_deepest_product_stage() -> None:

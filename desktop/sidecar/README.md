@@ -221,6 +221,16 @@ application. It owns one `DesktopProviderStore` and one `WorkspaceImportStore`
 for the process lifetime and
 requires the native host to supply a Desktop session token, native instance ID,
 readiness key, source commit, and private state root.
+The release application wraps the complete FastAPI/Starlette stack with CORS,
+including the server-error boundary, so bounded error responses remain readable
+by the packaged renderer. Only
+the exact packaged Tauri origins (`tauri://localhost` and
+`http://tauri.localhost`), used methods, the standard CORS-safelisted headers,
+and the renderer contract headers are accepted;
+wildcards, credentials, lookalike origins, unknown methods, and unknown headers
+are rejected. CORS preflight is handled before Desktop session authentication,
+while ordinary `/desktop/v1/*` requests still require the exact ephemeral
+session header.
 Embedded callers get an ASGI shutdown close hook by default. The packaged
 launcher explicitly sets `close_on_shutdown=False` and becomes the single
 provider shutdown owner so listener/provider cleanup failures can be converted

@@ -148,10 +148,12 @@ type SnapshotRefreshPublication =
 
 export interface DesktopProductAppProps {
   provider?: DesktopProductProvider;
+  onReady?: () => void;
 }
 
 export function DesktopProductApp({
   provider = unavailableDesktopProductProvider,
+  onReady,
 }: DesktopProductAppProps) {
   const [snapshot, setSnapshot] = useState<DesktopProductSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -163,6 +165,7 @@ export function DesktopProductApp({
   const [actionState, setActionState] = useState<AsyncState>("idle");
   const [actionError, setActionError] = useState<ActionErrorState | null>(null);
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
+  const readyReported = useRef(false);
   const actionErrorGeneration = useRef(0);
   const actionStateGeneration = useRef(0);
   const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
@@ -417,6 +420,12 @@ export function DesktopProductApp({
     setCreatingProject(false);
     setSettingsOpen(true);
   }, [snapshot]);
+
+  useEffect(() => {
+    if (!snapshot || readyReported.current) return;
+    readyReported.current = true;
+    onReady?.();
+  }, [onReady, snapshot]);
 
   if (!snapshot) {
     return (

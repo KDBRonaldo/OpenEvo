@@ -33,6 +33,19 @@ const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V2";
+const RENDERER_STAGE_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_STAGE_V1";
+const RENDERER_STAGE_VOCABULARY: [&str; 10] = [
+    "sidecar_start_requested",
+    "sidecar_start_returned",
+    "sidecar_start_failed",
+    "ready_requested",
+    "window_identity_valid",
+    "window_identity_invalid",
+    "window_visible",
+    "window_not_visible",
+    "window_visibility_unknown",
+    "ready_validation_failed",
+];
 const SIDECAR_PROCESS_MARKER: &str = "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
@@ -5409,8 +5422,15 @@ fn start_sidecar(
     _app: tauri::AppHandle,
     state: tauri::State<'_, DesktopHostState>,
 ) -> HostResult<DesktopBootstrapContextV1> {
+    emit_renderer_stage("sidecar_start_requested");
     let bundled_path = bundled_sidecar_path();
-    start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref())
+    let result = start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref());
+    emit_renderer_stage(if result.is_ok() {
+        "sidecar_start_returned"
+    } else {
+        "sidecar_start_failed"
+    });
+    result
 }
 
 #[tauri::command]
@@ -5424,22 +5444,44 @@ fn renderer_ready(
     state: tauri::State<'_, DesktopHostState>,
     openapi_sha256: String,
 ) -> HostResult<()> {
-    let visible = window.is_visible().map_err(|_| renderer_window_error())?;
-    let size = window.inner_size().map_err(|_| renderer_window_error())?;
-    validate_renderer_window_ready(window.label(), visible, size.width, size.height)?;
-    renderer_ready_inner(&state, &openapi_sha256)
+    emit_renderer_stage("ready_requested");
+    let size = match window.inner_size() {
+        Ok(size) => size,
+        Err(_) => {
+            emit_renderer_stage("window_identity_invalid");
+            return Err(renderer_window_error());
+        }
+    };
+    if let Err(error) = validate_renderer_window_ready(window.label(), size.width, size.height) {
+        emit_renderer_stage("window_identity_invalid");
+        return Err(error);
+    }
+    emit_renderer_stage("window_identity_valid");
+    match window.is_visible() {
+        Ok(visible) => emit_renderer_stage(if visible {
+            "window_visible"
+        } else {
+            "window_not_visible"
+        }),
+        Err(_) => emit_renderer_stage("window_visibility_unknown"),
+    }
+    let result = renderer_ready_inner(&state, &openapi_sha256);
+    if result.is_err() {
+        emit_renderer_stage("ready_validation_failed");
+    }
+    result
 }
 
-fn validate_renderer_window_ready(
-    label: &str,
-    visible: bool,
-    width: u32,
-    height: u32,
-) -> HostResult<()> {
-    if label != "main" || !visible || width == 0 || height == 0 {
+fn validate_renderer_window_ready(label: &str, width: u32, height: u32) -> HostResult<()> {
+    if label != "main" || width == 0 || height == 0 {
         return Err(renderer_window_error());
     }
     Ok(())
+}
+
+fn emit_renderer_stage(stage: &'static str) {
+    debug_assert!(RENDERER_STAGE_VOCABULARY.contains(&stage));
+    eprintln!("{RENDERER_STAGE_MARKER} {stage}");
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -6146,19 +6188,33 @@ mod tests {
     }
 
     #[test]
-    fn renderer_window_readiness_requires_the_visible_main_webview() {
-        validate_renderer_window_ready("main", true, 1280, 860).unwrap();
+    fn renderer_window_readiness_requires_the_nonempty_main_webview() {
+        validate_renderer_window_ready("main", 1280, 860).unwrap();
 
-        for (label, visible, width, height) in [
-            ("secondary", true, 1280, 860),
-            ("main", false, 1280, 860),
-            ("main", true, 0, 860),
-            ("main", true, 1280, 0),
+        for (label, width, height) in [
+            ("secondary", 1280, 860),
+            ("main", 0, 860),
+            ("main", 1280, 0),
         ] {
-            let error = validate_renderer_window_ready(label, visible, width, height).unwrap_err();
+            let error = validate_renderer_window_ready(label, width, height).unwrap_err();
             assert_eq!(error.code, "renderer_window_unavailable");
         }
         assert_eq!(RENDERER_READY_MARKER, "OPENEVO_DESKTOP_RENDERER_READY_V2");
+        assert_eq!(
+            RENDERER_STAGE_VOCABULARY,
+            [
+                "sidecar_start_requested",
+                "sidecar_start_returned",
+                "sidecar_start_failed",
+                "ready_requested",
+                "window_identity_valid",
+                "window_identity_invalid",
+                "window_visible",
+                "window_not_visible",
+                "window_visibility_unknown",
+                "ready_validation_failed",
+            ]
+        );
     }
 
     #[test]

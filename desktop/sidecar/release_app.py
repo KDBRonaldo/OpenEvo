@@ -10,7 +10,9 @@ from typing import Literal, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp
 
 from desktop.sidecar.contracts.v1.app import DESKTOP_SESSION_HEADER, create_contract_app
 from desktop.sidecar.contracts.v1.models import ApiErrorV1
@@ -91,6 +93,32 @@ ErrorCategory = Literal[
     "diagnostic",
     "maintenance",
 ]
+
+_TAURI_RELEASE_ORIGINS = ("tauri://localhost", "http://tauri.localhost")
+_TAURI_RELEASE_METHODS = ("GET", "POST", "PATCH", "DELETE")
+_TAURI_RELEASE_HEADERS = (
+    "Accept",
+    "Accept-Language",
+    "Content-Language",
+    "Content-Type",
+    DESKTOP_SESSION_HEADER,
+    "Idempotency-Key",
+    "If-Match",
+    "Last-Event-ID",
+)
+
+
+class _ReleaseDesktopLocalApiApp(FastAPI):
+    def build_middleware_stack(self) -> ASGIApp:
+        # Global wrapping keeps CORS outside Starlette's ServerErrorMiddleware,
+        # so the renderer can consume bounded 500 responses as well.
+        return CORSMiddleware(
+            app=super().build_middleware_stack(),
+            allow_origins=list(_TAURI_RELEASE_ORIGINS),
+            allow_methods=list(_TAURI_RELEASE_METHODS),
+            allow_headers=list(_TAURI_RELEASE_HEADERS),
+            allow_credentials=False,
+        )
 
 
 def _cleanup_after_primary_failure(cleanup: Callable[[], None]) -> None:
@@ -356,7 +384,7 @@ def create_release_desktop_local_api_app(
         )
         if startup_phase is not None:
             startup_phase("contract_app")
-        app = create_contract_app(provider)
+        app = create_contract_app(provider, _app_factory=_ReleaseDesktopLocalApiApp)
     except BaseException:
         if core_runtime is not None:
             _cleanup_after_primary_failure(core_runtime.close)

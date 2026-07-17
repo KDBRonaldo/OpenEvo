@@ -1048,7 +1048,11 @@ def test_release_app_route_registration_failure_closes_provider(
         "middleware",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(canary),
     )
-    monkeypatch.setattr(release_app, "create_contract_app", lambda _provider: app)
+    monkeypatch.setattr(
+        release_app,
+        "create_contract_app",
+        lambda _provider, **_kwargs: app,
+    )
     monkeypatch.setattr(
         release_app,
         "DesktopReleaseProvider",
@@ -1098,7 +1102,11 @@ def test_release_app_can_delegate_shutdown_ownership(
         "WorkspaceImportStore",
         lambda *_args, **_kwargs: SimpleNamespace(close=lambda: None),
     )
-    monkeypatch.setattr(release_app, "create_contract_app", lambda _provider: app)
+    monkeypatch.setattr(
+        release_app,
+        "create_contract_app",
+        lambda _provider, **_kwargs: app,
+    )
     monkeypatch.setattr(
         release_app,
         "DesktopReleaseProvider",
