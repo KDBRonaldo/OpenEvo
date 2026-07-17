@@ -5,13 +5,20 @@ README 和 `docs/architecture/` 补上下文。
 
 ## 项目定位
 
-OpenEvo 是面向真实 agent harness 的 evolution 系统，当前对外产品面只有：
+产品目标、支持范围和 release acceptance 只以
+`docs/maintainer/productization/spec.md` 为准。本文件规定实现与协作方式，不是第二份产品
+spec。
 
-- **OpenEvo Core Backend**：运行在远程服务器上的执行、trajectory/transcript capture、
-  dataset/job/artifact、method registry、context resolve、runtime injection、deployment
-  和 backend API 统一 contract。
-- **OpenEvo Desktop**：面向普通科研用户的 macOS 桌面应用，用于配置远程服务器、启动
-  OpenEvo Core 后端、运行 science task，并监控 memory、skill、agent-system 等演化过程。
+OpenEvo 是面向真实 agent harness 的 evolution 系统，对外只有两个应用：
+
+- **OpenEvo Daemon**：运行在远程 Linux 服务器上的后端，统一拥有执行、
+  trajectory/transcript capture、dataset/job/artifact、method registry、context resolve、
+  runtime injection、deployment lifecycle 和 backend API。
+- **OpenEvo Desktop Client**：面向普通科研用户的 macOS 桌面应用，用于配置远程服务器、
+  安装或连接 OpenEvo Daemon、运行 science task，并监控 memory、skill、agent-system 等
+  演化过程。
+
+`src/openevo/` 中的 OpenEvo Core 是 Daemon 使用的共享实现，不是第三个用户产品。
 
 不存在单独发布的 CLI 或开发套件产品面。保留的命令行入口只是后端 launcher、维护工具、
 CI 工具或开发者自动化工具，不能在公开文档里包装成普通用户产品。
@@ -37,22 +44,25 @@ OpenEvo Core 的核心目标是把 agent 运行过程稳定地转成可训练、
 Codex subscription 只是第一个落地 case，Claude Code、Gemini CLI、OpenHands 或其他
 harness 只要能提供稳定 transcript，都应能接入 pure-text evolution。
 
-所有 evolution/training 方法统一只在下一 task/session 生效。一个 task/session 从 admission
-到结束必须 pin 同一 context/model/adapter revision；task 完成后才封存 dataset、在 inference
-进程外运行 enabled methods，并把全部 target outputs、materialization 和必要 serving preparation
-作为一个 next revision 原子提交。下一 task 在该 revision 未完成时必须明确 queued/not-ready，
-不能静默使用 stale/partial revision。不要在 method descriptor 或 method config 中加入各自的
-online/offline timing、background/barrier 选择或 streaming/in-session ABI。方法差异继续通过
-input bindings、execution/capture/harness/runtime requirements、config 和 typed outputs 表达。
+所有 evolution/training 方法统一只在下一 task/session 生效。一个 immutable task 的 closed
+admission record 必须 pin 同一 project head、workspace snapshot、evolution revision 和 verified
+execution snapshot；它的所有 infrastructure attempts 复用该 admission。task 完成后才封存
+dataset、在 inference 进程外运行 enabled methods，并把 accepted workspace result 和全部 target
+outputs/materialization 作为一个 successor project head 原子提交。下一 task 在该 head 未完成时
+必须明确 queued/not-ready，不能静默使用 stale/partial state。不要在 method descriptor 或 method
+config 中加入各自的 online/offline timing、background/barrier 选择或 streaming/in-session ABI。
+方法差异继续通过 input bindings、execution/capture/harness/runtime requirements、config 和 typed
+outputs 表达。
 这是产品目标 contract；Store 当前只提供 atomic successor ledger commit primitive，完整的
 cross-session run-owner/readiness orchestration 尚未实现，不能把内部 ledger、materializer 或现有
 legacy Gateway path 描述为已经满足该 contract。
 
-Desktop/Core 的发布边界以 `docs/architecture/desktop-core-contract-v1.md` 为准。React
+Desktop/Daemon 的细化实现边界由
+`docs/architecture/desktop-core-contract-v1.md` 在 canonical spec 范围内定义。React
 renderer 只能调用带 Desktop session 鉴权的 `/desktop/v1/*` 本地 sidecar API，不能看到
 SSH command、Core URL、backend token、secret reference、host path 或 benchmark 概念。
-Sidecar 只在 Core 存在前负责 SSH/bootstrap；Core 通过兼容性检查后，run、service、artifact、
-revision 和 diagnostics 必须走 active project tunnel 上的 `/v1/*` Core Control API，不能退回
+Sidecar 只在 Daemon 存在前负责 SSH/bootstrap；Daemon 通过兼容性检查后，run、service、
+artifact、revision 和 diagnostics 必须走 active project tunnel 上的 `/v1/*` control API，不能退回
 SSH 直接执行。两个 API 都必须有严格 closed model、version/digest negotiation、typed error、
 幂等 action、游标和可恢复事件语义。Contract simulator 只能用于显式 debug/test build；release
 遇到 simulator、scaffold、dry-run、legacy route fallback、无 verified registry 或不兼容 digest
@@ -60,10 +70,11 @@ SSH 直接执行。两个 API 都必须有严格 closed model、version/digest n
 
 ## 目录结构
 
-- `src/openevo/`: OpenEvo Core Backend package、Core-owned science/project config
-  consumed by Desktop、deployment lifecycle、backend API 和 developer automation
+- `src/openevo/`: OpenEvo Core implementation、Daemon backend、Core-owned
+  science/project config、deployment lifecycle、backend API 和 developer automation
   helpers。
-- `desktop/`: OpenEvo Desktop 的 React/Vite/Tauri 前端、native host、sidecar 和打包资源。
+- `desktop/`: OpenEvo Desktop Client 的 React/Vite/Tauri 前端、native host、sidecar 和
+  打包资源。
 - `benchmarks/`: standalone benchmark automation packages。Benchmark-specific code
   must live outside `src/openevo` and `desktop` and import/call Core capabilities。
 - `benchmarks/terminal_bench/`: independently installable Terminal Bench maintainer
@@ -97,7 +108,9 @@ SSH 直接执行。两个 API 都必须有严格 closed model、version/digest n
   rename 原子发布。
   它不得按 target ID 分支，也不得在持久化 contract 中暴露 artifact URI、host path 或 opaque
   scanner handle。
-- `src/openevo/evolution/revisions.py`: immutable cross-session revision 与 task admission contract。
+- `src/openevo/evolution/revisions.py`: immutable cross-session project-head ledger 与 task
+  admission contract。这里内部名为 revision 的 ledger row 对应产品 spec 的 Project Head
+  composition；不要把它与仅表示 artifact set 的产品层 Evolution Revision 混为一谈。
   Store 允许显式 generation-zero head，并提供严格相邻 successor 的 atomic ledger commit primitive；
   当前 generation admission 固定 exact revision，下一 generation 持久化为 queued/not-ready。Activation
   在同一事务要求 queued request identity 匹配候选 revision，且仍未 pin 的当前代 queued admission 会阻止
@@ -116,7 +129,7 @@ SSH 直接执行。两个 API 都必须有严格 closed model、version/digest n
 - `src/openevo/experiments/`: experiment compiler/runner/promotion helpers。
 - `src/openevo/projects/science/`: ordinary-user science project config/compiler。
 - `src/openevo/deployment/`: remote deployment lifecycle、bootstrap、preflight、SSH transport。
-- `docs/architecture/`: OpenEvo Core Backend/Desktop 架构、evolution API、runtime
+- `docs/architecture/`: OpenEvo Daemon/Core/Desktop 架构、evolution API、runtime
   context、worker 接口文档。
 - `tests/`: regression tests，通常按 gateway、trajectory、evolution、rollout 等行为组织。
 
@@ -139,8 +152,8 @@ session/task events -> dataset artifact -> immutable evolution plan
   -> typed artifacts -> context resolve -> gateway runtime injection
 ```
 
-Cross-session revision ledger 使用 canonical manifest digest 绑定 project/workspace snapshots、
-materialized context/artifact set、registered execution snapshot 和 ordered adapters。当前 generation 的
+Cross-session project-head ledger 使用 canonical manifest digest 绑定 project/workspace snapshots、
+materialized context/artifact set、registered effective execution snapshot 和 ordered adapters。当前 generation 的
 admission 必须在同一 `BEGIN IMMEDIATE` 内 exact 匹配 stream/project、execution/capture mode、snapshot、
 context 和 artifact set；queued row 在 activation 后重启时允许保持未 pin，exact retry 再原子 pin active
 revision。未 pin `cancelled` 是保持完整 request sources 与 no-pin 语义的 closed historical audit row，head

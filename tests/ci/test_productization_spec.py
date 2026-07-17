@@ -8,6 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PRODUCTIZATION = REPO_ROOT / "docs" / "maintainer" / "productization"
 SPEC = PRODUCTIZATION / "spec.md"
 PLAN = PRODUCTIZATION / "implementation-plan.md"
+README = PRODUCTIZATION / "README.md"
 REMOVED_SPEC_NAME = "external-beta-release-spec.md"
 RETIRED_MARKERS = (
     REMOVED_SPEC_NAME,
@@ -21,143 +22,128 @@ RETIRED_MARKERS = (
     "science-task.schema.json",
     "science-workflow-canary-report.schema.json",
 )
-PLUG_REQUIREMENTS = tuple(f"PLUG-{number}" for number in range(1, 6))
-A2_STEPS = tuple(f"A2.{number}" for number in range(1, 6))
 
 
 def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _bullet_ids(text: str, prefix: str) -> tuple[str, ...]:
-    return tuple(
-        re.findall(rf"^- `({re.escape(prefix)}-\d+)\b", text, flags=re.MULTILINE)
-    )
-
-
-def _plug_requirement_bodies(text: str) -> dict[str, str]:
-    pattern = re.compile(
-        r"^- `(PLUG-\d+) [^`]+`: (?P<body>.*?)(?=^- `PLUG-\d+ |\n\n)",
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    return {
-        match.group(1): " ".join(match.group("body").split())
-        for match in pattern.finditer(text)
-    }
-
-
-def _a2_rows(text: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    rows = re.findall(
-        r"^\| `(A2\.\d+)` \| (?P<requirements>[^|]+) \| [^|]+ \|$",
-        text,
-        flags=re.MULTILINE,
-    )
-    return tuple(
-        (step, tuple(re.findall(r"PLUG-\d+", requirements)))
-        for step, requirements in rows
-    )
-
-
-def test_productization_has_one_concise_canonical_spec() -> None:
+def test_productization_has_one_canonical_target_spec() -> None:
     spec = _text(SPEC)
     plan = _text(PLAN)
+    readme = _text(README)
 
     assert not (PRODUCTIZATION / REMOVED_SPEC_NAME).exists()
-    assert "canonical product and release specification" in spec
+    assert "canonical target and release-acceptance specification" in spec
+    assert "only canonical product specification" in readme
+    assert "non-normative execution tracker" in readme
     assert "Canonical design: `docs/maintainer/productization/spec.md`" in plan
-    assert len(spec.splitlines()) <= 650
-    assert len(plan.splitlines()) <= 450
+    assert "not a second specification" in plan
+
+    for path in PRODUCTIZATION.glob("*.md"):
+        if path == SPEC:
+            continue
+        text = _text(path)
+        assert "Status: canonical product" not in text
+        assert "Status: canonical target" not in text
 
 
-def test_spec_preserves_stable_product_boundaries() -> None:
+def test_spec_defines_the_desktop_daemon_product_boundary() -> None:
     spec = _text(SPEC)
     for marker in (
-        "OpenEvo Core Backend",
-        "OpenEvo Desktop",
-        "benchmarks/terminal_bench/",
-        "CLI or Dev Kit product",
-        "call a model API directly",
-        "OpenEvo Core architecture",
-        "gateway, rollout, runtime",
+        "OpenEvo Desktop Client",
+        "**OpenEvo Daemon**",
+        "`src/openevo/` is the shared Core implementation",
+        "private Desktop sidecar",
+        "Benchmark automation is maintainer tooling",
+        "public CLI, Dev Kit, PyPI install path",
+        "bypasses the harness and calls a model API directly",
         "OPENEVO_*",
         "/openevo/session",
     ):
         assert marker in spec
 
+    assert "OpenEvo Core Backend" not in spec
     assert "Polar" not in spec
     assert "Polar" not in _text(PLAN)
 
 
-def test_spec_preserves_validated_methods_and_gates() -> None:
+def test_spec_closes_the_science_task_and_workspace_state_model() -> None:
     spec = _text(SPEC)
-    expected = {
-        "text_memory_expel_reflector": "12/21",
-        "skill_bundle_reflector": "14/25",
-        "agent_system_gepa_reflector": "17/25",
-    }
-    for method_id, threshold in expected.items():
-        assert method_id in spec
-        assert threshold in spec
-
-
-def test_spec_requires_pluggable_targets_methods_and_registry() -> None:
-    spec = _text(SPEC)
-    assert _bullet_ids(spec, "PLUG") == PLUG_REQUIREMENTS
-    requirement_bodies = _plug_requirement_bodies(spec)
-    assert tuple(requirement_bodies) == PLUG_REQUIREMENTS
-
-    plan = _text(PLAN)
-    rows = _a2_rows(plan)
-    assert tuple(step for step, _ in rows) == A2_STEPS
-    mapped_requirements = {requirement for _, requirements in rows for requirement in requirements}
-    assert mapped_requirements == set(PLUG_REQUIREMENTS)
-    assert dict(rows) == {
-        "A2.1": ("PLUG-1", "PLUG-2", "PLUG-3", "PLUG-4"),
-        "A2.2": ("PLUG-2", "PLUG-5"),
-        "A2.3": ("PLUG-1", "PLUG-2", "PLUG-3"),
-        "A2.4": ("PLUG-4",),
-        "A2.5": ("PLUG-1", "PLUG-2", "PLUG-3", "PLUG-4", "PLUG-5"),
-    }
-
-    ordered_sections = ("### A1.", "### A2.", "### A3.", "## B.", "## C.")
-    positions = [plan.index(section) for section in ordered_sections]
-    assert positions == sorted(positions)
-
-
-def test_spec_covers_modes_bootstrap_and_artifact_matrix() -> None:
-    combined = _text(SPEC) + _text(PLAN)
     for marker in (
-        "Codex Subscription Transcript",
-        "Self-Deployed Reference",
-        "token_level_metrics_available=false",
-        "Qwen/Qwen3-Coder-30B-A3B-Instruct",
-        "self-deployed-reference-v1.json",
-        "HTTP/HTTPS proxy",
-        "model download",
-        "pre-Core SSH transport/install/start",
-        "text_memory",
-        "skill_bundle",
-        "agent_system",
-        "all six mode/family cells",
+        "**Task Draft**",
+        "**Task**",
+        "**Run Attempt**",
+        "**Workspace Snapshot**",
+        "**Evolution Revision**",
+        "**Project Head**",
+        "one linear active head",
+        "first authoritative completed attempt",
+        "Restore never rewinds or forks",
+        "settings-only successor head",
+        "immutable execution receipt",
+        "cancellation racing",
+        "Creating a replacement plan is one atomic compare-and-set",
     ):
-        assert marker in combined
+        assert marker in spec
 
 
-def test_spec_covers_release_security_and_privacy_boundaries() -> None:
+def test_spec_supports_only_codex_harness_execution_modes() -> None:
     spec = _text(SPEC)
     for marker in (
-        "unsigned/not-notarized",
+        "Codex Subscription",
+        "Self-Deployed",
+        "Codex -> Core Gateway -> vLLM",
+        "There is no third arbitrary API-key-and-base-URL execution mode",
+        "Every subscription run MUST explicitly enable transcript capture",
+        "token-level metrics are unavailable",
+    ):
+        assert marker in spec
+
+
+def test_spec_preserves_pluggable_evolution_and_protected_methods() -> None:
+    spec = _text(SPEC)
+    for marker in (
+        "startup-frozen verified registry",
+        "Core-owned selection resolvers",
+        "accepted methods retained",
+        "compiler-owned configuration field",
+        "data-only handlers",
+        "normalized initial evolution intent",
+        "text_memory_expel_reflector",
+        "skill_bundle_reflector",
+        "agent_system_gepa_reflector",
+        "10/21",
+        "12/25",
+        "15/25",
+        "successor project head H+1",
+        "one transition attempt can commit",
+    ):
+        assert marker in spec
+
+    assert "PLUG-1" not in spec
+    assert "REV-1" not in spec
+
+
+def test_spec_has_complete_release_and_security_acceptance() -> None:
+    spec = _text(SPEC)
+    gate_ids = tuple(
+        re.findall(r"^### (G\d+)\.", spec, flags=re.MULTILINE)
+    )
+    assert gate_ids == tuple(f"G{number}" for number in range(1, 13))
+
+    for marker in (
+        "Apple Silicon OpenEvo Desktop DMG",
+        "Linux x86-64 OpenEvo Daemon Bundle",
+        "One machine-readable candidate evidence index",
+        "simulator=false",
+        "macOS Keychain",
+        "binds only to remote loopback",
+        "no telemetry or upload occurs by default",
+        "idempotent Daemon-owned asynchronous operation",
         "PyPI is not an External Beta release surface",
-        "No analytics, crash reporting, telemetry",
-        "bind only to local interfaces",
-        "Diagnostics export is explicit",
-        "Deletion is path-contained",
-        "redacted before persistence",
-        "transcript-derived datasets",
-        "any part of an\nartifact record",
-        "registration requests",
-        "URIs, payloads",
-        "GitHub Releases",
+        "raw subscription credential",
+        "non-public draft or staging release",
     ):
         assert marker in spec
 

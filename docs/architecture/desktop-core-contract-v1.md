@@ -1,11 +1,19 @@
-# Desktop/Core Contract v1
+# Desktop/Daemon Implementation Contract v1
 
-Issue #163 defines the first release contract for the exhibition-ready OpenEvo
-Desktop. This document fixes ownership and behavior. The checked-in OpenAPI
-documents and conformance tests fix the exact JSON schemas.
+Status: non-normative implementation snapshot for the current v1 APIs
+
+The canonical product target and release acceptance are defined only by
+`docs/maintainer/productization/spec.md`. This document refines the currently
+implemented Desktop/Daemon API slice. Statements that a capability is absent,
+hidden, or unavailable describe a current implementation gap; they do not
+remove or narrow a requirement in the canonical specification.
+
+Issue #163 tracks the exhibition-oriented implementation slice. The checked-in
+OpenAPI documents and conformance tests fix its exact JSON schemas.
 
 This is a product boundary, not a new product surface. OpenEvo still ships only
-OpenEvo Desktop and OpenEvo Core Backend.
+OpenEvo Desktop Client and OpenEvo Daemon. OpenEvo Core is the Daemon's shared
+implementation.
 
 ## Ownership
 
@@ -14,12 +22,13 @@ React renderer
   -> Desktop Local API v1
 local sidecar
   -> Core Control API v1 through the active SSH tunnel
-remote OpenEvo Core Backend
+remote OpenEvo Daemon
 ```
 
 The Tauri/Rust host owns the native process lifecycle, Desktop session
 credential, and native workspace selection. The exhibition release has no
-user-secret Keychain or secret-handoff surface.
+user-secret Keychain or secret-handoff surface; this is a current gap against
+the canonical target rather than the final release contract.
 The renderer never receives SSH passwords, key passphrases, backend bearer
 tokens, proxy passwords, raw host paths, remote commands, or the Core URL.
 
