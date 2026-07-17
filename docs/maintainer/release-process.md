@@ -174,13 +174,17 @@ private executable FD to that sidecar digest plus its private device, inode,
 and size. The smoke binds the marker PID to the current app descendant,
 process group, session, and live Darwin birth identity; requires FD 3 to be an
 IPv4 loopback listener; and requires FD 4 in the same process to match the
-declared regular-file device, inode, and size. It also requires both the
-renderer-ready marker and a visible window. It does not reopen the private
-executable pathname: the pathname remains in the documented same-UID trust
-boundary until native cleanup, while the marker and live FD identity are the
-observer's authority. Both packaged paths are rechecked after process cleanup.
+declared regular-file device, inode, and size. It also requires the V2
+renderer-ready marker, which the Tauri host emits only for the invoking visible
+`main` WebView with non-zero inner dimensions after Local API bootstrap. It
+does not reopen the private executable pathname: the pathname remains in the
+documented same-UID trust boundary until native cleanup, while the marker and
+live FD identity are the observer's authority. Both packaged paths are
+rechecked after process cleanup.
 Native stderr uses a nonblocking bounded pipe, parsing remains byte/line bounded,
-and timeout output uses only closed readiness stage names. Probe subprocesses
+and timeout output uses only closed readiness stage names. A probe deadline or
+transient shallower probe result cannot overwrite the deepest product readiness
+stage reached. Probe subprocesses
 share one readiness deadline and run in private sessions. Timeout cleanup takes
 a bounded ancestry snapshot while the direct leader is unreaped, kills observed
 escaped descendant groups before the root group, and then reaps the direct
@@ -192,8 +196,10 @@ ceases to exist within a bounded cleanup period; a zombie-only group is still a
 cleanup failure.
 The release host gives a cold packaged sidecar up to 60 seconds to complete its
 bounded PyInstaller onefile startup. Each mounted-DMG or detached-copy smoke has
-a separate 120-second readiness deadline so renderer, FD, and window probes
-cannot expire merely because the inner cold-start budget was consumed. Cleanup
+a separate 120-second readiness deadline so renderer and FD probes cannot
+expire merely because the inner cold-start budget was consumed. Window
+readiness is checked in-process by Tauri rather than by repeatedly compiling an
+external CoreGraphics probe. Cleanup
 then retains its independent 5-second termination and 15-second group-
 disappearance maximum bounds.
 Candidate JSON parsing
@@ -207,7 +213,8 @@ Availability alone is not release evidence: both real app launches still run
 The portable app-smoke unit fixture uses an emitted evidence record because its
 executable is a test script, not Mach-O. It never substitutes for candidate
 evidence: macOS candidate runs always inspect and launch the real Tauri binary
-and packaged sidecar with `file`, `lipo`, native window, and FD checks.
+and packaged sidecar with `file`, `lipo`, host-bound renderer/window readiness,
+and FD checks.
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
 best stochastic result.

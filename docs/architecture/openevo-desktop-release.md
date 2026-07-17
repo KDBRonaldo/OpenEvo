@@ -223,11 +223,15 @@ binding comes from the native host's already verified instance of that exact
 FD. The private pathname remains inside the documented same-UID trust boundary
 until native cleanup; the smoke does not reopen an `lsof` pathname because the
 marker and live FD identity, rather than that pathname, are the observation
-authority. The separate
-`OPENEVO_DESKTOP_RENDERER_READY_V1` acknowledgement and an on-screen non-empty
-window are both required. Failure or timeout of the CoreGraphics window probe
-fails closed; there is no weaker window-count fallback. Timeout output is
-restricted to a closed readiness stage and does not include process commands,
+authority. The separate `OPENEVO_DESKTOP_RENDERER_READY_V2` acknowledgement is
+emitted only after the invoking Tauri WebView is the visible `main` window with
+a non-zero inner size and the renderer has completed the frozen Local API
+bootstrap. The digest-bound marker therefore carries the renderer and native
+window readiness proof without an external Swift/CoreGraphics compiler probe.
+Failure to validate the invoking window fails closed inside the host. Timeout
+output is restricted to the deepest closed readiness stage reached and the
+closed stages observed during the launch; transient probe regressions cannot
+downgrade that primary stage, and diagnostics do not include process commands,
 paths, or credentials. The smoke
 signals the app process group only while its unreaped `Popen` child reserves the
 leader PID; once `poll` or `wait` has reaped that child, the numeric group is

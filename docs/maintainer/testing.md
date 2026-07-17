@@ -246,12 +246,16 @@ failure cleanup cannot lose an already observed sidecar group. StrictMode lifecy
 replacement selects the latest process marker while retaining all observed
 process groups for disappearance checks. Only the app group backed by an
 unreaped child authority may be signalled; reaped app groups and historical
-sidecar PGIDs are never signalled. A
-failure reports only one closed stage:
+sidecar PGIDs are never signalled. A failure reports the deepest stage reached
+and an observed-stage set drawn only from this closed vocabulary:
 `native_marker_absent`, `native_process_unavailable`,
 `listener_fd_unavailable`, `executable_fd_unavailable`,
-`renderer_ack_absent`, `renderer_window_absent`, or
-`probe_deadline_exhausted`. A macOS-only contract test
+or `renderer_ack_absent`. Probe deadline exhaustion and transient shallower
+probe failures cannot replace the deepest product readiness stage reached;
+timeout diagnostics also list only the closed stages observed during that
+launch. The V2 renderer marker is host-bound to a visible,
+non-empty `main` WebView; unit coverage rejects a hidden, zero-sized, or
+non-main invoking window. A macOS-only contract test
 calls `proc_pidinfo` for the live test process and compares `lsof -FDiT` output
 against a real regular file and loopback listener before packaging. Both macOS
 gates additionally repeat the

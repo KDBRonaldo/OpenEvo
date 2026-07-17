@@ -32,7 +32,7 @@ const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v1";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777";
-const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V1";
+const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V2";
 const SIDECAR_PROCESS_MARKER: &str = "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
@@ -5420,10 +5420,26 @@ fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostSta
 
 #[tauri::command(rename_all = "camelCase")]
 fn renderer_ready(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, DesktopHostState>,
     openapi_sha256: String,
 ) -> HostResult<()> {
+    let visible = window.is_visible().map_err(|_| renderer_window_error())?;
+    let size = window.inner_size().map_err(|_| renderer_window_error())?;
+    validate_renderer_window_ready(window.label(), visible, size.width, size.height)?;
     renderer_ready_inner(&state, &openapi_sha256)
+}
+
+fn validate_renderer_window_ready(
+    label: &str,
+    visible: bool,
+    width: u32,
+    height: u32,
+) -> HostResult<()> {
+    if label != "main" || !visible || width == 0 || height == 0 {
+        return Err(renderer_window_error());
+    }
+    Ok(())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -5598,6 +5614,13 @@ fn sidecar_inspection_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_process_inspection_failed",
         "OpenEvo Desktop could not inspect the sidecar process.",
+    )
+}
+
+fn renderer_window_error() -> NativeHostError {
+    NativeHostError::new(
+        "renderer_window_unavailable",
+        "OpenEvo Desktop renderer window is not ready.",
     )
 }
 
@@ -6120,6 +6143,22 @@ mod tests {
         );
         assert_eq!(session_token.len(), SESSION_TOKEN_BYTES * 2);
         assert_eq!(handoff_token.len(), HANDOFF_TOKEN_BYTES * 2);
+    }
+
+    #[test]
+    fn renderer_window_readiness_requires_the_visible_main_webview() {
+        validate_renderer_window_ready("main", true, 1280, 860).unwrap();
+
+        for (label, visible, width, height) in [
+            ("secondary", true, 1280, 860),
+            ("main", false, 1280, 860),
+            ("main", true, 0, 860),
+            ("main", true, 1280, 0),
+        ] {
+            let error = validate_renderer_window_ready(label, visible, width, height).unwrap_err();
+            assert_eq!(error.code, "renderer_window_unavailable");
+        }
+        assert_eq!(RENDERER_READY_MARKER, "OPENEVO_DESKTOP_RENDERER_READY_V2");
     }
 
     #[test]
