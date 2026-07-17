@@ -1510,7 +1510,9 @@ def _structural_check() -> None:
         'parser.add_argument("--listener-fd", type=int, required=True)',
         'parser.add_argument("--native-instance-stdin", action="store_true", required=True)',
         "_read_native_instance_frame()",
-        "uvicorn.Server(config).run(sockets=[listener])",
+        "server = uvicorn.Server(config)",
+        "_defer_packaged_server_signal_replay(",
+        "server.run(sockets=[listener])",
         '_NATIVE_SESSION_PROBE_ROUTE = "/openevo-native/session"',
     )
     if any(marker not in launcher_text for marker in required):
