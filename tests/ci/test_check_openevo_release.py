@@ -2254,6 +2254,11 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     macos_candidate = text[
         text.index("  macos-candidate:") : text.index("  linux-core-candidate:")
     ]
+    linux_candidate = text[
+        text.index("  linux-core-candidate:") : text.index(
+            "  draft-prerelease-roundtrip:"
+        )
+    ]
     release_test_command = "cargo test --locked --release -- --test-threads=1"
 
     for marker in (
@@ -2336,6 +2341,11 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert release_test_command in macos_candidate
     assert "lipo -version" not in macos_candidate
     assert "bundle/macos" not in macos_candidate
+    assert 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' in linux_candidate
+    assert 'test "$RUNNER_ENVIRONMENT" = "github-hosted"' in linux_candidate
+    assert linux_candidate.index(
+        "- name: Require an ephemeral GitHub-hosted Core runner"
+    ) < linux_candidate.index("- name: Download exact final candidate bytes")
     assert macos_candidate.count(
         "scripts/ci/smoke_openevo_desktop_bundle.py"
     ) == 2
@@ -2459,6 +2469,17 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert text.index("Restore private Core candidate input modes") < text.index(
         "Verify candidate manifest and transferred manifest bytes"
     )
+    core_lifecycle_step = text.split(
+        "      - name: Smoke exact candidate Core service lifecycle\n", maxsplit=1
+    )[1].split(
+        "  draft-prerelease-roundtrip:\n", maxsplit=1
+    )[0]
+    assert core_lifecycle_step.count('openevo-core-service"') == 3
+    assert '" ensure \\' in core_lifecycle_step
+    assert "consume-attachment \\" in core_lifecycle_step
+    assert '" stop \\' in core_lifecycle_step
+    assert "--service-root" not in core_lifecycle_step
+    assert "openevo-candidate-core-service" not in core_lifecycle_step
     assert "needs: [macos-candidate, linux-core-candidate]" in text
     assert text.index("gh release create") < text.index("gh release upload")
     assert text.index("gh release upload") < text.index("gh release download")

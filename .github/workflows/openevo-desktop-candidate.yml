@@ -320,6 +320,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Require an ephemeral GitHub-hosted Core runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: test "$RUNNER_ENVIRONMENT" = "github-hosted"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -388,18 +393,16 @@ jobs:
       - name: Smoke exact candidate Core service lifecycle
         run: |
           set -euo pipefail
-          service_root="$RUNNER_TEMP/openevo-candidate-core-service"
           attachment_name="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
           service_json="$RUNNER_TEMP/openevo-candidate-service.json"
           attachment_json="$RUNNER_TEMP/openevo-candidate-attachment.json"
           cleanup() {
             PYTHONPATH= "$RUNNER_TEMP/openevo-candidate-core/bin/openevo-core-service" stop \
-              --service-root "$service_root" --deadline-seconds 15 >/dev/null 2>&1 || true
+              --deadline-seconds 15 >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
           umask 077
           PYTHONPATH= "$RUNNER_TEMP/openevo-candidate-core/bin/openevo-core-service" ensure \
-            --service-root "$service_root" \
             --framework-lock "$GITHUB_WORKSPACE/candidate-artifacts/framework-lock.json" \
             --source-commit "$GITHUB_SHA" \
             --port 0 \
@@ -408,7 +411,6 @@ jobs:
             --attachment-name "$attachment_name" > "$service_json"
           PYTHONPATH= "$RUNNER_TEMP/openevo-candidate-core/bin/openevo-core-service" \
             consume-attachment \
-            --service-root "$service_root" \
             --attachment-name "$attachment_name" > "$attachment_json"
           PYTHONPATH= "$RUNNER_TEMP/openevo-candidate-core/bin/python" - \
             "$service_json" "$attachment_json" <<'PY'
