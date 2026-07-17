@@ -20,10 +20,29 @@ from zipfile import BadZipFile, ZipFile
 MANIFEST_NAME = "release-candidate.json"
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
+MANAGED_RUNTIME_SOURCE_NAME = "managed-runtime-source.json"
 MINIMUM_MACOS_VERSION = "12.0"
 TAURI_EXECUTABLE_NAME = "openevo-desktop"
 CORE_PYTHON_REQUIRES = ">=3.11"
 CORE_SUPPORTED_PLATFORMS = ("linux-x86_64",)
+MANAGED_RUNTIME_REPOSITORY = "CompLifeLab-ZJU/OpenEvo"
+MANAGED_RUNTIME_RELEASE_ID = 354404740
+MANAGED_RUNTIME_RELEASE_TAG = "openevo-managed-runtime-assets-v0.1.0"
+MANAGED_RUNTIME_ASSET_ID = 478167627
+MANAGED_RUNTIME_ARCHIVE_NAME = "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+MANAGED_RUNTIME_ARCHIVE_SIZE = 374_592_823
+MANAGED_RUNTIME_ARCHIVE_SHA256 = "7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a"
+MANAGED_RUNTIME_CONFIG_ID = (
+    "sha256:ae4e0189161bec78e419ab4887b1028e51f30996beee7b078011e3656e6084a1"
+)
+MANAGED_RUNTIME_OCI_INDEX_ID = (
+    "sha256:014ee0866c332b73dfa9165397486a0ffbd132b274705e18b2b8c9b78d5dbb90"
+)
+MANAGED_RUNTIME_ALIAS = "openevo/science-runtime:0.1.0"
+MANAGED_RUNTIME_LABEL = "io.openevo.managed-runtime"
+MANAGED_RUNTIME_LABEL_VALUE = "true"
+MANAGED_RUNTIME_PLATFORM = "linux-amd64"
+MANAGED_RUNTIME_EXECUTION_MODE = "codex_subscription_transcript"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARCHITECTURE_TARGETS = {
     "aarch64": "aarch64-apple-darwin",
@@ -44,6 +63,7 @@ REQUIRED_INPUT_ROLES = (
     ("python_requirements", "python-requirements.txt"),
     ("app_bundle_smoke", "app-bundle-smoke.json"),
     ("dmg_copy_smoke", "dmg-copy-smoke.json"),
+    ("managed_runtime_source", MANAGED_RUNTIME_SOURCE_NAME),
 )
 FINAL_ROLES = tuple(role for role, _name in REQUIRED_INPUT_ROLES) + (
     "core_descriptor",
@@ -145,6 +165,62 @@ def _require_safe_basename(value: object, subject: str) -> str:
     return value
 
 
+def _managed_runtime_source_evidence() -> dict[str, object]:
+    return {
+        "asset": {
+            "api_digest": f"sha256:{MANAGED_RUNTIME_ARCHIVE_SHA256}",
+            "byte_size": MANAGED_RUNTIME_ARCHIVE_SIZE,
+            "download_sha256": MANAGED_RUNTIME_ARCHIVE_SHA256,
+            "id": MANAGED_RUNTIME_ASSET_ID,
+            "name": MANAGED_RUNTIME_ARCHIVE_NAME,
+        },
+        "image": {
+            "config_id": MANAGED_RUNTIME_CONFIG_ID,
+            "oci_index_digest": MANAGED_RUNTIME_OCI_INDEX_ID,
+        },
+        "release": {
+            "id": MANAGED_RUNTIME_RELEASE_ID,
+            "is_draft": True,
+            "tag": MANAGED_RUNTIME_RELEASE_TAG,
+        },
+        "repository": MANAGED_RUNTIME_REPOSITORY,
+        "schema_version": 1,
+    }
+
+
+def _managed_runtime_manifest() -> dict[str, object]:
+    source = _managed_runtime_source_evidence()
+    asset = source["asset"]
+    assert isinstance(asset, dict)
+    return {
+        "archive": {
+            "byte_size": asset["byte_size"],
+            "filename": asset["name"],
+            "sha256": asset["download_sha256"],
+        },
+        "asset": {
+            "api_digest": asset["api_digest"],
+            "id": asset["id"],
+        },
+        "capability": {
+            "capture_mode": "transcript",
+            "execution_mode": MANAGED_RUNTIME_EXECUTION_MODE,
+            "harness_id": "codex",
+            "token_level_metrics_available": False,
+        },
+        "image": {
+            "config_id": MANAGED_RUNTIME_CONFIG_ID,
+            "loaded_image_id": MANAGED_RUNTIME_OCI_INDEX_ID,
+            "managed_label": {
+                MANAGED_RUNTIME_LABEL: MANAGED_RUNTIME_LABEL_VALUE,
+            },
+            "platform": MANAGED_RUNTIME_PLATFORM,
+            "runtime_alias": MANAGED_RUNTIME_ALIAS,
+        },
+        "release": source["release"],
+    }
+
+
 def render_candidate_release_notes(
     *,
     source_commit: str,
@@ -173,6 +249,11 @@ def render_candidate_release_notes(
             "It runs subscription-authenticated Codex on the remote server with transcript capture and non-parametric evolution.",
             "Self-Deployed Reference mode: unavailable in this candidate.",
             "The shipped Desktop release authority blocks saving or running that mode; its Core-side reference architecture is not a Desktop product claim.",
+            f"Managed Science runtime archive: {MANAGED_RUNTIME_ARCHIVE_NAME}.",
+            f"Managed Science runtime archive size: {MANAGED_RUNTIME_ARCHIVE_SIZE}.",
+            f"Managed Science runtime archive SHA-256: {MANAGED_RUNTIME_ARCHIVE_SHA256}.",
+            f"Managed Science runtime source asset ID: {MANAGED_RUNTIME_ASSET_ID}.",
+            f"Managed Science runtime loaded image ID: {MANAGED_RUNTIME_OCI_INDEX_ID}.",
             "",
             "## Known Limitations",
             "",
@@ -189,7 +270,7 @@ def render_candidate_release_notes(
             "Trajectory-to-skill pass@1 rescue count: pending.",
             "Agent-system pass@1 rescue count: pending.",
             "No benchmark performance claim is made by this draft.",
-            "The exact Core wheel, candidate DMG, its mounted app and detached copy, dependency evidence, and downloaded draft assets are validated by this workflow.",
+            "The exact Core wheel, candidate DMG, its mounted app and detached copy, embedded subscription Science runtime, source evidence, dependency evidence, and downloaded draft assets are validated by this workflow.",
             "",
             "## Security And Privacy",
             "",
@@ -745,6 +826,8 @@ def create_candidate_manifest(
         architecture=architecture,
         dmg_path=paths["desktop_dmg"],
     )
+    if _load_json(paths["managed_runtime_source"]) != _managed_runtime_source_evidence():
+        raise CandidateError("managed runtime source evidence is invalid")
     _validate_release_notes(
         paths["release_notes"],
         source_commit=source_commit,
@@ -788,12 +871,13 @@ def create_candidate_manifest(
             "native_architectures": native_architectures,
             "rust_target": rust_target,
         },
+        "managed_runtime": _managed_runtime_manifest(),
         "release": {
             "channel": "unsigned-draft-prerelease",
             "notarized": False,
             "signed": False,
         },
-        "schema_version": 2,
+        "schema_version": 3,
         "source_commit": source_commit,
         "version": version,
     }
@@ -821,6 +905,7 @@ def _validate_candidate_manifest(
         "version",
         "release",
         "macos",
+        "managed_runtime",
         "core",
         "files",
     }
@@ -830,9 +915,10 @@ def _validate_candidate_manifest(
     version = manifest.get("version")
     release = manifest.get("release")
     macos = manifest.get("macos")
+    managed_runtime = manifest.get("managed_runtime")
     core = manifest.get("core")
     files = manifest.get("files")
-    if manifest.get("schema_version") != 2:
+    if manifest.get("schema_version") != 3:
         raise CandidateError("candidate manifest schema version is invalid")
     if type(source_commit) is not str or SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise CandidateError("candidate source commit is invalid")
@@ -864,6 +950,8 @@ def _validate_candidate_manifest(
         "bundled_external_bin": [expected_slice],
     }:
         raise CandidateError("candidate manifest does not bind the packaged Mach-O slices")
+    if managed_runtime != _managed_runtime_manifest():
+        raise CandidateError("candidate managed runtime identity is invalid")
     if type(files) is not list or len(files) != len(FINAL_ROLES):
         raise CandidateError("candidate file inventory is incomplete")
     by_role: dict[str, dict[str, object]] = {}
@@ -949,6 +1037,11 @@ def _validate_candidate_manifest(
     )
     if observed_native_architectures != native_architectures:
         raise CandidateError("candidate manifest Mach-O slices do not match native evidence")
+    if (
+        _load_json(root / str(by_role["managed_runtime_source"]["filename"]))
+        != _managed_runtime_source_evidence()
+    ):
+        raise CandidateError("managed runtime source evidence is invalid")
     _validate_release_notes(
         root / str(by_role["release_notes"]["filename"]),
         source_commit=source_commit,

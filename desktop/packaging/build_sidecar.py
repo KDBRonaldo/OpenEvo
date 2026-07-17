@@ -24,14 +24,20 @@ from tempfile import TemporaryDirectory
 import tomllib
 from urllib.request import urlopen
 from zipfile import BadZipFile, ZipFile
+import zlib
 
 from openevo.evolution.framework.runtime import (
     FrameworkDistributionLock,
     load_framework_distribution_lock,
 )
+from openevo.runtime.managed import (
+    MANAGED_RUNTIME_ARCHIVE_RELEASE,
+    verify_managed_runtime_archive,
+)
 
 SIDECAR_NAME = "openevo-desktop-sidecar"
 CORE_WHEEL_ARCHIVE_ROOT = Path("openevo/wheels")
+MANAGED_RUNTIME_ARCHIVE_ROOT = Path("openevo/runtime-assets")
 CORE_FRAMEWORK_LOCK_BASENAME = "framework-lock.json"
 FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
     {
@@ -967,6 +973,136 @@ def _archive_member_bytes(executable: Path, member_name: str) -> bytes:
     return payload
 
 
+def _archive_member_digest(
+    executable: Path,
+    member_name: str,
+    *,
+    expected_size: int,
+) -> tuple[int, str]:
+    """Hash one direct CArchive member without buffering its decompressed bytes."""
+
+    try:
+        from PyInstaller.archive.readers import CArchiveReader
+    except ImportError as exc:
+        raise RuntimeError("PyInstaller is required to inspect the sidecar archive") from exc
+    archive = CArchiveReader(str(executable))
+    try:
+        with executable.open("rb") as stream:
+            cookie_offset = archive._find_magic_pattern(
+                stream,
+                archive._COOKIE_MAGIC_PATTERN,
+            )
+            if cookie_offset < 0:
+                raise RuntimeError("sidecar archive cookie is unavailable")
+            stream.seek(cookie_offset)
+            cookie = stream.read(archive._COOKIE_LENGTH)
+            if len(cookie) != archive._COOKIE_LENGTH:
+                raise RuntimeError("sidecar archive cookie is truncated")
+            _, archive_length, toc_offset, toc_length, _, _ = struct.unpack(
+                archive._COOKIE_FORMAT,
+                cookie,
+            )
+            archive_end = cookie_offset + archive._COOKIE_LENGTH
+            archive_start = archive_end - archive_length
+            toc_start = archive_start + toc_offset
+            if (
+                archive_start < 0
+                or toc_start < archive_start
+                or toc_length < 0
+                or toc_start + toc_length > cookie_offset
+            ):
+                raise RuntimeError("sidecar archive TOC bounds are invalid")
+            stream.seek(toc_start)
+            toc_payload = stream.read(toc_length)
+            if len(toc_payload) != toc_length:
+                raise RuntimeError("sidecar archive TOC is truncated")
+
+            selected: tuple[int, int, int, int] | None = None
+            position = 0
+            while position < len(toc_payload):
+                if len(toc_payload) - position < archive._TOC_ENTRY_LENGTH:
+                    raise RuntimeError("sidecar archive TOC entry is truncated")
+                values = struct.unpack(
+                    archive._TOC_ENTRY_FORMAT,
+                    toc_payload[position : position + archive._TOC_ENTRY_LENGTH],
+                )
+                entry_length, offset, compressed_size, size, compressed, _typecode = values
+                if entry_length < archive._TOC_ENTRY_LENGTH or position + entry_length > len(
+                    toc_payload
+                ):
+                    raise RuntimeError("sidecar archive TOC entry bounds are invalid")
+                encoded_name = toc_payload[
+                    position + archive._TOC_ENTRY_LENGTH : position + entry_length
+                ]
+                name = encoded_name.rstrip(b"\0").decode("utf-8", errors="strict")
+                if name.replace("\\", "/") == member_name:
+                    if selected is not None:
+                        raise RuntimeError("sidecar archive contains a duplicate member")
+                    selected = (offset, compressed_size, size, compressed)
+                position += entry_length
+
+            if selected is None:
+                raise RuntimeError("sidecar archive member is unavailable")
+            offset, compressed_size, size, compressed = selected
+            if (
+                size != expected_size
+                or offset < 0
+                or compressed_size < 0
+                or archive_start + offset + compressed_size > toc_start
+                or compressed not in (0, 1)
+            ):
+                raise RuntimeError("sidecar archive member bounds are invalid")
+
+            stream.seek(archive_start + offset)
+            digest = hashlib.sha256()
+            observed = 0
+            remaining_input = compressed_size
+            decompressor = zlib.decompressobj() if compressed else None
+            while remaining_input:
+                chunk = stream.read(min(1024 * 1024, remaining_input))
+                if not chunk:
+                    raise RuntimeError("sidecar archive member is truncated")
+                remaining_input -= len(chunk)
+                output = (
+                    chunk
+                    if decompressor is None
+                    else decompressor.decompress(chunk, expected_size + 1 - observed)
+                )
+                if decompressor is not None and decompressor.unconsumed_tail:
+                    raise RuntimeError("sidecar archive member exceeds its byte budget")
+                observed += len(output)
+                if observed > expected_size:
+                    raise RuntimeError("sidecar archive member exceeds its byte budget")
+                digest.update(output)
+            if decompressor is not None:
+                output = decompressor.flush(expected_size + 1 - observed)
+                observed += len(output)
+                digest.update(output)
+                if decompressor.unused_data or not decompressor.eof or observed > expected_size:
+                    raise RuntimeError("sidecar archive member compression is invalid")
+    except (AttributeError, OSError, struct.error, UnicodeError, zlib.error) as exc:
+        raise RuntimeError("sidecar archive member could not be verified") from exc
+    if observed != expected_size:
+        raise RuntimeError("sidecar archive member size differs from the release contract")
+    return observed, digest.hexdigest()
+
+
+def _validate_managed_runtime_archive(archive: Path) -> tuple[int, str]:
+    """Validate the exact Core-owned archive and return its outer identity."""
+
+    try:
+        verify_managed_runtime_archive(
+            archive,
+            release=MANAGED_RUNTIME_ARCHIVE_RELEASE,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("managed runtime archive identity is invalid") from exc
+    return (
+        MANAGED_RUNTIME_ARCHIVE_RELEASE.byte_size,
+        MANAGED_RUNTIME_ARCHIVE_RELEASE.sha256,
+    )
+
+
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -1777,10 +1913,35 @@ def _validate_embedded_product_web(
         raise RuntimeError("Desktop sidecar product web build digest differs from dist")
 
 
+def _validate_embedded_managed_runtime_archive(
+    executable: Path,
+    archive: Path,
+) -> None:
+    runtime = MANAGED_RUNTIME_ARCHIVE_RELEASE
+    expected_member = (MANAGED_RUNTIME_ARCHIVE_ROOT / runtime.filename).as_posix()
+    members = sorted(
+        name
+        for name in _archive_member_names(executable)
+        if name.startswith(f"{MANAGED_RUNTIME_ARCHIVE_ROOT.as_posix()}/")
+    )
+    if members != [expected_member]:
+        raise RuntimeError("sidecar archive does not contain the exact managed runtime archive")
+    source_identity = _validate_managed_runtime_archive(archive)
+    embedded_identity = _archive_member_digest(
+        executable,
+        expected_member,
+        expected_size=runtime.byte_size,
+    )
+    if embedded_identity != source_identity:
+        raise RuntimeError("embedded managed runtime archive identity differs from its source")
+
+
 def build_sidecar(
     *,
     clean: bool,
     core_wheel_output_dir: Path | None = None,
+    managed_runtime_archive: Path | None = None,
+    release_build: bool = False,
 ) -> Path:
     repo = _repo_root()
     desktop_root = repo / "desktop"
@@ -1792,6 +1953,11 @@ def build_sidecar(
     entrypoint = packaging_root / "sidecar_entry.py"
     static_root = packaging_root / "web"
 
+    if release_build and managed_runtime_archive is None:
+        raise RuntimeError("release sidecar build requires the managed runtime archive")
+    if managed_runtime_archive is not None:
+        managed_runtime_archive = Path(os.path.abspath(managed_runtime_archive))
+        _validate_managed_runtime_archive(managed_runtime_archive)
     if core_wheel_output_dir is not None:
         output_candidate = Path(os.path.abspath(core_wheel_output_dir))
         _reject_symlink_path(output_candidate)
@@ -1872,6 +2038,14 @@ def build_sidecar(
             "uvicorn.protocols.websockets.auto",
             str(entrypoint),
         ]
+        if managed_runtime_archive is not None:
+            command[-1:-1] = [
+                "--add-data",
+                (
+                    f"{managed_runtime_archive}{os.pathsep}"
+                    f"{MANAGED_RUNTIME_ARCHIVE_ROOT.as_posix()}"
+                ),
+            ]
         pyinstaller_env = os.environ.copy()
         pyinstaller_env["PYTHONPATH"] = os.pathsep.join(
             filter(
@@ -1901,6 +2075,8 @@ def build_sidecar(
             version=core_version,
         )
         _validate_embedded_product_web(built, desktop_root, product_web_digest)
+        if managed_runtime_archive is not None:
+            _validate_embedded_managed_runtime_archive(built, managed_runtime_archive)
 
         if core_wheel_output_dir is not None:
             _publish_core_release_inputs_once(
@@ -1925,10 +2101,25 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Preserve the exact embedded Core wheel and framework lock in this output directory.",
     )
+    parser.add_argument(
+        "--managed-runtime-archive",
+        type=Path,
+        help=(
+            "Embed the exact managed subscription Science runtime archive. "
+            "Dev/debug builds may omit it."
+        ),
+    )
+    parser.add_argument(
+        "--release-build",
+        action="store_true",
+        help="Fail closed unless the managed subscription Science runtime is embedded.",
+    )
     args = parser.parse_args(argv)
     target = build_sidecar(
         clean=not args.no_clean,
         core_wheel_output_dir=args.core_wheel_output_dir,
+        managed_runtime_archive=args.managed_runtime_archive,
+        release_build=args.release_build,
     )
     print(target)
     return 0

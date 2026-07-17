@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -12,6 +13,21 @@ import pytest
 def _load_module():
     path = Path(__file__).resolve().parents[2] / "scripts/ci/openevo_release_candidate.py"
     spec = importlib.util.spec_from_file_location("openevo_release_candidate", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_runtime_asset_module():
+    path = (
+        Path(__file__).resolve().parents[2] / "scripts/ci/verify_managed_runtime_release_asset.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "verify_managed_runtime_release_asset",
+        path,
+    )
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -33,10 +49,31 @@ def test_candidate_release_notes_are_one_canonical_document() -> None:
 
     assert notes.endswith("\n")
     assert "Self-Deployed Reference mode: unavailable in this candidate." in notes
+    assert "openevo-science-runtime-0.1.0-linux-amd64.tar.gz" in notes
+    assert "Managed Science runtime source asset ID: 478167627." in notes
     assert "Credential-canary verification for release assets: pending." in notes
     assert "Local Desktop data under ~/.openevo/desktop is retained" in notes
     assert "org.openevo.desktop" in notes
     assert "run-retry recovery" in notes
+
+
+def test_candidate_workflow_closes_managed_subscription_runtime_release() -> None:
+    candidate = _load_module()
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(encoding="utf-8")
+
+    for value in (
+        str(candidate.MANAGED_RUNTIME_ASSET_ID),
+        str(candidate.MANAGED_RUNTIME_ARCHIVE_SIZE),
+        candidate.MANAGED_RUNTIME_ARCHIVE_NAME,
+        candidate.MANAGED_RUNTIME_ARCHIVE_SHA256,
+        "verify_managed_runtime_release_asset.py",
+        "--managed-runtime-archive",
+        "--release-build",
+        "docker:29.3-dind",
+        "smoke_managed_runtime_archive.py",
+    ):
+        assert value in workflow
+    assert workflow.count("self-deployed") == 0
 
 
 def test_write_notes_command_creates_but_never_replaces_canonical_document(
@@ -287,7 +324,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
     ) == []
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["release"] == {
         "channel": "unsigned-draft-prerelease",
         "notarized": False,
@@ -312,7 +349,16 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
     assert by_role["checksums"]["filename"] == "SHA256SUMS"
     assert by_role["app_bundle_smoke"]["filename"] == "app-bundle-smoke.json"
     assert by_role["dmg_copy_smoke"]["filename"] == "dmg-copy-smoke.json"
+    assert by_role["managed_runtime_source"]["filename"] == "managed-runtime-source.json"
     assert payload["core"]["registry_digest"] == "a" * 64
+    assert payload["managed_runtime"] == candidate._managed_runtime_manifest()
+    assert payload["managed_runtime"]["capability"] == {
+        "capture_mode": "transcript",
+        "execution_mode": "codex_subscription_transcript",
+        "harness_id": "codex",
+        "token_level_metrics_available": False,
+    }
+    assert "self-deployed" not in json.dumps(payload["managed_runtime"])
     descriptor = json.loads(
         (tmp_path / "core-install-artifact.json").read_text(encoding="utf-8")
     )
@@ -324,6 +370,71 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         "python_requires": ">=3.11",
         "supported_platforms": ["linux-x86_64"],
     }
+
+
+def test_managed_runtime_source_binds_draft_asset_and_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _load_module()
+    verifier = _load_runtime_asset_module()
+    assert candidate._managed_runtime_source_evidence() == (verifier.expected_source_evidence())
+    archive = tmp_path / verifier.MANAGED_RUNTIME_ARCHIVE_RELEASE.filename
+    archive.write_bytes(b"managed subscription runtime")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    release = dataclasses.replace(
+        verifier.MANAGED_RUNTIME_ARCHIVE_RELEASE,
+        byte_size=archive.stat().st_size,
+        sha256=digest,
+        asset_api_digest=f"sha256:{digest}",
+    )
+    monkeypatch.setattr(verifier, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    monkeypatch.setattr(
+        verifier,
+        "verify_managed_runtime_archive",
+        lambda *_args, **_kwargs: None,
+    )
+    asset = {
+        "digest": f"sha256:{digest}",
+        "id": release.asset_id,
+        "name": archive.name,
+        "size": archive.stat().st_size,
+        "state": "uploaded",
+    }
+    release_json = tmp_path / "release.json"
+    asset_json = tmp_path / "asset.json"
+    evidence = tmp_path / "managed-runtime-source.json"
+    _write_json(
+        release_json,
+        {
+            "assets": [asset],
+            "draft": True,
+            "id": release.asset_release_id,
+            "tag_name": release.asset_release_tag,
+        },
+    )
+    _write_json(asset_json, asset)
+
+    verifier.verify_release_asset(
+        release_json,
+        asset_json,
+        archive,
+        evidence,
+    )
+
+    assert json.loads(evidence.read_text(encoding="utf-8")) == (
+        verifier.expected_source_evidence()
+    )
+
+    asset["id"] = release.asset_id + 1
+    _write_json(asset_json, asset)
+    with pytest.raises(verifier.AssetVerificationError, match="release/asset API identity"):
+        verifier.verify_release_asset(
+            release_json,
+            asset_json,
+            archive,
+            tmp_path / "rejected.json",
+        )
 
 
 @pytest.mark.parametrize(
@@ -390,6 +501,25 @@ def test_candidate_manifest_rejects_post_manifest_asset_mutation(tmp_path: Path)
 
     errors = candidate.validate_candidate_manifest(manifest)
     assert any("digest mismatch" in error and paths["wheel"].name in error for error in errors)
+
+
+def test_candidate_manifest_rejects_managed_runtime_source_mutation(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    source = tmp_path / candidate.MANAGED_RUNTIME_SOURCE_NAME
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["asset"]["id"] += 1
+    _write_json(source, payload)
+
+    with pytest.raises(candidate.CandidateError, match="runtime source evidence"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="b" * 64,
+        )
 
 
 def test_candidate_manifest_rejects_false_universal_architecture(tmp_path: Path) -> None:
@@ -791,6 +921,11 @@ def _write_candidate_inputs(
         copied_smoke_evidence["mach_o"][binary]["slices"] = dmg_slices or ["arm64"]
     _write_json(root / "app-bundle-smoke.json", mounted_smoke_evidence)
     _write_json(root / "dmg-copy-smoke.json", copied_smoke_evidence)
+    candidate = _load_module()
+    _write_json(
+        root / candidate.MANAGED_RUNTIME_SOURCE_NAME,
+        candidate._managed_runtime_source_evidence(),
+    )
     return {"wheel": wheel, "framework_lock": framework_lock, "dmg": dmg}
 
 

@@ -128,6 +128,38 @@ jobs:
           echo "OPENEVO_RUST_TARGET=$triple" >> "$GITHUB_ENV"
           echo "OPENEVO_ARCHITECTURE=$architecture" >> "$GITHUB_ENV"
 
+      - name: Download and verify controlled managed subscription runtime asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME_RELEASE_ID: "354404740"
+          RUNTIME_ASSET_ID: "478167627"
+          RUNTIME_ASSET_NAME: openevo-science-runtime-0.1.0-linux-amd64.tar.gz
+          RUNTIME_ASSET_SIZE: "374592823"
+          RUNTIME_ASSET_SHA256: 7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a
+        run: |
+          runtime_dir="$RUNNER_TEMP/openevo-managed-runtime"
+          mkdir -m 700 "$runtime_dir"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RUNTIME_RELEASE_ID" \
+            > "$runtime_dir/release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$RUNTIME_ASSET_ID" \
+            > "$runtime_dir/asset.json"
+          runtime_archive="$runtime_dir/$RUNTIME_ASSET_NAME"
+          gh api -H "Accept: application/octet-stream" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$RUNTIME_ASSET_ID" \
+            > "$runtime_archive"
+          test "$(stat -f '%z' "$runtime_archive")" = "$RUNTIME_ASSET_SIZE"
+          printf '%s  %s\n' "$RUNTIME_ASSET_SHA256" "$runtime_archive" \
+            | shasum -a 256 --check -
+          chmod 600 "$runtime_archive"
+          uv run python scripts/ci/verify_managed_runtime_release_asset.py \
+            "$runtime_dir/release.json" \
+            "$runtime_dir/asset.json" \
+            "$runtime_archive" \
+            --evidence-out "$runtime_dir/managed-runtime-source.json"
+          echo "OPENEVO_MANAGED_RUNTIME_ARCHIVE=$runtime_archive" >> "$GITHUB_ENV"
+          echo "OPENEVO_MANAGED_RUNTIME_SOURCE=$runtime_dir/managed-runtime-source.json" \
+            >> "$GITHUB_ENV"
+
       - name: Test and build renderer
         working-directory: desktop
         run: |
@@ -171,7 +203,9 @@ jobs:
         working-directory: desktop
         run: |
           python packaging/build_sidecar.py \
-            --core-wheel-output-dir "$RUNNER_TEMP/openevo-candidate-core"
+            --core-wheel-output-dir "$RUNNER_TEMP/openevo-candidate-core" \
+            --managed-runtime-archive "$OPENEVO_MANAGED_RUNTIME_ARCHIVE" \
+            --release-build
           echo "OPENEVO_CANDIDATE_CORE=$RUNNER_TEMP/openevo-candidate-core" >> "$GITHUB_ENV"
           sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-${OPENEVO_RUST_TARGET}"
           test -x "$sidecar"
@@ -226,6 +260,8 @@ jobs:
             "candidate-artifacts/OpenEvo-Desktop-${OPENEVO_VERSION}-${OPENEVO_ARCHITECTURE}.dmg"
           cp "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl candidate-artifacts/
           cp "$OPENEVO_CANDIDATE_CORE/framework-lock.json" candidate-artifacts/
+          cp "$OPENEVO_MANAGED_RUNTIME_SOURCE" \
+            candidate-artifacts/managed-runtime-source.json
 
       - name: Mount, launch, copy, detach, and relaunch the exact DMG app
         run: |
@@ -241,6 +277,24 @@ jobs:
           mounted_app="$mount_dir/OpenEvo Desktop.app"
           copied_app="$copy_dir/OpenEvo Desktop.app"
           test -d "$mounted_app"
+          mounted_sidecar="$mounted_app/Contents/MacOS/openevo-desktop-sidecar"
+          test -x "$mounted_sidecar"
+          uv run python - "$mounted_sidecar" "$OPENEVO_MANAGED_RUNTIME_ARCHIVE" <<'PY'
+          import importlib.util
+          from pathlib import Path
+          import sys
+
+          builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+          spec = importlib.util.spec_from_file_location("openevo_candidate_sidecar", builder_path)
+          if spec is None or spec.loader is None:
+              raise SystemExit("Desktop sidecar packaging validator is unavailable")
+          builder = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(builder)
+          builder._validate_embedded_managed_runtime_archive(
+              Path(sys.argv[1]),
+              Path(sys.argv[2]),
+          )
+          PY
           uv run python scripts/ci/smoke_openevo_desktop_bundle.py \
             "$mounted_app" \
             --launch-origin mounted_dmg \
@@ -315,7 +369,7 @@ jobs:
   linux-core-candidate:
     name: Verify exact candidate Core bytes on Linux
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     needs: macos-candidate
     steps:
       - uses: actions/checkout@v4
@@ -361,6 +415,38 @@ jobs:
             --expected-source-commit "$GITHUB_SHA" \
             --expected-core-platform linux-x86_64
 
+      - name: Redownload and bind the same managed subscription runtime source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME_RELEASE_ID: "354404740"
+          RUNTIME_ASSET_ID: "478167627"
+          RUNTIME_ASSET_NAME: openevo-science-runtime-0.1.0-linux-amd64.tar.gz
+          RUNTIME_ASSET_SIZE: "374592823"
+          RUNTIME_ASSET_SHA256: 7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a
+        run: |
+          runtime_dir="$RUNNER_TEMP/openevo-managed-runtime-linux"
+          mkdir -m 700 "$runtime_dir"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RUNTIME_RELEASE_ID" \
+            > "$runtime_dir/release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$RUNTIME_ASSET_ID" \
+            > "$runtime_dir/asset.json"
+          runtime_archive="$runtime_dir/$RUNTIME_ASSET_NAME"
+          gh api -H "Accept: application/octet-stream" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$RUNTIME_ASSET_ID" \
+            > "$runtime_archive"
+          test "$(stat -c '%s' "$runtime_archive")" = "$RUNTIME_ASSET_SIZE"
+          printf '%s  %s\n' "$RUNTIME_ASSET_SHA256" "$runtime_archive" \
+            | sha256sum --check -
+          chmod 600 "$runtime_archive"
+          uv run python scripts/ci/verify_managed_runtime_release_asset.py \
+            "$runtime_dir/release.json" \
+            "$runtime_dir/asset.json" \
+            "$runtime_archive" \
+            --evidence-out "$runtime_dir/managed-runtime-source.json"
+          cmp candidate-artifacts/managed-runtime-source.json \
+            "$runtime_dir/managed-runtime-source.json"
+          echo "OPENEVO_LINUX_RUNTIME_ARCHIVE=$runtime_archive" >> "$GITHUB_ENV"
+
       - name: Smoke Linux migration and context projection from exact Core wheel
         run: |
           python -m venv "$RUNNER_TEMP/openevo-candidate-core"
@@ -389,6 +475,42 @@ jobs:
           if smoke["registry_digest"] != candidate["core"]["registry_digest"]:
               raise SystemExit("Linux registry digest differs from the candidate manifest")
           PY
+
+      - name: Exercise real Docker load identity rollback and subscription alias
+        run: |
+          set -euo pipefail
+          daemon_name="openevo-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker --host unix:///var/run/docker.sock rm -f "$daemon_name" \
+              >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker --host unix:///var/run/docker.sock run -d --privileged \
+            --name "$daemon_name" -p 127.0.0.1::2375 \
+            docker:29.3-dind --host=tcp://0.0.0.0:2375 --tls=false
+          daemon_address="$(
+            docker --host unix:///var/run/docker.sock port "$daemon_name" 2375/tcp
+          )"
+          export DOCKER_HOST="tcp://$daemon_address"
+          for attempt in $(seq 1 60); do
+            if docker version --format '{{.Server.Version}}' 2>/dev/null \
+              | grep -q '^29\.3\.'; then
+              break
+            fi
+            sleep 1
+          done
+          docker version --format '{{.Server.Version}}' | grep -q '^29\.3\.'
+          uv run python scripts/ci/smoke_managed_runtime_archive.py \
+            "$OPENEVO_LINUX_RUNTIME_ARCHIVE" \
+            --evidence-out managed-runtime-docker-evidence.json
+
+      - name: Retain real Docker managed runtime evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: openevo-managed-runtime-docker-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: managed-runtime-docker-evidence.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Smoke exact candidate Core service lifecycle
         run: |
@@ -433,18 +555,26 @@ jobs:
           port = service["port"]
           token = attachment["bearer_token"]
           opener = build_opener(ProxyHandler({}))
-          digests = set()
-          for mode in ("codex_subscription_transcript", "self-deployed"):
-              request = Request(
-                  f"http://127.0.0.1:{port}/v1/capabilities?"
-                  + urlencode({"execution_mode": mode}),
-                  headers={"Authorization": f"Bearer {token}"},
-              )
-              with opener.open(request, timeout=10) as response:
-                  payload = json.load(response)
-              digests.add(payload["registry_digest"])
-          if len(digests) != 1:
-              raise SystemExit("candidate Core release modes returned different registries")
+          request = Request(
+              f"http://127.0.0.1:{port}/v1/capabilities?"
+              + urlencode({"execution_mode": "codex_subscription_transcript"}),
+              headers={"Authorization": f"Bearer {token}"},
+          )
+          with opener.open(request, timeout=10) as response:
+              payload = json.load(response)
+          profile = payload.get("evaluated_profile")
+          if not isinstance(payload.get("registry_digest"), str):
+              raise SystemExit("candidate subscription registry identity is unavailable")
+          if not isinstance(profile, dict) or {
+              "execution_mode": profile.get("execution_mode"),
+              "capture_mode": profile.get("capture_mode"),
+              "harness_id": profile.get("harness_id"),
+          } != {
+              "execution_mode": "subscription",
+              "capture_mode": "transcript",
+              "harness_id": "codex",
+          }:
+              raise SystemExit("candidate subscription capability profile is invalid")
           PY
 
   draft-prerelease-roundtrip:

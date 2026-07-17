@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import errno
 import importlib.util
 import hashlib
@@ -146,6 +147,141 @@ def test_core_framework_lock_is_canonical_and_bound_to_exact_wheel(tmp_path: Pat
         ).model_dump(mode="json")
         == expected
     )
+
+
+def test_managed_runtime_archive_contract_is_exact_and_rejects_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    release = builder.MANAGED_RUNTIME_ARCHIVE_RELEASE
+    assert release.filename == ("openevo-science-runtime-0.1.0-linux-amd64.tar.gz")
+    assert release.byte_size == 374_592_823
+    assert release.sha256 == ("7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a")
+    archive = tmp_path / release.filename
+    archive.write_bytes(b"managed subscription runtime")
+    archive.chmod(0o600)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    release = dataclasses.replace(
+        release,
+        byte_size=archive.stat().st_size,
+        sha256=digest,
+        asset_api_digest=f"sha256:{digest}",
+    )
+    monkeypatch.setattr(builder, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    calls: list[tuple[Path, object]] = []
+
+    def verify(path: Path, *, release: object) -> None:
+        calls.append((path, release))
+
+    monkeypatch.setattr(builder, "verify_managed_runtime_archive", verify)
+
+    assert builder._validate_managed_runtime_archive(archive) == (
+        archive.stat().st_size,
+        digest,
+    )
+    assert calls == [(archive, release)]
+
+    monkeypatch.setattr(
+        builder,
+        "verify_managed_runtime_archive",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("tampered")),
+    )
+    with pytest.raises(RuntimeError, match="managed runtime archive"):
+        builder._validate_managed_runtime_archive(archive)
+
+
+def test_release_build_requires_managed_runtime_before_cleaning_owned_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    marker = repo / "desktop/packaging/sidecar-dist/keep"
+    marker.parent.mkdir()
+    marker.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(builder, "_repo_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="release sidecar build requires"):
+        builder.build_sidecar(clean=True, release_build=True)
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_release_cli_passes_explicit_runtime_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    archive = tmp_path / builder.MANAGED_RUNTIME_ARCHIVE_RELEASE.filename
+    output = tmp_path / "core"
+    target = tmp_path / "sidecar"
+    captured: dict[str, object] = {}
+
+    def fake_build_sidecar(**kwargs: object) -> Path:
+        captured.update(kwargs)
+        return target
+
+    monkeypatch.setattr(builder, "build_sidecar", fake_build_sidecar)
+
+    assert (
+        builder.main(
+            [
+                "--release-build",
+                "--managed-runtime-archive",
+                str(archive),
+                "--core-wheel-output-dir",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "clean": True,
+        "core_wheel_output_dir": output,
+        "managed_runtime_archive": archive,
+        "release_build": True,
+    }
+
+
+def test_embedded_managed_runtime_archive_is_closed_and_source_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"sidecar")
+    release = builder.MANAGED_RUNTIME_ARCHIVE_RELEASE
+    archive = tmp_path / release.filename
+    archive.write_bytes(b"managed subscription runtime")
+    archive.chmod(0o600)
+    identity = (archive.stat().st_size, hashlib.sha256(archive.read_bytes()).hexdigest())
+    release = dataclasses.replace(
+        release,
+        byte_size=identity[0],
+        sha256=identity[1],
+        asset_api_digest=f"sha256:{identity[1]}",
+    )
+    monkeypatch.setattr(builder, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    monkeypatch.setattr(builder, "verify_managed_runtime_archive", lambda *_args, **_kwargs: None)
+    member = (builder.MANAGED_RUNTIME_ARCHIVE_ROOT / release.filename).as_posix()
+    monkeypatch.setattr(builder, "_archive_member_names", lambda _: (member,))
+    monkeypatch.setattr(
+        builder,
+        "_archive_member_digest",
+        lambda *_args, **_kwargs: identity,
+    )
+
+    builder._validate_embedded_managed_runtime_archive(executable, archive)
+
+    monkeypatch.setattr(
+        builder,
+        "_archive_member_names",
+        lambda _: (member, f"{builder.MANAGED_RUNTIME_ARCHIVE_ROOT}/stale.tar.gz"),
+    )
+    with pytest.raises(RuntimeError, match="exact managed runtime archive"):
+        builder._validate_embedded_managed_runtime_archive(executable, archive)
 
 
 def test_core_wheel_and_lock_build_are_reproducible(tmp_path: Path) -> None:
@@ -327,10 +463,12 @@ def test_sidecar_archive_product_web_matches_audited_build_and_rejects_tampering
 
 
 @pytest.mark.parametrize("clean", [False, True])
+@pytest.mark.parametrize("release_build", [False, True])
 def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     clean: bool,
+    release_build: bool,
 ) -> None:
     builder = _load_builder()
     repo = tmp_path / "repo"
@@ -343,6 +481,9 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     (generic_build / "user-output.txt").write_text("keep", encoding="utf-8")
     (repo / "src/openevo/openevo.egg-info").mkdir()
     (repo / "src/openevo/openevo.egg-info/PKG-INFO").write_text("stale", encoding="utf-8")
+    runtime_archive = repo / builder.MANAGED_RUNTIME_ARCHIVE_RELEASE.filename
+    runtime_archive.write_bytes(b"managed subscription runtime")
+    runtime_archive.chmod(0o600)
     commands: list[str] = []
     embedded_wheel: Path | None = None
     embedded_bytes: bytes | None = None
@@ -403,6 +544,18 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
             assert embedded_lock.is_file()
             embedded_lock_bytes = embedded_lock.read_bytes()
             assert wheel_destination == lock_destination == "openevo/wheels"
+            runtime_data = [
+                (Path(source_value), destination)
+                for source_value, destination in (
+                    value.rsplit(os.pathsep, 1) for value in add_data
+                )
+                if destination == "openevo/runtime-assets"
+            ]
+            assert runtime_data == (
+                [(runtime_archive, "openevo/runtime-assets")]
+                if release_build
+                else []
+            )
             assert not any(
                 command[index : index + 2] == ["--collect-data", "openevo"]
                 for index in range(len(command) - 1)
@@ -422,6 +575,12 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         lambda *_: pyinstaller_root,
     )
     monkeypatch.setattr(builder, "_validate_fd_bound_bootloader", lambda _: None)
+    monkeypatch.setattr(builder, "_validate_managed_runtime_archive", lambda _: None)
+    monkeypatch.setattr(
+        builder,
+        "_validate_embedded_managed_runtime_archive",
+        lambda *_: None,
+    )
     monkeypatch.setattr(builder.subprocess, "run", fake_run)
     monkeypatch.setattr(
         builder,
@@ -457,6 +616,8 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     target = builder.build_sidecar(
         clean=clean,
         core_wheel_output_dir=wheel_output,
+        managed_runtime_archive=runtime_archive if release_build else None,
+        release_build=release_build,
     )
 
     assert commands == ["build", "product-web", "PyInstaller"]
