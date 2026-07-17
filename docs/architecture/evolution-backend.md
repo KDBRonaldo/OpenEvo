@@ -252,6 +252,10 @@ mode、registered execution snapshot、materialized context 和 artifact set；�
 task 终结后保留 pin 供 audit；active admission count 是后续 serving drain 的 lease primitive。若 successor
 activation 后在 retry 前重启，startup 接受 `active_generation == required_generation` 的未 pin queued row；
 retry 重新执行 exact match 后原子 pin，不在 startup 猜测 admission。
+这里的 durable `queued` row 只是尚未接入产品 run owner 的 Store 内部 primitive，不是
+Desktop/Daemon 的公开 Task 状态。目标产品必须在 successor 尚未激活时返回 typed
+not-ready，并且不创建 Task、admission 或 run；资源/服务调度队列只允许出现在 Task 已经
+固定当前 Project Head 之后。
 未 pin `cancelled` 是 closed historical audit row；它继续验证完整 request sources、terminal record 和 no-pin
 语义，但 head 推进后不再与当前 active generation 建立相邻关系。Pinned `cancelled` 继续验证其原 revision、
 materialization 和 execution snapshot closure，但原 pin 不必仍为 active head。

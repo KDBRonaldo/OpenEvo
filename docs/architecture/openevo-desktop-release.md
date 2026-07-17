@@ -7,7 +7,10 @@
 
 The canonical release requirements live in
 `docs/maintainer/productization/spec.md`. This document defines the packaging
-boundary that workstream C3/D3 must implement.
+implementation and its current unsigned draft rehearsal. Wherever this document
+describes a Core wheel or `core-install-artifact.json`, it records the current
+rehearsal only; those assets are not the canonical Daemon Bundle and cannot
+satisfy the External Beta clean-host or release-consistency gates.
 
 ## Product Boundary
 
@@ -16,12 +19,12 @@ OpenEvo Desktop is the ordinary-user macOS application. Its package combines:
 - the React/Vite user interface;
 - the Tauri/Rust native host;
 - the bundled local sidecar;
-- the descriptor-matched OpenEvo Core install artifact used for remote
-  bootstrap.
+- the manifest-matched OpenEvo Daemon Bundle, or a verifier that can obtain only
+  those exact release-manifest-bound bytes for remote bootstrap.
 
 The browser-served Vite build is a development and CI surface, not the released
-application. The Core wheel is a remote backend artifact, not a second desktop
-application.
+application. The current embedded Core wheel is an interim packaging input, not
+the final Daemon Bundle or a second desktop application.
 
 ## Current Implementation
 
@@ -834,10 +837,10 @@ macOS candidate artifact. Remote-smoke cleanup is conditional on the exact
 attachment generation and release identity still matching under the Core
 supervisor locks, so a replacement service cannot be stopped by stale cleanup.
 
-## External Beta Artifacts
+## Current Draft Rehearsal Artifacts
 
-The implemented release workflow must produce, from one reviewed `stable`
-commit:
+The implemented packaging-only workflow currently produces, from one reviewed
+`stable` commit:
 
 - `OpenEvo-Desktop-<version>-<aarch64|x64>.dmg` for the architecture actually
   built by the current runner; no universal claim is made;
@@ -854,7 +857,9 @@ commit:
 - release notes and the dependency/security evidence required by the canonical
   spec.
 
-PyPI is not part of the External Beta release.
+PyPI is not part of the External Beta release. This rehearsal inventory is not
+the final release inventory; the canonical inventory replaces the wheel and
+descriptor with the exact Daemon Bundle and release manifest.
 
 The dependency/security summaries, Core descriptor, and release candidate
 manifest use version 2. Native smoke evidence uses version 3 to bind its launch
@@ -896,7 +901,7 @@ clean/no-clean contract. The final target-triple externalBin is published from a
 verified sibling staging file with atomic replacement, so a failed replacement
 does not remove or partially overwrite the previously built target.
 
-## Release Build Sequence
+## Current Rehearsal Build Sequence
 
 The replacement workflow must:
 
@@ -933,7 +938,7 @@ never deletes a Git tag and fails unless a same-name tag is absent. It
 deliberately leaves
 a successful candidate as an unsigned draft prerelease; a maintainer cannot use
 that result to bypass the still-pending science, benchmark, privacy, review,
-signing, or notarization gates.
+unsigned-launch, or final publication gates.
 
 The GitHub draft is administratively mutable; it is not an immutable publication
 authority. Validation describes individual GitHub API reads, not an atomic
@@ -957,26 +962,31 @@ The current packaging-only candidate launches a copied app without simulating
 browser-download quarantine. It therefore records the Privacy & Security allow
 flow as pending and does not satisfy that final Gatekeeper requirement.
 
-## Blocking Validation
+## Current Rehearsal Validation
 
-Release evidence must cover:
+This workflow's packaging evidence covers:
 
-- supported architecture and minimum macOS version;
+- the runner architecture used by this rehearsal;
 - exact Mach-O slices for both the Tauri executable and sidecar in the app
   inside the mounted candidate DMG and in its detached copy;
 - symlink-rejecting app/`Info.plist`/binary paths plus stable pre/post binary
   identity and SHA256 across each native launch;
+- real renderer/product readiness for the mounted app and detached copy;
 - Core Python/platform compatibility and a Linux verifier selected from the
   descriptor's closed supported-platform list;
-- sidecar start, crash recovery, tunnel loss, quit, and relaunch;
-- first-run bootstrap against the exact Core descriptor;
-- the ordinary science flow without CLI use;
-- no-default-telemetry and secret-canary checks;
-- mounted/copy launch and supported window-size/accessibility checks;
+- packaged sidecar startup and bounded process-group cleanup;
+- clean installation and service smoke of the exact interim Core wheel;
 - artifact inventory, SHA256, source commit, and release-note consistency;
+- non-public draft upload, clean redownload, and point-in-time metadata/asset
+  roundtrip;
 - third-party-only Python export/report equality and vulnerability audits with
   no ignored advisories; the Rust audit tool must parse the current RustSec
   database or the evidence collector fails closed.
+
+It does not prove remote first-run bootstrap, tunnel-loss recovery, an ordinary
+science task, secret-canary/privacy behavior, the complete macOS/window/
+accessibility matrix, or any final G1-G12 verdict. Those remain canonical
+External Beta gates and require the final Daemon Bundle candidate.
 
 Local source checks remain useful during implementation:
 

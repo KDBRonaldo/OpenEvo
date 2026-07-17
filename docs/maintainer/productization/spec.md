@@ -66,19 +66,18 @@ OpenEvo Desktop Client
        | SSH bootstrap and authenticated private tunnel
        v
 Linux server
-OpenEvo Daemon
+OpenEvo Daemon (assembled from `src/openevo/` Core)
 |- versioned control API
 |- project, task, run, and revision owner
 |- gateway, rollout, evolution, and worker services
 |- Codex harness runtimes
 `- managed vLLM deployment when self-deployed
-       |
-       v
-OpenEvo Core implementation
 ```
 
 `src/openevo/` is the shared Core implementation used by the Daemon. Core is
-not a third application that ordinary users install or operate separately.
+not a third application that ordinary users install or operate separately. The
+Daemon is the deployable application and composition root around Core; it does
+not duplicate Core execution or evolution behavior.
 
 The Desktop sidecar is a client-internal transport and state-projection
 component. It is not a business backend. It MUST NOT own canonical project,
@@ -91,7 +90,7 @@ The repository dependency direction is:
 
 ```text
 Desktop Client -> versioned Daemon contracts
-OpenEvo Daemon -> Core implementation
+OpenEvo Daemon application -> Core implementation
 benchmark automation -> Core or Daemon contracts
 Core -> neither Desktop nor benchmark automation
 ```
@@ -122,11 +121,18 @@ The ordinary-user product uses a small, stable vocabulary:
 - **Evolution Method**: the selected algorithm that updates one target.
 - **Evolution Revision**: an immutable set of evolution artifacts used by one
   or more tasks.
-- **Project Head**: the workspace snapshot, evolution revision, and verified
-  effective execution snapshot that the next workspace draft is based on. A
-  submitted task uses a sealed snapshot derived from that base and the exact
-  effective execution snapshot in the head. The head advances as one auditable
-  transition and never rewinds.
+- **Runtime Context Snapshot**: the content-addressed, verified materialization
+  of an Evolution Revision for a specific registry and runtime contract. Its
+  single identity covers the complete manifest, instructions, staged payloads,
+  and integrity digests consumed by a task.
+- **Project Head** or **Head Revision**: the workspace snapshot, Evolution
+  Revision, Runtime Context Snapshot, and verified effective execution snapshot
+  that the next workspace draft is based on. A submitted task pins those exact
+  identities. The head advances as one auditable transition and never rewinds.
+
+Wire contracts MUST use distinct opaque identity types for Head Revisions and
+Evolution Revisions. A generic `revision` field whose meaning depends on context
+is not a stable contract.
 
 Worker leases, registry digests, datasets, materialization handles, internal
 job IDs, and service process IDs are diagnostic concepts. They are not primary
@@ -154,17 +160,44 @@ the release gates.
 Each manifest lists exact tested operating-system versions. Claiming one macOS
 or Ubuntu version does not imply support for a newer point or major release.
 
+The release manifest contains a finite closed clean-host matrix. Each row has a
+stable ID and binds an exact macOS build, fresh remote-user/host profile, SSH
+authentication form, network/proxy profile, execution mode/model profile,
+initial-state assertions, and reset provenance. The rows provide declared
+pairwise coverage rather than an implicit full Cartesian product, while every
+supported operating system, authentication form, network profile, execution
+mode, and model profile appears in at least one row. A candidate cannot omit or
+add a row without changing the manifest identity. Each row is assigned to
+exactly G3 or G4 and becomes an expected case ID; every row must produce exactly
+one indexed, non-simulated result.
+
+Every clean-host row also binds machine-controlled phase deadlines, an overall
+deadline, maximum automatic retry counts, interruption/resume accounting, and
+the terminal state expected on timeout. An interactive subscription-login wait
+uses a separately declared user-action window; once the user completes or
+cancels that action, the next machine-controlled deadline resumes. A test
+cannot wait indefinitely or hide repeated attempts inside one result record.
+
+The matrix MUST include at least one G3 row and one G4 row using the mandatory
+`cn-mainland-restricted-v1` profile. This is a reproducible firewall-like
+profile that denies declared direct routes to the Codex service and
+release-managed download endpoints, then requires the configured proxy,
+Hugging Face endpoint, and container mirror paths to succeed where applicable.
+It validates the product's remote proxy/mirror behavior for users in restricted
+networks; it does not claim universal availability across every mainland China
+carrier, proxy provider, or changing third-party service policy.
+
 Both execution modes require a release-supported Docker Engine API available to
 the remote user. Self-Deployed additionally requires a compatible NVIDIA
 driver, NVIDIA Container Toolkit, sufficient VRAM, and sufficient model
 storage. Each release carries a versioned host profile with the exact Docker,
 driver/CUDA, VRAM, memory, disk, and model constraints enforced by preflight.
 
-The release MUST preserve the established Core responsibility and data flow
-across gateway, rollout, runtime, capture, trajectory, evolution backend,
-worker, artifact, context resolution, and runtime injection. Productization
-may reorganize paths, packaging, imports, adapters, and public interfaces, but
-MUST NOT redesign or replace the validated evolution algorithms.
+The release MUST preserve the established Core execution/evolution data path and
+validated evolution algorithms. Productization may reorganize paths, packaging,
+imports, adapters, and public interfaces, but it cannot bypass or replace that
+architecture. The exact module chain is maintained in architecture
+documentation rather than duplicated here.
 
 Runtime and data identity use only:
 
@@ -185,11 +218,12 @@ The complete workflow is:
 ```text
 install and open the DMG
 -> add a remote server
+-> configure optional remote proxy and mirror settings
 -> verify the SSH host identity
 -> run preflight and install or attach the Daemon
--> configure project execution settings
--> prepare Codex or a self-deployed model
 -> create a research project
+-> configure project execution settings
+-> prepare Codex or the selected self-deployed model
 -> upload research inputs
 -> configure enabled evolution targets and methods
 -> run and monitor a task
@@ -278,13 +312,14 @@ contains references, not secret values.
 The first-run flow MUST remain inside Desktop:
 
 ```text
-server address and SSH identity
+server address, SSH identity, and optional remote network settings
 -> host-key confirmation
 -> remote preflight
 -> Daemon installation or attachment
--> execution-mode setup
--> service readiness
 -> first project
+-> project execution-mode selection
+-> required Codex login or model preparation
+-> service readiness
 ```
 
 Supported SSH authentication methods are:
@@ -298,8 +333,8 @@ accepts the new identity. Desktop MUST NOT silently replace a pinned host key.
 
 Remote network settings include:
 
-- HTTP proxy;
-- HTTPS proxy;
+- HTTP proxy endpoint or host/port;
+- HTTPS proxy endpoint or host/port;
 - `NO_PROXY`;
 - optional proxy authentication;
 - optional Hugging Face endpoint;
@@ -337,8 +372,8 @@ The Task view provides:
 - input file and directory attachments;
 - the project's saved execution settings;
 - the project head and evolution revision that the run will use;
-- run, cancel, infrastructure-retry, and run-again actions with their distinct
-  task semantics;
+- run, cancel attempt, close incomplete task, infrastructure-retry, and
+  run-again actions with their distinct task semantics;
 - live progress, transcript, tool activity, and result;
 - files created or modified by the harness;
 - download and local reveal actions.
@@ -351,6 +386,7 @@ Preparing
 Running
 Finalizing
 Evolving
+Waiting for next head
 Ready for next task
 Needs attention
 Cancelled
@@ -360,10 +396,12 @@ Technical service names and stack traces are hidden by default but available in
 an explicit technical-details view.
 
 The user MAY prepare a draft for the next task while a run or evolution is in
-progress. During that interval the draft is limited to local task text and
-non-file form values; remote workspace uploads and mutations wait for the new
-head. Desktop MUST NOT start the task until the required project head is ready
-or the user has explicitly resolved a failed evolution transition.
+progress. During that interval the draft is limited to task text and non-file
+form values stored locally by Desktop; remote workspace uploads and mutations
+wait for the new head. Submission before that head commits fails with a typed
+not-ready response and creates no Task, admission, or run. A failed transition
+leaves the draft intact while the user chooses retry, repair, or abandon; it
+never falls back to the prior head.
 
 ### 7.6 Evolution View
 
@@ -402,11 +440,21 @@ The Files view supports:
 
 - file and directory upload;
 - progress, cancellation, safe retry, and digest verification;
+- replacement/overwrite, rename, move, and delete with explicit confirmation;
 - browsing project inputs, task outputs, and evolution artifacts;
 - safe preview of supported text, Markdown, JSON, image, and tabular formats;
-- single-file download and directory export.
+- single-file download and directory export;
+- a research provenance export containing an integrity manifest, project
+  configuration, task and attempt metadata, artifact lineage, and user-selected
+  research inputs and outputs without secrets or internal service state;
+- a complete restorable project backup as defined by the data-lifecycle
+  contract.
 
 Internal OpenEvo state is not editable through the file browser.
+The release does not include a general code or text editor. Replace, rename,
+move, and delete operations create a staged workspace draft against an expected
+Project Head; they do not mutate an admitted Task. A head change invalidates an
+incompatible staged operation visibly.
 
 The History view is task-oriented:
 
@@ -424,6 +472,17 @@ requires the Daemon to create a new audited successor of the current project
 head; Desktop MUST NOT rewind the head or assemble an unvalidated runtime
 context locally.
 
+History lets the user open and export the task input, each attempt and
+transcript, workspace input/result snapshots, Evolution Revision, Runtime
+Context metadata, artifacts, and lineage. Before restore, Desktop previews the
+selected historical workspace, evolution state, or both, identifies inherited
+current components, and requires confirmation.
+
+The External Beta provides explicit project backup and restore, not continuous
+remote backup. Desktop shows remote project and cache storage use. Server-level
+disaster recovery outside those project backups remains the server owner's
+responsibility and is documented.
+
 ### 7.8 System And Recovery
 
 The System view includes:
@@ -436,7 +495,9 @@ The System view includes:
 - GPU, VRAM, memory, disk, and project-storage status;
 - retry, doctor, repair, restart, update, and rollback actions where allowed;
 - redacted diagnostics export;
-- project deletion, cache cleanup, and Daemon uninstall.
+- clearly separated actions named **Remove Server From This Mac**, **Delete
+  Project From Server**, **Clean Shared Caches**, and **Uninstall OpenEvo
+  Daemon**, each with an impact preview.
 
 It is not a developer console. Desktop MUST NOT expose an arbitrary remote
 shell, Python console, benchmark runner, worker lease editor, or internal
@@ -520,19 +581,10 @@ source checkout.
 
 ### 8.4 Installation
 
-Installation is an idempotent, journaled state machine:
-
-```text
-preflight
--> stage exact bundle
--> verify release identity and digest
--> install immutable generation
--> verify Core and registry inventory
--> start candidate Daemon
--> run readiness checks
--> atomically activate generation
--> retain previous working generation
-```
+Installation is idempotent and recoverable. It exposes preflight, transfer,
+verification, candidate startup, readiness, and activation progress. Only an
+exact verified immutable generation that passes readiness may become active,
+and activation preserves the previous working generation for rollback.
 
 The transfer path MUST work over standard SSH/SFTP and MUST NOT require
 `rsync`, Python, or a package manager on the server.
@@ -541,22 +593,16 @@ An interrupted or repeated installation resumes safely or restarts from a
 clean staging area. An unverified generation never becomes active. A failed
 candidate never replaces a working Daemon.
 
+Concurrent Desktop clients, reconnecting installers, and stale upgrade
+operations MUST be fenced at the remote-user installation boundary. Their
+observable result is one active generation and one Daemon writer; a stale
+operation cannot activate after a newer operation has won.
+
 ### 8.5 Process And Service Model
 
 The Daemon is the single writer for its managed state and the supervisor for
-its child processes:
-
-```text
-OpenEvo Daemon
-|- control API and operation manager
-|- project/run/revision owner
-|- gateway
-|- rollout
-|- evolution backend
-|- evolution workers
-|- optional vLLM deployment
-`- managed task runtimes containing Codex
-```
+the Gateway, rollout, evolution, worker, optional vLLM, and managed Codex task
+runtime services required by the active projects.
 
 Child services use these externally observable states:
 
@@ -591,8 +637,9 @@ Desktop negotiates protocol and release compatibility before mutation.
 - A missing Daemon is installed from the Desktop-matched bundle.
 - An older compatible Daemon MAY remain attached while active work completes.
 - An idle older Daemon MAY be upgraded automatically according to user policy.
-- An incompatible upgrade MUST wait for active work or require an explicit
-  cancellation decision.
+- An incompatible older Daemon MUST remain active until its work is quiescent;
+  cancelling that work requires a compatible Desktop/Daemon control session,
+  not a lifecycle-script shortcut.
 - Desktop MUST NOT silently downgrade a newer Daemon.
 - An incompatible pairing is read-only where safely possible and otherwise
   blocked with a typed update action.
@@ -602,6 +649,22 @@ needed for recovery, performs required migrations, and proves readiness before
 activation. Candidate or migration failure restores the previous working
 generation and leaves project data, artifacts, model caches, and Codex
 authentication intact.
+
+Activation has an explicit rollback barrier. Before the new generation accepts
+any incompatible business-state mutation, candidate or migration failure may
+atomically restore the old generation and metadata. After the new generation
+accepts its first such mutation, including a new Project Head or Runtime Context,
+automatic rollback to an older reader is forbidden unless the release profile
+proves backward-readable state and lossless reverse migration. Otherwise
+recovery proceeds forward with the new generation or a corrected successor; the
+retained old bytes are not advertised as an activatable rollback.
+
+Every release generation implements a small manifest-bound maintenance protocol
+that remains compatible across the declared upgrade range. It exposes only
+release identity, quiescent-or-active status, generation staging, candidate
+readiness, activation, and rollback. It cannot inspect or mutate project
+business state. This protocol lets Desktop safely defer or perform an upgrade
+even when the full control APIs are not mutation-compatible.
 
 ### 8.7 Automated Preparation
 
@@ -713,9 +776,10 @@ insufficient.
 ### 9.2 Self-Deployed
 
 For a release-supported Self-Deployed project, the user selects a
-manifest-bound Hugging Face model profile. The Daemon:
+manifest-bound Hugging Face model profile containing an exact model ID and
+commit. The Daemon:
 
-1. resolves a mutable branch or tag to an exact commit;
+1. verifies the exact model identity and revision from the profile;
 2. checks model architecture, storage, VRAM, context, and serving
    compatibility;
 3. downloads and verifies the exact snapshot;
@@ -728,10 +792,10 @@ operation. They are not injected into Codex or the task runtime.
 
 The release manifest identifies at least one fully validated model profile,
 including exact model revision, vLLM image, serving arguments, hardware floor,
-context limit, and compatibility range. Desktop MAY offer an explicitly
-experimental custom Hugging Face model ID and revision, but that path is not a
-release-supported profile, cannot contribute release evidence, and never
-inherits compatibility claims from a static preflight result.
+context limit, and compatibility range. Additional model profiles become
+release-supported only when they are manifest-bound and pass the same clean-host
+and execution gates. An arbitrary unvalidated model ID is not part of the
+External Beta contract.
 
 Model deployments are server resources referenced by projects. The Daemon MAY
 maintain multiple model configurations, but it MUST serialize or reject
@@ -750,17 +814,24 @@ support.
 
 ### 10.1 Transport Boundary
 
-Before a healthy Daemon exists, Desktop uses SSH only for:
+Before a healthy compatible Daemon session exists, Desktop uses SSH only for:
 
 - host inspection;
 - bundle staging and installation;
 - unique Daemon ensure or attachment;
 - private tunnel establishment;
-- recovery when the control API cannot start.
+- invocation of the manifest-bound maintenance protocol when the control API
+  cannot start or is not mutation-compatible.
 
-After the Daemon is healthy, all project, task, file, service, model, evolution,
-artifact, and data-management operations use the versioned Daemon API. Desktop
-MUST NOT fall back to ad hoc SSH business commands when an API request fails.
+This SSH lifecycle path may inspect release/quiescence status, ensure, stage,
+start, activate, or roll back a Daemon generation. It MUST NOT read or mutate
+project, task, run, revision, artifact, database, or model-service business
+state.
+
+After the Daemon is healthy and a compatible control session is negotiated, all
+project, task, file, service, model, evolution, artifact, and data-management
+operations use the versioned Daemon API. Desktop MUST NOT fall back to ad hoc
+SSH business commands when an API request fails.
 
 The Daemon binds its API to remote loopback only. Desktop reaches it through an
 authenticated private SSH tunnel and verifies the remote release identity.
@@ -778,8 +849,9 @@ The API provides versioned resources for:
 - **Capabilities**: targets, methods, schemas, defaults, and support reasons;
 - **Tasks and Runs**: admission, attempts, cancellation, retry, and results;
 - **Events**: replayable timelines and logs;
-- **Project Heads And Revisions**: immutable workspace/evolution composition
-  and historical execution context;
+- **Project Heads**: immutable workspace, Evolution Revision, Runtime Context
+  Snapshot, and effective execution composition;
+- **Evolution Revisions**: immutable target artifact sets and lineage;
 - **Artifacts**: safe metadata, content, renderer payloads, diffs, and lineage;
 - **Services**: Codex, Gateway, worker, runtime, and model health;
 - **Diagnostics and Data Management**: doctor, repair, export, cleanup, delete,
@@ -790,7 +862,20 @@ resource semantics are product requirements.
 
 ### 10.3 API Behavior
 
-The contract MUST provide:
+Before any mutation, the active tunnel session negotiates and pins:
+
+- API major version and request/response schema identity;
+- event schema identity;
+- Desktop and Daemon release/build identities and compatibility ranges;
+- enabled feature set;
+- verified evolution registry identity and availability.
+
+If any pinned identity changes, mutations fail closed until Desktop reconnects
+and negotiates a new session. A compatible older Daemon or read-only newer
+Daemon is usable only when this predicate explicitly allows the requested
+operation.
+
+The contract MUST also provide:
 
 - version negotiation before mutation;
 - idempotency keys for mutations;
@@ -803,6 +888,10 @@ The contract MUST provide:
 - redacted, write-only secret inputs;
 - optimistic or explicit concurrency control for saved project changes.
 
+Multiple Desktop clients MAY observe the same Daemon. The Daemon serializes
+authoritative mutations, rejects stale expected identities, and never lets a
+client's local cache overwrite newer remote state.
+
 The Daemon is the authority. Desktop MUST NOT infer success from SSH process
 output, use a local method table, rebuild capabilities from bundled code, or
 substitute stale cache when the remote contract fails.
@@ -814,12 +903,27 @@ submitting a task. The Daemon validates it against server readiness and the
 same verified capability registry that will execute it.
 
 When desired execution settings differ from the active head, the Daemon first
-resolves and proves a new effective snapshot, validates active artifacts
-against it, and commits a settings-only successor head that inherits the
-workspace and evolution revision. This transition is allowed only when no task
-or other head transition is in flight. A task cannot override mode, model
-deployment, or network policy; it uses the exact effective snapshot in its
-predecessor head.
+resolves and proves a new effective snapshot, validates and materializes active
+artifacts against it, and commits a settings-only successor head that inherits
+the workspace and Evolution Revision while binding the newly verified Runtime
+Context Snapshot. This transition is allowed only when no task or other head
+transition is in flight. A task cannot override mode, model deployment, or
+network policy; it uses the exact effective snapshot in its predecessor head.
+
+When a verified Daemon upgrade changes the registry or runtime-consumption
+contract without changing project settings, a context-rebind successor inherits
+the exact workspace, Evolution Revision, and effective execution snapshot while
+producing a new Runtime Context Snapshot. Until that successor commits, the
+project is visibly not ready for task submission. An artifact no longer accepted
+by the new registry blocks rebind with a typed repair action.
+
+Settings-only and context-rebind successors publish no partial state. Failure or
+cancellation leaves the prior Project Head and staged workspace draft unchanged
+and permits an exact retry. Because both successors inherit the identical
+workspace snapshot, successful commit atomically rebinds a staged workspace
+draft when its expected workspace identity still matches. Otherwise the draft
+is invalidated and must be restaged; a client never guesses that rebinding is
+safe.
 
 Admission also verifies that every active evolution artifact is compatible with
 the effective harness, model, runtime, and capture settings. An incompatible
@@ -834,6 +938,7 @@ content-addressed project configuration
 closed task envelope
 workspace-input snapshot
 active evolution revision
+content-addressed runtime-context snapshot
 verified effective execution snapshot for harness, capture, model, runtime,
 serving, and task-network policy
 verified registry and normalized initial evolution intent
@@ -845,15 +950,17 @@ for that task references the same admission record.
 
 Every attempt produces an immutable execution receipt binding the admission
 identity to the actual predecessor head, workspace, harness, capture, model,
-runtime, serving, network-policy, and service-attestation identities it used.
-An attempt cannot become authoritative unless the receipt exactly satisfies
-the closed admission.
+runtime context, runtime, serving, network-policy, and service-attestation
+identities it used. An attempt cannot become authoritative unless the receipt
+exactly satisfies the closed admission.
 
 ### 10.5 Task, Attempt, Workspace, And Head State
 
-A project has one linear active head. It MAY have one submitted task or one
-successor transition in flight at a time; different projects MAY run
-concurrently. The release does not expose project-head branches.
+A project has one linear active head. It MAY have one admitted Task or one
+successor transition in flight at a time. A next Task Draft may exist locally,
+but submission remains not-ready until the transition resolves. Different
+projects MAY run concurrently. The release does not expose project-head
+branches.
 
 Task and workspace state advance as follows:
 
@@ -880,12 +987,23 @@ for a new task and leaves the predecessor head unchanged. A cancellation racing
 with completion is resolved atomically by the Daemon: either the completed
 attempt becomes authoritative or the cancellation wins, never both.
 
+Closing an incomplete task preserves its task and attempt audit records but
+does not commit the attempt workspace or create evolution input. Cancellation
+cannot undo side effects already performed against external scientific services
+or network resources; Desktop and user documentation disclose this limitation.
+
 The first attempt that reaches a terminal harness result with valid required
 capture becomes authoritative for the task, even when the scientific outcome
 is a failure. It closes the task to further attempts and is the only attempt
 allowed to produce that task's workspace result and evolution transition.
 Running the request again after that point creates a new task based on the
 project head that eventually commits.
+
+The authoritative attempt automatically accepts its immutable workspace-result
+snapshot for the successor transition. Desktop lets the user inspect and export
+that result, but the External Beta does not add a manual pre-commit approval
+branch. A user who wants older content later creates an audited restore
+successor.
 
 The harness executes in an isolated writable view of the sealed input snapshot.
 Its file changes produce an immutable result snapshot. Desktop MAY display and
@@ -894,26 +1012,32 @@ task until the successor project head commits.
 
 User uploads and file edits between tasks create a Daemon-owned staged
 workspace draft with an expected base-head identity. Submission seals that
-draft. A submitted task or successor transition blocks further remote workspace
+draft. An admitted Task or successor transition blocks further remote workspace
 mutation for the project. If the expected head no longer matches, submission
 fails visibly and requires the user to restage against the current head; no
 automatic merge or silent data loss is permitted.
 
 One run-result project-head transition combines the accepted workspace-result
-snapshot with the successor evolution revision and inherits the exact effective
-execution snapshot from the predecessor head. When no evolution target is
-enabled, the transition commits the workspace result with inherited evolution
-artifacts. When evolution is enabled, the next task waits for the complete
-transition. A separate settings-only transition is the only path that changes
-the head's effective execution snapshot.
+snapshot with evolution state and inherits the exact effective execution
+snapshot from the predecessor head. When no evolution target is enabled, it
+reuses the predecessor's exact Evolution Revision and Runtime Context Snapshot
+identities. When evolution is enabled, it commits one new Evolution Revision and
+its verified Runtime Context Snapshot after the complete transition. Only a
+settings-only successor changes the effective execution snapshot; a
+context-rebind successor changes only Runtime Context identity.
 
 Historical restore is allowed only when no task or successor transition is in
 flight. It uses an expected-current-head check and creates one atomic audited
 successor. Selected historical workspace or evolution content is copied into
 that successor; each unselected component is inherited from the current head.
 The effective execution snapshot is always inherited. Changing the artifact set
-creates a new evolution-revision identity. Restore never rewinds or forks the
-project head and invalidates any local draft based on the prior head.
+creates a new Evolution Revision and verified Runtime Context Snapshot.
+Restore never rewinds or forks the project head and invalidates any local draft
+based on the prior head.
+
+Restore validates and stages the complete successor before commit. Failure or
+cancellation leaves the current Project Head and draft unchanged and is safely
+retryable; only a successful restore invalidates the old-head draft.
 
 ## 11. Evolution Framework
 
@@ -936,8 +1060,11 @@ compiles the initial immutable plan against the task-bound verified registry.
 A replacement plan uses that same registry, predecessor head, effective
 execution snapshot, authoritative attempt, sealed dataset, and workspace
 result; only the explicitly repaired target selections/configuration may
-differ. A Daemon generation required by an unresolved transition cannot be
-discarded by upgrade.
+differ. The exact verified implementation identity needed by an unresolved
+transition must remain executable for retry, or the user must explicitly repair
+or abandon that transition before it can be retired. Whether this is achieved
+by retaining a Daemon generation or another verified mechanism is an
+architecture decision.
 
 Repair configuration is transition-specific. Desktop MUST ask separately
 whether to save the same selection as the project's desired configuration for
@@ -951,24 +1078,9 @@ The release targets are:
 | `skill_bundle` | Skills | Adds a validated skill bundle containing `SKILL.md` |
 | `agent_system` | Agent System | Adds validated harness instruction content at an allowlisted destination |
 
-Project configuration uses one generic target map:
-
-```yaml
-evolution:
-  targets:
-    text_memory:
-      enabled: true
-      method: text_memory_expel_reflector
-      config: {}
-    skill_bundle:
-      enabled: true
-      method: skill_bundle_reflector
-      config: {}
-    agent_system:
-      enabled: true
-      method: agent_system_gepa_reflector
-      config: {}
-```
+Project configuration uses one generic
+`evolution.targets.<target_id> = {enabled, method, config}` map. It does not add
+target-specific top-level project fields.
 
 Each enabled target stores either one concrete method or a Core-owned selection
 resolver exposed for that target. A resolver, such as the supported
@@ -1006,32 +1118,20 @@ Desktop MUST preserve a still-accepted saved selection even when it is no
 longer offered as a new choice. It MUST NOT present a hidden accepted method as
 a new recommendation or conflate a resolver with a concrete method.
 
-Every compiler-owned configuration field MUST be declared by the method
-descriptor as a closed-source injection from an implemented authoritative
-project or execution source. The field remains present in the method's complete
-schema but Desktop does not render it as user-owned input. The Daemon removes
-stale user values, injects the authoritative value, and validates the complete
-normalized method configuration before planning. An undeclared field with the
-same name remains user-owned and cannot be overwritten by convention.
-
-Every exposed method descriptor declares:
-
-```text
-stable method ID
-target ID
-user-facing metadata
-closed configuration schema and defaults
-ordered input requirements
-output artifact types
-supported harness, execution, capture, and runtime profiles
-compiler-owned configuration injections
-implementation and distribution identity
-maturity and exposure
-```
+Each descriptor carries a stable method/target and implementation identity,
+user-facing metadata, a closed schema/defaults, ordered inputs, typed outputs,
+support profiles, maturity/exposure, and negotiated config/handler/contribution/
+runtime/renderer contract versions. A compiler-owned configuration field is
+explicitly declared as Daemon-owned: Desktop does not render it as user input,
+and the Daemon replaces stale values from its authoritative project or execution
+source before validation. An undeclared field remains user-owned.
 
 The release registry is built from exact verified release distributions.
 Desktop does not automatically install arbitrary research plugins, and the
 product does not claim that method code is sandboxed from the server user.
+Desktop renders only negotiated schema, contribution, and renderer vocabularies.
+An unknown contract version remains visible as unsupported and blocks use; it
+does not fall back to guessed rendering or execution.
 
 ### 11.3 Maintainer Extension Contract
 
@@ -1050,20 +1150,17 @@ It MUST NOT require:
 - a second scheduler or artifact store;
 - direct model-API task execution.
 
-After a verified Daemon upgrade, a compatible new method appears through
-capabilities and Desktop renders its configuration without a Desktop code
-change.
+After a verified Daemon upgrade, a compatible new method for an existing target
+appears through capabilities and Desktop renders it without a Desktop code
+change when it uses negotiated contract vocabularies.
 
 Adding a new target is broader. It requires a typed artifact contract, safe
 projection and runtime-consumption behavior, presentation metadata, and a
 supported safe renderer. Target-specific behavior lives only in verified
 descriptors and data-only handlers. When a target fits the generic
-contribution and renderer contracts, adding it MUST NOT add target-ID branches
-to the project compiler, resolver, materializer, Gateway, or Desktop.
-
-Existing method functions MAY be reached through framework adapters. Their
-algorithm implementation MUST NOT be rewritten merely to satisfy packaging or
-dispatch structure.
+contribution and renderer contracts, it can be added without a Desktop release.
+Introducing a new runtime-consumption or renderer vocabulary requires explicit
+contract negotiation and may require a compatible Core or Desktop release.
 
 ### 11.4 Protected Methods
 
@@ -1094,22 +1191,18 @@ result.
 Paths, imports, packaging, adapters, descriptors, and infrastructure MAY
 change when behavior guards and performance gates continue to pass.
 
-The release owns a canonical protected-baseline manifest tied to the
-pre-productization commit. It identifies every behavior-bearing function body,
-prompt/resource, default/config value, filter, evaluator/selection rule,
-tie-break rule, and artifact fixture by normalized digest. Candidate
-comparison is fail closed.
+The release owns a canonical protected baseline tied to the
+pre-productization implementation. It combines behavior fixtures and
+performance gates with source/resource digest checks for known prompts,
+defaults, filters, evaluators, selection rules, and artifact construction.
+Source checks are a defense against accidental edits, not a claim to prove all
+transitive behavior by hashing.
 
-The only permitted differences are a closed machine-readable allowlist of:
-
-- file or module relocation with normalized protected content unchanged;
-- import-path rewrites required by that relocation;
-- framework adapter and descriptor code outside protected algorithm bodies.
-
-Any other protected difference blocks release even when tests or benchmark
-floors pass. Human intent is not the acceptance predicate; review confirms the
-machine-generated comparison and allowlist rather than deciding whether an
-algorithm change was intentional.
+The machine-readable source comparison permits only reviewed file/module
+relocation, corresponding import-path rewrites, and framework adapter or
+descriptor code outside protected algorithm bodies. Any unexplained protected
+source/resource difference blocks release even when a stochastic benchmark
+floor happens to pass.
 
 ### 11.5 Cross-Session Transition
 
@@ -1118,13 +1211,14 @@ effect only across sessions:
 
 ```text
 run N is admitted on project head H containing workspace W, evolution
-revision R, and effective execution snapshot E
--> Codex executes entirely on W, R, and E
+revision R, runtime context C, and effective execution snapshot E
+-> Codex executes entirely on W, C, and E
 -> transcript or trajectory is captured
 -> the transition dataset is sealed
 -> enabled methods run outside active inference
 -> all outputs validate and materialize
--> successor project head H+1 containing W+1, R+1, and inherited E commits
+-> successor project head H+1 containing W+1, R+1, verified C+1, and inherited
+E commits
 -> the next run is admitted on H+1
 ```
 
@@ -1143,12 +1237,12 @@ atomic transition:
 - outputs remain staged and unavailable to runtime consumption until the
   transition commits;
 - one failed target prevents partial activation;
-- the prior project head and evolution revision remain committed and
-  recoverable.
+- the prior Project Head, Evolution Revision, and Runtime Context Snapshot remain
+  committed and recoverable.
 
-If the next task requires a pending successor, it is visibly queued or not
-ready. It MUST NOT silently run on the prior project head. After a failed
-transition:
+While a successor is pending, the next Task Draft remains visibly not ready and
+cannot be submitted. It MUST NOT silently run on the prior Project Head. After a
+failed transition:
 
 - retrying transient execution preserves the same immutable plan and records a
   new transition attempt;
@@ -1156,7 +1250,8 @@ transition:
   plan bound to the same predecessor, authoritative run, sealed dataset, and
   workspace-result snapshot;
 - explicitly abandoning evolution creates a successor project head containing
-  the accepted workspace result and inherited evolution artifacts.
+  the accepted workspace result and the predecessor's exact Evolution Revision
+  and Runtime Context Snapshot.
 
 Creating a replacement plan is one atomic compare-and-set operation against the
 expected current head and transition generation. It makes every prior plan for
@@ -1207,8 +1302,10 @@ A benchmark automation owns:
 - task lists and evaluation configuration;
 - benchmark reports and evidence.
 
-It consumes stable Core or Daemon capabilities for project compilation,
-execution, capture, evolution, artifact activation, and follow-up runs.
+Across releases, benchmark automation consumes the versioned Daemon API. A
+same-candidate automation package MAY use exact-version in-process Core
+interfaces for lower-level tests, but that maintainer ABI is not a separately
+distributed product or compatibility promise.
 
 Terminal Bench, scientific benchmarks, and general-agent benchmarks use sibling
 automation packages. Desktop exposes no benchmark controls.
@@ -1216,43 +1313,67 @@ automation packages. Desktop exposes no benchmark controls.
 Release performance evidence MUST exercise the real data path through capture,
 dataset sealing, verified method dispatch, artifact registration,
 materialization, revision activation, runtime injection, and the authoritative
-follow-up harness attempt. Directly calling a method function is unit-test
-evidence, not release performance evidence.
+follow-up harness attempt through the same candidate's supported control path.
+Directly calling a method function is unit-test evidence, not release
+performance evidence.
 
 ### 12.1 Performance Manifests
 
 The repository MUST contain canonical, reviewable manifests for the three
-historical baseline-failed subsets. Each manifest pins or identifies:
+historical baseline-failed subsets. Their closed schema belongs to benchmark
+automation, but each manifest pins:
 
-- benchmark and task versions;
-- applicable task IDs;
-- runtime image;
-- harness and model configuration;
-- method configuration;
-- evaluator version;
-- canonical protected baseline and behavior-fixture bundle identities;
-- genesis project head, predecessor evolution revision, and complete prior
-  artifact set;
-- source-attempt, capture, sealed-dataset, and dataset-construction identities;
-- algorithm candidate/evaluator budget;
-- allowed infrastructure-replacement policy and complete launch-ledger format;
-- authoritative result format.
+- benchmark, task IDs, runtime image, harness, model, and evaluator;
+- method configuration and algorithm candidate/evaluator budget;
+- protected baseline and behavior-fixture identities;
+- initial workspace, Project Head, Evolution Revision, Runtime Context Snapshot,
+  and prior artifact set;
+- source attempt, capture, sealed dataset, and construction identities;
+- one candidate gate reservation and complete append-only task-launch ledger
+  identity covering the baseline and evolved arms;
+- one authoritative result format and a closed infrastructure-replacement
+  policy.
 
 These historical preservation profiles use the execution mode and model
 identity recorded by the canonical baseline, currently Codex Subscription.
 Their floors protect the previously demonstrated method behavior; they are not
 silently transferred to a different Self-Deployed model.
 
-Each method runs independently with no artifact from another target. The score
-is the number of tasks rescued by one authoritative evolved pass@1 attempt.
-That attempt runs only after the protected algorithm has completed its internal
-candidate evaluation, selected its result, and the result has been activated in
-the successor revision. Algorithm-internal candidate trials are not gate
-attempts and cannot be counted as rescues.
+Each method runs independently with no artifact from another target. Every task
+has exactly one authoritative same-candidate no-artifact baseline pass@1 attempt
+and exactly one authoritative evolved pass@1 attempt. Both arms pin the same
+task, initial workspace, effective execution snapshot, mode/model, runtime,
+evaluator, and non-target artifact set. Only a baseline score of `0` followed
+by an evolved score of `1` counts as one rescue. Baseline successes and evolved
+failures remain in the complete report and cannot be discarded or rerun to
+improve the aggregate.
 
-The gate profile sets `n_attempts=1` for the authoritative follow-up. Evidence
-labels algorithm evaluation records separately from the
-`authoritative_gate_score`.
+Benchmark automation instantiates independent source/control and treatment
+projects from the same immutable canonical genesis; it does not fork either
+project's linear Head. The control project's authoritative baseline capture and
+sealed dataset are the method's source input. Only that content-addressed
+dataset and its provenance may cross into the treatment project through the
+versioned benchmark/Core input contract. Workspace results, service state,
+artifacts, runtime state, and Project Head state cannot cross.
+
+The treatment project starts with the exact canonical workspace and empty
+target artifact state, runs the protected method through verified dispatch,
+activates the result through its normal successor Project Head, and launches
+the evolved evaluation in a fresh benchmark runtime. The manifest and receipts
+prove that the two projects share the task, genesis workspace, effective
+execution snapshot, mode/model, runtime, evaluator, and non-target artifacts,
+and that only the sealed source dataset and resulting target contribution
+distinguish the treatment path.
+
+The evolved attempt runs only after the protected algorithm has completed its
+internal candidate evaluation, selected its result, and the result has been
+activated in the successor revision. Algorithm-internal candidate trials are
+not gate attempts and cannot be counted as rescues.
+
+The gate profile sets `n_attempts=1` independently for the authoritative
+baseline and evolved arms. Evidence labels algorithm evaluation records
+separately from `authoritative_baseline_score`,
+`authoritative_evolved_score`, and `authoritative_rescue`.
 
 An infrastructure failure that prevents scoring MAY be rerun when the failure
 and replacement are recorded. A scored failure cannot be rerun merely to obtain
@@ -1271,14 +1392,12 @@ Missing a floor blocks release and requires root-cause analysis and a new
 declared candidate run after a relevant correction. The floor does not permit
 intentional algorithm changes or unexplained systematic regression.
 
-Gate profiles use a closed machine-readable schema and record both
-`historical_reference` and `blocking_floor`, together with exact task, runtime,
-harness, model, method, evaluator, predecessor, dataset, budget, attempt-count,
-and result-format identities. Unless a profile explicitly pins a prior artifact,
-the complete initial artifact set is empty. The aggregator fails closed on an
-extra scored attempt, an unclassified replacement, or a record not reachable
-from the declared launch ledger. Historical-summary-only manifests are not
-executable release evidence.
+Gate profiles record both `historical_reference` and `blocking_floor`. Unless a
+profile explicitly pins a prior artifact, the complete initial artifact set is
+empty. The aggregator fails closed on an extra scored attempt, an unclassified
+replacement, a launch or result not reachable from the one reserved ledger, or
+an unindexed repeated candidate gate run. Historical-summary-only manifests are
+not executable release evidence.
 
 ## 13. Security, Privacy, And Data
 
@@ -1295,8 +1414,8 @@ executable release evidence.
 - Task runtimes do not receive SSH keys, the Docker socket, the Daemon state
   root, the complete user home, raw subscription or Hugging Face credentials,
   or arbitrary host mounts.
-- Runtime mounts are limited to the project workspace and the materialized
-  execution snapshot.
+- Runtime mounts are limited to the project workspace and the Runtime Context
+  Snapshot.
 - Paths and deletion operations enforce containment and no-follow behavior.
 
 Science tasks MAY need outbound network access for literature search, data
@@ -1323,9 +1442,10 @@ Secret values are:
 - redacted from logs, events, errors, transcripts, datasets, artifacts,
   lineage, diagnostics, benchmark evidence, and release files.
 
-Redaction MUST be tested with distinct canary values at configuration,
-environment, harness, service-response, database, artifact, and export
-boundaries.
+Redaction MUST be tested with a closed source-by-sink matrix and distinct
+canary values for Keychain, remote secret store, configuration, environment,
+harness authentication/input, service response, database write, artifact,
+diagnostics, backup, and export boundaries.
 
 Secret filtering MUST NOT silently rewrite ordinary scientific inputs merely
 because they resemble sensitive text. Diagnostics and export flows still
@@ -1341,8 +1461,36 @@ The Daemon is authoritative for:
 - evolution datasets, artifacts, lineage, and revisions;
 - managed service, operation, model, image, and cache state.
 
-Removing a server profile from Desktop removes local connection data only. It
-does not delete remote research data.
+Project-owned configuration, workspace snapshots, task/admission/attempt
+history, transcripts, datasets, Evolution Revisions, Runtime Context Snapshots,
+artifacts, lineage, and Head Revisions are retained until the user deletes the
+project. They are never removed automatically for capacity pressure.
+
+Redacted service logs are size/time rotated according to a release-manifest
+policy; task transcripts and timelines are not service logs and remain
+project-owned history. Failed staging, orphan runtime, and incomplete download
+data are cleaned only after recovery has classified them as unreachable.
+Unreferenced model, image, and download caches MAY be evicted and later
+re-created. When capacity remains insufficient, the Daemon blocks new
+space-consuming operations and presents cleanup choices instead of deleting
+authoritative project data.
+
+A **project backup** is a Daemon-created, versioned, integrity-verified archive
+of all project-owned authoritative metadata and payloads required to restore the
+project. It excludes credentials, service secrets, and shared model/image
+caches. Backup requires the project to have no Task or transition in flight and
+uses one consistent Head boundary. Desktop warns that the archive contains
+research data and saves it only to a user-selected destination.
+
+Restore verifies the complete archive before mutation and imports it as a new
+project identity while preserving source identities and lineage in provenance.
+Only releases within the archive's declared compatibility range may restore it.
+Failure exposes no partial project. The release gates exercise backup,
+verification, corruption rejection, and restore.
+
+**Remove Server From This Mac** removes the local profile, accepted host-key
+record, and selected Keychain references only. It does not delete the remote
+Daemon or research data.
 
 Deleting a project is one idempotent Daemon-owned asynchronous operation. It
 first prevents new project work, then stops or waits for conflicting work,
@@ -1352,13 +1500,15 @@ before reporting success. A partial delete remains visible and safely
 retryable. Shared verified model and image caches are not deleted with one
 project.
 
-Daemon uninstall offers distinct, explicitly confirmed choices:
+**Uninstall OpenEvo Daemon** offers distinct, explicitly confirmed choices:
 
 - remove the Daemon and retain projects and caches;
 - remove the Daemon and projects but retain shared model caches;
 - remove all OpenEvo-managed data.
 
-Cache cleanup, project deletion, and uninstall are separate operations.
+**Clean Shared Caches**, **Delete Project From Server**, Desktop application
+removal, local server-profile removal, and Daemon uninstall are separate
+operations with separate impact previews.
 OpenEvo does not claim that normal filesystem deletion is physical secure
 erasure.
 
@@ -1410,22 +1560,35 @@ One GitHub Release contains:
 - the source tag or archive;
 - release notes;
 - supported-environment and known-limitation statements;
-- complete dependency, license, and vulnerability evidence for shipped
-  components.
+- complete dependency, license, provenance, and applicable vulnerability
+  evidence for shipped and release-managed downloaded components;
+- a closed prepublication evidence bundle containing G1-G11 records and its
+  machine-readable inventory.
 
 The release manifest binds:
 
 ```text
 Desktop version and architecture
 Daemon and protocol version
+request/response and event schema identities
+feature compatibility range
 Core and verified registry identity
+Codex CLI version, source, integrity, and license identity
 managed science runtime image digest
 vLLM image digest
 validated self-deployed model profile
 validated remote-host profile
 supported platform matrix
+closed clean-host matrix row identities
+packaged-app ready deadline and tested window matrix
+retention, log-rotation, and cache-eviction policy
+gate-profile and evidence-schema digests
 artifact checksums
 ```
+
+No manifest, checksum inventory, evidence index, or attestation includes its
+own digest. An outer inventory may bind an inner object; self-referential hash
+contracts are forbidden.
 
 The DMG contains the matched Daemon Bundle or obtains only the exact
 manifest-bound bytes through a verified download. Remote bootstrap verifies the
@@ -1439,18 +1602,41 @@ The DMG is unsigned and non-notarized for this release. User documentation
 provides concise manual macOS launch instructions without implying that the
 application is signed.
 
-Release security evidence uses vulnerability data refreshed within seven days
-of candidate evaluation. No unresolved known Critical or High vulnerability
-may affect a shipped reachable runtime component. No shipped dependency may
-have an unknown, incompatible, or prohibited license. A Medium-or-lower
-vulnerability exception requires a linked issue, affected-component analysis,
-owner, expiry, and release-note disclosure; an exception is part of the
-candidate evidence index.
+Release security evidence covers the DMG, Daemon Bundle, Codex CLI, managed
+runtime and vLLM images, model profile, and their reachable dependencies.
+Applicable vulnerability data is refreshed within seven days of candidate
+evaluation. No unresolved known Critical or High vulnerability may affect a
+reachable component. No shipped or release-managed component may have an
+unknown, incompatible, or prohibited license. A Medium-or-lower vulnerability
+exception requires a linked issue, affected-component analysis, owner, expiry,
+and release-note disclosure; an exception is part of the candidate evidence
+index.
 
-Final artifacts are first uploaded to a non-public draft or staging release.
-The publisher downloads and revalidates those exact bytes and all blocking
-evidence before making the release public. Publication cannot replace the tag,
-manifest, or asset bytes; any change creates a new candidate and reruns the
+Release construction follows one non-circular DAG:
+
+1. Freeze the source commit, protected release-policy baseline, closed gate
+   profiles, and evidence schemas.
+2. Build and freeze the DMG, Daemon Bundle, release manifest, checksums, release
+   notes, and managed-component identities.
+3. Run G1-G11 against those exact frozen bytes and identities.
+4. Create the prepublication evidence bundle and index for G1-G11, including
+   the exact expected G12 case IDs and procedure but no fabricated G12 verdict.
+5. Upload the immutable release payload and prepublication evidence bundle to a
+   non-public draft or staging release with no replacement.
+6. Download the complete declared draft asset set into a clean environment,
+   revalidate its bytes and metadata, and emit a detached G12 attestation.
+7. Create one detached final candidate evidence index that binds the
+   prepublication index, G1-G11 reports, G12 attestation, and final G1-G12
+   verdicts.
+8. After all gates have ended, the publication controller validates that final
+   index as the publish-eligibility record, then publishes only by changing
+   visibility; no tag, manifest, note, or asset byte may change.
+
+The detached G12 attestation and final candidate evidence index are protected
+publication records, not members of the draft asset set they attest. Their
+storage identity and digest are retained with the publication audit record.
+This exclusion is explicit and prevents either object from needing to validate
+itself. Any payload or evidence change creates a new candidate and reruns the
 affected gates.
 
 After publication, automation records a non-gating publication attestation that
@@ -1471,7 +1657,8 @@ Release-facing documentation covers:
 - Subscription login and data disclosure;
 - Self-Deployed model preparation and hardware requirements;
 - project, task, files, evolution, history, and recovery workflows;
-- diagnostics, retention, deletion, cache cleanup, and uninstall;
+- diagnostics, retention, project backup/restore, server-owner disaster
+  recovery responsibility, deletion, cache cleanup, and uninstall;
 - Core and Daemon architecture;
 - method and target integration for maintainers;
 - standalone benchmark automation;
@@ -1491,13 +1678,30 @@ Evidence records the environment, input identity, command or UI path, output,
 and pass/fail result. Infrastructure failures are distinguished from product
 failures and cannot be used to discard a valid negative result.
 
-One machine-readable candidate evidence index binds the release manifest
-digest, candidate commit, artifact hashes, environment identities, report
-hashes, CI or operator-run references, `simulator=false` for every release
-gate, and the final status of G1 through G12. The release publisher downloads
-and revalidates the indexed evidence and refuses publication when any gate is
-missing, pending, duplicated with conflicting identity, simulated, or bound to
-another candidate.
+The detached final candidate evidence index binds the release manifest digest,
+candidate commit, artifact hashes, prepublication evidence index, detached G12
+attestation, environment identities, report hashes, CI or operator-run
+references, `simulator=false` for every release gate, and the final status of
+G1 through G12. For every gate it also binds the closed profile/schema digest,
+exact expected case IDs, exact result record set, and one aggregate verdict.
+The verifier rejects a missing, extra, duplicated, unindexed, or conflicting
+case or run, even when an aggregate report says `pass`. The release publisher
+revalidates all referenced evidence and refuses publication when any gate is
+missing, pending, simulated, or bound to another candidate.
+
+The final index is generated only after G12 has produced its independent
+attestation. It records the G12 verdict but is not an input, pass criterion, or
+piece of evidence for G12. Its validation is the publication controller's
+post-gate eligibility check.
+
+Closed gate profiles derive from a protected release-policy baseline frozen
+before candidate evaluation and identified independently of the candidate
+manifest. Stable required case IDs cannot be removed; deadlines cannot be
+lengthened, accepted cardinalities widened, or expected safety states weakened
+without an explicit canonical-spec and release-policy change reviewed before a
+new candidate freeze. The verifier performs this monotonic comparison for every
+gate with a closed profile, including the clean-host matrix and G8-G11, before
+candidate evaluation.
 
 ### G1. Product And Contract Boundary
 
@@ -1508,35 +1712,47 @@ Pass criteria:
 - benchmark-specific code is outside Core and Desktop;
 - no public CLI, Dev Kit, PyPI install path, or legacy product identity is
   advertised;
-- packaged Desktop uses only versioned remote capabilities and APIs;
-- no local method table or release fallback backend is active;
-- capability conformance covers visible methods, hidden accepted methods,
-  selection resolvers and every declared concrete outcome, configured and
-  effective defaults including no-effective-default, and independent
-  execution/capture/harness/runtime support reasons;
-- hidden accepted selections round-trip without becoming new recommendations,
-  and resolver identities/support match their accepted concrete methods;
-- compiler-owned injection removes stale user values and supplies the
-  authoritative harness/provider identity in both execution modes;
-- fixture extensions prove that a compatible method or generic target appears
-  without a Desktop method table or target-ID branch in compiler, resolver,
-  materializer, Gateway, or Desktop.
+- packaged Desktop uses only authenticated versioned Daemon capabilities and
+  APIs after bootstrap;
+- session compatibility pins the required release, schema, feature, and registry
+  identities before mutation;
+- no local method table, release fallback backend, simulator, or ad hoc SSH
+  business path is active;
+- capability conformance covers visible choices, retained accepted choices and
+  their lossless round-trip, resolver-to-concrete identities, configured and
+  effective defaults including no effective default, independent
+  execution/capture/harness/runtime support reasons, and unsupported contract
+  versions;
+- Daemon-owned configuration injection removes stale user values and supplies
+  the verified harness/provider identity in both execution modes;
+- a fixture method for an existing target appears and is configurable without a
+  Desktop code change when it uses the negotiated generic contracts;
+- a fixture target crosses capability, planning, artifact, Runtime Context, and
+  Desktop rendering through existing negotiated vocabularies without a Desktop
+  code change, while an unknown vocabulary fails closed.
 
 Evidence: repository checks, package/import tests, release-content inspection,
-capability conformance suites, generic-extension fixtures, and documentation
-link checks.
+contract and capability conformance suites, generic-extension fixtures, and
+documentation link checks.
 
 ### G2. Packaged Desktop Installation
 
-Environment: a clean user account on every macOS version claimed by the release
-manifest, with no repository checkout, Python, Node, Rust, or OpenEvo state.
+Environment: a new user account on every exact macOS build claimed by the
+release manifest, with no repository checkout, Python, Node, Rust, application
+install, OpenEvo support directory, OpenEvo Keychain item, or accepted host key.
+The manifest declares a product-ready deadline no greater than 120 seconds on
+the gate machine.
 
 Pass criteria:
 
 - the DMG mounts, installs, and launches through the documented unsigned-app
   flow;
 - the bundled native host and Desktop sidecar start without a terminal;
-- first-run, quit, relaunch, and uninstall work;
+- the renderer reaches the real product shell within the declared deadline;
+- first-run, quit, relaunch, removal, and reinstall work;
+- removing Desktop or a local server profile does not delete remote Daemon or
+  project state; an explicit local-state cleanup removes only documented local
+  files and Keychain references;
 - no development server, simulator, or source-relative fallback is used.
 
 Evidence: packaged-app smoke logs, screenshots, artifact checksum, and tested
@@ -1550,14 +1766,27 @@ and release-supported Docker Engine but no usable NVIDIA GPU, OpenEvo, Python,
 
 Pass criteria:
 
+- every manifest row assigned to G3 produces exactly one complete result;
+- every row stays within its declared phase/overall deadlines and retry
+  cardinalities, with user-login waiting accounted separately;
 - Desktop installs and attaches the exact Daemon Bundle;
 - Codex and the runtime image are prepared through Desktop;
 - the user completes the mediated subscription login;
-- a real task runs with transcript capture;
-- Desktop disconnect and reconnect preserve the run and timeline.
+- one real no-evolution task runs through Codex with transcript capture and an
+  immutable matching execution receipt;
+- Desktop disconnect and reconnect preserve the run and timeline;
+- across the clean-host matrix, SSH agent, private-key/passphrase, password,
+  host-key change rejection, unauthenticated proxy, and authenticated proxy
+  paths each receive at least one end-to-end bootstrap test;
+- the required `cn-mainland-restricted-v1` row proves direct-route denial and
+  successful proxied Codex preparation, login, execution, and applicable
+  release-managed downloads;
+- retained local credentials use Keychain references, and secret canaries are
+  absent from renderer state, project configuration, logs, and diagnostics.
 
 Evidence: preflight report, installation operation history, service health,
-task/run record, transcript-capture declaration, and packaged Desktop trace.
+authentication/bootstrap matrix, task/run record, transcript-capture
+declaration, execution receipt, and packaged Desktop trace.
 
 ### G4. Clean Self-Deployed Deployment
 
@@ -1567,15 +1796,25 @@ required driver, Docker Engine, and NVIDIA runtime but no OpenEvo, Python,
 
 Pass criteria:
 
+- every manifest row assigned to G4 produces exactly one complete result;
+- every row stays within its declared phase/overall deadlines and retry
+  cardinalities;
 - Desktop installs the Daemon;
 - Codex, the managed science runtime image, the exact reference model, and the
   vLLM image are prepared and verified through Desktop;
 - serving readiness proves the expected model identity;
-- Codex executes a real task through Core Gateway and vLLM;
-- interruption and resume of at least one large download are demonstrated.
+- Codex executes one real no-evolution task through Core Gateway and vLLM with
+  an immutable matching execution receipt;
+- interruption and resume of at least one model or image download are
+  demonstrated, and the resumed bytes have the manifest-bound digest;
+- the required `cn-mainland-restricted-v1` row proves direct-route denial and
+  successful configured remote proxy, Hugging Face endpoint, and container
+  mirror routing for required downloads while loopback Daemon/Gateway/vLLM
+  traffic remains excluded.
 
 Evidence: hardware/preflight report, model snapshot identity, image digest,
-service readiness, run snapshot, and packaged Desktop trace.
+service readiness, run snapshot, execution receipt, download-resume record, and
+packaged Desktop trace.
 
 ### G5. Mode-By-Target Evolution
 
@@ -1584,18 +1823,26 @@ with one target enabled per test.
 
 Pass criteria for each of six paths:
 
-- a predeclared target-specific canary fails its criterion without the target
-  artifact under the same mode/profile;
+- a closed machine-readable canary profile pins the mode, target, task,
+  environment, baseline state, artifact state, and deterministic pass predicate;
+- exactly one authoritative no-artifact baseline attempt scores `0/1`;
 - run N produces valid capture and a sealed transition input;
+- the canary generation task produces no workspace-content delta, so the
+  baseline and follow-up use the same immutable evaluation task, Workspace
+  Snapshot, effective execution snapshot, mode/model, and non-target artifact
+  set;
 - the selected protected method runs through verified dispatch;
 - its typed artifact validates and materializes;
-- successor project head H+1 and evolution revision R+1 commit;
+- successor Project Head H+1 atomically binds Evolution Revision R+1 and Runtime
+  Context Snapshot C+1;
 - run N+1 is admitted on H+1;
 - runtime evidence proves that Codex consumed the artifact and the follow-up
-  canary now passes the target-specific criterion;
-- method execution evidence proves the protected reflector used the
-  compiler-injected harness/provider identity for that execution mode rather
-  than a user-supplied model endpoint.
+  canary scores `1/1`;
+- the target artifact contribution is the only controlled difference between
+  the baseline and exactly one authoritative follow-up attempt;
+- method evidence proves the protected reflector used the verified
+  harness/provider path for that execution mode rather than a user-supplied
+  model endpoint.
 
 Evidence: six machine-readable transition reports plus corresponding task,
 baseline-canary, artifact, project-head, revision, and follow-up efficacy
@@ -1606,14 +1853,15 @@ records.
 Pass criteria:
 
 - all three targets can evolve from one completed run;
-- independent jobs may overlap without state corruption;
 - one successor project head, containing the accepted workspace result and
-  complete successor evolution revision, commits only after all three outputs
-  are ready;
-- injected follow-up context contains the complete committed set;
+  complete successor Evolution Revision and Runtime Context Snapshot, commits
+  only after all three outputs are ready;
+- the admitted follow-up receipt pins and consumes the complete committed
+  context;
 - forced method, artifact-validation, and materialization failures each leave
   the prior project head active and expose no partial successor;
-- pending and failed transitions never silently admit a run on stale context.
+- pending and failed transitions reject next-task submission and never run it on
+  stale context.
 
 Evidence: successful and fault-injected transition reports.
 
@@ -1628,19 +1876,29 @@ Pass criteria:
 - trajectory-to-skill rescues at least 12 of 25 tasks;
 - agent-system evolution rescues at least 15 of 25 tasks;
 - each method runs independently through the real Core path;
-- the canonical protected baseline, behavior-fixture bundle digest, protected
-  behavior suites, exact registry identities, and normalized candidate
-  comparison contain no difference outside the closed mechanical allowlist;
-- every applicable task has one authoritative scored pass@1 result.
-- algorithm candidate trials are labeled separately and only the independent
-  post-activation attempt contributes to the rescue count.
+- protected behavior fixtures and source/resource guards show no unexplained
+  algorithm change, and exact registry identities match the candidate;
+- every applicable task has exactly one authoritative no-artifact baseline
+  pass@1 result and one authoritative post-activation evolved pass@1 result;
+- the baseline capture is sealed as that task's method input, and the evolved
+  evaluation uses a fresh runtime with the exact canonical workspace restored;
+- only same-task `0 -> 1` pairs contribute to the rescue floor; baseline
+  successes, evolved failures, and infrastructure replacements remain visible;
+- algorithm candidate trials are labeled separately and do not contribute to
+  either authoritative arm or the rescue count.
 
 Evidence: per-task records, aggregate reports, manifests, selected artifacts,
 injection evidence, and exact release identities.
 
 ### G8. Recovery And Idempotency
 
-Fault matrix:
+The repository owns a versioned closed fault profile whose digest is bound by
+the release manifest. A candidate cannot reduce it. The profile selects required
+checkpoints across bootstrap/tunnel recovery; Task submit, admission, execution,
+cancel, completion, retry, and close; evolution dispatch, artifact validation,
+materialization, replacement, abandon, and commit; settings-only,
+context-rebind, and historical-restore successors; and install/upgrade
+activation. At those checkpoints it applies:
 
 - Desktop termination;
 - SSH tunnel loss;
@@ -1649,15 +1907,26 @@ Fault matrix:
 - worker termination;
 - task-runtime termination;
 - server restart;
-- repeated client mutation.
+- repeated client mutation;
+- concurrent Desktop ensure/upgrade operations;
+- concurrent stale project mutations.
+
+Each case binds the operation, checkpoint, fault, fixture identity, expected
+durable state, operation-specific recovery deadline, and exact allowed
+cardinalities. Every profile case is executed at least once on the candidate; an
+unbounded “eventually recovers” assertion is insufficient.
 
 Pass criteria:
 
 - Desktop reconnects and replays events without duplicate runs;
-- interrupted work reaches an honest terminal or recoverable state;
-- committed revisions remain valid;
+- interrupted work reaches the declared honest terminal or recoverable state
+  within its deadline;
+- committed Project Heads, Evolution Revisions, and Runtime Context Snapshots
+  remain valid;
 - staged state never becomes partially active;
 - orphan processes, runtimes, leases, and staging data reconcile safely;
+- concurrent install or upgrade attempts leave one active generation and one
+  Daemon writer;
 - cancellation/completion races produce exactly one winner, a late attempt
   cannot become authoritative, and every retry receipt matches the task's
   closed admission;
@@ -1667,37 +1936,81 @@ Pass criteria:
 - restore rejects a stale expected head, inherits the unselected components,
   creates the required new identities, and invalidates drafts based on the old
   head;
-- a settings-only successor proves readiness and compatibility before changing
-  the head's effective execution snapshot.
+- failed or interrupted settings-only, context-rebind, and restore successors
+  leave the prior Project Head and draft unchanged; successful successors bind
+  the exact required identities;
+- repeated not-ready submission creates no Task or attempt, and the first valid
+  submission after the exact successor is active creates exactly one Task and
+  attempt.
 
 Evidence: fault-injection and race test reports, immutable attempt receipts,
 transition ledgers, and recovered state snapshots.
 
 ### G9. Upgrade And Rollback
 
+The repository owns a versioned closed upgrade profile, bound by digest in the
+release manifest. It pins every predecessor/newer fixture generation, metadata
+fixture, active/quiescent state, compatibility outcome, injected failure, and
+expected deadline/cardinality. It includes compatible-old, incompatible-old,
+newer-Daemon, interrupted-stage, candidate-startup-failure,
+migration-failure, pre-barrier rollback, post-barrier rollback rejection, and
+concurrent-installer rows.
+
 Pass criteria:
 
-- a supported older Daemon upgrades from the packaged Desktop;
+- compatibility decisions are derived from the negotiated manifest predicate,
+  not version-string ordering alone;
+- when a prior published compatible release exists, its exact Daemon fixture
+  upgrades from the packaged Desktop;
 - active compatible work is preserved or the upgrade is visibly deferred;
+- the cross-version maintenance protocol safely observes quiescence and upgrades
+  an incompatible-old fixture without business-state access;
 - interrupted staging resumes safely;
 - candidate startup failure retains the working generation;
 - migration failure restores working metadata;
-- Desktop never silently downgrades a newer Daemon.
+- pre-barrier rollback restores the old generation without data loss, while
+  post-barrier rollback is rejected unless the profile proves backward
+  readability and a lossless reverse migration;
+- concurrent or stale installers cannot activate after the winning generation;
+- Desktop never silently downgrades a newer Daemon;
+- a registry/runtime-contract change creates a valid context-rebind successor
+  for a compatible project or leaves that project visibly blocked on the prior
+  Head with a typed repair action.
+
+For the first External Beta, the published-predecessor upgrade row MAY be
+recorded as `not_applicable` only when the publisher records an externally
+verifiable source-repository release-history query showing no predecessor at
+candidate freeze. Candidate failure, metadata rollback, concurrency,
+incompatible-old, newer-Daemon, and no-silent-downgrade rows remain blocking and
+use fixed fixture generations.
 
 Evidence: upgrade matrix, before/after release identities, and rollback reports.
 
 ### G10. Desktop Product Quality
 
+The repository owns a closed product-quality profile bound by digest in the
+release manifest. It fixes workflow/state/window case IDs, exact viewport
+dimensions, seeded remote fixtures, accessibility scanner/version/rules,
+visual-snapshot method and tolerances, and manual keyboard/notification
+assertions. Every case produces one indexed result.
+
 Pass criteria:
 
 - first-run, project creation, task execution, cancellation, retry, file
-  transfer, transcript, evolution, artifact diff, history, System, and
-  diagnostics workflows operate in the packaged app;
+  transfer, preview, download/research export, project backup/restore,
+  transcript, evolution, artifact diff, historical restore, System,
+  diagnostics, Remove Server From This Mac, Delete Project From Server, Clean
+  Shared Caches, and Uninstall OpenEvo Daemon workflows operate in the packaged
+  app;
 - empty, loading, offline, reconnecting, degraded, failed, cancelled, pending,
-  and success states are coherent;
-- supported window sizes have no clipped, overlapping, or unreachable controls;
-- keyboard navigation, focus, contrast, and notifications pass the declared
-  accessibility checks;
+  and success states pass their profile assertions;
+- every profile window has
+  no clipped, overlapping, obscured, or unreachable controls;
+- declared WCAG 2.2 AA contrast and focus checks pass, automated accessibility
+  scanning reports no serious or critical finding, and a manual keyboard-only
+  path completes setup, task submission, monitoring, and result export;
+- notifications identify completion or required action without disclosing task
+  or secret content on the lock screen by default;
 - invalid capability and method states remain visible and block unsafe runs.
 
 Evidence: packaged end-to-end results, visual snapshots, accessibility report,
@@ -1705,22 +2018,39 @@ and manual real-Mac checklist.
 
 ### G11. Security, Privacy, And Data Lifecycle
 
+The repository owns a versioned closed security/data-lifecycle profile bound by
+digest in the release manifest and checked against the protected release-policy
+baseline. It fixes attack fixtures, secret-canary source/sink allow/deny rules,
+network expectations, backup-corruption cases, and before/after data
+inventories. Every case produces one indexed result.
+
 Pass criteria:
 
-- host-key change, unauthenticated local access, remote port exposure, path
-  traversal, symlink escape, reserved environment override, and privileged
-  runtime attempts fail closed;
-- distinct secret canaries are injected at configuration, environment,
-  harness-authentication, harness-input, and service-response boundaries and
-  do not persist in returned project config, databases, logs, events,
-  timelines, errors, transcripts, datasets, complete artifact records or
-  payloads, lineage, diagnostics, benchmark evidence, or release files;
-- task-authored code and tool subprocesses cannot read or exfiltrate SSH keys,
+- the profile covers host-key change, unauthenticated local
+  access, remote port exposure, path traversal, symlink escape, reserved
+  environment override, privileged runtime, and task attempts to read each
+  forbidden credential or host resource; every case fails closed;
+- a closed source-by-sink canary matrix assigns distinct values to Keychain,
+  remote secret-store, configuration, environment, harness-authentication,
+  harness-input, service-response, database-write, artifact, diagnostics, and
+  export boundaries; every disallowed sink has zero matches in returned project
+  config, non-secret databases, logs, events, timelines, errors, transcripts,
+  datasets, artifact records or payloads, lineage, diagnostics, benchmark
+  evidence, backups/exports, or release files;
+- a designated Keychain or remote secret store contains only the secrets it is
+  authorized to retain, is excluded from export, and passes permission and
+  access-boundary tests;
+- task-authored code and tool subprocess attack fixtures cannot read SSH keys,
   Docker access, the complete user home, Daemon state, raw subscription
   credentials, or Hugging Face credentials;
-- no telemetry or upload occurs by default;
-- project deletion, cache cleanup, profile removal, and each uninstall choice
-  affect only the stated data;
+- no analytics, crash, telemetry, or diagnostics upload occurs by default;
+  disclosed Subscription harness traffic, user-enabled task networking, and
+  release-managed downloads are tested separately and are not telemetry;
+- project backup contains no secret, rejects corruption without partial restore,
+  and restores the declared authoritative inventory;
+- Delete Project From Server, Clean Shared Caches, Remove Server From This Mac,
+  and each Uninstall OpenEvo Daemon choice produce before/after inventories
+  proving that only the stated owned data changed;
 - diagnostics exclude research content by default.
 
 Evidence: security test report, canary scan, network binding inspection, and
@@ -1730,8 +2060,9 @@ data-lifecycle test report.
 
 Pass criteria:
 
-- DMG, Daemon Bundle, manifest, checksums, source tag, runtime descriptors,
-  release notes, and tested identities agree;
+- DMG, Daemon Bundle, Codex CLI, managed images, model profile, manifest,
+  checksums, source tag, runtime descriptors, release notes, and tested
+  identities agree;
 - all blocking reports refer to the same candidate;
 - user and maintainer documentation match actual behavior and supported scope;
 - known limitations include unsigned status and every intentionally unsupported
@@ -1739,14 +2070,15 @@ Pass criteria:
 - dependency evidence satisfies the vulnerability freshness, severity,
   exception, and license policy in Section 14;
 - the non-public draft or staging release contains the exact validated
-  artifacts, and the publisher proves that public release will expose those
-  immutable bytes without replacement;
-- the release is marked publish-eligible only after this downloaded-draft
-  validation passes.
+  artifacts, and the publisher uses a no-replace publication operation that
+  changes visibility without accepting new tag or asset bytes;
+- downloaded-draft revalidation completes without accepting an undeclared,
+  missing, replaced, or mismatched asset or metadata field.
 
-Evidence: release-manifest verifier output, dependency/security reports, and a
-downloaded draft-release smoke test. These are the pre-publication G12
-eligibility records.
+Evidence: release-manifest verifier output, dependency/security reports,
+downloaded draft-release smoke, and detached G12 attestation. The attestation
+is not a member of the draft asset set it attests. The final candidate evidence
+index is generated only after this gate ends and is not G12 evidence.
 
 ## 16. Explicitly Out Of Scope
 
@@ -1757,6 +2089,7 @@ The External Beta does not include:
 - in-session or streaming evolution;
 - harnesses other than Codex;
 - arbitrary external API-key-and-base-URL task execution;
+- arbitrary unvalidated Hugging Face model profiles;
 - user-installed unverified plugins from Desktop;
 - a public CLI or Dev Kit product;
 - PyPI distribution as a product surface;
@@ -1767,6 +2100,7 @@ The External Beta does not include:
 - guaranteed automatic installation of drivers, kernels, Docker system policy,
   firewalls, or other root-owned infrastructure;
 - bundling large model weights inside the DMG;
+- continuous remote backup or disaster-recovery service;
 - macOS signing, notarization, or automatic Desktop updates;
 - compatibility with pre-release legacy runtime state, names, markers, or
   import paths.

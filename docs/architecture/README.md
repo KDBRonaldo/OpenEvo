@@ -5,12 +5,13 @@ OpenEvo is still pre-release; target documents must not be read as proof that a
 packaged workflow already exists. The product surfaces are:
 
 - **OpenEvo Desktop**: the ordinary-user macOS app and local sidecar facade.
-- **OpenEvo Core Backend**: the remote Python backend that owns execution,
-  deployment, trajectory capture, evolution, artifacts, and typed APIs.
+- **OpenEvo Daemon**: the remote Linux backend that owns execution, deployment,
+  trajectory capture, evolution, artifacts, and typed APIs.
 
-Developer automation and source-checkout utilities are Core Backend workflows.
-Standalone benchmark automation lives outside Core and Desktop, imports Core
-capabilities, and is not a separate product surface.
+The Core implementation under `src/openevo/` is assembled into the Daemon; it
+is not a third product. Developer automation and source-checkout utilities are
+maintainer workflows. Standalone benchmark automation lives outside Core and
+Desktop, imports Core capabilities, and is not a separate product surface.
 Terminal Bench maintainer commands and package boundaries are documented in
 `../../benchmarks/terminal_bench/README.md`.
 
@@ -21,12 +22,12 @@ Terminal Bench maintainer commands and package boundaries are documented in
      gates.
 2. [Pre-release Desktop User Docs](../user/README.md)
    - Short target workflows while the packaged application is implemented.
-3. [OpenEvo Core Backend API Target](../core/backend-api.md)
+3. [OpenEvo Daemon API Target](../core/backend-api.md)
    - Typed backend routes, Desktop facade boundary, state-root reads, and error
      model.
-4. [OpenEvo Core Backend Release](core-backend-release.md)
-   - Core install artifact, backend launcher, remote install identity, and
-     release smoke evidence.
+4. [OpenEvo Daemon Release](core-backend-release.md)
+   - Daemon Bundle, backend launcher, remote install identity, and release
+     smoke evidence.
 5. [Core Control API v1 Provider](core-control-v1-provider.md)
    - Frozen remote control contract ownership, durable projects/workspaces,
      verified capabilities, service observation, SSE replay, and fail-closed gaps.
@@ -48,7 +49,7 @@ Terminal Bench maintainer commands and package boundaries are documented in
 
 ## Desktop And Remote Lifecycle
 
-Pre-release Desktop workflow notes live under `docs/user/`; Core target
+Pre-release Desktop workflow notes live under `docs/user/`; Daemon target
 contracts live under `docs/core/`. [Desktop Release Packaging](openevo-desktop-release.md)
 separates the currently executable sidecar build from the still-blocked macOS
 DMG release gates. [Desktop Active-Tunnel Core Bridge v1](desktop-core-bridge-v1.md)
@@ -56,7 +57,7 @@ documents the strict project-session bridge and its still-unwired release
 persistence boundary. Older Desktop foundation notes remain implementation
 history.
 
-## Core Backend Internals
+## Daemon And Core Internals
 
 - [Core Internal Service Supervisor](core-service-supervisor.md)
   - Host-global Core ownership of evolution, rollout, gateway, and worker
@@ -83,7 +84,7 @@ and must keep maintainer command examples machine-marked as maintainer-only.
 flowchart LR
     Desktop[OpenEvo Desktop .dmg]
     Sidecar[Local sidecar facade]
-    Backend[Remote OpenEvo Core Backend]
+    Backend[Remote OpenEvo Daemon]
     Harness[Codex or other harness]
     Store[Evolution backend]
     Methods[Method workers]
@@ -99,5 +100,5 @@ flowchart LR
 ```
 
 Desktop must not fork method registry behavior, artifact contracts, context
-resolution, remote lifecycle, or harness execution semantics. Those live in
-Core Backend.
+resolution, remote lifecycle, or harness execution semantics. Those live in the
+Daemon's Core implementation.

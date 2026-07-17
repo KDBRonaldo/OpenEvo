@@ -15,13 +15,15 @@ manifest, checksum inventory, and draft roundtrip from reviewed source.
 - Release date:
 - Commit SHA:
 - GitHub Actions run:
+- Release manifest SHA256:
+- Detached candidate evidence index and G12 attestation:
 
 ## Download And Install
 
 - Desktop DMG and supported architecture:
 - DMG SHA256:
-- Core install artifact:
-- Core descriptor and SHA256:
+- Daemon Bundle and SHA256:
+- Release manifest and SHA256:
 - Supported macOS versions:
 - Unsigned/not-notarized notice:
 - Checksum verification and Gatekeeper steps:
@@ -30,6 +32,7 @@ manifest, checksum inventory, and draft roundtrip from reviewed source.
 
 - Codex subscription transcript mode:
 - Self-deployed reference model ID, revision, vLLM profile, and hardware:
+- Restricted-network/proxy profile:
 - Textual memory:
 - Trajectory-to-skill:
 - Agent-system evolution:
@@ -48,10 +51,11 @@ manifest, checksum inventory, and draft roundtrip from reviewed source.
 - Textual-memory pass@1 rescue count and benchmark summary:
 - Trajectory-to-skill pass@1 rescue count and benchmark summary:
 - Agent-system pass@1 rescue count and benchmark summary:
-- Core clean-install and integration result:
+- Daemon Bundle clean-install and integration result:
 - Codex three-artifact science E2E result:
 - Self-deployed three-artifact science E2E result:
 - Packaged DMG smoke result:
+- Clean-host matrix result:
 - Security, privacy, diagnostics, and docs result:
 
 ## Security And Privacy

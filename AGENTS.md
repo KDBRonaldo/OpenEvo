@@ -46,10 +46,11 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 
 所有 evolution/training 方法统一只在下一 task/session 生效。一个 immutable task 的 closed
 admission record 必须 pin 同一 project head、workspace snapshot、evolution revision 和 verified
-execution snapshot；它的所有 infrastructure attempts 复用该 admission。task 完成后才封存
+runtime context/execution snapshot；它的所有 infrastructure attempts 复用该 admission。task 完成后才封存
 dataset、在 inference 进程外运行 enabled methods，并把 accepted workspace result 和全部 target
-outputs/materialization 作为一个 successor project head 原子提交。下一 task 在该 head 未完成时
-必须明确 queued/not-ready，不能静默使用 stale/partial state。不要在 method descriptor 或 method
+outputs/runtime context 作为一个 successor project head 原子提交。下一 task 在该 head 未完成时
+只能保留 draft，提交必须返回 not-ready 且不能创建 Task/admission/run，不能静默使用
+stale/partial state。不要在 method descriptor 或 method
 config 中加入各自的 online/offline timing、background/barrier 选择或 streaming/in-session ABI。
 方法差异继续通过 input bindings、execution/capture/harness/runtime requirements、config 和 typed
 outputs 表达。
@@ -115,7 +116,8 @@ SSH 直接执行。两个 API 都必须有严格 closed model、version/digest n
   当前 generation admission 固定 exact revision，下一 generation 持久化为 queued/not-ready。Activation
   在同一事务要求 queued request identity 匹配候选 revision，且仍未 pin 的当前代 queued admission 会阻止
   后续 head 推进。该 primitive 不提供 transition/readiness 证明或 run-owner 编排，不得增加绕过这些阶段
-  的任意 revision publish 入口。Execution snapshot 使用 closed typed
+  的任意 revision publish 入口。这些 queued rows 是未接入产品的 Store 内部 primitive，不是 Desktop
+  可提交的 queued Task；普通用户路径必须遵守 canonical spec 的 draft/not-ready 语义。Execution snapshot 使用 closed typed
   model/runtime/serving data；model source 必须显式声明 `hugging_face`、`managed_snapshot` 或
   `subscription`，不能持久化 host path/URI。Store 只接受 verified producer sealed 的
   `VerifiedExecutionSnapshot`，再从 typed canonical bytes 计算 ID/digest 并记录 producer ID；该对象不能

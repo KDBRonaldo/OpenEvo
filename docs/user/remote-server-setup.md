@@ -3,11 +3,11 @@
 > Pre-release target: the complete fresh-server workflow is still under
 > implementation and is not currently a supported user procedure.
 
-Before Core exists, the Desktop native host/sidecar connects over SSH, prepares
-OpenEvo-owned directories, uploads and verifies the exact Core artifact,
-installs it in a user-level environment, starts Core, and opens the local
-tunnel. After Core is healthy, Core owns doctor/repair, upgrades, services, and
-runs.
+Before the Daemon is installed, the Desktop native host/sidecar connects over
+SSH, prepares OpenEvo-owned directories, uploads and verifies the exact
+manifest-matched Daemon Bundle, installs it in a user-level environment, starts
+the Daemon, and opens the local tunnel. After the Daemon is healthy, it owns
+doctor/repair, upgrades, services, and runs.
 
 The supported setup should configure process-level proxy variables, install
 supported user-space dependencies, verify or install Codex CLI, pull managed

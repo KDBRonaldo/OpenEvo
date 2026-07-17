@@ -6,12 +6,13 @@ workflows. It has two release-facing surfaces:
 - **OpenEvo Desktop**: the macOS application used by scientists to configure a
   remote server, start runs, and inspect memory, skill, and agent-system
   evolution.
-- **OpenEvo Core Backend**: the Python runtime installed on the remote server.
-  It owns harness execution, runtime sessions, trajectory capture, datasets,
-  jobs, workers, artifacts, context resolution, deployment, and backend APIs.
+- **OpenEvo Daemon**: the application installed under the user's account on the
+  remote Linux server. It owns harness execution, runtime sessions, trajectory
+  capture, datasets, jobs, workers, artifacts, revisions, model services, and
+  the versioned control API.
 
-Desktop wraps Core Backend. Core Backend is the source of truth for execution
-and evolution behavior.
+`src/openevo/` contains the Core implementation assembled into the Daemon. Core
+is not a third release-facing application.
 
 ## User Model
 
@@ -19,13 +20,15 @@ The ordinary-user flow is:
 
 ```text
 Install OpenEvo Desktop .dmg
--> create a science project
--> configure a remote server and optional network proxy
+-> configure a remote server, SSH identity, and optional remote network proxy
 -> run doctor/bootstrap from Desktop
--> start the remote OpenEvo Core Backend
+-> install or attach the remote OpenEvo Daemon
+-> create a science project
 -> choose an execution mode currently enabled by the Desktop release
 -> launch a science run
 -> monitor services, logs, timeline, and evolved artifacts
+-> wait for or resolve the atomic successor Project Head
+-> run the next task with the committed workspace and evolved context
 ```
 
 OpenEvo Desktop should not require a scientist to install Python packages,
@@ -42,10 +45,13 @@ harness on the remote server. It requires transcript capture, does not call
 model APIs directly, and supports non-parametric evolution such as text memory,
 skill bundles, and agent-system instructions.
 
-**Self-Deployed Reference mode** is present in the Core architecture, initially
-around vLLM, but the current Desktop release marks it unavailable and blocks
-saving or running that mode. It is not a runnable Desktop product claim until
-its release gates pass.
+**Self-Deployed mode** uses a manifest-bound Hugging Face model profile served
+by Daemon-managed vLLM and still executes tasks through remote Codex.
+
+The canonical External Beta requires both modes. This repository is pre-release:
+the current build exposes a narrow Subscription path for development, marks
+Self-Deployed unavailable, and has no release-ready candidate. Those
+implementation gaps do not redefine the target product.
 
 For every enabled mode, OpenEvo is a wrapper around an existing harness. OpenEvo
 captures or ingests trajectories/transcripts, evolves typed artifacts, and
@@ -55,9 +61,9 @@ injects the selected context into later sessions.
 
 ```text
 src/openevo/
-  backend/       remote Core Backend API and launchers
+  backend/       remote Daemon control API and launchers
   deployment/    SSH, preflight, bootstrap, workspace sync, services
-  experiments/   experiment compiler, runner, and promotion gates
+  experiments/   experiment compiler and runner
   evolution/     datasets, jobs, workers, artifacts, methods, context resolver
   gateway/       proxy, runtime injection, completion capture
   harness/       Codex and other harness contracts/presets
@@ -77,7 +83,7 @@ benchmarks/
 
 docs/
   user/          ordinary-user Desktop guidance
-  core/          Core Backend contracts
+  core/          Daemon and Core contracts
   architecture/  current architecture notes
   maintainer/    release, process, and migration material
 
@@ -89,22 +95,24 @@ examples/
   research-benchmarks/
 ```
 
-The product dependency direction is `desktop -> src/openevo`; Core Backend must
-not import Desktop code. Standalone benchmark packages may import Core
-contracts, while Core and Desktop must not import or package benchmark code.
+The product dependency direction is `Desktop -> versioned Daemon contracts` and
+`Daemon -> Core implementation`; Core must not import Desktop code. Standalone
+benchmark packages may use exact-version Core or versioned Daemon contracts,
+while Core and Desktop must not import or package benchmark code.
 
-## Core Backend
+## Daemon Maintainer Entrypoints
 
-The Python package is named `openevo`. The public console entrypoint is the
-server-side backend launcher:
+The Core Python package is named `openevo`. Its command entrypoint is a
+server-side Daemon launcher and maintainer tool, not an ordinary-user CLI
+product:
 
 ```bash
 openevo-backend --help
 openevo-backend serve --help
 ```
 
-`openevo-backend serve` starts the typed backend API used by Desktop through an
-SSH tunnel. `openevo-backend run` is a backend maintenance and automation
+`openevo-backend serve` starts the typed Daemon API used by Desktop through an
+SSH tunnel. `openevo-backend run` is a maintenance and automation
 entrypoint for experiment snapshots; it is not the ordinary-user product UI.
 
 Maintainer-only backend automation smoke:
@@ -153,43 +161,12 @@ cargo metadata --locked --format-version 1
 cargo test --locked
 ```
 
-Desktop's local provider store keeps the idempotency reservation for every
-nonterminal local operation even after the normal retention deadline. Startup
-and replay require that reservation's canonical response and unique operation
-ID to match an operation-side authority digest over the full action identity,
-request digest, resource scope, and operation kind. Operation reads and replays
-do not reconcile or cancel live work, and every nonterminal operation must fit
-its fixed startup-cancellation slot before it is persisted. A nullable operation
-authority is only an in-transaction staging state: every mutation precommit and
-startup recovery rejects any operation without a digest. Before startup changes
-resource state or cancels work, every live operation must have exactly one
-canonical idempotency row with the same route, scope, key, request digest, kind,
-operation ID, and authority digest, and its fixed terminal reservation must fit.
-Corrupt live records are never converted into cancellation records. The
-canonical v2 schema fingerprint is the only accepted v2 authority: the
-unreleased intermediate branch-private v2 layout is rejected at startup without
-migration. Terminal reservations become eligible for ordinary retention cleanup.
-
-Run retry recovery also preserves one exact mutation intent across an ambiguous
-transport or response-validation outcome. The release provider may replay that
-same run ID, idempotency key, ETag, and observed renderer epoch after later
-refreshes advance the view; a new or cross-wired intent must pass the current
-snapshot checks. A typed API rejection ends this replay authority immediately
-and does not start reconciliation polling. Before transport, the provider saves
-a bounded, non-secret copy of the original run and intent in the Tauri native
-host app data directory for `org.openevo.desktop`, not WebView storage, so a
-renderer or application restart cannot mint a second action.
-A 2xx response is accepted only when it preserves the complete canonical prefix,
-same project, and exactly one new current attempt. The provider then overlays the
-validated run into both its own cache and the renderer until a fresh Core
-aggregate independently proves that same appended attempt.
-
-Current release smoke checks are pre-External-Beta maintainer checks. They
-validate Core Backend wheel identity and Desktop asset packaging, but they do
-not publish GitHub Release assets, PyPI artifacts, or a release-ready `.dmg`.
-The External Beta release gates and required Core, DMG, checksum, and
-release-note artifacts are defined in
-`docs/maintainer/productization/spec.md`.
+Current pull-request release smokes are pre-External-Beta maintainer checks.
+They validate the Core wheel identity and Desktop packaging without publishing.
+The separately dispatched packaging rehearsal may upload an unsigned draft
+prerelease, but its interim wheel and DMG are not a release-ready candidate.
+The External Beta release gates and required Daemon Bundle, DMG, checksum, and
+release-note artifacts are defined in `docs/maintainer/productization/spec.md`.
 
 ## Pre-External-Beta Release Smoke
 
@@ -198,13 +175,13 @@ release contract. It is useful for local regression checks, but it is not the
 release process and does not create a releasable DMG, GitHub Release, or PyPI
 artifact.
 
-External Beta release work must use the descriptor-matched Core artifact, the
+External Beta release work must use the manifest-matched Daemon Bundle, the
 exact packaged DMG and checksums, and the release gates in
 `docs/maintainer/productization/spec.md`. PyPI is not part of this release.
 
 ## Examples
 
-- `examples/science-minimal/`: smallest Core Backend experiment config.
+- `examples/science-minimal/`: smallest Core experiment config.
 - `examples/science-with-local-folder/`: ordinary science project shape that
   uses a user workspace folder.
 - `examples/self-deployed-model/`: Self-Deployed Reference model-serving
@@ -221,7 +198,7 @@ artifacts, and context inputs that Desktop-backed runs use.
 ## Documentation
 
 - User guidance: [docs/user/README.md](docs/user/README.md)
-- Core Backend API: `docs/core/backend-api.md`
+- Daemon/Core API: `docs/core/backend-api.md`
 - Release-facing architecture index: `docs/architecture/README.md`
 - Security policy: [SECURITY.md](SECURITY.md)
 - Runtime and evolution contracts:
