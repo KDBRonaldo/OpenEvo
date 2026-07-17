@@ -240,10 +240,14 @@ closed stages observed during the launch; transient probe regressions cannot
 downgrade that primary stage, and diagnostics do not include process commands,
 paths, or credentials. Native renderer diagnostics use only the closed
 `OPENEVO_DESKTOP_RENDERER_STAGE_V1` vocabulary. Renderer-owned reports are
-restricted by the native command type to `provider_created`,
-`provider_create_failed`, `initial_snapshot_failed`, and `product_committed`;
-they cannot emit native lifecycle or readiness stages. Final success still
-requires the V2 ready marker. The smoke
+restricted by the native command type to the fixed
+`bootstrap_context_{validated,failed}`,
+`local_api_version_{verified,failed}`, `retry_recovery_{ready,failed}`,
+`provider_adapter_{ready,failed}`, `provider_{created,create_failed}`,
+`initial_snapshot_failed`, and `product_committed` stages. The phase markers
+carry no exception text, endpoint, credential, path, or user data, and they
+cannot emit native lifecycle or readiness stages. Final success still requires
+the V2 ready marker. The smoke
 signals the app process group only while its unreaped `Popen` child reserves the
 leader PID; once `poll` or `wait` has reaped that child, the numeric group is
 observation-only. Sidecar groups are terminated by the native host and
@@ -307,6 +311,14 @@ header set. That exact set includes browser-generated `Cache-Control` and
 API reads. It does not allow wildcard,
 credentialed, lookalike-origin, unknown-method, or unknown-header requests;
 preflight runs before Desktop session authentication.
+The macOS bundle merges `desktop/src-tauri/Info.plist` to permit cleartext
+transport only for the exact numeric `127.0.0.1` exception used by the native
+bootstrap. Broad ATS escape hatches such as `NSAllowsLocalNetworking`,
+`NSAllowsArbitraryLoads`, and `NSAllowsArbitraryLoadsInWebContent` are
+forbidden.
+This changes WebKit transport permission only; the bootstrap schema still
+rejects every non-numeric-loopback endpoint and CORS remains independently
+closed.
 SQLite may report an OS-canonical spelling of that database path, including the
 macOS `/var` to `/private/var` alias. The provider therefore requires an absolute
 `PRAGMA database_list` path and requires the SQLite-reported path and managed

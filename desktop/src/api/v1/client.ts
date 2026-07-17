@@ -88,6 +88,12 @@ export interface DesktopClientOptions {
   readonly allowedProviderKinds?: readonly DesktopBootstrapContextV1["negotiated_contract"]["provider_kind"][];
 }
 
+export interface DesktopBootstrapContractOptions {
+  readonly supportedMajors: readonly number[];
+  readonly acceptedOpenApiDigests: NonEmptyReadonlyArray<string>;
+  readonly allowedProviderKinds: readonly DesktopBootstrapContextV1["negotiated_contract"]["provider_kind"][];
+}
+
 export interface CreateRequestOptions {
   readonly idempotencyKey: string;
 }
@@ -168,6 +174,26 @@ export class ContractVersionUnsupportedError extends Error {
     this.clientSupportedMajors = clientSupportedMajors;
     this.serverSupportedMajors = serverSupportedMajors;
   }
+}
+
+export function validateDesktopBootstrapContext(
+  input: unknown,
+  options: DesktopBootstrapContractOptions,
+): DesktopBootstrapContextV1 {
+  const bootstrap = desktopBootstrapContextV1Schema.parse(input);
+  if (!options.supportedMajors.includes(bootstrap.negotiated_contract.major)) {
+    throw new ContractVersionUnsupportedError(
+      options.supportedMajors,
+      [bootstrap.negotiated_contract.major],
+    );
+  }
+  if (!options.acceptedOpenApiDigests.includes(bootstrap.negotiated_contract.openapi_sha256)) {
+    throw new DesktopContractError("Tauri bootstrap reported an unknown OpenAPI digest");
+  }
+  if (!options.allowedProviderKinds.includes(bootstrap.negotiated_contract.provider_kind)) {
+    throw new DesktopContractError("Tauri bootstrap reported a forbidden provider kind");
+  }
+  return bootstrap;
 }
 
 export interface NegotiatedVersion {
@@ -265,19 +291,11 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
     if (!bootstrapPromise) {
       bootstrapPromise = options
         .bootstrap()
-        .then((input) => desktopBootstrapContextV1Schema.parse(input))
-        .then((bootstrap) => {
-          if (!supportedMajors.includes(bootstrap.negotiated_contract.major)) {
-            throw new ContractVersionUnsupportedError(supportedMajors, [bootstrap.negotiated_contract.major]);
-          }
-          if (!acceptedOpenApiDigests.includes(bootstrap.negotiated_contract.openapi_sha256)) {
-            throw new DesktopContractError("Tauri bootstrap reported an unknown OpenAPI digest");
-          }
-          if (!allowedProviderKinds.includes(bootstrap.negotiated_contract.provider_kind)) {
-            throw new DesktopContractError("Tauri bootstrap reported a forbidden provider kind");
-          }
-          return bootstrap;
-        })
+        .then((input) => validateDesktopBootstrapContext(input, {
+          supportedMajors,
+          acceptedOpenApiDigests,
+          allowedProviderKinds,
+        }))
         .catch((error) => {
           bootstrapPromise = null;
           throw error;
