@@ -203,7 +203,8 @@ The packaging-level native smoke is
 `CFBundleExecutable` from `Info.plist` and launches that exact
 `Contents/MacOS` process; directly executing the bundled sidecar is not app
 evidence. On macOS it requires the credential-free V2 native process marker,
-the renderer-ready marker, a visible renderer window, the packaged sidecar's
+the renderer-ready marker from the committed product shell, a non-empty `main`
+WebView, the packaged sidecar's
 IPv4 loopback listener on inherited FD 3, and a regular executable FD 4 whose
 device, inode, and size match the native marker whose verified digest binds it
 to the bundled externalBin. The marker PID's Darwin birth identity is re-read
@@ -213,8 +214,8 @@ boundary until native cleanup. The smoke does not reopen the pathname reported
 by `lsof`; it trusts only the marker-bound live FD identity. Its macOS probes
 share the 120-second app-smoke readiness deadline and run in private sessions.
 The native host retains a separate 60-second bounded allowance for a cold
-PyInstaller onefile startup; the larger outer deadline also covers renderer,
-FD, and window observation. Cleanup subsequently keeps its separate 5-second
+PyInstaller onefile startup; the larger outer deadline also covers renderer and
+FD observation. Cleanup subsequently keeps its separate 5-second
 termination and 15-second process-group disappearance bounds. Timeout cleanup uses
 a bounded ancestry snapshot to kill an observed child that escaped with
 `setsid`, then kills the root group and reaps the direct leader. Observation
@@ -253,9 +254,15 @@ and an observed-stage set drawn only from this closed vocabulary:
 or `renderer_ack_absent`. Probe deadline exhaustion and transient shallower
 probe failures cannot replace the deepest product readiness stage reached;
 timeout diagnostics also list only the closed stages observed during that
-launch. The V2 renderer marker is host-bound to a visible,
-non-empty `main` WebView; unit coverage rejects a hidden, zero-sized, or
-non-main invoking window. A macOS-only contract test
+launch. Renderer diagnostics are also restricted to the closed
+`OPENEVO_DESKTOP_RENDERER_STAGE_V1` vocabulary. The V2 renderer marker is
+host-bound to a non-empty `main` WebView after the authoritative product
+snapshot commits; unit coverage rejects a zero-sized or non-main invoking
+window, while logical visibility remains diagnostic on direct-binary runners.
+A Local API regression separately verifies exact Tauri origins, methods,
+standard safelisted plus renderer-owned request headers, preflight-before-session
+ordering, and CORS coverage outside the server-error boundary.
+A macOS-only contract test
 calls `proc_pidinfo` for the live test process and compares `lsof -FDiT` output
 against a real regular file and loopback listener before packaging. Both macOS
 gates additionally repeat the

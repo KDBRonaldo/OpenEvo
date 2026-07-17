@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from functools import wraps
 from typing import Annotated, Literal, NoReturn, Protocol
 
@@ -145,8 +145,12 @@ def _bind_provider(app: FastAPI, provider: DesktopLocalApiProviderV1) -> None:
         route.dependant.call = invoke_provider
 
 
-def create_contract_app(provider: DesktopLocalApiProviderV1 | None = None) -> FastAPI:
-    app = FastAPI(
+def create_contract_app(
+    provider: DesktopLocalApiProviderV1 | None = None,
+    *,
+    _app_factory: Callable[..., FastAPI] = FastAPI,
+) -> FastAPI:
+    app = _app_factory(
         title="OpenEvo Desktop Local API",
         summary="Strict renderer-to-sidecar product contract.",
         description=(

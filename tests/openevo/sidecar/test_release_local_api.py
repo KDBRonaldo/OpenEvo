@@ -229,6 +229,86 @@ def _project(profile_id: str, *, name: str = "Protein design") -> dict[str, obje
     }
 
 
+def test_release_local_api_allows_only_packaged_tauri_cors_origins(tmp_path: Path) -> None:
+    app = _app(tmp_path / "state")
+
+    with TestClient(app) as client:
+        discovery = client.get("/version", headers={"Origin": "tauri://localhost"})
+        preflight = client.options(
+            "/desktop/v1/state",
+            headers={
+                "Origin": "http://tauri.localhost",
+                "Access-Control-Request-Method": "PATCH",
+                "Access-Control-Request-Headers": (
+                    "Content-Type, X-OpenEvo-Desktop-Session, Idempotency-Key, "
+                    "If-Match, Last-Event-ID"
+                ),
+            },
+        )
+        forbidden_method = client.options(
+            "/desktop/v1/state",
+            headers={
+                "Origin": "tauri://localhost",
+                "Access-Control-Request-Method": "PUT",
+                "Access-Control-Request-Headers": "Content-Type",
+            },
+        )
+        forbidden_header = client.options(
+            "/desktop/v1/state",
+            headers={
+                "Origin": "tauri://localhost",
+                "Access-Control-Request-Method": "PATCH",
+                "Access-Control-Request-Headers": "X-Not-Allowed",
+            },
+        )
+        hostile = client.get(
+            "/version",
+            headers={"Origin": "https://tauri.localhost.attacker.example"},
+        )
+
+    assert discovery.status_code == 200
+    assert discovery.headers["access-control-allow-origin"] == "tauri://localhost"
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == "http://tauri.localhost"
+    assert {
+        value.strip().lower()
+        for value in preflight.headers["access-control-allow-headers"].split(",")
+    } == {
+        "accept",
+        "accept-language",
+        "content-language",
+        "content-type",
+        "idempotency-key",
+        "if-match",
+        "last-event-id",
+        "x-openevo-desktop-session",
+    }
+    assert {
+        value.strip()
+        for value in preflight.headers["access-control-allow-methods"].split(",")
+    } == {"GET", "POST", "PATCH", "DELETE"}
+    assert forbidden_method.status_code == 400
+    assert forbidden_header.status_code == 400
+    assert "access-control-allow-origin" not in hostile.headers
+
+
+def test_release_local_api_applies_cors_outside_unhandled_errors(tmp_path: Path) -> None:
+    app = _app(tmp_path / "state")
+
+    @app.get("/_test/unhandled", include_in_schema=False)
+    def unhandled_error() -> None:
+        raise RuntimeError("test canary")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get(
+            "/_test/unhandled",
+            headers={"Origin": "tauri://localhost"},
+        )
+
+    assert response.status_code == 500
+    assert response.headers["access-control-allow-origin"] == "tauri://localhost"
+
+
 def _create_profile(client: TestClient, *, name: str, key: str):
     return client.post(
         "/desktop/v1/profiles",

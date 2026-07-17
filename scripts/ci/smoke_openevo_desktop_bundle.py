@@ -43,6 +43,7 @@ REQUIRED_BOOLEAN_EVIDENCE = (
 MACH_O_ARCHITECTURES = {"arm64", "x86_64"}
 NATIVE_PROCESS_MARKER_PREFIX = b"OPENEVO_DESKTOP_SIDECAR_PROCESS_"
 NATIVE_RENDERER_MARKER_PREFIX = b"OPENEVO_DESKTOP_RENDERER_READY_"
+NATIVE_RENDERER_STAGE_MARKER_PREFIX = b"OPENEVO_DESKTOP_RENDERER_STAGE_"
 NATIVE_HOST_LOG_MAX_BYTES = 64 * 1024
 NATIVE_HOST_LOG_MAX_LINES = 512
 NATIVE_GROUP_MAX_PROCESSES = 16
@@ -60,6 +61,20 @@ _NATIVE_READINESS_STAGE_RANK = {
     stage: rank for rank, stage in enumerate(NATIVE_READINESS_STAGES)
 }
 PROBE_DEADLINE_STAGE = "probe_deadline_exhausted"
+NATIVE_RENDERER_STAGES = frozenset(
+    {
+        "sidecar_start_requested",
+        "sidecar_start_returned",
+        "sidecar_start_failed",
+        "ready_requested",
+        "window_identity_valid",
+        "window_identity_invalid",
+        "window_visible",
+        "window_not_visible",
+        "window_visibility_unknown",
+        "ready_validation_failed",
+    }
+)
 _NATIVE_PROCESS_MARKER_PATTERN = re.compile(
     rb"OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
     rb"pid=([1-9][0-9]{0,9}) pgid=([1-9][0-9]{0,9}) "
@@ -69,6 +84,9 @@ _NATIVE_PROCESS_MARKER_PATTERN = re.compile(
 )
 _NATIVE_RENDERER_MARKER_PATTERN = re.compile(
     rb"OPENEVO_DESKTOP_RENDERER_READY_V2 ([0-9a-f]{64})"
+)
+_NATIVE_RENDERER_STAGE_MARKER_PATTERN = re.compile(
+    rb"OPENEVO_DESKTOP_RENDERER_STAGE_V1 ([a-z_]{1,64})"
 )
 
 
@@ -87,6 +105,7 @@ class NativeHostObservation(NamedTuple):
     active_process: NativeSidecarProcessMarker | None
     renderer_ready: bool
     process_groups: frozenset[int]
+    renderer_stages: frozenset[str] = frozenset()
 
 
 class NativeFileDescriptorObservation(NamedTuple):
@@ -509,7 +528,15 @@ def _parse_native_host_observation(
     active_process: NativeSidecarProcessMarker | None = None
     renderer_ready = False
     process_groups: set[int] = set()
+    renderer_stages: set[str] = set()
     for line in lines:
+        if line.startswith(NATIVE_RENDERER_STAGE_MARKER_PREFIX):
+            matched = _NATIVE_RENDERER_STAGE_MARKER_PATTERN.fullmatch(line)
+            stage = matched.group(1).decode("ascii") if matched is not None else None
+            if stage not in NATIVE_RENDERER_STAGES:
+                raise SmokeFailure("Native host renderer stage is malformed")
+            renderer_stages.add(stage)
+            continue
         if line.startswith(NATIVE_PROCESS_MARKER_PREFIX):
             matched = _NATIVE_PROCESS_MARKER_PATTERN.fullmatch(line)
             if matched is None:
@@ -567,6 +594,7 @@ def _parse_native_host_observation(
         active_process=active_process,
         renderer_ready=renderer_ready,
         process_groups=frozenset(process_groups),
+        renderer_stages=frozenset(renderer_stages),
     )
 
 
@@ -959,6 +987,7 @@ def smoke_bundle(
         evidence: dict[str, object] | None = None
         readiness_stage = "native_marker_absent"
         observed_readiness_stages = {readiness_stage}
+        observed_renderer_stages: set[str] = set()
         deadline = time.monotonic() + timeout_seconds
         captured_error: BaseException | None = None
         try:
@@ -968,6 +997,7 @@ def smoke_bundle(
                     native_stderr_buffer,
                     process_groups,
                 )
+                observed_renderer_stages.update(native_observation.renderer_stages)
                 if sys.platform == "darwin":
                     if process.poll() is None:
                         evidence, observed_groups, candidate_stage = _macos_native_evidence(
@@ -1006,7 +1036,8 @@ def smoke_bundle(
                 raise SmokeFailure(
                     "Timed out waiting for OpenEvo Desktop app smoke evidence "
                     f"(stage={readiness_stage}; observed_stages="
-                    f"{','.join(sorted(observed_readiness_stages))})"
+                    f"{','.join(sorted(observed_readiness_stages))}; renderer_stages="
+                    f"{','.join(sorted(observed_renderer_stages)) or 'none'})"
                 )
         except BaseException as exc:
             captured_error = exc

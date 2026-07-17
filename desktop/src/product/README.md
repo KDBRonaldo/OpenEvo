@@ -15,6 +15,11 @@ Release startup has one entry point: `createReleaseDesktopProductProvider`.
 It accepts a provider only after the Tauri bootstrap and `DesktopApiClientV1`
 agree on contract major, checked-in OpenAPI digest, provider kind, and required
 features. The contract simulator is test-only and is not a release fallback.
+The final native renderer acknowledgement is deferred until the provider has
+loaded an authoritative snapshot and React has committed the actual product
+shell. A bootstrap placeholder or provider object alone cannot satisfy the
+packaged app smoke; acknowledgement failure tears down that exact sidecar
+session and returns to the explicit startup failure state.
 The `openevo-desktop` Vite mode replaces the general provider-kind parser with
 `providerKinds.release.ts`, whose only accepted value is `desktop_sidecar`.
 Rollup can then remove simulator, scaffold, and dry-run provider definitions and

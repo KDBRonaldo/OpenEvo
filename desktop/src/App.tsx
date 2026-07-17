@@ -133,10 +133,16 @@ export function SharedDashboardShell() {
   );
 }
 
-export function OpenEvoDesktopOnlyShell({ provider }: { provider?: DesktopProductProvider }) {
+export function OpenEvoDesktopOnlyShell({
+  provider,
+  onReady,
+}: {
+  provider?: DesktopProductProvider;
+  onReady?: () => void;
+}) {
   return (
     <Routes>
-      <Route path="*" element={<DesktopProductApp provider={provider} />} />
+      <Route path="*" element={<DesktopProductApp provider={provider} onReady={onReady} />} />
     </Routes>
   );
 }
@@ -147,6 +153,11 @@ export function AppShell({ desktopOnly = false, productProvider }: { desktopOnly
 
 type ReleaseDesktopStartupState =
   | { readonly status: "loading" }
+  | {
+      readonly status: "committing";
+      readonly provider: DesktopProductProvider;
+      readonly generation: number;
+    }
   | { readonly status: "ready"; readonly provider: DesktopProductProvider }
   | { readonly status: "failed" };
 
@@ -160,6 +171,7 @@ export function ReleaseDesktopProductShell({
   reportReady?: () => Promise<void>;
 }) {
   const generation = useRef(0);
+  const readinessGeneration = useRef<number | null>(null);
   const lifecycle = useRef<Promise<void>>(Promise.resolve());
   const [startup, setStartup] = useState<ReleaseDesktopStartupState>({ status: "loading" });
 
@@ -191,12 +203,7 @@ export function ReleaseDesktopProductShell({
           await stopProvider();
           return;
         }
-        await reportReady();
-        if (generation.current !== requestGeneration) {
-          await stopProvider();
-          return;
-        }
-        setStartup({ status: "ready", provider });
+        setStartup({ status: "committing", provider, generation: requestGeneration });
       } catch {
         try {
           await stopProvider();
@@ -208,7 +215,36 @@ export function ReleaseDesktopProductShell({
         }
       }
     });
-  }, [createProvider, enqueueLifecycle, reportReady, stopProvider]);
+  }, [createProvider, enqueueLifecycle, stopProvider]);
+
+  const reportCommittedProduct = useCallback((
+    committingGeneration: number,
+    provider: DesktopProductProvider,
+  ) => {
+    if (readinessGeneration.current === committingGeneration) return;
+    readinessGeneration.current = committingGeneration;
+    void enqueueLifecycle(async () => {
+      if (generation.current !== committingGeneration) return;
+      try {
+        // Effects run only after React has committed the product shell. The
+        // native marker therefore proves the packaged product UI, not merely
+        // the bootstrap placeholder, reached the invoking main WebView.
+        await reportReady();
+        if (generation.current === committingGeneration) {
+          setStartup({ status: "ready", provider });
+        }
+      } catch {
+        try {
+          await stopProvider();
+        } catch {
+          // Native cleanup is bounded; startup remains explicitly retryable.
+        }
+        if (generation.current === committingGeneration) {
+          setStartup({ status: "failed" });
+        }
+      }
+    });
+  }, [enqueueLifecycle, reportReady, stopProvider]);
 
   useEffect(() => {
     start();
@@ -218,6 +254,14 @@ export function ReleaseDesktopProductShell({
     };
   }, [cancelLifecycle, start]);
 
+  if (startup.status === "committing") {
+    return (
+      <OpenEvoDesktopOnlyShell
+        provider={startup.provider}
+        onReady={() => reportCommittedProduct(startup.generation, startup.provider)}
+      />
+    );
+  }
   if (startup.status === "ready") {
     return <OpenEvoDesktopOnlyShell provider={startup.provider} />;
   }

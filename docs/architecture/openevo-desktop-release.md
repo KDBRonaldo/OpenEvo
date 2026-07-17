@@ -224,15 +224,20 @@ FD. The private pathname remains inside the documented same-UID trust boundary
 until native cleanup; the smoke does not reopen an `lsof` pathname because the
 marker and live FD identity, rather than that pathname, are the observation
 authority. The separate `OPENEVO_DESKTOP_RENDERER_READY_V2` acknowledgement is
-emitted only after the invoking Tauri WebView is the visible `main` window with
-a non-zero inner size and the renderer has completed the frozen Local API
-bootstrap. The digest-bound marker therefore carries the renderer and native
-window readiness proof without an external Swift/CoreGraphics compiler probe.
-Failure to validate the invoking window fails closed inside the host. Timeout
+emitted only after the invoking Tauri WebView is the `main` window with a
+non-zero inner size and the renderer has loaded an authoritative Local API
+snapshot and committed the product shell. The digest-bound marker therefore
+carries renderer, product-commit, and native window-identity proof without an
+external Swift/CoreGraphics compiler probe. A direct-binary GitHub runner has
+no interactive Aqua visibility contract, so `NSWindow.isVisible` is recorded
+only as one of the closed diagnostics and is not release authority. Failure to
+validate the invoking window identity fails closed inside the host. Timeout
 output is restricted to the deepest closed readiness stage reached and the
 closed stages observed during the launch; transient probe regressions cannot
 downgrade that primary stage, and diagnostics do not include process commands,
-paths, or credentials. The smoke
+paths, or credentials. Native renderer diagnostics use only the closed
+`OPENEVO_DESKTOP_RENDERER_STAGE_V1` vocabulary; final success still requires
+the V2 ready marker. The smoke
 signals the app process group only while its unreaped `Popen` child reserves the
 leader PID; once `poll` or `wait` has reaped that child, the numeric group is
 observation-only. Sidecar groups are terminated by the native host and
@@ -286,6 +291,14 @@ mounts only that release Local API and the audited product web. It does not
 construct the legacy sidecar app, expose `/openevo-api/*`, translate the Desktop
 session header into a legacy mutation token, or accept a backend base URL. Its
 durable provider state is isolated under `<Desktop config root>/local-api-v1`.
+The release Local API wraps the complete FastAPI/Starlette application,
+including its server-error boundary, in strict CORS so bounded failures remain
+readable by the packaged renderer. It allows exactly
+`tauri://localhost` and `http://tauri.localhost`, the four used HTTP methods,
+the standard CORS-safelisted headers, and the renderer contract's bounded
+header set. It does not allow wildcard,
+credentialed, lookalike-origin, unknown-method, or unknown-header requests;
+preflight runs before Desktop session authentication.
 SQLite may report an OS-canonical spelling of that database path, including the
 macOS `/var` to `/private/var` alias. The provider therefore requires an absolute
 `PRAGMA database_list` path and requires the SQLite-reported path and managed
