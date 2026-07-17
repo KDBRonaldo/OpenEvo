@@ -721,7 +721,7 @@ The adapter between the two v1 contracts is deterministic and fail closed:
 | Scratch source | Core creates its signed empty workspace snapshot. |
 | Native-folder `import_id` | Sidecar resolves the private canonical archive and completes the Core upload session; React never handles archive bytes. |
 | Validate current project | Sidecar fetches current Core project refs and verified capabilities, then submits Core project validation. |
-| Run current project | Sidecar fetches the active head and any reachable successor, selects the exact Core-required revision, validates, and submits Core run creation. |
+| Run current project | Current v1 sidecar fetches the active revision and may also inspect a reachable successor. Its legacy successor-selection behavior is release-blocking; the canonical path submits only an active Project Head after the not-ready check below. |
 | Core SSE change | Sidecar validates the complete Core event, updates its remote snapshot cache, and emits only an ETag/digest-bound Local invalidation. |
 
 Missing tunnel, contract mismatch, stale Local ETag, release-unavailable mode,
@@ -742,12 +742,12 @@ reported ETag. An applied imported-draft outcome with no active revision retains
 its pre-patch base revision as effective authority. If the base is also empty,
 only `null` or a same-project generation-zero first revision is accepted.
 
-Required-revision selection is fixed: if Core reports a reachable queued or
-preparing successor for the active head, the new task requires that successor
-and remains queued until Core activates it. Otherwise it requires the current
-active head. Desktop never skips a pending valid successor to start against
-stale context, and it never treats failed or cancelled materialization as an
-admissible revision.
+Current v1 still has a legacy required-revision path that can select a reachable
+queued or preparing successor. It is not the release contract and must be
+removed rather than extended. The canonical path accepts only the active
+Project Head. Any pending, failed, or unresolved successor returns typed
+not-ready before Task creation; Desktop keeps a local draft and never queues a
+Task against uncommitted or stale context.
 
 ## Core Control API v1
 
@@ -805,6 +805,13 @@ DELETE /v1/diagnostics/{diagnostic_id}
 POST   /v1/maintenance/cache-cleanup
 GET    /v1/events
 ```
+
+This current v1 surface lacks the canonical close-incomplete-Task,
+transition-retry, replacement-plan, abandon, and historical-restore actions.
+Those are release blockers, not optional follow-up routes. They require a new
+negotiated API contract major with idempotent action identities and
+expected-head/transition compare-and-set fields before the corresponding
+Desktop workflows can be considered implemented.
 
 The sidecar derives `project_id` only from the active project session and sends
 it in every Core artifact read path. Core authorizes metadata, content, and diff
@@ -941,30 +948,33 @@ the terminal revision and transition states cannot disagree.
 
 `RunCreateV1` references Core-owned immutable project, task, and workspace
 snapshot objects, an expected capability registry digest, and a required
-revision proven reachable from the active head. Execution and capture modes
-come from the authoritative Core project; the create request cannot override
-them.
-The required revision may still be queued or preparing: Core accepts the run
-but keeps it queued until that exact revision is atomically active. A failed or
-cancelled revision cannot be required. The request does not accept arbitrary
-runtime/model maps, host paths, shell commands, benchmark fields, or a
-client-authored admission envelope.
+Project Head that must be active. Execution and capture modes come from the
+authoritative Core project; the create request cannot override them. When a
+successor is queued or preparing, Core returns typed not-ready before creating a
+Task, admission, or run. A failed or cancelled successor cannot be required. The
+request does not accept arbitrary runtime/model maps, host paths, shell
+commands, benchmark fields, or a client-authored admission envelope.
+
+The implemented v1 `RevisionRefV1` does not yet provide the canonical distinct
+Project Head, Evolution Revision, Runtime Context Snapshot, and verified
+effective execution identities. A new negotiated API contract major must
+introduce those distinct opaque references plus an immutable admission and
+execution receipt before release. Existing generic revision fields cannot
+acquire context-dependent meanings.
 
 The run state machine is
 `queued -> preparing -> running -> succeeded|failed|cancelled`, with the
-additional transient `cancelling` state. A queued run includes a closed reason
-with code, user-safe summary, and optional retry delay;
-`required_revision_uncommitted` means the requested next session cannot start
-yet. `admitted_at` records the admission boundary. Before admission both it and
-`pinned_revision` are null; Core must not copy the required revision into the pin.
-After admission both are non-null, and `preparing`, `running`, `cancelling`, and
-every post-admission terminal response retain the exact pin. A cancellation
-before admission remains unpinned. A zero-attempt run waiting on a successor may
-therefore remain queued with both values null. `required_revision` always preserves the complete
-revision, reachable-head ID, and `active|successor` relation. An active required
-revision has no successor transition, so `revision_transition` is null; a
-successor relation requires a transition whose full predecessor and successor
-refs match the required relation. List, detail, and context responses preserve
+additional transient `cancelling` state. An initially admitted queued run
+includes a closed reason with code, user-safe summary, and optional retry delay;
+it already owns a closed admission that pins the active Project Head. This
+queueing is for admitted resource/service scheduling, never for waiting on an
+uncommitted successor.
+
+Current v1 retry is a release-blocking exception: it appends an attempt and then
+clears `admitted_at` and `pinned_revision` while awaiting re-admission, as
+documented below. The new API major must remove that reset. Every initial or
+retried queued attempt must remain under the Task's one immutable admission and
+unchanged Head/execution pins. List, detail, and context responses preserve
 those identities, current attempt/error, `updated_at`, and strong ETag. A run
 has at most 100 attempts; detail embeds all of them in contiguous number order,
 and current attempt ID, number, status, error, and run ID must match the run.
@@ -1062,6 +1072,11 @@ as the renderer. All subsequent reads and mutations therefore use the same run.
 Every lagging, omitting, or otherwise non-proving aggregate remains behind that
 overlay, regardless of its attempt count, until a fresh Core aggregate
 independently proves the same appended attempt ID and prefix.
+
+That admission reset is an exact description of the frozen v1 response, not an
+accepted release behavior. The migrated provider must instead validate one
+appended attempt under the unchanged immutable admission and must reject any
+retry response that clears or recomputes its Head or effective-execution pins.
 
 Evolution is cross-session. A successful task seals its dataset, runs every
 enabled target, validates and materializes all outputs, and then atomically

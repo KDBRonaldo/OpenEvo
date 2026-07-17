@@ -16,54 +16,74 @@ from one reviewed `stable` commit. The workflow builds only its macOS runner
 architecture, mounts the exact candidate DMG, launches its real Tauri app,
 copies that app to a temporary installation location, detaches the image, and
 launches the copied app again. It verifies the Tauri executable and sidecar
-Mach-O slices in both launches with `file` and `lipo`, verifies the same final
-Core wheel on Linux, and creates an unsigned draft prerelease.
+Mach-O slices in both launches with `file` and `lipo`, verifies the same
+interim Core wheel on Linux, and creates an unsigned draft prerelease.
 It uploads all assets, downloads them into a clean directory, and validates the
 exact closed manifest before leaving the draft for review. Passing this
 packaging rehearsal does not satisfy the science E2E, benchmark,
-secret-canary/privacy, signing, notarization, or final publication gates.
+secret-canary/privacy, clean-host Daemon Bundle, or final publication gates.
 
 PyPI is not part of the unsigned External Beta. The ordinary-user artifact is
-the macOS Desktop DMG; Desktop installs the descriptor-matched Core artifact on
+the macOS Desktop DMG; Desktop installs the manifest-matched Daemon Bundle on
 the remote server.
+
+The current packaging-only workflow still emits a Core wheel and
+`core-install-artifact.json` as an implementation rehearsal. Those interim
+assets are not the External Beta Daemon Bundle and cannot satisfy G3, G4, or
+G12. The final candidate workflow must replace that composition with the
+bundle and release-manifest contract below.
 
 ## Required Outputs
 
-- one OpenEvo Desktop DMG for the architecture actually built and declared by
-  the runner; the current workflow does not claim a universal build;
+- one Apple Silicon OpenEvo Desktop DMG for the exact architecture declared by
+  the canonical release manifest;
 - DMG SHA256 checksum;
-- exact Core install artifact and SHA256 checksum;
-- Core descriptor containing version, compatibility, source commit, artifact
-  name, and checksum; the current closed compatibility is Python `>=3.11` on
-  `linux-x86_64`;
+- exact Linux x86-64 Daemon Bundle and SHA256 checksum;
+- release manifest containing Desktop/Daemon/protocol versions, compatibility,
+  source commit, exact artifact identities, closed environment matrix, and gate
+  profile/evidence identities;
 - candidate manifest and canonical checksum inventory binding the DMG, exact
-  Core wheel, framework lock, Core descriptor, source commit, architecture,
-  native smoke evidence, and supply-chain reports;
+  Daemon Bundle, release manifest, source commit, architecture, native smoke
+  evidence, and supply-chain reports;
+- source tag or source archive bound to the candidate commit;
 - release notes;
+- supported-environment and known-limitation statements;
 - dependency lock, practical vulnerability, and license results for shipped
-  Python, npm, and Rust dependencies, including the exact third-party-only
-  Python requirements input audited by `pip-audit`;
-- benchmark summaries for textual memory, trajectory-to-skill, and
-  agent-system gates.
+  Python, npm, Rust, Codex CLI, managed runtime/vLLM images, and validated model
+  profile dependencies;
+- complete per-task records and benchmark summaries for textual memory,
+  trajectory-to-skill, and agent-system gates;
+- complete G1-G11 case records plus the closed prepublication evidence bundle
+  and index;
+- detached G12 attestation and detached final candidate evidence index retained
+  as protected publication records outside the draft asset set they attest.
 
 ## Candidate Preparation
 
-1. Select one candidate commit from `stable` after all productization PRs are
-   merged.
-2. Run protected algorithm/source-boundary tests.
-3. Run the three independent Terminal Bench performance gates.
-4. Build and clean-install the Core artifact.
-5. Run Core integration tests for Codex subscription transcript and the
-   self-deployed reference profile.
-6. Build the Desktop app and run source-level tests before packaging.
-7. Build the DMG and rerun the packaged-app lifecycle and science workflow
-   smoke against the exact Core descriptor/artifact.
-8. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
-   dependency checks.
+1. Select one candidate commit from `stable` and freeze its release policy,
+   closed profiles, and evidence schemas.
+2. Build and freeze the self-contained Daemon Bundle, Desktop DMG, release
+   manifest, checksums, notes, and managed-component identities.
+3. Run G1-G11 against those exact frozen bytes, including protected
+   source/behavior checks, both-mode integration, all clean-host profiles,
+   three independent Terminal Bench gates, security, privacy, recovery, and
+   product-quality cases.
+4. Create the closed G1-G11 prepublication evidence bundle and index, including
+   the exact expected G12 procedure and case IDs.
+5. Upload the immutable release payload and prepublication evidence to a
+   non-public draft with no replacement.
+6. Download the complete declared asset set into a clean environment and emit
+   the detached G12 attestation.
+7. Generate and verify the detached final candidate evidence index binding
+   G1-G12.
+8. Publish only by changing visibility. Any tag, manifest, note, payload,
+   report, or profile change creates a new candidate at step 1.
 
-The exact Core wheel export runs only on a GitHub-hosted ephemeral runner or an
-equivalently controlled one-shot build account. Its requested output path must
-not exist. The builder verifies the generated wheel and canonical
+The remainder of this section documents the current packaging rehearsal where
+it differs from the target process. Its exact Core wheel export runs only on a
+GitHub-hosted ephemeral runner or an equivalently controlled one-shot build
+account. Its requested output path must not exist. The builder verifies the
+generated wheel and canonical
 `framework-lock.json`, writes the exact pair into a private random sibling
 staging directory, fsyncs and revalidates both files, and atomically publishes
 the complete directory with no-replace semantics. It never adopts, overwrites,
@@ -148,9 +168,10 @@ is parseable; malformed or incomplete JSON still fails in the collector and no
 advisory is ignored. The final draft job alone receives `contents: write`;
 build and Linux verification retain read-only permissions.
 
-The dependency and security summaries, Core descriptor, and release candidate
-manifest use schema version 2 for those closed contracts. Native smoke evidence
-uses version 3 so every report declares its `mounted_dmg` or `detached_copy`
+The current rehearsal's dependency and security summaries, Core descriptor,
+and release candidate manifest use schema version 2 for those closed
+contracts. Native smoke evidence uses version 3 so every report declares its
+`mounted_dmg` or `detached_copy`
 launch origin and binds the source DMG and both packaged binaries by SHA256. The
 unchanged license inventory remains version 1; `framework-lock.json` retains its
 independent string-valued version 1 contract.
@@ -227,17 +248,18 @@ Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
 best stochastic result.
 
-## Draft Release Validation
+## Current Draft Rehearsal Validation
 
-The manual workflow creates a uniquely tagged GitHub draft prerelease only after
-its macOS and Linux candidate jobs succeed. Cross-job Actions artifact names
-bind source commit, workflow run, and run attempt so a full rerun cannot collide
-with immutable v4 artifacts from an earlier attempt. It uploads the required
-outputs, downloads every asset into a clean directory, and verifies:
+The current manual workflow creates a uniquely tagged GitHub draft prerelease
+only after its macOS and Linux rehearsal jobs succeed. Cross-job Actions
+artifact names bind source commit, workflow run, and run attempt so a full
+rerun cannot collide with immutable v4 artifacts from an earlier attempt. It
+uploads the required outputs, downloads every asset into a clean directory, and
+verifies:
 
 - asset names and architectures are expected;
 - SHA256 files match downloaded bytes;
-- the Core descriptor references the uploaded Core artifact;
+- the interim Core descriptor references the uploaded Core wheel;
 - the DMG version and bundled/fetched descriptor match the candidate commit;
 - release notes exactly match the release-tool-owned canonical packaging
   document. The GitHub body adds only a release-tool-generated, 128-bit random
@@ -284,8 +306,9 @@ this workflow is review evidence only and must not be edited, retagged, or
 promoted. After the science, benchmark, privacy, signing-policy, and final
 product gates are implemented and
 pass, create a new final candidate from a reviewed `stable` commit. That future
-path must generate final release notes and a new manifest/checksum inventory,
-roundtrip every asset again, and publish only those unchanged revalidated bytes.
+path must use the exact Daemon Bundle and canonical release manifest, generate
+final release notes and a new checksum/evidence inventory, roundtrip every
+asset again, and publish only those unchanged revalidated bytes.
 
 ## Rollback
 
@@ -293,4 +316,5 @@ Before publication, close the failed draft and open a corrective issue. After
 publication, mark a broken release clearly, preserve evidence needed to explain
 the failure, and publish a corrected version rather than replacing bytes under
 the same tag. User-facing rollback is manual installation of the most recent
-compatible DMG/Core pair; document any irreversible state migration.
+compatible DMG/Daemon pair within the rollback barrier defined by the canonical
+specification; document any irreversible state migration.

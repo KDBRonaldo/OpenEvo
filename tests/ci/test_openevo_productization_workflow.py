@@ -38,11 +38,9 @@ def test_plan_covers_productization_workstreams_and_release_gates() -> None:
         "E",
     ]
     required_markers = (
-        "textual-memory 12/21 performance gate",
-        "trajectory-to-skill 14/25 performance gate",
-        "agent-system 17/25 performance gate",
-        "clean Core install",
-        "packaged DMG",
+        "G7",
+        "self-contained Daemon bundle",
+        "packaged Desktop",
         "Immediate Execution Order",
     )
     missing = [marker for marker in required_markers if marker not in text]
@@ -240,13 +238,16 @@ def test_identity_audit_fails_on_active_legacy_markers() -> None:
         bad_dir.rmdir()
 
 
-def test_release_facing_docs_present_only_desktop_and_core_backend() -> None:
+def test_release_facing_docs_present_only_desktop_and_daemon() -> None:
     release_docs = [
         REPO_ROOT / "README.md",
         REPO_ROOT / "docs" / "architecture" / "README.md",
+        REPO_ROOT / "docs" / "core" / "backend-api.md",
+        REPO_ROOT / "docs" / "maintainer" / "repository-structure.md",
     ]
     forbidden_phrases = (
         "three public surfaces",
+        "OpenEvo Core Backend",
         "OpenEvo Dev Kit",
         "Dev Kit",
         "DevKit",
@@ -259,6 +260,10 @@ def test_release_facing_docs_present_only_desktop_and_core_backend() -> None:
                 offenders.append(f"{path.relative_to(REPO_ROOT)}: {phrase}")
 
     assert offenders == []
+    assert all(
+        "OpenEvo Daemon" in path.read_text(encoding="utf-8")
+        for path in release_docs
+    )
 
 
 def test_release_repository_metadata_is_present() -> None:

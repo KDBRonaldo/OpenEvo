@@ -2629,6 +2629,10 @@ def test_release_docs_and_notes_match_execution_mode_and_native_storage_authorit
     }
     readme = Path("README.md").read_text(encoding="utf-8")
     normalized_readme = " ".join(readme.split())
+    release_process = Path("docs/maintainer/release-process.md").read_text(
+        encoding="utf-8"
+    )
+    normalized_release_process = " ".join(release_process.split())
     notes = _load_release_candidate_module().render_candidate_release_notes(
         source_commit="a" * 40,
         version="0.1.0",
@@ -2639,10 +2643,16 @@ def test_release_docs_and_notes_match_execution_mode_and_native_storage_authorit
     assert by_mode["self-deployed"].support_state == "unavailable"
     assert "Codex subscription transcript mode: available in this candidate." in notes
     assert "Self-Deployed Reference mode: unavailable in this candidate." in notes
-    assert "current Desktop release marks it unavailable and blocks" in normalized_readme
+    assert "canonical External Beta requires both modes" in normalized_readme
+    assert (
+        "current build exposes a narrow Subscription path for development, "
+        "marks Self-Deployed unavailable"
+    ) in normalized_readme
     assert "persistent WebView storage" not in readme
-    assert "Tauri native host app data directory" in normalized_readme
-    assert "org.openevo.desktop" in normalized_readme
+    assert (
+        "Tauri native host app-data directory for `org.openevo.desktop`"
+        in normalized_release_process
+    )
 
 
 def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:

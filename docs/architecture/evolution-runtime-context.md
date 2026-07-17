@@ -83,6 +83,9 @@ terminal state 都采用 immutable/idempotent 语义。Admission envelope 只允
 content-addressed refs 和 opaque IDs；schema 不接收 instruction、credential、env、setup command 或开放
 task/runtime/model dict；非闭集字段直接拒绝，也不接受调用方直接提供 digest。Activation 后重启可
 保留 `active_generation == required_generation` 的未 pin queued row，retry exact 验证后原子 pin。
+该 queued row 是 Store 内部、尚未接入产品编排的 primitive，不是 Desktop/Daemon 对外的
+queued Task。目标 run owner 在 successor 未激活时必须返回 typed not-ready，且不创建
+Task、admission 或 run；只有已经固定 active Project Head 的 Task 才能进入资源或服务调度。
 未 pin `cancelled` 是 closed historical audit row：继续验证 request sources 和 no-pin 语义，但 head 任意推进
 后不再要求其 generation 与当前 active generation 相邻；pinned `cancelled` 仍验证原 pin closure，而不要求
 原 pin 当前 active。权威 `get_active_revision`/`get_task_admission` read 都在显式一致 transaction 中完成对应

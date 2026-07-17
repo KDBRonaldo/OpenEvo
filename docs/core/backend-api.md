@@ -1,20 +1,20 @@
-# OpenEvo Core Backend API
+# OpenEvo Daemon API
 
 > Target contract: the current backend implements only part of this surface.
-> [Desktop/Core Contract v1](../architecture/desktop-core-contract-v1.md)
+> [Desktop/Daemon Contract v1](../architecture/desktop-core-contract-v1.md)
 > defines the release boundary and versioning rules. Workstream B converges the
 > models, routes, tests, and this document together; undocumented or
 > unimplemented routes must not be presented as released.
 
-OpenEvo Core Backend is the remote server process that OpenEvo Desktop controls
-through a localhost SSH tunnel. Desktop owns local app state, SSH bootstrap, and
-typed request forwarding. Core owns projects, environment doctor and repair,
-service supervision, run lifecycle, transcripts, datasets, evolution jobs,
-artifacts, diagnostics, and runtime injection.
+OpenEvo Daemon is the remote Linux process that OpenEvo Desktop controls through
+a localhost SSH tunnel. Desktop owns local app state, SSH bootstrap, and typed
+request forwarding. The Daemon's Core implementation owns projects, environment
+doctor and repair, service supervision, run lifecycle, transcripts, datasets,
+evolution jobs, artifacts, diagnostics, and runtime injection.
 
 The External Beta target contract is intentionally black-box: Desktop talks to
-Core through HTTP APIs and never bypasses them for run or service operations
-after bootstrap.
+the Daemon through HTTP APIs and never bypasses them for run or service
+operations after bootstrap.
 
 ## Launcher
 
@@ -95,7 +95,7 @@ Core returns typed auth errors:
 
 ## Route Surface
 
-Core exposes typed JSON routes. Minimum release endpoint surface:
+The current v1 migration inventory contains these typed JSON routes:
 
 ```text
 GET  /version
@@ -134,6 +134,14 @@ POST /v1/services/{service_id}/stop
 POST /v1/maintenance/cache-cleanup
 ```
 
+This inventory is not the complete release API. The new negotiated API contract
+major must add distinct Project Head, Evolution Revision, Runtime Context,
+immutable admission, and execution-receipt resources plus idempotent
+close-incomplete-Task, transition retry/replacement/abandon, and historical
+restore actions. Their mutations use expected-head/transition compare-and-set
+fields. Release Desktop workflows cannot emulate the missing actions through
+`DELETE /v1/runs`, local state, or SSH.
+
 Artifact inspection is explicitly project-scoped. Core first verifies the live
 project and its signed active revision, then requires the artifact to appear in
 that revision's durable typed artifact authority. A predecessor artifact is not
@@ -167,8 +175,8 @@ content and diff rather than applying its ordinary 4 MiB JSON response limit.
 `/version` returns Core package version, source commit, descriptor SHA256,
 artifact SHA256, state/API contract versions, Python version, and supported API
 version. Its Pydantic model and black-box tests become authoritative when the
-route is implemented. Desktop must fail setup if the backend version is
-incompatible with the bundled Core descriptor.
+route is implemented. Desktop must fail setup if the Daemon version is
+incompatible with the manifest-matched Daemon Bundle.
 
 ## Health
 
@@ -202,27 +210,27 @@ IDs and user actions.
 ## Repair
 
 `POST /v1/environment/repair` performs user-level repairs that OpenEvo is allowed
-to do: reinstall the verified Core artifact, recreate a remote venv, refresh a
-backend token, repair directory permissions under the configured workspace,
-restart managed services, or re-run network bootstrap with configured proxy
-settings. System package changes, Docker daemon changes, global shell profile
-edits, and SSH private-key edits are out of scope.
+to do: reinstall the verified Daemon Bundle, restore its managed environment,
+refresh a backend token, repair directory permissions under the configured
+workspace, restart managed services, or re-run network bootstrap with
+configured proxy settings. System package changes, Docker daemon changes,
+global shell profile edits, and SSH private-key edits are out of scope.
 
 ## Runs
 
-`POST /v1/runs` creates a science run from `RunCreateV1`. The request contains
-only Core-owned immutable project, task, and workspace snapshot IDs, the
-expected verified-registry digest, the required revision ID, and the release
-execution/capture modes. Runtime maps, model maps, host paths, commands,
-benchmark fields, context allowlists, and client-authored admission envelopes
-are rejected. Project method selections are read from the immutable project
-snapshot, whose sole evolution shape is
+`POST /v1/runs` creates a science Task, closed admission, and run from
+`RunCreateV1`. The request contains only Core-owned immutable project and
+workspace-draft inputs, the expected verified-registry digest, the active
+Project Head ID, and the release execution/capture modes. Runtime maps, model
+maps, host paths, commands, benchmark fields, context allowlists, and
+client-authored admission envelopes are rejected. Project method selections are
+read from the immutable project snapshot, whose sole evolution shape is
 `evolution.targets.<target_id> = {enabled, method, config}`.
 
-The required revision may be active, queued, or preparing. For queued or
-preparing revisions Core persists the run with
-`required_revision_uncommitted`; it starts only after that exact revision is
-atomically active. Failed or cancelled revisions are rejected.
+The required Project Head must be active. If a successor transition is pending,
+failed, or awaiting repair, Core returns typed not-ready before creating a Task,
+admission, or run. An initially admitted queued run already pins its closed
+admission and waits only for resource/service scheduling, not for a successor.
 
 `POST /v1/runs/{run_id}/cancel` asks Core to cancel a queued, preparing, or running
 attempt. `POST /v1/runs/{run_id}/retry` creates a new attempt from the immutable
@@ -231,6 +239,11 @@ Core-owned event and artifact state behind the fixed read APIs, not through a
 separate release endpoint. `DELETE /v1/runs/{run_id}` performs a documented
 cleanup path and must support dry-run preview through run deletion planning and
 the maintenance cleanup API.
+
+Frozen v1 currently clears the revision/admission pin while a retry waits for
+re-admission. That is a release-blocking legacy behavior. The new API major
+keeps the Task's immutable admission and effective execution pins unchanged and
+only appends the retry attempt.
 
 ## Run Context
 

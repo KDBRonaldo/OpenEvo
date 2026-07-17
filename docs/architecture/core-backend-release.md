@@ -1,18 +1,19 @@
-# Core Backend Release Architecture
+# OpenEvo Daemon Release Architecture
 
-OpenEvo Core Backend is the server-side execution and evolution backend used by
-OpenEvo Desktop. Desktop configures the remote server and monitors runs, while
-Core owns run lifecycle, service supervision, datasets, jobs, artifacts,
-context resolution, and runtime injection.
+OpenEvo Daemon is the remote Linux application used by OpenEvo Desktop. It is
+assembled from the shared Core implementation and the release-managed runtime.
+Desktop configures the remote server and monitors runs, while the Daemon owns
+run lifecycle, service supervision, datasets, jobs, artifacts, context
+resolution, and runtime injection.
 
 ## Core-Owned Service Supervision
 
-External Beta Core must expose typed service state through backend APIs. It
-must supervise or report the status of the services needed for a run, including
-backend API, gateway, rollout, worker, and optional model-serving processes.
-Desktop may request repair or restart through typed APIs, but it must not
-directly execute release-mode gateway, rollout, worker, benchmark, or run
-commands after bootstrap.
+The External Beta Daemon must expose typed service state through backend APIs.
+It must supervise or report the status of the services needed for a run,
+including backend API, gateway, rollout, worker, and optional model-serving
+processes. Desktop may request repair or restart through typed APIs, but it
+must not directly execute release-mode gateway, rollout, worker, benchmark, or
+run commands after bootstrap.
 
 The Core Control API itself is one host/user-global loopback daemon, not one
 daemon per project or run. Its filesystem, release identity, pidfd lifecycle,
@@ -25,13 +26,13 @@ The Desktop sidecar owns local app integration and remote bootstrap:
 
 - keychain references and local sidecar token;
 - SSH connection and tunnel setup;
-- uploading or downloading the verified Core artifact;
+- uploading or downloading the verified Daemon Bundle;
 - creating the remote user-level install;
-- starting Core Backend if it is absent;
-- forwarding Desktop requests to Core through loopback.
+- starting the Daemon if it is absent;
+- forwarding Desktop requests to the Daemon through loopback.
 
-After Core is healthy, ordinary run, log, artifact, doctor, repair, and service
-operations go through Core APIs.
+After the Daemon is healthy, ordinary run, log, artifact, doctor, repair, and
+service operations go through its APIs.
 
 ## Evolution Capabilities
 
@@ -83,8 +84,8 @@ recoverable through typed repair actions.
 
 ## Deletion
 
-Deleting local Desktop state does not delete remote Core state. Core should
-provide project/run cleanup APIs or documented repair actions so users can
+Deleting local Desktop state does not delete remote Daemon state. The Daemon
+provides project/run cleanup APIs and documented repair actions so users can
 remove remote datasets, jobs, artifacts, logs, and diagnostics intentionally.
 
 ## Cleanup
