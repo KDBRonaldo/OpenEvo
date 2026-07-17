@@ -234,14 +234,22 @@ def test_release_local_api_allows_only_packaged_tauri_cors_origins(tmp_path: Pat
 
     with TestClient(app) as client:
         discovery = client.get("/version", headers={"Origin": "tauri://localhost"})
+        discovery_preflight = client.options(
+            "/version",
+            headers={
+                "Origin": "tauri://localhost",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Cache-Control, Pragma",
+            },
+        )
         preflight = client.options(
             "/desktop/v1/state",
             headers={
                 "Origin": "http://tauri.localhost",
                 "Access-Control-Request-Method": "PATCH",
                 "Access-Control-Request-Headers": (
-                    "Content-Type, X-OpenEvo-Desktop-Session, Idempotency-Key, "
-                    "If-Match, Last-Event-ID"
+                    "Cache-Control, Content-Type, X-OpenEvo-Desktop-Session, "
+                    "Idempotency-Key, If-Match, Last-Event-ID, Pragma"
                 ),
             },
         )
@@ -268,6 +276,10 @@ def test_release_local_api_allows_only_packaged_tauri_cors_origins(tmp_path: Pat
 
     assert discovery.status_code == 200
     assert discovery.headers["access-control-allow-origin"] == "tauri://localhost"
+    assert discovery_preflight.status_code == 200
+    assert discovery_preflight.headers["access-control-allow-origin"] == (
+        "tauri://localhost"
+    )
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == "http://tauri.localhost"
     assert {
@@ -276,11 +288,13 @@ def test_release_local_api_allows_only_packaged_tauri_cors_origins(tmp_path: Pat
     } == {
         "accept",
         "accept-language",
+        "cache-control",
         "content-language",
         "content-type",
         "idempotency-key",
         "if-match",
         "last-event-id",
+        "pragma",
         "x-openevo-desktop-session",
     }
     assert {

@@ -79,8 +79,14 @@ describe("ReleaseDesktopProductShell", () => {
         return provider!;
       });
     const stop = vi.fn(async () => { lifecycle.push("stop"); });
+    const reportStage = vi.fn(async (stage: string) => { lifecycle.push(stage); });
 
-    root = await renderReleaseShell(factory, stop, vi.fn().mockResolvedValue(undefined));
+    root = await renderReleaseShell(
+      factory,
+      stop,
+      vi.fn().mockResolvedValue(undefined),
+      reportStage,
+    );
     expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
     expect(document.body.textContent).not.toContain("secret bootstrap detail");
     expect(factory).toHaveBeenCalledTimes(1);
@@ -93,6 +99,8 @@ describe("ReleaseDesktopProductShell", () => {
     });
 
     expect(factory).toHaveBeenCalledTimes(2);
+    expect(reportStage).toHaveBeenCalledWith("provider_create_failed");
+    expect(reportStage).toHaveBeenCalledWith("product_committed");
     expect(document.body.textContent).toContain("Research brief");
     const firstStart = lifecycle.indexOf("start-1");
     const secondStart = lifecycle.indexOf("start-2");
@@ -112,6 +120,7 @@ describe("ReleaseDesktopProductShell", () => {
       productCommittedWhenReported = document.body.textContent?.includes("Research brief") ?? false;
       lifecycle.push("ready");
     });
+    const reportStage = vi.fn(async (stage: string) => { lifecycle.push(stage); });
     const container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -123,6 +132,7 @@ describe("ReleaseDesktopProductShell", () => {
             <ReleaseDesktopProductShell
               createProvider={factory}
               stopProvider={stop}
+              reportStage={reportStage}
               reportReady={reportReady}
             />
           </MemoryRouter>
@@ -138,6 +148,10 @@ describe("ReleaseDesktopProductShell", () => {
     expect(lifecycle.at(-1)).toBe("ready");
     expect(lifecycle.slice(0, -1)).toContain("stop");
     expect(reportReady).toHaveBeenCalledTimes(1);
+    expect(reportStage.mock.calls.map(([stage]) => stage)).toEqual([
+      "provider_created",
+      "product_committed",
+    ]);
     expect(productCommittedWhenReported).toBe(true);
     expect(document.body.textContent).toContain("Research brief");
   });
@@ -213,12 +227,52 @@ describe("ReleaseDesktopProductShell", () => {
     expect(document.body.textContent).not.toContain("Research brief");
     expect(document.body.textContent).not.toContain("native renderer contract mismatch");
   });
+
+  it("keeps bootstrap diagnostics outside product readiness authority", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const factory = vi.fn(async () => provider!);
+    const stop = vi.fn(async () => {});
+    const reportReady = vi.fn(async () => {});
+    const reportStage = vi.fn()
+      .mockImplementationOnce(() => {
+        throw new Error("diagnostic bridge unavailable");
+      })
+      .mockRejectedValueOnce(new Error("diagnostic bridge rejected"));
+
+    root = await renderReleaseShell(factory, stop, reportReady, reportStage);
+
+    expect(reportStage).toHaveBeenCalledTimes(2);
+    expect(reportReady).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Research brief");
+    expect(document.body.textContent).not.toContain("diagnostic bridge");
+  });
+
+  it("does not classify native stop failure as provider creation failure", async () => {
+    const factory = vi.fn();
+    const stop = vi.fn(async () => {
+      throw new Error("native stop unavailable");
+    });
+    const reportStage = vi.fn();
+
+    root = await renderReleaseShell(
+      factory,
+      stop,
+      vi.fn().mockResolvedValue(undefined),
+      reportStage,
+    );
+
+    expect(factory).not.toHaveBeenCalled();
+    expect(reportStage).not.toHaveBeenCalledWith("provider_create_failed");
+    expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
+    expect(document.body.textContent).not.toContain("native stop unavailable");
+  });
 });
 
 async function renderReleaseShell(
   factory: () => Promise<FixtureDesktopProductProvider>,
   stopProvider?: () => Promise<void>,
   reportReady?: () => Promise<void>,
+  reportStage?: (stage: string) => Promise<void> | void,
 ): Promise<Root> {
   const container = document.createElement("div");
   document.body.appendChild(container);
@@ -229,6 +283,7 @@ async function renderReleaseShell(
         <ReleaseDesktopProductShell
           createProvider={factory}
           stopProvider={stopProvider}
+          reportStage={reportStage}
           reportReady={reportReady}
         />
       </MemoryRouter>,

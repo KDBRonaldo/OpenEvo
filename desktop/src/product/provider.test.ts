@@ -11,6 +11,7 @@ import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 import {
   createReleaseDesktopProductProvider,
   nativeRunRetryRecoveryStore,
+  reportReleaseDesktopBootstrapStage,
   reportReleaseDesktopReady,
 } from "./releaseProvider";
 
@@ -49,6 +50,16 @@ describe("Desktop product provider boundary", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("renderer_ready", {
       openapiSha256: DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0],
+    });
+  });
+
+  it("reports only a closed renderer bootstrap stage through native IPC", async () => {
+    invokeMock.mockResolvedValue(undefined);
+
+    reportReleaseDesktopBootstrapStage("provider_created");
+
+    expect(invokeMock).toHaveBeenCalledWith("renderer_bootstrap_stage", {
+      stage: "provider_created",
     });
   });
 

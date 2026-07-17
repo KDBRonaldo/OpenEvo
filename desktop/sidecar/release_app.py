@@ -99,12 +99,14 @@ _TAURI_RELEASE_METHODS = ("GET", "POST", "PATCH", "DELETE")
 _TAURI_RELEASE_HEADERS = (
     "Accept",
     "Accept-Language",
+    "Cache-Control",
     "Content-Language",
     "Content-Type",
     DESKTOP_SESSION_HEADER,
     "Idempotency-Key",
     "If-Match",
     "Last-Event-ID",
+    "Pragma",
 )
 
 

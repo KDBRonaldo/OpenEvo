@@ -148,11 +148,13 @@ type SnapshotRefreshPublication =
 
 export interface DesktopProductAppProps {
   provider?: DesktopProductProvider;
+  onInitialSnapshotFailed?: () => void;
   onReady?: () => void;
 }
 
 export function DesktopProductApp({
   provider = unavailableDesktopProductProvider,
+  onInitialSnapshotFailed,
   onReady,
 }: DesktopProductAppProps) {
   const [snapshot, setSnapshot] = useState<DesktopProductSnapshot | null>(null);
@@ -166,6 +168,8 @@ export function DesktopProductApp({
   const [actionError, setActionError] = useState<ActionErrorState | null>(null);
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
   const readyReported = useRef(false);
+  const authoritativeSnapshotPublished = useRef(false);
+  const initialSnapshotFailureReported = useRef(false);
   const actionErrorGeneration = useRef(0);
   const actionStateGeneration = useRef(0);
   const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
@@ -202,6 +206,16 @@ export function DesktopProductApp({
     setPendingRetryPoll((current) => current === pending ? null : current);
   }, []);
 
+  const reportInitialSnapshotFailure = useCallback((): void => {
+    if (authoritativeSnapshotPublished.current || initialSnapshotFailureReported.current) return;
+    initialSnapshotFailureReported.current = true;
+    try {
+      onInitialSnapshotFailed?.();
+    } catch {
+      // Bootstrap diagnostics cannot alter the product error state.
+    }
+  }, [onInitialSnapshotFailed]);
+
   const publishRefresh = useCallback((publication: SnapshotRefreshPublication): void => {
     if (publication.kind === "pending") {
       setSnapshot((current) => current ? {
@@ -211,6 +225,7 @@ export function DesktopProductApp({
       return;
     }
     if (publication.kind === "rejected") {
+      reportInitialSnapshotFailure();
       setSnapshot((current) => current ? {
         ...current,
         stream: {
@@ -245,6 +260,7 @@ export function DesktopProductApp({
       setActionError({ owner: errorOwner, message: userMessage(retryRecoveryFailure) });
     }
     if (result.status !== "fresh") {
+      if (result.status === "error") reportInitialSnapshotFailure();
       setSnapshot((current) => current ? { ...current, stream: result.stream } : current);
       if (result.status === "error") {
         setLoadError(userMessage(
@@ -273,13 +289,14 @@ export function DesktopProductApp({
     } else if (pendingRetry?.acceptedRun) {
       next = mergeAuthoritativeRetryRun(next, pendingRetry.acceptedRun, pendingRetry);
     }
+    authoritativeSnapshotPublished.current = true;
     setSnapshot(next);
     setLoadError(null);
     setSelectedProjectId((current) => {
       if (current && next.projects.some((project) => project.project_id === current)) return current;
       return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
     });
-  }, [abandonPendingRetry, clearPendingRetry, provider]);
+  }, [abandonPendingRetry, clearPendingRetry, provider, reportInitialSnapshotFailure]);
 
   useLayoutEffect(() => {
     const coordinator = refreshCoordinator.current!;

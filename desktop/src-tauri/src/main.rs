@@ -34,10 +34,14 @@ const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V2";
 const RENDERER_STAGE_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_STAGE_V1";
-const RENDERER_STAGE_VOCABULARY: [&str; 10] = [
+const RENDERER_STAGE_VOCABULARY: [&str; 14] = [
     "sidecar_start_requested",
     "sidecar_start_returned",
     "sidecar_start_failed",
+    "provider_created",
+    "provider_create_failed",
+    "initial_snapshot_failed",
+    "product_committed",
     "ready_requested",
     "window_identity_valid",
     "window_identity_invalid",
@@ -46,6 +50,26 @@ const RENDERER_STAGE_VOCABULARY: [&str; 10] = [
     "window_visibility_unknown",
     "ready_validation_failed",
 ];
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RendererBootstrapStageV1 {
+    ProviderCreated,
+    ProviderCreateFailed,
+    InitialSnapshotFailed,
+    ProductCommitted,
+}
+
+impl RendererBootstrapStageV1 {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderCreated => "provider_created",
+            Self::ProviderCreateFailed => "provider_create_failed",
+            Self::InitialSnapshotFailed => "initial_snapshot_failed",
+            Self::ProductCommitted => "product_committed",
+        }
+    }
+}
 const SIDECAR_PROCESS_MARKER: &str = "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
@@ -5438,6 +5462,11 @@ fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostSta
     stop_sidecar_inner(&state)
 }
 
+#[tauri::command]
+fn renderer_bootstrap_stage(stage: RendererBootstrapStageV1) {
+    emit_renderer_stage(stage.as_str());
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn renderer_ready(
     window: tauri::WebviewWindow,
@@ -5676,6 +5705,7 @@ fn main() {
             write_run_retry_recovery,
             start_sidecar,
             stop_sidecar,
+            renderer_bootstrap_stage,
             renderer_ready,
             select_project_source,
             cancel_project_source,
@@ -6206,6 +6236,10 @@ mod tests {
                 "sidecar_start_requested",
                 "sidecar_start_returned",
                 "sidecar_start_failed",
+                "provider_created",
+                "provider_create_failed",
+                "initial_snapshot_failed",
+                "product_committed",
                 "ready_requested",
                 "window_identity_valid",
                 "window_identity_invalid",
@@ -6215,6 +6249,30 @@ mod tests {
                 "ready_validation_failed",
             ]
         );
+    }
+
+    #[test]
+    fn renderer_owned_bootstrap_stages_are_a_closed_subset() {
+        for (encoded, expected) in [
+            ("\"provider_created\"", "provider_created"),
+            ("\"provider_create_failed\"", "provider_create_failed"),
+            ("\"initial_snapshot_failed\"", "initial_snapshot_failed"),
+            ("\"product_committed\"", "product_committed"),
+        ] {
+            let stage: RendererBootstrapStageV1 = serde_json::from_str(encoded).unwrap();
+            assert_eq!(stage.as_str(), expected);
+        }
+        for forbidden in [
+            "ready_requested",
+            "window_identity_valid",
+            "sidecar_start_returned",
+            "credential_dumped",
+        ] {
+            assert!(
+                serde_json::from_str::<RendererBootstrapStageV1>(&format!("\"{forbidden}\""))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

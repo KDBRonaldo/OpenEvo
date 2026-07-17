@@ -20,6 +20,13 @@ loaded an authoritative snapshot and React has committed the actual product
 shell. A bootstrap placeholder or provider object alone cannot satisfy the
 packaged app smoke; acknowledgement failure tears down that exact sidecar
 session and returns to the explicit startup failure state.
+Packaged bootstrap also reports the closed diagnostic stages
+`provider_created`, `provider_create_failed`, `initial_snapshot_failed`, and
+`product_committed` through a typed native command. These stages distinguish
+provider negotiation from initial data loading and React publication, but are
+diagnostic only: none can replace the final native renderer acknowledgement or
+make a candidate pass. Reporting is best effort and cannot change product
+readiness or error handling.
 The `openevo-desktop` Vite mode replaces the general provider-kind parser with
 `providerKinds.release.ts`, whose only accepted value is `desktop_sidecar`.
 Rollup can then remove simulator, scaffold, and dry-run provider definitions and

@@ -226,7 +226,9 @@ including the server-error boundary, so bounded error responses remain readable
 by the packaged renderer. Only
 the exact packaged Tauri origins (`tauri://localhost` and
 `http://tauri.localhost`), used methods, the standard CORS-safelisted headers,
-and the renderer contract headers are accepted;
+the renderer contract headers, and the browser-generated `Cache-Control` and
+`Pragma` headers required by the renderer's `cache: "no-store"` requests are
+accepted;
 wildcards, credentials, lookalike origins, unknown methods, and unknown headers
 are rejected. CORS preflight is handled before Desktop session authentication,
 while ordinary `/desktop/v1/*` requests still require the exact ephemeral

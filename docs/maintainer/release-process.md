@@ -186,7 +186,11 @@ live FD identity are the observer's authority. Both packaged paths are
 rechecked after process cleanup.
 Native stderr uses a nonblocking bounded pipe, parsing remains byte/line bounded,
 and timeout output uses only closed readiness and renderer stage names. Unknown
-renderer stages fail closed and never become success evidence. A probe deadline or
+renderer stages fail closed and never become success evidence. The renderer can
+report only `provider_created`, `provider_create_failed`,
+`initial_snapshot_failed`, and `product_committed` through its typed native
+command; these reports diagnose bootstrap progress and cannot replace the V2
+renderer-ready marker. A probe deadline or
 transient shallower probe result cannot overwrite the deepest product readiness
 stage reached. Probe subprocesses
 share one readiness deadline and run in private sessions. Timeout cleanup takes

@@ -71,6 +71,23 @@ export async function reportReleaseDesktopReady(): Promise<void> {
   });
 }
 
+export const RELEASE_DESKTOP_BOOTSTRAP_STAGES = [
+  "provider_created",
+  "provider_create_failed",
+  "initial_snapshot_failed",
+  "product_committed",
+] as const;
+
+export type ReleaseDesktopBootstrapStage = typeof RELEASE_DESKTOP_BOOTSTRAP_STAGES[number];
+
+export function reportReleaseDesktopBootstrapStage(stage: ReleaseDesktopBootstrapStage): void {
+  try {
+    void invoke("renderer_bootstrap_stage", { stage }).catch(() => {});
+  } catch {
+    // Diagnostics never participate in startup or readiness authority.
+  }
+}
+
 export async function createReleaseDesktopProductProvider(
   dependencies: ReleaseProviderFactoryDependencies = {},
 ): Promise<ReleaseDesktopProductProvider> {

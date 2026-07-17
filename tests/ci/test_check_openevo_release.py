@@ -505,6 +505,8 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
                     f"executable_sha256={'b' * 64} executable_size=19"
                 ),
                 "OPENEVO_DESKTOP_RENDERER_STAGE_V1 sidecar_start_returned",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 provider_created",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 product_committed",
                 "OPENEVO_DESKTOP_RENDERER_STAGE_V1 ready_requested",
                 "OPENEVO_DESKTOP_RENDERER_STAGE_V1 window_not_visible",
                 f"OPENEVO_DESKTOP_RENDERER_READY_V2 {RELEASE_OPENAPI_SHA256}",
@@ -527,6 +529,8 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
         {
             "sidecar_start_requested",
             "sidecar_start_returned",
+            "provider_created",
+            "product_committed",
             "ready_requested",
             "window_not_visible",
         }
@@ -1257,6 +1261,10 @@ def test_bundle_smoke_reports_closed_native_readiness_stage() -> None:
         "sidecar_start_requested",
         "sidecar_start_returned",
         "sidecar_start_failed",
+        "provider_created",
+        "provider_create_failed",
+        "initial_snapshot_failed",
+        "product_committed",
         "ready_requested",
         "window_identity_valid",
         "window_identity_invalid",
