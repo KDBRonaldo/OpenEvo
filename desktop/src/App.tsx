@@ -13,8 +13,10 @@ import { DesktopProductApp } from "./product/DesktopProductApp";
 import type { DesktopProductProvider } from "./product/provider";
 import {
   createReleaseDesktopProductProvider,
+  reportReleaseDesktopBootstrapStage,
   reportReleaseDesktopReady,
   stopReleaseDesktopProductProvider,
+  type ReleaseDesktopBootstrapStage,
 } from "./product/releaseProvider";
 
 const isOpenEvoDesktopOnlyBuild =
@@ -135,14 +137,25 @@ export function SharedDashboardShell() {
 
 export function OpenEvoDesktopOnlyShell({
   provider,
+  onInitialSnapshotFailed,
   onReady,
 }: {
   provider?: DesktopProductProvider;
+  onInitialSnapshotFailed?: () => void;
   onReady?: () => void;
 }) {
   return (
     <Routes>
-      <Route path="*" element={<DesktopProductApp provider={provider} onReady={onReady} />} />
+      <Route
+        path="*"
+        element={(
+          <DesktopProductApp
+            provider={provider}
+            onInitialSnapshotFailed={onInitialSnapshotFailed}
+            onReady={onReady}
+          />
+        )}
+      />
     </Routes>
   );
 }
@@ -164,16 +177,26 @@ type ReleaseDesktopStartupState =
 export function ReleaseDesktopProductShell({
   createProvider = createReleaseDesktopProductProvider,
   stopProvider = stopReleaseDesktopProductProvider,
+  reportStage = reportReleaseDesktopBootstrapStage,
   reportReady = reportReleaseDesktopReady,
 }: {
   createProvider?: () => Promise<DesktopProductProvider>;
   stopProvider?: () => Promise<void>;
+  reportStage?: (stage: ReleaseDesktopBootstrapStage) => Promise<void> | void;
   reportReady?: () => Promise<void>;
 }) {
   const generation = useRef(0);
   const readinessGeneration = useRef<number | null>(null);
   const lifecycle = useRef<Promise<void>>(Promise.resolve());
   const [startup, setStartup] = useState<ReleaseDesktopStartupState>({ status: "loading" });
+
+  const reportStageBestEffort = useCallback((stage: ReleaseDesktopBootstrapStage): void => {
+    try {
+      void Promise.resolve(reportStage(stage)).catch(() => {});
+    } catch {
+      // Closed diagnostics cannot alter startup state or readiness authority.
+    }
+  }, [reportStage]);
 
   const enqueueLifecycle = useCallback((operation: () => Promise<void>): Promise<void> => {
     const next = lifecycle.current.catch(() => {}).then(operation);
@@ -198,7 +221,14 @@ export function ReleaseDesktopProductShell({
         // credential from the Tauri host.
         await stopProvider();
         if (generation.current !== requestGeneration) return;
-        const provider = await createProvider();
+        let provider: DesktopProductProvider;
+        try {
+          provider = await createProvider();
+        } catch (error) {
+          reportStageBestEffort("provider_create_failed");
+          throw error;
+        }
+        reportStageBestEffort("provider_created");
         if (generation.current !== requestGeneration) {
           await stopProvider();
           return;
@@ -215,7 +245,7 @@ export function ReleaseDesktopProductShell({
         }
       }
     });
-  }, [createProvider, enqueueLifecycle, stopProvider]);
+  }, [createProvider, enqueueLifecycle, reportStageBestEffort, stopProvider]);
 
   const reportCommittedProduct = useCallback((
     committingGeneration: number,
@@ -229,6 +259,7 @@ export function ReleaseDesktopProductShell({
         // Effects run only after React has committed the product shell. The
         // native marker therefore proves the packaged product UI, not merely
         // the bootstrap placeholder, reached the invoking main WebView.
+        reportStageBestEffort("product_committed");
         await reportReady();
         if (generation.current === committingGeneration) {
           setStartup({ status: "ready", provider });
@@ -244,7 +275,7 @@ export function ReleaseDesktopProductShell({
         }
       }
     });
-  }, [enqueueLifecycle, reportReady, stopProvider]);
+  }, [enqueueLifecycle, reportReady, reportStageBestEffort, stopProvider]);
 
   useEffect(() => {
     start();
@@ -258,6 +289,7 @@ export function ReleaseDesktopProductShell({
     return (
       <OpenEvoDesktopOnlyShell
         provider={startup.provider}
+        onInitialSnapshotFailed={() => reportStageBestEffort("initial_snapshot_failed")}
         onReady={() => reportCommittedProduct(startup.generation, startup.provider)}
       />
     );

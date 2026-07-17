@@ -37,6 +37,60 @@ describe("DesktopProductApp", () => {
     document.body.innerHTML = "";
   });
 
+  it("reports the initial product snapshot lifecycle without error details", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    provider.failNextRefresh();
+    const onInitialSnapshotFailed = vi.fn();
+    const onReady = vi.fn();
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <DesktopProductApp
+          provider={provider!}
+          onInitialSnapshotFailed={onInitialSnapshotFailed}
+          onReady={onReady}
+        />,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(onInitialSnapshotFailed).toHaveBeenCalledTimes(1);
+    expect(onReady).not.toHaveBeenCalled();
+    expect(screenText()).toContain("OpenEvo Desktop is unavailable");
+    expect(screenText()).not.toContain("internal refresh details");
+  });
+
+  it("reports readiness once after the initial product snapshot commits", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const onInitialSnapshotFailed = vi.fn();
+    const onReady = vi.fn();
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <DesktopProductApp
+          provider={provider!}
+          onInitialSnapshotFailed={onInitialSnapshotFailed}
+          onReady={onReady}
+        />,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(onInitialSnapshotFailed).not.toHaveBeenCalled();
+    expect(onReady).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("Research brief");
+  });
+
   it("navigates between Research, Evolution, and System", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     root = await renderProduct(provider);

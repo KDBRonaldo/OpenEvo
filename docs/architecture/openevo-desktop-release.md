@@ -236,8 +236,11 @@ output is restricted to the deepest closed readiness stage reached and the
 closed stages observed during the launch; transient probe regressions cannot
 downgrade that primary stage, and diagnostics do not include process commands,
 paths, or credentials. Native renderer diagnostics use only the closed
-`OPENEVO_DESKTOP_RENDERER_STAGE_V1` vocabulary; final success still requires
-the V2 ready marker. The smoke
+`OPENEVO_DESKTOP_RENDERER_STAGE_V1` vocabulary. Renderer-owned reports are
+restricted by the native command type to `provider_created`,
+`provider_create_failed`, `initial_snapshot_failed`, and `product_committed`;
+they cannot emit native lifecycle or readiness stages. Final success still
+requires the V2 ready marker. The smoke
 signals the app process group only while its unreaped `Popen` child reserves the
 leader PID; once `poll` or `wait` has reaped that child, the numeric group is
 observation-only. Sidecar groups are terminated by the native host and
@@ -296,7 +299,9 @@ including its server-error boundary, in strict CORS so bounded failures remain
 readable by the packaged renderer. It allows exactly
 `tauri://localhost` and `http://tauri.localhost`, the four used HTTP methods,
 the standard CORS-safelisted headers, and the renderer contract's bounded
-header set. It does not allow wildcard,
+header set. That exact set includes browser-generated `Cache-Control` and
+`Pragma`, because the renderer uses `fetch` with `cache: "no-store"` for Local
+API reads. It does not allow wildcard,
 credentialed, lookalike-origin, unknown-method, or unknown-header requests;
 preflight runs before Desktop session authentication.
 SQLite may report an OS-canonical spelling of that database path, including the
