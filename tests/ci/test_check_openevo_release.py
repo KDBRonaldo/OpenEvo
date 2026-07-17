@@ -2474,12 +2474,38 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     )[1].split(
         "  draft-prerelease-roundtrip:\n", maxsplit=1
     )[0]
-    assert core_lifecycle_step.count('openevo-core-service"') == 3
+    assert core_lifecycle_step.count('openevo-core-service"') == 4
     assert '" ensure \\' in core_lifecycle_step
-    assert "consume-attachment \\" in core_lifecycle_step
+    assert core_lifecycle_step.count("consume-attachment \\") == 2
     assert '" stop \\' in core_lifecycle_step
     assert "--service-root" not in core_lifecycle_step
     assert "openevo-candidate-core-service" not in core_lifecycle_step
+    assert (
+        'attachment_suffix="$(PYTHONPATH= '
+        '"$RUNNER_TEMP/openevo-candidate-core/bin/python" '
+        "-c 'import secrets; print(secrets.token_hex(16))')\""
+    ) in core_lifecycle_step
+    assert '[[ "$attachment_suffix" =~ ^[0-9a-f]{32}$ ]]' in core_lifecycle_step
+    assert core_lifecycle_step.count("attachment_name=") == 1
+    assert 'attachment_name="bootstrap-${attachment_suffix}.json"' in core_lifecycle_step
+    assert core_lifecycle_step.count('--attachment-name "$attachment_name"') == 3
+    assert "GITHUB_RUN_ID" not in core_lifecycle_step
+    assert "GITHUB_RUN_ATTEMPT" not in core_lifecycle_step
+    assert "${{ github.run_id }}" not in core_lifecycle_step
+    assert "${{ github.run_attempt }}" not in core_lifecycle_step
+    assert core_lifecycle_step.count("trap cleanup EXIT") == 1
+    lifecycle_cleanup = core_lifecycle_step.split("          cleanup() {\n", maxsplit=1)[
+        1
+    ].split("          }\n", maxsplit=1)[0]
+    assert (
+        'PYTHONPATH= "$RUNNER_TEMP/openevo-candidate-core/bin/openevo-core-service" \\\n'
+        "              consume-attachment \\\n"
+        '              --attachment-name "$attachment_name" '
+        ">/dev/null 2>&1 || true"
+    ) in lifecycle_cleanup
+    assert lifecycle_cleanup.index("consume-attachment") < lifecycle_cleanup.index(
+        '" stop \\'
+    )
     assert "needs: [macos-candidate, linux-core-candidate]" in text
     assert text.index("gh release create") < text.index("gh release upload")
     assert text.index("gh release upload") < text.index("gh release download")

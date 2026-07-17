@@ -393,10 +393,18 @@ jobs:
       - name: Smoke exact candidate Core service lifecycle
         run: |
           set -euo pipefail
-          attachment_name="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          attachment_suffix="$(PYTHONPATH= "$RUNNER_TEMP/openevo-candidate-core/bin/python" -c 'import secrets; print(secrets.token_hex(16))')"
+          [[ "$attachment_suffix" =~ ^[0-9a-f]{32}$ ]] || {
+            echo "candidate Core attachment suffix is invalid" >&2
+            exit 1
+          }
+          attachment_name="bootstrap-${attachment_suffix}.json"
           service_json="$RUNNER_TEMP/openevo-candidate-service.json"
           attachment_json="$RUNNER_TEMP/openevo-candidate-attachment.json"
           cleanup() {
+            PYTHONPATH= "$RUNNER_TEMP/openevo-candidate-core/bin/openevo-core-service" \
+              consume-attachment \
+              --attachment-name "$attachment_name" >/dev/null 2>&1 || true
             PYTHONPATH= "$RUNNER_TEMP/openevo-candidate-core/bin/openevo-core-service" stop \
               --deadline-seconds 15 >/dev/null 2>&1 || true
           }

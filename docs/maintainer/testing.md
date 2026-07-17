@@ -237,14 +237,19 @@ reports to agree. The dependent Linux candidate job must exercise the installed
 Core service at the OS-account-derived canonical `~/.openevo/core` root. It
 must not pass a run-scoped `$RUNNER_TEMP` service root, because the product
 contract intentionally rejects alternate per-project or per-run daemons. The
-preceding release-mode Clippy gate compiles all Tauri targets with warnings
-denied, so test-only platform helpers cannot leak into the shipped host binary
-as dead code. The macOS PR and candidate gates run the complete release Rust
-suite with one test thread because its
-native process-lifecycle cases mutate process-global environment and load the
-shared OS process table. Security-path fixtures canonicalize the macOS system
-temporary-directory alias before exercising no-follow path traversal; the
-production traversal remains strict. The bundle smoke also rejects symbolic
+lifecycle step must generate its bearer-bearing attachment as
+`bootstrap-<32 lowercase hex>.json` with the exact installed candidate
+interpreter; GitHub run IDs and attempts are public and do not satisfy that
+attachment contract. Failure cleanup best-effort consumes and unlinks any
+published attachment before stopping the service, so an interrupted smoke does
+not leave the bearer-bearing file behind. The preceding release-mode Clippy
+gate compiles all Tauri targets with warnings denied, so test-only platform
+helpers cannot leak into the shipped host binary as dead code. The macOS PR and
+candidate gates run the complete release Rust suite with one test thread
+because its native process-lifecycle cases mutate process-global environment
+and load the shared OS process table. Security-path fixtures canonicalize the
+macOS system temporary-directory alias before exercising no-follow path
+traversal; the production traversal remains strict. The bundle smoke also rejects symbolic
 links in the app, `Info.plist`, Tauri executable, sidecar, or their in-bundle
 ancestors and revalidates binary identity and digest after cleanup. Candidate
 JSON fixtures cover duplicate keys at both top-level and nested locations.

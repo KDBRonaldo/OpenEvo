@@ -98,13 +98,16 @@ The repository currently provides:
   bytes. The service smoke uses the installed launcher's canonical
   OS-account-derived `~/.openevo/core` root; it must not substitute a
   run-scoped `$RUNNER_TEMP` root and thereby contradict the host-global service
-  identity contract. Only after both jobs pass does a write-scoped job create
-  an unsigned draft prerelease, upload every manifest member, download every
-  asset into an empty directory, revalidate the closed inventory, compare all
-  bytes, and validate the review-facing draft fields and the per-attempt random
-  ownership marker. A separate run-attempt-qualified Actions artifact retains
-  that point-in-time metadata record. The successful draft has a `tagName` but
-  does not create a remote Git tag;
+  identity contract. Its bearer-bearing bootstrap attachment uses an
+  installed-interpreter-generated `bootstrap-<32 lowercase hex>.json` name;
+  public workflow IDs are not attachment identity. Only after both jobs pass
+  does a write-scoped job create an unsigned draft prerelease, upload every
+  manifest member, download every asset into an empty directory, revalidate the
+  closed inventory, compare all bytes, and validate the review-facing draft
+  fields and the per-attempt random ownership marker. A separate
+  run-attempt-qualified Actions artifact retains that point-in-time metadata
+  record. The successful draft has a `tagName` but does not create a remote Git
+  tag;
 - a disabled `.github/workflows/openevo-release-artifact.yml` placeholder that
   publishes nothing.
 
