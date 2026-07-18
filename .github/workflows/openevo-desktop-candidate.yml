@@ -648,10 +648,17 @@ jobs:
             bash -ceu '
               mount --bind "$OPENEVO_DIND_SOCKET" /var/run/docker.sock
               export DOCKER_HOST=unix:///var/run/docker.sock
+              smoke_root="$(mktemp -d /tmp/openevo-managed-runtime-smoke.XXXXXX)"
+              trap '\''rm -rf -- "$smoke_root"'\'' EXIT
+              chmod 700 "$smoke_root"
+              smoke_archive="$smoke_root/$(basename "$OPENEVO_RUNTIME_ARCHIVE")"
+              cp -- "$OPENEVO_RUNTIME_ARCHIVE" "$smoke_archive"
+              chmod 600 "$smoke_archive"
+              test "$(stat -c "%u:%a" "$smoke_archive")" = "0:600"
               cd "$OPENEVO_REPO"
               "$OPENEVO_REPO/.venv/bin/python" \
                 scripts/ci/smoke_managed_runtime_archive.py \
-                "$OPENEVO_RUNTIME_ARCHIVE" \
+                "$smoke_archive" \
                 --fixed-docker-fault-injection \
                 --expected-docker-socket-device "$OPENEVO_DIND_SOCKET_DEVICE" \
                 --expected-docker-socket-inode "$OPENEVO_DIND_SOCKET_INODE" \

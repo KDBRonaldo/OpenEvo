@@ -87,6 +87,7 @@ def test_candidate_workflow_closes_managed_subscription_runtime_release() -> Non
         "unshare --mount --propagation private",
         'mount --bind "$OPENEVO_DIND_SOCKET" /var/run/docker.sock',
         'sudo docker --host "unix://$dind_socket"',
+        'test "$(stat -c "%u:%a" "$smoke_archive")" = "0:600"',
     ):
         assert value in workflow
     assert workflow.count("self-deployed") == 0
