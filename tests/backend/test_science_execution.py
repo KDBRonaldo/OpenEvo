@@ -10,7 +10,12 @@ from openevo.backend.science_execution import compile_science_execution
 from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.experiments.models import ExperimentConfig
 from openevo.internal_auth import InternalServiceIdentity
-from openevo.runtime.managed import MANAGED_HOME, MANAGED_PATH, MANAGED_RUNTIME_RELEASES
+from openevo.runtime.managed import (
+    MANAGED_HOME,
+    MANAGED_PATH,
+    MANAGED_RUNTIME_RELEASES,
+    MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+)
 
 
 def _project(
@@ -108,9 +113,11 @@ def test_project_compiles_to_single_session_existing_experiment_path(tmp_path: P
     )
     assert execution.config.runtime.container_user == "host"
     assert execution.config.runtime.env == {"HOME": MANAGED_HOME, "PATH": MANAGED_PATH}
-    assert execution.config.runtime.prepare[0].command.startswith(
-        f"mkdir -p {MANAGED_HOME}/.codex"
+    assert (
+        execution.config.runtime.prepare[0].command
+        == MANAGED_SUBSCRIPTION_PREPARE_COMMAND
     )
+    assert "/openevo/session/logs/agent" in MANAGED_SUBSCRIPTION_PREPARE_COMMAND
     assert execution.config.tasks[0].instruction == project.task.objective
     assert execution.config.tasks[0].workspace is None
     assert execution.execution_profile.execution_mode == "subscription"

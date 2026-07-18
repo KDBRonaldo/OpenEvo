@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import dataclasses
 import importlib.util
+import shlex
+import subprocess
 
 import pytest
 
@@ -21,6 +23,25 @@ from tests.managed_runtime_testkit import (
     RUNTIME_RELEASE_ID,
     write_test_managed_runtime_archive,
 )
+
+
+def test_managed_subscription_prepare_creates_private_agent_log_tree(
+    tmp_path: Path,
+) -> None:
+    session_root = tmp_path / "session root"
+    command = managed.MANAGED_SUBSCRIPTION_PREPARE_COMMAND
+    assert command.count("/openevo/session") == 7
+    rebased = command.replace("/openevo/session", shlex.quote(str(session_root)))
+
+    subprocess.run(
+        ["/bin/sh", "-eu", "-c", rebased],
+        check=True,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+
+    for directory in (session_root / "logs", session_root / "logs" / "agent"):
+        assert directory.is_dir()
+        assert directory.stat().st_mode & 0o777 == 0o700
 
 
 def test_release_contract_binds_actual_archive_config_authority() -> None:

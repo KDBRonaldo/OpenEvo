@@ -556,8 +556,10 @@ MANAGED_SUBSCRIPTION_ENV: Final[dict[str, str]] = {
 }
 MANAGED_SUBSCRIPTION_ENV_KEYS: Final[frozenset[str]] = frozenset(MANAGED_SUBSCRIPTION_ENV)
 MANAGED_SUBSCRIPTION_PREPARE_COMMAND: Final[str] = (
-    f"mkdir -p {MANAGED_HOME}/.codex {MANAGED_WORKSPACE} && "
-    f"chmod 700 {MANAGED_HOME} {MANAGED_HOME}/.codex"
+    f"mkdir -p {MANAGED_HOME}/.codex {MANAGED_WORKSPACE} "
+    "/openevo/session/logs/agent && "
+    f"chmod 700 {MANAGED_HOME} {MANAGED_HOME}/.codex "
+    "/openevo/session/logs /openevo/session/logs/agent"
 )
 
 

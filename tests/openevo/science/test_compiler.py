@@ -9,7 +9,12 @@ from openevo.evolution.framework.builtins import (
     build_builtin_registry,
 )
 from openevo.projects.science import PreparedWorkspace, ScienceProjectConfig, compile_science_project
-from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
+from openevo.runtime.managed import (
+    MANAGED_HOME,
+    MANAGED_PATH,
+    MANAGED_RUNTIME_RELEASES,
+    MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+)
 
 _compile_experiment = experiments.compile_experiment
 _REGISTRY_SNAPSHOT = build_builtin_registry(
@@ -76,20 +81,13 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
     assert compiled.runtime.workdir == "/openevo/session/workspace"
     assert compiled.runtime.container_user == "host"
     assert compiled.runtime.env == {
-        "HOME": "/openevo/session/home",
-        "PATH": (
-            "/home/openevo/.local/bin:/usr/local/sbin:/usr/local/bin:"
-            "/usr/sbin:/usr/bin:/sbin:/bin"
-        ),
+        "HOME": MANAGED_HOME,
+        "PATH": MANAGED_PATH,
     }
     assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
         {
             "type": "exec",
-            "command": (
-                "mkdir -p /openevo/session/home/.codex "
-                "/openevo/session/workspace && chmod 700 "
-                "/openevo/session/home /openevo/session/home/.codex"
-            ),
+            "command": MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
             "cwd": None,
             "env": None,
             "source": None,
@@ -145,11 +143,8 @@ def test_local_inference_compiles_to_transcript_proxy_auth_and_hf_model_metadata
     assert compiled.runtime.env == {
         "SCIENCE_DATASET": "folding",
         "OPENEVO_MANAGED_HF_MODEL": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
-        "HOME": "/openevo/session/home",
-        "PATH": (
-            "/home/openevo/.local/bin:/usr/local/sbin:/usr/local/bin:"
-            "/usr/sbin:/usr/bin:/sbin:/bin"
-        ),
+        "HOME": MANAGED_HOME,
+        "PATH": MANAGED_PATH,
     }
     assert compiled.agent.env["CODEX_HOME"] == "/openevo/session/home/.codex"
     assert compiled.runtime.container_user == "host"
@@ -362,11 +357,7 @@ def test_scratch_source_has_no_workspace_and_keeps_runtime_and_setup_commands() 
     assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
         {
             "type": "exec",
-            "command": (
-                "mkdir -p /openevo/session/home/.codex "
-                "/openevo/session/workspace && chmod 700 "
-                "/openevo/session/home /openevo/session/home/.codex"
-            ),
+            "command": MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
             "cwd": None,
             "env": None,
             "source": None,
@@ -400,11 +391,7 @@ def test_experiment_compiler_uploads_workspace_before_science_prepare_actions() 
             "type": "exec",
             "source": None,
             "target": None,
-            "command": (
-                "mkdir -p /openevo/session/home/.codex "
-                "/openevo/session/workspace && chmod 700 "
-                "/openevo/session/home /openevo/session/home/.codex"
-            ),
+            "command": MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
             "cwd": None,
             "env": None,
         },

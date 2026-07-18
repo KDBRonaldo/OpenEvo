@@ -11,6 +11,7 @@ from openevo.runtime.managed import (
     MANAGED_PATH,
     MANAGED_RUNTIME_IMAGES as MANAGED_RUNTIME_IMAGES,
     MANAGED_RUNTIME_RELEASES,
+    MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
 )
 
 
@@ -124,10 +125,7 @@ def _runtime_payload(project: ScienceProjectConfig) -> dict[str, Any]:
 def _runtime_directory_prepare_command(project: ScienceProjectConfig) -> str:
     if project.environment.profile == "custom_image":
         return f"mkdir -p {_WORKDIR}"
-    return (
-        f"mkdir -p {MANAGED_HOME}/.codex {_WORKDIR} && "
-        f"chmod 700 {MANAGED_HOME} {MANAGED_HOME}/.codex"
-    )
+    return MANAGED_SUBSCRIPTION_PREPARE_COMMAND
 
 
 def _runtime_image(project: ScienceProjectConfig) -> str:
