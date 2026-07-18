@@ -561,19 +561,40 @@ def _completed_result(
     include_output: bool = True,
     output_type: str = "text_memory",
     promoted: bool = True,
+    prior_dataset_ids: tuple[str, ...] = (),
+    prior_artifact_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    input_artifact_ids = ["dataset-1", *prior_dataset_ids, *prior_artifact_ids]
     output = {
         "artifact_id": artifact_id,
         "type": output_type,
         "name": "Durable memory",
         "manifest": {"record_count": 1},
         "lineage": {
+            "input_artifact_ids": input_artifact_ids,
+            "source_dataset_artifact_ids": ["dataset-1", *prior_dataset_ids],
             "openevo_execution": {
                 "target_id": "text_memory",
                 "method_id": "memory_reflection",
                 "job_id": "job-memory-1",
-                "input_bindings": [{"artifact_id": "dataset-1", "artifact_type": "dataset"}],
-            }
+                "input_bindings": [
+                    {
+                        "binding_id": "dataset_inputs",
+                        "artifact_ids": ["dataset-1"],
+                        "artifact_digests": ["1" * 64],
+                    },
+                    {
+                        "binding_id": "prior_target_artifacts",
+                        "artifact_ids": list(prior_artifact_ids),
+                        "artifact_digests": ["2" * 64 for _ in prior_artifact_ids],
+                    },
+                    {
+                        "binding_id": "history_datasets",
+                        "artifact_ids": list(prior_dataset_ids),
+                        "artifact_digests": ["3" * 64 for _ in prior_dataset_ids],
+                    },
+                ],
+            },
         },
         "scores": {"quality": 0.75},
         "promoted": promoted,
@@ -589,8 +610,8 @@ def _completed_result(
                 "rounds": [
                     {
                         "artifact_ids": {
-                            "dataset": ["dataset-1"],
-                            "text_memory": [artifact_id],
+                            "dataset": ["dataset-1", *prior_dataset_ids],
+                            "text_memory": [*prior_artifact_ids, artifact_id],
                         },
                         "jobs": [
                             {
@@ -607,6 +628,142 @@ def _completed_result(
             }
         ],
     }
+
+
+def test_project_artifacts_preserve_canonical_grouped_input_lineage(
+    tmp_path: Path,
+    registry: object,
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    try:
+        project = _project(store, registry)
+        assert project.active_revision is not None
+        artifacts = owner_module._project_artifacts(
+            _completed_result(
+                prior_dataset_ids=("dataset-prior",),
+                prior_artifact_ids=("memory-prior",),
+            ),
+            project=project,
+            run_id="run-lineage",
+            revision=project.active_revision,
+        )
+        assert len(artifacts) == 1
+        assert artifacts[0].lineage.source_dataset_ids == [
+            "dataset-1",
+            "dataset-prior",
+        ]
+        assert artifacts[0].lineage.source_artifact_ids == ["memory-prior"]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("bindings", "inventory", "message"),
+    [
+        (
+            [
+                {
+                    "binding_id": "inputs",
+                    "artifact_ids": ["unknown"],
+                    "artifact_digests": ["1" * 64],
+                }
+            ],
+            {},
+            "not in the result inventory",
+        ),
+        (
+            [
+                {
+                    "binding_id": "inputs",
+                    "artifact_ids": ["known"],
+                    "artifact_digests": ["1" * 64],
+                },
+                {
+                    "binding_id": "inputs",
+                    "artifact_ids": ["known"],
+                    "artifact_digests": ["1" * 64],
+                },
+            ],
+            {"known": "text_memory"},
+            "binding is duplicated",
+        ),
+        (
+            [
+                {
+                    "binding_id": "first",
+                    "artifact_ids": ["known"],
+                    "artifact_digests": ["1" * 64],
+                },
+                {
+                    "binding_id": "second",
+                    "artifact_ids": ["known"],
+                    "artifact_digests": ["2" * 64],
+                },
+            ],
+            {"known": "text_memory"},
+            "digest is inconsistent",
+        ),
+    ],
+)
+def test_lineage_inputs_fail_closed_on_inconsistent_execution_inventory(
+    bindings: list[dict[str, object]],
+    inventory: dict[str, str],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        owner_module._lineage_inputs(
+            {"input_bindings": bindings},
+            artifact_types_by_id=inventory,
+        )
+
+
+def test_lineage_inputs_enforce_per_type_contract_limit() -> None:
+    artifact_ids = [f"memory-{index}" for index in range(129)]
+    binding = {
+        "binding_id": "inputs",
+        "artifact_ids": artifact_ids,
+        "artifact_digests": ["1" * 64 for _ in artifact_ids],
+    }
+    inventory = {artifact_id: "text_memory" for artifact_id in artifact_ids}
+    datasets, artifacts = owner_module._lineage_inputs(
+        {
+            "input_bindings": [
+                {
+                    **binding,
+                    "artifact_ids": artifact_ids[:128],
+                    "artifact_digests": binding["artifact_digests"][:128],
+                }
+            ]
+        },
+        artifact_types_by_id=inventory,
+    )
+    assert datasets == []
+    assert artifacts == artifact_ids[:128]
+    with pytest.raises(ValueError, match="lineage is too large"):
+        owner_module._lineage_inputs(
+            {"input_bindings": [binding]},
+            artifact_types_by_id=inventory,
+        )
+
+
+def test_result_context_rejects_cross_type_identity_and_non_single_session_shape() -> None:
+    duplicated = _completed_result()
+    round_result = duplicated["tasks"][0]["rounds"][0]
+    round_result["artifact_ids"]["skill_bundle"] = ["dataset-1"]
+    with pytest.raises(ValueError, match="multiple context types"):
+        owner_module._result_context(duplicated)
+
+    multiple_tasks = _completed_result()
+    multiple_tasks["tasks"].append(multiple_tasks["tasks"][0])
+    with pytest.raises(ValueError, match="exactly one task"):
+        owner_module._result_context(multiple_tasks)
+
+    multiple_rounds = _completed_result()
+    multiple_rounds["tasks"][0]["rounds"].append(
+        multiple_rounds["tasks"][0]["rounds"][0]
+    )
+    with pytest.raises(ValueError, match="exactly one round"):
+        owner_module._worker_output_records(multiple_rounds)
 
 
 def _response_model(response: object) -> m.RunV1:

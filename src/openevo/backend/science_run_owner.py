@@ -41,6 +41,7 @@ from openevo.backend.service_supervisor import (
     ServiceRunLease,
 )
 from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
+from openevo.evolution.framework.execution import ResolvedMethodInputBinding
 from openevo.evolution.runtime_injection import build_runtime_injection_plan
 from openevo.experiments import EvolutionHttpClient, RolloutHttpClient
 from openevo.experiments.clients import EvolutionClientProtocol, RolloutClientProtocol
@@ -1726,17 +1727,24 @@ def _run_model(data: Mapping[str, object], *, version: int) -> m.RunV1:
     return m.RunV1.model_validate_json(_canonical_bytes({**payload, "etag": etag}))
 
 
+def _single_science_round(result: Mapping[str, object]) -> dict[str, Any]:
+    tasks = result.get("tasks")
+    if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], dict):
+        raise ValueError("science result must contain exactly one task")
+    rounds = tasks[0].get("rounds")
+    if not isinstance(rounds, list) or len(rounds) != 1 or not isinstance(rounds[0], dict):
+        raise ValueError("science result task must contain exactly one round")
+    return rounds[0]
+
+
 def _result_context(result: Mapping[str, object]) -> dict[str, list[str]]:
-    try:
-        tasks = result["tasks"]
-        task = cast(list[dict[str, Any]], tasks)[0]
-        round_result = cast(list[dict[str, Any]], task["rounds"])[-1]
-        raw = cast(dict[str, object], round_result["artifact_ids"])
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError("science result has no terminal artifact context") from exc
+    raw = _single_science_round(result).get("artifact_ids")
+    if not isinstance(raw, dict):
+        raise ValueError("science result has no terminal artifact context")
     if len(raw) > 128:
         raise ValueError("science result has too many artifact context types")
     context: dict[str, list[str]] = {}
+    seen_ids: set[str] = set()
     total = 0
     for artifact_type, values in raw.items():
         if not isinstance(artifact_type, str) or not isinstance(values, list):
@@ -1749,6 +1757,9 @@ def _result_context(result: Mapping[str, object]) -> dict[str, list[str]]:
             or any(len(item.encode("utf-8")) > 256 for item in ids)
         ):
             raise ValueError("science result artifact IDs are invalid")
+        if seen_ids.intersection(ids):
+            raise ValueError("science result artifact ID has multiple context types")
+        seen_ids.update(ids)
         total += len(ids)
         if total > 1024:
             raise ValueError("science result has too many artifact IDs")
@@ -1998,11 +2009,23 @@ def _project_artifacts(
     revision: m.RevisionRefV1,
 ) -> list[m.ArtifactSummaryV1]:
     outputs = _worker_output_records(result)
+    terminal_context = _result_context(result)
     selected_artifact_ids = {
-        artifact_id
-        for artifact_ids in _result_context(result).values()
+        artifact_id for artifact_ids in terminal_context.values() for artifact_id in artifact_ids
+    }
+    artifact_types_by_id = {
+        artifact_id: artifact_type
+        for artifact_type, artifact_ids in terminal_context.items()
         for artifact_id in artifact_ids
     }
+    for artifact_id, output in outputs.items():
+        output_type = output.get("type")
+        if not isinstance(output_type, str) or not output_type:
+            raise ValueError("science result artifact type is invalid")
+        existing_type = artifact_types_by_id.get(artifact_id)
+        if existing_type is not None and existing_type != output_type:
+            raise ValueError("science result artifact context type is invalid")
+        artifact_types_by_id[artifact_id] = output_type
     if len(outputs) > 1024:
         raise ValueError("science result has too many artifact outputs")
     projected: list[m.ArtifactSummaryV1] = []
@@ -2045,7 +2068,10 @@ def _project_artifacts(
         target_id = execution.get("target_id")
         if not all(isinstance(value, str) and value for value in (method_id, job_id, target_id)):
             raise ValueError("science result artifact execution identity is incomplete")
-        source_dataset_ids, source_artifact_ids = _lineage_inputs(execution)
+        source_dataset_ids, source_artifact_ids = _lineage_inputs(
+            execution,
+            artifact_types_by_id=artifact_types_by_id,
+        )
         score_models = [
             m.ArtifactScoreV1(name=str(score_name), value=float(score_value))
             for score_name, score_value in scores.items()
@@ -2115,66 +2141,76 @@ def _project_artifacts(
 def _worker_output_records(result: Mapping[str, object]) -> dict[str, dict[str, Any]]:
     outputs: dict[str, dict[str, Any]] = {}
     artifact_ids: set[str] = set()
-    tasks = result.get("tasks")
-    if not isinstance(tasks, list) or not tasks:
-        raise ValueError("science result has no task outputs")
-    for task in tasks:
-        rounds = task.get("rounds") if isinstance(task, dict) else None
-        if not isinstance(rounds, list) or not rounds:
-            raise ValueError("science result task rounds are invalid")
-        for round_result in rounds:
-            jobs = round_result.get("jobs") if isinstance(round_result, dict) else None
-            if not isinstance(jobs, list):
-                raise ValueError("science result jobs are invalid")
-            for job in jobs:
-                worker_results = job.get("worker_results") if isinstance(job, dict) else None
-                if not isinstance(worker_results, list):
-                    raise ValueError("science result worker outputs are invalid")
-                for worker_result in worker_results:
-                    if not isinstance(worker_result, dict):
-                        raise ValueError("science result worker output is invalid")
-                    raw_ids = worker_result.get("artifact_ids")
-                    raw_outputs = worker_result.get("outputs")
-                    if not isinstance(raw_ids, list) or not isinstance(raw_outputs, list):
-                        raise ValueError("science result worker output inventory is incomplete")
-                    for artifact_id in raw_ids:
-                        if not isinstance(artifact_id, str) or not artifact_id:
-                            raise ValueError("science result artifact ID is invalid")
-                        artifact_ids.add(artifact_id)
-                    for output in raw_outputs:
-                        artifact_id = (
-                            output.get("artifact_id") if isinstance(output, dict) else None
-                        )
-                        if not isinstance(artifact_id, str) or not artifact_id:
-                            raise ValueError("science result artifact output is invalid")
-                        existing = outputs.get(artifact_id)
-                        if existing is not None and _canonical_bytes(existing) != _canonical_bytes(
-                            output
-                        ):
-                            raise ValueError(
-                                "science result artifact output changed within the run"
-                            )
-                        outputs[artifact_id] = output
+    jobs = _single_science_round(result).get("jobs")
+    if not isinstance(jobs, list):
+        raise ValueError("science result jobs are invalid")
+    for job in jobs:
+        worker_results = job.get("worker_results") if isinstance(job, dict) else None
+        if not isinstance(worker_results, list):
+            raise ValueError("science result worker outputs are invalid")
+        for worker_result in worker_results:
+            if not isinstance(worker_result, dict):
+                raise ValueError("science result worker output is invalid")
+            raw_ids = worker_result.get("artifact_ids")
+            raw_outputs = worker_result.get("outputs")
+            if not isinstance(raw_ids, list) or not isinstance(raw_outputs, list):
+                raise ValueError("science result worker output inventory is incomplete")
+            for artifact_id in raw_ids:
+                if not isinstance(artifact_id, str) or not artifact_id:
+                    raise ValueError("science result artifact ID is invalid")
+                artifact_ids.add(artifact_id)
+            for output in raw_outputs:
+                artifact_id = output.get("artifact_id") if isinstance(output, dict) else None
+                if not isinstance(artifact_id, str) or not artifact_id:
+                    raise ValueError("science result artifact output is invalid")
+                existing = outputs.get(artifact_id)
+                if existing is not None and _canonical_bytes(existing) != _canonical_bytes(output):
+                    raise ValueError("science result artifact output changed within the run")
+                outputs[artifact_id] = output
     if set(outputs) != artifact_ids:
         raise ValueError("science result artifact output inventory is incomplete")
     return outputs
 
 
-def _lineage_inputs(execution: Mapping[str, object]) -> tuple[list[str], list[str]]:
+def _lineage_inputs(
+    execution: Mapping[str, object],
+    *,
+    artifact_types_by_id: Mapping[str, str],
+) -> tuple[list[str], list[str]]:
     datasets: list[str] = []
     artifacts: list[str] = []
     bindings = execution.get("input_bindings")
-    if not isinstance(bindings, list):
-        return datasets, artifacts
-    for binding in bindings:
-        if not isinstance(binding, dict):
-            continue
-        artifact_id = binding.get("artifact_id")
-        artifact_type = binding.get("artifact_type")
-        if not isinstance(artifact_id, str):
-            continue
-        (datasets if artifact_type == "dataset" else artifacts).append(artifact_id)
-    return datasets[:128], artifacts[:128]
+    if not isinstance(bindings, list) or len(bindings) > 128:
+        raise ValueError("science result artifact input bindings are invalid")
+    binding_ids: set[str] = set()
+    artifact_digests: dict[str, str] = {}
+    for raw_binding in bindings:
+        try:
+            binding = ResolvedMethodInputBinding.model_validate(raw_binding)
+        except ValueError as exc:
+            raise ValueError("science result artifact input binding is invalid") from exc
+        if binding.binding_id in binding_ids:
+            raise ValueError("science result artifact input binding is duplicated")
+        binding_ids.add(binding.binding_id)
+        for artifact_id, digest in zip(
+            binding.artifact_ids,
+            binding.artifact_digests,
+            strict=True,
+        ):
+            artifact_type = artifact_types_by_id.get(artifact_id)
+            if artifact_type is None:
+                raise ValueError("science result artifact input is not in the result inventory")
+            existing_digest = artifact_digests.get(artifact_id)
+            if existing_digest is not None:
+                if existing_digest != digest:
+                    raise ValueError("science result artifact input digest is inconsistent")
+                continue
+            artifact_digests[artifact_id] = digest
+            target = datasets if artifact_type == "dataset" else artifacts
+            target.append(artifact_id)
+            if len(target) > 128:
+                raise ValueError("science result artifact lineage is too large")
+    return datasets, artifacts
 
 
 def _request_digest(request: m.ContractModel | None, etag: str) -> str:
