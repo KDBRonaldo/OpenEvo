@@ -457,6 +457,15 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         ]
         assert all("codex" not in part.lower() for spec in backend.spawned for part in spec.argv)
         assert all(spec.argv[1] == "-I" for spec in backend.spawned)
+        framework_specs = [
+            spec for spec in backend.spawned if "--framework-lock" in spec.argv
+        ]
+        assert len(framework_specs) == 2
+        assert all(
+            spec.argv[spec.argv.index("--framework-lock") + 1] == os.fspath(framework_lock)
+            for spec in framework_specs
+        )
+        assert not (tmp_path / "core-services" / "framework-lock.json").exists()
         assert all("PYTHONPATH" not in spec.env for spec in backend.spawned)
         assert all("PYTHONHOME" not in spec.env for spec in backend.spawned)
         assert all(

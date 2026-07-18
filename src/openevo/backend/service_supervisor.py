@@ -1994,7 +1994,7 @@ class CoreServiceSupervisor:
         try:
             self._framework_lock_source = _VerifiedFrameworkLock(Path(framework_lock))
             self._framework_lock_digest = self._framework_lock_source.digest
-            self._managed_framework_lock = self._root.path / "framework-lock.json"
+            self._framework_lock_path = self._framework_lock_source.path
             self._launch_mode = launch_mode
             self._verified_registry = verified_registry
             self._run_admission_url = (
@@ -2121,8 +2121,7 @@ class CoreServiceSupervisor:
             deadline = time.monotonic() + (
                 self._startup_timeout if total_timeout is None else total_timeout
             )
-            lock_payload = self._framework_lock_source.verified_payload()
-            self._root.atomic_write("framework-lock.json", lock_payload)
+            self._framework_lock_source.verified_payload()
             if execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
                 if self._active_run_lease is not None:
                     raise SupervisorStateError(
@@ -2681,7 +2680,7 @@ class CoreServiceSupervisor:
                     "--artifact-root",
                     os.fspath(evolution_root / "artifacts"),
                     "--framework-lock",
-                    os.fspath(self._managed_framework_lock),
+                    os.fspath(self._framework_lock_path),
                 ),
                 ports["evolution-backend"],
                 ServiceHealthProbe.http(
@@ -2749,7 +2748,7 @@ class CoreServiceSupervisor:
                     "--artifact-root",
                     os.fspath(evolution_root / "artifacts"),
                     "--framework-lock",
-                    os.fspath(self._managed_framework_lock),
+                    os.fspath(self._framework_lock_path),
                 ),
                 None,
                 ServiceHealthProbe.http(
