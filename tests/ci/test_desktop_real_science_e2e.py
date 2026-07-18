@@ -114,6 +114,84 @@ def test_native_frame_uses_the_closed_credential_protocol() -> None:
     assert credentials.session_token not in repr(credentials)
 
 
+def test_local_api_requires_explicit_contract_for_empty_error_response() -> None:
+    module = _load_runner()
+
+    class EmptyResponse:
+        status = 403
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            return b""
+
+    class FakeOpener:
+        def open(self, _request: object, *, timeout: int):
+            assert timeout == 30
+            return EmptyResponse()
+
+    api = module.LocalApi("http://127.0.0.1:12345", "a" * 64)
+    api._opener = FakeOpener()
+
+    assert (
+        api.request(
+            "GET",
+            "/openevo-native/session",
+            stage="empty_probe",
+            expected_status=403,
+            authenticated=False,
+            expected_empty_body=True,
+        )
+        is None
+    )
+    with pytest.raises(module.E2EFailure, match="invalid_json_response"):
+        api.request(
+            "GET",
+            "/openevo-native/session",
+            stage="empty_probe_without_contract",
+            expected_status=403,
+            authenticated=False,
+        )
+
+
+def test_local_api_rejects_payload_when_empty_response_is_declared() -> None:
+    module = _load_runner()
+
+    class NonEmptyResponse:
+        status = 403
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            return b"{}"
+
+    class FakeOpener:
+        def open(self, _request: object, *, timeout: int):
+            assert timeout == 30
+            return NonEmptyResponse()
+
+    api = module.LocalApi("http://127.0.0.1:12345", "a" * 64)
+    api._opener = FakeOpener()
+
+    with pytest.raises(module.E2EFailure, match="unexpected_empty_response_payload"):
+        api.request(
+            "GET",
+            "/openevo-native/session",
+            stage="non_empty_probe",
+            expected_status=403,
+            authenticated=False,
+            expected_empty_body=True,
+        )
+
+
 def test_wheel_lock_validation_binds_exact_bytes(tmp_path: Path) -> None:
     module = _load_runner()
     wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"

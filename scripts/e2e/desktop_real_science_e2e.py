@@ -311,6 +311,7 @@ class LocalApi:
         headers: Mapping[str, str] | None = None,
         expected_status: int | Sequence[int] = 200,
         authenticated: bool = True,
+        expected_empty_body: bool = False,
     ) -> dict[str, Any] | None:
         request_headers = dict(headers or {})
         if authenticated:
@@ -342,6 +343,10 @@ class LocalApi:
         if status not in statuses:
             remote_code = _remote_error_code(payload)
             raise E2EFailure(stage, remote_code, http_status=status)
+        if expected_empty_body:
+            if payload:
+                raise E2EFailure(stage, "unexpected_empty_response_payload")
+            return None
         if status == 204:
             if payload:
                 raise E2EFailure(stage, "unexpected_no_content_payload")
@@ -1598,6 +1603,7 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
         stage="desktop_session_probe_unauthenticated",
         expected_status=403,
         authenticated=False,
+        expected_empty_body=True,
     )
     return {
         "source_commit": source_commit,
