@@ -133,8 +133,15 @@ def test_desktop_wheel_smoke_exercises_config_backed_lifecycle(
     monkeypatch,
 ) -> None:
     smoke = _load_desktop_wheel_smoke_module()
-    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
-    wheel.write_bytes(_nested_wheel_bytes(metadata=GOOD_METADATA))
+    wheel = tmp_path / f"openevo-{smoke.OPENEVO_VERSION}-py3-none-any.whl"
+    wheel.write_bytes(
+        _nested_wheel_bytes(
+            metadata=GOOD_METADATA.replace(
+                "Version: 0.1.0",
+                f"Version: {smoke.OPENEVO_VERSION}",
+            )
+        )
+    )
     monkeypatch.setattr(
         "desktop.sidecar.api.discover_local_openevo_wheel",
         lambda: wheel,
@@ -1571,13 +1578,14 @@ def test_cli_wheel_only_requires_exact_openevo_wheel_artifact_name(
 ) -> None:
     checker = _load_module()
     wheel = _write_wheel(tmp_path / "polar-0.1.0-py3-none-any.whl")
+    project_version = checker._project_version()
 
     result = checker.main(["--wheel", str(wheel)])
 
     assert result == 1
     assert (
         "Release artifacts must include an exact OpenEvo wheel for remote install: "
-        "openevo-0.1.0-*.whl."
+        f"openevo-{project_version}-*.whl."
     ) in capsys.readouterr().err
 
 
@@ -2780,6 +2788,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
     cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
     cargo_config = tomllib.loads(cargo)
+    project_config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     cargo_metadata = json.loads(
         subprocess.run(
             [
@@ -2834,7 +2843,11 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     effective_tauri_binary = config.get("mainBinaryName") or cargo_main_binary
     assert effective_tauri_binary == candidate_tool.TAURI_EXECUTABLE_NAME == "openevo-desktop"
     assert cargo_config["package"]["name"] == "openevo-desktop"
-    assert config["version"] == "0.1.0"
+    assert (
+        config["version"]
+        == cargo_config["package"]["version"]
+        == project_config["project"]["version"]
+    )
     assert config["identifier"] == "org.openevo.desktop"
     assert config["build"]["beforeBuildCommand"] == "npm run build:openevo"
     assert config["build"]["frontendDist"] == "../dist"

@@ -69,6 +69,7 @@ jobs:
             tests/openevo/test_experiment_models.py \
             tests/openevo/test_experiment_runner.py \
             tests/openevo/test_core_capabilities.py \
+            tests/openevo/test_core_host_service.py \
             -q
 
   real-docker-runtime-probes:

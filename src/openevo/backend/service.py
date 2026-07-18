@@ -55,6 +55,8 @@ _PENDING_NAME = "pending.json"
 _SPAWN_LOCK_NAME = "spawn.lock"
 _SERVICE_GENERATION_HEADER = "X-OpenEvo-Core-Generation"
 _RELEASE_IDENTITY_HEADER = "X-OpenEvo-Core-Release-Identity"
+_PROCESS_GROUP_LIFECYCLE_COMPATIBILITY = 3
+_ONEFILE_LAUNCHER_CLEANUP_SECONDS = 10.0
 _ORPHANED_SERVICE_CHILDREN_GUARD = threading.Lock()
 _ORPHANED_SERVICE_CHILDREN: dict[int, subprocess.Popen[bytes]] = {}
 _PIDFD_SYSCALL_NUMBERS = {
@@ -97,6 +99,18 @@ class ProcessIdentity:
     pid: int
     boot_id: str
     start_time_ticks: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ServiceProcessGroup:
+    launcher: ProcessIdentity
+    application: ProcessIdentity
+
+    @property
+    def identities(self) -> tuple[ProcessIdentity, ...]:
+        if self.launcher == self.application:
+            return (self.launcher,)
+        return (self.application, self.launcher)
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +409,66 @@ class LinuxProcessController:
             return False
         return current == identity and state not in {"X", "Z"}
 
+    def owns_service_process(
+        self,
+        launcher: ProcessIdentity,
+        claimed: ProcessIdentity,
+    ) -> bool:
+        """Verify the source or PyInstaller onefile service process topology."""
+
+        if launcher.boot_id != self.boot_id or claimed.boot_id != self.boot_id:
+            return False
+        if launcher == claimed:
+            return self.is_alive(launcher)
+        try:
+            launcher_before = self.capture(launcher.pid)
+            claimed_before = self.capture(claimed.pid)
+            payload = (Path("/proc") / str(claimed.pid) / "stat").read_text(encoding="ascii")
+            end = payload.rfind(")")
+            fields = payload[end + 1 :].split() if end >= 0 else []
+            parent_pid = int(fields[1])
+            process_group_id = int(fields[2])
+            session_id = int(fields[3])
+            launcher_after = self.capture(launcher.pid)
+            claimed_after = self.capture(claimed.pid)
+        except (ProcessLookupError, FileNotFoundError):
+            return False
+        except (IndexError, OSError, UnicodeError, ValueError) as exc:
+            raise CoreServiceError(
+                CoreServiceErrorCode.STATE_INVALID,
+                "Core service child topology cannot be verified.",
+                retryable=False,
+            ) from exc
+        return (
+            launcher_before == launcher_after == launcher
+            and claimed_before == claimed_after == claimed
+            and parent_pid == launcher.pid
+            and process_group_id == launcher.pid
+            and session_id == launcher.pid
+            and self.is_alive(launcher)
+            and self.is_alive(claimed)
+        )
+
+    def wait_for_exit(self, identity: ProcessIdentity, *, deadline: float) -> bool:
+        try:
+            pid_fd = _pidfd_open(identity.pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            try:
+                if self.capture(identity.pid) != identity:
+                    return True
+            except ProcessLookupError:
+                return True
+            poller = select.poll()
+            poller.register(pid_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if poller.poll(remaining_ms):
+                return True
+            return not self.is_alive(identity)
+        finally:
+            os.close(pid_fd)
+
     def find_lock_holders(self, lock: LockIdentity) -> tuple[ProcessIdentity, ...]:
         holders: dict[int, ProcessIdentity] = {}
         try:
@@ -474,6 +548,22 @@ class LinuxProcessController:
             os.close(pid_fd)
 
 
+def _frozen_service_environment(
+    *,
+    reuse_parent_extraction_for_bounded_smoke: bool,
+) -> dict[str, str] | None:
+    """Select independent long-lived or parent-owned bounded onefile state."""
+
+    if not (getattr(sys, "frozen", False) and isinstance(getattr(sys, "_MEIPASS", None), str)):
+        return None
+    environment = dict(os.environ)
+    if reuse_parent_extraction_for_bounded_smoke:
+        environment.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+        return environment
+    environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return environment
+
+
 def ensure_core_service(
     *,
     service_root: str | Path,
@@ -487,6 +577,7 @@ def ensure_core_service(
     process_controller: LinuxProcessController | None = None,
     _fault_injector: Callable[[str, int], None] | None = None,
     _bootstrap_lock_fd: int | None = None,
+    _reuse_frozen_extraction_for_bounded_smoke: bool = False,
 ) -> CoreServiceAttachment:
     _retry_orphaned_service_children()
     if (
@@ -499,7 +590,20 @@ def ensure_core_service(
         )
         or (
             daemon_bundle_identity is not None
-            and not isinstance(daemon_bundle_identity, CoreDaemonBundleIdentity)
+            and (
+                not isinstance(daemon_bundle_identity, CoreDaemonBundleIdentity)
+                or daemon_bundle_identity.lifecycle_compatibility
+                < _PROCESS_GROUP_LIFECYCLE_COMPATIBILITY
+            )
+        )
+        or type(_reuse_frozen_extraction_for_bounded_smoke) is not bool
+        or (
+            _reuse_frozen_extraction_for_bounded_smoke
+            and (
+                daemon_bundle_identity is not None
+                or not getattr(sys, "frozen", False)
+                or not isinstance(getattr(sys, "_MEIPASS", None), str)
+            )
         )
     ):
         raise CoreServiceError(
@@ -548,6 +652,9 @@ def ensure_core_service(
                     daemon_bundle_identity=daemon_bundle_identity,
                     controller=controller,
                     fault_injector=_fault_injector,
+                    reuse_frozen_extraction_for_bounded_smoke=(
+                        _reuse_frozen_extraction_for_bounded_smoke
+                    ),
                 )
             finally:
                 os.close(lifecycle_lock_fd)
@@ -594,8 +701,13 @@ def observe_core_service_predecessor(
                 if state.get("state") == "stopped":
                     return CoreServicePredecessor.absent()
                 ledger = state
-                process = _process_from_ledger(ledger)
-                if not controller.is_alive(process):
+                process_group = _service_process_group_from_ledger(ledger)
+                if not _service_process_group_is_alive(process_group, controller):
+                    _terminate_service_process_group(
+                        process_group,
+                        controller,
+                        deadline=deadline,
+                    )
                     if _is_exact_daemon_ledger(ledger):
                         root.atomic_write_json(
                             _LEDGER_NAME,
@@ -640,8 +752,8 @@ def inspect_core_service(
     with root:
         controller = process_controller or LinuxProcessController()
         ledger = _read_ledger(root)
-        identity = _process_from_ledger(ledger)
-        if not controller.is_alive(identity):
+        process_group = _service_process_group_from_ledger(ledger)
+        if not _service_process_group_is_alive(process_group, controller):
             raise CoreServiceError(
                 CoreServiceErrorCode.STATUS_INVALID,
                 "Core service is not running.",
@@ -699,9 +811,11 @@ def stop_core_service(
                 if ledger is not None:
                     state = _require_service_state(ledger)
                     if state.get("state", "running") == "running":
-                        identity = _process_from_ledger(state)
-                        if controller.is_alive(identity):
-                            controller.terminate(identity, deadline=deadline)
+                        _terminate_service_process_group(
+                            _service_process_group_from_ledger(state),
+                            controller,
+                            deadline=deadline,
+                        )
                         if preserve_compatibility_floor or _is_exact_daemon_ledger(state):
                             root.atomic_write_json(
                                 _LEDGER_NAME,
@@ -770,9 +884,11 @@ def stop_core_service_if_generation(
                     or ledger["release_identity"] != expected_release_identity
                 ):
                     return False
-                identity = _process_from_ledger(ledger)
-                if controller.is_alive(identity):
-                    controller.terminate(identity, deadline=deadline)
+                _terminate_service_process_group(
+                    _service_process_group_from_ledger(ledger),
+                    controller,
+                    deadline=deadline,
+                )
                 if _is_exact_daemon_ledger(ledger):
                     root.atomic_write_json(
                         _LEDGER_NAME,
@@ -961,10 +1077,12 @@ def _ensure_locked(
     daemon_bundle_identity: CoreDaemonBundleIdentity | None,
     controller: LinuxProcessController,
     fault_injector: Callable[[str, int], None] | None = None,
+    reuse_frozen_extraction_for_bounded_smoke: bool = False,
 ) -> CoreServiceAttachment:
     bearer = load_or_create_core_bearer_token(root)
     existing_value = root.read_optional_json(_LEDGER_NAME)
     floor: dict[str, Any] | None = None
+    predecessor_consumed = False
     if existing_value is None:
         _recover_pending(root, controller=controller, deadline=deadline)
     if existing_value is not None:
@@ -976,13 +1094,18 @@ def _ensure_locked(
                     expected=expected_predecessor,
                     actual=CoreServicePredecessor.absent(),
                 )
-            _require_floor_compatibility(floor, daemon_bundle_identity)
             root.unlink_regular(_READY_NAME)
             root.unlink_regular(_PENDING_NAME)
         else:
             ledger = state
-            process = _process_from_ledger(ledger)
-            alive = controller.is_alive(process)
+            process_group = _service_process_group_from_ledger(ledger)
+            alive = _service_process_group_is_alive(process_group, controller)
+            if not alive:
+                _terminate_service_process_group(
+                    process_group,
+                    controller,
+                    deadline=deadline,
+                )
             if not alive and _is_exact_daemon_ledger(ledger):
                 floor = _floor_from_ledger(ledger)
                 root.atomic_write_json(_LEDGER_NAME, floor, replace=True)
@@ -1027,31 +1150,54 @@ def _ensure_locked(
                         attached=True,
                     )
                 if daemon_bundle_identity is not None:
-                    raise CoreServiceError(
-                        CoreServiceErrorCode.UPDATE_REQUIRED,
-                        "A different OpenEvo Daemon bundle is already running; stop it "
-                        "explicitly before a compatible upgrade.",
-                        retryable=False,
+                    current_compatibility = actual_predecessor.lifecycle_compatibility
+                    if (
+                        not replace_mismatched
+                        or current_compatibility is None
+                        or daemon_bundle_identity.lifecycle_compatibility <= current_compatibility
+                    ):
+                        raise CoreServiceError(
+                            CoreServiceErrorCode.UPDATE_REQUIRED,
+                            "The active OpenEvo Daemon cannot be replaced by this lifecycle "
+                            "compatibility.",
+                            retryable=False,
+                        )
+                    _terminate_service_process_group(
+                        process_group,
+                        controller,
+                        deadline=deadline,
                     )
-                if not replace_mismatched:
-                    raise CoreServiceError(
-                        CoreServiceErrorCode.IDENTITY_MISMATCH,
-                        "A different verified Core release is already running.",
-                        retryable=False,
+                    floor = _floor_from_ledger(ledger)
+                    root.atomic_write_json(_LEDGER_NAME, floor, replace=True)
+                    root.unlink_regular(_READY_NAME)
+                    root.unlink_regular(_PENDING_NAME)
+                    predecessor_consumed = True
+                else:
+                    if not replace_mismatched:
+                        raise CoreServiceError(
+                            CoreServiceErrorCode.IDENTITY_MISMATCH,
+                            "A different verified Core release is already running.",
+                            retryable=False,
+                        )
+                    _require_predecessor_match(
+                        expected=expected_predecessor,
+                        actual=actual_predecessor,
                     )
+                    _terminate_service_process_group(
+                        process_group,
+                        controller,
+                        deadline=deadline,
+                    )
+                    root.unlink_regular(_LEDGER_NAME)
+                    root.unlink_regular(_READY_NAME)
+                    root.unlink_regular(_PENDING_NAME)
+        if floor is not None:
+            _require_floor_compatibility(floor, daemon_bundle_identity)
+            if expected_predecessor is not None and not predecessor_consumed:
                 _require_predecessor_match(
                     expected=expected_predecessor,
-                    actual=actual_predecessor,
+                    actual=CoreServicePredecessor.absent(),
                 )
-                controller.terminate(process, deadline=deadline)
-                root.unlink_regular(_LEDGER_NAME)
-                root.unlink_regular(_READY_NAME)
-                root.unlink_regular(_PENDING_NAME)
-        if floor is not None and expected_predecessor is not None:
-            _require_predecessor_match(
-                expected=expected_predecessor,
-                actual=CoreServicePredecessor.absent(),
-            )
     elif expected_predecessor is not None:
         _require_predecessor_match(
             expected=expected_predecessor,
@@ -1062,6 +1208,7 @@ def _ensure_locked(
     bearer = rotate_core_bearer_token(root)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     child: subprocess.Popen[bytes] | None = None
+    process_group: _ServiceProcessGroup | None = None
     ready_read = -1
     ready_write = -1
     spawn_lock_fd = -1
@@ -1086,7 +1233,7 @@ def _ensure_locked(
         root.atomic_write_json(
             _PENDING_NAME,
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "phase": "spawn_intent",
                 "release_identity": release.digest,
                 "port": actual_port,
@@ -1118,12 +1265,16 @@ def _ensure_locked(
             "--generation",
             generation,
         ]
+        child_environment = _frozen_service_environment(
+            reuse_parent_extraction_for_bounded_smoke=(reuse_frozen_extraction_for_bounded_smoke)
+        )
         try:
             child = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
                 stdout=log_fd,
                 stderr=subprocess.STDOUT,
+                env=child_environment,
                 start_new_session=True,
                 close_fds=True,
                 pass_fds=(listener.fileno(), ready_write, spawn_lock_fd),
@@ -1134,6 +1285,7 @@ def _ensure_locked(
             ready_write = -1
             os.close(spawn_lock_fd)
             spawn_lock_fd = -1
+        launcher_process = controller.capture(child.pid)
         if fault_injector is not None:
             fault_injector("after_spawn", child.pid)
         try:
@@ -1152,14 +1304,23 @@ def _ensure_locked(
                 "Core service returned an invalid readiness proof.",
                 retryable=True,
             )
-        process = _claimed_process(
+        process_group = _claimed_process(
             root,
-            expected_pid=child.pid,
+            expected_launcher=launcher_process,
+            process_controller=controller,
             release_identity=release.digest,
             port=actual_port,
             generation=generation,
         )
-        if not controller.is_alive(process):
+        if daemon_bundle_identity is None and (
+            process_group.launcher != process_group.application
+        ):
+            raise CoreServiceError(
+                CoreServiceErrorCode.START_FAILED,
+                "A frozen Core service requires a versioned Daemon lifecycle identity.",
+                retryable=False,
+            )
+        if not _service_process_group_is_alive(process_group, controller):
             raise CoreServiceError(
                 CoreServiceErrorCode.START_FAILED,
                 "Core service exited during startup.",
@@ -1190,16 +1351,19 @@ def _ensure_locked(
                 }
             )
         ready_digest = hashlib.sha256(canonical_json_bytes(ready_ledger)).hexdigest()
+        persisted_process = (
+            process_group.application if daemon_bundle_identity is None else process_group.launcher
+        )
         ledger: dict[str, object] = {
-            "schema_version": 2 if daemon_bundle_identity is None else 3,
+            "schema_version": 2 if daemon_bundle_identity is None else 5,
             "state": "running" if daemon_bundle_identity is not None else None,
             "release_identity": release.digest,
             "registry_digest": release.registry_digest,
             "framework_lock_sha256": release.framework_lock_sha256,
             "source_commit": release.source_commit,
-            "pid": process.pid,
-            "boot_id": process.boot_id,
-            "start_time_ticks": process.start_time_ticks,
+            "pid": persisted_process.pid,
+            "boot_id": persisted_process.boot_id,
+            "start_time_ticks": persisted_process.start_time_ticks,
             "port": actual_port,
             "generation": generation,
             "ready_sha256": ready_digest,
@@ -1209,6 +1373,9 @@ def _ensure_locked(
         else:
             ledger.update(
                 {
+                    "application_pid": process_group.application.pid,
+                    "application_boot_id": process_group.application.boot_id,
+                    "application_start_time_ticks": (process_group.application.start_time_ticks),
                     "bundle_sha256": daemon_bundle_identity.bundle_sha256,
                     "canonical_manifest_sha256": (
                         daemon_bundle_identity.canonical_manifest_sha256
@@ -1219,7 +1386,7 @@ def _ensure_locked(
         root.atomic_write_json(_READY_NAME, ready_ledger, replace=False)
         root.atomic_write_json(_LEDGER_NAME, ledger, replace=floor is not None)
         root.unlink_regular(_PENDING_NAME)
-        if not controller.is_alive(process):
+        if not _service_process_group_is_alive(process_group, controller):
             raise CoreServiceError(
                 CoreServiceErrorCode.START_FAILED,
                 "Core service exited during state publication.",
@@ -1232,12 +1399,40 @@ def _ensure_locked(
             attached=False,
         )
     except BaseException:
-        child_exit_confirmed = True
+        cleanup_deadline = max(deadline, time.monotonic() + 10.0)
+        pending_cleanup_confirmed = True
+        if process_group is not None:
+            try:
+                _terminate_service_process_group(
+                    process_group,
+                    controller,
+                    deadline=cleanup_deadline,
+                )
+            except BaseException:
+                pending_cleanup_confirmed = False
+        try:
+            if root.read_optional_json(_PENDING_NAME, max_bytes=_MAX_READY_BYTES) is not None:
+                _recover_pending(
+                    root,
+                    controller=controller,
+                    deadline=cleanup_deadline,
+                    clear_state=False,
+                )
+        except BaseException:
+            pending_cleanup_confirmed = False
         if child is not None:
             child_exit_confirmed = _terminate_spawned_child(child)
             if not child_exit_confirmed:
                 _retain_orphaned_service_child(child)
-        if child_exit_confirmed:
+        else:
+            child_exit_confirmed = True
+        if process_group is not None:
+            try:
+                if _service_process_group_is_alive(process_group, controller):
+                    pending_cleanup_confirmed = False
+            except BaseException:
+                pending_cleanup_confirmed = False
+        if child_exit_confirmed and pending_cleanup_confirmed:
             try:
                 if floor is None:
                     root.unlink_regular(_LEDGER_NAME)
@@ -1245,7 +1440,7 @@ def _ensure_locked(
                     root.atomic_write_json(_LEDGER_NAME, floor, replace=True)
                 root.unlink_regular(_READY_NAME)
                 root.unlink_regular(_PENDING_NAME)
-            except Exception:
+            except BaseException:
                 pass
         raise
     finally:
@@ -1547,19 +1742,51 @@ def _recover_pending(
     *,
     controller: LinuxProcessController,
     deadline: float,
+    clear_state: bool = True,
 ) -> None:
     value = root.read_optional_json(_PENDING_NAME, max_bytes=_MAX_READY_BYTES)
     if value is None:
-        root.unlink_regular(_READY_NAME)
+        if clear_state:
+            root.unlink_regular(_READY_NAME)
         return
     pending = _require_pending(value)
-    if pending["phase"] == "spawn_intent":
+    original_identity = (
+        pending["release_identity"],
+        pending["port"],
+        pending["generation"],
+    )
+    lock_identity: LockIdentity | None = None
+    if "spawn_lock_device" in pending:
         lock_identity = LockIdentity(
             device=pending["spawn_lock_device"],
             inode=pending["spawn_lock_inode"],
         )
+    claimed_identities: list[ProcessIdentity] = []
+
+    def terminate_claimed(value: dict[str, Any]) -> None:
+        if value["phase"] != "spawn_claimed":
+            return
+        identity = ProcessIdentity(
+            pid=value["pid"],
+            boot_id=value["boot_id"],
+            start_time_ticks=value["start_time_ticks"],
+        )
+        if identity not in claimed_identities:
+            claimed_identities.append(identity)
+        if controller.is_alive(identity):
+            controller.terminate(identity, deadline=deadline)
+
+    terminate_claimed(pending)
+    if lock_identity is not None:
         for holder in controller.find_lock_holders(lock_identity):
-            controller.terminate(holder, deadline=deadline)
+            if controller.is_alive(holder):
+                claimed_was_present = bool(claimed_identities)
+                if not claimed_was_present or not _wait_for_natural_launcher_exit(
+                    holder,
+                    controller,
+                    deadline=deadline,
+                ):
+                    controller.terminate(holder, deadline=deadline)
         spawn_lock_fd = root.open_lock(_SPAWN_LOCK_NAME)
         try:
             metadata = os.fstat(spawn_lock_fd)
@@ -1576,18 +1803,35 @@ def _recover_pending(
             current = root.read_optional_json(_PENDING_NAME, max_bytes=_MAX_READY_BYTES)
             if current is not None:
                 pending = _require_pending(current)
+                if (
+                    pending["release_identity"],
+                    pending["port"],
+                    pending["generation"],
+                ) != original_identity:
+                    raise CoreServiceError(
+                        CoreServiceErrorCode.STATE_INVALID,
+                        "Core service pending identity changed during recovery.",
+                        retryable=False,
+                    )
+                terminate_claimed(pending)
         finally:
             os.close(spawn_lock_fd)
-    if pending["phase"] == "spawn_claimed":
-        identity = ProcessIdentity(
-            pid=pending["pid"],
-            boot_id=pending["boot_id"],
-            start_time_ticks=pending["start_time_ticks"],
+        for holder in controller.find_lock_holders(lock_identity):
+            if controller.is_alive(holder):
+                raise CoreServiceError(
+                    CoreServiceErrorCode.DEADLINE_EXCEEDED,
+                    "Core service launcher remained alive after pending recovery.",
+                    retryable=True,
+                )
+    if any(controller.is_alive(identity) for identity in claimed_identities):
+        raise CoreServiceError(
+            CoreServiceErrorCode.DEADLINE_EXCEEDED,
+            "Core service application remained alive after pending recovery.",
+            retryable=True,
         )
-        if controller.is_alive(identity):
-            controller.terminate(identity, deadline=deadline)
-    root.unlink_regular(_PENDING_NAME)
-    root.unlink_regular(_READY_NAME)
+    if clear_state:
+        root.unlink_regular(_PENDING_NAME)
+        root.unlink_regular(_READY_NAME)
 
 
 def _require_pending(value: Any) -> dict[str, Any]:
@@ -1599,13 +1843,22 @@ def _require_pending(value: Any) -> dict[str, Any]:
         "generation",
     }
     intent_keys = common | {"spawn_lock_device", "spawn_lock_inode"}
-    claimed_keys = common | {"pid", "boot_id", "start_time_ticks"}
+    claimed_v2_keys = common | {"pid", "boot_id", "start_time_ticks"}
+    claimed_v3_keys = claimed_v2_keys | {"spawn_lock_device", "spawn_lock_inode"}
+    schema_version = value.get("schema_version") if isinstance(value, dict) else None
+    phase = value.get("phase") if isinstance(value, dict) else None
+    expected_keys = (
+        intent_keys
+        if phase == "spawn_intent"
+        else claimed_v3_keys
+        if schema_version == 3
+        else claimed_v2_keys
+    )
     if (
         not isinstance(value, dict)
-        or value.get("schema_version") != 2
-        or (value.get("phase") == "spawn_intent" and set(value) != intent_keys)
-        or (value.get("phase") == "spawn_claimed" and set(value) != claimed_keys)
-        or value.get("phase") not in {"spawn_intent", "spawn_claimed"}
+        or schema_version not in {2, 3}
+        or phase not in {"spawn_intent", "spawn_claimed"}
+        or set(value) != expected_keys
         or not isinstance(value.get("release_identity"), str)
         or re.fullmatch(r"[0-9a-f]{64}", value["release_identity"]) is None
         or not isinstance(value.get("generation"), str)
@@ -1617,10 +1870,10 @@ def _require_pending(value: Any) -> dict[str, Any]:
             retryable=False,
         )
     _required_int(value, "port", minimum=1, maximum=65535)
-    if value["phase"] == "spawn_intent":
+    if value["phase"] == "spawn_intent" or schema_version == 3:
         _required_int(value, "spawn_lock_device", minimum=1)
         _required_int(value, "spawn_lock_inode", minimum=1)
-    else:
+    if value["phase"] == "spawn_claimed":
         _required_int(value, "pid", minimum=1)
         _required_int(value, "start_time_ticks", minimum=1)
         if (
@@ -1638,15 +1891,15 @@ def _require_pending(value: Any) -> dict[str, Any]:
 def _claimed_process(
     root: HostServiceRoot,
     *,
-    expected_pid: int,
+    expected_launcher: ProcessIdentity,
+    process_controller: LinuxProcessController,
     release_identity: str,
     port: int,
     generation: str,
-) -> ProcessIdentity:
+) -> _ServiceProcessGroup:
     pending = _require_pending(root.read_json(_PENDING_NAME, max_bytes=_MAX_READY_BYTES))
     if (
         pending["phase"] != "spawn_claimed"
-        or pending["pid"] != expected_pid
         or pending["release_identity"] != release_identity
         or pending["port"] != port
         or pending["generation"] != generation
@@ -1656,10 +1909,20 @@ def _claimed_process(
             "Core service child claim does not match the spawn intent.",
             retryable=False,
         )
-    return ProcessIdentity(
+    claimed = ProcessIdentity(
         pid=pending["pid"],
         boot_id=pending["boot_id"],
         start_time_ticks=pending["start_time_ticks"],
+    )
+    if not process_controller.owns_service_process(expected_launcher, claimed):
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATE_INVALID,
+            "Core service child claim does not match the spawn topology.",
+            retryable=False,
+        )
+    return _ServiceProcessGroup(
+        launcher=expected_launcher,
+        application=claimed,
     )
 
 
@@ -1714,7 +1977,7 @@ def claim_core_service_spawn(
             root.atomic_write_json(
                 _PENDING_NAME,
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "phase": "spawn_claimed",
                     "release_identity": release_identity,
                     "pid": identity.pid,
@@ -1722,6 +1985,8 @@ def claim_core_service_spawn(
                     "start_time_ticks": identity.start_time_ticks,
                     "port": port,
                     "generation": generation,
+                    "spawn_lock_device": pending["spawn_lock_device"],
+                    "spawn_lock_inode": pending["spawn_lock_inode"],
                 },
                 replace=True,
             )
@@ -1840,13 +2105,23 @@ def _require_ledger(value: Any) -> dict[str, Any]:
         "canonical_manifest_sha256",
         "lifecycle_compatibility",
     }
+    process_group_keys = {
+        "application_pid",
+        "application_boot_id",
+        "application_start_time_ticks",
+    }
     schema_version = value.get("schema_version") if isinstance(value, dict) else None
-    expected_keys = exact_keys if schema_version == 3 else legacy_keys
+    if schema_version == 5:
+        expected_keys = exact_keys | process_group_keys
+    elif schema_version == 3:
+        expected_keys = exact_keys
+    else:
+        expected_keys = legacy_keys
     if (
         not isinstance(value, dict)
         or set(value) != expected_keys
-        or schema_version not in {1, 2, 3}
-        or (schema_version == 3 and value.get("state") != "running")
+        or schema_version not in {1, 2, 3, 5}
+        or (schema_version in {3, 5} and value.get("state") != "running")
     ):
         _raise_invalid_service_state()
     for key in (
@@ -1857,7 +2132,7 @@ def _require_ledger(value: Any) -> dict[str, Any]:
     ):
         if not isinstance(value[key], str) or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None:
             _raise_invalid_service_state()
-    if schema_version == 3:
+    if schema_version in {3, 5}:
         for key in ("bundle_sha256", "canonical_manifest_sha256"):
             if (
                 not isinstance(value.get(key), str)
@@ -1865,7 +2140,11 @@ def _require_ledger(value: Any) -> dict[str, Any]:
             ):
                 _raise_invalid_service_state()
         compatibility = value.get("lifecycle_compatibility")
-        if type(compatibility) is not int or not 2 <= compatibility <= 2**31 - 1:
+        minimum_compatibility = 3 if schema_version == 5 else 2
+        if (
+            type(compatibility) is not int
+            or not minimum_compatibility <= compatibility <= 2**31 - 1
+        ):
             _raise_invalid_service_state()
     if (
         not isinstance(value["source_commit"], str)
@@ -1878,6 +2157,14 @@ def _require_ledger(value: Any) -> dict[str, Any]:
         _raise_invalid_service_state()
     _required_int(value, "pid", minimum=1)
     _required_int(value, "start_time_ticks", minimum=1)
+    if schema_version == 5:
+        if (
+            not isinstance(value["application_boot_id"], str)
+            or _BOOT_ID_PATTERN.fullmatch(value["application_boot_id"]) is None
+        ):
+            _raise_invalid_service_state()
+        _required_int(value, "application_pid", minimum=1)
+        _required_int(value, "application_start_time_ticks", minimum=1)
     _required_int(value, "port", minimum=1, maximum=65535)
     return value
 
@@ -1891,7 +2178,7 @@ def _raise_invalid_service_state() -> None:
 
 
 def _is_exact_daemon_ledger(ledger: dict[str, Any]) -> bool:
-    return ledger.get("schema_version") == 3 and ledger.get("state") == "running"
+    return ledger.get("schema_version") in {3, 5} and ledger.get("state") == "running"
 
 
 def _floor_from_ledger(ledger: dict[str, Any]) -> dict[str, Any]:
@@ -1962,6 +2249,71 @@ def _process_from_ledger(ledger: dict[str, Any]) -> ProcessIdentity:
         boot_id=ledger["boot_id"],
         start_time_ticks=ledger["start_time_ticks"],
     )
+
+
+def _service_process_group_from_ledger(
+    ledger: dict[str, Any],
+) -> _ServiceProcessGroup:
+    launcher = _process_from_ledger(ledger)
+    if ledger["schema_version"] != 5:
+        return _ServiceProcessGroup(
+            launcher=launcher,
+            application=launcher,
+        )
+    return _ServiceProcessGroup(
+        launcher=launcher,
+        application=ProcessIdentity(
+            pid=ledger["application_pid"],
+            boot_id=ledger["application_boot_id"],
+            start_time_ticks=ledger["application_start_time_ticks"],
+        ),
+    )
+
+
+def _service_process_group_is_alive(
+    process_group: _ServiceProcessGroup,
+    controller: LinuxProcessController,
+) -> bool:
+    return all(controller.is_alive(identity) for identity in process_group.identities)
+
+
+def _terminate_service_process_group(
+    process_group: _ServiceProcessGroup,
+    controller: LinuxProcessController,
+    *,
+    deadline: float,
+) -> None:
+    if controller.is_alive(process_group.application):
+        controller.terminate(process_group.application, deadline=deadline)
+    if (
+        process_group.launcher != process_group.application
+        and controller.is_alive(process_group.launcher)
+        and not _wait_for_natural_launcher_exit(
+            process_group.launcher,
+            controller,
+            deadline=deadline,
+        )
+    ):
+        controller.terminate(process_group.launcher, deadline=deadline)
+    if any(controller.is_alive(identity) for identity in process_group.identities):
+        raise CoreServiceError(
+            CoreServiceErrorCode.DEADLINE_EXCEEDED,
+            "Core service process group did not stop before the deadline.",
+            retryable=True,
+        )
+
+
+def _wait_for_natural_launcher_exit(
+    launcher: ProcessIdentity,
+    controller: LinuxProcessController,
+    *,
+    deadline: float,
+) -> bool:
+    cleanup_deadline = min(
+        deadline,
+        time.monotonic() + _ONEFILE_LAUNCHER_CLEANUP_SECONDS,
+    )
+    return controller.wait_for_exit(launcher, deadline=cleanup_deadline)
 
 
 def _release_from_ledger(ledger: dict[str, Any]) -> CoreReleaseIdentity:

@@ -486,6 +486,45 @@ def test_service_failure_is_rendered_as_closed_json(
     }
 
 
+def test_daemon_bundle_declares_process_group_lifecycle_compatibility() -> None:
+    assert daemon_bundle._LIFECYCLE_COMPATIBILITY == 3
+
+
+def test_bundle_smoke_uses_bounded_parent_extraction_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    attachment = SimpleNamespace(
+        attached=False,
+        generation="5" * 32,
+        release_identity="2" * 64,
+    )
+    monkeypatch.setattr(daemon_bundle, "release_identity", lambda: {"verified": True})
+    monkeypatch.setattr(
+        daemon_bundle,
+        "_load_build_metadata",
+        lambda: {"source_commit": "1" * 40},
+    )
+    monkeypatch.setattr(daemon_bundle, "default_core_service_root", lambda: Path("/core"))
+    monkeypatch.setattr(daemon_bundle, "_asset_path", lambda _name: Path("/framework-lock.json"))
+
+    def ensure(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return attachment
+
+    monkeypatch.setattr(daemon_bundle, "ensure_core_service", ensure)
+    monkeypatch.setattr(daemon_bundle, "stop_core_service_if_generation", lambda **_kwargs: True)
+
+    result = daemon_bundle.smoke_daemon(deadline_seconds=30)
+
+    assert captured["_reuse_frozen_extraction_for_bounded_smoke"] is True
+    assert result == {
+        "identity": {"verified": True},
+        "readiness": {"backend_ready": True, "controlled_exit": True},
+        "schema_version": 1,
+    }
+
+
 def test_service_ensure_returns_authenticated_subscription_attachment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -495,7 +534,7 @@ def test_service_ensure_returns_authenticated_subscription_attachment(
         bundle_sha256="7" * 64,
         canonical_manifest_sha256="8" * 64,
         generation="5" * 32,
-        lifecycle_compatibility=2,
+        lifecycle_compatibility=3,
         port=43117,
         registry_digest="3" * 64,
         release_identity="2" * 64,
@@ -525,7 +564,7 @@ def test_service_ensure_returns_authenticated_subscription_attachment(
         lambda **_kwargs: CoreDaemonBundleIdentity(
             bundle_sha256="7" * 64,
             canonical_manifest_sha256="8" * 64,
-            lifecycle_compatibility=2,
+            lifecycle_compatibility=3,
         ),
     )
 
@@ -555,7 +594,7 @@ def test_service_ensure_returns_authenticated_subscription_attachment(
         "execution_mode": "subscription",
         "generation": "5" * 32,
         "host": "127.0.0.1",
-        "lifecycle_compatibility": 2,
+        "lifecycle_compatibility": 3,
         "port": 43117,
         "registry_digest": "3" * 64,
         "release_identity": "2" * 64,
@@ -576,7 +615,7 @@ def test_service_inspect_excludes_bearer_and_status_proof(
         bundle_sha256="7" * 64,
         canonical_manifest_sha256="8" * 64,
         generation="5" * 32,
-        lifecycle_compatibility=2,
+        lifecycle_compatibility=3,
         port=43117,
         registry_digest="3" * 64,
         release_identity="2" * 64,
@@ -592,7 +631,7 @@ def test_service_inspect_excludes_bearer_and_status_proof(
         "bundle_sha256": "7" * 64,
         "canonical_manifest_sha256": "8" * 64,
         "generation": "5" * 32,
-        "lifecycle_compatibility": 2,
+        "lifecycle_compatibility": 3,
         "port": 43117,
         "registry_digest": "3" * 64,
         "release_identity": "2" * 64,

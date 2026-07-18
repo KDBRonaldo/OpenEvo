@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -45,12 +47,22 @@ RELEASE_B = CoreReleaseIdentity(
 DAEMON_A = CoreDaemonBundleIdentity(
     bundle_sha256="2" * 64,
     canonical_manifest_sha256="3" * 64,
-    lifecycle_compatibility=2,
+    lifecycle_compatibility=3,
 )
 DAEMON_B = CoreDaemonBundleIdentity(
     bundle_sha256="4" * 64,
     canonical_manifest_sha256="5" * 64,
+    lifecycle_compatibility=3,
+)
+DAEMON_V2 = CoreDaemonBundleIdentity(
+    bundle_sha256="6" * 64,
+    canonical_manifest_sha256="7" * 64,
     lifecycle_compatibility=2,
+)
+DAEMON_V4 = CoreDaemonBundleIdentity(
+    bundle_sha256="8" * 64,
+    canonical_manifest_sha256="9" * 64,
+    lifecycle_compatibility=4,
 )
 
 
@@ -62,8 +74,14 @@ class FakeController:
         self.next_start = 100
         self.terminated: list[ProcessIdentity] = []
         self.lock_holders: tuple[ProcessIdentity, ...] = ()
+        self.service_children: set[tuple[ProcessIdentity, ProcessIdentity]] = set()
+        self.natural_exit_on_wait: set[ProcessIdentity] = set()
+        self.waited_for_exit: list[ProcessIdentity] = []
 
     def capture(self, pid: int) -> ProcessIdentity:
+        existing = self.current.get(pid)
+        if existing is not None:
+            return existing
         identity = ProcessIdentity(pid=pid, boot_id=self.boot_id, start_time_ticks=self.next_start)
         self.next_start += 1
         self.current[pid] = identity
@@ -71,6 +89,24 @@ class FakeController:
 
     def is_alive(self, identity: ProcessIdentity) -> bool:
         return self.current.get(identity.pid) == identity
+
+    def owns_service_process(
+        self,
+        launcher: ProcessIdentity,
+        claimed: ProcessIdentity,
+    ) -> bool:
+        return (
+            self.is_alive(launcher)
+            and self.is_alive(claimed)
+            and (launcher == claimed or (launcher, claimed) in self.service_children)
+        )
+
+    def wait_for_exit(self, identity: ProcessIdentity, *, deadline: float) -> bool:
+        del deadline
+        self.waited_for_exit.append(identity)
+        if identity in self.natural_exit_on_wait:
+            self.current.pop(identity.pid, None)
+        return not self.is_alive(identity)
 
     def terminate(self, identity: ProcessIdentity, *, deadline: float) -> None:
         del deadline
@@ -87,6 +123,7 @@ class FakeChild:
 
     def __init__(self, argv: list[str], **kwargs: object) -> None:
         self.argv = argv
+        self.environment = kwargs.get("env")
         self.pid = FakeChild.next_pid
         FakeChild.next_pid += 1
         self.returncode: int | None = None
@@ -142,7 +179,7 @@ def service_fakes(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeController, list
             root.atomic_write_json(
                 "pending.json",
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "phase": "spawn_claimed",
                     "release_identity": pending["release_identity"],
                     "pid": identity.pid,
@@ -150,6 +187,8 @@ def service_fakes(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeController, list
                     "start_time_ticks": identity.start_time_ticks,
                     "port": pending["port"],
                     "generation": pending["generation"],
+                    "spawn_lock_device": pending["spawn_lock_device"],
+                    "spawn_lock_inode": pending["spawn_lock_inode"],
                 },
                 replace=True,
             )
@@ -206,9 +245,295 @@ def test_second_project_and_concurrent_bootstrap_attach_one_daemon(
     assert failures == []
     assert len(results) == 2
     assert len(children) == 1
+    assert children[0].environment is None
     assert {result.generation for result in results} == {results[0].generation}
     assert {result.port for result in results} == {results[0].port}
     assert sorted(result.attached for result in results) == [False, True]
+
+
+def test_frozen_onefile_daemon_child_gets_independent_extraction_environment(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    monkeypatch.setattr(service.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(service.sys, "_MEIPASS", str(tmp_path / "_MEI-parent"), raising=False)
+    monkeypatch.setenv("PYINSTALLER_RESET_ENVIRONMENT", "0")
+    monkeypatch.setenv("OPENEVO_TEST_PARENT_ENV", "preserved")
+    claimed: list[ProcessIdentity] = []
+
+    def spawn_onefile(argv: list[str], **kwargs: object) -> FakeChild:
+        child = FakeChild(argv, **kwargs)
+        launcher = controller.capture(child.pid)
+        application = controller.capture(child.pid + 10_000)
+        controller.service_children.add((launcher, application))
+        controller.natural_exit_on_wait.add(launcher)
+        root_path = Path(argv[argv.index("--service-root") + 1])
+        with HostServiceRoot(root_path) as service_root:
+            pending = service_root.read_json("pending.json")
+            service_root.atomic_write_json(
+                "pending.json",
+                {
+                    "schema_version": 3,
+                    "phase": "spawn_claimed",
+                    "release_identity": pending["release_identity"],
+                    "pid": application.pid,
+                    "boot_id": application.boot_id,
+                    "start_time_ticks": application.start_time_ticks,
+                    "port": pending["port"],
+                    "generation": pending["generation"],
+                    "spawn_lock_device": pending["spawn_lock_device"],
+                    "spawn_lock_inode": pending["spawn_lock_inode"],
+                },
+                replace=True,
+            )
+        claimed.append(application)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(service.subprocess, "Popen", spawn_onefile)
+
+    ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        port=0,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_A,
+        process_controller=controller,
+    )
+
+    assert len(children) == 1
+    environment = children[0].environment
+    assert isinstance(environment, dict)
+    assert environment["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert environment["OPENEVO_TEST_PARENT_ENV"] == "preserved"
+    with HostServiceRoot(root, create=False) as service_root:
+        ledger = service_root.read_json("service.json")
+    launcher = ProcessIdentity(
+        pid=ledger["pid"],
+        boot_id=ledger["boot_id"],
+        start_time_ticks=ledger["start_time_ticks"],
+    )
+    assert ledger["pid"] == children[0].pid
+    assert ledger["application_pid"] == claimed[0].pid
+
+    stop_core_service(service_root=root, process_controller=controller)
+
+    assert controller.terminated == [claimed[0]]
+    assert controller.waited_for_exit == [launcher]
+
+
+def test_bounded_frozen_smoke_reuses_parent_extraction_until_controlled_stop(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    monkeypatch.setattr(service.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(service.sys, "_MEIPASS", str(tmp_path / "_MEI-parent"), raising=False)
+    monkeypatch.setenv("PYINSTALLER_RESET_ENVIRONMENT", "1")
+    monkeypatch.setenv("OPENEVO_TEST_PARENT_ENV", "preserved")
+
+    attachment = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+        _reuse_frozen_extraction_for_bounded_smoke=True,
+    )
+    environment = children[0].environment
+
+    assert isinstance(environment, dict)
+    assert "PYINSTALLER_RESET_ENVIRONMENT" not in environment
+    assert environment["OPENEVO_TEST_PARENT_ENV"] == "preserved"
+    with HostServiceRoot(root, create=False) as service_root:
+        ledger = service_root.read_json("service.json")
+    assert ledger["schema_version"] == 2
+    assert ledger["pid"] == children[0].pid
+
+    assert service.stop_core_service_if_generation(
+        service_root=root,
+        expected_generation=attachment.generation,
+        expected_release_identity=attachment.release_identity,
+        process_controller=controller,
+    )
+    assert not (root / "service.json").exists()
+
+
+def test_frozen_onefile_startup_failure_terminates_launcher_and_application(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    monkeypatch.setattr(service.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(service.sys, "_MEIPASS", str(tmp_path / "_MEI-parent"), raising=False)
+    identities: list[tuple[ProcessIdentity, ProcessIdentity]] = []
+
+    def spawn_onefile(argv: list[str], **kwargs: object) -> FakeChild:
+        child = FakeChild(argv, **kwargs)
+        launcher = controller.capture(child.pid)
+        application = controller.capture(child.pid + 10_000)
+        controller.service_children.add((launcher, application))
+        controller.lock_holders = (launcher,)
+        root_path = Path(argv[argv.index("--service-root") + 1])
+        with HostServiceRoot(root_path) as service_root:
+            pending = service_root.read_json("pending.json")
+            service_root.atomic_write_json(
+                "pending.json",
+                {
+                    "schema_version": 3,
+                    "phase": "spawn_claimed",
+                    "release_identity": pending["release_identity"],
+                    "pid": application.pid,
+                    "boot_id": application.boot_id,
+                    "start_time_ticks": application.start_time_ticks,
+                    "port": pending["port"],
+                    "generation": pending["generation"],
+                    "spawn_lock_device": pending["spawn_lock_device"],
+                    "spawn_lock_inode": pending["spawn_lock_inode"],
+                },
+                replace=True,
+            )
+        identities.append((launcher, application))
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(service.subprocess, "Popen", spawn_onefile)
+
+    def fail_status(**_kwargs: object) -> str:
+        raise CoreServiceError(
+            CoreServiceErrorCode.START_FAILED,
+            "injected status failure",
+            retryable=True,
+        )
+
+    monkeypatch.setattr(service, "_authenticated_status_proof", fail_status)
+
+    with pytest.raises(CoreServiceError) as exc_info:
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            expected_predecessor=CoreServicePredecessor.absent(),
+            daemon_bundle_identity=DAEMON_A,
+            process_controller=controller,
+        )
+
+    launcher, application = identities[0]
+    assert exc_info.value.code is CoreServiceErrorCode.START_FAILED
+    assert controller.terminated == [application, launcher]
+    assert children[0].returncode == -15
+    assert not (root / "pending.json").exists()
+    assert not (root / "service.json").exists()
+
+
+def test_partial_onefile_process_group_is_cleaned_before_restart(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    groups: list[tuple[ProcessIdentity, ProcessIdentity]] = []
+
+    def spawn_onefile(argv: list[str], **kwargs: object) -> FakeChild:
+        child = FakeChild(argv, **kwargs)
+        launcher = controller.capture(child.pid)
+        application = controller.capture(child.pid + 10_000)
+        controller.service_children.add((launcher, application))
+        root_path = Path(argv[argv.index("--service-root") + 1])
+        with HostServiceRoot(root_path) as service_root:
+            pending = service_root.read_json("pending.json")
+            service_root.atomic_write_json(
+                "pending.json",
+                {
+                    "schema_version": 3,
+                    "phase": "spawn_claimed",
+                    "release_identity": pending["release_identity"],
+                    "pid": application.pid,
+                    "boot_id": application.boot_id,
+                    "start_time_ticks": application.start_time_ticks,
+                    "port": pending["port"],
+                    "generation": pending["generation"],
+                    "spawn_lock_device": pending["spawn_lock_device"],
+                    "spawn_lock_inode": pending["spawn_lock_inode"],
+                },
+                replace=True,
+            )
+        groups.append((launcher, application))
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(service.subprocess, "Popen", spawn_onefile)
+    first = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_A,
+        process_controller=controller,
+    )
+    first_launcher, first_application = groups[0]
+    del controller.current[first_application.pid]
+
+    restarted = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        port=first.port,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_A,
+        process_controller=controller,
+    )
+
+    assert restarted.generation != first.generation
+    assert controller.terminated == [first_launcher]
+    assert len(groups) == 2
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process topology is required")
+def test_linux_controller_accepts_direct_session_application_child() -> None:
+    program = (
+        "import os,time;"
+        "child=os.fork();"
+        "print(child,flush=True) if child else time.sleep(60);"
+        "os.waitpid(child,0) if child else None"
+    )
+    launcher = subprocess.Popen(
+        [sys.executable, "-c", program],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert launcher.stdout is not None
+        claimed_pid = int(launcher.stdout.readline())
+        controller = service.LinuxProcessController()
+        launcher_identity = controller.capture(launcher.pid)
+        claimed_identity = controller.capture(claimed_pid)
+
+        assert controller.owns_service_process(launcher_identity, claimed_identity)
+        assert not controller.owns_service_process(claimed_identity, launcher_identity)
+    finally:
+        try:
+            os.killpg(launcher.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        launcher.wait(timeout=5)
 
 
 def test_bootstrap_lock_serializes_verification_install_and_lifecycle(
@@ -1062,6 +1387,136 @@ def test_daemon_same_release_different_bundle_fails_without_stopping_live_servic
     )
 
 
+def test_process_group_daemon_rejects_compatibility_v2(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+
+    with pytest.raises(CoreServiceError) as exc_info:
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            expected_predecessor=CoreServicePredecessor.absent(),
+            daemon_bundle_identity=DAEMON_V2,
+            process_controller=controller,
+        )
+
+    assert exc_info.value.code is CoreServiceErrorCode.START_FAILED
+    assert not (root / "service.json").exists()
+
+
+def test_compatibility_v3_reader_stops_v2_daemon_and_upgrades_its_floor(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    old = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+    )
+    with HostServiceRoot(root, create=False) as pinned:
+        ready = pinned.read_json("ready.json")
+        ready.update(
+            {
+                "schema_version": 2,
+                "bundle_sha256": DAEMON_V2.bundle_sha256,
+                "canonical_manifest_sha256": DAEMON_V2.canonical_manifest_sha256,
+                "lifecycle_compatibility": DAEMON_V2.lifecycle_compatibility,
+            }
+        )
+        ledger = pinned.read_json("service.json")
+        ledger.update(
+            {
+                "schema_version": 3,
+                "state": "running",
+                "bundle_sha256": DAEMON_V2.bundle_sha256,
+                "canonical_manifest_sha256": DAEMON_V2.canonical_manifest_sha256,
+                "lifecycle_compatibility": DAEMON_V2.lifecycle_compatibility,
+                "ready_sha256": hashlib.sha256(service.canonical_json_bytes(ready)).hexdigest(),
+            }
+        )
+        pinned.atomic_write_json("ready.json", ready, replace=True)
+        pinned.atomic_write_json("service.json", ledger, replace=True)
+
+    predecessor = service.observe_core_service_predecessor(
+        service_root=root,
+        process_controller=controller,
+    )
+    assert predecessor == CoreServicePredecessor.running(
+        generation=old.generation,
+        release_identity=old.release_identity,
+        bundle_sha256=DAEMON_V2.bundle_sha256,
+        canonical_manifest_sha256=DAEMON_V2.canonical_manifest_sha256,
+        lifecycle_compatibility=2,
+    )
+    upgraded = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        replace_mismatched=True,
+        expected_predecessor=predecessor,
+        daemon_bundle_identity=DAEMON_A,
+        process_controller=controller,
+    )
+    with HostServiceRoot(root, create=False) as pinned:
+        upgraded_ledger = pinned.read_json("service.json")
+
+    assert upgraded.attached is False
+    assert upgraded.generation != old.generation
+    assert upgraded.lifecycle_compatibility == 3
+    assert upgraded_ledger["schema_version"] == 5
+    assert upgraded_ledger["lifecycle_compatibility"] == 3
+
+
+def test_dead_newer_daemon_floor_rejects_stale_desktop_downgrade(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_V4,
+        process_controller=controller,
+    )
+    with HostServiceRoot(root, create=False) as pinned:
+        newer = pinned.read_json("service.json")
+    controller.current.pop(newer["pid"])
+
+    with pytest.raises(CoreServiceError) as exc_info:
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            expected_predecessor=CoreServicePredecessor.absent(),
+            daemon_bundle_identity=DAEMON_A,
+            process_controller=controller,
+        )
+    with HostServiceRoot(root, create=False) as pinned:
+        floor = pinned.read_json("service.json")
+
+    assert exc_info.value.code is CoreServiceErrorCode.UPDATE_REQUIRED
+    assert len(children) == 1
+    assert floor["state"] == "stopped"
+    assert floor["lifecycle_compatibility"] == 4
+    assert floor["bundle_sha256"] == DAEMON_V4.bundle_sha256
+
+
 def test_daemon_floor_allows_legacy_upgrade_and_rejects_same_abi_downgrade(
     tmp_path: Path,
     service_fakes: tuple[FakeController, list[FakeChild]],
@@ -1124,7 +1579,7 @@ def test_daemon_floor_allows_legacy_upgrade_and_rejects_same_abi_downgrade(
     assert floor == {
         "bundle_sha256": DAEMON_A.bundle_sha256,
         "canonical_manifest_sha256": DAEMON_A.canonical_manifest_sha256,
-        "lifecycle_compatibility": 2,
+        "lifecycle_compatibility": 3,
         "release_identity": RELEASE_A.digest,
         "schema_version": 3,
         "state": "stopped",
@@ -1171,6 +1626,61 @@ def test_pending_process_is_recovered_before_restart(
 
     assert attachment.attached is False
     assert controller.terminated == [pending_identity]
+    assert len(children) == 1
+    assert not (root / "pending.json").exists()
+
+
+def test_claimed_onefile_pending_recovers_application_and_launcher(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    launcher = ProcessIdentity(
+        pid=778,
+        boot_id=controller.boot_id,
+        start_time_ticks=56,
+    )
+    application = ProcessIdentity(
+        pid=779,
+        boot_id=controller.boot_id,
+        start_time_ticks=57,
+    )
+    controller.current[launcher.pid] = launcher
+    controller.current[application.pid] = application
+    controller.lock_holders = (launcher,)
+    with HostServiceRoot(root) as pinned:
+        spawn_lock_fd = pinned.open_lock("spawn.lock")
+        metadata = os.fstat(spawn_lock_fd)
+        os.close(spawn_lock_fd)
+        pinned.atomic_write_json(
+            "pending.json",
+            {
+                "schema_version": 3,
+                "phase": "spawn_claimed",
+                "release_identity": RELEASE_A.digest,
+                "pid": application.pid,
+                "boot_id": application.boot_id,
+                "start_time_ticks": application.start_time_ticks,
+                "port": 8765,
+                "generation": "8" * 32,
+                "spawn_lock_device": metadata.st_dev,
+                "spawn_lock_inode": metadata.st_ino,
+            },
+            replace=False,
+        )
+
+    attachment = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+    )
+
+    assert attachment.attached is False
+    assert controller.terminated[:2] == [application, launcher]
     assert len(children) == 1
     assert not (root / "pending.json").exists()
 
@@ -1488,7 +1998,8 @@ def test_pidfd_esrch_is_already_stopped_and_stop_cleans_publication(
         start_time_ticks=ledger["start_time_ticks"],
     )
     controller = service.LinuxProcessController.__new__(service.LinuxProcessController)
-    monkeypatch.setattr(controller, "is_alive", lambda _identity: True)
+    process_alive = True
+    monkeypatch.setattr(controller, "is_alive", lambda _identity: process_alive)
     monkeypatch.setattr(controller, "capture", lambda _pid: identity)
     monkeypatch.setattr(
         service.os,
@@ -1498,6 +2009,8 @@ def test_pidfd_esrch_is_already_stopped_and_stop_cleans_publication(
     )
 
     def already_stopped(*_args: object) -> None:
+        nonlocal process_alive
+        process_alive = False
         raise OSError(errno.ESRCH, "gone")
 
     monkeypatch.setattr(

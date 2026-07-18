@@ -64,7 +64,7 @@ _CORE_METADATA_KEYS = {
 _FILE_METADATA_KEYS = {"filename", "sha256"}
 _PLATFORM_METADATA_KEYS = {"architecture", "system"}
 _PYTHON_METADATA_KEYS = {"implementation", "version"}
-_LIFECYCLE_COMPATIBILITY = 2
+_LIFECYCLE_COMPATIBILITY = 3
 
 
 class DaemonBundleError(RuntimeError):
@@ -577,6 +577,7 @@ def smoke_daemon(*, deadline_seconds: float) -> dict[str, object]:
             framework_lock=_asset_path(_FRAMEWORK_LOCK_NAME),
             source_commit=metadata["source_commit"],
             deadline_seconds=deadline_seconds,
+            _reuse_frozen_extraction_for_bounded_smoke=True,
         )
         if attachment.attached:
             raise DaemonBundleError("Daemon smoke requires an unused canonical service root.")

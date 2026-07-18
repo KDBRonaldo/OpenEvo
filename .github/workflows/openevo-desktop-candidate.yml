@@ -49,6 +49,7 @@ jobs:
           uv run python -m pytest \
             tests/ci/test_build_openevo_daemon_bundle.py \
             tests/ci/test_openevo_desktop_daemon_resource.py \
+            tests/openevo/test_core_host_service.py \
             -q
 
       - name: Build exact Core inputs and self-contained Daemon
