@@ -55,6 +55,10 @@ _MANAGED_SUBSCRIPTION_SECURITY_OPTIONS: Final[tuple[str, ...]] = (
     "apparmor=unconfined",
 )
 _MANAGED_SUBSCRIPTION_APPARMOR_PROFILES: Final[frozenset[str]] = frozenset({"", "unconfined"})
+_MANAGED_SUBSCRIPTION_TMPFS_DESTINATION: Final[str] = "/tmp"
+_MANAGED_SUBSCRIPTION_TMPFS_OPTIONS: Final[str] = (
+    "rw,nosuid,nodev,size=512m,mode=1777"
+)
 _OwnershipState = Literal[
     "none",
     "create_pending",
@@ -682,6 +686,12 @@ class DockerRuntime(BaseRuntime):
             or host_config.get("CapDrop") != ["ALL"]
             or host_config.get("SecurityOpt") != list(_MANAGED_SUBSCRIPTION_SECURITY_OPTIONS)
             or host_config.get("Privileged") is not False
+            or host_config.get("Tmpfs")
+            != {
+                _MANAGED_SUBSCRIPTION_TMPFS_DESTINATION: (
+                    _MANAGED_SUBSCRIPTION_TMPFS_OPTIONS
+                )
+            }
             or not isinstance(apparmor_profile, str)
             or apparmor_profile not in _MANAGED_SUBSCRIPTION_APPARMOR_PROFILES
         ):
@@ -991,6 +1001,11 @@ class DockerRuntime(BaseRuntime):
                     "--security-opt=no-new-privileges:true",
                     "--security-opt=seccomp=unconfined",
                     "--security-opt=apparmor=unconfined",
+                    "--tmpfs",
+                    (
+                        f"{_MANAGED_SUBSCRIPTION_TMPFS_DESTINATION}:"
+                        f"{_MANAGED_SUBSCRIPTION_TMPFS_OPTIONS}"
+                    ),
                 ]
             )
         if self.spec.container_user == "host":

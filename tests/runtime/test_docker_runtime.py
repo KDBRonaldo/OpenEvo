@@ -298,6 +298,11 @@ def _credential_mount_inspect_output(
                     "seccomp=unconfined",
                     "apparmor=unconfined",
                 ],
+                "Tmpfs": {
+                    docker_module._MANAGED_SUBSCRIPTION_TMPFS_DESTINATION: (
+                        docker_module._MANAGED_SUBSCRIPTION_TMPFS_OPTIONS
+                    )
+                },
             },
             "apparmor_profile": apparmor_profile,
         }
@@ -1023,6 +1028,10 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     assert "--security-opt=no-new-privileges:true" in create
     assert "--security-opt=seccomp=unconfined" in create
     assert "--security-opt=apparmor=unconfined" in create
+    assert create[create.index("--tmpfs") + 1] == (
+        f"{docker_module._MANAGED_SUBSCRIPTION_TMPFS_DESTINATION}:"
+        f"{docker_module._MANAGED_SUBSCRIPTION_TMPFS_OPTIONS}"
+    )
     assert create[create.index("--workdir") + 1] == runtime.runtime_session_dir
     assert not credential_dir.is_relative_to(session_dir)
 
@@ -1080,7 +1089,14 @@ async def test_credential_sandbox_accepts_closed_apparmor_platform_evidence(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutation",
-    ["cap_drop", "security_opt", "privileged", "apparmor", "docker_socket_mount"],
+    [
+        "cap_drop",
+        "security_opt",
+        "privileged",
+        "tmpfs",
+        "apparmor",
+        "docker_socket_mount",
+    ],
 )
 async def test_credential_sandbox_rejects_changed_security_or_mount_evidence(
     tmp_path: Path,
@@ -1103,6 +1119,8 @@ async def test_credential_sandbox_rejects_changed_security_or_mount_evidence(
         evidence["host_config"]["SecurityOpt"].append("label=disable")
     elif mutation == "privileged":
         evidence["host_config"]["Privileged"] = True
+    elif mutation == "tmpfs":
+        evidence["host_config"]["Tmpfs"] = {"/tmp": "rw,size=64m"}
     elif mutation == "apparmor":
         evidence["apparmor_profile"] = "docker-default"
     else:
