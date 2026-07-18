@@ -140,6 +140,17 @@ ordinary-user release. Release candidates use an exact DMG, Daemon bundle,
 managed runtime, manifest, checksums, and release evidence; PyPI is not a
 Preview release surface.
 
+## Pre-External-Beta Release Smoke
+
+This maintainer-only gate verifies the exact Desktop DMG, bundled Daemon,
+managed runtime, checksums, and evidence before publication. The GitHub Release
+is the only Preview distribution surface; it does not publish OpenEvo to PyPI.
+
+The current build exposes a narrow Subscription path for development, marks
+Self-Deployed unavailable, and is released as an unsigned Preview. The
+canonical External Beta requires both modes and must satisfy the complete
+acceptance contract in `docs/maintainer/productization/spec.md`.
+
 ## Architecture And Contributing
 
 - Release contract: `docs/maintainer/productization/spec.md`
