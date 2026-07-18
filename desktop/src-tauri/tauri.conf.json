@@ -25,7 +25,8 @@
     "externalBin": ["binaries/openevo-desktop-sidecar"],
     "macOS": {
       "minimumSystemVersion": "12.0",
-      "infoPlist": "Info.plist"
+      "infoPlist": "Info.plist",
+      "signingIdentity": "-"
     }
   }
 }

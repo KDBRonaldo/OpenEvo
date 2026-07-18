@@ -2390,12 +2390,24 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert macos_candidate.count("copied_app=") == 1
     assert mounted_smoke in shipped_app_smoke
     assert copied_smoke in shipped_app_smoke
+    assert 'codesign --verify --deep --strict --verbose=2 "$mounted_app"' in shipped_app_smoke
+    assert 'grep -F "Signature=adhoc"' in shipped_app_smoke
+    assert 'xattr -w com.apple.quarantine "$quarantine_value" "$copied_app"' in shipped_app_smoke
+    assert 'xattr -dr com.apple.quarantine "$copied_app"' in shipped_app_smoke
+    assert 'codesign --verify --deep --strict --verbose=2 "$copied_app"' in shipped_app_smoke
     mounted_smoke_position = shipped_app_smoke.index(mounted_smoke)
     copy_position = shipped_app_smoke.index('ditto "$mounted_app" "$copied_app"')
     release_detach = shipped_app_smoke.index('hdiutil detach "$mount_dir" -quiet\n')
+    quarantine_position = shipped_app_smoke.index(
+        'xattr -w com.apple.quarantine "$quarantine_value" "$copied_app"'
+    )
+    quarantine_removal_position = shipped_app_smoke.index(
+        'xattr -dr com.apple.quarantine "$copied_app"'
+    )
     copied_smoke_position = shipped_app_smoke.index(copied_smoke)
     assert mounted_smoke_position < copy_position < release_detach
-    assert release_detach < copied_smoke_position
+    assert release_detach < quarantine_position < quarantine_removal_position
+    assert quarantine_removal_position < copied_smoke_position
     assert "trap cleanup EXIT" in shipped_app_smoke
     assert (
         'hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true'
@@ -2429,7 +2441,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "Parameter evolution is not included in this candidate.",
         "PyPI is not used for this release.",
         "Only the declared architecture was built.",
-        "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.",
+        "command-line quarantine removal is validated.",
         "## Validation Results",
         "Benchmark gates completed by this packaging candidate: 0 of 3.",
         "Textual-memory pass@1 rescue count: pending.",
@@ -2831,6 +2843,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert config["bundle"]["externalBin"] == ["binaries/openevo-desktop-sidecar"]
     assert config["bundle"]["macOS"]["minimumSystemVersion"] == "12.0"
     assert config["bundle"]["macOS"]["infoPlist"] == "Info.plist"
+    assert config["bundle"]["macOS"]["signingIdentity"] == "-"
     with Path("desktop/src-tauri/Info.plist").open("rb") as stream:
         info_plist = plistlib.load(stream)
     assert info_plist == {

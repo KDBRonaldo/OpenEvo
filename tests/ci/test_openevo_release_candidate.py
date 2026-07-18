@@ -448,7 +448,7 @@ def test_managed_runtime_source_binds_prerelease_asset_and_download(
         "Parameter evolution is not included in this candidate.",
         "PyPI is not used for this release.",
         "Only the declared architecture was built.",
-        "Browser-download quarantine and the Privacy & Security allow flow are not validated by this workflow.",
+        "command-line quarantine removal is validated.",
         "## Validation Results",
         "Benchmark gates completed by this packaging candidate: 0 of 3.",
         "Textual-memory pass@1 rescue count: pending.",

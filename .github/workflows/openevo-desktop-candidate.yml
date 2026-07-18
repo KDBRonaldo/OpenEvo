@@ -279,6 +279,11 @@ jobs:
           test -d "$mounted_app"
           mounted_sidecar="$mounted_app/Contents/MacOS/openevo-desktop-sidecar"
           test -x "$mounted_sidecar"
+          codesign --verify --deep --strict --verbose=2 "$mounted_app"
+          codesign -dv --verbose=4 "$mounted_app" \
+            2> "$RUNNER_TEMP/openevo-candidate-codesign.txt"
+          grep -F "Signature=adhoc" \
+            "$RUNNER_TEMP/openevo-candidate-codesign.txt"
           uv run python - "$mounted_sidecar" "$OPENEVO_MANAGED_RUNTIME_ARCHIVE" <<'PY'
           import importlib.util
           from pathlib import Path
@@ -303,6 +308,15 @@ jobs:
             --evidence-out candidate-artifacts/app-bundle-smoke.json
           ditto "$mounted_app" "$copied_app"
           hdiutil detach "$mount_dir" -quiet
+          quarantine_value="0081;$(printf '%x' "$(date +%s)");OpenEvoDesktopCI;"
+          xattr -w com.apple.quarantine "$quarantine_value" "$copied_app"
+          test "$(xattr -p com.apple.quarantine "$copied_app")" = "$quarantine_value"
+          xattr -dr com.apple.quarantine "$copied_app"
+          if xattr -p com.apple.quarantine "$copied_app" >/dev/null 2>&1; then
+            echo "Documented quarantine removal did not clear the copied app" >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$copied_app"
           uv run python scripts/ci/smoke_openevo_desktop_bundle.py \
             "$copied_app" \
             --launch-origin detached_copy \

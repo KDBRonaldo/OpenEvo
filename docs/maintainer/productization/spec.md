@@ -1598,9 +1598,13 @@ PyPI is not an External Beta release surface. Editable source installation is a
 maintainer workflow and MUST NOT be documented as Desktop or Daemon
 installation.
 
-The DMG is unsigned and non-notarized for this release. User documentation
-provides concise manual macOS launch instructions without implying that the
-application is signed.
+The DMG has no Developer ID signature and is non-notarized for this release.
+The contained app bundle MUST be ad-hoc signed as one internally consistent
+bundle. Candidate validation MUST apply a synthetic browser quarantine to the
+copied app, execute the documented recursive quarantine-removal command,
+revalidate the complete app signature, and launch those exact bytes. User
+documentation provides that concise manual launch procedure without implying
+Developer ID signing or notarization.
 
 Release security evidence covers the DMG, Daemon Bundle, Codex CLI, managed
 runtime and vLLM images, model profile, and their reachable dependencies.
