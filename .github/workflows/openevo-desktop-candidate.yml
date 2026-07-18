@@ -486,6 +486,7 @@ jobs:
           }
           trap cleanup EXIT
           docker --host unix:///var/run/docker.sock run -d --privileged \
+            -e DOCKER_TLS_CERTDIR= \
             --name "$daemon_name" -p 127.0.0.1::2375 \
             docker:29.3-dind --host=tcp://0.0.0.0:2375 --tls=false
           daemon_address="$(
