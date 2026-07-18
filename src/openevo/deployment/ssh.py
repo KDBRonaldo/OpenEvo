@@ -45,6 +45,22 @@ from openevo.deployment.core_runtime import (
     parse_core_supervisor_runtime_preflight,
 )
 from openevo.deployment.host_keys import TrustedKnownHostsBinding
+from openevo.deployment.managed_runtime_assets import (
+    MANAGED_RUNTIME_TRANSFER_LEASE,
+    ManagedRuntimeArchiveSnapshotError,
+    ManagedRuntimeLoadReceipt,
+    ManagedRuntimeTransfer,
+    build_managed_runtime_discard_command,
+    build_managed_runtime_finalize_command,
+    build_managed_runtime_prepare_command,
+    build_managed_runtime_probe_command,
+    build_managed_runtime_rsync_path,
+    parse_managed_runtime_discard,
+    parse_managed_runtime_prepare,
+    parse_managed_runtime_probe,
+    parse_managed_runtime_receipt,
+    snapshot_managed_runtime_archive,
+)
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import RemoteProfileConfig
 from openevo.deployment.system_executables import (
@@ -190,6 +206,8 @@ class SshTransportErrorCode(str, Enum):
     CORE_KERNEL_SYSCALL_UNSUPPORTED = "core_kernel_syscall_unsupported"
     CORE_RUNTIME_UNSUPPORTED = "core_runtime_unsupported"
     CORE_RUNTIME_PREFLIGHT_FAILED = "core_runtime_preflight_failed"
+    MANAGED_RUNTIME_FAILED = "managed_runtime_failed"
+    CANCELLED = "ssh_operation_cancelled"
     INVALID_REQUEST = "invalid_ssh_request"
     TIMEOUT = "ssh_timeout"
 
@@ -222,6 +240,10 @@ class SshTransportError(RuntimeError):
             SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED: (
                 "Remote Core service runtime preflight failed."
             ),
+            SshTransportErrorCode.MANAGED_RUNTIME_FAILED: (
+                "Managed Science runtime preparation failed."
+            ),
+            SshTransportErrorCode.CANCELLED: "SSH operation was cancelled.",
             SshTransportErrorCode.INVALID_REQUEST: "SSH request is invalid.",
             SshTransportErrorCode.TIMEOUT: "SSH operation timed out.",
         }
@@ -823,6 +845,7 @@ class SshRemoteExecutorTransport:
             str, tuple[StagedCoreBootstrapAssets, CorePythonRuntimeAuthority]
         ] = {}
         self._core_asset_transfer_ownerships: set[_CoreAssetTransferAdmission] = set()
+        self._managed_runtime_lock = threading.Lock()
         self._operation_guard = threading.Lock()
         self._active_subprocesses: set[_OwnedSubprocessAuthority] = set()
         self._active_tunnels: set[SshTunnel | SshCoreTunnel] = set()
@@ -888,7 +911,10 @@ class SshRemoteExecutorTransport:
         self,
         argv_factory: Callable[[Path], list[str]],
         timeout_seconds: float,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        _raise_if_cancelled(cancel_event)
         self._require_open()
         trust_lease = self._trusted_host.open_for_spawn(self._profile)
         try:
@@ -907,18 +933,28 @@ class SshRemoteExecutorTransport:
         try:
             argv = argv_factory(known_hosts_file)
             if self._uses_default_runner:
-                completed = _run_subprocess(
-                    argv,
-                    timeout_seconds,
-                    trust_ownership=trust_ownership,
-                    env=self._process_environment(),
-                    agent_socket_source=self._agent_socket_source,
-                    on_start=self._register_subprocess,
-                    on_finish=self._unregister_subprocess,
+                common = {
+                    "trust_ownership": trust_ownership,
+                    "env": self._process_environment(),
+                    "agent_socket_source": self._agent_socket_source,
+                    "on_start": self._register_subprocess,
+                    "on_finish": self._unregister_subprocess,
+                }
+                completed = (
+                    _run_subprocess(argv, timeout_seconds, **common)
+                    if cancel_event is None
+                    else _run_subprocess(
+                        argv,
+                        timeout_seconds,
+                        cancel_event=cancel_event,
+                        **common,
+                    )
                 )
             else:
+                _raise_if_cancelled(cancel_event)
                 self._require_open()
                 completed = self._runner(argv, timeout_seconds)
+            _raise_if_cancelled(cancel_event)
             self._require_open()
             return completed, known_hosts_file
         finally:
@@ -1172,7 +1208,205 @@ class SshRemoteExecutorTransport:
             _log_transport_failure(SshTransportErrorCode.CORE_ASSET_FAILED)
             raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED) from None
 
-    def select_core_python_runtime(self, *, timeout_seconds: float) -> CorePythonRuntimeAuthority:
+    def ensure_managed_runtime(
+        self,
+        *,
+        runtime: CorePythonRuntimeAuthority,
+        archive_path: str,
+        archive_sha256: str,
+        archive_size: int,
+        platform: str,
+        config_id: str,
+        oci_index_id: str,
+        aliases: tuple[str, ...],
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
+    ) -> ManagedRuntimeLoadReceipt:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= 900
+            or (cancel_event is not None and not isinstance(cancel_event, threading.Event))
+        ):
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        try:
+            if not isinstance(runtime, CorePythonRuntimeAuthority):
+                raise ValueError("Core Python runtime authority is invalid")
+            runtime.__post_init__()
+            probe_command = build_managed_runtime_probe_command(
+                runtime,
+                archive_sha256=archive_sha256,
+                archive_size=archive_size,
+                platform=platform,
+                config_id=config_id,
+                oci_index_id=oci_index_id,
+                aliases=aliases,
+            )
+        except SshTransportError:
+            raise
+        except (TypeError, ValueError):
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+        deadline = time.monotonic() + float(timeout_seconds)
+        acquired = False
+        while not acquired:
+            try:
+                _raise_if_cancelled(cancel_event)
+            except _SubprocessCancelled:
+                raise SshTransportError(SshTransportErrorCode.CANCELLED) from None
+            acquired = self._managed_runtime_lock.acquire(
+                timeout=min(0.05, _stage_remaining(deadline))
+            )
+        try:
+            try:
+                probe = self._run_secret_with_remote_failure(
+                    probe_command,
+                    timeout_seconds=_stage_remaining(deadline),
+                    remote_failure_code=SshTransportErrorCode.MANAGED_RUNTIME_FAILED,
+                    cancel_event=cancel_event,
+                )
+                ready = parse_managed_runtime_probe(probe)
+                if ready is not None:
+                    return ready
+                with snapshot_managed_runtime_archive(
+                    archive_path=archive_path,
+                    archive_sha256=archive_sha256,
+                    archive_size=archive_size,
+                ) as snapshot:
+                    prepared = self._run_secret_with_remote_failure(
+                        build_managed_runtime_prepare_command(
+                            runtime,
+                            archive_sha256=archive_sha256,
+                            archive_size=archive_size,
+                        ),
+                        timeout_seconds=_stage_remaining(deadline),
+                        remote_failure_code=SshTransportErrorCode.MANAGED_RUNTIME_FAILED,
+                        cancel_event=cancel_event,
+                    )
+                    transfer = parse_managed_runtime_prepare(prepared)
+                    try:
+                        self._upload_managed_runtime_snapshot(
+                            snapshot.root,
+                            transfer,
+                            archive_size=archive_size,
+                            deadline=deadline,
+                            cancel_event=cancel_event,
+                        )
+                        remaining = _stage_remaining(deadline)
+                        finalized = self._run_secret_with_remote_failure(
+                            build_managed_runtime_finalize_command(
+                                runtime,
+                                transfer,
+                                archive_sha256=archive_sha256,
+                                archive_size=archive_size,
+                                platform=platform,
+                                config_id=config_id,
+                                oci_index_id=oci_index_id,
+                                aliases=aliases,
+                                load_timeout_seconds=max(1, min(900, int(remaining))),
+                            ),
+                            timeout_seconds=remaining,
+                            remote_failure_code=SshTransportErrorCode.MANAGED_RUNTIME_FAILED,
+                            cancel_event=cancel_event,
+                        )
+                        receipt = parse_managed_runtime_receipt(finalized)
+                        if receipt.reused:
+                            raise ValueError("managed runtime load receipt is inconsistent")
+                        return receipt
+                    except BaseException:
+                        self._discard_managed_runtime_transfer(
+                            runtime,
+                            transfer,
+                            archive_sha256=archive_sha256,
+                            archive_size=archive_size,
+                        )
+                        raise
+            except ManagedRuntimeArchiveSnapshotError:
+                _log_transport_failure(SshTransportErrorCode.INVALID_REQUEST)
+                raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+            except SshTransportError:
+                raise
+            except (OSError, TypeError, ValueError):
+                _log_transport_failure(SshTransportErrorCode.MANAGED_RUNTIME_FAILED)
+                raise SshTransportError(SshTransportErrorCode.MANAGED_RUNTIME_FAILED) from None
+        finally:
+            self._managed_runtime_lock.release()
+
+    def _discard_managed_runtime_transfer(
+        self,
+        runtime: CorePythonRuntimeAuthority,
+        transfer: ManagedRuntimeTransfer,
+        *,
+        archive_sha256: str,
+        archive_size: int,
+    ) -> None:
+        try:
+            response = self._run_secret_with_remote_failure(
+                build_managed_runtime_discard_command(
+                    runtime,
+                    transfer,
+                    archive_sha256=archive_sha256,
+                    archive_size=archive_size,
+                ),
+                timeout_seconds=_CORE_ASSET_CLEANUP_SECONDS,
+                remote_failure_code=SshTransportErrorCode.MANAGED_RUNTIME_FAILED,
+            )
+            parse_managed_runtime_discard(response)
+        except Exception:
+            _log_transport_failure(SshTransportErrorCode.MANAGED_RUNTIME_FAILED)
+            raise SshTransportError(SshTransportErrorCode.MANAGED_RUNTIME_FAILED) from None
+
+    def _upload_managed_runtime_snapshot(
+        self,
+        local_root: Path,
+        transfer: ManagedRuntimeTransfer,
+        *,
+        archive_size: int,
+        deadline: float,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        failure_code: SshTransportErrorCode | None = None
+        completed: subprocess.CompletedProcess[str] | None = None
+        phase = "trust"
+        try:
+            phase = "process"
+            completed, _known_hosts_file = self._run_trusted_subprocess(
+                lambda known_hosts_file: self._managed_runtime_rsync_argv(
+                    local_root,
+                    transfer,
+                    known_hosts_file,
+                    archive_size=archive_size,
+                ),
+                _stage_remaining(deadline),
+                cancel_event=cancel_event,
+            )
+        except _SubprocessCancelled:
+            failure_code = SshTransportErrorCode.CANCELLED
+        except subprocess.TimeoutExpired:
+            failure_code = SshTransportErrorCode.TIMEOUT
+        except _KnownHostsSpawnFailure:
+            failure_code = SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+        except SshTransportError:
+            raise
+        except Exception:
+            failure_code = (
+                SshTransportErrorCode.RSYNC_FAILED
+                if phase == "process"
+                else SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+            )
+        if failure_code is not None:
+            _log_transport_failure(failure_code)
+            raise SshTransportError(failure_code)
+        assert completed is not None
+        if completed.returncode != 0:
+            _log_transport_failure(SshTransportErrorCode.RSYNC_FAILED)
+            raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
+
+    def select_core_python_runtime(
+        self,
+        *,
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
+    ) -> CorePythonRuntimeAuthority:
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -1186,6 +1420,7 @@ class SshRemoteExecutorTransport:
             timeout_seconds=float(timeout_seconds),
             remote_failure_code=SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED,
             env=_core_runtime_proxy_env(self._profile),
+            cancel_event=cancel_event,
         )
         try:
             selection = parse_core_supervisor_runtime_preflight(payload)
@@ -1494,6 +1729,7 @@ class SshRemoteExecutorTransport:
         timeout_seconds: float,
         remote_failure_code: SshTransportErrorCode,
         env: dict[str, str] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> SecretStr:
         try:
             bound_command = self._bind_core_asset_consumption(command)
@@ -1508,7 +1744,10 @@ class SshRemoteExecutorTransport:
             completed, _known_hosts_file = self._run_trusted_subprocess(
                 lambda known_hosts_file: self._ssh_argv(marked_command, known_hosts_file),
                 timeout_seconds,
+                cancel_event=cancel_event,
             )
+        except _SubprocessCancelled:
+            failure_code = SshTransportErrorCode.CANCELLED
         except subprocess.TimeoutExpired:
             failure_code = SshTransportErrorCode.TIMEOUT
         except _KnownHostsSpawnFailure:
@@ -1853,6 +2092,36 @@ class SshRemoteExecutorTransport:
             ssh_command,
             _with_trailing_slash(str(local_root)),
             f"{_rsync_host(self._profile.host)}:{_with_trailing_slash(remote_root)}",
+        ]
+
+    def _managed_runtime_rsync_argv(
+        self,
+        local_root: Path,
+        transfer: ManagedRuntimeTransfer,
+        known_hosts_file: Path,
+        *,
+        archive_size: int,
+    ) -> list[str]:
+        ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
+        return [
+            RSYNC_EXECUTABLE,
+            "--recursive",
+            "--inplace",
+            "--delete",
+            f"--max-size={archive_size}",
+            f"--filter=protect /{MANAGED_RUNTIME_TRANSFER_LEASE}",
+            "--chmod=F600,D700",
+            "--no-owner",
+            "--no-group",
+            "--rsync-path",
+            build_managed_runtime_rsync_path(
+                transfer,
+                archive_size=archive_size,
+            ),
+            "-e",
+            ssh_command,
+            _with_trailing_slash(str(local_root)),
+            f"{_rsync_host(self._profile.host)}:{_with_trailing_slash(transfer.incoming_root)}",
         ]
 
 
@@ -2487,6 +2756,7 @@ def _run_subprocess(
     agent_socket_source: SshAgentSocketSource | None = None,
     on_start: Callable[[_OwnedSubprocessAuthority], None] | None = None,
     on_finish: Callable[[_OwnedSubprocessAuthority], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if trust_lease is not None and trust_ownership is not None:
         raise RuntimeError("known-host lease has multiple ownership sources")
@@ -2520,6 +2790,7 @@ def _run_subprocess(
                 process_group_id=authority.process_group_id,
                 exit_observer=authority.exit_observer,
                 on_group_cleanup_confirmed=authority.mark_group_cleanup_confirmed,
+                cancel_event=cancel_event,
             )
         except BaseException:
             try:
@@ -2567,6 +2838,18 @@ class _SubprocessCaptureLimitExceeded(RuntimeError):
     """Internal signal translated to an existing renderer-safe transport error."""
 
 
+class _SubprocessCancelled(RuntimeError):
+    """Internal activation cancellation after owned process-group convergence."""
+
+
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None:
+        if not isinstance(cancel_event, threading.Event):
+            raise TypeError("cancellation authority is invalid")
+        if cancel_event.is_set():
+            raise _SubprocessCancelled
+
+
 class _KnownHostsSpawnFailure(RuntimeError):
     """Internal trust setup failure without retaining the original exception."""
 
@@ -2579,6 +2862,7 @@ def _capture_subprocess_output(
     process_group_id: int,
     exit_observer: _SubprocessExitObserver,
     on_group_cleanup_confirmed: Callable[[], None],
+    cancel_event: threading.Event | None = None,
 ) -> tuple[bytes, bytes]:
     assert process.stdout is not None
     assert process.stderr is not None
@@ -2594,6 +2878,7 @@ def _capture_subprocess_output(
     group_killed = False
     try:
         while selector.get_map():
+            _raise_if_cancelled(cancel_event)
             now = time.monotonic()
             if not leader_exited and exit_observer.exited():
                 leader_exited = True

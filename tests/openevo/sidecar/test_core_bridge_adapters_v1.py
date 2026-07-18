@@ -23,6 +23,7 @@ from desktop.sidecar.core_bridge_adapters_v1 import (
     CoreBootstrapConfigV1,
     DesktopCoreSshBridgeAdapterV1,
     SealedCoreBootstrapAssetV1,
+    SealedManagedRuntimeArchiveV1,
     VerifiedCoreHttpTransportV1,
 )
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1
@@ -50,6 +51,7 @@ from openevo.deployment.ssh import (
     SshTransportErrorCode,
     StagedCoreBootstrapAssets,
 )
+from openevo.runtime.managed import MANAGED_RUNTIME_ARCHIVE_RELEASE
 
 
 PROFILE_ID = "profile-a"
@@ -82,6 +84,11 @@ def _bootstrap_config(tmp_path: Path) -> CoreBootstrapConfigV1:
         ),
         encoding="utf-8",
     )
+    release = MANAGED_RUNTIME_ARCHIVE_RELEASE
+    runtime_archive = tmp_path / release.filename
+    runtime_archive.touch()
+    os.truncate(runtime_archive, release.byte_size)
+    runtime_archive.chmod(0o600)
     return CoreBootstrapConfigV1(
         source_commit=SOURCE_COMMIT,
         wheel=SealedCoreBootstrapAssetV1(
@@ -93,6 +100,14 @@ def _bootstrap_config(tmp_path: Path) -> CoreBootstrapConfigV1:
             local_path=str(framework_lock),
             sha256=hashlib.sha256(framework_lock.read_bytes()).hexdigest(),
             byte_size=framework_lock.stat().st_size,
+        ),
+        managed_runtime_archive=SealedManagedRuntimeArchiveV1(
+            local_path=str(runtime_archive),
+            sha256=release.sha256,
+            byte_size=release.byte_size,
+            platform=release.platform,
+            config_id=release.config_id,
+            oci_index_id=release.oci_index_id,
         ),
     )
 
@@ -192,8 +207,20 @@ class FakeCoreTransport:
         self.after_runtime_preflight: Callable[[], None] | None = None
         self.after_stage: Callable[[], None] | None = None
         self.after_secret: Callable[[], None] | None = None
+        self.managed_runtime_calls: list[dict[str, object]] = []
+        self.managed_runtime_block = False
+        self.managed_runtime_entered = threading.Event()
+        self.managed_runtime_cancelled = threading.Event()
+        self.operation_order: list[str] = []
 
-    def select_core_python_runtime(self, *, timeout_seconds: float) -> CorePythonRuntimeAuthority:
+    def select_core_python_runtime(
+        self,
+        *,
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
+    ) -> CorePythonRuntimeAuthority:
+        if cancel_event is not None and cancel_event.is_set():
+            raise SshTransportError(SshTransportErrorCode.CANCELLED)
         self.runtime_preflight_timeouts.append(timeout_seconds)
         if self.runtime_preflight_error is not None:
             raise self.runtime_preflight_error
@@ -202,6 +229,7 @@ class FakeCoreTransport:
         return _runtime()
 
     def stage_core_bootstrap_assets(self, **kwargs: object) -> StagedCoreBootstrapAssets:
+        self.operation_order.append("core_assets")
         try:
             with snapshot_core_bootstrap_assets(
                 wheel_path=str(kwargs["wheel_path"]),
@@ -241,6 +269,18 @@ class FakeCoreTransport:
             framework_lock_device=1,
             framework_lock_inode=4,
         )
+
+    def ensure_managed_runtime(self, **kwargs: object) -> object:
+        self.operation_order.append("managed_runtime")
+        self.managed_runtime_calls.append(kwargs)
+        if self.managed_runtime_block:
+            cancel_event = kwargs.get("cancel_event")
+            assert isinstance(cancel_event, threading.Event)
+            self.managed_runtime_entered.set()
+            assert cancel_event.wait(timeout=2)
+            self.managed_runtime_cancelled.set()
+            raise SshTransportError(SshTransportErrorCode.CANCELLED)
+        return object()
 
     def run(
         self,
@@ -319,6 +359,13 @@ def test_core_host_stages_sealed_assets_then_bootstraps_supported_host(
     assert first.bearer_identity.startswith("core-host-v1-")
     assert first.bearer_identity != BEARER
     assert len(transport.stage_calls) == 2
+    assert len(transport.managed_runtime_calls) == 2
+    assert transport.operation_order == [
+        "managed_runtime",
+        "core_assets",
+        "managed_runtime",
+        "core_assets",
+    ]
     assert len(transport.runtime_preflight_timeouts) == 2
     assert transport.stage_calls[0]["wheel_sha256"] == _bootstrap_config(tmp_path).wheel.sha256
     assert "/usr/bin/python3 -I -c" in transport.commands[0]
@@ -328,6 +375,75 @@ def test_core_host_stages_sealed_assets_then_bootstraps_supported_host(
     assert BEARER not in repr(first)
     assert BEARER not in repr(adapter)
     assert str(tmp_path) not in repr(_bootstrap_config(tmp_path))
+
+
+def test_core_host_without_packaged_managed_runtime_fails_before_remote_work(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _bootstrap_config(tmp_path)
+    without_runtime = CoreBootstrapConfigV1(
+        source_commit=bootstrap.source_commit,
+        wheel=bootstrap.wheel,
+        framework_lock=bootstrap.framework_lock,
+    )
+    transport = FakeCoreTransport()
+    adapter = DesktopCoreSshBridgeAdapterV1(
+        FakeLifecycle(PROFILE_ID, transport),
+        without_runtime,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as unavailable:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert unavailable.value.error.code == "managed_runtime_asset_unavailable"
+    assert transport.runtime_preflight_timeouts == []
+    assert transport.managed_runtime_calls == []
+    assert transport.stage_calls == []
+
+
+def test_core_host_cancellation_stops_runtime_before_publication_and_allows_retry(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    transport.managed_runtime_block = True
+    adapter, _lifecycle, _transport = _adapter(tmp_path, transport)
+    cancel_event = threading.Event()
+    result: list[object] = []
+
+    def ensure() -> None:
+        try:
+            result.append(
+                adapter.ensure_core(
+                    PROFILE_ID,
+                    deadline=time.monotonic() + 5,
+                    cancel_event=cancel_event,
+                )
+            )
+        except BaseException as exc:
+            result.append(exc)
+
+    thread = threading.Thread(target=ensure)
+    thread.start()
+    assert transport.managed_runtime_entered.wait(timeout=1)
+    cancel_event.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert transport.managed_runtime_cancelled.is_set()
+    assert isinstance(result[0], DesktopCoreBridgeErrorV1)
+    assert result[0].error.code == "active_project_session_superseded"
+    assert transport.stage_calls == []
+    assert transport.commands == []
+    assert transport.secret_commands == []
+
+    transport.managed_runtime_block = False
+    retry = adapter.ensure_core(
+        PROFILE_ID,
+        deadline=time.monotonic() + 5,
+        cancel_event=threading.Event(),
+    )
+    assert retry.profile_id == PROFILE_ID
+    assert len(transport.stage_calls) == 1
 
 
 def test_core_host_rejects_cross_profile_and_transport_replacement(tmp_path: Path) -> None:

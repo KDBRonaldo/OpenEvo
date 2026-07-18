@@ -12,6 +12,10 @@ from fastapi.testclient import TestClient
 import pytest
 
 import desktop.sidecar.release_runtime as release_runtime
+from tests.managed_runtime_testkit import (
+    RUNTIME_FILENAME,
+    write_test_managed_runtime_archive,
+)
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1
 from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError
 from desktop.sidecar.provider_store import DesktopProviderStore
@@ -23,6 +27,7 @@ from desktop.sidecar.release_runtime import (
     DesktopReleaseCoreRuntimeV1,
     ReleaseRuntimeConfigurationError,
     bundled_core_asset_root,
+    bundled_managed_runtime_asset_root,
     create_release_core_runtime,
     load_core_bootstrap_config,
 )
@@ -36,7 +41,7 @@ SOURCE_COMMIT = "a" * 40
 
 
 def _assets(root: Path, *, wheel_payload: bytes = b"wheel-v1") -> Path:
-    root.mkdir(mode=0o700)
+    root.mkdir(mode=0o700, parents=True)
     wheel_name = "openevo-0.1.0-py3-none-any.whl"
     wheel = root / wheel_name
     wheel.write_bytes(wheel_payload)
@@ -98,9 +103,73 @@ def test_bundled_asset_root_requires_absolute_pyinstaller_root(
 ) -> None:
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
     assert bundled_core_asset_root() == tmp_path / "openevo" / "wheels"
+    assert bundled_managed_runtime_asset_root() == tmp_path / "openevo" / "runtime-assets"
     monkeypatch.setattr(sys, "_MEIPASS", "relative")
     with pytest.raises(ReleaseRuntimeConfigurationError):
         bundled_core_asset_root()
+
+
+def test_load_core_bootstrap_config_without_runtime_archive_is_not_release_ready(
+    tmp_path: Path,
+) -> None:
+    root = _assets(tmp_path / "assets")
+
+    config = load_core_bootstrap_config(root, source_commit=SOURCE_COMMIT)
+
+    assert config.managed_runtime_archive is None
+
+
+def test_load_core_bootstrap_config_seals_exact_candidate_runtime_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from desktop.sidecar import core_bridge_adapters_v1
+
+    wheel_root = _assets(tmp_path / "openevo" / "wheels")
+    runtime_root = tmp_path / "openevo" / "runtime-assets"
+    runtime_root.mkdir(mode=0o700)
+    archive = runtime_root / RUNTIME_FILENAME
+    expected = write_test_managed_runtime_archive(archive)
+    monkeypatch.setattr(release_runtime, "MANAGED_RUNTIME_ARCHIVE_RELEASE", expected)
+    monkeypatch.setattr(core_bridge_adapters_v1, "MANAGED_RUNTIME_ARCHIVE_RELEASE", expected)
+
+    config = load_core_bootstrap_config(wheel_root, source_commit=SOURCE_COMMIT)
+
+    assert config.managed_runtime_archive is not None
+    assert config.managed_runtime_archive.sha256 == expected.sha256
+    assert config.managed_runtime_archive.byte_size == expected.byte_size
+    assert str(runtime_root) not in repr(config)
+
+
+@pytest.mark.parametrize("mutation", ["symlink", "hardlink", "writable", "tamper"])
+def test_candidate_runtime_archive_rejects_unsealed_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    wheel_root = _assets(tmp_path / "openevo" / "wheels")
+    runtime_root = tmp_path / "openevo" / "runtime-assets"
+    runtime_root.mkdir(mode=0o700)
+    archive = runtime_root / RUNTIME_FILENAME
+    expected = write_test_managed_runtime_archive(archive)
+    monkeypatch.setattr(release_runtime, "MANAGED_RUNTIME_ARCHIVE_RELEASE", expected)
+    if mutation == "symlink":
+        target = runtime_root / "target"
+        archive.rename(target)
+        archive.symlink_to(target)
+    elif mutation == "hardlink":
+        os.link(archive, runtime_root / "second-link")
+    elif mutation == "writable":
+        archive.chmod(0o666)
+    else:
+        archive.write_bytes(b"tampered-runtime")
+
+    with pytest.raises(ReleaseRuntimeConfigurationError):
+        load_core_bootstrap_config(
+            wheel_root,
+            runtime_asset_root=runtime_root,
+            source_commit=SOURCE_COMMIT,
+        )
 
 
 def test_release_runtime_composes_and_closes_owned_resources(tmp_path: Path) -> None:
@@ -123,6 +192,9 @@ def test_release_runtime_composes_and_closes_owned_resources(tmp_path: Path) -> 
         asset_root=assets,
         source_commit=SOURCE_COMMIT,
     )
+    assert runtime.core_bridge._activation_timeout == 900.0
+    assert runtime.core_bridge._timeout == 60.0
+    assert runtime.managed_runtime_available is False
     runtime.start(
         active_project=lambda: None,
         publish=lambda: None,

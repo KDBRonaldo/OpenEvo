@@ -34,6 +34,7 @@ from openevo.backend.contracts.v1 import models as core_v1
 
 DEFAULT_BRIDGE_TIMEOUT_SECONDS = 60.0
 MAX_BRIDGE_TIMEOUT_SECONDS = 300.0
+MAX_ACTIVATION_TIMEOUT_SECONDS = 900.0
 WORKSPACE_CHUNK_BYTES = core_v1.MAX_WORKSPACE_CHUNK_BYTES
 ADAPTER_WORKER_COUNT = 4
 MAX_ADAPTER_QUEUE_SIZE = 64
@@ -175,7 +176,13 @@ class CoreHostAttachmentV1:
 class CoreHostService(Protocol):
     """Ensures or attaches the one host-global Core process."""
 
-    def ensure_core(self, profile_id: str, *, deadline: float) -> CoreHostAttachmentV1: ...
+    def ensure_core(
+        self,
+        profile_id: str,
+        *,
+        deadline: float,
+        cancel_event: threading.Event | None = None,
+    ) -> CoreHostAttachmentV1: ...
 
 
 class CoreTunnelHandleV1:
@@ -774,15 +781,22 @@ class DesktopCoreBridgeV1:
         archive_source: WorkspaceArchiveSource,
         transport_factory: Callable[[], httpx.BaseTransport] | None = None,
         timeout: float = DEFAULT_BRIDGE_TIMEOUT_SECONDS,
+        activation_timeout: float | None = None,
     ) -> None:
         if not 0 < timeout <= MAX_BRIDGE_TIMEOUT_SECONDS:
             raise ValueError("bridge timeout must be finite and at most 300 seconds")
+        resolved_activation_timeout = (
+            timeout if activation_timeout is None else activation_timeout
+        )
+        if not 0 < resolved_activation_timeout <= MAX_ACTIVATION_TIMEOUT_SECONDS:
+            raise ValueError("bridge activation timeout must be finite and at most 900 seconds")
         self._host_service = host_service
         self._tunnel_factory = tunnel_factory
         self._persistence = persistence
         self._archive_source = archive_source
         self._transport_factory = transport_factory
         self._timeout = float(timeout)
+        self._activation_timeout = float(resolved_activation_timeout)
         self._lock = threading.RLock()
         self._transition_lock = threading.Lock()
         self._generation = 0
@@ -826,7 +840,7 @@ class DesktopCoreBridgeV1:
     ) -> CoreActivationV1:
         if (activation_id is None) != (cancel_event is None):
             raise ValueError("activation cancellation identity and event must appear together")
-        deadline = time.monotonic() + self._timeout
+        deadline = time.monotonic() + self._activation_timeout
         token = self._begin_activation(
             deadline,
             activation_id=activation_id,
@@ -834,10 +848,22 @@ class DesktopCoreBridgeV1:
         )
         generation = token.generation
         try:
+            def ensure_core() -> CoreHostAttachmentV1:
+                if token.cancel_event is None:
+                    return self._host_service.ensure_core(
+                        project.profile_id,
+                        deadline=deadline,
+                    )
+                return self._host_service.ensure_core(
+                    project.profile_id,
+                    deadline=deadline,
+                    cancel_event=token.cancel_event,
+                )
+
             attachment = self._adapter_external(
                 token,
                 deadline,
-                lambda: self._host_service.ensure_core(project.profile_id, deadline=deadline),
+                ensure_core,
                 label="Core host attach",
             )
             if attachment.profile_id != project.profile_id:

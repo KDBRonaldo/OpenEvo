@@ -18,10 +18,14 @@ import traceback
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 import openevo.deployment.ssh as ssh_module
 import openevo.deployment.system_executables as executable_module
+from tests.managed_runtime_testkit import write_test_managed_runtime_archive
 from openevo.deployment import RemoteCommandResult, RemoteExecutorTransport
+from openevo.deployment import managed_runtime_assets
+from openevo.deployment.core_runtime import CorePythonRuntimeAuthority
 from openevo.deployment.host_keys import (
     HostKeyStoreError,
     HostKeyStoreErrorCode,
@@ -240,6 +244,80 @@ def _transport(
         tunnel_starter=tunnel_starter,
         port_allocator=port_allocator,
         core_connection_starter=core_connection_starter,
+    )
+
+
+def _core_runtime_authority() -> CorePythonRuntimeAuthority:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "executable_path": "/home/alice/.local/share/uv/python/python3.11",
+        "executable_sha256": "b" * 64,
+        "device": 1,
+        "inode": 2,
+        "uid": 1000,
+        "mode": 0o755,
+        "byte_size": 4096,
+        "mtime_ns": 3,
+        "ctime_ns": 4,
+        "version": [3, 11, 12],
+    }
+    canonical = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    return CorePythonRuntimeAuthority(
+        authority_id=hashlib.sha256(
+            b"openevo-core-python-runtime-v1\0" + canonical
+        ).hexdigest(),
+        executable_path=str(values["executable_path"]),
+        executable_sha256=str(values["executable_sha256"]),
+        device=1,
+        inode=2,
+        uid=1000,
+        mode=0o755,
+        byte_size=4096,
+        mtime_ns=3,
+        ctime_ns=4,
+        version=(3, 11, 12),
+    )
+
+
+def _runtime_response(release: object, *, reused: bool) -> SecretStr:
+    return SecretStr(
+        json.dumps(
+            {
+                "aliases": list(release.aliases),
+                "archive_sha256": release.sha256,
+                "archive_size": release.byte_size,
+                "config_id": release.config_id,
+                "oci_index_id": release.oci_index_id,
+                "platform": release.platform,
+                "reused": reused,
+                "schema_version": 2,
+                "status": "ready",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+def _runtime_prepare(transfer_id: str) -> SecretStr:
+    return SecretStr(
+        json.dumps(
+            {
+                "incoming_device": 1,
+                "incoming_inode": 3,
+                "incoming_root": (
+                    "/home/alice/.openevo/core/managed-runtime-staging/incoming-"
+                    + transfer_id
+                ),
+                "schema_version": 1,
+                "service_root": "/home/alice/.openevo/core",
+                "staging_device": 1,
+                "staging_inode": 2,
+                "transfer_id": transfer_id,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     )
 
 
@@ -4270,3 +4348,133 @@ def test_upload_dir_raises_when_rsync_fails(tmp_path: Path) -> None:
         transport.upload_dir(str(local), "/remote/path")
 
     assert exc_info.value.code is SshTransportErrorCode.RSYNC_FAILED
+
+
+def test_managed_runtime_existing_image_is_idempotent_without_archive_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+    release = write_test_managed_runtime_archive(archive)
+    monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    archive.unlink()
+    transport = _transport(tmp_path)
+    calls: list[str] = []
+
+    def run_secret(command: str, **_kwargs: object) -> SecretStr:
+        calls.append(command)
+        return _runtime_response(release, reused=True)
+
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", run_secret)
+    receipt = transport.ensure_managed_runtime(
+        runtime=_core_runtime_authority(),
+        archive_path=str(archive),
+        archive_sha256=release.sha256,
+        archive_size=release.byte_size,
+        platform=release.platform,
+        config_id=release.config_id,
+        oci_index_id=release.oci_index_id,
+        aliases=release.aliases,
+        timeout_seconds=30,
+    )
+
+    assert receipt.reused is True
+    assert len(calls) == 1
+    transport.close()
+
+
+def test_managed_runtime_threads_cancellation_through_probe_upload_and_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+    release = write_test_managed_runtime_archive(archive)
+    monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    transport = _transport(tmp_path)
+    transfer_id = "e" * 32
+    responses = iter(
+        (
+            SecretStr('{"schema_version":2,"status":"load_required"}'),
+            _runtime_prepare(transfer_id),
+            _runtime_response(release, reused=False),
+        )
+    )
+    cancel_event = threading.Event()
+    remote_events: list[object] = []
+    upload_events: list[object] = []
+
+    def run_secret(_command: str, **kwargs: object) -> SecretStr:
+        remote_events.append(kwargs.get("cancel_event"))
+        return next(responses)
+
+    def upload(*_args: object, **kwargs: object) -> None:
+        upload_events.append(kwargs.get("cancel_event"))
+
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", run_secret)
+    monkeypatch.setattr(transport, "_upload_managed_runtime_snapshot", upload)
+
+    receipt = transport.ensure_managed_runtime(
+        runtime=_core_runtime_authority(),
+        archive_path=str(archive),
+        archive_sha256=release.sha256,
+        archive_size=release.byte_size,
+        platform=release.platform,
+        config_id=release.config_id,
+        oci_index_id=release.oci_index_id,
+        aliases=release.aliases,
+        timeout_seconds=30,
+        cancel_event=cancel_event,
+    )
+
+    assert receipt.reused is False
+    assert remote_events == [cancel_event, cancel_event, cancel_event]
+    assert upload_events == [cancel_event]
+    transport.close()
+
+
+def test_managed_runtime_transfer_failure_discards_exact_remote_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+    release = write_test_managed_runtime_archive(archive)
+    monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    transport = _transport(tmp_path)
+    transfer_id = "d" * 32
+    commands: list[str] = []
+    responses = iter(
+        (
+            SecretStr('{"schema_version":2,"status":"load_required"}'),
+            _runtime_prepare(transfer_id),
+            SecretStr('{"schema_version":1,"status":"discarded"}'),
+        )
+    )
+
+    def run_secret(command: str, **_kwargs: object) -> SecretStr:
+        commands.append(command)
+        return next(responses)
+
+    def fail_upload(*_args: object, **_kwargs: object) -> None:
+        raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
+
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", run_secret)
+    monkeypatch.setattr(transport, "_upload_managed_runtime_snapshot", fail_upload)
+
+    with pytest.raises(SshTransportError) as failed:
+        transport.ensure_managed_runtime(
+            runtime=_core_runtime_authority(),
+            archive_path=str(archive),
+            archive_sha256=release.sha256,
+            archive_size=release.byte_size,
+            platform=release.platform,
+            config_id=release.config_id,
+            oci_index_id=release.oci_index_id,
+            aliases=release.aliases,
+            timeout_seconds=30,
+        )
+
+    assert failed.value.code is SshTransportErrorCode.RSYNC_FAILED
+    assert len(commands) == 3
+    assert "discard" in commands[-1]
+    assert transfer_id in commands[-1]
+    transport.close()

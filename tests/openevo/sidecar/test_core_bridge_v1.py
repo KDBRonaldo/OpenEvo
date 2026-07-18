@@ -231,7 +231,14 @@ class FakeHostService:
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def ensure_core(self, profile_id: str, *, deadline: float) -> CoreHostAttachmentV1:
+    def ensure_core(
+        self,
+        profile_id: str,
+        *,
+        deadline: float,
+        cancel_event: threading.Event | None = None,
+    ) -> CoreHostAttachmentV1:
+        del cancel_event
         self.calls.append((profile_id, deadline))
         if self.block:
             self.entered.set()

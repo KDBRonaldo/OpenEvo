@@ -57,10 +57,12 @@ from openevo.deployment.core_assets import (
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.core_runtime import CorePythonRuntimeAuthority
 from openevo.deployment.ssh import SshTransportError, SshTransportErrorCode
+from openevo.runtime.managed import MANAGED_RUNTIME_ARCHIVE_RELEASE
 
 
 _HOST_IDENTITY_DOMAIN = b"openevo-desktop-core-host-identity-v1\0"
 _MAX_REMOTE_OPERATION_SECONDS = 300.0
+_MAX_MANAGED_RUNTIME_SECONDS = 900.0
 _MIN_BOOTSTRAP_SECONDS = 1.0
 _MAX_HTTP_IO_SECONDS = 60.0
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
@@ -84,7 +86,10 @@ class _CoreSshTransport(Protocol):
     def close(self) -> None: ...
 
     def select_core_python_runtime(
-        self, *, timeout_seconds: float
+        self,
+        *,
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
     ) -> CorePythonRuntimeAuthority: ...
 
     def stage_core_bootstrap_assets(
@@ -100,6 +105,21 @@ class _CoreSshTransport(Protocol):
         bundle_id: str,
         timeout_seconds: float,
     ) -> StagedCoreBootstrapAssets: ...
+
+    def ensure_managed_runtime(
+        self,
+        *,
+        runtime: CorePythonRuntimeAuthority,
+        archive_path: str,
+        archive_sha256: str,
+        archive_size: int,
+        platform: str,
+        config_id: str,
+        oci_index_id: str,
+        aliases: tuple[str, ...],
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
+    ) -> object: ...
 
     def run(
         self,
@@ -147,12 +167,43 @@ class SealedCoreBootstrapAssetV1:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class SealedManagedRuntimeArchiveV1:
+    """Composition-sealed offline managed Science runtime archive."""
+
+    local_path: str = field(repr=False)
+    sha256: str
+    byte_size: int
+    platform: str
+    config_id: str
+    oci_index_id: str
+
+    def __post_init__(self) -> None:
+        release = MANAGED_RUNTIME_ARCHIVE_RELEASE
+        if (
+            not isinstance(self.local_path, str)
+            or not Path(self.local_path).is_absolute()
+            or not _is_canonical_local_path(self.local_path)
+            or Path(self.local_path).name != release.filename
+            or self.sha256 != release.sha256
+            or self.byte_size != release.byte_size
+            or self.platform != release.platform
+            or self.config_id != release.config_id
+            or self.oci_index_id != release.oci_index_id
+        ):
+            raise ValueError("sealed managed runtime archive identity is invalid")
+
+    def __repr__(self) -> str:
+        return "SealedManagedRuntimeArchiveV1(<private>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class CoreBootstrapConfigV1:
     """Closed sealed install inputs supplied by the future release composition."""
 
     source_commit: str
     wheel: SealedCoreBootstrapAssetV1
     framework_lock: SealedCoreBootstrapAssetV1
+    managed_runtime_archive: SealedManagedRuntimeArchiveV1 | None = None
     remote_port: int = 0
     replace_mismatched: bool = False
 
@@ -162,6 +213,13 @@ class CoreBootstrapConfigV1:
             or _SOURCE_COMMIT_PATTERN.fullmatch(self.source_commit) is None
             or not isinstance(self.wheel, SealedCoreBootstrapAssetV1)
             or not isinstance(self.framework_lock, SealedCoreBootstrapAssetV1)
+            or (
+                self.managed_runtime_archive is not None
+                and not isinstance(
+                    self.managed_runtime_archive,
+                    SealedManagedRuntimeArchiveV1,
+                )
+            )
             or type(self.remote_port) is not int
             or not 0 <= self.remote_port <= 65_535
             or type(self.replace_mismatched) is not bool
@@ -466,19 +524,40 @@ class DesktopCoreSshBridgeAdapterV1:
     def __repr__(self) -> str:
         return "DesktopCoreSshBridgeAdapterV1(<private>)"
 
-    def ensure_core(self, profile_id: str, *, deadline: float) -> CoreHostAttachmentV1:
+    def ensure_core(
+        self,
+        profile_id: str,
+        *,
+        deadline: float,
+        cancel_event: threading.Event | None = None,
+    ) -> CoreHostAttachmentV1:
+        activation_cancel = cancel_event or threading.Event()
+        _require_activation_not_cancelled(activation_cancel)
+        managed_runtime = self._bootstrap.managed_runtime_archive
+        if managed_runtime is None:
+            raise _adapter_error(
+                "managed_runtime_asset_unavailable",
+                "This Desktop build does not contain the trusted managed Science runtime.",
+                status=409,
+                next_action=(
+                    "Install an OpenEvo Desktop release candidate with managed runtime assets."
+                ),
+            )
         transport = self._active_transport(
             profile_id,
             require_tunnel=False,
             require_asset_stage=True,
             require_runtime_preflight=True,
+            require_managed_runtime=True,
         )
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         try:
             runtime = cast(_CoreSshTransport, transport).select_core_python_runtime(
-                timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS)
+                timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS),
+                cancel_event=activation_cancel,
             )
         except SshTransportError as exc:
+            _require_activation_not_cancelled(activation_cancel)
             raise _ssh_runtime_preflight_error(exc) from None
         except BaseException as exc:
             if not isinstance(exc, Exception):
@@ -489,6 +568,35 @@ class DesktopCoreSshBridgeAdapterV1:
                 retryable=True,
             ) from None
         _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
+        _require_activation_not_cancelled(activation_cancel)
+        self._require_same_transport(profile_id, transport)
+        remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
+        try:
+            cast(_CoreSshTransport, transport).ensure_managed_runtime(
+                runtime=runtime,
+                archive_path=managed_runtime.local_path,
+                archive_sha256=managed_runtime.sha256,
+                archive_size=managed_runtime.byte_size,
+                platform=managed_runtime.platform,
+                config_id=managed_runtime.config_id,
+                oci_index_id=managed_runtime.oci_index_id,
+                aliases=MANAGED_RUNTIME_ARCHIVE_RELEASE.aliases,
+                timeout_seconds=min(remaining, _MAX_MANAGED_RUNTIME_SECONDS),
+                cancel_event=activation_cancel,
+            )
+        except SshTransportError as exc:
+            _require_activation_not_cancelled(activation_cancel)
+            raise _ssh_managed_runtime_error(exc) from None
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            raise _adapter_error(
+                "managed_runtime_prepare_failed",
+                "The trusted managed Science runtime could not be prepared.",
+                retryable=True,
+            ) from None
+        _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
+        _require_activation_not_cancelled(activation_cancel)
         self._require_same_transport(profile_id, transport)
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         bundle_id = _bootstrap_bundle_id(self._bootstrap)
@@ -505,6 +613,7 @@ class DesktopCoreSshBridgeAdapterV1:
                 timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS),
             )
         except SshTransportError as exc:
+            _require_activation_not_cancelled(activation_cancel)
             raise _ssh_asset_error(exc) from None
         except BaseException as exc:
             if not isinstance(exc, Exception):
@@ -515,6 +624,7 @@ class DesktopCoreSshBridgeAdapterV1:
                 retryable=True,
             ) from None
         _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
+        _require_activation_not_cancelled(activation_cancel)
         self._require_same_transport(profile_id, transport)
         _verify_staged_assets(self._bootstrap, staged, bundle_id=bundle_id)
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
@@ -531,6 +641,7 @@ class DesktopCoreSshBridgeAdapterV1:
         try:
             remote = execute_core_control_bootstrap(plan, cast(_CoreSshTransport, transport))
         except CoreControlBootstrapError as exc:
+            _require_activation_not_cancelled(activation_cancel)
             raise _bootstrap_error(exc) from None
         except BaseException as exc:
             if not isinstance(exc, Exception):
@@ -541,6 +652,7 @@ class DesktopCoreSshBridgeAdapterV1:
                 retryable=True,
             ) from None
         _remaining(deadline)
+        _require_activation_not_cancelled(activation_cancel)
         self._require_same_transport(profile_id, transport)
         bearer_identity = _host_identity(profile_id, remote)
         with self._lock:
@@ -693,6 +805,7 @@ class DesktopCoreSshBridgeAdapterV1:
         require_tunnel: bool,
         require_asset_stage: bool = False,
         require_runtime_preflight: bool = False,
+        require_managed_runtime: bool = False,
     ) -> object:
         if not isinstance(profile_id, str) or not profile_id:
             raise _adapter_error(
@@ -714,6 +827,7 @@ class DesktopCoreSshBridgeAdapterV1:
             + (("open_core_tunnel",) if require_tunnel else ())
             + (("stage_core_bootstrap_assets",) if require_asset_stage else ())
             + (("select_core_python_runtime",) if require_runtime_preflight else ())
+            + (("ensure_managed_runtime",) if require_managed_runtime else ())
         )
         if any(not callable(getattr(transport, name, None)) for name in required):
             raise _adapter_error(
@@ -729,6 +843,7 @@ class DesktopCoreSshBridgeAdapterV1:
                 require_tunnel=False,
                 require_asset_stage=False,
                 require_runtime_preflight=False,
+                require_managed_runtime=False,
             )
             is not expected
         ):
@@ -905,6 +1020,20 @@ def _remaining(deadline: float, *, minimum: float = 0.0) -> float:
     return remaining
 
 
+def _require_activation_not_cancelled(cancel_event: threading.Event) -> None:
+    if not isinstance(cancel_event, threading.Event) or cancel_event.is_set():
+        raise _activation_cancelled_error()
+
+
+def _activation_cancelled_error() -> DesktopCoreBridgeErrorV1:
+    return _adapter_error(
+        "active_project_session_superseded",
+        "The project activation was cancelled before Core publication.",
+        status=409,
+        retryable=True,
+    )
+
+
 def _validate_archive_stream(stream: BinaryIO) -> None:
     descriptor = stream.fileno()
     metadata = os.fstat(descriptor)
@@ -1035,7 +1164,38 @@ def _ssh_asset_error(exc: SshTransportError) -> DesktopCoreBridgeErrorV1:
     )
 
 
+def _ssh_managed_runtime_error(exc: SshTransportError) -> DesktopCoreBridgeErrorV1:
+    if exc.code is SshTransportErrorCode.CANCELLED:
+        return _activation_cancelled_error()
+    if exc.code is SshTransportErrorCode.INVALID_REQUEST:
+        return _adapter_error(
+            "managed_runtime_asset_invalid",
+            "The packaged managed Science runtime failed release verification.",
+            status=500,
+        )
+    if exc.code is SshTransportErrorCode.TIMEOUT:
+        return _adapter_error(
+            "managed_runtime_prepare_deadline_exceeded",
+            "The managed Science runtime was not prepared before the deadline.",
+            status=504,
+            retryable=True,
+        )
+    if exc.code is SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED:
+        return _adapter_error(
+            "core_ssh_authority_invalid",
+            "The active SSH host authority is no longer valid.",
+            status=409,
+        )
+    return _adapter_error(
+        "managed_runtime_prepare_failed",
+        "The trusted managed Science runtime could not be prepared.",
+        retryable=True,
+    )
+
+
 def _ssh_runtime_preflight_error(exc: SshTransportError) -> DesktopCoreBridgeErrorV1:
+    if exc.code is SshTransportErrorCode.CANCELLED:
+        return _activation_cancelled_error()
     if exc.code is SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE:
         return _adapter_error(
             "core_python_runtime_unavailable",
@@ -1219,5 +1379,6 @@ __all__ = (
     "CoreBootstrapConfigV1",
     "DesktopCoreSshBridgeAdapterV1",
     "SealedCoreBootstrapAssetV1",
+    "SealedManagedRuntimeArchiveV1",
     "VerifiedCoreHttpTransportV1",
 )

@@ -22,6 +22,7 @@ from desktop.sidecar.core_bridge_adapters_v1 import (
     CoreBootstrapConfigV1,
     DesktopCoreSshBridgeAdapterV1,
     SealedCoreBootstrapAssetV1,
+    SealedManagedRuntimeArchiveV1,
 )
 from desktop.sidecar.core_bridge_store_v1 import DesktopCoreBridgeStoreV1
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1, DesktopCoreBridgeV1
@@ -35,6 +36,11 @@ from desktop.sidecar.workspace_imports import (
 )
 from openevo.backend.contracts.v1 import models as core_v1
 from openevo.deployment.core_assets import MAX_CORE_WHEEL_BYTES, MAX_FRAMEWORK_LOCK_BYTES
+from openevo.runtime.managed import (
+    MANAGED_RUNTIME_ARCHIVE_RELEASE,
+    ManagedRuntimeArchiveVerificationError,
+    verify_managed_runtime_archive,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,9 +48,11 @@ _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_ASSET_DIRECTORY_ENTRIES = 8
 _CORE_ASSET_DIRECTORY = Path("openevo/wheels")
+_MANAGED_RUNTIME_ASSET_DIRECTORY = Path("openevo/runtime-assets")
 _FRAMEWORK_LOCK_NAME = "framework-lock.json"
 _RELAY_MIN_BACKOFF_SECONDS = 0.1
 _RELAY_MAX_BACKOFF_SECONDS = 2.0
+_RELEASE_ACTIVATION_TIMEOUT_SECONDS = 900.0
 
 
 class ReleaseRuntimeConfigurationError(RuntimeError):
@@ -243,10 +251,12 @@ class DesktopReleaseCoreRuntimeV1:
         bridge: DesktopCoreBridgeV1,
         event_broker: DesktopEventBrokerV1,
         bridge_store: DesktopCoreBridgeStoreV1,
+        managed_runtime_available: bool = False,
     ) -> None:
         self.core_bridge = bridge
         self.event_broker = event_broker
         self._bridge_store = bridge_store
+        self.managed_runtime_available = managed_runtime_available
         self._relay = DesktopCoreEventRelayV1(bridge)
         self._close_lock = threading.RLock()
         self._stopped = False
@@ -306,9 +316,23 @@ def bundled_core_asset_root() -> Path:
     return Path(bundle_root) / _CORE_ASSET_DIRECTORY
 
 
+def bundled_managed_runtime_asset_root() -> Path:
+    """Return the PyInstaller extraction root for the offline runtime archive."""
+
+    import sys
+
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if not isinstance(bundle_root, str) or not Path(bundle_root).is_absolute():
+        raise ReleaseRuntimeConfigurationError(
+            "release sidecar has no absolute packaged resource root"
+        )
+    return Path(bundle_root) / _MANAGED_RUNTIME_ASSET_DIRECTORY
+
+
 def load_core_bootstrap_config(
     asset_root: Path | str,
     *,
+    runtime_asset_root: Path | str | None = None,
     source_commit: str,
 ) -> CoreBootstrapConfigV1:
     """Load one exact embedded wheel/lock pair through a pinned directory fd."""
@@ -353,10 +377,16 @@ def load_core_bootstrap_config(
         )
         assert lock.payload is not None
         _validate_framework_lock(lock.payload, wheel.asset)
+        runtime_archive = _load_managed_runtime_archive(
+            runtime_asset_root
+            if runtime_asset_root is not None
+            else root.parent / _MANAGED_RUNTIME_ASSET_DIRECTORY.name
+        )
         return CoreBootstrapConfigV1(
             source_commit=source_commit,
             wheel=wheel.asset,
             framework_lock=lock.asset,
+            managed_runtime_archive=runtime_archive,
             replace_mismatched=True,
         )
     except OSError as exc:
@@ -400,6 +430,7 @@ def create_release_core_runtime(
             persistence=bridge_store,
             archive_source=archive_source,
             transport_factory=adapter.new_http_transport,
+            activation_timeout=_RELEASE_ACTIVATION_TIMEOUT_SECONDS,
         )
         if startup_phase is not None:
             startup_phase("core_runtime")
@@ -407,6 +438,7 @@ def create_release_core_runtime(
             bridge=bridge,
             event_broker=broker,
             bridge_store=bridge_store,
+            managed_runtime_available=bootstrap.managed_runtime_archive is not None,
         )
     except BaseException:
         if bridge is not None:
@@ -424,6 +456,7 @@ def _seal_file(
     *,
     max_bytes: int,
     retain_payload: bool = False,
+    require_private: bool = False,
 ) -> _SealedFile:
     if Path(name).name != name or name in {"", ".", ".."}:
         raise ReleaseRuntimeConfigurationError("Core release asset name is invalid")
@@ -439,6 +472,7 @@ def _seal_file(
             or metadata.st_uid != os.getuid()
             or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) & 0o022
+            or (require_private and stat.S_IMODE(metadata.st_mode) & 0o077)
             or not 0 < metadata.st_size <= max_bytes
         ):
             raise ReleaseRuntimeConfigurationError("Core release asset identity is invalid")
@@ -473,6 +507,90 @@ def _seal_file(
         )
     finally:
         os.close(descriptor)
+
+
+def _load_managed_runtime_archive(
+    asset_root: Path | str,
+) -> SealedManagedRuntimeArchiveV1 | None:
+    root = Path(asset_root)
+    try:
+        root_lstat = root.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(root_lstat.st_mode):
+        raise ReleaseRuntimeConfigurationError(
+            "managed runtime release asset directory is invalid"
+        )
+    try:
+        absolute_root = Path(os.path.abspath(root))
+        current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            for part in absolute_root.parts[1:]:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=current_fd,
+                )
+                os.close(current_fd)
+                current_fd = next_fd
+            root_fd = current_fd
+        except BaseException:
+            os.close(current_fd)
+            raise
+    except OSError as exc:
+        raise ReleaseRuntimeConfigurationError(
+            "managed runtime release assets could not be verified"
+        ) from exc
+    try:
+        metadata = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise ReleaseRuntimeConfigurationError(
+                "managed runtime release asset directory is not private owner-controlled storage"
+            )
+        names = tuple(entry.name for entry in os.scandir(root_fd))
+        release = MANAGED_RUNTIME_ARCHIVE_RELEASE
+        if names != (release.filename,):
+            raise ReleaseRuntimeConfigurationError(
+                "managed runtime release assets must contain the exact archive"
+            )
+        sealed = _seal_file(
+            root_fd,
+            absolute_root,
+            release.filename,
+            max_bytes=release.byte_size,
+            require_private=True,
+        ).asset
+        if sealed.byte_size != release.byte_size or sealed.sha256 != release.sha256:
+            raise ReleaseRuntimeConfigurationError(
+                "managed runtime release archive identity is invalid"
+            )
+        try:
+            verify_managed_runtime_archive(sealed.local_path, release=release)
+        except ManagedRuntimeArchiveVerificationError as exc:
+            raise ReleaseRuntimeConfigurationError(
+                "managed runtime release archive contents are invalid"
+            ) from exc
+        return SealedManagedRuntimeArchiveV1(
+            local_path=sealed.local_path,
+            sha256=sealed.sha256,
+            byte_size=sealed.byte_size,
+            platform=release.platform,
+            config_id=release.config_id,
+            oci_index_id=release.oci_index_id,
+        )
+    except OSError as exc:
+        raise ReleaseRuntimeConfigurationError(
+            "managed runtime release assets could not be verified"
+        ) from exc
+    finally:
+        os.close(root_fd)
 
 
 def _validate_framework_lock(
@@ -518,6 +636,7 @@ __all__ = (
     "ProviderWorkspaceArchiveSourceV1",
     "ReleaseRuntimeConfigurationError",
     "bundled_core_asset_root",
+    "bundled_managed_runtime_asset_root",
     "create_release_core_runtime",
     "load_core_bootstrap_config",
 )
