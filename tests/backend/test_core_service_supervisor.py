@@ -1619,6 +1619,17 @@ def test_failed_initialization_releases_host_global_owner(tmp_path: Path) -> Non
     supervisor.close()
 
 
+def test_immutable_framework_lock_is_accepted(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    framework_lock.chmod(0o400)
+
+    supervisor, _, _, _ = _supervisor(tmp_path, framework_lock)
+
+    supervisor.close()
+
+
 def test_framework_lock_path_replacement_fails_before_service_stop(
     tmp_path: Path,
     framework_lock: Path,

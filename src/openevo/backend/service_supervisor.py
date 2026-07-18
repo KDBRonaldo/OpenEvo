@@ -1900,7 +1900,7 @@ class _VerifiedFrameworkLock:
         self.fd = _open_absolute_nofollow_file(self.path, "framework lock")
         try:
             info = os.fstat(self.fd)
-            _require_private_file(info, os.getuid(), "framework lock")
+            _require_private_framework_lock(info, os.getuid())
             if info.st_size > _MAX_FRAMEWORK_LOCK_BYTES:
                 raise SupervisorStateError("framework lock exceeds its byte limit")
             self.identity = _fd_identity(self.fd)
@@ -1918,7 +1918,7 @@ class _VerifiedFrameworkLock:
             if _fd_identity(current_fd) != self.identity:
                 raise SupervisorStateError("framework lock pathname binding changed")
             info = os.fstat(current_fd)
-            _require_private_file(info, os.getuid(), "framework lock")
+            _require_private_framework_lock(info, os.getuid())
             if info.st_size > _MAX_FRAMEWORK_LOCK_BYTES:
                 raise SupervisorStateError("framework lock exceeds its byte limit")
             payload = os.pread(current_fd, info.st_size + 1, 0)
@@ -3908,6 +3908,17 @@ def _require_private_file(info: os.stat_result, uid: int, label: str) -> None:
         raise SupervisorStateError(f"{label} is not a link-count-one regular file")
     if info.st_uid != uid or stat.S_IMODE(info.st_mode) != _FILE_MODE:
         raise SupervisorStateError(f"{label} must be owner-only mode 0600")
+
+
+def _require_private_framework_lock(info: os.stat_result, uid: int) -> None:
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SupervisorStateError(
+            "framework lock is not a link-count-one regular file"
+        )
+    if info.st_uid != uid or stat.S_IMODE(info.st_mode) not in {0o400, _FILE_MODE}:
+        raise SupervisorStateError(
+            "framework lock must be owner-only mode 0600 or immutable 0400"
+        )
 
 
 def _fd_identity(fd: int) -> tuple[int, int, int]:
