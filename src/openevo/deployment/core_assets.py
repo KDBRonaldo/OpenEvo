@@ -1836,13 +1836,18 @@ try:
                     )
                     try:
                         final_root = service_root + "/assets/" + bundle
-                        if (final_root + "/" + wheel_name not in command
-                                or final_root + "/framework-lock.json" not in command):
+                        wheel_path = final_root + "/" + wheel_name
+                        framework_lock_path = final_root + "/framework-lock.json"
+                        if (wheel_path not in command
+                                or framework_lock_path not in command):
                             raise SystemExit(78)
                         pinned_root = (
                             "/proc/" + str(os.getpid()) + "/fd/" + str(bundle_fd)
                         )
-                        rewritten = command.replace(final_root, pinned_root)
+                        rewritten = command.replace(
+                            wheel_path,
+                            pinned_root + "/" + wheel_name,
+                        )
                         completed = subprocess.run(
                             rewritten,
                             shell=True,

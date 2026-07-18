@@ -840,6 +840,8 @@ def test_remote_asset_consumer_reads_verified_pinned_publication(
     consumed = tmp_path / "consumed"
     nested_reader = (
         "import hashlib,pathlib,sys;"
+        "assert sys.argv[1].startswith('/proc/') and '/fd/' in sys.argv[1];"
+        "assert not sys.argv[2].startswith('/proc/');"
         "assert hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()==sys.argv[3];"
         "assert hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).hexdigest()==sys.argv[4]"
     )
@@ -1497,8 +1499,10 @@ def test_core_python_runtime_selection_maps_no_supported_python_and_inherits_pro
         timeout_seconds: float,
         remote_failure_code: SshTransportErrorCode,
         env: dict[str, str] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> SecretStr:
         assert remote_failure_code is SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED
+        assert cancel_event is None
         commands.append((command, timeout_seconds))
         assert env == {
             "HTTPS_PROXY": "http://127.0.0.1:7890",
