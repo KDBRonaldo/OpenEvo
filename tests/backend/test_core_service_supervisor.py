@@ -1268,7 +1268,7 @@ def test_release_restart_completed_replay_reverifies_inventory_before_return(
     monkeypatch.setattr(
         supervisor_module,
         "LocalManagedScienceRuntimeProbe",
-        lambda: runtime_probe,
+        lambda **_kwargs: runtime_probe,
     )
     supervisor = CoreServiceSupervisor(
         launch_mode=ServiceLaunchMode.RELEASE,
@@ -1325,7 +1325,7 @@ def test_release_restart_inventory_failure_is_transactional_between_reverificati
     monkeypatch.setattr(
         supervisor_module,
         "LocalManagedScienceRuntimeProbe",
-        lambda: runtime_probe,
+        lambda **_kwargs: runtime_probe,
     )
     supervisor = CoreServiceSupervisor(
         launch_mode=ServiceLaunchMode.RELEASE,
@@ -1859,6 +1859,31 @@ def test_subscription_runtime_bootstrap_failure_is_unavailable_without_spawn(
         assert "not prepared" in snapshot.status_message
         with pytest.raises(SupervisorStateError, match="not restartable"):
             supervisor.restart("gateway", operation_id="bypass-runtime-probe")
+    finally:
+        supervisor.close()
+
+
+def test_default_runtime_probe_uses_private_managed_credential_root(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    service_root = tmp_path / "core-services"
+    supervisor = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
+        service_root=service_root,
+        framework_lock=framework_lock,
+        release_identity=ServiceReleaseIdentity(
+            install_digest=INSTALL_DIGEST,
+            registry_digest=REGISTRY_DIGEST,
+        ),
+        run_admission_url=None,
+    )
+    try:
+        probe = supervisor._managed_runtime_probe
+        assert isinstance(probe, LocalManagedScienceRuntimeProbe)
+        assert probe._credential_probe_root == service_root / "credential-probes"
+        assert (service_root / "credential-probes").stat().st_mode & 0o777 == 0o700
+        assert list((service_root / "credential-probes").iterdir()) == []
     finally:
         supervisor.close()
 

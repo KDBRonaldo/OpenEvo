@@ -2007,8 +2007,13 @@ class CoreServiceSupervisor:
             self._process_backend = process_backend or RealSubprocessBackend()
             self._health_checker = health_checker or DefaultHealthChecker()
             self._port_probe = port_probe or SocketPortProbe()
+            self._root.ensure_directory("credential-probes")
+            self._credential_probe_root = self._root.path / "credential-probes"
             self._managed_runtime_probe = (
-                managed_runtime_probe or LocalManagedScienceRuntimeProbe()
+                managed_runtime_probe
+                or LocalManagedScienceRuntimeProbe(
+                    credential_probe_root=self._credential_probe_root,
+                )
             )
             self._startup_timeout = startup_timeout
             self._stop_timeout = stop_timeout
