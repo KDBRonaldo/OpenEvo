@@ -601,14 +601,37 @@ def smoke_daemon(*, deadline_seconds: float) -> dict[str, object]:
     }
 
 
-def _replace_option(arguments: list[str], option: str, value: str) -> None:
+def _required_option_index(arguments: Sequence[str], option: str) -> int:
     indexes = [index for index, argument in enumerate(arguments) if argument == option]
     if len(indexes) != 1 or indexes[0] + 1 >= len(arguments):
         raise DaemonBundleError(f"Internal Daemon invocation is missing {option}.")
     index = indexes[0]
     if arguments[index + 1].startswith("--"):
         raise DaemonBundleError(f"Internal Daemon invocation has an invalid {option}.")
+    return index
+
+
+def _replace_option(arguments: list[str], option: str, value: str) -> None:
+    index = _required_option_index(arguments, option)
     arguments[index + 1] = value
+
+
+def _invoke_internal_module_main(
+    module: str,
+    module_arguments: Sequence[str],
+    main: Any,
+) -> int:
+    previous_argv = sys.argv
+    try:
+        sys.argv = [module, *module_arguments]
+        result = main()
+    finally:
+        sys.argv = previous_argv
+    if result is None:
+        return 0
+    if type(result) is int:
+        return result
+    raise DaemonBundleError("Internal Daemon module returned an invalid status.")
 
 
 def _internal_module_dispatch(arguments: Sequence[str]) -> int | None:
@@ -670,6 +693,27 @@ def _internal_module_dispatch(arguments: Sequence[str]) -> int | None:
         from openevo.backend.service import main as service_main
 
         return service_main(module_arguments)
+    if module == "openevo.evolution.cli":
+        if not module_arguments or module_arguments[0] not in {"serve", "worker"}:
+            raise DaemonBundleError("Internal evolution invocation is not allowlisted.")
+        _replace_option(
+            module_arguments,
+            "--framework-lock",
+            str(_asset_path(_FRAMEWORK_LOCK_NAME)),
+        )
+        from openevo.evolution.cli import main as evolution_main
+
+        return _invoke_internal_module_main(module, module_arguments, evolution_main)
+    if module == "openevo.rollout.server":
+        _required_option_index(module_arguments, "--config")
+        from openevo.rollout.server import main as rollout_main
+
+        return _invoke_internal_module_main(module, module_arguments, rollout_main)
+    if module == "openevo.gateway.server":
+        _required_option_index(module_arguments, "--config")
+        from openevo.gateway.server import main as gateway_main
+
+        return _invoke_internal_module_main(module, module_arguments, gateway_main)
     raise DaemonBundleError("Internal Daemon module invocation is not allowlisted.")
 
 

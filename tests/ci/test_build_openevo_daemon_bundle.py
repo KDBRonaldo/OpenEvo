@@ -354,6 +354,104 @@ def test_internal_launcher_dispatch_rebinds_ephemeral_assets(
     ]
 
 
+def test_internal_managed_service_dispatch_is_closed_and_rebinds_framework_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openevo.evolution import cli as evolution_cli
+    from openevo.gateway import server as gateway_server
+    from openevo.rollout import server as rollout_server
+
+    captured: dict[str, list[str]] = {}
+    original_argv = sys.argv
+    monkeypatch.setattr(
+        daemon_bundle,
+        "_asset_path",
+        lambda name: Path("/child-extraction") / name,
+    )
+    monkeypatch.setattr(
+        daemon_bundle,
+        "_load_build_metadata",
+        lambda: {
+            "source_commit": "c" * 40,
+            "core": {"wheel_filename": "openevo-0.1.0-py3-none-any.whl"},
+        },
+    )
+    monkeypatch.setattr(
+        evolution_cli,
+        "main",
+        lambda argv=None: captured.setdefault("evolution", list(sys.argv)) and 0,
+    )
+    monkeypatch.setattr(
+        rollout_server,
+        "main",
+        lambda: captured.setdefault("rollout", list(sys.argv)) and None,
+    )
+    monkeypatch.setattr(
+        gateway_server,
+        "main",
+        lambda: captured.setdefault("gateway", list(sys.argv)) and None,
+    )
+
+    assert daemon_bundle._internal_module_dispatch(
+        [
+            "-I",
+            "-m",
+            "openevo.evolution.cli",
+            "serve",
+            "--framework-lock",
+            "/parent-extraction/framework-lock.json",
+        ]
+    ) == 0
+    assert daemon_bundle._internal_module_dispatch(
+        [
+            "-I",
+            "-m",
+            "openevo.rollout.server",
+            "--config",
+            "/managed/topology.json",
+        ]
+    ) == 0
+    assert daemon_bundle._internal_module_dispatch(
+        [
+            "-I",
+            "-m",
+            "openevo.gateway.server",
+            "--config",
+            "/managed/topology.json",
+            "--node-id",
+            "core-gateway",
+        ]
+    ) == 0
+
+    assert captured == {
+        "evolution": [
+            "openevo.evolution.cli",
+            "serve",
+            "--framework-lock",
+            "/child-extraction/framework-lock.json",
+        ],
+        "rollout": [
+            "openevo.rollout.server",
+            "--config",
+            "/managed/topology.json",
+        ],
+        "gateway": [
+            "openevo.gateway.server",
+            "--config",
+            "/managed/topology.json",
+            "--node-id",
+            "core-gateway",
+        ],
+    }
+    assert sys.argv is original_argv
+    with pytest.raises(daemon_bundle.DaemonBundleError, match="not allowlisted"):
+        daemon_bundle._internal_module_dispatch(["-I", "-m", "os", "getcwd"])
+    with pytest.raises(daemon_bundle.DaemonBundleError, match="not allowlisted"):
+        daemon_bundle._internal_module_dispatch(
+            ["-I", "-m", "openevo.evolution.cli", "promote"]
+        )
+
+
 def test_internal_script_dispatch_only_allows_managed_runtime_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
