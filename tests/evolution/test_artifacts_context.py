@@ -656,6 +656,56 @@ def test_context_resolver_honors_explicit_context_artifact_ids(tmp_path):
     assert adapter_context.adapter_merge_spec.adapters[0]["artifact_id"] == adapter.artifact_id
 
 
+def test_context_resolver_accepts_exact_artifact_from_same_project_across_runs(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    memory_file = tmp_path / "artifacts" / "payloads" / "memory.md"
+    memory_file.parent.mkdir(parents=True)
+    memory_file.write_text("Carry this observation into the next task.", encoding="utf-8")
+    memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="project memory",
+            uri=memory_file.as_uri(),
+            compatibility={
+                "task_tags": [
+                    "openevo_run_task:run-first:task-a",
+                    "openevo_project:project-stable",
+                ]
+            },
+        )
+    )
+
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task-b",
+            instruction="Continue the project.",
+            metadata={
+                "task_tags": [
+                    "openevo_run_task:run-second:task-b",
+                    "openevo_project:project-stable",
+                ],
+                "evolution": {"context_artifact_ids": [memory.artifact_id]},
+            },
+        )
+    )
+
+    assert context.memory["artifact_ids"] == [memory.artifact_id]
+    assert context.selection["artifact_ids"] == [memory.artifact_id]
+
+    with pytest.raises(ValueError, match="incompatible"):
+        store.resolve_context(
+            ContextResolveRequest(
+                task_id="task-b",
+                instruction="Continue another project.",
+                metadata={
+                    "task_tags": ["openevo_project:project-other"],
+                    "evolution": {"context_artifact_ids": [memory.artifact_id]},
+                },
+            )
+        )
+
+
 def test_context_resolver_skips_legacy_agent_system_with_unsafe_target_path(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()

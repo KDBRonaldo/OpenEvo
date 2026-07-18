@@ -544,6 +544,10 @@ def test_text_memory_method_writes_markdown_from_dataset(tmp_path):
         "text_memory",
         tmp_path,
         input_artifacts=[_dataset_artifact(tmp_path)],
+        config={
+            "compatibility": {"task_tags": ["openevo_project:project-1"]},
+            "promoted": True,
+        },
     )
 
     artifacts = run_method(job, artifact_root=tmp_path / "artifacts")
@@ -561,6 +565,7 @@ def test_text_memory_method_writes_markdown_from_dataset(tmp_path):
     assert "solved calculator task" in memory
     assert artifact.manifest["source_dataset_artifact_id"] == "art_dataset"
     assert artifact.manifest["record_count"] == 2
+    assert artifact.compatibility == {"task_tags": ["openevo_project:project-1"]}
 
 
 def test_text_memory_method_rejects_non_dataset_input_artifact(tmp_path):
@@ -597,6 +602,7 @@ def test_skill_bundle_method_writes_skill_markdown(tmp_path):
         config={
             "name": "calculator-helper",
             "skill_markdown": "# Calculator Helper\n\nUse exact arithmetic.",
+            "compatibility": {"task_tags": ["openevo_project:project-1"]},
         },
     )
 
@@ -611,6 +617,7 @@ def test_skill_bundle_method_writes_skill_markdown(tmp_path):
         "# Calculator Helper\n\nUse exact arithmetic.\n"
     )
     assert artifact.manifest["entrypoint"] == "SKILL.md"
+    assert artifact.compatibility == {"task_tags": ["openevo_project:project-1"]}
 
 
 def test_text_memory_reflector_writes_llm_memory_from_dataset(tmp_path, monkeypatch):

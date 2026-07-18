@@ -24,6 +24,10 @@ from openevo.evolution.framework.builtins import (
     _target_descriptors,
     build_builtin_registry,
 )
+from openevo.experiments.compiler import (
+    _compile_core_experiment,
+    _issue_core_project_scope_authority,
+)
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 
 ExperimentConfig = experiments.ExperimentConfig
@@ -164,6 +168,20 @@ def compile_experiment(
     **kwargs: object,
 ):
     return _compile_experiment(
+        config,
+        *args,
+        registry_snapshot=_REGISTRY_SNAPSHOT,
+        execution_profile=_EXECUTION_PROFILE,
+        **kwargs,
+    )
+
+
+def compile_core_experiment(
+    config: ExperimentConfig,
+    *args: object,
+    **kwargs: object,
+):
+    return _compile_core_experiment(
         config,
         *args,
         registry_snapshot=_REGISTRY_SNAPSHOT,
@@ -1100,6 +1118,67 @@ def test_evolution_job_compatibility_uses_single_task_scoped_tag() -> None:
     ]
     assert "openevo:biology-components" not in jobs[0]["config"]["compatibility"][
         "task_tags"
+    ]
+
+
+def test_core_project_compatibility_scope_is_stable_across_live_runs() -> None:
+    config = _config(
+        tasks=[
+            {
+                "id": "task-a",
+                "instruction": "Do A.",
+                "workspace": "/tmp/a",
+                "metadata": {"openevo": {"project_id": "project-forged"}},
+            }
+        ],
+    )
+    unscoped = compile_experiment(config, run_id="run-unscoped")
+    first = compile_core_experiment(
+        config,
+        run_id="run-first",
+        core_project_scope=_issue_core_project_scope_authority(
+            project_id="project-stable",
+            run_id="run-first",
+        ),
+    )
+    second = compile_core_experiment(
+        config,
+        run_id="run-second",
+        core_project_scope=_issue_core_project_scope_authority(
+            project_id="project-stable",
+            run_id="run-second",
+        ),
+    )
+
+    jobs = first.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+        task_id="task-a",
+    )
+    unscoped_jobs = unscoped.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+        task_id="task-a",
+    )
+    next_rollout = second.tasks[0].rollout_payload_for_round(
+        0,
+        context_artifact_ids=["artifact-first"],
+    )
+
+    artifact_tags = jobs[0]["config"]["compatibility"]["task_tags"]
+    assert artifact_tags == [
+        "openevo_run_task:run-first:task-a",
+        "openevo_project:project-stable",
+    ]
+    assert next_rollout["metadata"]["task_tags"] == [
+        "openevo_run_task:run-second:task-a",
+        "openevo_project:project-stable",
+    ]
+    assert set(artifact_tags).intersection(next_rollout["metadata"]["task_tags"]) == {
+        "openevo_project:project-stable"
+    }
+    assert unscoped_jobs[0]["config"]["compatibility"]["task_tags"] == [
+        "openevo_run_task:run-unscoped:task-a"
     ]
 
 

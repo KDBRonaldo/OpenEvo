@@ -122,6 +122,8 @@ def test_project_compiles_to_single_session_existing_experiment_path(tmp_path: P
     assert execution.config.tasks[0].workspace is None
     assert execution.execution_profile.execution_mode == "subscription"
     assert execution.execution_profile.capture_mode == "transcript"
+    assert execution._core_project_scope.project_id == project.id
+    assert execution._core_project_scope.run_id == "run-public-1"
     assert execution.task_id.startswith("science-")
     assert execution.submitted_task_id == (f"{execution.task_id}--run-run-public-1--round-0")
 

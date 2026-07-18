@@ -42,8 +42,9 @@ from openevo.backend.service_supervisor import (
 )
 from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
 from openevo.evolution.runtime_injection import build_runtime_injection_plan
-from openevo.experiments import EvolutionHttpClient, RolloutHttpClient, run_experiment
+from openevo.experiments import EvolutionHttpClient, RolloutHttpClient
 from openevo.experiments.clients import EvolutionClientProtocol, RolloutClientProtocol
+from openevo.experiments.runner import _run_core_authoritative_experiment
 from openevo.internal_auth import (
     GenerationBoundRunAdmissionCheck,
     RunAdmissionError,
@@ -109,7 +110,7 @@ class CoreScienceRunOwner:
         project_store: CoreControlStoreV1,
         service_supervisor: CoreServiceSupervisor | _ServiceOwner,
         executable_registry: VerifiedExecutableRegistry,
-        experiment_runner: ExperimentRunner = run_experiment,
+        experiment_runner: ExperimentRunner = _run_core_authoritative_experiment,
         rollout_factory: RolloutFactory | None = None,
         evolution_factory: EvolutionFactory | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -718,7 +719,7 @@ class CoreScienceRunOwner:
                     task_ids=[compiled.task_id],
                     rounds_override=1,
                     initial_context_artifact_ids=self._ledger.input_context(run_id),
-                    core_authoritative_successor=True,
+                    core_project_scope=compiled._core_project_scope,
                     managed_worker=True,
                     output_dir=output_dir,
                     artifact_root=output_dir / "worker-artifacts",

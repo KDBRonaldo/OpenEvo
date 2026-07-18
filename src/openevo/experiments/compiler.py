@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from openevo.evolution.framework import (
     EvolutionExecutionProfile,
@@ -36,6 +38,35 @@ _LEGACY_AGENT_SYSTEM_HISTORY_METHODS = frozenset(
     }
 )
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
+_CORE_PROJECT_SCOPE_SEAL = object()
+
+
+class _CoreProjectScopeAuthority:
+    __slots__ = ("_project_id", "_run_id", "__weakref__")
+
+    def __init__(self, *, project_id: str, run_id: str, _seal: object) -> None:
+        if _seal is not _CORE_PROJECT_SCOPE_SEAL:
+            raise TypeError("Core project scope authority cannot be constructed directly")
+        object.__setattr__(self, "_project_id", project_id)
+        object.__setattr__(self, "_run_id", run_id)
+
+    @property
+    def project_id(self) -> str:
+        return self._project_id
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("Core project scope authority is immutable")
+
+
+_CORE_PROJECT_SCOPE_AUTHORITIES: WeakKeyDictionary[
+    _CoreProjectScopeAuthority,
+    tuple[str, str],
+] = WeakKeyDictionary()
+_CORE_PROJECT_SCOPE_LOCK = threading.Lock()
 
 
 ContextArtifactIds = Mapping[str, str | Sequence[str]] | Sequence[str] | None
@@ -109,6 +140,7 @@ class CompiledTask:
     experiment_id: str
     experiment_name: str
     run_id: str | None
+    core_project_scope: _CoreProjectScopeAuthority | None
     task_id: str
     instruction: str
     workspace: str | None
@@ -258,8 +290,16 @@ class CompiledTask:
 
     def _task_tags(self) -> list[str]:
         if self.run_id:
-            return [f"openevo_run_task:{self.run_id}:{self.task_id}"]
-        return [f"openevo_task:{self.experiment_name}:{self.task_id}"]
+            tags = [f"openevo_run_task:{self.run_id}:{self.task_id}"]
+        else:
+            tags = [f"openevo_task:{self.experiment_name}:{self.task_id}"]
+        project_scope_id = _core_project_scope_id_for_run(
+            self.core_project_scope,
+            run_id=self.run_id,
+        )
+        if project_scope_id is not None:
+            tags.append(f"openevo_project:{project_scope_id}")
+        return tags
 
 
 def _job_compatibility(
@@ -422,11 +462,60 @@ def compile_experiment(
     registry_snapshot: RegistrySnapshot,
     execution_profile: EvolutionExecutionProfile,
 ) -> CompiledExperiment:
+    return _compile_experiment_with_scope(
+        config,
+        task_ids=task_ids,
+        rounds_override=rounds_override,
+        run_id=run_id,
+        core_project_scope=None,
+        registry_snapshot=registry_snapshot,
+        execution_profile=execution_profile,
+    )
+
+
+def _compile_core_experiment(
+    config: ExperimentConfig,
+    task_ids: Sequence[str] | None = None,
+    rounds_override: int | None = None,
+    *,
+    run_id: str,
+    core_project_scope: _CoreProjectScopeAuthority,
+    registry_snapshot: RegistrySnapshot,
+    execution_profile: EvolutionExecutionProfile,
+) -> CompiledExperiment:
+    if not isinstance(core_project_scope, _CoreProjectScopeAuthority):
+        raise ValueError("Core project scope authority is required")
+    normalized_run_id = _normalize_core_run_id(run_id)
+    return _compile_experiment_with_scope(
+        config,
+        task_ids=task_ids,
+        rounds_override=rounds_override,
+        run_id=normalized_run_id,
+        core_project_scope=core_project_scope,
+        registry_snapshot=registry_snapshot,
+        execution_profile=execution_profile,
+    )
+
+
+def _compile_experiment_with_scope(
+    config: ExperimentConfig,
+    task_ids: Sequence[str] | None,
+    rounds_override: int | None,
+    run_id: str | None,
+    *,
+    core_project_scope: _CoreProjectScopeAuthority | None,
+    registry_snapshot: RegistrySnapshot,
+    execution_profile: EvolutionExecutionProfile,
+) -> CompiledExperiment:
     round_count = rounds_override if rounds_override is not None else config.evolution.rounds
     if isinstance(round_count, bool) or round_count < 1:
         raise ValueError(f"round_count must be at least 1, got {round_count}")
 
     normalized_run_id = _normalize_run_id(run_id)
+    _core_project_scope_id_for_run(
+        core_project_scope,
+        run_id=normalized_run_id,
+    )
     selected_tasks = _select_tasks(config.tasks, task_ids)
     target_selections = _target_selections(config)
     agent = _agent_payload(config)
@@ -457,6 +546,7 @@ def compile_experiment(
                 experiment_id=experiment_id,
                 experiment_name=config.experiment.name,
                 run_id=normalized_run_id,
+                core_project_scope=core_project_scope,
                 task_id=task.id,
                 instruction=task.instruction,
                 workspace=_workspace_source(task, config_path),
@@ -560,6 +650,73 @@ def _normalize_run_id(run_id: str | None) -> str | None:
     if not text:
         raise ValueError("run_id must be a non-empty string when provided")
     return text
+
+
+def _normalize_core_project_scope_id(project_id: str | None) -> str | None:
+    if project_id is None:
+        return None
+    if (
+        not isinstance(project_id, str)
+        or not project_id
+        or project_id != project_id.strip()
+        or len(project_id) > 128
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in project_id)
+    ):
+        raise ValueError("core_project_scope_id is outside the Core opaque ID policy")
+    return project_id
+
+
+def _normalize_core_run_id(run_id: object) -> str:
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or run_id != run_id.strip()
+        or len(run_id) > 128
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in run_id)
+    ):
+        raise ValueError("Core run_id is outside the Core opaque ID policy")
+    return run_id
+
+
+def _issue_core_project_scope_authority(
+    *,
+    project_id: str,
+    run_id: str,
+) -> _CoreProjectScopeAuthority:
+    normalized_project_id = _normalize_core_project_scope_id(project_id)
+    normalized_run_id = _normalize_core_run_id(run_id)
+    if normalized_project_id is None:
+        raise ValueError("Core project scope authority requires project and run identities")
+    authority = _CoreProjectScopeAuthority(
+        project_id=normalized_project_id,
+        run_id=normalized_run_id,
+        _seal=_CORE_PROJECT_SCOPE_SEAL,
+    )
+    with _CORE_PROJECT_SCOPE_LOCK:
+        _CORE_PROJECT_SCOPE_AUTHORITIES[authority] = (
+            normalized_project_id,
+            normalized_run_id,
+        )
+    return authority
+
+
+def _core_project_scope_id_for_run(
+    authority: _CoreProjectScopeAuthority | None,
+    *,
+    run_id: str | None,
+) -> str | None:
+    if authority is None:
+        return None
+    if not isinstance(authority, _CoreProjectScopeAuthority):
+        raise ValueError("Core project scope authority is invalid")
+    with _CORE_PROJECT_SCOPE_LOCK:
+        issued_binding = _CORE_PROJECT_SCOPE_AUTHORITIES.get(authority)
+    if issued_binding is None:
+        raise ValueError("Core project scope authority was not issued by Core")
+    project_id, issued_run_id = issued_binding
+    if run_id is None or issued_run_id != run_id:
+        raise ValueError("Core project scope authority belongs to another run")
+    return project_id
 
 
 def _compile_method_spec(

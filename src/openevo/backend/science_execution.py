@@ -8,6 +8,10 @@ from pathlib import Path
 from openevo.backend.contracts.v1 import models as m
 from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.evolution.framework import EvolutionExecutionProfile
+from openevo.experiments.compiler import (
+    _CoreProjectScopeAuthority,
+    _issue_core_project_scope_authority,
+)
 from openevo.experiments.models import ExperimentConfig
 from openevo.runtime.codex_isolation import (
     CODEX_SUBSCRIPTION_CONTRACT_KEY,
@@ -30,6 +34,7 @@ _MANAGED_PROXY_CODEX_HOME = f"{MANAGED_HOME}/.codex"
 class CompiledScienceExecution:
     config: ExperimentConfig
     execution_profile: EvolutionExecutionProfile
+    _core_project_scope: _CoreProjectScopeAuthority
     task_id: str
     submitted_task_id: str
     credential_isolation: dict[str, object] | None
@@ -146,6 +151,10 @@ def compile_science_execution(
     return CompiledScienceExecution(
         config=config,
         execution_profile=profile,
+        _core_project_scope=_issue_core_project_scope_authority(
+            project_id=project.id,
+            run_id=run_id,
+        ),
         task_id=task_id,
         submitted_task_id=f"{task_id}--run-{run_id}--round-0",
         credential_isolation=credential_isolation,

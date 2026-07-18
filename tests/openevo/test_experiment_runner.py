@@ -25,6 +25,12 @@ from openevo.evolution.framework.builtins import (
     build_builtin_registry,
 )
 from openevo.evolution.models import ReviewRequestCreateRequest
+from openevo.experiments.compiler import (
+    _CoreProjectScopeAuthority,
+    _compile_core_experiment,
+    _issue_core_project_scope_authority,
+)
+from openevo.experiments.runner import _run_core_authoritative_experiment
 
 ExperimentConfig = experiments.ExperimentConfig
 _dry_run_experiment = experiments.dry_run_experiment
@@ -139,6 +145,15 @@ def dry_run_experiment(config: ExperimentConfig, **kwargs: Any):
 
 def run_experiment(config: ExperimentConfig, **kwargs: Any):
     return _run_experiment(
+        config,
+        executable_registry=_EXECUTABLE_REGISTRY,
+        execution_profile=_EXECUTION_PROFILE,
+        **kwargs,
+    )
+
+
+def run_core_experiment(config: ExperimentConfig, **kwargs: Any):
+    return _run_core_authoritative_experiment(
         config,
         executable_registry=_EXECUTABLE_REGISTRY,
         execution_profile=_EXECUTION_PROFILE,
@@ -620,6 +635,131 @@ def test_live_runner_rejects_non_numeric_poll_interval(tmp_path: Path) -> None:
         raise AssertionError("expected ValueError")
 
     assert rollout.submitted == []
+
+
+def test_public_experiment_apis_do_not_expose_core_project_authority() -> None:
+    import inspect
+
+    public_compile_parameters = inspect.signature(experiments.compile_experiment).parameters
+    public_run_parameters = inspect.signature(experiments.run_experiment).parameters
+
+    assert "core_project_scope" not in public_compile_parameters
+    assert "core_project_scope" not in public_run_parameters
+    assert "core_authoritative_successor" not in public_run_parameters
+
+
+@pytest.mark.parametrize("authority", [None, object()])
+def test_core_runner_rejects_missing_or_invalid_scope_without_side_effects(
+    tmp_path: Path,
+    authority: object | None,
+) -> None:
+    rollout = FakeRolloutClient()
+    output_dir = tmp_path / "must-not-exist"
+
+    with pytest.raises(ValueError, match="authority is required"):
+        _run_core_authoritative_experiment(
+            _config(),
+            run_id="run-invalid-authority",
+            core_project_scope=authority,  # type: ignore[arg-type]
+            output_dir=output_dir,
+            rollout_client=rollout,
+            evolution_client=FakeEvolutionClient(),
+            worker_runner=FakeWorkerRunner(),
+            poll_interval_seconds=0.0,
+            max_poll_attempts=1,
+            executable_registry=_EXECUTABLE_REGISTRY,
+            execution_profile=_EXECUTION_PROFILE,
+        )
+
+    assert rollout.submitted == []
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("run_id", [None, 123, " run-bound", "run-bound\n"])
+def test_core_runner_rejects_invalid_run_id_without_side_effects(
+    tmp_path: Path,
+    run_id: object,
+) -> None:
+    rollout = FakeRolloutClient()
+    output_dir = tmp_path / "must-not-exist"
+    authority = _issue_core_project_scope_authority(
+        project_id="project-bound",
+        run_id="run-bound",
+    )
+
+    with pytest.raises(ValueError, match="Core run_id"):
+        _run_core_authoritative_experiment(
+            _config(),
+            run_id=run_id,  # type: ignore[arg-type]
+            core_project_scope=authority,
+            output_dir=output_dir,
+            rollout_client=rollout,
+            evolution_client=FakeEvolutionClient(),
+            worker_runner=FakeWorkerRunner(),
+            poll_interval_seconds=0.0,
+            max_poll_attempts=1,
+            executable_registry=_EXECUTABLE_REGISTRY,
+            execution_profile=_EXECUTION_PROFILE,
+        )
+
+    assert rollout.submitted == []
+    assert not output_dir.exists()
+
+
+def test_core_project_scope_authority_cannot_be_constructed_mutated_or_reused() -> None:
+    with pytest.raises(TypeError, match="cannot be constructed"):
+        _CoreProjectScopeAuthority(
+            project_id="project-forged",
+            run_id="run-forged",
+            _seal=object(),
+        )
+
+    authority = _issue_core_project_scope_authority(
+        project_id="project-bound",
+        run_id="run-bound",
+    )
+    with pytest.raises(ValueError, match="authority is required"):
+        _compile_core_experiment(
+            _config(),
+            run_id="run-bound",
+            core_project_scope=None,  # type: ignore[arg-type]
+            registry_snapshot=_REGISTRY_SNAPSHOT,
+            execution_profile=_EXECUTION_PROFILE,
+        )
+    with pytest.raises(ValueError, match="Core run_id"):
+        _compile_core_experiment(
+            _config(),
+            run_id=123,  # type: ignore[arg-type]
+            core_project_scope=authority,
+            registry_snapshot=_REGISTRY_SNAPSHOT,
+            execution_profile=_EXECUTION_PROFILE,
+        )
+    with pytest.raises(AttributeError, match="immutable"):
+        authority._project_id = "project-mutated"  # type: ignore[misc]
+    object.__setattr__(authority, "_project_id", "project-forged")
+    compiled = _compile_core_experiment(
+        _config(),
+        run_id="run-bound",
+        core_project_scope=authority,
+        registry_snapshot=_REGISTRY_SNAPSHOT,
+        execution_profile=_EXECUTION_PROFILE,
+    )
+    assert (
+        compiled.tasks[0].rollout_payload_for_round(
+            0,
+            context_artifact_ids=[],
+        )["metadata"]["task_tags"][-1]
+        == "openevo_project:project-bound"
+    )
+
+    with pytest.raises(ValueError, match="another run"):
+        _compile_core_experiment(
+            _config(),
+            run_id="run-other",
+            core_project_scope=authority,
+            registry_snapshot=_REGISTRY_SNAPSHOT,
+            execution_profile=_EXECUTION_PROFILE,
+        )
 
 
 def test_live_runner_scopes_policy_versions_to_each_run(tmp_path: Path) -> None:
@@ -4127,7 +4267,8 @@ def test_core_authoritative_successor_selects_target_output_without_rewriting_pr
         ]
 
     rollout = FakeRolloutClient()
-    result = run_experiment(
+    run_id = "run-core-successor"
+    result = run_core_experiment(
         _config(
             evolution={
                 "targets": {
@@ -4140,8 +4281,12 @@ def test_core_authoritative_successor_selects_target_output_without_rewriting_pr
                 }
             }
         ),
+        run_id=run_id,
         rounds_override=2,
-        core_authoritative_successor=True,
+        core_project_scope=_issue_core_project_scope_authority(
+            project_id="project-core-successor",
+            run_id=run_id,
+        ),
         output_dir=tmp_path / "run",
         rollout_client=rollout,
         evolution_client=evolution,
@@ -4156,6 +4301,12 @@ def test_core_authoritative_successor_selects_target_output_without_rewriting_pr
     assert first_job["approved_artifact_ids"] == ["candidate-agent-system"]
     assert "promoted" not in evolution.jobs[0]["config"]
     assert artifacts["candidate-agent-system"]["promoted"] is False
+    assert evolution.jobs[0]["config"]["compatibility"]["task_tags"][-1] == (
+        "openevo_project:project-core-successor"
+    )
+    assert rollout.submitted[1]["metadata"]["task_tags"][-1] == (
+        "openevo_project:project-core-successor"
+    )
     assert rollout.submitted[1]["metadata"]["evolution"]["context_artifact_ids"] == [
         "candidate-agent-system"
     ]

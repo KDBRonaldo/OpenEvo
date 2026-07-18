@@ -206,6 +206,7 @@ def text_memory(job: WorkerClaimedJob, artifact_root: Path) -> list[ArtifactRegi
                 "record_count": len(records),
             },
             lineage={"input_artifact_ids": [dataset.artifact_id]},
+            compatibility=_dict_config(job.config.get("compatibility")),
             tags=_string_list(job.config.get("tags")),
             promoted=bool(job.config.get("promoted", False)),
         )
@@ -489,6 +490,7 @@ def skill_bundle(job: WorkerClaimedJob, artifact_root: Path) -> list[ArtifactReg
             name=name,
             uri=output_dir.resolve().as_uri(),
             manifest={"entrypoint": "SKILL.md", "files": ["SKILL.md"]},
+            compatibility=_dict_config(job.config.get("compatibility")),
             tags=_string_list(job.config.get("tags")),
             promoted=bool(job.config.get("promoted", False)),
         )

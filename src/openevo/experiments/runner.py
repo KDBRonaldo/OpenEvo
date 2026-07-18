@@ -15,7 +15,14 @@ from openevo.evolution.worker import EvolutionWorkerClient, run_once
 
 from .clients import EvolutionClientProtocol, EvolutionHttpClient
 from .clients import RolloutClientProtocol, RolloutHttpClient
-from .compiler import CompiledEvolutionMethodSpec, CompiledExperiment, compile_experiment
+from .compiler import (
+    CompiledEvolutionMethodSpec,
+    CompiledExperiment,
+    _CoreProjectScopeAuthority,
+    _compile_core_experiment,
+    _normalize_core_run_id,
+    compile_experiment,
+)
 from .models import ExperimentConfig
 from .promotion import (
     PromotionReviewer,
@@ -117,7 +124,6 @@ def run_experiment(
     task_ids: Sequence[str] | None = None,
     rounds_override: int | None = None,
     initial_context_artifact_ids: Mapping[str, Sequence[str]] | None = None,
-    core_authoritative_successor: bool = False,
     managed_worker: bool = False,
     output_dir: Path | None = None,
     artifact_root: Path | None = None,
@@ -130,19 +136,115 @@ def run_experiment(
     executable_registry: VerifiedExecutableRegistry,
     execution_profile: EvolutionExecutionProfile,
 ) -> dict[str, Any]:
+    return _run_experiment_with_scope(
+        config,
+        run_id=run_id,
+        task_ids=task_ids,
+        rounds_override=rounds_override,
+        initial_context_artifact_ids=initial_context_artifact_ids,
+        core_project_scope=None,
+        managed_worker=managed_worker,
+        output_dir=output_dir,
+        artifact_root=artifact_root,
+        rollout_client=rollout_client,
+        evolution_client=evolution_client,
+        worker_runner=worker_runner,
+        promotion_reviewer=promotion_reviewer,
+        poll_interval_seconds=poll_interval_seconds,
+        max_poll_attempts=max_poll_attempts,
+        executable_registry=executable_registry,
+        execution_profile=execution_profile,
+    )
+
+
+def _run_core_authoritative_experiment(
+    config: ExperimentConfig,
+    *,
+    core_project_scope: _CoreProjectScopeAuthority,
+    run_id: str,
+    task_ids: Sequence[str] | None = None,
+    rounds_override: int | None = None,
+    initial_context_artifact_ids: Mapping[str, Sequence[str]] | None = None,
+    managed_worker: bool = False,
+    output_dir: Path | None = None,
+    artifact_root: Path | None = None,
+    rollout_client: RolloutClientProtocol | None = None,
+    evolution_client: EvolutionClientProtocol | None = None,
+    worker_runner: WorkerRunner | None = None,
+    promotion_reviewer: PromotionReviewer | None = None,
+    poll_interval_seconds: float = 2.0,
+    max_poll_attempts: int = 1800,
+    executable_registry: VerifiedExecutableRegistry,
+    execution_profile: EvolutionExecutionProfile,
+) -> dict[str, Any]:
+    if not isinstance(core_project_scope, _CoreProjectScopeAuthority):
+        raise ValueError("Core project scope authority is required")
+    normalized_run_id = _normalize_core_run_id(run_id)
+    return _run_experiment_with_scope(
+        config,
+        run_id=normalized_run_id,
+        task_ids=task_ids,
+        rounds_override=rounds_override,
+        initial_context_artifact_ids=initial_context_artifact_ids,
+        core_project_scope=core_project_scope,
+        managed_worker=managed_worker,
+        output_dir=output_dir,
+        artifact_root=artifact_root,
+        rollout_client=rollout_client,
+        evolution_client=evolution_client,
+        worker_runner=worker_runner,
+        promotion_reviewer=promotion_reviewer,
+        poll_interval_seconds=poll_interval_seconds,
+        max_poll_attempts=max_poll_attempts,
+        executable_registry=executable_registry,
+        execution_profile=execution_profile,
+    )
+
+
+def _run_experiment_with_scope(
+    config: ExperimentConfig,
+    *,
+    run_id: str | None,
+    task_ids: Sequence[str] | None,
+    rounds_override: int | None,
+    initial_context_artifact_ids: Mapping[str, Sequence[str]] | None,
+    core_project_scope: _CoreProjectScopeAuthority | None,
+    managed_worker: bool,
+    output_dir: Path | None,
+    artifact_root: Path | None,
+    rollout_client: RolloutClientProtocol | None,
+    evolution_client: EvolutionClientProtocol | None,
+    worker_runner: WorkerRunner | None,
+    promotion_reviewer: PromotionReviewer | None,
+    poll_interval_seconds: float,
+    max_poll_attempts: int,
+    executable_registry: VerifiedExecutableRegistry,
+    execution_profile: EvolutionExecutionProfile,
+) -> dict[str, Any]:
     _validate_polling_options(
         poll_interval_seconds=poll_interval_seconds,
         max_poll_attempts=max_poll_attempts,
     )
     run_id = run_id if run_id is not None else uuid4().hex
-    compiled = compile_experiment(
-        config,
-        task_ids=task_ids,
-        rounds_override=rounds_override,
-        run_id=run_id,
-        registry_snapshot=executable_registry.snapshot,
-        execution_profile=execution_profile,
-    )
+    if core_project_scope is None:
+        compiled = compile_experiment(
+            config,
+            task_ids=task_ids,
+            rounds_override=rounds_override,
+            run_id=run_id,
+            registry_snapshot=executable_registry.snapshot,
+            execution_profile=execution_profile,
+        )
+    else:
+        compiled = _compile_core_experiment(
+            config,
+            task_ids=task_ids,
+            rounds_override=rounds_override,
+            run_id=run_id,
+            core_project_scope=core_project_scope,
+            registry_snapshot=executable_registry.snapshot,
+            execution_profile=execution_profile,
+        )
     output_root = (
         output_dir
         if output_dir is not None
@@ -168,7 +270,7 @@ def run_experiment(
             max_poll_attempts=max_poll_attempts,
             executable_registry=executable_registry,
             initial_context_artifact_ids=initial_context_artifact_ids,
-            core_authoritative_successor=core_authoritative_successor,
+            core_authoritative_successor=core_project_scope is not None,
             managed_worker=managed_worker,
         )
     finally:

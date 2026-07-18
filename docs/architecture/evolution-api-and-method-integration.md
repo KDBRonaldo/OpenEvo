@@ -685,6 +685,20 @@ Gateway 在 run 前调用：
 }
 ```
 
+Experiment compiler 会保留每次执行的
+`openevo_run_task:<run_id>:<task_id>` tag 作为审计与单次执行身份。由 Core run owner
+编译的产品运行还必须由 Science compiler 签发一个不属于 `ExperimentConfig` 或公开
+experiment API、绑定 exact project ID 和 run ID 的进程内 project-scope authority。
+Core run owner 只通过私有的 Core-authoritative runner/compiler 路径传递该 authority；
+公开的 `run_experiment` 和 `compile_experiment` 不接收 project scope 或 successor
+开关。Compiler 从签发方保存的不可变绑定中复核 authority 与当前 run，而不信任调用方可见
+对象中的字段。Compiler 据此生成
+`openevo_project:<project_id>` tag，并把同一有序 tag 集合同时写入 rollout metadata 和 method
+output compatibility。这样 successor revision 精确固定的 artifact 可以被同一 project 的后续
+run 或后续科研 task 消费，而另一个 project 仍会在 compatibility filter 处失败。通用 task
+metadata 即使包含同名 `openevo.project_id` 也不能取得 project scope；没有 Core authority 的
+benchmark automation 继续只使用原有 task-scoped tag。
+
 响应会包含：
 
 ```json

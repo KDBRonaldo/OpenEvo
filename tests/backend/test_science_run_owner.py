@@ -1733,6 +1733,10 @@ def test_successor_context_is_pinned_into_the_next_session(
             "skill_bundle": [],
             "text_memory": ["memory-for-next-session"],
         }
+        assert runner.calls[0]["core_project_scope"].project_id == project.id
+        assert runner.calls[0]["core_project_scope"].run_id == first_run.id
+        assert runner.calls[1]["core_project_scope"].project_id == project.id
+        assert runner.calls[1]["core_project_scope"].run_id == second_run.id
         context_response = owner.invoke("getCoreRunContextV1", {"run_id": second_run.id})
         assert isinstance(context_response, Response)
         context = m.RunContextV1.model_validate_json(context_response.body)
