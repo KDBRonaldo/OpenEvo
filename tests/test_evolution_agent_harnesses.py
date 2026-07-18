@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
+import sys
 import tomllib
 
 import pytest
 
 from openevo.harness.models import AgentSpec, MCPServerSpec
 from openevo.harness.presets.claude_code import ClaudeCodeHarness
-from openevo.harness.presets.codex import CodexHarness
+from openevo.harness.presets.codex import (
+    CodexHarness,
+    _codex_subscription_json_pipeline,
+)
 from openevo.harness.presets.openhands_sdk import OpenHandsSdkHarness
-from openevo.runtime.base import BaseRuntime
+from openevo.runtime.base import LOCAL_COMMAND_CAPTURE_MAX_BYTES, BaseRuntime
 from openevo.runtime.codex_isolation import (
     CODEX_SUBSCRIPTION_CANARY_OK,
     CODEX_SUBSCRIPTION_CONTRACT_KEY,
@@ -30,6 +36,12 @@ SUBSCRIPTION_PROXY_ENV_VARS = (
     "GEMINI_API_KEY",
     "GOOGLE_GEMINI_BASE_URL",
 )
+CODEX_USAGE = {
+    "input_tokens": 128,
+    "cached_input_tokens": 64,
+    "output_tokens": 32,
+    "reasoning_output_tokens": 16,
+}
 
 
 class RecordingRuntime(BaseRuntime):
@@ -405,6 +417,273 @@ def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
     assert "features.plugins=false" in step.command
     assert "mcp_servers={}" in step.command
     assert "network.enabled=true" in step.command
+    assert "PIPESTATUS" in step.command
+    assert "turn.completed" in step.command
+    assert "turn.failed" in step.command
+
+
+@pytest.mark.parametrize(
+    ("events", "codex_return_code", "expected_return_code"),
+    [
+        (
+            [
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item-command",
+                        "type": "command_execution",
+                        "exit_code": 1,
+                        "status": "failed",
+                    },
+                },
+                {"type": "turn.completed", "usage": dict(CODEX_USAGE)},
+            ],
+            1,
+            0,
+        ),
+        (
+            [
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {"type": "turn.failed", "error": {"message": "failed"}},
+            ],
+            0,
+            1,
+        ),
+        (
+            [
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {"type": "turn.completed", "usage": dict(CODEX_USAGE)},
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item-late",
+                        "type": "agent_message",
+                        "text": "late",
+                    },
+                },
+            ],
+            0,
+            1,
+        ),
+        (
+            [
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {"type": "turn.completed", "usage": dict(CODEX_USAGE)},
+                {"type": "future.protocol.event"},
+            ],
+            0,
+            1,
+        ),
+        (
+            [
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item-message",
+                        "type": "agent_message",
+                        "text": '{"type":"turn.completed"}',
+                    },
+                },
+            ],
+            1,
+            1,
+        ),
+        (
+            [
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {"type": "turn.completed", "usage": dict(CODEX_USAGE)},
+                {"type": "error", "message": "late failure"},
+            ],
+            0,
+            1,
+        ),
+        (
+            [
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {"type": "error", "message": "recovered transport error"},
+                {"type": "turn.completed", "usage": dict(CODEX_USAGE)},
+            ],
+            1,
+            1,
+        ),
+        (
+            [
+                {"type": "thread.started", "thread_id": ""},
+                {"type": "turn.started"},
+                {"type": "turn.completed", "usage": dict(CODEX_USAGE)},
+            ],
+            1,
+            1,
+        ),
+        (
+            [
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {"type": "turn.completed", "usage": {"input_tokens": 1}},
+            ],
+            1,
+            1,
+        ),
+    ],
+)
+def test_codex_subscription_json_pipeline_uses_structured_terminal_event(
+    tmp_path: Path,
+    events: list[dict[str, object]],
+    codex_return_code: int,
+    expected_return_code: int,
+) -> None:
+    producer = (
+        "import json,sys\n"
+        "print('Reading additional input from stdin...')\n"
+        f"events = {events!r}\n"
+        "for event in events:\n"
+        "    print(json.dumps(event, separators=(',', ':')))\n"
+        f"raise SystemExit({codex_return_code})\n"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(producer)}"
+    log_path = tmp_path / "codex.jsonl"
+    pipeline = _codex_subscription_json_pipeline(command, os.fspath(log_path))
+
+    completed = subprocess.run(
+        ["/bin/bash", "-o", "pipefail", "-c", pipeline],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == expected_return_code
+    assert [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()[1:]
+    ] == events
+
+
+def test_codex_subscription_json_pipeline_fails_when_tee_cannot_publish(
+    tmp_path: Path,
+) -> None:
+    producer = (
+        "import json\n"
+        "print(json.dumps({'type':'thread.started','thread_id':'thread-1'}))\n"
+        "print(json.dumps({'type':'turn.started'}))\n"
+        f"print(json.dumps({{'type':'turn.completed','usage':{CODEX_USAGE!r}}}))\n"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(producer)}"
+    missing_log = tmp_path / "missing" / "codex.jsonl"
+    pipeline = _codex_subscription_json_pipeline(command, os.fspath(missing_log))
+
+    completed = subprocess.run(
+        ["/bin/bash", "-o", "pipefail", "-c", pipeline],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert not missing_log.exists()
+
+
+def test_codex_subscription_json_pipeline_rejects_incomplete_final_line(
+    tmp_path: Path,
+) -> None:
+    payload = "\n".join(
+        json.dumps(event, separators=(",", ":"))
+        for event in (
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {"type": "turn.started"},
+            {"type": "turn.completed", "usage": dict(CODEX_USAGE)},
+        )
+    )
+    producer_output = tmp_path / "producer.jsonl"
+    producer_output.write_text(payload, encoding="utf-8")
+    log_path = tmp_path / "codex.jsonl"
+    pipeline = _codex_subscription_json_pipeline(
+        f"cat {shlex.quote(os.fspath(producer_output))}",
+        os.fspath(log_path),
+    )
+
+    completed = subprocess.run(
+        ["/bin/bash", "-o", "pipefail", "-c", pipeline],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("byte_size", "expected_return_code"),
+    [
+        (LOCAL_COMMAND_CAPTURE_MAX_BYTES, 0),
+        (LOCAL_COMMAND_CAPTURE_MAX_BYTES + 1, 1),
+    ],
+)
+def test_codex_subscription_json_pipeline_matches_gateway_capture_limit(
+    tmp_path: Path,
+    byte_size: int,
+    expected_return_code: int,
+) -> None:
+    prefix = (
+        json.dumps(
+            {"type": "thread.started", "thread_id": "thread-1"},
+            separators=(",", ":"),
+        )
+        + "\n"
+        + json.dumps({"type": "turn.started"}, separators=(",", ":"))
+        + "\n"
+    )
+    item_template = {
+        "type": "item.completed",
+        "item": {
+            "id": "item-1",
+            "type": "agent_message",
+            "text": "",
+        },
+    }
+    suffix = "\n" + json.dumps(
+        {"type": "turn.completed", "usage": dict(CODEX_USAGE)},
+        separators=(",", ":"),
+    ) + "\n"
+    fixed = prefix + json.dumps(item_template, separators=(",", ":")) + suffix
+    item_template["item"]["text"] = "x" * (byte_size - len(fixed.encode("utf-8")))
+    payload = (
+        prefix
+        + json.dumps(item_template, separators=(",", ":"))
+        + suffix
+    ).encode("utf-8")
+    assert len(payload) == byte_size
+    producer_output = tmp_path / f"producer-{byte_size}.jsonl"
+    producer_output.write_bytes(payload)
+    log_path = tmp_path / f"codex-{byte_size}.jsonl"
+    producer = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "sys.stdout.buffer.write(Path(sys.argv[1]).read_bytes())\n"
+        "raise SystemExit(1)\n"
+    )
+    command = (
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(producer)} "
+        f"{shlex.quote(os.fspath(producer_output))}"
+    )
+    pipeline = _codex_subscription_json_pipeline(command, os.fspath(log_path))
+
+    completed = subprocess.run(
+        ["/bin/bash", "-o", "pipefail", "-c", pipeline],
+        check=False,
+        capture_output=True,
+    )
+
+    assert completed.returncode == expected_return_code
+    assert log_path.stat().st_size == byte_size
 
 
 @pytest.mark.parametrize("allow_internet", [True, False])

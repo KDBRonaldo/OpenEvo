@@ -19,7 +19,11 @@ from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
 from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.models import ExecInput, ExecResult, PrepareAction, RuntimeSpec
-from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
+from openevo.runtime.managed import (
+    MANAGED_RUNTIME_RELEASES,
+    MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+    MANAGED_WORKSPACE,
+)
 from openevo.trajectory.models import EvaluatorSpec, StrategySpec
 from openevo.trajectory.registry import (
     default_builder_registry,
@@ -103,6 +107,13 @@ def _subscription_dispatch_request(session_id: str) -> SessionDispatchRequest:
             profile="managed_science",
             image=MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest,
             container_user="host",
+            workdir=MANAGED_WORKSPACE,
+            prepare=[
+                PrepareAction(
+                    type="exec",
+                    command=MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+                )
+            ],
         ),
         agent=AgentSpec(
             harness="codex",

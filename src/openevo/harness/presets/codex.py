@@ -13,7 +13,12 @@ from openevo.harness.presets._subscription import (
     command_with_unset_proxy_env,
     normalize_auth_mode,
 )
-from openevo.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR, RUNTIME_SESSION_DIR
+from openevo.runtime.base import (
+    LOCAL_COMMAND_CAPTURE_MAX_BYTES,
+    BaseRuntime,
+    RUNTIME_AGENT_LOG_DIR,
+    RUNTIME_SESSION_DIR,
+)
 from openevo.runtime.codex_isolation import (
     CODEX_SUBSCRIPTION_CANARY_OK,
     codex_subscription_cli_flags,
@@ -36,6 +41,155 @@ _NATIVE_MEMORY_POLICIES = {
     _NATIVE_MEMORY_POLICY_PRESERVE,
     _NATIVE_MEMORY_POLICY_CLEAR,
 }
+_CODEX_TERMINAL_EVENT_VALIDATOR_SOURCE = rf"""
+import json
+import os
+import stat
+import sys
+
+max_bytes = {LOCAL_COMMAND_CAPTURE_MAX_BYTES}
+flags = os.O_RDONLY | os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+
+try:
+    descriptor = os.open(sys.argv[1], flags)
+except OSError:
+    raise SystemExit(1)
+
+counts = {{
+    "thread.started": 0,
+    "turn.started": 0,
+    "turn.completed": 0,
+}}
+turn_active = False
+try:
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != os.geteuid()
+        or not 0 < before.st_size <= max_bytes
+    ):
+        raise SystemExit(1)
+    payload = b""
+    while len(payload) <= before.st_size:
+        chunk = os.read(descriptor, min(65536, before.st_size - len(payload) + 1))
+        if not chunk:
+            break
+        payload += chunk
+    after = os.fstat(descriptor)
+    path_metadata = os.lstat(sys.argv[1])
+finally:
+    os.close(descriptor)
+
+def identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+if (
+    len(payload) != before.st_size
+    or payload[-1:] != b"\n"
+    or identity(before) != identity(after)
+    or identity(before) != identity(path_metadata)
+    or not stat.S_ISREG(path_metadata.st_mode)
+    or path_metadata.st_nlink != 1
+):
+    raise SystemExit(1)
+
+try:
+    lines = payload.decode("utf-8").splitlines()
+except UnicodeError:
+    raise SystemExit(1)
+if lines and lines[0] == "Reading additional input from stdin...":
+    lines = lines[1:]
+if not lines or any(not line for line in lines):
+    raise SystemExit(1)
+
+last_event_type = None
+for raw_line in lines:
+    try:
+        event = json.loads(raw_line)
+    except (json.JSONDecodeError, RecursionError):
+        raise SystemExit(1)
+    if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+        raise SystemExit(1)
+    event_type = event["type"]
+    if event_type == "thread.started":
+        if (
+            any(counts.values())
+            or turn_active
+            or not isinstance(event.get("thread_id"), str)
+            or not event["thread_id"]
+        ):
+            raise SystemExit(1)
+        counts[event_type] += 1
+    elif event_type == "turn.started":
+        if counts["thread.started"] != 1 or any(
+            counts[name] for name in ("turn.started", "turn.completed")
+        ) or turn_active:
+            raise SystemExit(1)
+        counts[event_type] += 1
+        turn_active = True
+    elif event_type in {{"item.started", "item.updated", "item.completed"}}:
+        item = event.get("item")
+        if (
+            not turn_active
+            or not isinstance(item, dict)
+            or not isinstance(item.get("id"), str)
+            or not item["id"]
+            or not isinstance(item.get("type"), str)
+            or not item["type"]
+        ):
+            raise SystemExit(1)
+    elif event_type == "turn.completed":
+        usage = event.get("usage")
+        usage_fields = {{
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        }}
+        if (
+            not turn_active
+            or counts[event_type] != 0
+            or not isinstance(usage, dict)
+            or set(usage) != usage_fields
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in usage.values()
+            )
+        ):
+            raise SystemExit(1)
+        counts[event_type] += 1
+        turn_active = False
+    elif event_type in {{"turn.failed", "error"}}:
+        raise SystemExit(1)
+    else:
+        raise SystemExit(1)
+    last_event_type = event_type
+
+if (
+    counts
+    != {{
+        "thread.started": 1,
+        "turn.started": 1,
+        "turn.completed": 1,
+    }}
+    or turn_active
+    or last_event_type != "turn.completed"
+):
+    raise SystemExit(1)
+"""
 
 
 class CodexHarness(BaseHarness):
@@ -173,7 +327,15 @@ class CodexHarness(BaseHarness):
         codex_command = f"{executable} exec {flags_str} -- {escaped}"
         if auth_mode == AUTH_MODE_SUBSCRIPTION:
             codex_command = command_with_unset_proxy_env(codex_command)
-        pipeline = f"{codex_command} 2>&1 </dev/null | tee {RUNTIME_AGENT_LOG_DIR}/codex.txt"
+            pipeline = _codex_subscription_json_pipeline(
+                codex_command,
+                f"{RUNTIME_AGENT_LOG_DIR}/codex.txt",
+            )
+        else:
+            pipeline = (
+                f"{codex_command} 2>&1 </dev/null | "
+                f"tee {RUNTIME_AGENT_LOG_DIR}/codex.txt"
+            )
         command = f"/bin/bash -o pipefail -c {shlex.quote(pipeline)}"
 
         run_step = ExecInput(
@@ -233,6 +395,33 @@ def _nonempty_env_path(value: str | None) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _codex_subscription_json_pipeline(codex_command: str, log_path: str) -> str:
+    quoted_log = shlex.quote(log_path)
+    validator = (
+        f"python3 -c {shlex.quote(_CODEX_TERMINAL_EVENT_VALIDATOR_SOURCE)} "
+        f"{quoted_log}"
+    )
+    return (
+        "set +e; "
+        f"{codex_command} 2>&1 </dev/null | tee {quoted_log}; "
+        'pipeline_status=("${PIPESTATUS[@]}"); '
+        'codex_rc="${pipeline_status[0]:-1}"; '
+        'tee_rc="${pipeline_status[1]:-1}"; '
+        "set -e; "
+        'if test "$tee_rc" -ne 0; then exit "$tee_rc"; fi; '
+        f"if {validator}; then "
+        'if test "$codex_rc" -ne 0; then '
+        "printf '%s\\n' "
+        "'OpenEvo accepted a completed Codex JSON turn after a nonzero CLI exit.' "
+        ">&2; "
+        "fi; "
+        "exit 0; "
+        "fi; "
+        'if test "$codex_rc" -ne 0; then exit "$codex_rc"; fi; '
+        "exit 1"
+    )
 
 
 def _native_memory_policy(settings: dict[str, object]) -> str:
