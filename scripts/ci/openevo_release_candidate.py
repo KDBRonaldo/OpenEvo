@@ -180,7 +180,8 @@ def _managed_runtime_source_evidence() -> dict[str, object]:
         },
         "release": {
             "id": MANAGED_RUNTIME_RELEASE_ID,
-            "is_draft": True,
+            "is_draft": False,
+            "is_prerelease": True,
             "tag": MANAGED_RUNTIME_RELEASE_TAG,
         },
         "repository": MANAGED_RUNTIME_REPOSITORY,

@@ -372,7 +372,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
     }
 
 
-def test_managed_runtime_source_binds_draft_asset_and_download(
+def test_managed_runtime_source_binds_prerelease_asset_and_download(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -408,8 +408,9 @@ def test_managed_runtime_source_binds_draft_asset_and_download(
         release_json,
         {
             "assets": [asset],
-            "draft": True,
+            "draft": False,
             "id": release.asset_release_id,
+            "prerelease": True,
             "tag_name": release.asset_release_tag,
         },
     )

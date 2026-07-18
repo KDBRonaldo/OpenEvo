@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the exact private GitHub release asset and downloaded archive bytes."""
+"""Verify the exact GitHub prerelease asset and downloaded archive bytes."""
 
 from __future__ import annotations
 
@@ -86,7 +86,8 @@ def expected_source_evidence() -> dict[str, object]:
         },
         "release": {
             "id": release.asset_release_id,
-            "is_draft": True,
+            "is_draft": False,
+            "is_prerelease": True,
             "tag": release.asset_release_tag,
         },
         "repository": "CompLifeLab-ZJU/OpenEvo",
@@ -114,7 +115,8 @@ def verify_release_asset(
     if (
         release_payload.get("id") != expected.asset_release_id
         or release_payload.get("tag_name") != expected.asset_release_tag
-        or release_payload.get("draft") is not True
+        or release_payload.get("draft") is not False
+        or release_payload.get("prerelease") is not True
         or not isinstance(release_assets, list)
         or len(release_assets) != 1
         or _asset_identity(release_assets[0]) != expected_api_asset
