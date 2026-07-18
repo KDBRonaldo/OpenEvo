@@ -2676,6 +2676,35 @@ def test_rsync_nested_ssh_uses_verified_platform_target_and_inherits_fd(
     assert int(actual_argv[marker_index + 2]) in pass_fds
 
 
+def test_linux_frozen_birth_launcher_uses_loaded_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ssh_module.sys, "platform", "linux")
+    monkeypatch.setattr(ssh_module.sys, "frozen", True, raising=False)
+
+    assert ssh_module._owned_subprocess_launcher() == "/proc/self/exe"
+    assert ssh_module._subprocess_birth_argv(
+        [ssh_module.SSH_EXECUTABLE, "-V"],
+        17,
+        18,
+    )[:5] == [
+        "/proc/self/exe",
+        "-I",
+        "-c",
+        ssh_module._SUBPROCESS_BIRTH_LAUNCHER,
+        ssh_module.OWNED_SUBPROCESS_BIRTH_ARGUMENT,
+    ]
+
+
+def test_non_frozen_birth_launcher_uses_python_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ssh_module.sys, "platform", "linux")
+    monkeypatch.delattr(ssh_module.sys, "frozen", raising=False)
+
+    assert ssh_module._owned_subprocess_launcher() == sys.executable
+
+
 def test_darwin_rsync_nested_ssh_uses_revalidated_fixed_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

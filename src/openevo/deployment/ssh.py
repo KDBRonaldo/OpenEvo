@@ -2375,13 +2375,14 @@ class _OwnedSubprocessAuthority:
             if agent_proxy is not None:
                 agent_proxy.verify_upstream_binding()
             self._spawn_outcome_unknown = True
+            launcher = _owned_subprocess_launcher()
             process = _OWNED_SUBPROCESS_POPEN(
                 _subprocess_birth_argv(
                     spawn_argv,
                     birth_record_fd,
                     executable.descriptor,
                 ),
-                executable=sys.executable,
+                executable=launcher,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -2442,13 +2443,14 @@ class _OwnedSubprocessAuthority:
             if agent_proxy is not None:
                 agent_proxy.verify_upstream_binding()
             self._spawn_outcome_unknown = True
+            launcher = _owned_subprocess_launcher()
             process = _TUNNEL_SUBPROCESS_POPEN(
                 _subprocess_birth_argv(
                     spawn_argv,
                     birth_record_fd,
                     executable.descriptor,
                 ),
-                executable=sys.executable,
+                executable=launcher,
                 stdin=subprocess.DEVNULL if stream_fd is None else stream_fd,
                 stdout=subprocess.DEVNULL if stream_fd is None else stream_fd,
                 stderr=subprocess.DEVNULL,
@@ -2690,7 +2692,7 @@ def _subprocess_birth_argv(
     if not argv:
         raise RuntimeError("subprocess argv is empty")
     return [
-        sys.executable,
+        _owned_subprocess_launcher(),
         "-I",
         "-c",
         _SUBPROCESS_BIRTH_LAUNCHER,
@@ -2699,6 +2701,12 @@ def _subprocess_birth_argv(
         str(executable_fd),
         *argv,
     ]
+
+
+def _owned_subprocess_launcher() -> str:
+    if sys.platform.startswith("linux") and getattr(sys, "frozen", False) is True:
+        return "/proc/self/exe"
+    return sys.executable
 
 
 def _read_subprocess_birth_record(birth_record: BinaryIO | None) -> int | None:
