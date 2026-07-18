@@ -2501,6 +2501,11 @@ def test_release_subscription_create_and_patch_bind_managed_service_readiness(
         )
 
     assert patched.status_code == 200
+    assert patched.json()["current_task_snapshot"] == project["current_task_snapshot"]
+    assert (
+        patched.json()["current_workspace_snapshot"]
+        == project["current_workspace_snapshot"]
+    )
     assert [call["execution_mode"] for call in supervisor.ensure_calls] == [
         ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
         ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,

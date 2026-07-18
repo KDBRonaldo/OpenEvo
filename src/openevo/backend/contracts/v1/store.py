@@ -2221,7 +2221,7 @@ class CoreControlStoreV1:
         workspace = patch.workspace if "workspace" in fields else current.workspace
         assert spec is not None and task is not None and workspace is not None
         task_snapshot = current.current_task_snapshot
-        if "task" in fields:
+        if "task" in fields and task != current.task:
             task_snapshot = _snapshot(
                 self._signing_key,
                 m.SnapshotKind.TASK,
