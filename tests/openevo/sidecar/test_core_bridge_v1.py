@@ -869,6 +869,7 @@ def _bridge(
     fake_core: FakeCore | None = None,
     archive_source: FakeArchiveSource | None = None,
     timeout: float = 5.0,
+    activation_timeout: float | None = None,
 ) -> tuple[DesktopCoreBridgeV1, FakePersistence, FakeCore, FakeTunnelFactory]:
     persistence = persistence or FakePersistence()
     fake_core = fake_core or FakeCore(local_project)
@@ -880,6 +881,7 @@ def _bridge(
         archive_source=archive_source or FakeArchiveSource(),
         transport_factory=lambda: httpx.MockTransport(fake_core),
         timeout=timeout,
+        activation_timeout=activation_timeout,
     )
     return bridge, persistence, fake_core, tunnels
 
@@ -982,6 +984,25 @@ def test_activate_then_create_run_uses_real_strict_clients_and_core_authority() 
             ),
         )
     ]
+
+
+def test_activation_total_deadline_does_not_expand_core_request_timeout() -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(
+        local_project,
+        timeout=60.0,
+        activation_timeout=900.0,
+    )
+
+    activation = bridge.activate_project(
+        local_project,
+        idempotency_key="activate-long-total-deadline-0001",
+    )
+
+    assert activation.core_project.id == CORE_PROJECT_ID
+    assert bridge._active is not None
+    assert bridge._active.client._request_deadline_seconds == 60.0
+    bridge.close()
 
 
 def test_durable_activation_projection_rebinds_the_live_local_etag() -> None:

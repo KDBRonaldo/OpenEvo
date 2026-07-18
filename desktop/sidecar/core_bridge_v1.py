@@ -2837,7 +2837,7 @@ class DesktopCoreBridgeV1:
     def _new_client(
         self, connection: CoreTunnelConnectionV1, deadline: float
     ) -> CoreControlClientV1:
-        timeout = self._remaining(deadline)
+        timeout = min(self._timeout, self._remaining(deadline))
         transport = self._new_transport()
         try:
             return CoreControlClientV1(
@@ -2855,7 +2855,7 @@ class DesktopCoreBridgeV1:
         connection: CoreBootstrapTunnelConnectionV1,
         deadline: float,
     ) -> CoreProjectBootstrapClientV1:
-        timeout = self._remaining(deadline)
+        timeout = min(self._timeout, self._remaining(deadline))
         transport = self._new_transport()
         try:
             return CoreProjectBootstrapClientV1(
