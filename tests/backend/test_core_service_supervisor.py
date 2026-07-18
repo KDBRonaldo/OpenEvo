@@ -701,6 +701,33 @@ def test_atomic_run_binding_lease_blocks_another_model_generation_until_release(
         supervisor.close()
 
 
+def test_active_run_lease_blocks_supervisor_close_without_stopping_services(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock)
+    lease = None
+    try:
+        snapshot, lease = _ensure_subscription_binding(supervisor)
+        assert snapshot.run_ready is True
+        assert lease is not None
+
+        with pytest.raises(SupervisorStateError, match="leased to an active run"):
+            supervisor.close()
+
+        assert backend.terminated == []
+        assert all(service.status is ServiceStatus.RUNNING for service in supervisor.list())
+        lease.close()
+        lease = None
+        supervisor.close()
+        assert len(backend.terminated) == 4
+    finally:
+        if lease is not None:
+            lease.close()
+        if not supervisor._closed:
+            supervisor.close()
+
+
 def test_auth_replacement_after_snapshot_does_not_revoke_active_run_authority(
     tmp_path: Path,
     framework_lock: Path,
@@ -1394,7 +1421,7 @@ def test_release_mode_rejects_development_injection(
         )
 
 
-def test_new_release_rebinds_only_an_empty_unbound_service_ledger(
+def test_new_release_rebinds_an_empty_unbound_service_ledger(
     tmp_path: Path,
     framework_lock: Path,
 ) -> None:
@@ -1424,15 +1451,119 @@ def test_new_release_rebinds_only_an_empty_unbound_service_ledger(
         replacement.close()
 
 
-def test_new_release_rejects_a_bound_service_ledger(
+def test_new_release_rebinds_a_quiescent_ready_service_ledger(
     tmp_path: Path,
     framework_lock: Path,
 ) -> None:
     first, _, _, _ = _supervisor(tmp_path, framework_lock)
     try:
-        _ensure_subscription(first)
+        snapshot = _ensure_subscription(first)
+        assert snapshot.run_ready is True
+        assert snapshot.runtime_identity_digest is not None
     finally:
         first.close()
+
+    replacement_identity = ServiceReleaseIdentity("c" * 64, "d" * 64)
+    replacement = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
+        service_root=tmp_path / "core-services",
+        framework_lock=framework_lock,
+        release_identity=replacement_identity,
+    )
+    try:
+        assert replacement._ledger.release.install_digest == replacement_identity.install_digest
+        assert replacement._ledger.release.registry_digest == replacement_identity.registry_digest
+        assert replacement._ledger.execution_mode is None
+        assert replacement._ledger.services == []
+    finally:
+        replacement.close()
+
+
+def test_new_release_rebinds_after_a_prerequisite_failure_is_cleanly_closed(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    first, _, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        runtime_probe=FakeManagedScienceRuntimeProbe(ready=False),
+    )
+    try:
+        snapshot = _ensure_subscription(first)
+        assert snapshot.run_ready is False
+        assert snapshot.runtime_identity_digest is None
+        assert all(service.status is ServiceStatus.UNAVAILABLE for service in snapshot.services)
+    finally:
+        first.close()
+
+    replacement = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
+        service_root=tmp_path / "core-services",
+        framework_lock=framework_lock,
+        release_identity=ServiceReleaseIdentity("c" * 64, "d" * 64),
+    )
+    try:
+        assert replacement._ledger.execution_mode is None
+        assert replacement._ledger.runtime_readiness_code is None
+        assert replacement._ledger.services == []
+    finally:
+        replacement.close()
+
+
+def test_new_release_rejects_an_unavailable_ledger_without_clean_close(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    first, _, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        runtime_probe=FakeManagedScienceRuntimeProbe(ready=False),
+    )
+    snapshot = _ensure_subscription(first)
+    assert snapshot.run_ready is False
+    assert all(service.status is ServiceStatus.UNAVAILABLE for service in snapshot.services)
+    first._abandon_for_test()
+
+    with pytest.raises(SupervisorStateError, match="release identity"):
+        CoreServiceSupervisor(
+            launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
+            service_root=tmp_path / "core-services",
+            framework_lock=framework_lock,
+            release_identity=ServiceReleaseIdentity("c" * 64, "d" * 64),
+        )
+
+
+def test_new_release_rejects_a_failed_service_without_process_identity(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    first, backend, _, _ = _supervisor(tmp_path, framework_lock)
+    assert _ensure_subscription(first).run_ready is True
+    backend.crash("gateway", 23)
+    deadline = time.monotonic() + 1
+    while first.get("gateway").status is not ServiceStatus.FAILED:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    assert first._record("gateway").pid is None
+    first._abandon_for_test()
+
+    with pytest.raises(SupervisorStateError, match="release identity"):
+        CoreServiceSupervisor(
+            launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
+            service_root=tmp_path / "core-services",
+            framework_lock=framework_lock,
+            release_identity=ServiceReleaseIdentity("c" * 64, "d" * 64),
+        )
+
+
+def test_new_release_rejects_a_live_service_ledger(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    first, _, _, _ = _supervisor(tmp_path, framework_lock)
+    snapshot = _ensure_subscription(first)
+    assert snapshot.run_ready is True
+    first._abandon_for_test()
 
     with pytest.raises(SupervisorStateError, match="release identity"):
         CoreServiceSupervisor(

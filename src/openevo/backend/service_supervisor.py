@@ -2559,6 +2559,10 @@ class CoreServiceSupervisor:
                 return
             if total_timeout is not None and total_timeout <= 0:
                 raise ValueError("total_timeout must be positive")
+            if self._active_run_lease is not None:
+                raise SupervisorStateError(
+                    "managed service generation is leased to an active run"
+                )
             deadline = time.monotonic() + (
                 total_timeout
                 if total_timeout is not None
@@ -3366,20 +3370,17 @@ class CoreServiceSupervisor:
             ledger = _Ledger.model_validate(raw)
         except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError) as exc:
             raise SupervisorStateError("service ledger is invalid") from exc
+        self._validate_loaded_ledger(ledger)
         if ledger.release != expected_release:
-            if (
-                ledger.execution_mode is not None
-                or ledger.generation_digest is not None
-                or ledger.group_status_message is not None
-                or ledger.runtime_identity_digest is not None
-                or ledger.runtime_readiness_code is not None
-                or ledger.services
-            ):
+            if not self._ledger_is_quiescent(ledger):
                 raise SupervisorStateError("service ledger release identity does not match Core")
             ledger = _Ledger(schema_version=1, release=expected_release)
             self._ledger = ledger
             self._persist()
             return ledger
+        return ledger
+
+    def _validate_loaded_ledger(self, ledger: _Ledger) -> None:
         if ledger.execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
             if ledger.runtime_identity_digest is not None or ledger.runtime_readiness_code not in {
                 None,
@@ -3461,7 +3462,18 @@ class CoreServiceSupervisor:
             > self._max_log_bytes
         ):
             raise SupervisorStateError("service ledger aggregate log budget is exceeded")
-        return ledger
+
+    @staticmethod
+    def _ledger_is_quiescent(ledger: _Ledger) -> bool:
+        return all(
+            record.status is ServiceStatus.STOPPED
+            and record.pid is None
+            and record.birth_token is None
+            and record.session_id is None
+            and record.process_group_id is None
+            and record.ownership_digest is None
+            for record in ledger.services
+        )
 
     def _recover_prior_owner_state(self) -> None:
         changed = False
