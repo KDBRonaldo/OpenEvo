@@ -35,6 +35,16 @@ def _load_runtime_asset_module():
     return module
 
 
+def _load_managed_runtime_smoke_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_managed_runtime_archive.py"
+    spec = importlib.util.spec_from_file_location("smoke_managed_runtime_archive", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _release_notes_text() -> str:
     candidate = _load_module()
     return candidate.render_candidate_release_notes(
@@ -69,11 +79,90 @@ def test_candidate_workflow_closes_managed_subscription_runtime_release() -> Non
         "verify_managed_runtime_release_asset.py",
         "--managed-runtime-archive",
         "--release-build",
-        "docker:29.3-dind",
+        "docker:29.3-dind@sha256:a8d074fe486e65abe4ce251c264b78727be7b63a789ccb1eff2dcc786b443cb2",
         "smoke_managed_runtime_archive.py",
+        "--fixed-docker-fault-injection",
+        "--expected-docker-socket-device",
+        "--expected-docker-socket-inode",
+        "unshare --mount --propagation private",
+        'mount --bind "$OPENEVO_DIND_SOCKET" /var/run/docker.sock',
+        'sudo docker --host "unix://$dind_socket"',
     ):
         assert value in workflow
     assert workflow.count("self-deployed") == 0
+
+
+@pytest.mark.parametrize(
+    ("mode", "markers", "calls"),
+    [
+        ("fail_tag", ["fail_tag"], ["tag"]),
+        ("cancel_tag", ["cancel_tag"], ["tag"]),
+        (
+            "fail_remove",
+            ["fail_remove_tag", "fail_remove_remove"],
+            ["tag", "remove"],
+        ),
+    ],
+)
+def test_managed_runtime_smoke_requires_exact_fault_injection_evidence(
+    tmp_path: Path,
+    mode: str,
+    markers: list[str],
+    calls: list[str],
+) -> None:
+    smoke = _load_managed_runtime_smoke_module()
+    release = smoke.MANAGED_RUNTIME_ARCHIVE_RELEASE
+    encoded_calls = {
+        "tag": ["tag", release.oci_index_id, release.aliases[0]],
+        "remove": ["image", "rm", release.aliases[0]],
+    }
+    (tmp_path / "docker-proxy-injections.log").write_text(
+        "\n".join(markers) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docker-proxy.log").write_text(
+        "".join(json.dumps(encoded_calls[name]) + "\n" for name in calls),
+        encoding="utf-8",
+    )
+
+    smoke._assert_fault_injection(tmp_path, mode)
+
+    (tmp_path / "docker-proxy-injections.log").write_text("", encoding="utf-8")
+    with pytest.raises(smoke.SmokeError, match="exact branch"):
+        smoke._assert_fault_injection(tmp_path, mode)
+
+    (tmp_path / "docker-proxy-injections.log").write_text(
+        "\n".join([*markers, markers[-1]]) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(smoke.SmokeError, match="exact branch"):
+        smoke._assert_fault_injection(tmp_path, mode)
+
+
+def test_managed_runtime_smoke_checks_isolation_before_docker_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_managed_runtime_smoke_module()
+    monkeypatch.setattr(smoke, "verify_managed_runtime_archive", lambda *_args, **_kwargs: None)
+
+    def reject_authority(**_kwargs):
+        raise smoke.SmokeError("not isolated")
+
+    def unexpected_cleanup(*_args, **_kwargs):
+        raise AssertionError("Docker cleanup ran before isolation was verified")
+
+    monkeypatch.setattr(smoke, "_require_isolated_docker_authority", reject_authority)
+    monkeypatch.setattr(smoke, "_cleanup_images", unexpected_cleanup)
+
+    with pytest.raises(smoke.SmokeError, match="not isolated"):
+        smoke.smoke(
+            tmp_path / "runtime.tar.gz",
+            tmp_path / "evidence.json",
+            fixed_docker_fault_injection=True,
+            expected_socket_device=1,
+            expected_socket_inode=1,
+        )
 
 
 def test_write_notes_command_creates_but_never_replaces_canonical_document(

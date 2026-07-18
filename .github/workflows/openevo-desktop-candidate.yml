@@ -606,30 +606,57 @@ jobs:
         run: |
           set -euo pipefail
           daemon_name="openevo-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          socket_root="$RUNNER_TEMP/$daemon_name"
+          test "$socket_root" = \
+            "$RUNNER_TEMP/openevo-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$socket_root"
           cleanup() {
             docker --host unix:///var/run/docker.sock rm -f "$daemon_name" \
               >/dev/null 2>&1 || true
+            sudo rm -rf -- "$socket_root"
           }
           trap cleanup EXIT
           docker --host unix:///var/run/docker.sock run -d --privileged \
             -e DOCKER_TLS_CERTDIR= \
-            --name "$daemon_name" -p 127.0.0.1::2375 \
-            docker:29.3-dind --host=tcp://0.0.0.0:2375 --tls=false
-          daemon_address="$(
-            docker --host unix:///var/run/docker.sock port "$daemon_name" 2375/tcp
-          )"
-          export DOCKER_HOST="tcp://$daemon_address"
+            --name "$daemon_name" \
+            --mount "type=bind,src=$socket_root,dst=/var/run" \
+            docker:29.3-dind@sha256:a8d074fe486e65abe4ce251c264b78727be7b63a789ccb1eff2dcc786b443cb2 \
+            --host=unix:///var/run/docker.sock --tls=false
+          dind_socket="$socket_root/docker.sock"
           for attempt in $(seq 1 60); do
-            if docker version --format '{{.Server.Version}}' 2>/dev/null \
+            if sudo docker --host "unix://$dind_socket" \
+              version --format '{{.Server.Version}}' 2>/dev/null \
               | grep -q '^29\.3\.'; then
               break
             fi
             sleep 1
           done
-          docker version --format '{{.Server.Version}}' | grep -q '^29\.3\.'
-          uv run python scripts/ci/smoke_managed_runtime_archive.py \
-            "$OPENEVO_LINUX_RUNTIME_ARCHIVE" \
-            --evidence-out managed-runtime-docker-evidence.json
+          sudo docker --host "unix://$dind_socket" \
+            version --format '{{.Server.Version}}' | grep -q '^29\.3\.'
+          dind_socket_device="$(stat -Lc '%d' "$dind_socket")"
+          dind_socket_inode="$(stat -Lc '%i' "$dind_socket")"
+          [[ "$dind_socket_device" =~ ^[0-9]+$ ]]
+          [[ "$dind_socket_inode" =~ ^[1-9][0-9]*$ ]]
+          sudo env \
+            OPENEVO_DIND_SOCKET="$dind_socket" \
+            OPENEVO_DIND_SOCKET_DEVICE="$dind_socket_device" \
+            OPENEVO_DIND_SOCKET_INODE="$dind_socket_inode" \
+            OPENEVO_EVIDENCE="$GITHUB_WORKSPACE/managed-runtime-docker-evidence.json" \
+            OPENEVO_REPO="$GITHUB_WORKSPACE" \
+            OPENEVO_RUNTIME_ARCHIVE="$OPENEVO_LINUX_RUNTIME_ARCHIVE" \
+            unshare --mount --propagation private -- \
+            bash -ceu '
+              mount --bind "$OPENEVO_DIND_SOCKET" /var/run/docker.sock
+              export DOCKER_HOST=unix:///var/run/docker.sock
+              cd "$OPENEVO_REPO"
+              "$OPENEVO_REPO/.venv/bin/python" \
+                scripts/ci/smoke_managed_runtime_archive.py \
+                "$OPENEVO_RUNTIME_ARCHIVE" \
+                --fixed-docker-fault-injection \
+                --expected-docker-socket-device "$OPENEVO_DIND_SOCKET_DEVICE" \
+                --expected-docker-socket-inode "$OPENEVO_DIND_SOCKET_INODE" \
+                --evidence-out "$OPENEVO_EVIDENCE"
+            '
 
       - name: Retain real Docker managed runtime evidence
         uses: actions/upload-artifact@v4
