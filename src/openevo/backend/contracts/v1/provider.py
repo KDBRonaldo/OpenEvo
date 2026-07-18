@@ -243,7 +243,7 @@ def _release_readiness_error(
 ) -> _ReleaseActivationReadinessHTTPError:
     errors = {
         "codex_cli_unavailable": (
-            "Codex CLI is unavailable on the remote Core host.",
+            "Codex CLI is unavailable for the remote SSH user.",
             m.ErrorCategory.ENVIRONMENT,
             m.RepairAction.USER_ACTION_REQUIRED,
             (
@@ -260,7 +260,7 @@ def _release_readiness_error(
         "runtime_executable_unavailable": (
             "The managed Science runtime executable is unavailable.",
             m.ErrorCategory.ENVIRONMENT,
-            m.RepairAction.OPENEVO_CAN_RECONFIGURE,
+            m.RepairAction.USER_ACTION_REQUIRED,
             "Restore the supported container runtime for the SSH user, then retry activation.",
         ),
         "runtime_image_unavailable": (
@@ -276,10 +276,10 @@ def _release_readiness_error(
             "Repair the managed Science runtime installation, then retry activation.",
         ),
         "service_group_unavailable": (
-            "Required managed Core services are unavailable.",
+            "Required OpenEvo Daemon services are unavailable.",
             m.ErrorCategory.SERVICE,
             m.RepairAction.OPENEVO_CAN_RETRY,
-            "Restart managed Core services, then retry project activation.",
+            "Reconnect OpenEvo Daemon, then retry project activation.",
         ),
         "run_admission_unavailable": (
             "The managed science run admission owner is unavailable.",
@@ -301,7 +301,7 @@ def _release_readiness_error(
             "Managed Science readiness is unavailable.",
             m.ErrorCategory.SERVICE,
             m.RepairAction.OPENEVO_CAN_RETRY,
-            "Restart managed Core services, then retry project activation.",
+            "Reconnect OpenEvo Daemon, then retry project activation.",
         ),
     )
     return _release_activation_error(
@@ -882,7 +882,7 @@ class CoreControlProviderV1:
         except CoreServiceControlError as exc:
             raise _release_activation_error(
                 code="project_activation_service_supervisor_failed",
-                message="Core could not verify managed service readiness.",
+                message="OpenEvo Daemon could not verify managed service readiness.",
                 category=m.ErrorCategory.SERVICE,
                 repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
                 next_action="Retry after OpenEvo Daemon service ownership is restored.",
@@ -890,7 +890,7 @@ class CoreControlProviderV1:
         if not isinstance(snapshot, ServiceGroupSnapshot):
             raise _release_activation_error(
                 code="project_activation_service_snapshot_invalid",
-                message="Core received invalid managed service readiness evidence.",
+                message="OpenEvo Daemon received invalid managed service readiness evidence.",
                 category=m.ErrorCategory.SERVICE,
                 repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
                 next_action="Restart or update OpenEvo Daemon, then retry project activation.",
@@ -901,7 +901,7 @@ class CoreControlProviderV1:
                 message="Managed services do not match the Codex subscription project mode.",
                 category=m.ErrorCategory.SERVICE,
                 repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
-                next_action="Restart managed Core services, then retry project activation.",
+                next_action="Reconnect OpenEvo Daemon, then retry project activation.",
             )
         if not snapshot.run_ready:
             raise _release_readiness_error(snapshot.run_readiness_code)

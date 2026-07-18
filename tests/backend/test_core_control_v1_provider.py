@@ -2571,7 +2571,7 @@ def test_release_patch_checks_the_persisted_effective_spec(tmp_path: Path) -> No
         (
             ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
             "project_activation_runtime_executable_unavailable",
-            "openevo_can_reconfigure",
+            "user_action_required",
             "container runtime for the SSH user",
         ),
         (
@@ -2584,7 +2584,7 @@ def test_release_patch_checks_the_persisted_effective_spec(tmp_path: Path) -> No
             ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE,
             "project_activation_service_group_unavailable",
             "openevo_can_retry",
-            "Restart managed Core services",
+            "Reconnect OpenEvo Daemon",
         ),
     ],
 )
