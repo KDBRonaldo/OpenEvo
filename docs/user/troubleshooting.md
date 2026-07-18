@@ -1,73 +1,138 @@
-# OpenEvo Desktop Current Troubleshooting Notes
+# OpenEvo Preview Troubleshooting
 
-> Pre-release status: error codes and actions will be completed alongside the
-> real Core/Desktop workflow. Do not treat this page as a released support
-> catalog.
+OpenEvo errors include a stable `code`, a user-safe message, whether retry is
+allowed, a `repair_action`, and a `next_action`. Follow `next_action` first.
+When reporting a problem, include the code, Desktop and Daemon release
+identities, the operation phase, and any displayed logs reference. Do not share
+SSH keys, Codex credentials, full transcripts, or private research data.
 
-Desktop starts in setup-required state until a real local sidecar and remote
-Core Backend are reachable. It must not show a demo project, fake ready
-services, or promoted artifacts before configuration is saved.
+## Common Typed Errors
 
-Current typed errors use this shape:
+`ssh_connection_failed`
 
-```json
-{
-  "code": "backend_unavailable",
-  "message": "Remote backend is not reachable.",
-  "severity": "blocking",
-  "category": "service",
-  "retryable": true,
-  "repair_action": "openevo_can_retry",
-  "details": {},
-  "logs_ref": "services/openevo_backend"
-}
+Check the host, port, user, network, and that the correct key is loaded in the
+Mac SSH agent. Then reconnect.
+
+`host_key_verification_failed` or `core_ssh_authority_invalid`
+
+Stop. Re-check the fingerprint with the server administrator. Do not accept an
+unexplained key change.
+
+`core_python_runtime_unavailable`
+
+The remote architecture has no supported automatic Python path. Use a
+release-supported server.
+
+`core_python_runtime_provision_failed`
+
+Check the remote proxy, HTTPS/TLS access, home-directory space, and inode
+capacity, then retry activation.
+
+`core_bootstrap_install_failed`
+
+The isolated Daemon generation could not be installed. Check remote space and
+network access, then use the Desktop retry action.
+
+`managed_runtime_prepare_failed`
+
+Confirm that Docker Engine is usable by the SSH user and has enough storage,
+then retry.
+
+`project_activation_codex_cli_unavailable`
+
+Install the release-supported Codex CLI on the remote server so
+`codex --version` works for the SSH user.
+
+`project_activation_codex_subscription_auth_unavailable`
+
+Sign in to Codex as the same remote SSH user and confirm `codex login status`,
+then retry activation.
+
+`project_activation_runtime_executable_unavailable`
+
+Install or restore Docker Engine access for the SSH user.
+
+`project_activation_runtime_image_unavailable`
+
+Use the OpenEvo repair/retry action to prepare the packaged science runtime. Do
+not upload an image manually.
+
+`release_execution_mode_unsupported`
+
+Select Codex subscription transcript mode. Self-Deployed is not in this
+Preview.
+
+`core_project_not_ready`
+
+Wait for activation or the successor revision to finish, refresh, and submit
+again. Do not run against the prior revision.
+
+## Unsigned App Is Blocked
+
+Confirm that the DMG and checksum came from the intended GitHub Release. Then
+open **System Settings > Privacy & Security** and choose **Open Anyway** for
+OpenEvo. This is a manual exception for an unsigned, non-notarized Preview; it
+does not make the app signed.
+
+## SSH Agent Has No Usable Key
+
+Desktop does not prompt for a password or key file. In Terminal on the Mac:
+
+```bash
+ssh-add -l
 ```
 
-Desktop maps `repair_action` to retry, OpenEvo-managed install/repair,
-reconfiguration, a required external user action, or unsupported behavior. The
-full release guide must be generated or checked against the final typed-error
-catalog and packaged UI.
+If the required identity is absent, add it to the agent and reconnect. Confirm
+that the same identity can access the configured remote user. Do not disable
+host-key checking to work around a connection problem.
 
-If a session retry reports that its response was lost, leave Desktop open while
-it refreshes the run. Desktop clears the error only after Core shows the same run
-with a newly appended attempt; a status or ETag change alone is not treated as
-success. Retrying the button before that proof reuses the original idempotent
-action. If the remote workspace is offline, reconnect it first. The special
-`core_not_started` state instead offers project activation because activation
-starts Core for that project.
+## Codex Works In One Shell But Activation Fails
 
-## Remote Python bootstrap
+OpenEvo checks `codex` and the subscription status as the configured SSH user.
+On the server, verify:
 
-OpenEvo Desktop automatically looks for remote Python 3.13, 3.12, or 3.11. On a
-typical Ubuntu 22.04 GPU server whose system Python is 3.10, Desktop also checks
-an existing `uv` in PATH, `~/.local/bin/uv`, or `~/.cargo/bin/uv`. If uv is not
-installed, Desktop automatically downloads a pinned, SHA-256-verified official
-uv build on x86-64 and AArch64 Linux, then uses it to install Python 3.11.
-Configured HTTP proxy, HTTPS proxy, and no-proxy values apply to both downloads.
-You do not need to SSH into the server, change PATH, install uv, or replace the
-system Python.
+```bash
+codex --version
+codex login status
+```
 
-The following activation failures have different repairs:
+The login must be a Codex subscription and its authentication state must be
+readable from that user's normal Codex home. Desktop does not perform the login
+and does not accept a token as a substitute.
 
-- `core_python_runtime_unavailable`: the server CPU/platform has no supported
-  automatic runtime path. Use a supported x86-64 or AArch64 Ubuntu server.
-- `core_python_runtime_provision_failed`: the pinned uv download, integrity
-  check, or Python download failed. Check the configured server proxy, remote
-  network, TLS certificates, and available home-directory space, then use the
-  Desktop retry action.
-- `core_supervisor_kernel_unsupported`: the Linux kernel does not support the
-  pidfd syscalls required for safe Core process supervision. Use a newer
-  supported Linux server/kernel.
-- `core_supervisor_runtime_unsupported`: Linux boot/process identity could not
-  be verified. Check that `/proc` and the kernel boot ID are available.
-- `core_bootstrap_install_failed`: the isolated Core generation could not finish
-  venv creation, pip bootstrapping, wheel installation, staged import
-  verification, or safe recovery of an interrupted generation. Check available
-  home-directory space and inode capacity, plus the configured proxy/network/TLS
-  settings, then use the Desktop retry action. A retry safely recovers a bounded
-  OpenEvo-owned partial generation; do not manually replace files under
-  `~/.openevo/core`.
+## Connection Or Preparation Was Interrupted
 
-OpenEvo probes kernel syscalls directly. A uv Python that lacks the convenience
-attributes `os.pidfd_open` or `signal.pidfd_send_signal` is still supported and
-does not need to be replaced.
+Choose **Reconnect**. Desktop re-reads authoritative remote state and resumes or
+retries only the relevant operation. If **Cancel operation** was used, wait
+until cancellation settles before starting another connection or activation.
+
+Closing Desktop does not cancel a remote science session. After reopening, make
+the SSH identity available to the agent, reconnect, and let the timeline replay.
+If Desktop says a mutation outcome is unknown, leave it open while it confirms
+the original idempotent action. Repeated clicks do not create a valid shortcut.
+
+## Session Is Waiting For A Revision
+
+Cross-session evolution is atomic. The next session cannot start until the
+previous session's complete successor revision is active. A
+`required_revision_uncommitted` status means OpenEvo is still committing that
+revision. Wait and refresh; do not disable evolution merely to force a stale
+run.
+
+If evolution fails, the previous revision remains active but the next draft is
+not silently submitted against it. Use the error's retry or repair action.
+
+## Cancellation
+
+**Cancel session** requests a remote cancellation. The session may briefly show
+**Cancelling** while the Daemon reconciles the runtime. Only the terminal
+**Cancelled** state confirms the outcome. A cancelled or failed session does
+not report a successful successor revision.
+
+## Disk Or Runtime Problems
+
+Check free space in the remote user's home and in container storage. OpenEvo
+does not change Docker daemon configuration or delete project history to make
+space. Do not manually replace files under remote `~/.openevo` while the Daemon
+may be active; a partial manual cleanup can make release identity checks fail
+closed.
