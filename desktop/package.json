@@ -14,6 +14,8 @@
     "build:desktop": "npm run build:sidecar && npm run tauri:build",
     "preview": "vite preview",
     "test": "vitest",
+    "test:product-browser": "playwright test",
+    "test:product-browser:update": "playwright test --update-snapshots",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -27,6 +29,8 @@
     "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@playwright/test": "^1.61.1",
     "@tailwindcss/vite": "^4.0.0",
     "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^22.7.0",

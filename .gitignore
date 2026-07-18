@@ -137,6 +137,8 @@ docs/*
 # Desktop frontend build artifacts
 desktop/node_modules/
 desktop/dist/
+desktop/playwright-report/
+desktop/test-results/
 desktop/packaging/sidecar-build/
 desktop/packaging/sidecar-dist/
 desktop/packaging/core-wheel-dist/

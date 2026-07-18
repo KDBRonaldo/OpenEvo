@@ -339,6 +339,30 @@ server address, SSH identity, and optional remote network settings
 -> service readiness
 ```
 
+Before any server is configured, Desktop MUST open a bundled read-only
+scientific project example rather than an empty marketing or setup screen. The
+example is renderer-owned synthetic content and MUST remain visibly labelled as
+such. It demonstrates a complete cross-session project: a baseline task that
+does not support a conclusion, later successful tasks, safe reasoning/tool
+summaries, and the evolution history plus readable outputs for textual memory,
+trajectory-to-skill, and agent-system evolution. It MUST NOT expose raw
+chain-of-thought, commands, credentials, host paths, service URLs, or benchmark
+concepts. The example MUST name Project Head generation and Evolution Revision
+as distinct identities even when its synthetic history advances them together;
+it must not teach users that an artifact-set revision is the complete project
+head.
+
+Sample interactions MUST perform no mutation and MUST NOT initiate SSH, Daemon,
+Core, artifact, or external-network work or create authoritative state. Normal
+read-only synchronization with the authenticated Desktop-local sidecar remains
+active so existing real projects and profiles stay discoverable. The example
+and real opaque project identities occupy disjoint UI selection domains. It
+remains discoverable after real projects exist, but an authoritative real
+project selection is never replaced by the example. Starting from the example,
+adding a server always creates a new remote-workspace profile; successful
+creation makes that profile selectable for connection and project creation
+without editing or hiding an existing profile.
+
 Supported SSH authentication methods are:
 
 - SSH agent;
@@ -2031,12 +2055,12 @@ assertions. Every case produces one indexed result.
 
 Pass criteria:
 
-- first-run, project creation, task execution, cancellation, retry, file
-  transfer, preview, download/research export, project backup/restore,
-  transcript, evolution, artifact diff, historical restore, System,
-  diagnostics, Remove Server From This Mac, Delete Project From Server, Clean
-  Shared Caches, and Uninstall OpenEvo Daemon workflows operate in the packaged
-  app;
+- first-run read-only scientific example, project creation, task execution,
+  cancellation, retry, file transfer, preview, download/research export,
+  project backup/restore, transcript, evolution, artifact diff, historical
+  restore, System, diagnostics, Remove Server From This Mac, Delete Project
+  From Server, Clean Shared Caches, and Uninstall OpenEvo Daemon workflows
+  operate in the packaged app;
 - empty, loading, offline, reconnecting, degraded, failed, cancelled, pending,
   and success states pass their profile assertions;
 - every profile window has

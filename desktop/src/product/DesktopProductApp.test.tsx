@@ -227,7 +227,7 @@ describe("DesktopProductApp", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
     await act(async () => {
-      switcher.value = "project-fixture-2";
+      switcher.value = projectOptionValue(switcher, "project-fixture-2");
       switcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
     await flush();
@@ -1883,18 +1883,27 @@ describe("DesktopProductApp", () => {
     expect(Array.from(grid?.children ?? []).every((child) => child.classList.contains("product-panel"))).toBe(true);
   });
 
-  it("adopts a profile created before its response was lost without replaying it as an update", async () => {
+  it("replays an uncertain profile create by idempotency key before adopting it", async () => {
     provider = createFixtureDesktopProductProvider({ newUser: true });
     root = await renderProduct(provider);
 
     await clickButton("Add workspace");
     setInput("Server address", "lab.example.test");
     setInput("User name", "researcher");
+    provider.advanceEpochOnNextRefresh();
     provider.loseNextProfileCreateResponseAfterCommit();
     await clickButton("Save workspace");
     await flush();
 
     expect(provider.profileCreateActionIds()).toHaveLength(1);
+    expect(provider.profileUpdateActionIds()).toHaveLength(0);
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+
+    await clickButton("Save workspace");
+    await flush();
+
+    expect(provider.profileCreateActionIds()).toHaveLength(2);
+    expect(provider.profileCreateActionIds()[1]).toBe(provider.profileCreateActionIds()[0]);
     expect(provider.profileUpdateActionIds()).toHaveLength(0);
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(screenText()).toContain("Research server");
@@ -2014,7 +2023,7 @@ describe("DesktopProductApp", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
     await act(async () => {
-      switcher.value = "project-fixture-2";
+      switcher.value = projectOptionValue(switcher, "project-fixture-2");
       switcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
     expect(screenText()).toContain("Activate this project");
@@ -2033,7 +2042,7 @@ describe("DesktopProductApp", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
     await act(async () => {
-      switcher.value = "project-fixture-2";
+      switcher.value = projectOptionValue(switcher, "project-fixture-2");
       switcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
     await clickButton("System");
@@ -2080,7 +2089,7 @@ describe("DesktopProductApp", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
     await act(async () => {
-      switcher.value = "project-fixture-2";
+      switcher.value = projectOptionValue(switcher, "project-fixture-2");
       switcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
     await flush();
@@ -2407,6 +2416,14 @@ async function renderProduct(fixture: FixtureDesktopProductProvider): Promise<Ro
   });
   await flush();
   return rendered;
+}
+
+function projectOptionValue(switcher: HTMLSelectElement, projectId: string): string {
+  const option = Array.from(switcher.options).find(
+    (candidate) => candidate.dataset.projectId === projectId,
+  );
+  if (!option) throw new Error(`Project option ${projectId} was not found.`);
+  return option.value;
 }
 
 async function flush(): Promise<void> {

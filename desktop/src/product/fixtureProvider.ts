@@ -72,6 +72,7 @@ export interface FixtureProviderOptions {
   newUser?: boolean;
   releaseExecutionModes?: boolean;
   projectExecutionMode?: ProjectV1["execution"]["mode"];
+  projectId?: string;
   includeParametricMemory?: boolean;
 }
 
@@ -79,6 +80,8 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   readonly providerKind = "contract_simulator" as const;
   private readonly listeners = new Set<(signal: ProductSubscriptionSignal) => void>();
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+  private connectionFlowGeneration = 0;
+  private operationSequence = 0;
   private readonly stepDelayMs: number;
   private readonly artifactTruncated: boolean;
   private readonly includeParametricMemory: boolean;
@@ -96,6 +99,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private validation: ProjectValidationV1 | null;
   private stream: DesktopProductSnapshot["stream"] = { status: "fresh", epoch: 1, lastEventId: null };
   private readonly actionSignatures = new Map<string, string>();
+  private readonly profileCreateResults = new Map<string, RemoteProfileV1>();
   private failProjectSave = false;
   private failProjectSaveWithUnknownError = false;
   private failProfileSaveWithUnknownError = false;
@@ -103,6 +107,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private loseProfileCreateResponseAfterCommit = false;
   private failProjectCreateWithUnknownError = false;
   private failRefresh = false;
+  private advanceEpochOnRefresh = false;
   private restoreCapabilitiesOnRefresh: ProjectCapabilitiesV1 | null = null;
   private capabilityRefreshesBeforeRestore = 0;
   private nextProjectSaveStatus: 412 | null = null;
@@ -154,7 +159,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
             : capability),
         });
     this.profiles = newUser ? [] : [this.makeProfile(online ? "connected" : "disconnected")];
-    this.projects = newUser ? [] : [this.makeProjectFixture(options.projectExecutionMode)];
+    this.projects = newUser
+      ? []
+      : [this.makeProjectFixture(options.projectExecutionMode, options.projectId)];
     this.state = newUser ? this.makeNewUserState() : this.makeState(online ? "online" : "offline");
     this.capabilities = online
       ? this.makeCapabilities(
@@ -180,8 +187,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       this.failRefresh = false;
       throw new Error("internal refresh details");
     }
-    if (this.stream.status !== "fresh") {
+    if (this.stream.status !== "fresh" || this.advanceEpochOnRefresh) {
       this.stream = { status: "fresh", epoch: this.stream.epoch + 1, lastEventId: null };
+      this.advanceEpochOnRefresh = false;
     }
     if (this.restoreCapabilitiesOnRefresh && this.capabilityRefreshesBeforeRestore > 0) {
       this.capabilityRefreshesBeforeRestore -= 1;
@@ -197,13 +205,15 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private snapshot(): DesktopProductSnapshot {
     const contextProject = this.state.active_project
       ? this.projects.find((item) => item.project_id === this.state.active_project?.project_id) ?? null
-      : this.projects[0] ?? null;
-    const capability = this.capabilities
+      : null;
+    const capabilitiesMatchActiveProject =
+      contextProject !== null && this.capabilities?.project_id === contextProject.project_id;
+    const capability = capabilitiesMatchActiveProject && this.capabilities
       ? { status: "ready" as const, projectId: this.capabilities.project_id, executionMode: capabilityExecutionMode(this.capabilities), value: this.capabilities }
       : contextProject
         ? { status: "unavailable" as const, projectId: contextProject.project_id, executionMode: contextProject.execution.mode, error: null }
         : null;
-    const project = this.capabilities
+    const project = capabilitiesMatchActiveProject && this.capabilities
       ? this.projects.find((item) => item.project_id === this.capabilities?.project_id)
       : null;
     const validation = this.validation && project
@@ -235,7 +245,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   async createProfile(input: ProfileCreateV1, intent: ProductMutationIntent): Promise<RemoteProfileV1> {
     this.profileCreateActions.push(intent.actionId);
-    this.checkIntent(intent, "profile:create");
+    this.checkIntent(intent, `profile:create:${JSON.stringify(input)}`);
+    const replay = this.profileCreateResults.get(intent.actionId);
+    if (replay) return structuredClone(replay);
     if (this.failProfileCreateWithUnknownError) {
       this.failProfileCreateWithUnknownError = false;
       throw new Error("profile response was lost");
@@ -255,18 +267,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       updated_at: NOW,
     });
     this.profiles = [...this.profiles, profile];
-    this.state = desktopStateV1Schema.parse({
-      ...this.state,
-      core: {
-        state: "disconnected",
-        profile_id: null,
-        active_tunnel: false,
-        operation_id: null,
-        host_key_review: null,
-        core: null,
-        failure: null,
-      },
-    });
+    this.profileCreateResults.set(intent.actionId, structuredClone(profile));
     this.emit();
     if (this.loseProfileCreateResponseAfterCommit) {
       this.loseProfileCreateResponseAfterCommit = false;
@@ -308,16 +309,40 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     if (profile.authentication_kind !== "ssh_agent") {
       throw new Error("SSH agent is the only authentication method supported by this release.");
     }
-    this.activeOperation = this.makeOperation("profile_connect", "running", "Connecting securely", 1, 4);
-    this.state = this.connectionState("connecting", { operationId: this.activeOperation.operation_id });
+    const flowGeneration = this.connectionFlowGeneration + 1;
+    this.connectionFlowGeneration = flowGeneration;
+    this.activeOperation = this.makeOperation(
+      "profile_connect",
+      "running",
+      "Connecting securely",
+      1,
+      4,
+      profileId,
+    );
+    const operationId = this.activeOperation.operation_id;
+    this.state = this.connectionState("connecting", {
+      operationId,
+      profileId,
+    });
+    this.alignRemoteProjectContext();
     this.updateProfileConnection(profileId, "connecting");
     this.emit();
     this.schedule(1, () => {
+      if (!this.connectionFlowIsActive(flowGeneration, profileId)) return;
       this.state = this.connectionState("host_key_review", {
-        operationId: this.activeOperation?.operation_id ?? "operation-connect-fixture",
+        operationId,
+        profileId,
       });
       this.updateProfileConnection(profileId, "host_key_required");
-      this.activeOperation = this.makeOperation("profile_connect", "running", "Confirm server identity", 2, 4);
+      this.activeOperation = this.makeOperation(
+        "profile_connect",
+        "running",
+        "Confirm server identity",
+        2,
+        4,
+        profileId,
+        operationId,
+      );
       this.emit();
     });
     return structuredClone(this.activeOperation);
@@ -327,29 +352,54 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     const profile = this.requireProfile(profileId);
     this.checkIntent(intent, `profile:host-key:${profileId}`, profile.etag);
     const review = this.state.core.host_key_review;
-    if (!review || review.algorithm !== input.algorithm || review.fingerprint !== input.fingerprint) {
+    if (
+      this.state.core.profile_id !== profileId
+      || !review
+      || review.algorithm !== input.algorithm
+      || review.fingerprint !== input.fingerprint
+    ) {
       throw new Error("The server identity changed before it was accepted.");
     }
-    this.activeOperation = this.makeOperation("host_key_accept", "running", "Checking environment", 2, 4);
-    this.state = this.connectionState("checking", { operationId: this.activeOperation.operation_id });
+    const flowGeneration = this.connectionFlowGeneration + 1;
+    this.connectionFlowGeneration = flowGeneration;
+    this.activeOperation = this.makeOperation(
+      "host_key_accept",
+      "running",
+      "Checking environment",
+      2,
+      4,
+      profileId,
+    );
+    const operationId = this.activeOperation.operation_id;
+    this.state = this.connectionState("checking", {
+      operationId,
+      profileId,
+    });
+    this.alignRemoteProjectContext();
     this.emit();
     this.schedule(1, () => {
-      this.activeOperation = this.makeOperation("bootstrap", "running", "Preparing OpenEvo", 3, 4);
-      this.state = this.connectionState("bootstrapping", { operationId: this.activeOperation.operation_id });
+      if (!this.connectionFlowIsActive(flowGeneration, profileId)) return;
+      this.activeOperation = this.makeOperation(
+        "host_key_accept",
+        "running",
+        "Preparing OpenEvo",
+        3,
+        4,
+        profileId,
+        operationId,
+      );
+      this.state = this.connectionState("bootstrapping", {
+        operationId: this.activeOperation.operation_id,
+        profileId,
+      });
       this.emit();
     });
     this.schedule(2, () => {
+      if (!this.connectionFlowIsActive(flowGeneration, profileId)) return;
       this.activeOperation = null;
-      this.state = this.connectionState("online");
+      this.state = this.connectionState("online", { profileId });
       this.updateProfileConnection(profileId, "connected");
-      this.projects = this.projects.map((project) => ({ ...project, state: "active" }));
-      const activeProject = this.projects[0];
-      this.capabilities = this.makeCapabilities(
-        activeProject?.project_id ?? "project-fixture-1",
-        activeProject?.execution.mode ?? "self-deployed",
-      );
-      this.validation = activeProject ? this.makeValidation(activeProject, this.capabilities) : null;
-      this.services = this.makeServices(true, false);
+      this.alignRemoteProjectContext();
       this.emit();
     });
     return structuredClone(this.activeOperation);
@@ -457,6 +507,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       this.emit();
       throw this.apiError(status, "project_activation_conflict", "The project changed before activation.", "project");
     }
+    this.connectionFlowGeneration += 1;
     const coreProjectId = project.remote?.core_project_id ?? this.fixtureCoreProjectId(project.project_id);
     const activated = projectV1Schema.parse({
       ...project,
@@ -468,13 +519,16 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       },
       updated_at: NOW,
     });
-    const onlineState = this.connectionState("online");
+    const onlineState = this.connectionState("online", {
+      profileId: project.profile_id,
+    });
     this.state = desktopStateV1Schema.parse({ ...this.state, core: onlineState.core });
     this.updateProfileConnection(project.profile_id, "connected");
     this.projects = this.projects.map((item) => item.project_id === projectId ? activated : item);
     this.capabilities = this.makeCapabilities(projectId, activated.execution.mode);
     this.validation = this.capabilities ? this.makeValidation(activated, this.capabilities) : null;
-    this.activeOperation = this.makeOperation("project_activate", "succeeded", "Project ready", 1, 1, project.project_id);
+    const completedOperation = this.makeOperation("project_activate", "succeeded", "Project ready", 1, 1, project.project_id);
+    this.activeOperation = null;
     this.state = desktopStateV1Schema.parse({
       ...this.state,
       active_project: {
@@ -484,8 +538,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         connection_state: "ready",
       },
     });
+    this.services = this.makeServices(true, false, activated);
     this.emit();
-    return structuredClone(this.activeOperation);
+    return structuredClone(completedOperation);
   }
 
   async selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1> {
@@ -748,9 +803,14 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       finished_at: NOW,
       etag: ETAG_B,
     });
+    this.connectionFlowGeneration += 1;
     this.activeOperation = null;
-    this.state = this.connectionState("disconnected");
-    this.updateProfileConnection(operation.resource.resource_id, "disconnected");
+    if (operation.resource.resource_type === "profile") {
+      this.state = this.connectionState("disconnected", {
+        profileId: operation.resource.resource_id,
+      });
+      this.updateProfileConnection(operation.resource.resource_id, "disconnected");
+    }
     this.emit();
     return structuredClone(cancelled);
   }
@@ -1194,13 +1254,16 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   private makeProjectFixture(
     executionMode: ProjectV1["execution"]["mode"] = "self-deployed",
+    projectId?: string,
   ): ProjectV1 {
     const project = structuredClone(CONTRACT_FIXTURE_V1.project);
-    const coreProjectId = this.fixtureCoreProjectId(project.project_id);
+    const desktopProjectId = projectId ?? project.project_id;
+    const coreProjectId = this.fixtureCoreProjectId(desktopProjectId);
     const subscription = executionMode === "codex_subscription_transcript";
     const modelRef = subscription ? "gpt-5.5" : project.execution.hf_model;
     return projectV1Schema.parse({
       ...project,
+      project_id: desktopProjectId,
       execution: {
         mode: executionMode,
         capture_mode: "transcript",
@@ -1311,6 +1374,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
           },
       active_project: {
         ...structuredClone(CONTRACT_FIXTURE_V1.state.active_project),
+        project_id: this.projects[0]?.project_id
+          ?? CONTRACT_FIXTURE_V1.state.active_project.project_id,
+        project_etag: this.projects[0]?.etag
+          ?? CONTRACT_FIXTURE_V1.state.active_project.project_etag,
         connection_state: connection === "online" ? "ready" : "offline",
       },
       pending_operation_ids: [],
@@ -1339,38 +1406,60 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   private connectionState(
     state: DesktopStateV1["core"]["state"],
-    options: { operationId?: string } = {},
+    options: { operationId?: string; profileId?: string } = {},
   ): DesktopStateV1 {
     const operationStates = ["connecting", "host_key_review", "checking", "bootstrapping", "core_starting", "reconnecting"];
+    const profileId = options.profileId ?? CONTRACT_FIXTURE_V1.profile.profile_id;
+    const activeProject = this.state.active_project?.profile_id === profileId
+      ? this.state.active_project
+      : null;
+    const hasCompatibleCore = ["online", "degraded", "reconnecting"].includes(state);
+    const hasActiveTunnel = ["online", "degraded", "reconnecting"].includes(state);
+    const projectConnectionState = ["online", "degraded"].includes(state)
+      ? "ready"
+      : ["offline", "disconnected"].includes(state)
+        ? "offline"
+        : "connecting";
+    const operationId = operationStates.includes(state)
+      ? options.operationId ?? "operation-connect-fixture"
+      : null;
     return desktopStateV1Schema.parse({
       ...this.state,
       core: {
         state,
-        profile_id: CONTRACT_FIXTURE_V1.profile.profile_id,
-        active_tunnel: state === "online",
-        operation_id: operationStates.includes(state) ? options.operationId ?? "operation-connect-fixture" : null,
+        profile_id: profileId,
+        active_tunnel: hasActiveTunnel,
+        operation_id: operationId,
         host_key_review: state === "host_key_review"
           ? {
               algorithm: "ssh-ed25519",
               fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             }
           : null,
-        core: state === "online"
+        core: hasCompatibleCore
           ? { contract_version: "1", contract_digest: B, core_version: "1.0.0" }
           : null,
         failure: state === "offline"
           ? { code: "connection_required", message: "Connect the remote workspace to continue.", retryable: true, next_action: "Connect when available." }
-          : null,
+          : state === "degraded"
+            ? { code: "service_degraded", message: "One or more remote services need attention.", retryable: true, next_action: "Reconnect or inspect service status." }
+            : null,
       },
-      active_project: this.state.active_project
-        ? { ...this.state.active_project, connection_state: state === "online" ? "ready" : "connecting" }
+      active_project: activeProject
+        ? { ...activeProject, connection_state: projectConnectionState }
         : null,
+      pending_operation_ids: operationId ? [operationId] : [],
     });
   }
 
-  private makeServices(online: boolean, degraded: boolean): ServiceV1[] {
+  private makeServices(online: boolean, degraded: boolean, project?: ProjectV1): ServiceV1[] {
     const status: ServiceV1["status"] = online ? (degraded ? "degraded" : "running") : "unavailable";
-    const execution = this.projects[0]?.execution;
+    const activeProjectId = this.state.active_project?.project_id;
+    const execution = (
+      project
+      ?? this.projects.find((item) => item.project_id === activeProjectId)
+      ?? this.projects[0]
+    )?.execution;
     const modelRef = execution?.codex_model ?? execution?.hf_model ?? "open-models/research-model-fixture-1";
     return [
       { id: "service-runtime-fixture", display_name: "OpenEvo runtime", kind: "control" as const },
@@ -1401,15 +1490,28 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     label: string,
     current: number,
     total: number,
-    projectId = this.projects[0]?.project_id ?? "project-fixture-1",
+    resourceId?: string,
+    operationId?: string,
   ): LocalOperationV1 {
     const terminal = ["succeeded", "failed", "cancelled"].includes(state);
+    const profileOperation = [
+      "profile_connect",
+      "profile_disconnect",
+      "host_key_accept",
+      "bootstrap",
+    ].includes(kind);
     return localOperationV1Schema.parse({
       schema_version: "1",
-      operation_id: `operation-${kind}-fixture`,
+      operation_id: operationId ?? `operation-${kind}-fixture-${++this.operationSequence}`,
       operation_kind: kind,
       state,
-      resource: { resource_type: kind.startsWith("profile") || kind === "host_key_accept" ? "profile" : "project", resource_id: kind.startsWith("profile") || kind === "host_key_accept" ? this.profiles[0]?.profile_id ?? "profile-fixture-1" : projectId },
+      resource: {
+        resource_type: profileOperation ? "profile" : "project",
+        resource_id: resourceId
+          ?? (profileOperation
+            ? this.profiles[0]?.profile_id ?? "profile-fixture-1"
+            : this.projects[0]?.project_id ?? "project-fixture-1"),
+      },
       progress: { current, total, label },
       checks: [],
       result: null,
@@ -1536,6 +1638,20 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private replaceRun(run: RunV1): void {
     this.runs = this.runs.map((item) => (item.id === run.id ? run : item));
     this.emit();
+  }
+
+  private connectionFlowIsActive(generation: number, profileId: string): boolean {
+    return this.connectionFlowGeneration === generation
+      && this.activeOperation?.resource.resource_type === "profile"
+      && this.activeOperation.resource.resource_id === profileId;
+  }
+
+  private alignRemoteProjectContext(): void {
+    const activeProjectId = this.state.active_project?.project_id ?? null;
+    if (activeProjectId && this.capabilities?.project_id === activeProjectId) return;
+    this.capabilities = null;
+    this.validation = null;
+    this.services = [];
   }
 
   private schedule(steps: number, action: () => void): void {
@@ -2035,11 +2151,37 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.failProfileCreateWithUnknownError = true;
   }
 
+  advanceEpochOnNextRefresh(): void {
+    this.advanceEpochOnRefresh = true;
+  }
+
   loseNextProfileCreateResponseAfterCommit(): void {
     this.loseProfileCreateResponseAfterCommit = true;
   }
 
   emitAuthoritativeRefresh(): void {
+    this.emit();
+  }
+
+  useForeignProfileConnectionState(
+    state: "connecting" | "host_key_review" | "degraded",
+  ): void {
+    this.connectionFlowGeneration += 1;
+    const profileId = CONTRACT_FIXTURE_V1.profile.profile_id;
+    this.activeOperation = state === "degraded"
+      ? null
+      : this.makeOperation(
+        "profile_connect",
+        "running",
+        state === "host_key_review" ? "Confirm server identity" : "Connecting securely",
+        state === "host_key_review" ? 2 : 1,
+        4,
+        profileId,
+      );
+    this.state = this.connectionState(state, {
+      operationId: this.activeOperation?.operation_id,
+      profileId,
+    });
     this.emit();
   }
 

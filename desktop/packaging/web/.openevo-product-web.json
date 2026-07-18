@@ -1,20 +1,20 @@
 {
   "schema_version": "1",
-  "build_digest": "5896674e890386f44ce3481621370dceb5a9157326c09dff99cdfccb23ea6763",
+  "build_digest": "7e164a2005f1cc60fc6cf51dda2c397dbbadbd93f105ae6316bea3ce3161d367",
   "files": [
     {
-      "path": "assets/index-CLYHEX-n.js",
-      "sha256": "5736086f0ccf00c39a8aaba2c0c50d7676061e35229d9386a0594d7063238e92",
-      "byte_size": 488294
+      "path": "assets/index-7wM9J_i0.js",
+      "sha256": "e083074b1e3ed251f45d7a71619e38c90e7ed6453070f0a8cf83d92819b712ec",
+      "byte_size": 516768
     },
     {
-      "path": "assets/index-CnaqcjgS.css",
-      "sha256": "8b4162604d419d49b198c7da565a19c270a6cb1734708a4dc1b8a2c537fd6bde",
-      "byte_size": 54718
+      "path": "assets/index-ScNP37KI.css",
+      "sha256": "f6112db2c596df5695c5c6e426c8ef054aaccdf8873601b0765ce7ed1f608c57",
+      "byte_size": 67499
     },
     {
       "path": "index.html",
-      "sha256": "cfdea15e4c169feda0e5a547ff67e02ede8a4631e08983cb84f772309d263dff",
+      "sha256": "534bada5a0a73601b43ce4c63354123e2c430e5d49ddf503678a8bcec770a240",
       "byte_size": 435
     }
   ]

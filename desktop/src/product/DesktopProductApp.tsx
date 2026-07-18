@@ -40,6 +40,7 @@ import type {
   ExecutionModeCapabilitiesV1,
   ExecutionModeCapabilityV1,
   LogEntryV1,
+  LocalOperationV1,
   ProfileCreateV1,
   ProjectCapabilitiesV1,
   ProjectPatchV1,
@@ -64,6 +65,8 @@ import {
 } from "./provider";
 import { MethodConfigEditor, methodConfigErrors } from "./MethodConfigEditor";
 import { retryRunProvesSingleAppend } from "./runRetryRecovery";
+import { SampleScientificProjectView } from "./ScientificProjectSample";
+import { SAMPLE_SCIENTIFIC_PROJECT } from "./scientificProjectSampleData";
 import {
   sameSessionOutputIdentity,
   sessionOutputIdentity,
@@ -79,8 +82,18 @@ const DEFAULT_HF_MODEL = "Qwen/Qwen3-8B";
 const ACTIVE_RUN_REFRESH_INTERVAL_MS = 1_000;
 const PENDING_RETRY_REFRESH_LIMIT = 60;
 const REQUIRED_EVOLUTION_TARGETS = ["text_memory", "skill_bundle", "agent_system"] as const;
+const SAMPLE_PROJECT_OPTION_KEY = "sample";
+const PROJECT_OPTION_PREFIX = "project:";
+const WORKSPACE_OPTION_PREFIX = "workspace:";
 
 type Workspace = "research" | "evolution" | "system";
+type ProjectSelection =
+  | { readonly kind: "sample" }
+  | { readonly kind: "project"; readonly projectId: string }
+  | { readonly kind: "workspace"; readonly profileId: string };
+type RemoteWorkspaceDrawerMode =
+  | { readonly kind: "create" }
+  | { readonly kind: "edit"; readonly profileId: string };
 type AsyncState = "idle" | "working";
 type ActionRecovery = { readonly kind: "readmit_run"; readonly projectId: string } | null;
 type ActionAttemptResult = {
@@ -89,7 +102,11 @@ type ActionAttemptResult = {
   readonly refreshedSnapshot: DesktopProductSnapshot | null;
   readonly errorOwner: number;
 };
-type ActionErrorState = { readonly owner: number; readonly message: string };
+type ActionErrorState = {
+  readonly owner: number;
+  readonly message: string;
+  readonly selectionIdentity: string;
+};
 type PendingProjectActivation = {
   readonly projectId: string;
   readonly activationActionId: string;
@@ -113,7 +130,11 @@ type ProfileSaveIntent = {
   readonly canonicalPayload: string;
   readonly input: ProfileCreateV1;
   readonly route:
-    | { readonly kind: "create"; readonly intent: ProductMutationIntent }
+    | {
+        readonly kind: "create";
+        readonly intent: ProductMutationIntent;
+        readonly confirmedProfileId: string | null;
+      }
     | { readonly kind: "update"; readonly profileId: string; readonly intent: ProductResourceMutationIntent };
 };
 type ProfileSaveAttemptResult = { readonly saved: boolean; readonly pendingIntent: ProfileSaveIntent | null };
@@ -160,9 +181,13 @@ export function DesktopProductApp({
   const [snapshot, setSnapshot] = useState<DesktopProductSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState<Workspace>("research");
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [projectSelection, setProjectSelection] = useState<ProjectSelection | null>(null);
+  const selectionIdentity = projectSelectionIdentity(projectSelection);
+  const selectionIdentityRef = useRef(selectionIdentity);
+  selectionIdentityRef.current = selectionIdentity;
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [connectionSettingsOpen, setConnectionSettingsOpen] = useState(false);
+  const [connectionSettingsMode, setConnectionSettingsMode] =
+    useState<RemoteWorkspaceDrawerMode | null>(null);
   const [creatingProject, setCreatingProject] = useState(false);
   const [actionState, setActionState] = useState<AsyncState>("idle");
   const [actionError, setActionError] = useState<ActionErrorState | null>(null);
@@ -257,7 +282,11 @@ export function DesktopProductApp({
       actionErrorGeneration.current = errorOwner;
       setActionRecovery(null);
       setPendingRetryPoll(null);
-      setActionError({ owner: errorOwner, message: userMessage(retryRecoveryFailure) });
+      setActionError({
+        owner: errorOwner,
+        message: userMessage(retryRecoveryFailure),
+        selectionIdentity: selectionIdentityRef.current,
+      });
     }
     if (result.status !== "fresh") {
       if (result.status === "error") reportInitialSnapshotFailure();
@@ -280,6 +309,7 @@ export function DesktopProductApp({
         setActionError({
           owner: errorOwner,
           message: "The retry outcome is not yet confirmed. OpenEvo will keep checking the remote session.",
+          selectionIdentity: selectionIdentityRef.current,
         });
         setPendingRetryPoll(pendingRetry);
       }
@@ -292,9 +322,24 @@ export function DesktopProductApp({
     authoritativeSnapshotPublished.current = true;
     setSnapshot(next);
     setLoadError(null);
-    setSelectedProjectId((current) => {
-      if (current && next.projects.some((project) => project.project_id === current)) return current;
-      return next.state.active_project?.project_id ?? next.projects[0]?.project_id ?? null;
+    setProjectSelection((current) => {
+      if (current?.kind === "sample") return current;
+      if (
+        current?.kind === "project"
+        && next.projects.some((project) => project.project_id === current.projectId)
+      ) {
+        return current;
+      }
+      if (
+        current?.kind === "workspace"
+        && next.profiles.some((profile) => profile.profile_id === current.profileId)
+      ) {
+        return current;
+      }
+      const projectId = next.state.active_project?.project_id ?? next.projects[0]?.project_id;
+      if (projectId) return { kind: "project", projectId };
+      const profileId = next.profiles[0]?.profile_id;
+      return profileId ? { kind: "workspace", profileId } : { kind: "sample" };
     });
   }, [abandonPendingRetry, clearPendingRetry, provider, reportInitialSnapshotFailure]);
 
@@ -336,13 +381,39 @@ export function DesktopProductApp({
     };
   }, [provider, refresh]);
 
-  const project = useMemo(
-    () => snapshot?.projects.find((item) => item.project_id === selectedProjectId) ?? snapshot?.projects[0] ?? null,
-    [selectedProjectId, snapshot],
-  );
-  const profile = project
-    ? snapshot?.profiles.find((item) => item.profile_id === project.profile_id) ?? null
-    : snapshot?.profiles[0] ?? null;
+  const viewingSample = projectSelection?.kind === "sample";
+  const selectedProjectId =
+    projectSelection?.kind === "project" ? projectSelection.projectId : null;
+  const selectedWorkspaceProfileId =
+    projectSelection?.kind === "workspace" ? projectSelection.profileId : null;
+  const project = useMemo(() => {
+    if (viewingSample || selectedWorkspaceProfileId) return null;
+    return snapshot?.projects.find((item) => item.project_id === selectedProjectId)
+      ?? snapshot?.projects[0]
+      ?? null;
+  }, [selectedProjectId, selectedWorkspaceProfileId, snapshot, viewingSample]);
+  const profile = viewingSample
+    ? null
+    : project
+      ? snapshot?.profiles.find((item) => item.profile_id === project.profile_id) ?? null
+      : selectedWorkspaceProfileId
+        ? snapshot?.profiles.find((item) => item.profile_id === selectedWorkspaceProfileId) ?? null
+        : snapshot?.profiles[0] ?? null;
+  const connectionSettingsProfile = connectionSettingsMode?.kind === "edit"
+    ? snapshot?.profiles.find((item) => item.profile_id === connectionSettingsMode.profileId)
+      ?? null
+    : null;
+  useEffect(() => {
+    if (
+      connectionSettingsMode?.kind === "edit"
+      && snapshot
+      && !snapshot.profiles.some(
+        (item) => item.profile_id === connectionSettingsMode.profileId,
+      )
+    ) {
+      setConnectionSettingsMode(null);
+    }
+  }, [connectionSettingsMode, snapshot]);
   const coreProjectId = project?.remote?.core_project_id ?? null;
   const projectRuns = stableRunOrder(snapshot?.runs.filter((run) => run.project_id === coreProjectId) ?? []);
   const activeRun = projectRuns.find((run) => !isTerminal(run.status)) ?? null;
@@ -369,6 +440,7 @@ export function DesktopProductApp({
     refreshOnUnknown = false,
     reservedErrorOwner?: number,
   ): Promise<ActionAttemptResult> => {
+    const actionSelectionIdentity = selectionIdentityRef.current;
     const errorOwner = reservedErrorOwner ?? reserveActionErrorOwner();
     const stateOwner = actionStateGeneration.current + 1;
     actionStateGeneration.current = stateOwner;
@@ -394,7 +466,11 @@ export function DesktopProductApp({
         refreshedSnapshot = await refresh("mutation");
       }
       if (actionErrorGeneration.current === errorOwner) {
-        setActionError({ owner: errorOwner, message: userMessage(error) });
+        setActionError({
+          owner: errorOwner,
+          message: userMessage(error),
+          selectionIdentity: actionSelectionIdentity,
+        });
       }
       return { saved: false, error, refreshedSnapshot, errorOwner };
     } finally {
@@ -433,7 +509,7 @@ export function DesktopProductApp({
     if (!setupProject || setupProject.evolution_configuration_state !== "pending") return;
     if (recoveredProjectSetup.current === setupProject.project_id) return;
     recoveredProjectSetup.current = setupProject.project_id;
-    setSelectedProjectId(setupProject.project_id);
+    setProjectSelection({ kind: "project", projectId: setupProject.project_id });
     setCreatingProject(false);
     setSettingsOpen(true);
   }, [snapshot]);
@@ -462,7 +538,7 @@ export function DesktopProductApp({
   }
 
   const connection = snapshot.state.core;
-  const displayedConnectionState = connection.state === "online" && profile && connection.profile_id !== profile.profile_id
+  const displayedConnectionState = profile && connection.profile_id !== profile.profile_id
     ? "disconnected"
     : connection.state;
   const settingsProject = creatingProject ? null : project;
@@ -472,6 +548,21 @@ export function DesktopProductApp({
   const servicesNeedAttention = projectSessionReady
     && (projectServices.length === 0 || projectServices.some((service) => service.status !== "running"));
   const canCreateProject = profile?.connection_state === "connected";
+  const profilesWithoutProjects = snapshot.profiles.filter(
+    (candidate) => !snapshot.projects.some(
+      (candidateProject) => candidateProject.profile_id === candidate.profile_id,
+    ),
+  );
+  const selectedOperation = snapshot.activeOperation
+    && operationBelongsToSelection(snapshot.activeOperation, project, profile)
+    ? snapshot.activeOperation
+    : null;
+  const activeOperationRunning = snapshot.activeOperation !== null
+    && !["succeeded", "failed", "cancelled"].includes(snapshot.activeOperation.state);
+  const lifecycleMutationBusy =
+    actionState === "working" || (activeOperationRunning && selectedOperation === null);
+  const visibleActionError =
+    actionError?.selectionIdentity === selectionIdentity ? actionError : null;
   const coreCanActivateProject = connection.profile_id === profile?.profile_id
     && (displayedConnectionState === "online"
       || displayedConnectionState === "degraded"
@@ -484,7 +575,7 @@ export function DesktopProductApp({
   const canStart = startReason === null;
 
   const cancelActiveOperation = async () => {
-    const operation = snapshot.activeOperation;
+    const operation = selectedOperation;
     if (!operation || cancellingOperation) return;
     const errorOwner = reserveActionErrorOwner();
     setCancellingOperation(true);
@@ -496,7 +587,11 @@ export function DesktopProductApp({
       await refresh("mutation");
     } catch (error) {
       if (actionErrorGeneration.current === errorOwner) {
-        setActionError({ owner: errorOwner, message: userMessage(error) });
+        setActionError({
+          owner: errorOwner,
+          message: userMessage(error),
+          selectionIdentity,
+        });
       }
       await refresh("mutation");
     } finally {
@@ -585,7 +680,7 @@ export function DesktopProductApp({
           <div className="sidebar-foot-label">Current revision</div>
           <div className="sidebar-revision">
             <CircleDot size={15} />
-            <span>{revisionLabel(project, projectRuns)}</span>
+            <span>{viewingSample ? `Project Head ${SAMPLE_SCIENTIFIC_PROJECT.activeProjectHeadGeneration}` : revisionLabel(project, projectRuns)}</span>
           </div>
         </div>
       </aside>
@@ -597,54 +692,131 @@ export function DesktopProductApp({
             <div className="project-switcher-control">
               <select
                 id="project-switcher"
-                value={project?.project_id ?? ""}
-                onChange={(event) => setSelectedProjectId(event.target.value)}
-                disabled={snapshot.projects.length === 0}
+                value={viewingSample
+                  ? SAMPLE_PROJECT_OPTION_KEY
+                  : project
+                    ? projectOptionKey(project.project_id)
+                    : profile
+                      ? workspaceOptionKey(profile.profile_id)
+                      : ""}
+                onChange={(event) => {
+                  const key = event.target.value;
+                  setActionError(null);
+                  setActionRecovery(null);
+                  if (key === SAMPLE_PROJECT_OPTION_KEY) {
+                    setProjectSelection({ kind: "sample" });
+                    return;
+                  }
+                  const selected = snapshot.projects.find(
+                    (item) => projectOptionKey(item.project_id) === key,
+                  );
+                  if (selected) {
+                    setProjectSelection({ kind: "project", projectId: selected.project_id });
+                    return;
+                  }
+                  const selectedProfile = profilesWithoutProjects.find(
+                    (item) => workspaceOptionKey(item.profile_id) === key,
+                  );
+                  setProjectSelection(selectedProfile
+                    ? { kind: "workspace", profileId: selectedProfile.profile_id }
+                    : null);
+                }}
+                disabled={actionState === "working"}
               >
-                {snapshot.projects.length === 0 ? <option value="">No project</option> : null}
-                {snapshot.projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.name}</option>)}
+                <optgroup label="内置示例">
+                  <option value={SAMPLE_PROJECT_OPTION_KEY}>[只读] {SAMPLE_SCIENTIFIC_PROJECT.name}</option>
+                </optgroup>
+                {snapshot.projects.length > 0 ? (
+                  <optgroup label="我的项目">
+                    {snapshot.projects.map((item) => (
+                      <option
+                        key={item.project_id}
+                        value={projectOptionKey(item.project_id)}
+                        data-project-id={item.project_id}
+                      >
+                        {item.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                ) : null}
+                {profilesWithoutProjects.length > 0 ? (
+                  <optgroup label="待创建项目的工作区">
+                    {profilesWithoutProjects.map((item) => (
+                      <option
+                        key={item.profile_id}
+                        value={workspaceOptionKey(item.profile_id)}
+                        data-profile-id={item.profile_id}
+                      >
+                        {item.name} · 尚无项目
+                      </option>
+                    ))}
+                  </optgroup>
+                ) : null}
               </select>
               <ChevronDown size={15} aria-hidden="true" />
             </div>
             <IconButton label="Create project" onClick={() => { setCreatingProject(true); setSettingsOpen(true); }} disabled={!canCreateProject}><Plus size={17} /></IconButton>
           </div>
           <div className="topbar-actions">
-            <ConnectionBadge state={displayedConnectionState} profileName={profile?.name ?? "Remote workspace"} />
-            <IconButton label="Remote workspace settings" onClick={() => setConnectionSettingsOpen(true)}><PanelLeft size={17} /></IconButton>
-            <IconButton label="Project settings" onClick={() => { setCreatingProject(false); setSettingsOpen(true); }} disabled={!project}><Settings size={17} /></IconButton>
+            {viewingSample
+              ? <span className="sample-topbar-badge"><ShieldCheck size={14} /> 示例 · 未连接</span>
+              : <ConnectionBadge state={displayedConnectionState} profileName={profile?.name ?? "Remote workspace"} />}
+            <IconButton
+              label="Remote workspace settings"
+              onClick={() => setConnectionSettingsMode(
+                viewingSample || !profile
+                  ? { kind: "create" }
+                  : { kind: "edit", profileId: profile.profile_id },
+              )}
+            >
+              <PanelLeft size={17} />
+            </IconButton>
+            <IconButton label="Project settings" onClick={() => { setCreatingProject(false); setSettingsOpen(true); }} disabled={viewingSample || !project}><Settings size={17} /></IconButton>
           </div>
         </header>
 
         <main className="product-main">
-          {actionError ? <InlineNotice
+          {viewingSample ? (
+            <SampleScientificProjectView
+              workspace={workspace}
+              onConnectRemote={() => setConnectionSettingsMode({ kind: "create" })}
+            />
+          ) : null}
+          {!connectionSettingsMode && visibleActionError ? <InlineNotice
             tone="error"
             title="Action could not be completed"
-            detail={actionError.message}
+            detail={visibleActionError.message}
             onDismiss={() => { setActionError(null); setActionRecovery(null); }}
             actionLabel={actionRecovery?.kind === "readmit_run" ? "Re-admit session" : undefined}
             onAction={actionRecovery?.kind === "readmit_run" && project && actionRecovery.projectId === project.project_id
               ? () => void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), actionRecovery)
               : undefined}
           /> : null}
-          {snapshot.activeOperation && !["succeeded", "failed", "cancelled"].includes(snapshot.activeOperation.state) ? (
+          {!viewingSample && selectedOperation && !["succeeded", "failed", "cancelled"].includes(selectedOperation.state) ? (
             <section className="operation-cancel-bar" aria-live="polite">
-              <div><LoaderCircle className="spin" size={17} /><span>{snapshot.activeOperation.progress?.label ?? "Local operation in progress"}</span></div>
+              <div><LoaderCircle className="spin" size={17} /><span>{selectedOperation.progress?.label ?? "Local operation in progress"}</span></div>
               <button className="secondary-button" type="button" onClick={() => void cancelActiveOperation()} disabled={cancellingOperation}><Square size={14} /> {cancellingOperation ? "Cancelling..." : "Cancel operation"}</button>
             </section>
           ) : null}
-          <ConnectionGate
-            snapshot={snapshot}
-            profile={profile}
-            hasProject={project !== null}
-            busy={actionState === "working"}
-            onConnect={(selectedProfile) => void act(() => provider.connectProfile(selectedProfile.profile_id, resourceIntent(snapshot, selectedProfile.etag)))}
-            onAccept={(profileId) => {
-              const review = snapshot.state.core.host_key_review;
-              if (review && profile) void act(() => provider.acceptHostKey(profileId, review, resourceIntent(snapshot, profile.etag)));
-            }}
-            onSetup={() => setConnectionSettingsOpen(true)}
-          />
-          {project && !projectSessionReady && canShowActivation ? (
+          {!viewingSample ? (
+            <ConnectionGate
+              snapshot={snapshot}
+              profile={profile}
+              operation={selectedOperation}
+              busy={lifecycleMutationBusy}
+              onConnect={(selectedProfile) => void act(() => provider.connectProfile(selectedProfile.profile_id, resourceIntent(snapshot, selectedProfile.etag)))}
+              onAccept={(profileId) => {
+                const review = snapshot.state.core.host_key_review;
+                if (review && profile) void act(() => provider.acceptHostKey(profileId, review, resourceIntent(snapshot, profile.etag)));
+              }}
+              onSetup={() => setConnectionSettingsMode(
+                profile
+                  ? { kind: "edit", profileId: profile.profile_id }
+                  : { kind: "create" },
+              )}
+            />
+          ) : null}
+          {!viewingSample && project && !projectSessionReady && canShowActivation ? (
             <ProjectActivationGate
               project={project}
               busy={actionState === "working"}
@@ -653,7 +825,7 @@ export function DesktopProductApp({
             />
           ) : null}
 
-          {workspace === "research" && servicesNeedAttention ? (
+          {!viewingSample && workspace === "research" && servicesNeedAttention ? (
             <div className="service-health-notice" role="status">
               <AlertCircle size={17} />
               <div><strong>Remote services need attention</strong><span>Review the remote environment before starting another session.</span></div>
@@ -661,7 +833,7 @@ export function DesktopProductApp({
             </div>
           ) : null}
 
-          {workspace === "research" ? (
+          {!viewingSample && workspace === "research" ? (
             <ResearchWorkspace
               project={project}
               hasProfile={profile !== null}
@@ -680,13 +852,17 @@ export function DesktopProductApp({
               onRetry={retryFailedRun}
               onCancel={() => activeRun && void act(() => provider.cancelRun(activeRun.id, resourceIntent(snapshot, activeRun.etag)))}
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
-              onOpenConnection={() => setConnectionSettingsOpen(true)}
+              onOpenConnection={() => setConnectionSettingsMode(
+                profile
+                  ? { kind: "edit", profileId: profile.profile_id }
+                  : { kind: "create" },
+              )}
               onOpenEvolution={() => setWorkspace("evolution")}
               onOpenSystem={() => setWorkspace("system")}
               onRefresh={() => void refresh("manual")}
             />
           ) : null}
-          {workspace === "evolution" ? (
+          {!viewingSample && workspace === "evolution" ? (
             <EvolutionWorkspace
               project={project}
               runs={projectRuns}
@@ -697,15 +873,19 @@ export function DesktopProductApp({
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
             />
           ) : null}
-          {workspace === "system" ? (
+          {!viewingSample && workspace === "system" ? (
             <SystemWorkspace
               snapshot={snapshot}
               profile={profile}
               services={projectServices}
               projectSessionReady={projectSessionReady}
-              busy={actionState === "working"}
+              busy={lifecycleMutationBusy}
               onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id, resourceIntent(snapshot, profile.etag)))}
-              onConfigure={() => setConnectionSettingsOpen(true)}
+              onConfigure={() => setConnectionSettingsMode(
+                profile
+                  ? { kind: "edit", profileId: profile.profile_id }
+                  : { kind: "create" },
+              )}
               onRefresh={() => void refresh("manual")}
             />
           ) : null}
@@ -724,7 +904,7 @@ export function DesktopProductApp({
           onClose={() => {
             const pending = pendingProjectActivation.current;
             if (pending) {
-              setSelectedProjectId(pending.projectId);
+              setProjectSelection({ kind: "project", projectId: pending.projectId });
               setCreatingProject(false);
               pendingProjectActivation.current = null;
             }
@@ -789,7 +969,7 @@ export function DesktopProductApp({
                   resourceIntent(afterCreate, current.etag, pending.activationActionId),
                 );
                 pendingProjectActivation.current = null;
-                setSelectedProjectId(current.project_id);
+                setProjectSelection({ kind: "project", projectId: current.project_id });
                 setCreatingProject(false);
               }
             });
@@ -826,25 +1006,52 @@ export function DesktopProductApp({
           onSettleSource={(actionId, outcome) => provider.settleProjectSource(actionId, outcome)}
         />
       ) : null}
-      {connectionSettingsOpen ? (
+      {connectionSettingsMode
+      && (connectionSettingsMode.kind === "create" || connectionSettingsProfile) ? (
         <RemoteWorkspaceDrawer
-          profile={profile}
+          profile={connectionSettingsProfile}
           observedProfiles={snapshot.profiles}
           streamEpoch={snapshot.stream.status === "fresh" ? snapshot.stream.epoch : null}
           busy={actionState === "working"}
-          onClose={() => setConnectionSettingsOpen(false)}
-          createSaveIntent={(input) => profileSaveIntent(snapshot, profile, input)}
+          errorMessage={visibleActionError?.message ?? null}
+          onDismissError={() => { setActionError(null); setActionRecovery(null); }}
+          onClose={() => setConnectionSettingsMode(null)}
+          createSaveIntent={(input) => profileSaveIntent(
+            snapshot,
+            connectionSettingsMode,
+            connectionSettingsProfile,
+            input,
+          )}
           onSave={async (intent) => {
             const route = intent.route;
-            const result = await act(() => route.kind === "create"
-              ? provider.createProfile(intent.input, route.intent)
-              : provider.updateProfile(route.profileId, intent.input, route.intent), null, true);
-            const createdProfile = route.kind === "create"
-              ? matchingProfile(result.refreshedSnapshot, intent.canonicalPayload)
+            const returnedProfile = { current: null as RemoteProfileV1 | null };
+            const result = await act(async () => {
+              returnedProfile.current = route.kind === "create"
+                ? await provider.createProfile(intent.input, route.intent)
+                : await provider.updateProfile(route.profileId, intent.input, route.intent);
+            }, null, true);
+            const confirmedProfileId = route.kind === "create"
+              ? returnedProfile.current?.profile_id ?? route.confirmedProfileId
               : null;
-            if (result.saved || createdProfile) {
+            const createdProfile = confirmedProfileId
+              ? matchingConfirmedProfile(
+                result.refreshedSnapshot?.profiles,
+                intent.canonicalPayload,
+                confirmedProfileId,
+              )
+              : null;
+            const saveConfirmed = route.kind === "create"
+              ? createdProfile !== null
+              : result.saved;
+            if (saveConfirmed) {
               setActionError(null);
-              setConnectionSettingsOpen(false);
+              setConnectionSettingsMode(null);
+              if (createdProfile) {
+                setProjectSelection({
+                  kind: "workspace",
+                  profileId: createdProfile.profile_id,
+                });
+              }
               return { saved: true, pendingIntent: null };
             }
             const requestEpoch = route.intent.streamEpoch;
@@ -853,13 +1060,25 @@ export function DesktopProductApp({
               : null;
             return {
               saved: false,
-              pendingIntent: requestPreconditionChanged(result, requestEpoch, resource) ? null : intent,
+              pendingIntent: requestPreconditionChanged(result, requestEpoch, resource)
+                ? null
+                : route.kind === "create" && confirmedProfileId
+                  ? {
+                      ...intent,
+                      route: { ...route, confirmedProfileId },
+                    }
+                  : intent,
             };
           }}
           onCreateObserved={(observedProfile) => {
             setActionError(null);
-            setConnectionSettingsOpen(false);
-            setSelectedProjectId((current) => current ?? snapshot.projects.find((item) => item.profile_id === observedProfile.profile_id)?.project_id ?? null);
+            setConnectionSettingsMode(null);
+            const matchingProject = snapshot.projects.find(
+              (item) => item.profile_id === observedProfile.profile_id,
+            );
+            setProjectSelection(matchingProject
+              ? { kind: "project", projectId: matchingProject.project_id }
+              : { kind: "workspace", profileId: observedProfile.profile_id });
           }}
         />
       ) : null}
@@ -1155,7 +1374,7 @@ function ConnectionBadge({ state, profileName }: { state: DesktopProductSnapshot
 function ConnectionGate({
   snapshot,
   profile,
-  hasProject,
+  operation,
   busy,
   onConnect,
   onAccept,
@@ -1163,7 +1382,7 @@ function ConnectionGate({
 }: {
   snapshot: DesktopProductSnapshot;
   profile: RemoteProfileV1 | null;
-  hasProject: boolean;
+  operation: LocalOperationV1 | null;
   busy: boolean;
   onConnect: (profile: RemoteProfileV1) => void;
   onAccept: (profileId: string) => void;
@@ -1171,15 +1390,21 @@ function ConnectionGate({
 }) {
   const core = snapshot.state.core;
   const profileId = profile?.profile_id ?? null;
-  if (core.state === "online" && core.profile_id === profileId) return null;
+  const coreBelongsToSelectedProfile =
+    profileId !== null && core.profile_id === profileId;
+  if (core.state === "online" && coreBelongsToSelectedProfile) return null;
   if (core.state === "offline"
     && core.failure?.code === "core_not_started"
     && profile?.connection_state === "connected"
-    && (!hasProject || core.profile_id === profileId)) return null;
-  if (core.state === "degraded") {
+    && coreBelongsToSelectedProfile) return null;
+  if (coreBelongsToSelectedProfile && core.state === "degraded") {
     return <InlineNotice tone="warning" title="Remote workspace needs attention" detail={core.failure?.message ?? "Open System to review service status and operation logs."} />;
   }
-  if (core.state === "host_key_review" && core.host_key_review && profileId) {
+  if (
+    coreBelongsToSelectedProfile
+    && core.state === "host_key_review"
+    && core.host_key_review
+  ) {
     return (
       <section className="connection-gate host-review" aria-live="polite">
         <div className="gate-icon"><ShieldCheck size={21} /></div>
@@ -1194,8 +1419,8 @@ function ConnectionGate({
       </section>
     );
   }
-  if (isConnectionBusy(core.state)) {
-    const progress = snapshot.activeOperation?.progress;
+  if (coreBelongsToSelectedProfile && isConnectionBusy(core.state)) {
+    const progress = operation?.progress;
     return (
       <section className="connection-gate" aria-live="polite">
         <div className="gate-icon progress"><LoaderCircle className="spin" size={21} /></div>
@@ -1214,9 +1439,9 @@ function ConnectionGate({
   return (
     <section className="connection-gate" aria-live="polite">
       <div className="gate-icon"><PanelLeft size={21} /></div>
-      <div className="gate-copy">
-        <h2>{core.state === "online" ? "Switch remote workspace" : "Remote workspace is offline"}</h2>
-        <p>{credentialReason ?? (core.state === "online" ? "Connect this project's assigned workspace before activating or running it." : core.failure?.message ?? "Connect to run research sessions and inspect evolution.")}</p>
+        <div className="gate-copy">
+          <h2>{core.state === "online" ? "Switch remote workspace" : "Remote workspace is offline"}</h2>
+          <p>{credentialReason ?? (core.state === "online" ? "Connect this project's assigned workspace before activating or running it." : coreBelongsToSelectedProfile ? core.failure?.message ?? "Connect to run research sessions and inspect evolution." : "Connect this remote workspace to continue.")}</p>
       </div>
       <button className="primary-button" type="button" onClick={() => credentialReason ? onSetup() : onConnect(profile)} disabled={busy} title={busy ? "A connection action is already running" : credentialReason ? "Configure the required credential" : "Connect remote workspace"}>
         {credentialReason ? <Settings size={16} /> : <ArrowRight size={16} />} {credentialReason ? "Configure" : "Connect"}
@@ -1762,6 +1987,10 @@ function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
 
 function SystemWorkspace({ snapshot, profile, services, projectSessionReady, busy, onConnect, onConfigure, onRefresh }: { snapshot: DesktopProductSnapshot; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onConfigure: () => void; onRefresh: () => void }) {
   const core = snapshot.state.core;
+  const profileOwnsCore =
+    profile !== null && core.profile_id === profile.profile_id;
+  const displayedCoreState = profileOwnsCore ? core.state : "disconnected";
+  const displayedTunnel = profileOwnsCore && core.active_tunnel;
   const readyServices = services.filter((service) => service.status === "running").length;
   const servicesNeedAttention = projectSessionReady
     && (services.length === 0 || services.some((service) => service.status !== "running"));
@@ -1770,16 +1999,16 @@ function SystemWorkspace({ snapshot, profile, services, projectSessionReady, bus
       <div className="workspace-heading"><div><p className="eyebrow">System</p><h1>Remote environment</h1><p>Connection, service status, and model availability.</p></div></div>
       <div className="system-grid">
         <section className="product-panel connection-panel">
-          <div className="panel-heading"><div><span className="panel-kicker">Connection</span><h2>{profile?.name ?? "No remote workspace"}</h2></div><StatePill state={core.state} /></div>
+          <div className="panel-heading"><div><span className="panel-kicker">Connection</span><h2>{profile?.name ?? "No remote workspace"}</h2></div><StatePill state={displayedCoreState} /></div>
           <dl className="definition-list">
             <div><dt>Server</dt><dd>{profile ? `${profile.host}:${profile.port}` : "Not configured"}</dd></div>
-            <div><dt>Secure connection</dt><dd>{core.active_tunnel ? "Active" : "Not connected"}</dd></div>
-            <div><dt>Compatibility</dt><dd>{snapshot.state.contract.compatible ? "Compatible" : "Needs update"}</dd></div>
+            <div><dt>Secure connection</dt><dd>{displayedTunnel ? "Active" : "Not connected"}</dd></div>
+            <div><dt>Compatibility</dt><dd>{profileOwnsCore ? (snapshot.state.contract.compatible ? "Compatible" : "Needs update") : "Not connected"}</dd></div>
             <div><dt>Project access</dt><dd>{projectSessionReady ? "Ready" : "Unavailable"}</dd></div>
           </dl>
           <div className="system-button-row">
             <button className="secondary-button" type="button" onClick={onConfigure}><Settings size={15} /> {profile ? "Edit" : "Add workspace"}</button>
-            {profile && (core.state !== "online" || servicesNeedAttention) ? <button className="secondary-button" type="button" onClick={onConnect} disabled={busy || isConnectionBusy(core.state) || missingCredentialReason(profile) !== null} title={busy ? "A connection action is already running" : missingCredentialReason(profile) ?? "Reconnect remote workspace"}><RefreshCw size={15} /> Reconnect</button> : null}
+            {profile && (displayedCoreState !== "online" || servicesNeedAttention) ? <button className="secondary-button" type="button" onClick={onConnect} disabled={busy || (profileOwnsCore && isConnectionBusy(core.state)) || missingCredentialReason(profile) !== null} title={busy ? "A connection action is already running" : missingCredentialReason(profile) ?? "Reconnect remote workspace"}><RefreshCw size={15} /> Reconnect</button> : null}
           </div>
         </section>
       </div>
@@ -1811,6 +2040,8 @@ function RemoteWorkspaceDrawer({
   observedProfiles,
   streamEpoch,
   busy,
+  errorMessage,
+  onDismissError,
   onClose,
   createSaveIntent,
   onSave,
@@ -1820,6 +2051,8 @@ function RemoteWorkspaceDrawer({
   observedProfiles: readonly RemoteProfileV1[];
   streamEpoch: number | null;
   busy: boolean;
+  errorMessage: string | null;
+  onDismissError: () => void;
   onClose: () => void;
   createSaveIntent: (input: ProfileCreateV1) => ProfileSaveIntent;
   onSave: (intent: ProfileSaveIntent) => Promise<ProfileSaveAttemptResult>;
@@ -1837,6 +2070,10 @@ function RemoteWorkspaceDrawer({
   const guardedClose = useGuardedDrawerClose(dirty, onClose);
   const dialogRef = useDialogFocus(guardedClose.requestClose);
   const pendingSaveIntent = useRef<ProfileSaveIntent | null>(null);
+  const [pendingCreateObservation, setPendingCreateObservation] = useState<{
+    readonly profileId: string;
+    readonly canonicalPayload: string;
+  } | null>(null);
   const parsedPort = Number(port);
   const valid = name.trim() !== "" && host.trim() !== "" && user.trim() !== "" && Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65_535;
   const requiredFieldMessage = name.trim() === ""
@@ -1848,18 +2085,27 @@ function RemoteWorkspaceDrawer({
         : user.trim() === ""
           ? "Enter the remote server user name."
           : null;
-  const markDirty = () => { pendingSaveIntent.current = null; setDirty(true); };
+  const markDirty = () => {
+    pendingSaveIntent.current = null;
+    setPendingCreateObservation(null);
+    onDismissError();
+    setDirty(true);
+  };
   const update = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement>) => { setter(event.target.value); markDirty(); };
   useEffect(() => {
-    const pending = pendingSaveIntent.current;
-    const createdProfile = pending?.route.kind === "create"
-      ? observedProfiles.find((item) => canonicalProfile(item) === pending.canonicalPayload)
+    const createdProfile = pendingCreateObservation
+      ? matchingConfirmedProfile(
+        observedProfiles,
+        pendingCreateObservation.canonicalPayload,
+        pendingCreateObservation.profileId,
+      )
       : null;
     if (createdProfile) {
       pendingSaveIntent.current = null;
+      setPendingCreateObservation(null);
       onCreateObserved(createdProfile);
     }
-  }, [observedProfiles, onCreateObserved]);
+  }, [observedProfiles, onCreateObserved, pendingCreateObservation]);
   return (
     <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => {
       if (guardedClose.confirming) {
@@ -1872,6 +2118,12 @@ function RemoteWorkspaceDrawer({
       <aside ref={dialogRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="workspace-settings-title" tabIndex={-1}>
         <div className="drawer-head" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><div><span className="panel-kicker">Remote workspace</span><h2 id="workspace-settings-title">Server connection</h2></div><IconButton label="Close connection settings" onClick={guardedClose.requestClose}><X size={18} /></IconButton></div>
         <div className="drawer-content" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}>
+          {errorMessage ? <InlineNotice
+            tone="error"
+            title="Action could not be completed"
+            detail={errorMessage}
+            onDismiss={onDismissError}
+          /> : null}
           <section className="form-section">
             <h3>Server</h3>
             <label>Workspace name<input required value={name} onChange={update(setName)} placeholder="Research server" /></label>
@@ -1893,6 +2145,7 @@ function RemoteWorkspaceDrawer({
         </div>
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
         <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={guardedClose.requestClose}>Cancel</button><button className="primary-button" type="button" aria-describedby={requiredFieldMessage ? "workspace-required-fields" : undefined} disabled={!valid || busy || streamEpoch === null || (profile !== null && !dirty)} title={!valid ? "Complete the required server fields" : streamEpoch === null ? "Refresh this view before saving" : profile && !dirty ? "No unsaved changes" : "Save remote workspace"} onClick={() => {
+          if (streamEpoch === null) return;
           const input: ProfileCreateV1 = {
             name: name.trim(),
             host: host.trim(),
@@ -1906,9 +2159,23 @@ function RemoteWorkspaceDrawer({
             },
           };
           const pending = pendingSaveIntent.current;
-          const intent = pending?.canonicalPayload === canonicalProfilePayload(input) ? pending : createSaveIntent(input);
+          const intent = pending?.canonicalPayload === canonicalProfilePayload(input)
+            ? rebaseProfileSaveIntent(pending, streamEpoch)
+            : createSaveIntent(input);
           pendingSaveIntent.current = intent;
-          void onSave(intent).then((result) => { pendingSaveIntent.current = result.pendingIntent; });
+          void onSave(intent).then((result) => {
+            pendingSaveIntent.current = result.pendingIntent;
+            if (result.saved) return;
+            const pendingRoute = result.pendingIntent?.route;
+            setPendingCreateObservation(
+              pendingRoute?.kind === "create" && pendingRoute.confirmedProfileId
+                ? {
+                    profileId: pendingRoute.confirmedProfileId,
+                    canonicalPayload: result.pendingIntent!.canonicalPayload,
+                  }
+                : null,
+            );
+          });
         }}><Save size={15} /> {busy ? "Saving..." : "Save workspace"}</button></div>
       </aside>
     </div>
@@ -2435,23 +2702,85 @@ function subscriptionExecution(codexModel: string): ProjectV1["execution"] {
   };
 }
 
-function profileSaveIntent(snapshot: DesktopProductSnapshot, profile: RemoteProfileV1 | null, input: ProfileCreateV1): ProfileSaveIntent {
+function projectOptionKey(projectId: string): string {
+  return `${PROJECT_OPTION_PREFIX}${projectId}`;
+}
+
+function workspaceOptionKey(profileId: string): string {
+  return `${WORKSPACE_OPTION_PREFIX}${profileId}`;
+}
+
+function projectSelectionIdentity(selection: ProjectSelection | null): string {
+  if (!selection) return "none";
+  if (selection.kind === "sample") return SAMPLE_PROJECT_OPTION_KEY;
+  return selection.kind === "project"
+    ? projectOptionKey(selection.projectId)
+    : workspaceOptionKey(selection.profileId);
+}
+
+function operationBelongsToSelection(
+  operation: LocalOperationV1,
+  project: ProjectV1 | null,
+  profile: RemoteProfileV1 | null,
+): boolean {
+  if (operation.resource.resource_type === "profile") {
+    return profile?.profile_id === operation.resource.resource_id;
+  }
+  return project?.project_id === operation.resource.resource_id;
+}
+
+function profileSaveIntent(
+  snapshot: DesktopProductSnapshot,
+  mode: RemoteWorkspaceDrawerMode,
+  profile: RemoteProfileV1 | null,
+  input: ProfileCreateV1,
+): ProfileSaveIntent {
   const canonicalPayload = canonicalProfilePayload(input);
-  return profile
-    ? {
-        canonicalPayload,
-        input,
-        route: {
-          kind: "update",
-          profileId: profile.profile_id,
-          intent: resourceIntent(snapshot, profile.etag),
-        },
-      }
-    : {
-        canonicalPayload,
-        input,
-        route: { kind: "create", intent: mutationIntent(snapshot) },
-      };
+  if (mode.kind === "create") {
+    return {
+      canonicalPayload,
+      input,
+      route: {
+        kind: "create",
+        intent: mutationIntent(snapshot),
+        confirmedProfileId: null,
+      },
+    };
+  }
+  if (!profile || profile.profile_id !== mode.profileId) {
+    throw new Error("The selected remote workspace is no longer available.");
+  }
+  return {
+    canonicalPayload,
+    input,
+    route: {
+      kind: "update",
+      profileId: mode.profileId,
+      intent: resourceIntent(snapshot, profile.etag),
+    },
+  };
+}
+
+function rebaseProfileSaveIntent(
+  intent: ProfileSaveIntent,
+  streamEpoch: number,
+): ProfileSaveIntent {
+  if (intent.route.kind === "create") {
+    return {
+      ...intent,
+      route: {
+        ...intent.route,
+        intent: { ...intent.route.intent, streamEpoch },
+      },
+    };
+  }
+  return {
+    ...intent,
+    route: {
+      ...intent.route,
+      intent: { ...intent.route.intent, streamEpoch },
+    },
+  };
 }
 
 function canonicalProfilePayload(input: ProfileCreateV1): string {
@@ -2480,8 +2809,15 @@ function canonicalProfile(profile: RemoteProfileV1): string {
   });
 }
 
-function matchingProfile(snapshot: DesktopProductSnapshot | null, canonicalPayload: string): RemoteProfileV1 | null {
-  return snapshot?.profiles.find((profile) => canonicalProfile(profile) === canonicalPayload) ?? null;
+function matchingConfirmedProfile(
+  profiles: readonly RemoteProfileV1[] | undefined,
+  canonicalPayload: string,
+  confirmedProfileId: string,
+): RemoteProfileV1 | null {
+  return profiles?.find(
+    (profile) => profile.profile_id === confirmedProfileId
+      && canonicalProfile(profile) === canonicalPayload,
+  ) ?? null;
 }
 
 function selectedArtifactsForRevision(artifacts: readonly ArtifactV1[], revision: RevisionRefV1): ArtifactV1[] {

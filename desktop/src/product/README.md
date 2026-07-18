@@ -1,5 +1,32 @@
 # Desktop Product Renderer Boundary
 
+## Built-in scientific project sample
+
+The first-launch project switcher includes one Desktop-owned, static scientific
+project tour. When no remote profiles or real projects exist, the renderer
+opens this sample by default.
+
+- The sample is always labelled `内置示例 · 只读`.
+- Its synthetic enzyme-kinetics data, session summaries, timelines, safe Codex
+  trace summaries, evolution history, and readable artifacts live in
+  `scientificProjectSampleData.ts`.
+- Project Head generations and Evolution Revision identities are displayed
+  separately; the sample does not collapse the full project composition into
+  its evolution artifact set.
+- It is rendered directly by `ScientificProjectSample.tsx`; it is not inserted
+  into `DesktopProductProvider`, Local API state, Core state, or run admission.
+- Sample interactions issue no mutations and initiate no SSH, Daemon, Core,
+  artifact, or external-network work. Normal read-only Desktop-local state
+  synchronization remains active so real projects stay discoverable.
+- Safe trace summaries exclude raw chain-of-thought, commands, credentials,
+  host paths, secret references, and Core/service URLs.
+- The fixture remains available beside real projects, but never replaces an
+  authoritative project selection or revision.
+- `npm run test:product-browser` verifies the first-run Research and Evolution
+  views at the closed 1440, 1024, and 760 pixel viewports with Chromium,
+  committed visual baselines, keyboard interaction, viewport bounds, and
+  serious/critical axe findings.
+
 The product renderer consumes only `DesktopProductProvider`. Mutations carry the
 renderer-observed stream epoch, resource ETag, and a stable action identity.
 `startRun` intentionally carries only project identity and intent metadata; the

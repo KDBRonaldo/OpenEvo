@@ -410,10 +410,18 @@ async function switchProject(projectId: string): Promise<void> {
   const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
   if (!switcher) throw new Error("Project switcher was not found.");
   await act(async () => {
-    switcher.value = projectId;
+    switcher.value = projectOptionValue(switcher, projectId);
     switcher.dispatchEvent(new Event("change", { bubbles: true }));
     await settlePromises();
   });
+}
+
+function projectOptionValue(switcher: HTMLSelectElement, projectId: string): string {
+  const option = Array.from(switcher.options).find(
+    (candidate) => candidate.dataset.projectId === projectId,
+  );
+  if (!option) throw new Error(`Project option ${projectId} was not found.`);
+  return option.value;
 }
 
 async function clickButton(label: string): Promise<void> {

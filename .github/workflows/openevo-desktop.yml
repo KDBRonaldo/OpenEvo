@@ -86,8 +86,10 @@ jobs:
         working-directory: desktop
         run: |
           npm ci
+          npx playwright install --with-deps chromium
           npm audit --audit-level=high
           npm test -- --run
+          npm run test:product-browser
           npm run typecheck
           npm run build:openevo
 
