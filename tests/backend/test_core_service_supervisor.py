@@ -1394,6 +1394,55 @@ def test_release_mode_rejects_development_injection(
         )
 
 
+def test_new_release_rebinds_only_an_empty_unbound_service_ledger(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    service_root = tmp_path / "release-rebind-services"
+    first = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
+        service_root=service_root,
+        framework_lock=framework_lock,
+        release_identity=ServiceReleaseIdentity(INSTALL_DIGEST, REGISTRY_DIGEST),
+    )
+    first.close()
+
+    replacement_identity = ServiceReleaseIdentity("c" * 64, "d" * 64)
+    replacement = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
+        service_root=service_root,
+        framework_lock=framework_lock,
+        release_identity=replacement_identity,
+    )
+    try:
+        persisted = json.loads((service_root / "ledger.json").read_text(encoding="utf-8"))
+        assert replacement._ledger.release.install_digest == replacement_identity.install_digest
+        assert replacement._ledger.release.registry_digest == replacement_identity.registry_digest
+        assert persisted["release"]["install_digest"] == replacement_identity.install_digest
+        assert persisted["release"]["registry_digest"] == replacement_identity.registry_digest
+    finally:
+        replacement.close()
+
+
+def test_new_release_rejects_a_bound_service_ledger(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    first, _, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        _ensure_subscription(first)
+    finally:
+        first.close()
+
+    with pytest.raises(SupervisorStateError, match="release identity"):
+        CoreServiceSupervisor(
+            launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
+            service_root=tmp_path / "core-services",
+            framework_lock=framework_lock,
+            release_identity=ServiceReleaseIdentity("c" * 64, "d" * 64),
+        )
+
+
 def test_release_registry_reverification_is_private_and_rejects_unsealed_objects(
     tmp_path: Path,
     framework_lock: Path,

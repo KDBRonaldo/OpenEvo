@@ -3362,7 +3362,19 @@ class CoreServiceSupervisor:
         except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError) as exc:
             raise SupervisorStateError("service ledger is invalid") from exc
         if ledger.release != expected_release:
-            raise SupervisorStateError("service ledger release identity does not match Core")
+            if (
+                ledger.execution_mode is not None
+                or ledger.generation_digest is not None
+                or ledger.group_status_message is not None
+                or ledger.runtime_identity_digest is not None
+                or ledger.runtime_readiness_code is not None
+                or ledger.services
+            ):
+                raise SupervisorStateError("service ledger release identity does not match Core")
+            ledger = _Ledger(schema_version=1, release=expected_release)
+            self._ledger = ledger
+            self._persist()
+            return ledger
         if ledger.execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
             if ledger.runtime_identity_digest is not None or ledger.runtime_readiness_code not in {
                 None,
