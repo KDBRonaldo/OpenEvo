@@ -774,12 +774,14 @@ def test_endpoint_probe_uses_verified_unix_socket_transport() -> None:
     generation = "3" * 32
     requests: list[bytes] = []
     servers: list[threading.Thread] = []
+    timeouts: list[float] = []
 
     class Endpoint:
         def verify_authority(self) -> None:
             return None
 
         def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+            timeouts.append(timeout_seconds)
             client, server_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             client.settimeout(timeout_seconds)
 
@@ -839,6 +841,8 @@ def test_endpoint_probe_uses_verified_unix_socket_transport() -> None:
 
     assert len(proof) == 64
     assert len(requests) == 2
+    assert len(timeouts) == 2
+    assert all(1.0 < timeout <= 2.0 for timeout in timeouts)
     assert requests[0].startswith(b"GET /version HTTP/1.1\r\n")
     assert requests[1].startswith(b"GET /v1/status HTTP/1.1\r\n")
     assert all(f"Authorization: Bearer {'S' * 64}".encode("ascii") in value for value in requests)

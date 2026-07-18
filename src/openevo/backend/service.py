@@ -47,6 +47,8 @@ _BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 _BOOT_ID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _MAX_READY_BYTES = 4096
 _MAX_HTTP_BYTES = 64 * 1024
+_LOCAL_HTTP_ATTEMPT_SECONDS = 1.0
+_TUNNEL_HTTP_ATTEMPT_SECONDS = 5.0
 _LEDGER_NAME = "service.json"
 _READY_NAME = "ready.json"
 _PENDING_NAME = "pending.json"
@@ -1076,12 +1078,12 @@ def _fetch_json(
             connection: http.client.HTTPConnection = http.client.HTTPConnection(
                 host,
                 port,
-                timeout=min(1.0, remaining),
+                timeout=min(_LOCAL_HTTP_ATTEMPT_SECONDS, remaining),
             )
         else:
             connection = _EndpointHTTPConnection(
                 endpoint,
-                timeout=min(1.0, remaining),
+                timeout=min(_TUNNEL_HTTP_ATTEMPT_SECONDS, remaining),
             )
         try:
             connection.request("GET", path, headers=headers)
