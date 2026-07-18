@@ -45,17 +45,17 @@ from openevo.deployment.core_control import (
     CoreControlBootstrapErrorCode,
     RemoteCoreControlAttachment,
     VerifiedCoreControlTunnel,
-    build_core_control_bootstrap_plan,
-    execute_core_control_bootstrap,
     open_core_control_tunnel,
 )
 from openevo.deployment.core_assets import (
     MAX_CORE_WHEEL_BYTES,
     MAX_FRAMEWORK_LOCK_BYTES,
-    StagedCoreBootstrapAssets,
+)
+from openevo.deployment.daemon_bundle_transport import (
+    DaemonBundleIdentity,
+    StagedDaemonBundle,
 )
 from openevo.deployment.preflight import RemoteCommandResult
-from openevo.deployment.core_runtime import CorePythonRuntimeAuthority
 from openevo.deployment.ssh import SshTransportError, SshTransportErrorCode
 from openevo.runtime.managed import MANAGED_RUNTIME_ARCHIVE_RELEASE
 
@@ -68,7 +68,7 @@ _MAX_HTTP_IO_SECONDS = 60.0
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _WHEEL_FILENAME_PATTERN = re.compile(r"[A-Za-z0-9_.+-]+\.whl\Z")
-_BOOTSTRAP_BUNDLE_DOMAIN = b"openevo-desktop-core-bootstrap-assets-v1\0"
+_DAEMON_BUNDLE_FILENAME = "openevo-daemon-linux-x86_64"
 
 
 class _CoreTunnelEndpoint(Protocol):
@@ -85,31 +85,28 @@ class _CoreTunnelEndpoint(Protocol):
 class _CoreSshTransport(Protocol):
     def close(self) -> None: ...
 
-    def select_core_python_runtime(
+    def stage_daemon_bundle(
         self,
+        *,
+        bundle_path: str,
+        bundle_sha256: str,
+        bundle_size: int,
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
+    ) -> StagedDaemonBundle: ...
+
+    def daemon_bundle_identity(
+        self,
+        bundle: StagedDaemonBundle,
         *,
         timeout_seconds: float,
         cancel_event: threading.Event | None = None,
-    ) -> CorePythonRuntimeAuthority: ...
+    ) -> DaemonBundleIdentity: ...
 
-    def stage_core_bootstrap_assets(
+    def ensure_managed_runtime_from_daemon(
         self,
+        bundle: StagedDaemonBundle,
         *,
-        runtime: CorePythonRuntimeAuthority,
-        wheel_path: str,
-        wheel_sha256: str,
-        wheel_size: int,
-        framework_lock_path: str,
-        framework_lock_sha256: str,
-        framework_lock_size: int,
-        bundle_id: str,
-        timeout_seconds: float,
-    ) -> StagedCoreBootstrapAssets: ...
-
-    def ensure_managed_runtime(
-        self,
-        *,
-        runtime: CorePythonRuntimeAuthority,
         archive_path: str,
         archive_sha256: str,
         archive_size: int,
@@ -120,6 +117,15 @@ class _CoreSshTransport(Protocol):
         timeout_seconds: float,
         cancel_event: threading.Event | None = None,
     ) -> object: ...
+
+    def ensure_daemon_bundle(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        port: int = 0,
+        timeout_seconds: float = 90.0,
+        cancel_event: threading.Event | None = None,
+    ) -> RemoteCoreControlAttachment: ...
 
     def run(
         self,
@@ -197,12 +203,58 @@ class SealedManagedRuntimeArchiveV1:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class SealedDaemonBundleV1:
+    """Composition-sealed Linux Daemon binary and its release identity."""
+
+    local_path: str = field(repr=False)
+    sha256: str
+    byte_size: int
+    manifest_sha256: str
+    release_identity: str
+    registry_digest: str
+    source_commit: str
+    wheel_sha256: str
+    dependency_lock_sha256: str
+    framework_lock_sha256: str
+
+    def __post_init__(self) -> None:
+        digests = (
+            self.sha256,
+            self.manifest_sha256,
+            self.release_identity,
+            self.registry_digest,
+            self.wheel_sha256,
+            self.dependency_lock_sha256,
+            self.framework_lock_sha256,
+        )
+        if (
+            not isinstance(self.local_path, str)
+            or not Path(self.local_path).is_absolute()
+            or not _is_canonical_local_path(self.local_path)
+            or Path(self.local_path).name != _DAEMON_BUNDLE_FILENAME
+            or type(self.byte_size) is not int
+            or not 0 < self.byte_size <= MAX_CORE_WHEEL_BYTES
+            or any(
+                not isinstance(value, str) or _DIGEST_PATTERN.fullmatch(value) is None
+                for value in digests
+            )
+            or not isinstance(self.source_commit, str)
+            or _SOURCE_COMMIT_PATTERN.fullmatch(self.source_commit) is None
+        ):
+            raise ValueError("sealed Daemon bundle identity is invalid")
+
+    def __repr__(self) -> str:
+        return "SealedDaemonBundleV1(<private>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class CoreBootstrapConfigV1:
     """Closed sealed install inputs supplied by the future release composition."""
 
     source_commit: str
     wheel: SealedCoreBootstrapAssetV1
     framework_lock: SealedCoreBootstrapAssetV1
+    daemon_bundle: SealedDaemonBundleV1 | None = None
     managed_runtime_archive: SealedManagedRuntimeArchiveV1 | None = None
     remote_port: int = 0
     replace_mismatched: bool = False
@@ -213,6 +265,10 @@ class CoreBootstrapConfigV1:
             or _SOURCE_COMMIT_PATTERN.fullmatch(self.source_commit) is None
             or not isinstance(self.wheel, SealedCoreBootstrapAssetV1)
             or not isinstance(self.framework_lock, SealedCoreBootstrapAssetV1)
+            or (
+                self.daemon_bundle is not None
+                and not isinstance(self.daemon_bundle, SealedDaemonBundleV1)
+            )
             or (
                 self.managed_runtime_archive is not None
                 and not isinstance(
@@ -226,6 +282,14 @@ class CoreBootstrapConfigV1:
             or _WHEEL_FILENAME_PATTERN.fullmatch(Path(self.wheel.local_path).name) is None
             or Path(self.framework_lock.local_path).name != "framework-lock.json"
             or self.framework_lock.byte_size > MAX_FRAMEWORK_LOCK_BYTES
+            or (
+                self.daemon_bundle is not None
+                and (
+                    self.daemon_bundle.source_commit != self.source_commit
+                    or self.daemon_bundle.wheel_sha256 != self.wheel.sha256
+                    or self.daemon_bundle.framework_lock_sha256 != self.framework_lock.sha256
+                )
+            )
         ):
             raise ValueError("Core bootstrap configuration is invalid")
 
@@ -543,37 +607,70 @@ class DesktopCoreSshBridgeAdapterV1:
                     "Install an OpenEvo Desktop release candidate with managed runtime assets."
                 ),
             )
+        daemon = self._bootstrap.daemon_bundle
+        if daemon is None:
+            raise _adapter_error(
+                "daemon_bundle_asset_unavailable",
+                "This Desktop build does not contain the trusted OpenEvo Daemon.",
+                status=409,
+                next_action="Install an OpenEvo Desktop release containing the Daemon bundle.",
+            )
         transport = self._active_transport(
             profile_id,
             require_tunnel=False,
-            require_asset_stage=True,
-            require_runtime_preflight=True,
+            require_daemon_bundle=True,
             require_managed_runtime=True,
         )
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         try:
-            runtime = cast(_CoreSshTransport, transport).select_core_python_runtime(
+            staged = cast(_CoreSshTransport, transport).stage_daemon_bundle(
+                bundle_path=daemon.local_path,
+                bundle_sha256=daemon.sha256,
+                bundle_size=daemon.byte_size,
                 timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS),
                 cancel_event=activation_cancel,
             )
         except SshTransportError as exc:
             _require_activation_not_cancelled(activation_cancel)
-            raise _ssh_runtime_preflight_error(exc) from None
+            raise _ssh_daemon_bundle_error(exc, action="stage") from None
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 raise
             raise _adapter_error(
-                "core_supervisor_runtime_preflight_failed",
-                "The remote Core supervisor runtime could not be verified.",
+                "daemon_bundle_stage_failed",
+                "The trusted OpenEvo Daemon could not be staged.",
                 retryable=True,
             ) from None
         _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         _require_activation_not_cancelled(activation_cancel)
         self._require_same_transport(profile_id, transport)
+        _verify_staged_daemon(daemon, staged)
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         try:
-            cast(_CoreSshTransport, transport).ensure_managed_runtime(
-                runtime=runtime,
+            identity = cast(_CoreSshTransport, transport).daemon_bundle_identity(
+                staged,
+                timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS),
+                cancel_event=activation_cancel,
+            )
+        except SshTransportError as exc:
+            _require_activation_not_cancelled(activation_cancel)
+            raise _ssh_daemon_bundle_error(exc, action="verify") from None
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            raise _adapter_error(
+                "daemon_bundle_identity_failed",
+                "The staged OpenEvo Daemon failed release identity verification.",
+                retryable=True,
+            ) from None
+        _verify_daemon_identity(daemon, identity)
+        _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
+        _require_activation_not_cancelled(activation_cancel)
+        self._require_same_transport(profile_id, transport)
+        remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
+        try:
+            cast(_CoreSshTransport, transport).ensure_managed_runtime_from_daemon(
+                staged,
                 archive_path=managed_runtime.local_path,
                 archive_sha256=managed_runtime.sha256,
                 archive_size=managed_runtime.byte_size,
@@ -599,61 +696,28 @@ class DesktopCoreSshBridgeAdapterV1:
         _require_activation_not_cancelled(activation_cancel)
         self._require_same_transport(profile_id, transport)
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
-        bundle_id = _bootstrap_bundle_id(self._bootstrap)
         try:
-            staged = cast(_CoreSshTransport, transport).stage_core_bootstrap_assets(
-                runtime=runtime,
-                wheel_path=self._bootstrap.wheel.local_path,
-                wheel_sha256=self._bootstrap.wheel.sha256,
-                wheel_size=self._bootstrap.wheel.byte_size,
-                framework_lock_path=self._bootstrap.framework_lock.local_path,
-                framework_lock_sha256=self._bootstrap.framework_lock.sha256,
-                framework_lock_size=self._bootstrap.framework_lock.byte_size,
-                bundle_id=bundle_id,
+            remote = cast(_CoreSshTransport, transport).ensure_daemon_bundle(
+                staged,
+                port=self._bootstrap.remote_port,
                 timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS),
+                cancel_event=activation_cancel,
             )
         except SshTransportError as exc:
             _require_activation_not_cancelled(activation_cancel)
-            raise _ssh_asset_error(exc) from None
+            raise _ssh_daemon_bundle_error(exc, action="start") from None
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 raise
             raise _adapter_error(
-                "core_bootstrap_asset_upload_failed",
-                "The sealed Core release assets could not be staged.",
-                retryable=True,
-            ) from None
-        _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
-        _require_activation_not_cancelled(activation_cancel)
-        self._require_same_transport(profile_id, transport)
-        _verify_staged_assets(self._bootstrap, staged, bundle_id=bundle_id)
-        remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
-        plan = build_core_control_bootstrap_plan(
-            runtime=runtime,
-            wheel_path=staged.wheel_path,
-            framework_lock=staged.framework_lock_path,
-            service_root=staged.service_root,
-            source_commit=self._bootstrap.source_commit,
-            port=self._bootstrap.remote_port,
-            deadline_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS),
-            replace_mismatched=self._bootstrap.replace_mismatched,
-        )
-        try:
-            remote = execute_core_control_bootstrap(plan, cast(_CoreSshTransport, transport))
-        except CoreControlBootstrapError as exc:
-            _require_activation_not_cancelled(activation_cancel)
-            raise _bootstrap_error(exc) from None
-        except BaseException as exc:
-            if not isinstance(exc, Exception):
-                raise
-            raise _adapter_error(
-                "core_bootstrap_failed",
-                "OpenEvo Core could not be attached or started.",
+                "daemon_start_failed",
+                "OpenEvo Daemon could not be attached or started.",
                 retryable=True,
             ) from None
         _remaining(deadline)
         _require_activation_not_cancelled(activation_cancel)
         self._require_same_transport(profile_id, transport)
+        _verify_daemon_attachment(daemon, remote)
         bearer_identity = _host_identity(profile_id, remote)
         with self._lock:
             self._generation += 1
@@ -803,8 +867,7 @@ class DesktopCoreSshBridgeAdapterV1:
         profile_id: str,
         *,
         require_tunnel: bool,
-        require_asset_stage: bool = False,
-        require_runtime_preflight: bool = False,
+        require_daemon_bundle: bool = False,
         require_managed_runtime: bool = False,
     ) -> object:
         if not isinstance(profile_id, str) or not profile_id:
@@ -825,9 +888,16 @@ class DesktopCoreSshBridgeAdapterV1:
         required = (
             ("run", "run_secret")
             + (("open_core_tunnel",) if require_tunnel else ())
-            + (("stage_core_bootstrap_assets",) if require_asset_stage else ())
-            + (("select_core_python_runtime",) if require_runtime_preflight else ())
-            + (("ensure_managed_runtime",) if require_managed_runtime else ())
+            + (
+                (
+                    "stage_daemon_bundle",
+                    "daemon_bundle_identity",
+                    "ensure_daemon_bundle",
+                )
+                if require_daemon_bundle
+                else ()
+            )
+            + (("ensure_managed_runtime_from_daemon",) if require_managed_runtime else ())
         )
         if any(not callable(getattr(transport, name, None)) for name in required):
             raise _adapter_error(
@@ -841,8 +911,7 @@ class DesktopCoreSshBridgeAdapterV1:
             self._active_transport(
                 profile_id,
                 require_tunnel=False,
-                require_asset_stage=False,
-                require_runtime_preflight=False,
+                require_daemon_bundle=False,
                 require_managed_runtime=False,
             )
             is not expected
@@ -968,44 +1037,61 @@ def _is_canonical_local_path(path: str) -> bool:
     )
 
 
-def _bootstrap_bundle_id(config: CoreBootstrapConfigV1) -> str:
-    identity = json.dumps(
-        {
-            "framework_lock": {
-                "byte_size": config.framework_lock.byte_size,
-                "sha256": config.framework_lock.sha256,
-            },
-            "schema_version": 1,
-            "source_commit": config.source_commit,
-            "wheel": {
-                "byte_size": config.wheel.byte_size,
-                "filename": Path(config.wheel.local_path).name,
-                "sha256": config.wheel.sha256,
-            },
-        },
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-    return hashlib.sha256(_BOOTSTRAP_BUNDLE_DOMAIN + identity).hexdigest()
-
-
-def _verify_staged_assets(
-    config: CoreBootstrapConfigV1,
+def _verify_staged_daemon(
+    expected: SealedDaemonBundleV1,
     staged: object,
-    *,
-    bundle_id: str,
 ) -> None:
-    if not isinstance(staged, StagedCoreBootstrapAssets):
-        raise _asset_identity_error()
-    expected_root = f"{staged.service_root}/assets/{bundle_id}"
+    if not isinstance(staged, StagedDaemonBundle):
+        raise _daemon_identity_error()
+    try:
+        staged.__post_init__()
+    except (TypeError, ValueError):
+        raise _daemon_identity_error() from None
     if (
-        staged.wheel_path != f"{expected_root}/{Path(config.wheel.local_path).name}"
-        or staged.framework_lock_path != f"{expected_root}/framework-lock.json"
-        or staged.wheel_sha256 != config.wheel.sha256
-        or staged.framework_lock_sha256 != config.framework_lock.sha256
+        staged.host_profile != "docker_user_container_v1"
+        or staged.sha256 != expected.sha256
+        or staged.size != expected.byte_size
     ):
-        raise _asset_identity_error()
+        raise _daemon_identity_error()
+
+
+def _verify_daemon_identity(
+    expected: SealedDaemonBundleV1,
+    actual: object,
+) -> None:
+    if not isinstance(actual, DaemonBundleIdentity):
+        raise _daemon_identity_error()
+    if (
+        actual.bundle_format != "pyinstaller-onefile"
+        or actual.bundle_sha256 != expected.sha256
+        or actual.bundle_size != expected.byte_size
+        or actual.core_distribution != "openevo"
+        or actual.core_wheel_sha256 != expected.wheel_sha256
+        or actual.dependency_lock_sha256 != expected.dependency_lock_sha256
+        or actual.framework_lock_sha256 != expected.framework_lock_sha256
+        or actual.registry_digest != expected.registry_digest
+        or actual.release_identity != expected.release_identity
+        or actual.source_commit != expected.source_commit
+        or actual.platform_system != "linux"
+        or actual.platform_architecture != "x86_64"
+    ):
+        raise _daemon_identity_error()
+
+
+def _verify_daemon_attachment(
+    expected: SealedDaemonBundleV1,
+    actual: object,
+) -> None:
+    if not isinstance(actual, RemoteCoreControlAttachment):
+        raise _daemon_identity_error()
+    if (
+        actual.release_identity != expected.release_identity
+        or actual.registry_digest != expected.registry_digest
+        or actual.source_commit != expected.source_commit
+        or actual.execution_mode != "subscription"
+        or actual.capture_mode != "transcript"
+    ):
+        raise _daemon_identity_error()
 
 
 def _remaining(deadline: float, *, minimum: float = 0.0) -> float:
@@ -1104,50 +1190,19 @@ def _request_body(
     )
 
 
-def _bootstrap_error(exc: CoreControlBootstrapError) -> DesktopCoreBridgeErrorV1:
-    status = 503
-    if exc.code is CoreControlBootstrapErrorCode.INVALID_PLAN:
-        status = 500
-    elif exc.code is CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED:
-        status = 504
-    elif exc.code is CoreControlBootstrapErrorCode.RESPONSE_INVALID:
-        status = 502
-    messages = {
-        CoreControlBootstrapErrorCode.INVALID_PLAN: "Core bootstrap settings are invalid.",
-        CoreControlBootstrapErrorCode.INSTALL_FAILED: (
-            "The isolated OpenEvo Core generation could not be installed."
-        ),
-        CoreControlBootstrapErrorCode.VERIFICATION_FAILED: (
-            "The isolated OpenEvo Core generation failed release verification."
-        ),
-        CoreControlBootstrapErrorCode.SERVICE_FAILED: (
-            "OpenEvo Core could not be attached or started."
-        ),
-        CoreControlBootstrapErrorCode.RESPONSE_INVALID: (
-            "The authenticated Core attachment response was invalid."
-        ),
-        CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED: (
-            "Core bootstrap exceeded its total deadline."
-        ),
-    }
-    return _adapter_error(
-        exc.code.value,
-        messages[exc.code],
-        status=status,
-        retryable=exc.retryable,
-    )
-
-
-def _ssh_asset_error(exc: SshTransportError) -> DesktopCoreBridgeErrorV1:
-    if exc.code in {
-        SshTransportErrorCode.CORE_ASSET_FAILED,
-        SshTransportErrorCode.INVALID_REQUEST,
-    }:
-        return _asset_identity_error()
+def _ssh_daemon_bundle_error(
+    exc: SshTransportError,
+    *,
+    action: str,
+) -> DesktopCoreBridgeErrorV1:
+    if exc.code is SshTransportErrorCode.CANCELLED:
+        return _activation_cancelled_error()
+    if exc.code is SshTransportErrorCode.INVALID_REQUEST:
+        return _daemon_identity_error()
     if exc.code is SshTransportErrorCode.TIMEOUT:
         return _adapter_error(
-            "core_bootstrap_asset_upload_deadline_exceeded",
-            "The sealed Core release assets were not staged before the deadline.",
+            f"daemon_bundle_{action}_deadline_exceeded",
+            "The OpenEvo Daemon operation did not finish before the deadline.",
             status=504,
             retryable=True,
         )
@@ -1157,9 +1212,11 @@ def _ssh_asset_error(exc: SshTransportError) -> DesktopCoreBridgeErrorV1:
             "The active SSH host authority is no longer valid.",
             status=409,
         )
+    if exc.code is SshTransportErrorCode.DAEMON_BUNDLE_FAILED and action == "verify":
+        return _daemon_identity_error()
     return _adapter_error(
-        "core_bootstrap_asset_upload_failed",
-        "The sealed Core release assets could not be staged.",
+        f"daemon_bundle_{action}_failed",
+        "The trusted OpenEvo Daemon could not be prepared on the remote server.",
         retryable=True,
     )
 
@@ -1193,76 +1250,10 @@ def _ssh_managed_runtime_error(exc: SshTransportError) -> DesktopCoreBridgeError
     )
 
 
-def _ssh_runtime_preflight_error(exc: SshTransportError) -> DesktopCoreBridgeErrorV1:
-    if exc.code is SshTransportErrorCode.CANCELLED:
-        return _activation_cancelled_error()
-    if exc.code is SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE:
-        return _adapter_error(
-            "core_python_runtime_unavailable",
-            "OpenEvo could not select a supported Python runtime on this server architecture.",
-            status=409,
-            next_action=(
-                "Use a supported x86-64 or AArch64 Ubuntu server, then retry activation."
-            ),
-        )
-    if exc.code is SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED:
-        return _adapter_error(
-            "core_python_runtime_provision_failed",
-            "OpenEvo could not download, verify, or provision remote Python 3.11.",
-            status=409,
-            retryable=True,
-            next_action=(
-                "Check the configured HTTP and HTTPS proxy or server network access, "
-                "then retry activation."
-            ),
-        )
-    if exc.code is SshTransportErrorCode.CORE_KERNEL_SYSCALL_UNSUPPORTED:
-        return _adapter_error(
-            "core_supervisor_kernel_unsupported",
-            "The remote Linux kernel does not provide the pidfd syscalls required by Core.",
-            status=409,
-            next_action="Use a Linux server whose kernel supports pidfd_open and pidfd_send_signal.",
-        )
-    if exc.code is SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED:
-        return _adapter_error(
-            "core_supervisor_runtime_unsupported",
-            (
-                "The remote host does not satisfy Core's Linux process identity "
-                "and supervision prerequisites."
-            ),
-            status=409,
-            next_action="Use a supported Linux GPU server and retry activation.",
-        )
-    if exc.code is SshTransportErrorCode.TIMEOUT:
-        return _adapter_error(
-            "core_supervisor_runtime_preflight_deadline_exceeded",
-            "The remote Core supervisor runtime preflight exceeded the deadline.",
-            status=504,
-            retryable=True,
-        )
-    if exc.code is SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED:
-        return _adapter_error(
-            "core_ssh_authority_invalid",
-            "The active SSH host authority is no longer valid.",
-            status=409,
-        )
-    if exc.code is SshTransportErrorCode.INVALID_REQUEST:
-        return _adapter_error(
-            "core_supervisor_runtime_preflight_invalid",
-            "The remote Core supervisor runtime preflight request is invalid.",
-            status=500,
-        )
+def _daemon_identity_error() -> DesktopCoreBridgeErrorV1:
     return _adapter_error(
-        "core_supervisor_runtime_preflight_failed",
-        "The remote Core supervisor runtime could not be verified.",
-        retryable=True,
-    )
-
-
-def _asset_identity_error() -> DesktopCoreBridgeErrorV1:
-    return _adapter_error(
-        "core_bootstrap_asset_invalid",
-        "The sealed Core release assets failed exact identity verification.",
+        "daemon_bundle_identity_mismatch",
+        "The staged OpenEvo Daemon does not match this Desktop release.",
         status=409,
     )
 
@@ -1379,6 +1370,7 @@ __all__ = (
     "CoreBootstrapConfigV1",
     "DesktopCoreSshBridgeAdapterV1",
     "SealedCoreBootstrapAssetV1",
+    "SealedDaemonBundleV1",
     "SealedManagedRuntimeArchiveV1",
     "VerifiedCoreHttpTransportV1",
 )

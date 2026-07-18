@@ -165,6 +165,7 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         builders=builder_registry,
         evaluators=evaluator_registry,
         default_runtime=node.default_runtime,
+        docker_host_path=node.docker_host_path,
         rollout_server_url=topology.gateway.rollout_server_url or None,
         heartbeat_interval_seconds=topology.gateway.heartbeat_interval_seconds,
         model_served=node.model_served,

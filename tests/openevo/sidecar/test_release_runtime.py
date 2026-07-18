@@ -27,6 +27,7 @@ from desktop.sidecar.release_runtime import (
     DesktopReleaseCoreRuntimeV1,
     ReleaseRuntimeConfigurationError,
     bundled_core_asset_root,
+    bundled_daemon_asset_root,
     bundled_managed_runtime_asset_root,
     create_release_core_runtime,
     load_core_bootstrap_config,
@@ -59,6 +60,61 @@ def _assets(root: Path, *, wheel_payload: bytes = b"wheel-v1") -> Path:
     return root
 
 
+def _daemon_assets(
+    root: Path,
+    wheel_root: Path,
+    *,
+    source_commit: str = SOURCE_COMMIT,
+) -> Path:
+    root.mkdir(mode=0o700, parents=True)
+    bundle = root / "openevo-daemon-linux-x86_64"
+    bundle.write_bytes(b"self-contained-daemon")
+    wheel = next(wheel_root.glob("openevo-*.whl"))
+    lock_path = wheel_root / "framework-lock.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    manifest = {
+        "artifact": {
+            "filename": bundle.name,
+            "sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "size": bundle.stat().st_size,
+        },
+        "build_environment_distributions": [],
+        "core": {
+            "framework_lock": {
+                "filename": lock_path.name,
+                "sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+            },
+            "registry_digest": "3" * 64,
+            "wheel": {
+                "filename": wheel.name,
+                "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                "size": wheel.stat().st_size,
+                "version": lock["distribution_version"],
+            },
+        },
+        "dependency_lock": {"filename": "uv.lock", "sha256": "4" * 64},
+        "platform": {"architecture": "x86_64", "system": "linux"},
+        "release": {"identity": "2" * 64, "source_commit": source_commit},
+        "runtime": {
+            "format": "pyinstaller-onefile",
+            "python": {"implementation": "CPython", "version": "3.11.15"},
+            "system_python_required": False,
+            "target_pypi_required": False,
+        },
+        "schema_version": 1,
+        "smoke": {
+            "backend_readiness": "passed",
+            "controlled_exit": "passed",
+            "identity": "passed",
+        },
+    }
+    (root / "openevo-daemon-bundle.json").write_text(
+        json.dumps(manifest, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return root
+
+
 def test_load_core_bootstrap_config_binds_exact_packaged_pair(tmp_path: Path) -> None:
     root = _assets(tmp_path / "assets")
 
@@ -69,6 +125,53 @@ def test_load_core_bootstrap_config_binds_exact_packaged_pair(tmp_path: Path) ->
     assert config.wheel.local_path == str(root.resolve() / "openevo-0.1.0-py3-none-any.whl")
     assert config.wheel.sha256 == hashlib.sha256(b"wheel-v1").hexdigest()
     assert config.framework_lock.local_path == str(root.resolve() / "framework-lock.json")
+
+
+def test_load_core_bootstrap_config_binds_exact_daemon_bundle(tmp_path: Path) -> None:
+    wheel_root = _assets(tmp_path / "openevo" / "wheels")
+    daemon_root = _daemon_assets(tmp_path / "openevo" / "daemon", wheel_root)
+
+    config = load_core_bootstrap_config(
+        wheel_root,
+        daemon_asset_root=daemon_root,
+        source_commit=SOURCE_COMMIT,
+    )
+
+    assert config.daemon_bundle is not None
+    assert config.daemon_bundle.source_commit == SOURCE_COMMIT
+    assert config.daemon_bundle.wheel_sha256 == config.wheel.sha256
+    assert config.daemon_bundle.framework_lock_sha256 == config.framework_lock.sha256
+    assert str(tmp_path) not in repr(config.daemon_bundle)
+
+
+@pytest.mark.parametrize("mutation", ["binary", "manifest", "source_commit", "extra"])
+def test_daemon_bundle_rejects_release_identity_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    wheel_root = _assets(tmp_path / "openevo" / "wheels")
+    daemon_root = _daemon_assets(tmp_path / "openevo" / "daemon", wheel_root)
+    manifest_path = daemon_root / "openevo-daemon-bundle.json"
+    if mutation == "binary":
+        (daemon_root / "openevo-daemon-linux-x86_64").write_bytes(b"changed")
+    elif mutation == "manifest":
+        manifest_path.write_text(manifest_path.read_text() + "\n", encoding="utf-8")
+    elif mutation == "source_commit":
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        value["release"]["source_commit"] = "f" * 40
+        manifest_path.write_text(
+            json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        (daemon_root / "unexpected").write_text("no", encoding="utf-8")
+
+    with pytest.raises(ReleaseRuntimeConfigurationError):
+        load_core_bootstrap_config(
+            wheel_root,
+            daemon_asset_root=daemon_root,
+            source_commit=SOURCE_COMMIT,
+        )
 
 
 @pytest.mark.parametrize("mutation", ["extra", "lock", "world_writable", "symlink"])
@@ -103,6 +206,7 @@ def test_bundled_asset_root_requires_absolute_pyinstaller_root(
 ) -> None:
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
     assert bundled_core_asset_root() == tmp_path / "openevo" / "wheels"
+    assert bundled_daemon_asset_root() == tmp_path / "openevo" / "daemon"
     assert bundled_managed_runtime_asset_root() == tmp_path / "openevo" / "runtime-assets"
     monkeypatch.setattr(sys, "_MEIPASS", "relative")
     with pytest.raises(ReleaseRuntimeConfigurationError):

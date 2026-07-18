@@ -44,6 +44,11 @@ from openevo.gateway.session_files import (
     SessionFileSecurityError,
 )
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
+from openevo.runtime.docker_host import (
+    DockerHostPathSpec,
+    discover_docker_host_path,
+    docker_self_inspect_argv,
+)
 from tests.framework_testkit import verified_builtin_registry
 
 
@@ -185,8 +190,14 @@ class FakePortProbe:
 
 
 class FakeManagedScienceRuntimeProbe:
-    def __init__(self, *, ready: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        ready: bool = True,
+        docker_host_path: DockerHostPathSpec | None = None,
+    ) -> None:
         self.ready = ready
+        self.docker_host_path = docker_host_path
         self.requests: list[ManagedScienceRuntimeRequest] = []
         self.auth_path: Path | None = None
 
@@ -226,6 +237,7 @@ class FakeManagedScienceRuntimeProbe:
                 if self.ready
                 else "Managed Science runtime image is not prepared."
             ),
+            docker_host_path=self.docker_host_path if self.ready else None,
             credential_authority=snapshot,
         )
 
@@ -315,6 +327,31 @@ class FakeProbeCommandRunner:
             }
         ]
         return ProbeCommandResult(0, json.dumps(payload).encode(), b"")
+
+
+def _docker_host_evidence(
+    destination: Path,
+    *,
+    hostname: str,
+    container_id: str,
+    source: str = "/srv/openevo-data",
+) -> bytes:
+    return json.dumps(
+        {
+            "id": container_id,
+            "hostname": hostname,
+            "running": True,
+            "mounts": [
+                {
+                    "Type": "bind",
+                    "Source": source,
+                    "Destination": os.fspath(destination),
+                    "RW": True,
+                }
+            ],
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 @pytest.fixture
@@ -502,6 +539,39 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         assert (
             len({service.port for service in snapshot.services if service.port is not None}) == 3
         )
+    finally:
+        supervisor.close()
+
+
+def test_subscription_plan_carries_verified_docker_host_path_into_gateway(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    hostname = "a" * 12
+    data_root = tmp_path / "release-data"
+    data_root.mkdir()
+    evidence = _docker_host_evidence(
+        data_root,
+        hostname=hostname,
+        container_id=hostname + ("b" * 52),
+    )
+    authority = discover_docker_host_path(
+        evidence,
+        namespace="core-release",
+        hostname=hostname,
+        minimum_available_bytes=0,
+    )
+    runtime_probe = FakeManagedScienceRuntimeProbe(docker_host_path=authority)
+    supervisor, _, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        runtime_probe=runtime_probe,
+    )
+    try:
+        snapshot = _ensure_subscription(supervisor)
+        assert snapshot.run_ready is True
+        topology = TopologyConfig.load(tmp_path / "core-services" / "topology.json")
+        assert topology.gateway.nodes[0].docker_host_path == authority
     finally:
         supervisor.close()
 
@@ -2024,6 +2094,9 @@ def test_default_runtime_probe_uses_private_managed_credential_root(
         probe = supervisor._managed_runtime_probe
         assert isinstance(probe, LocalManagedScienceRuntimeProbe)
         assert probe._credential_probe_root == service_root / "credential-probes"
+        assert probe._runtime_namespace is not None
+        assert probe._runtime_namespace.startswith("core-")
+        assert probe._require_docker_user_container is False
         assert (service_root / "credential-probes").stat().st_mode & 0o777 == 0o700
         assert list((service_root / "credential-probes").iterdir()) == []
     finally:
@@ -2060,6 +2133,88 @@ def test_local_managed_runtime_probe_binds_image_codex_and_private_auth(
     assert "not-read-by-probe" not in readiness.message
     assert readiness.credential_authority is not None
     readiness.credential_authority.close()
+
+
+def test_release_probe_discovers_docker_user_container_data_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":"not-read-by-probe"}', encoding="utf-8")
+    auth.chmod(0o600)
+    data_root = tmp_path / "release-data"
+    data_root.mkdir()
+    hostname = "c" * 12
+    self_inspect = docker_self_inspect_argv(hostname)
+    evidence = _docker_host_evidence(
+        data_root,
+        hostname=hostname,
+        container_id=hostname + ("d" * 52),
+    )
+    runner = FakeProbeCommandRunner(
+        results={self_inspect: ProbeCommandResult(0, evidence, b"")}
+    )
+    monkeypatch.setattr(
+        "openevo.runtime.docker_host.socket.gethostname",
+        lambda: hostname,
+    )
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+        runtime_namespace="core-release",
+        require_docker_user_container=True,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is True
+    assert readiness.docker_host_path is not None
+    assert readiness.docker_host_path.mount_destination == os.fspath(data_root)
+    assert readiness.docker_host_path.mount_source == "/srv/openevo-data"
+    assert runner.calls[-1] == self_inspect
+    assert readiness.credential_authority is not None
+    readiness.credential_authority.close()
+
+
+def test_release_probe_fails_closed_without_docker_user_container_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":"not-read-by-probe"}', encoding="utf-8")
+    auth.chmod(0o600)
+    hostname = "e" * 12
+    self_inspect = docker_self_inspect_argv(hostname)
+    runner = FakeProbeCommandRunner(
+        results={self_inspect: ProbeCommandResult(1, b"", b"not found")}
+    )
+    monkeypatch.setattr(
+        "openevo.runtime.docker_host.socket.gethostname",
+        lambda: hostname,
+    )
+
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+        runtime_namespace="core-release",
+        require_docker_user_container=True,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.0",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID
+    assert readiness.docker_host_path is None
+    assert readiness.credential_authority is None
+    assert runner.calls[-1] == self_inspect
 
 
 def test_local_probe_login_uses_snapshot_and_resists_source_path_aba(

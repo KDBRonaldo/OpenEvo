@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import ctypes
 from email.parser import Parser
 import hashlib
@@ -38,6 +39,9 @@ from openevo.runtime.managed import (
 SIDECAR_NAME = "openevo-desktop-sidecar"
 CORE_WHEEL_ARCHIVE_ROOT = Path("openevo/wheels")
 MANAGED_RUNTIME_ARCHIVE_ROOT = Path("openevo/runtime-assets")
+DAEMON_ARCHIVE_ROOT = Path("openevo/daemon")
+DAEMON_BUNDLE_BASENAME = "openevo-daemon-linux-x86_64"
+DAEMON_MANIFEST_BASENAME = "openevo-daemon-bundle.json"
 CORE_FRAMEWORK_LOCK_BASENAME = "framework-lock.json"
 FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
     {
@@ -53,6 +57,7 @@ FORBIDDEN_LEGACY_SIDECAR_MODULES = frozenset(
 PRODUCT_WEB_MANIFEST = ".openevo-product-web.json"
 SIDECAR_BUILD_METADATA_RELATIVE_PATH = Path("desktop/packaging/sidecar-build-metadata.json")
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{7,40}")
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 def _validate_core_inventory(names: set[str], *, container: str) -> None:
@@ -1134,6 +1139,12 @@ class _CoreReleaseInput:
             os.close(self.file_fd)
             self.file_fd = -1
 
+    def __enter__(self) -> _CoreReleaseInput:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
 
 def _sha256_fd(file_fd: int) -> tuple[int, str]:
     digest = hashlib.sha256()
@@ -1936,11 +1947,207 @@ def _validate_embedded_managed_runtime_archive(
         raise RuntimeError("embedded managed runtime archive identity differs from its source")
 
 
+def _load_daemon_release_manifest(
+    bundle: _CoreReleaseInput,
+    manifest: _CoreReleaseInput,
+    *,
+    repo: Path,
+) -> dict[str, object]:
+    if bundle.name != DAEMON_BUNDLE_BASENAME or manifest.name != DAEMON_MANIFEST_BASENAME:
+        raise RuntimeError("Daemon release inputs do not use canonical filenames")
+    if manifest.byte_size < 1 or manifest.byte_size > 1024 * 1024:
+        raise RuntimeError("Daemon release manifest size is invalid")
+    _verify_core_release_input(bundle)
+    _verify_core_release_input(manifest)
+    os.lseek(manifest.file_fd, 0, os.SEEK_SET)
+    payload = os.read(manifest.file_fd, manifest.byte_size + 1)
+    os.lseek(manifest.file_fd, 0, os.SEEK_SET)
+    if len(payload) != manifest.byte_size:
+        raise RuntimeError("Daemon release manifest changed while reading")
+    _verify_core_release_input(manifest)
+
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise RuntimeError("Daemon release manifest contains a duplicate key")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(payload, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Daemon release manifest is unreadable") from exc
+    expected_keys = {
+        "artifact",
+        "build_environment_distributions",
+        "core",
+        "dependency_lock",
+        "platform",
+        "release",
+        "runtime",
+        "schema_version",
+        "smoke",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise RuntimeError("Daemon release manifest does not use the closed schema")
+    canonical = (
+        json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if payload != canonical:
+        raise RuntimeError("Daemon release manifest is not canonical")
+    artifact = value.get("artifact")
+    if artifact != {
+        "filename": DAEMON_BUNDLE_BASENAME,
+        "sha256": bundle.sha256,
+        "size": bundle.byte_size,
+    }:
+        raise RuntimeError("Daemon release manifest does not bind the exact binary")
+    if value.get("schema_version") != 1 or value.get("platform") != {
+        "architecture": "x86_64",
+        "system": "linux",
+    }:
+        raise RuntimeError("Daemon release platform contract is invalid")
+    release = value.get("release")
+    if (
+        not isinstance(release, dict)
+        or set(release) != {"identity", "source_commit"}
+        or release.get("source_commit") != _BUILD_SOURCE_COMMIT
+        or not isinstance(release.get("identity"), str)
+        or _SHA256_PATTERN.fullmatch(release["identity"]) is None
+    ):
+        raise RuntimeError("Daemon release manifest does not bind the Desktop source commit")
+    dependency_lock = value.get("dependency_lock")
+    if dependency_lock != {
+        "filename": "uv.lock",
+        "sha256": _sha256_bytes((repo / "uv.lock").read_bytes()),
+    }:
+        raise RuntimeError("Daemon release manifest does not bind the dependency lock")
+    runtime = value.get("runtime")
+    if (
+        not isinstance(runtime, dict)
+        or set(runtime)
+        != {"format", "python", "system_python_required", "target_pypi_required"}
+        or runtime.get("format") != "pyinstaller-onefile"
+        or runtime.get("system_python_required") is not False
+        or runtime.get("target_pypi_required") is not False
+    ):
+        raise RuntimeError("Daemon release runtime contract is invalid")
+    python = runtime.get("python")
+    if (
+        not isinstance(python, dict)
+        or set(python) != {"implementation", "version"}
+        or python.get("implementation") != "CPython"
+        or not isinstance(python.get("version"), str)
+        or not python["version"]
+    ):
+        raise RuntimeError("Daemon release Python identity is invalid")
+    if value.get("smoke") != {
+        "backend_readiness": "passed",
+        "controlled_exit": "passed",
+        "identity": "passed",
+    }:
+        raise RuntimeError("Daemon release smoke contract is incomplete")
+    core = value.get("core")
+    if (
+        not isinstance(core, dict)
+        or set(core) != {"framework_lock", "registry_digest", "wheel"}
+        or not isinstance(core.get("registry_digest"), str)
+        or _SHA256_PATTERN.fullmatch(core["registry_digest"]) is None
+    ):
+        raise RuntimeError("Daemon release Core identity is invalid")
+    return value
+
+
+def _validate_daemon_manifest_core(
+    manifest: dict[str, object],
+    *,
+    wheel: Path,
+    framework_lock: Path,
+    version: str,
+) -> None:
+    core = manifest["core"]
+    assert isinstance(core, dict)
+    if core.get("framework_lock") != {
+        "filename": CORE_FRAMEWORK_LOCK_BASENAME,
+        "sha256": _sha256_bytes(framework_lock.read_bytes()),
+    } or core.get("wheel") != {
+        "filename": wheel.name,
+        "sha256": _sha256_bytes(wheel.read_bytes()),
+        "size": wheel.stat().st_size,
+        "version": version,
+    }:
+        raise RuntimeError("Daemon release manifest does not bind the embedded Core wheel and lock")
+
+
+def _validate_embedded_daemon_release_inputs(
+    executable: Path,
+    bundle: _CoreReleaseInput,
+    manifest: _CoreReleaseInput,
+) -> None:
+    expected = {
+        (DAEMON_ARCHIVE_ROOT / bundle.name).as_posix(): bundle,
+        (DAEMON_ARCHIVE_ROOT / manifest.name).as_posix(): manifest,
+    }
+    members = sorted(
+        name
+        for name in _archive_member_names(executable)
+        if name.startswith(f"{DAEMON_ARCHIVE_ROOT.as_posix()}/")
+    )
+    if members != sorted(expected):
+        raise RuntimeError(
+            "sidecar archive does not contain exactly the verified Daemon release inputs"
+        )
+    for member, source in expected.items():
+        _verify_core_release_input(source)
+        embedded_identity = _archive_member_digest(
+            executable,
+            member,
+            expected_size=source.byte_size,
+        )
+        if embedded_identity != (source.byte_size, source.sha256):
+            raise RuntimeError(
+                f"sidecar embedded Daemon release input differs from its source: {source.name}"
+            )
+
+
+def _open_daemon_release_input_pair(
+    bundle: Path,
+    manifest: Path,
+    *,
+    repo: Path,
+) -> tuple[_CoreReleaseInput, _CoreReleaseInput, dict[str, object]]:
+    if bundle.name != DAEMON_BUNDLE_BASENAME or manifest.name != DAEMON_MANIFEST_BASENAME:
+        raise RuntimeError("Daemon release inputs do not use canonical filenames")
+    bundle_source = _open_core_release_input(bundle, name=DAEMON_BUNDLE_BASENAME)
+    try:
+        manifest_source = _open_core_release_input(
+            manifest,
+            name=DAEMON_MANIFEST_BASENAME,
+        )
+    except BaseException:
+        bundle_source.close()
+        raise
+    try:
+        value = _load_daemon_release_manifest(
+            bundle_source,
+            manifest_source,
+            repo=repo,
+        )
+    except BaseException:
+        manifest_source.close()
+        bundle_source.close()
+        raise
+    return bundle_source, manifest_source, value
+
+
 def build_sidecar(
     *,
     clean: bool,
     core_wheel_output_dir: Path | None = None,
     managed_runtime_archive: Path | None = None,
+    daemon_bundle: Path | None = None,
+    daemon_manifest: Path | None = None,
     release_build: bool = False,
 ) -> Path:
     repo = _repo_root()
@@ -1953,8 +2160,16 @@ def build_sidecar(
     entrypoint = packaging_root / "sidecar_entry.py"
     static_root = packaging_root / "web"
 
-    if release_build and managed_runtime_archive is None:
-        raise RuntimeError("release sidecar build requires the managed runtime archive")
+    if release_build and (
+        managed_runtime_archive is None
+        or daemon_bundle is None
+        or daemon_manifest is None
+    ):
+        raise RuntimeError(
+            "release sidecar build requires the managed runtime archive and Daemon inputs"
+        )
+    if (daemon_bundle is None) != (daemon_manifest is None):
+        raise RuntimeError("Daemon bundle and manifest must be provided together")
     if managed_runtime_archive is not None:
         managed_runtime_archive = Path(os.path.abspath(managed_runtime_archive))
         _validate_managed_runtime_archive(managed_runtime_archive)
@@ -1969,13 +2184,33 @@ def build_sidecar(
             raise RuntimeError("Core wheel output directory overlaps generated paths")
         requested_output = _require_core_release_output_absent(output_candidate)
         core_wheel_output_dir = requested_output
-    if clean:
-        shutil.rmtree(dist_dir, ignore_errors=True)
-        shutil.rmtree(build_dir, ignore_errors=True)
-    binary_dir.mkdir(parents=True, exist_ok=True)
-    target = binary_dir / f"{SIDECAR_NAME}-{_target_triple()}{_platform_extension()}"
+    daemon_manifest_value: dict[str, object] | None = None
+    if daemon_bundle is not None and daemon_manifest is not None:
+        daemon_bundle = Path(os.path.abspath(daemon_bundle))
+        daemon_manifest = Path(os.path.abspath(daemon_manifest))
+        (
+            daemon_bundle_context,
+            daemon_manifest_context,
+            daemon_manifest_value,
+        ) = _open_daemon_release_input_pair(
+            daemon_bundle,
+            daemon_manifest,
+            repo=repo,
+        )
+    else:
+        daemon_bundle_context = nullcontext(None)
+        daemon_manifest_context = nullcontext(None)
 
-    with TemporaryDirectory(prefix="openevo-sidecar-build-") as temporary_dir:
+    with (
+        daemon_bundle_context as daemon_bundle_source,
+        daemon_manifest_context as daemon_manifest_source,
+        TemporaryDirectory(prefix="openevo-sidecar-build-") as temporary_dir,
+    ):
+        if clean:
+            shutil.rmtree(dist_dir, ignore_errors=True)
+            shutil.rmtree(build_dir, ignore_errors=True)
+        binary_dir.mkdir(parents=True, exist_ok=True)
+        target = binary_dir / f"{SIDECAR_NAME}-{_target_triple()}{_platform_extension()}"
         temporary_root = Path(temporary_dir)
         core_wheel = _build_core_wheel(repo, temporary_root / "core")
         _, core_version = _project_identity(repo)
@@ -1983,6 +2218,13 @@ def build_sidecar(
             core_wheel,
             version=core_version,
         )
+        if daemon_manifest_value is not None:
+            _validate_daemon_manifest_core(
+                daemon_manifest_value,
+                wheel=core_wheel,
+                framework_lock=core_framework_lock,
+                version=core_version,
+            )
         product_web_digest = _build_product_web(desktop_root)
         pyinstaller_root = _prepare_fd_bound_pyinstaller(
             repo,
@@ -2046,6 +2288,19 @@ def build_sidecar(
                     f"{MANAGED_RUNTIME_ARCHIVE_ROOT.as_posix()}"
                 ),
             ]
+        if daemon_bundle_source is not None and daemon_manifest_source is not None:
+            command[-1:-1] = [
+                "--add-data",
+                (
+                    f"{daemon_bundle_source.path}{os.pathsep}"
+                    f"{DAEMON_ARCHIVE_ROOT.as_posix()}"
+                ),
+                "--add-data",
+                (
+                    f"{daemon_manifest_source.path}{os.pathsep}"
+                    f"{DAEMON_ARCHIVE_ROOT.as_posix()}"
+                ),
+            ]
         pyinstaller_env = os.environ.copy()
         pyinstaller_env["PYTHONPATH"] = os.pathsep.join(
             filter(
@@ -2077,6 +2332,12 @@ def build_sidecar(
         _validate_embedded_product_web(built, desktop_root, product_web_digest)
         if managed_runtime_archive is not None:
             _validate_embedded_managed_runtime_archive(built, managed_runtime_archive)
+        if daemon_bundle_source is not None and daemon_manifest_source is not None:
+            _validate_embedded_daemon_release_inputs(
+                built,
+                daemon_bundle_source,
+                daemon_manifest_source,
+            )
 
         if core_wheel_output_dir is not None:
             _publish_core_release_inputs_once(
@@ -2110,6 +2371,22 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--daemon-bundle",
+        type=Path,
+        help=(
+            "Embed the verified Linux x86_64 Daemon binary at "
+            f"{DAEMON_ARCHIVE_ROOT.as_posix()}/. Dev/debug builds may omit it."
+        ),
+    )
+    parser.add_argument(
+        "--daemon-manifest",
+        type=Path,
+        help=(
+            "Embed the canonical Daemon release manifest at "
+            f"{DAEMON_ARCHIVE_ROOT.as_posix()}/. Dev/debug builds may omit it."
+        ),
+    )
+    parser.add_argument(
         "--release-build",
         action="store_true",
         help="Fail closed unless the managed subscription Science runtime is embedded.",
@@ -2119,6 +2396,8 @@ def main(argv: list[str] | None = None) -> int:
         clean=not args.no_clean,
         core_wheel_output_dir=args.core_wheel_output_dir,
         managed_runtime_archive=args.managed_runtime_archive,
+        daemon_bundle=args.daemon_bundle,
+        daemon_manifest=args.daemon_manifest,
         release_build=args.release_build,
     )
     print(target)

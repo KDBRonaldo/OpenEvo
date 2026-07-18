@@ -87,7 +87,7 @@ class RuntimeSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    backend: Literal["docker", "apptainer"] = "docker"
+    backend: Literal["docker", "apptainer", "bubblewrap"] = "docker"
     profile: ManagedRuntimeProfile | None = None
     container_user: Literal["image", "host"] = "image"
     image: str

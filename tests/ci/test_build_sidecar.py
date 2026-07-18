@@ -78,6 +78,62 @@ def _write_repo_skeleton(repo: Path) -> None:
         '[project]\nname = "openevo"\nversion = "0.1.0"\n',
         encoding="utf-8",
     )
+    (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+
+
+def _write_daemon_inputs(builder: ModuleType, repo: Path) -> tuple[Path, Path]:
+    bundle = repo / builder.DAEMON_BUNDLE_BASENAME
+    bundle.write_bytes(b"verified linux daemon")
+    bundle.chmod(0o700)
+    manifest = repo / builder.DAEMON_MANIFEST_BASENAME
+    payload = {
+        "artifact": {
+            "filename": bundle.name,
+            "sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "size": bundle.stat().st_size,
+        },
+        "build_environment_distributions": [{"name": "openevo", "version": "0.1.0"}],
+        "core": {
+            "framework_lock": {
+                "filename": "framework-lock.json",
+                "sha256": "b" * 64,
+            },
+            "registry_digest": "a" * 64,
+            "wheel": {
+                "filename": "openevo-0.1.0-py3-none-any.whl",
+                "sha256": "c" * 64,
+                "size": 1,
+                "version": "0.1.0",
+            },
+        },
+        "dependency_lock": {
+            "filename": "uv.lock",
+            "sha256": hashlib.sha256((repo / "uv.lock").read_bytes()).hexdigest(),
+        },
+        "platform": {"architecture": "x86_64", "system": "linux"},
+        "release": {
+            "identity": "d" * 64,
+            "source_commit": builder._BUILD_SOURCE_COMMIT,
+        },
+        "runtime": {
+            "format": "pyinstaller-onefile",
+            "python": {"implementation": "CPython", "version": "3.11.15"},
+            "system_python_required": False,
+            "target_pypi_required": False,
+        },
+        "schema_version": 1,
+        "smoke": {
+            "backend_readiness": "passed",
+            "controlled_exit": "passed",
+            "identity": "passed",
+        },
+    }
+    manifest.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest.chmod(0o600)
+    return bundle, manifest
 
 
 def _write_product_web(root: Path, *, javascript: str = "product workspace") -> None:
@@ -209,12 +265,52 @@ def test_release_build_requires_managed_runtime_before_cleaning_owned_paths(
     assert marker.read_text(encoding="utf-8") == "keep"
 
 
+def test_release_build_requires_both_daemon_inputs_before_cleaning_owned_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    marker = repo / "desktop/packaging/sidecar-dist/keep"
+    marker.parent.mkdir()
+    marker.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(builder, "_repo_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="managed runtime archive and Daemon inputs"):
+        builder.build_sidecar(
+            clean=True,
+            managed_runtime_archive=tmp_path / "runtime.tar.gz",
+            release_build=True,
+        )
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_daemon_inputs_must_be_a_complete_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    monkeypatch.setattr(builder, "_repo_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="must be provided together"):
+        builder.build_sidecar(
+            clean=False,
+            daemon_bundle=tmp_path / builder.DAEMON_BUNDLE_BASENAME,
+        )
+
+
 def test_release_cli_passes_explicit_runtime_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     builder = _load_builder()
     archive = tmp_path / builder.MANAGED_RUNTIME_ARCHIVE_RELEASE.filename
+    daemon_bundle = tmp_path / builder.DAEMON_BUNDLE_BASENAME
+    daemon_manifest = tmp_path / builder.DAEMON_MANIFEST_BASENAME
     output = tmp_path / "core"
     target = tmp_path / "sidecar"
     captured: dict[str, object] = {}
@@ -231,6 +327,10 @@ def test_release_cli_passes_explicit_runtime_authority(
                 "--release-build",
                 "--managed-runtime-archive",
                 str(archive),
+                "--daemon-bundle",
+                str(daemon_bundle),
+                "--daemon-manifest",
+                str(daemon_manifest),
                 "--core-wheel-output-dir",
                 str(output),
             ]
@@ -241,6 +341,8 @@ def test_release_cli_passes_explicit_runtime_authority(
         "clean": True,
         "core_wheel_output_dir": output,
         "managed_runtime_archive": archive,
+        "daemon_bundle": daemon_bundle,
+        "daemon_manifest": daemon_manifest,
         "release_build": True,
     }
 
@@ -282,6 +384,109 @@ def test_embedded_managed_runtime_archive_is_closed_and_source_bound(
     )
     with pytest.raises(RuntimeError, match="exact managed runtime archive"):
         builder._validate_embedded_managed_runtime_archive(executable, archive)
+
+
+def test_embedded_daemon_inputs_are_closed_and_source_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    bundle, manifest = _write_daemon_inputs(builder, repo)
+    executable = repo / "sidecar"
+    executable.write_bytes(b"sidecar")
+    bundle_source, manifest_source, _value = builder._open_daemon_release_input_pair(
+        bundle,
+        manifest,
+        repo=repo,
+    )
+    expected_members = (
+        f"{builder.DAEMON_ARCHIVE_ROOT.as_posix()}/{builder.DAEMON_BUNDLE_BASENAME}",
+        f"{builder.DAEMON_ARCHIVE_ROOT.as_posix()}/{builder.DAEMON_MANIFEST_BASENAME}",
+    )
+    monkeypatch.setattr(builder, "_archive_member_names", lambda _: expected_members)
+    monkeypatch.setattr(
+        builder,
+        "_archive_member_digest",
+        lambda _executable, member, *, expected_size: (
+            expected_size,
+            bundle_source.sha256
+            if member.endswith(builder.DAEMON_BUNDLE_BASENAME)
+            else manifest_source.sha256,
+        ),
+    )
+    try:
+        builder._validate_embedded_daemon_release_inputs(
+            executable,
+            bundle_source,
+            manifest_source,
+        )
+
+        monkeypatch.setattr(
+            builder,
+            "_archive_member_names",
+            lambda _: (*expected_members, "openevo/daemon/stale"),
+        )
+        with pytest.raises(RuntimeError, match="exactly the verified Daemon"):
+            builder._validate_embedded_daemon_release_inputs(
+                executable,
+                bundle_source,
+                manifest_source,
+            )
+
+        monkeypatch.setattr(builder, "_archive_member_names", lambda _: expected_members)
+        monkeypatch.setattr(
+            builder,
+            "_archive_member_digest",
+            lambda _executable, _member, *, expected_size: (expected_size, "f" * 64),
+        )
+        with pytest.raises(RuntimeError, match="differs from its source"):
+            builder._validate_embedded_daemon_release_inputs(
+                executable,
+                bundle_source,
+                manifest_source,
+            )
+    finally:
+        manifest_source.close()
+        bundle_source.close()
+
+
+def test_daemon_manifest_must_bind_embedded_core_wheel_and_lock(tmp_path: Path) -> None:
+    builder = _load_builder()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    lock = builder._write_core_framework_lock(wheel, version="0.1.0")
+    manifest: dict[str, object] = {
+        "core": {
+            "framework_lock": {
+                "filename": lock.name,
+                "sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+            },
+            "registry_digest": "a" * 64,
+            "wheel": {
+                "filename": wheel.name,
+                "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                "size": wheel.stat().st_size,
+                "version": "0.1.0",
+            },
+        }
+    }
+
+    builder._validate_daemon_manifest_core(
+        manifest,
+        wheel=wheel,
+        framework_lock=lock,
+        version="0.1.0",
+    )
+    manifest["core"]["wheel"]["sha256"] = "f" * 64
+    with pytest.raises(RuntimeError, match="embedded Core wheel and lock"):
+        builder._validate_daemon_manifest_core(
+            manifest,
+            wheel=wheel,
+            framework_lock=lock,
+            version="0.1.0",
+        )
 
 
 def test_core_wheel_and_lock_build_are_reproducible(tmp_path: Path) -> None:
@@ -484,6 +689,7 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     runtime_archive = repo / builder.MANAGED_RUNTIME_ARCHIVE_RELEASE.filename
     runtime_archive.write_bytes(b"managed subscription runtime")
     runtime_archive.chmod(0o600)
+    daemon_bundle, daemon_manifest = _write_daemon_inputs(builder, repo)
     commands: list[str] = []
     embedded_wheel: Path | None = None
     embedded_bytes: bytes | None = None
@@ -556,6 +762,23 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
                 if release_build
                 else []
             )
+            daemon_data = sorted(
+                (Path(source_value), destination)
+                for source_value, destination in (
+                    value.rsplit(os.pathsep, 1) for value in add_data
+                )
+                if destination == "openevo/daemon"
+            )
+            assert daemon_data == (
+                sorted(
+                    (
+                        (daemon_bundle, "openevo/daemon"),
+                        (daemon_manifest, "openevo/daemon"),
+                    )
+                )
+                if release_build
+                else []
+            )
             assert not any(
                 command[index : index + 2] == ["--collect-data", "openevo"]
                 for index in range(len(command) - 1)
@@ -576,9 +799,15 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     )
     monkeypatch.setattr(builder, "_validate_fd_bound_bootloader", lambda _: None)
     monkeypatch.setattr(builder, "_validate_managed_runtime_archive", lambda _: None)
+    monkeypatch.setattr(builder, "_validate_daemon_manifest_core", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         builder,
         "_validate_embedded_managed_runtime_archive",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        builder,
+        "_validate_embedded_daemon_release_inputs",
         lambda *_: None,
     )
     monkeypatch.setattr(builder.subprocess, "run", fake_run)
@@ -617,6 +846,8 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         clean=clean,
         core_wheel_output_dir=wheel_output,
         managed_runtime_archive=runtime_archive if release_build else None,
+        daemon_bundle=daemon_bundle if release_build else None,
+        daemon_manifest=daemon_manifest if release_build else None,
         release_build=release_build,
     )
 

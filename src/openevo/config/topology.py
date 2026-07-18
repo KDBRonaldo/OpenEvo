@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from openevo.runtime.docker_host import DockerHostPathSpec
 from openevo.runtime.models import RuntimeSpec
 
 
@@ -41,6 +42,7 @@ class GatewayNodeConfig(_StrictModel):
     max_run_workers: int = Field(default=2, gt=0)
     max_postrun_workers: int = Field(default=4, gt=0)
     default_runtime: RuntimeSpec | None = None
+    docker_host_path: DockerHostPathSpec | None = None
 
     @model_validator(mode="before")
     @classmethod

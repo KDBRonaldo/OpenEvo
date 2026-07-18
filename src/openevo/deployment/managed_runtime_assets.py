@@ -42,6 +42,108 @@ class ManagedRuntimeArchiveSnapshot:
     archive_size: int
 
 
+class OpenedManagedRuntimeArchive:
+    """Held descriptor authority for one private runtime archive snapshot."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        descriptor: int,
+        identity: tuple[int, ...],
+        sha256: str,
+        size: int,
+    ) -> None:
+        self.path = path
+        self.descriptor = descriptor
+        self._identity = identity
+        self.sha256 = sha256
+        self.size = size
+
+    @classmethod
+    def open(
+        cls,
+        snapshot: ManagedRuntimeArchiveSnapshot,
+    ) -> OpenedManagedRuntimeArchive:
+        if not isinstance(snapshot, ManagedRuntimeArchiveSnapshot):
+            raise ManagedRuntimeArchiveSnapshotError("managed runtime snapshot is invalid")
+        descriptor = -1
+        try:
+            if (
+                snapshot.archive_path.parent != snapshot.root
+                or snapshot.archive_path.name != MANAGED_RUNTIME_ARCHIVE_RELEASE.filename
+                or snapshot.archive_sha256 != MANAGED_RUNTIME_ARCHIVE_RELEASE.sha256
+                or snapshot.archive_size != MANAGED_RUNTIME_ARCHIVE_RELEASE.byte_size
+            ):
+                raise ValueError("managed runtime snapshot identity is invalid")
+            descriptor = os.open(
+                snapshot.archive_path,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened = os.fstat(descriptor)
+            current = snapshot.archive_path.lstat()
+            identity = _archive_file_identity(opened)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o400
+                or opened.st_size != snapshot.archive_size
+                or _archive_file_identity(current) != identity
+                or _hash_archive_descriptor(descriptor) != snapshot.archive_sha256
+            ):
+                raise ValueError("managed runtime snapshot identity is invalid")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return cls(
+                path=snapshot.archive_path,
+                descriptor=descriptor,
+                identity=identity,
+                sha256=snapshot.archive_sha256,
+                size=snapshot.archive_size,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise ManagedRuntimeArchiveSnapshotError(
+                "managed runtime snapshot identity is invalid"
+            ) from exc
+
+    def rewind(self) -> None:
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+
+    def verify_unchanged(self) -> None:
+        try:
+            opened = os.fstat(self.descriptor)
+            current = self.path.lstat()
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o400
+                or opened.st_size != self.size
+                or _archive_file_identity(opened) != self._identity
+                or _archive_file_identity(current) != self._identity
+                or _hash_archive_descriptor(self.descriptor) != self.sha256
+            ):
+                raise ValueError("managed runtime snapshot changed during transfer")
+            self.rewind()
+        except (OSError, ValueError) as exc:
+            raise ManagedRuntimeArchiveSnapshotError(
+                "managed runtime snapshot changed during transfer"
+            ) from exc
+
+    def close(self) -> None:
+        descriptor, self.descriptor = self.descriptor, -1
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    def __enter__(self) -> OpenedManagedRuntimeArchive:
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
+
+
 @dataclass(frozen=True, slots=True)
 class ManagedRuntimeLoadReceipt:
     archive_sha256: str
@@ -185,6 +287,59 @@ def build_managed_runtime_probe_command(
     )
 
 
+def _build_daemon_managed_runtime_command(
+    daemon_path: str,
+    action: str,
+    *arguments: str,
+) -> str:
+    if (
+        not isinstance(daemon_path, str)
+        or _REMOTE_PATH.fullmatch(daemon_path) is None
+        or any(part in {"", ".", ".."} for part in daemon_path.split("/")[1:])
+        or action not in {"discard", "finalize", "prepare", "probe", "receive"}
+        or any(not isinstance(value, str) or "\x00" in value for value in arguments)
+    ):
+        raise ValueError("managed runtime Daemon invocation is invalid")
+    return " ".join(
+        (
+            shlex.quote(daemon_path),
+            "managed-runtime",
+            action,
+            *(shlex.quote(value) for value in arguments),
+        )
+    )
+
+
+def build_daemon_managed_runtime_probe_command(
+    daemon_path: str,
+    *,
+    archive_sha256: str,
+    archive_size: int,
+    platform: str,
+    config_id: str,
+    oci_index_id: str,
+    aliases: tuple[str, ...],
+) -> str:
+    _validate_release_request(
+        archive_sha256=archive_sha256,
+        archive_size=archive_size,
+        platform=platform,
+        config_id=config_id,
+        oci_index_id=oci_index_id,
+        aliases=aliases,
+    )
+    return _build_daemon_managed_runtime_command(
+        daemon_path,
+        "probe",
+        archive_sha256,
+        str(archive_size),
+        platform,
+        config_id,
+        oci_index_id,
+        *aliases,
+    )
+
+
 def parse_managed_runtime_probe(payload: SecretStr) -> ManagedRuntimeLoadReceipt | None:
     value = _load_secret_json(payload)
     if not isinstance(value, dict) or set(value) not in (
@@ -223,6 +378,23 @@ def build_managed_runtime_prepare_command(
     return build_verified_python_command(
         runtime,
         _REMOTE_MANAGED_RUNTIME_SCRIPT,
+        "prepare",
+        archive_sha256,
+        str(archive_size),
+    )
+
+
+def build_daemon_managed_runtime_prepare_command(
+    daemon_path: str,
+    *,
+    archive_sha256: str,
+    archive_size: int,
+) -> str:
+    release = MANAGED_RUNTIME_ARCHIVE_RELEASE
+    if archive_sha256 != release.sha256 or archive_size != release.byte_size:
+        raise ValueError("managed runtime archive digest is invalid")
+    return _build_daemon_managed_runtime_command(
+        daemon_path,
         "prepare",
         archive_sha256,
         str(archive_size),
@@ -337,6 +509,73 @@ def build_managed_runtime_finalize_command(
     )
 
 
+def _transfer_arguments(transfer: ManagedRuntimeTransfer) -> tuple[str, ...]:
+    transfer.__post_init__()
+    return (
+        transfer.service_root,
+        transfer.transfer_id,
+        str(transfer.staging_device),
+        str(transfer.staging_inode),
+        str(transfer.incoming_device),
+        str(transfer.incoming_inode),
+    )
+
+
+def build_daemon_managed_runtime_receive_command(
+    daemon_path: str,
+    transfer: ManagedRuntimeTransfer,
+    *,
+    archive_sha256: str,
+    archive_size: int,
+) -> str:
+    release = MANAGED_RUNTIME_ARCHIVE_RELEASE
+    if archive_sha256 != release.sha256 or archive_size != release.byte_size:
+        raise ValueError("managed runtime archive identity is invalid")
+    return _build_daemon_managed_runtime_command(
+        daemon_path,
+        "receive",
+        *_transfer_arguments(transfer),
+        archive_sha256,
+        str(archive_size),
+    )
+
+
+def build_daemon_managed_runtime_finalize_command(
+    daemon_path: str,
+    transfer: ManagedRuntimeTransfer,
+    *,
+    archive_sha256: str,
+    archive_size: int,
+    platform: str,
+    config_id: str,
+    oci_index_id: str,
+    aliases: tuple[str, ...],
+    load_timeout_seconds: int,
+) -> str:
+    _validate_release_request(
+        archive_sha256=archive_sha256,
+        archive_size=archive_size,
+        platform=platform,
+        config_id=config_id,
+        oci_index_id=oci_index_id,
+        aliases=aliases,
+    )
+    if type(load_timeout_seconds) is not int or not 1 <= load_timeout_seconds <= 900:
+        raise ValueError("managed runtime load timeout is invalid")
+    return _build_daemon_managed_runtime_command(
+        daemon_path,
+        "finalize",
+        *_transfer_arguments(transfer),
+        archive_sha256,
+        str(archive_size),
+        platform,
+        config_id,
+        oci_index_id,
+        str(load_timeout_seconds),
+        *aliases,
+    )
+
+
 def build_managed_runtime_discard_command(
     runtime: CorePythonRuntimeAuthority,
     transfer: ManagedRuntimeTransfer,
@@ -363,6 +602,25 @@ def build_managed_runtime_discard_command(
     )
 
 
+def build_daemon_managed_runtime_discard_command(
+    daemon_path: str,
+    transfer: ManagedRuntimeTransfer,
+    *,
+    archive_sha256: str,
+    archive_size: int,
+) -> str:
+    release = MANAGED_RUNTIME_ARCHIVE_RELEASE
+    if archive_sha256 != release.sha256 or archive_size != release.byte_size:
+        raise ValueError("managed runtime archive identity is invalid")
+    return _build_daemon_managed_runtime_command(
+        daemon_path,
+        "discard",
+        *_transfer_arguments(transfer),
+        archive_sha256,
+        str(archive_size),
+    )
+
+
 def parse_managed_runtime_discard(payload: SecretStr) -> None:
     value = _load_secret_json(payload)
     if (
@@ -372,6 +630,12 @@ def parse_managed_runtime_discard(payload: SecretStr) -> None:
         or value != {"schema_version": 1, "status": "discarded"}
     ):
         raise ValueError("managed runtime discard response is invalid")
+
+
+def parse_managed_runtime_receive(payload: SecretStr) -> None:
+    value = _load_secret_json(payload)
+    if value != {"schema_version": 1, "status": "received"}:
+        raise ValueError("managed runtime receive response is invalid")
 
 
 def parse_managed_runtime_receipt(payload: SecretStr) -> ManagedRuntimeLoadReceipt:
@@ -510,6 +774,27 @@ def _copy_verified_archive(
         if source_fd >= 0:
             os.close(source_fd)
         os.close(parent_fd)
+
+
+def _archive_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _hash_archive_descriptor(descriptor: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _open_absolute_directory_no_follow(path: Path) -> int:
@@ -1379,7 +1664,7 @@ elif action == "prepare":
         os.close(receipts_fd)
         os.close(staging_fd)
         os.close(core_fd)
-elif action in {"discard", "finalize"}:
+elif action in {"discard", "finalize", "receive"}:
     service_argument, transfer = Path(sys.argv[2]), sys.argv[3]
     if not valid_hex(transfer, 32):
         fail()
@@ -1388,7 +1673,7 @@ elif action in {"discard", "finalize"}:
         incoming_identity = (int(sys.argv[6]), int(sys.argv[7]))
     except ValueError:
         fail()
-    if action == "discard":
+    if action in {"discard", "receive"}:
         sha, encoded_size = sys.argv[8:]
         size = archive_identity(sha, encoded_size)
     else:
@@ -1422,6 +1707,60 @@ elif action in {"discard", "finalize"}:
             if record is not None:
                 clear_transfer(staging_fd, record)
             print('{"schema_version":1,"status":"discarded"}')
+        elif action == "receive":
+            if record is None or record["archive"] is not None:
+                if record is not None:
+                    close_transfer(record)
+                fail()
+            archive_fd = -1
+            archive = None
+            try:
+                archive_fd = os.open(
+                    FILENAME,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=record["fd"],
+                )
+                archive = os.fstat(archive_fd)
+                if (not stat.S_ISREG(archive.st_mode) or archive.st_uid != uid
+                        or archive.st_nlink != 1 or stat.S_IMODE(archive.st_mode) != 0o600
+                        or archive.st_size != 0
+                        or not same_path(record["fd"], FILENAME, archive)):
+                    fail()
+                digest = hashlib.sha256()
+                observed = 0
+                while observed < size:
+                    chunk = os.read(0, min(1024 * 1024, size - observed))
+                    if not chunk:
+                        fail()
+                    write_all(archive_fd, chunk)
+                    digest.update(chunk)
+                    observed += len(chunk)
+                if os.read(0, 1) or observed != size or digest.hexdigest() != sha:
+                    fail()
+                os.fsync(archive_fd)
+                final = os.fstat(archive_fd)
+                if (final.st_dev, final.st_ino) != (archive.st_dev, archive.st_ino):
+                    fail()
+                archive = final
+                if (archive.st_size != size
+                        or not same_path(record["fd"], FILENAME, archive)):
+                    fail()
+                print('{"schema_version":1,"status":"received"}')
+            except BaseException:
+                if archive_fd >= 0:
+                    try:
+                        opened = os.fstat(archive_fd)
+                        if same_path(record["fd"], FILENAME, opened):
+                            os.unlink(FILENAME, dir_fd=record["fd"])
+                            os.fsync(record["fd"])
+                    except (FileNotFoundError, OSError):
+                        pass
+                raise
+            finally:
+                if archive_fd >= 0:
+                    os.close(archive_fd)
+                close_transfer(record)
         else:
             if record is None or record["archive"] is None:
                 if record is not None:
@@ -1603,6 +1942,12 @@ __all__ = (
     "ManagedRuntimeArchiveSnapshotError",
     "ManagedRuntimeLoadReceipt",
     "ManagedRuntimeTransfer",
+    "OpenedManagedRuntimeArchive",
+    "build_daemon_managed_runtime_discard_command",
+    "build_daemon_managed_runtime_finalize_command",
+    "build_daemon_managed_runtime_prepare_command",
+    "build_daemon_managed_runtime_probe_command",
+    "build_daemon_managed_runtime_receive_command",
     "build_managed_runtime_discard_command",
     "build_managed_runtime_finalize_command",
     "build_managed_runtime_prepare_command",
@@ -1611,6 +1956,7 @@ __all__ = (
     "parse_managed_runtime_prepare",
     "parse_managed_runtime_probe",
     "parse_managed_runtime_discard",
+    "parse_managed_runtime_receive",
     "parse_managed_runtime_receipt",
     "snapshot_managed_runtime_archive",
 )

@@ -1,18 +1,21 @@
 # Runtime Backends
 
-`openevo.runtime` gives each rollout session its own **sandbox** — one container
-(Docker or Apptainer) that lives for the whole session. The gateway uses it to
+`openevo.runtime` gives each rollout session its own **sandbox** through Docker,
+Apptainer, or rootless Bubblewrap. The gateway uses it to
 run the prepare recipe, execute the agent and evaluator commands, move files in
 and out, then tear it down.
 
 ## Mental model
 
-- **One `RuntimeSpec` → one container**, shared across the init → run → eval
-  stages of a session.
+- **One `RuntimeSpec` → one runtime sandbox**, shared across the init → run →
+  eval stages of a session. Docker and Apptainer keep a container/instance;
+  Bubblewrap recreates namespaces per command while retaining the same rootfs
+  authority and session bind.
 - The host session directory is **bind-mounted** to a fixed in-container path,
   `/openevo/session` (`RUNTIME_SESSION_DIR`). Uploads/downloads under that path
   use descriptor-relative host-side copies. Docker and Apptainer retain their
-  normal `docker cp` or tar fallback for paths outside that bind.
+  normal `docker cp` or tar fallback for paths outside that bind; Bubblewrap
+  rejects paths outside it.
 - Commands run in a login shell (`bash -lc`) with working directory
   `cwd or spec.workdir or /openevo/session`.
 - The factory verifies the chosen backend actually supports what the spec asks
@@ -25,6 +28,8 @@ and out, then tear it down.
   the bind-mount copy helpers.
 - `docker.py`: `DockerRuntime` — the default backend.
 - `apptainer.py`: `ApptainerRuntime` — daemonless, for clusters.
+- `bubblewrap.py`: `BubblewrapRuntime` — rootless execution from a directory
+  rootfs on hosts with unprivileged user namespaces.
 - `factory.py`: backend lookup + capability validation; also loads a custom
   backend via `RuntimeSpec.import_path`.
 
@@ -126,6 +131,44 @@ work ended. Core therefore quarantines its root and retains that isolation for
 the process lifetime. An authoritative operation that exceeds the one-second
 join bound remains quarantined until its real termination operation completes.
 This path does not use the evolution payload scanner's 256-file/16-GiB defaults.
+
+## Bubblewrap
+
+`backend="bubblewrap"` is a follow-up backend for an ordinary Linux user without
+Docker, root, or Apptainer. It is not part of the initial release profile. In
+this mode `RuntimeSpec.image` is not an OCI image name: it is the canonical
+absolute path of a rootfs directory owned by the Core user. The rootfs must be
+outside the writable session tree and contain `/bin/bash` plus the programs
+needed by the workload. Because later mounts cannot create targets through the
+read-only root, it must also contain real directories at `/dev`, `/home`,
+`/openevo/session`, `/proc`, and `/tmp`. The rootfs path, session path, mount
+targets, and executable are opened without following symlinks; rootfs, session,
+and executable authority is held by descriptor for the runtime lifetime.
+
+The backend uses exactly `/usr/bin/bwrap` by default. A deployment may provide
+`kwargs={"bwrap_binary": "/canonical/absolute/path"}`; the override must be a
+root- or Core-owned, single-link executable with no group/other write bits, and
+no path component may be a symlink. No `PATH` lookup is used.
+
+Every command starts with `--unshare-all`. Internet-enabled specs explicitly add
+`--share-net`; internet-disabled specs retain the new isolated network
+namespace. The rootfs is mounted read-only, `/openevo/session` is the only
+read-write host bind, and `/home` and `/tmp` are private tmpfs mounts.
+Bubblewrap receives a cleared environment with fixed private `HOME`/`TMPDIR` and
+an explicit baseline `PATH`; caller env is bounded and cannot override `HOME`,
+`TMPDIR`, or `PWD`. Working directories must be canonical absolute paths.
+
+Bubblewrap always executes as the host user, so its spec must set
+`container_user="host"`. It does not advertise GPU, CPU, memory, or storage
+limits. It supports only shared host networking or complete network isolation.
+Uploads and downloads outside `/openevo/session` fail closed; allowed transfers
+use the same descriptor-relative, no-follow `BaseRuntime` copy implementation as
+the other session bind paths.
+
+Bubblewrap is process-based rather than daemon-backed. Cancellation and timeout
+kill and reap the command's host process group; `--die-with-parent` covers the
+namespace child. A real-host integration test therefore requires both
+`/usr/bin/bwrap` and working unprivileged user namespaces.
 
 ## Docker vs Apptainer
 

@@ -68,6 +68,12 @@ from openevo.runtime.managed import (
     require_immutable_managed_runtime_image,
     verified_managed_runtime_image_reference,
 )
+from openevo.runtime.docker_host import (
+    DockerHostPathError,
+    DockerHostPathSpec,
+    discover_docker_host_path,
+    docker_self_inspect_argv,
+)
 from openevo.internal_auth import (
     INTERNAL_CREDENTIAL_FD_ENV,
     INTERNAL_LISTEN_FD_ENV,
@@ -342,6 +348,7 @@ class ManagedScienceRuntimeReadiness:
     identity_digest: str | None
     runtime_image_immutable_reference: str | None
     message: str
+    docker_host_path: DockerHostPathSpec | None = None
     credential_authority: (
         HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
     ) = field(
@@ -760,10 +767,14 @@ class LocalManagedScienceRuntimeProbe:
         command_runner: ProbeCommandRunner | None = None,
         codex_auth_path: Path | None = None,
         credential_probe_root: Path | None = None,
+        runtime_namespace: str | None = None,
+        require_docker_user_container: bool = False,
     ) -> None:
         self._command_runner = command_runner or BoundedProbeCommandRunner()
         self._codex_auth_path = codex_auth_path or (Path.home() / ".codex" / "auth.json")
         self._credential_probe_root = credential_probe_root
+        self._runtime_namespace = runtime_namespace
+        self._require_docker_user_container = require_docker_user_container
 
     def verify(
         self,
@@ -907,6 +918,29 @@ class LocalManagedScienceRuntimeProbe:
                     ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
                     "Managed Science bootstrap evidence is invalid.",
                 )
+            docker_host_path: DockerHostPathSpec | None = None
+            if self._runtime_namespace is not None:
+                try:
+                    host_result = self._command_runner.run(
+                        docker_self_inspect_argv(),
+                        deadline,
+                        cancellation,
+                    )
+                    if host_result.returncode != 0:
+                        raise DockerHostPathError(
+                            "Docker could not inspect the Daemon user container"
+                        )
+                    docker_host_path = discover_docker_host_path(
+                        host_result.stdout,
+                        namespace=self._runtime_namespace,
+                    )
+                except (DockerHostPathError, OSError, ValueError):
+                    if self._require_docker_user_container:
+                        credential_snapshot.close()
+                        return _runtime_not_ready(
+                            ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
+                            "The Docker user-container data-root mapping is unavailable.",
+                        )
             readiness = ManagedScienceRuntimeReadiness(
                 ready=True,
                 code=ServiceRunReadinessCode.READY,
@@ -923,10 +957,16 @@ class LocalManagedScienceRuntimeProbe:
                         "runtime_image": request.runtime_image,
                         "runtime_image_id": image_id,
                         "runtime_image_immutable_reference": immutable_image,
+                        "docker_host_path_identity": (
+                            None
+                            if docker_host_path is None
+                            else docker_host_path.identity_digest
+                        ),
                     }
                 ),
                 runtime_image_immutable_reference=immutable_image,
                 message="Managed Science runtime bootstrap is verified.",
+                docker_host_path=docker_host_path,
                 credential_authority=credential_snapshot,
             )
             credential_snapshot = None
@@ -2013,6 +2053,15 @@ class CoreServiceSupervisor:
                 managed_runtime_probe
                 or LocalManagedScienceRuntimeProbe(
                     credential_probe_root=self._credential_probe_root,
+                    runtime_namespace=(
+                        "core-"
+                        + hashlib.sha256(
+                            os.fsencode(os.fspath(self._root.path.absolute()))
+                        ).hexdigest()[:24]
+                    ),
+                    require_docker_user_container=(
+                        launch_mode is ServiceLaunchMode.RELEASE
+                    ),
                 )
             )
             self._startup_timeout = startup_timeout
@@ -2164,6 +2213,11 @@ class CoreServiceSupervisor:
                     "runtime_image_immutable_reference": (
                         runtime.runtime_image_immutable_reference
                     ),
+                    "docker_host_path_identity": (
+                        None
+                        if runtime.docker_host_path is None
+                        else runtime.docker_host_path.identity_digest
+                    ),
                 }
             )
             if self._active_run_lease is not None:
@@ -2262,6 +2316,7 @@ class CoreServiceSupervisor:
                     credential,
                     listeners,
                     candidate_authority,
+                    runtime.docker_host_path,
                 )
             except Exception:
                 for listener in listeners.values():
@@ -2607,6 +2662,7 @@ class CoreServiceSupervisor:
         credential_authority: (
             HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
         ),
+        docker_host_path: DockerHostPathSpec | None,
     ) -> tuple[tuple[ServiceProcessSpec, ...], dict[str, object]]:
         root = self._root.path
         topology_path = root / "topology.json"
@@ -2632,6 +2688,15 @@ class CoreServiceSupervisor:
                         "model_served": runtime_request.codex_model,
                         "port": ports["gateway"],
                         "public_url": gateway_url,
+                        **(
+                            {}
+                            if docker_host_path is None
+                            else {
+                                "docker_host_path": docker_host_path.model_dump(
+                                    mode="json"
+                                )
+                            }
+                        ),
                     }
                 ],
                 "rollout_server_url": rollout_url,

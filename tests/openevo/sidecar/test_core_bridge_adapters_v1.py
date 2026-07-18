@@ -15,7 +15,6 @@ import httpx
 from pydantic import SecretStr
 import pytest
 
-from desktop.sidecar import core_bridge_adapters_v1 as adapters
 from desktop.sidecar.contracts.v1.models import WorkspaceImportRefV1
 from desktop.sidecar.core_bridge_adapters_v1 import (
     AdoptedWorkspaceArchiveSourceV1,
@@ -23,6 +22,7 @@ from desktop.sidecar.core_bridge_adapters_v1 import (
     CoreBootstrapConfigV1,
     DesktopCoreSshBridgeAdapterV1,
     SealedCoreBootstrapAssetV1,
+    SealedDaemonBundleV1,
     SealedManagedRuntimeArchiveV1,
     VerifiedCoreHttpTransportV1,
 )
@@ -36,20 +36,15 @@ from desktop.sidecar.workspace_imports import (
     WorkspaceImportStore,
 )
 from openevo.deployment import core_control
-from openevo.deployment.core_control import (
-    CoreControlBootstrapError,
-    CoreControlBootstrapErrorCode,
-)
-from openevo.deployment.core_assets import (
-    CoreBootstrapAssetSnapshotError,
-    snapshot_core_bootstrap_assets,
+from openevo.deployment.core_control import parse_core_control_attachment
+from openevo.deployment.daemon_bundle_transport import (
+    DaemonBundleIdentity,
+    StagedDaemonBundle,
 )
 from openevo.deployment.preflight import RemoteCommandResult
-from openevo.deployment.core_runtime import CorePythonRuntimeAuthority
 from openevo.deployment.ssh import (
     SshTransportError,
     SshTransportErrorCode,
-    StagedCoreBootstrapAssets,
 )
 from openevo.runtime.managed import MANAGED_RUNTIME_ARCHIVE_RELEASE
 
@@ -61,34 +56,40 @@ RELEASE_IDENTITY = "2" * 64
 REGISTRY_DIGEST = "3" * 64
 STATUS_PROOF = "4" * 64
 GENERATION = "5" * 32
+DEPENDENCY_LOCK_DIGEST = "6" * 64
+WHEEL_DIGEST = hashlib.sha256(b"sealed-wheel").hexdigest()
+FRAMEWORK_LOCK_BYTES = json.dumps(
+    {
+        "schema_version": "1",
+        "distribution": "openevo",
+        "distribution_version": "0.1.0",
+        "distribution_digest": WHEEL_DIGEST,
+        "wheel_filename": "openevo-0.1.0-py3-none-any.whl",
+    },
+    separators=(",", ":"),
+    sort_keys=True,
+).encode("utf-8")
+FRAMEWORK_LOCK_DIGEST = hashlib.sha256(FRAMEWORK_LOCK_BYTES).hexdigest()
 ARCHIVE = bytes(1024)
-IMPORT_ID = "workspace-import-" + "6" * 48
+IMPORT_ID = "workspace-import-" + "7" * 48
 
 
 def _bootstrap_config(tmp_path: Path) -> CoreBootstrapConfigV1:
     wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
     wheel.write_bytes(b"sealed-wheel")
-    wheel_digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    wheel_digest = WHEEL_DIGEST
     framework_lock = tmp_path / "framework-lock.json"
-    framework_lock.write_text(
-        json.dumps(
-            {
-                "schema_version": "1",
-                "distribution": "openevo",
-                "distribution_version": "0.1.0",
-                "distribution_digest": wheel_digest,
-                "wheel_filename": wheel.name,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+    framework_lock.write_bytes(FRAMEWORK_LOCK_BYTES)
     release = MANAGED_RUNTIME_ARCHIVE_RELEASE
     runtime_archive = tmp_path / release.filename
     runtime_archive.touch()
     os.truncate(runtime_archive, release.byte_size)
     runtime_archive.chmod(0o600)
+    daemon = tmp_path / "openevo-daemon-linux-x86_64"
+    daemon.write_bytes(b"\x7fELF\0sealed-openevo-daemon")
+    daemon.chmod(0o700)
+    daemon_digest = hashlib.sha256(daemon.read_bytes()).hexdigest()
+    framework_lock_digest = FRAMEWORK_LOCK_DIGEST
     return CoreBootstrapConfigV1(
         source_commit=SOURCE_COMMIT,
         wheel=SealedCoreBootstrapAssetV1(
@@ -98,8 +99,20 @@ def _bootstrap_config(tmp_path: Path) -> CoreBootstrapConfigV1:
         ),
         framework_lock=SealedCoreBootstrapAssetV1(
             local_path=str(framework_lock),
-            sha256=hashlib.sha256(framework_lock.read_bytes()).hexdigest(),
+            sha256=framework_lock_digest,
             byte_size=framework_lock.stat().st_size,
+        ),
+        daemon_bundle=SealedDaemonBundleV1(
+            local_path=str(daemon),
+            sha256=daemon_digest,
+            byte_size=daemon.stat().st_size,
+            manifest_sha256="8" * 64,
+            release_identity=RELEASE_IDENTITY,
+            registry_digest=REGISTRY_DIGEST,
+            source_commit=SOURCE_COMMIT,
+            wheel_sha256=wheel_digest,
+            dependency_lock_sha256=DEPENDENCY_LOCK_DIGEST,
+            framework_lock_sha256=framework_lock_digest,
         ),
         managed_runtime_archive=SealedManagedRuntimeArchiveV1(
             local_path=str(runtime_archive),
@@ -132,37 +145,6 @@ def _attachment_payload(*, bearer: str = BEARER, port: int = 43117) -> SecretStr
             separators=(",", ":"),
             sort_keys=True,
         )
-    )
-
-
-def _runtime() -> CorePythonRuntimeAuthority:
-    values: dict[str, object] = {
-        "schema_version": 1,
-        "executable_path": "/home/alice/.local/share/uv/python/python3.11",
-        "executable_sha256": "a" * 64,
-        "device": 1,
-        "inode": 10,
-        "uid": 1000,
-        "mode": 0o755,
-        "byte_size": 4096,
-        "mtime_ns": 11,
-        "ctime_ns": 12,
-        "version": [3, 11, 12],
-    }
-    canonical = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
-    authority_id = hashlib.sha256(b"openevo-core-python-runtime-v1\0" + canonical).hexdigest()
-    return CorePythonRuntimeAuthority(
-        authority_id=authority_id,
-        executable_path=str(values["executable_path"]),
-        executable_sha256=str(values["executable_sha256"]),
-        device=1,
-        inode=10,
-        uid=1000,
-        mode=0o755,
-        byte_size=4096,
-        mtime_ns=11,
-        ctime_ns=12,
-        version=(3, 11, 12),
     )
 
 
@@ -202,75 +184,93 @@ class FakeCoreTransport:
         self.tunnel_error: Exception | None = None
         self.stage_error: Exception | None = None
         self.stage_calls: list[dict[str, object]] = []
-        self.runtime_preflight_error: Exception | None = None
-        self.runtime_preflight_timeouts: list[float] = []
-        self.after_runtime_preflight: Callable[[], None] | None = None
+        self.identity_error: Exception | None = None
+        self.ensure_error: Exception | None = None
         self.after_stage: Callable[[], None] | None = None
-        self.after_secret: Callable[[], None] | None = None
+        self.after_identity: Callable[[], None] | None = None
+        self.after_ensure: Callable[[], None] | None = None
         self.managed_runtime_calls: list[dict[str, object]] = []
         self.managed_runtime_block = False
         self.managed_runtime_entered = threading.Event()
         self.managed_runtime_cancelled = threading.Event()
         self.operation_order: list[str] = []
 
-    def select_core_python_runtime(
+    def stage_daemon_bundle(
         self,
         *,
+        bundle_path: str,
+        bundle_sha256: str,
+        bundle_size: int,
         timeout_seconds: float,
         cancel_event: threading.Event | None = None,
-    ) -> CorePythonRuntimeAuthority:
+    ) -> StagedDaemonBundle:
         if cancel_event is not None and cancel_event.is_set():
             raise SshTransportError(SshTransportErrorCode.CANCELLED)
-        self.runtime_preflight_timeouts.append(timeout_seconds)
-        if self.runtime_preflight_error is not None:
-            raise self.runtime_preflight_error
-        if self.after_runtime_preflight is not None:
-            self.after_runtime_preflight()
-        return _runtime()
-
-    def stage_core_bootstrap_assets(self, **kwargs: object) -> StagedCoreBootstrapAssets:
-        self.operation_order.append("core_assets")
-        try:
-            with snapshot_core_bootstrap_assets(
-                wheel_path=str(kwargs["wheel_path"]),
-                wheel_sha256=str(kwargs["wheel_sha256"]),
-                wheel_size=int(kwargs["wheel_size"]),
-                framework_lock_path=str(kwargs["framework_lock_path"]),
-                framework_lock_sha256=str(kwargs["framework_lock_sha256"]),
-                framework_lock_size=int(kwargs["framework_lock_size"]),
-            ):
-                pass
-        except CoreBootstrapAssetSnapshotError:
-            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
-        self.stage_calls.append(kwargs)
+        self.operation_order.append("daemon_stage")
+        payload = Path(bundle_path).read_bytes()
+        if len(payload) != bundle_size or hashlib.sha256(payload).hexdigest() != bundle_sha256:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        self.stage_calls.append(
+            {
+                "bundle_path": bundle_path,
+                "bundle_sha256": bundle_sha256,
+                "bundle_size": bundle_size,
+                "timeout_seconds": timeout_seconds,
+                "cancel_event": cancel_event,
+            }
+        )
         if self.stage_error is not None:
             error = self.stage_error
             self.stage_error = None
             raise error
         if self.after_stage is not None:
             self.after_stage()
-        return StagedCoreBootstrapAssets(
-            service_root="/home/alice/.openevo/core",
-            wheel_path=(
-                f"/home/alice/.openevo/core/assets/{kwargs['bundle_id']}/"
-                "openevo-0.1.0-py3-none-any.whl"
-            ),
-            framework_lock_path=(
-                f"/home/alice/.openevo/core/assets/{kwargs['bundle_id']}/framework-lock.json"
-            ),
-            wheel_sha256=str(kwargs["wheel_sha256"]),
-            framework_lock_sha256=str(kwargs["framework_lock_sha256"]),
-            wheel_size=int(kwargs["wheel_size"]),
-            framework_lock_size=int(kwargs["framework_lock_size"]),
-            bundle_device=1,
-            bundle_inode=2,
-            wheel_device=1,
-            wheel_inode=3,
-            framework_lock_device=1,
-            framework_lock_inode=4,
+        return StagedDaemonBundle(
+            host_profile="docker_user_container_v1",
+            sha256=bundle_sha256,
+            size=bundle_size,
+            reused=False,
+            _service_root="/home/alice/.openevo/daemon-bundles",
+            _executable_path=f"/home/alice/.openevo/daemon-bundles/bundle-{bundle_sha256}",
         )
 
-    def ensure_managed_runtime(self, **kwargs: object) -> object:
+    def daemon_bundle_identity(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
+    ) -> DaemonBundleIdentity:
+        del timeout_seconds
+        if cancel_event is not None and cancel_event.is_set():
+            raise SshTransportError(SshTransportErrorCode.CANCELLED)
+        self.operation_order.append("daemon_identity")
+        if self.identity_error is not None:
+            raise self.identity_error
+        if self.after_identity is not None:
+            self.after_identity()
+        return DaemonBundleIdentity(
+            bundle_format="pyinstaller-onefile",
+            bundle_sha256=bundle.sha256,
+            bundle_size=bundle.size,
+            core_distribution="openevo",
+            core_version="0.1.0",
+            core_wheel_sha256=WHEEL_DIGEST,
+            dependency_lock_sha256=DEPENDENCY_LOCK_DIGEST,
+            framework_lock_sha256=FRAMEWORK_LOCK_DIGEST,
+            registry_digest=REGISTRY_DIGEST,
+            release_identity=RELEASE_IDENTITY,
+            source_commit=SOURCE_COMMIT,
+            platform_system="linux",
+            platform_architecture="x86_64",
+        )
+
+    def ensure_managed_runtime_from_daemon(
+        self,
+        bundle: StagedDaemonBundle,
+        **kwargs: object,
+    ) -> object:
+        del bundle
         self.operation_order.append("managed_runtime")
         self.managed_runtime_calls.append(kwargs)
         if self.managed_runtime_block:
@@ -281,6 +281,19 @@ class FakeCoreTransport:
             self.managed_runtime_cancelled.set()
             raise SshTransportError(SshTransportErrorCode.CANCELLED)
         return object()
+
+    def ensure_daemon_bundle(
+        self,
+        bundle: StagedDaemonBundle,
+        **kwargs: object,
+    ) -> object:
+        del bundle, kwargs
+        self.operation_order.append("daemon_start")
+        if self.ensure_error is not None:
+            raise self.ensure_error
+        if self.after_ensure is not None:
+            self.after_ensure()
+        return parse_core_control_attachment(_attachment_payload())
 
     def run(
         self,
@@ -300,8 +313,6 @@ class FakeCoreTransport:
     def run_secret(self, command: str, *, timeout_seconds: float = 30.0) -> SecretStr:
         self.secret_commands.append(command)
         self.timeouts.append(timeout_seconds)
-        if self.after_secret is not None:
-            self.after_secret()
         return _attachment_payload()
 
     def open_core_tunnel(self, **kwargs: object) -> FakeCoreTunnel:
@@ -344,7 +355,7 @@ def verified_tunnel_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_core_host_stages_sealed_assets_then_bootstraps_supported_host(
+def test_core_host_stages_verified_daemon_prepares_runtime_then_starts(
     tmp_path: Path,
 ) -> None:
     adapter, _lifecycle, transport = _adapter(tmp_path)
@@ -361,17 +372,22 @@ def test_core_host_stages_sealed_assets_then_bootstraps_supported_host(
     assert len(transport.stage_calls) == 2
     assert len(transport.managed_runtime_calls) == 2
     assert transport.operation_order == [
+        "daemon_stage",
+        "daemon_identity",
         "managed_runtime",
-        "core_assets",
+        "daemon_start",
+        "daemon_stage",
+        "daemon_identity",
         "managed_runtime",
-        "core_assets",
+        "daemon_start",
     ]
-    assert len(transport.runtime_preflight_timeouts) == 2
-    assert transport.stage_calls[0]["wheel_sha256"] == _bootstrap_config(tmp_path).wheel.sha256
-    assert "/usr/bin/python3 -I -c" in transport.commands[0]
-    assert "consume-attachment" in transport.secret_commands[0]
+    assert (
+        transport.stage_calls[0]["bundle_sha256"]
+        == _bootstrap_config(tmp_path).daemon_bundle.sha256
+    )
+    assert transport.commands == []
+    assert transport.secret_commands == []
     assert BEARER not in " ".join(transport.commands + transport.secret_commands)
-    assert all(0 < timeout <= 5 for timeout in transport.timeouts)
     assert BEARER not in repr(first)
     assert BEARER not in repr(adapter)
     assert str(tmp_path) not in repr(_bootstrap_config(tmp_path))
@@ -385,6 +401,7 @@ def test_core_host_without_packaged_managed_runtime_fails_before_remote_work(
         source_commit=bootstrap.source_commit,
         wheel=bootstrap.wheel,
         framework_lock=bootstrap.framework_lock,
+        daemon_bundle=bootstrap.daemon_bundle,
     )
     transport = FakeCoreTransport()
     adapter = DesktopCoreSshBridgeAdapterV1(
@@ -396,9 +413,31 @@ def test_core_host_without_packaged_managed_runtime_fails_before_remote_work(
         adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
 
     assert unavailable.value.error.code == "managed_runtime_asset_unavailable"
-    assert transport.runtime_preflight_timeouts == []
     assert transport.managed_runtime_calls == []
     assert transport.stage_calls == []
+
+
+def test_core_host_without_packaged_daemon_fails_before_remote_work(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _bootstrap_config(tmp_path)
+    without_daemon = CoreBootstrapConfigV1(
+        source_commit=bootstrap.source_commit,
+        wheel=bootstrap.wheel,
+        framework_lock=bootstrap.framework_lock,
+        managed_runtime_archive=bootstrap.managed_runtime_archive,
+    )
+    transport = FakeCoreTransport()
+    adapter = DesktopCoreSshBridgeAdapterV1(
+        FakeLifecycle(PROFILE_ID, transport),
+        without_daemon,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as unavailable:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert unavailable.value.error.code == "daemon_bundle_asset_unavailable"
+    assert transport.operation_order == []
 
 
 def test_core_host_cancellation_stops_runtime_before_publication_and_allows_retry(
@@ -432,9 +471,10 @@ def test_core_host_cancellation_stops_runtime_before_publication_and_allows_retr
     assert transport.managed_runtime_cancelled.is_set()
     assert isinstance(result[0], DesktopCoreBridgeErrorV1)
     assert result[0].error.code == "active_project_session_superseded"
-    assert transport.stage_calls == []
+    assert len(transport.stage_calls) == 1
     assert transport.commands == []
     assert transport.secret_commands == []
+    assert "daemon_start" not in transport.operation_order
 
     transport.managed_runtime_block = False
     retry = adapter.ensure_core(
@@ -443,7 +483,7 @@ def test_core_host_cancellation_stops_runtime_before_publication_and_allows_retr
         cancel_event=threading.Event(),
     )
     assert retry.profile_id == PROFILE_ID
-    assert len(transport.stage_calls) == 1
+    assert len(transport.stage_calls) == 2
 
 
 def test_core_host_rejects_cross_profile_and_transport_replacement(tmp_path: Path) -> None:
@@ -454,185 +494,141 @@ def test_core_host_rejects_cross_profile_and_transport_replacement(tmp_path: Pat
     assert cross_profile.value.error.code == "core_profile_not_connected"
     assert transport.commands == []
 
-    transport.after_secret = lambda: setattr(lifecycle, "transport", FakeCoreTransport())
+    transport.after_ensure = lambda: setattr(lifecycle, "transport", FakeCoreTransport())
     with pytest.raises(DesktopCoreBridgeErrorV1) as replaced:
         adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
     assert replaced.value.error.code == "core_ssh_transport_identity_changed"
     assert BEARER not in str(replaced.value)
 
 
-def test_core_host_rejects_transport_replacement_after_runtime_and_asset_checks(
+def test_core_host_rejects_transport_replacement_after_daemon_checks(
     tmp_path: Path,
 ) -> None:
-    runtime_adapter, runtime_lifecycle, runtime_transport = _adapter(tmp_path)
-    runtime_transport.after_runtime_preflight = lambda: setattr(
-        runtime_lifecycle,
+    stage_adapter, stage_lifecycle, stage_transport = _adapter(tmp_path)
+    stage_transport.after_stage = lambda: setattr(
+        stage_lifecycle,
         "transport",
         FakeCoreTransport(),
     )
 
-    with pytest.raises(DesktopCoreBridgeErrorV1) as runtime_changed:
-        runtime_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
-    assert runtime_changed.value.error.code == "core_ssh_transport_identity_changed"
-    assert runtime_transport.stage_calls == []
+    with pytest.raises(DesktopCoreBridgeErrorV1) as stage_changed:
+        stage_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert stage_changed.value.error.code == "core_ssh_transport_identity_changed"
+    assert len(stage_transport.stage_calls) == 1
+    assert "daemon_identity" not in stage_transport.operation_order
 
-    asset_adapter, asset_lifecycle, asset_transport = _adapter(tmp_path)
-    asset_transport.after_stage = lambda: setattr(
-        asset_lifecycle,
+    identity_adapter, identity_lifecycle, identity_transport = _adapter(tmp_path)
+    identity_transport.after_identity = lambda: setattr(
+        identity_lifecycle,
         "transport",
         FakeCoreTransport(),
     )
 
-    with pytest.raises(DesktopCoreBridgeErrorV1) as asset_changed:
-        asset_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
-    assert asset_changed.value.error.code == "core_ssh_transport_identity_changed"
-    assert len(asset_transport.stage_calls) == 1
-    assert asset_transport.commands == []
+    with pytest.raises(DesktopCoreBridgeErrorV1) as identity_changed:
+        identity_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert identity_changed.value.error.code == "core_ssh_transport_identity_changed"
+    assert "managed_runtime" not in identity_transport.operation_order
 
 
-def test_core_host_rejects_local_asset_tamper_before_upload(tmp_path: Path) -> None:
+def test_core_host_rejects_local_daemon_tamper_before_upload(tmp_path: Path) -> None:
     config = _bootstrap_config(tmp_path)
     adapter = DesktopCoreSshBridgeAdapterV1(
         FakeLifecycle(PROFILE_ID, transport := FakeCoreTransport()),
         config,
     )
-    Path(config.wheel.local_path).write_bytes(b"tampered")
+    assert config.daemon_bundle is not None
+    Path(config.daemon_bundle.local_path).write_bytes(b"tampered")
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as tampered:
         adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
 
-    assert tampered.value.error.code == "core_bootstrap_asset_invalid"
+    assert tampered.value.error.code == "daemon_bundle_identity_mismatch"
     assert transport.stage_calls == []
     assert str(tmp_path) not in str(tampered.value)
 
 
 @pytest.mark.parametrize(
-    ("transport_code", "desktop_code", "message_fragment", "retryable"),
+    ("transport_code", "desktop_code", "http_status", "retryable"),
     [
         (
-            SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE,
-            "core_python_runtime_unavailable",
-            "server architecture",
+            SshTransportErrorCode.INVALID_REQUEST,
+            "daemon_bundle_identity_mismatch",
+            409,
             False,
         ),
         (
-            SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED,
-            "core_python_runtime_provision_failed",
-            "download, verify, or provision",
+            SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED,
+            "core_ssh_authority_invalid",
+            409,
+            False,
+        ),
+        (
+            SshTransportErrorCode.TIMEOUT,
+            "daemon_bundle_stage_deadline_exceeded",
+            504,
             True,
-        ),
-        (
-            SshTransportErrorCode.CORE_KERNEL_SYSCALL_UNSUPPORTED,
-            "core_supervisor_kernel_unsupported",
-            "Linux kernel",
-            False,
         ),
     ],
 )
-def test_core_host_reports_typed_remote_runtime_failures_before_upload(
+def test_core_host_reports_typed_daemon_stage_failures(
     tmp_path: Path,
     transport_code: SshTransportErrorCode,
     desktop_code: str,
-    message_fragment: str,
+    http_status: int,
     retryable: bool,
 ) -> None:
     adapter, _lifecycle, transport = _adapter(tmp_path)
-    transport.runtime_preflight_error = SshTransportError(transport_code)
+    transport.stage_error = SshTransportError(transport_code)
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as unsupported:
         adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
 
     assert unsupported.value.error.code == desktop_code
-    assert unsupported.value.error.http_status == 409
+    assert unsupported.value.error.http_status == http_status
     assert unsupported.value.error.retryable is retryable
-    assert message_fragment in unsupported.value.error.message
-    assert "os.pidfd_open" not in unsupported.value.error.message
-    assert "signal.pidfd_send_signal" not in unsupported.value.error.message
-    assert transport.stage_calls == []
     assert transport.commands == []
     assert str(tmp_path) not in str(unsupported.value)
 
 
-def test_core_install_failure_is_actionable_and_redacts_remote_details() -> None:
-    private = "http://proxy-user:proxy-secret@127.0.0.1 private/install/path"
-
-    mapped = adapters._bootstrap_error(
-        CoreControlBootstrapError(
-            CoreControlBootstrapErrorCode.INSTALL_FAILED,
-            private,
-            retryable=True,
-        )
-    )
-
-    assert mapped.error.code == "core_bootstrap_install_failed"
-    assert mapped.error.http_status == 503
-    assert mapped.error.retryable is True
-    assert "isolated OpenEvo Core generation" in mapped.error.message
-    assert "proxy-secret" not in str(mapped)
-    assert "private/install/path" not in str(mapped)
-
-
-def test_core_host_normalizes_runtime_and_upload_errors_without_private_values(
+def test_core_host_normalizes_daemon_errors_without_private_values(
     tmp_path: Path,
 ) -> None:
-    private = f"{BEARER} {tmp_path} python3 -I -c private-command"
-    runtime_adapter, _runtime_lifecycle, runtime_transport = _adapter(tmp_path)
-    runtime_transport.runtime_preflight_error = RuntimeError(private)
+    private = f"{BEARER} {tmp_path} private-command"
+    stage_adapter, _stage_lifecycle, stage_transport = _adapter(tmp_path)
+    stage_transport.stage_error = RuntimeError(private)
 
-    with pytest.raises(DesktopCoreBridgeErrorV1) as runtime_error:
-        runtime_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
-    assert runtime_error.value.error.code == "core_supervisor_runtime_preflight_failed"
-    assert private not in str(runtime_error.value)
-    assert BEARER not in str(runtime_error.value)
-    assert str(tmp_path) not in str(runtime_error.value)
-
-    upload_adapter, _upload_lifecycle, upload_transport = _adapter(tmp_path)
-    upload_transport.stage_error = RuntimeError(private)
-
-    with pytest.raises(DesktopCoreBridgeErrorV1) as upload_error:
-        upload_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
-    assert upload_error.value.error.code == "core_bootstrap_asset_upload_failed"
-    assert private not in str(upload_error.value)
-    assert BEARER not in str(upload_error.value)
-    assert str(tmp_path) not in str(upload_error.value)
+    with pytest.raises(DesktopCoreBridgeErrorV1) as stage_error:
+        stage_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+    assert stage_error.value.error.code == "daemon_bundle_stage_failed"
+    assert private not in str(stage_error.value)
+    assert BEARER not in str(stage_error.value)
+    assert str(tmp_path) not in str(stage_error.value)
 
 
-def test_core_host_partial_upload_retry_is_exact_and_idempotent(tmp_path: Path) -> None:
+def test_core_host_partial_daemon_stage_retry_is_exact_and_idempotent(
+    tmp_path: Path,
+) -> None:
     adapter, _lifecycle, transport = _adapter(tmp_path)
-    transport.stage_error = SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
+    transport.stage_error = SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as partial:
         adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
-    assert partial.value.error.code == "core_bootstrap_asset_upload_failed"
+    assert partial.value.error.code == "daemon_bundle_stage_failed"
 
     attachment = adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
     assert attachment.remote_port == 43117
     assert len(transport.stage_calls) == 2
-    assert transport.stage_calls[0]["bundle_id"] == transport.stage_calls[1]["bundle_id"]
+    assert transport.stage_calls[0]["bundle_sha256"] == transport.stage_calls[1]["bundle_sha256"]
 
 
-def test_core_host_maps_bootstrap_timeout_and_expired_deadline(tmp_path: Path) -> None:
-    preflight_transport = FakeCoreTransport()
-    preflight_transport.runtime_preflight_error = SshTransportError(SshTransportErrorCode.TIMEOUT)
-    preflight_adapter, _preflight_lifecycle, _preflight_transport = _adapter(
-        tmp_path,
-        preflight_transport,
-    )
-
-    with pytest.raises(DesktopCoreBridgeErrorV1) as preflight_timeout:
-        preflight_adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
-    assert (
-        preflight_timeout.value.error.code == "core_supervisor_runtime_preflight_deadline_exceeded"
-    )
-    assert preflight_transport.stage_calls == []
-
+def test_core_host_maps_daemon_timeout_and_expired_deadline(tmp_path: Path) -> None:
     transport = FakeCoreTransport()
-    transport.run_error = SshTransportError(SshTransportErrorCode.TIMEOUT)
+    transport.ensure_error = SshTransportError(SshTransportErrorCode.TIMEOUT)
     adapter, _lifecycle, _transport = _adapter(tmp_path, transport)
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as timeout:
         adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
-    assert timeout.value.error.code == "core_bootstrap_deadline_exceeded"
+    assert timeout.value.error.code == "daemon_bundle_start_deadline_exceeded"
     assert timeout.value.error.http_status == 504
     assert timeout.value.error.retryable is True
 

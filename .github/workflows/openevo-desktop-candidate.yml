@@ -16,10 +16,65 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  linux-daemon-bundle:
+    name: Build frozen Linux x86_64 Daemon bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require the reviewed stable source on Linux x86_64
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/stable"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$RUNNER_ENVIRONMENT" = "github-hosted"
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
+
+      - name: Install frozen Daemon build dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Test Daemon bundle and Desktop resource contracts
+        run: |
+          uv run python -m pytest \
+            tests/ci/test_build_openevo_daemon_bundle.py \
+            tests/ci/test_openevo_desktop_daemon_resource.py \
+            -q
+
+      - name: Build exact Core inputs and self-contained Daemon
+        run: |
+          uv run python scripts/ci/openevo_desktop_daemon_resource.py build \
+            --output-dir "$RUNNER_TEMP/openevo-desktop-daemon-inputs" \
+            --source-commit "$GITHUB_SHA"
+          test "$(find "$RUNNER_TEMP/openevo-desktop-daemon-inputs/core" -maxdepth 1 -type f -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          test -f "$RUNNER_TEMP/openevo-desktop-daemon-inputs/core/framework-lock.json"
+          test -x "$RUNNER_TEMP/openevo-desktop-daemon-inputs/daemon/openevo-daemon-linux-x86_64"
+          test -f "$RUNNER_TEMP/openevo-desktop-daemon-inputs/daemon/openevo-daemon-bundle.json"
+          test -f "$RUNNER_TEMP/openevo-desktop-daemon-inputs/daemon/SHA256SUMS"
+
+      - name: Upload immutable Daemon composition inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: openevo-desktop-daemon-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openevo-desktop-daemon-inputs
+          if-no-files-found: error
+          retention-days: 14
+
   macos-candidate:
     name: Build and smoke unsigned macOS candidate
     runs-on: macos-14
     timeout-minutes: 150
+    needs: linux-daemon-bundle
     outputs:
       manifest_sha256: ${{ steps.candidate.outputs.manifest_sha256 }}
     steps:
@@ -61,10 +116,31 @@ jobs:
           uv sync --frozen --group dev
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
+      - name: Download exact Linux Daemon composition inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: openevo-desktop-daemon-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openevo-desktop-daemon-inputs
+
+      - name: Restore and constrain Daemon composition input modes
+        run: |
+          daemon_inputs="$RUNNER_TEMP/openevo-desktop-daemon-inputs"
+          test "$(find "$daemon_inputs/core" -maxdepth 1 -type f -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          test "$(find "$daemon_inputs" -type f | wc -l | tr -d ' ')" = 5
+          test -z "$(find "$daemon_inputs" -type l -print -quit)"
+          chmod 0600 \
+            "$daemon_inputs"/core/openevo-*.whl \
+            "$daemon_inputs/core/framework-lock.json" \
+            "$daemon_inputs/daemon/openevo-daemon-bundle.json" \
+            "$daemon_inputs/daemon/SHA256SUMS"
+          chmod 0700 "$daemon_inputs/daemon/openevo-daemon-linux-x86_64"
+          echo "OPENEVO_DAEMON_INPUTS=$daemon_inputs" >> "$GITHUB_ENV"
+
       - name: Test packaging and candidate contracts
         run: |
           uv run python -m pytest \
             tests/ci/test_build_sidecar.py \
+            tests/ci/test_openevo_desktop_daemon_resource.py \
             tests/ci/test_check_openevo_release.py \
             tests/ci/test_openevo_release_candidate.py \
             tests/ci/test_openevo_release_evidence.py \
@@ -205,6 +281,8 @@ jobs:
           python packaging/build_sidecar.py \
             --core-wheel-output-dir "$RUNNER_TEMP/openevo-candidate-core" \
             --managed-runtime-archive "$OPENEVO_MANAGED_RUNTIME_ARCHIVE" \
+            --daemon-bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
+            --daemon-manifest "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-bundle.json" \
             --release-build
           echo "OPENEVO_CANDIDATE_CORE=$RUNNER_TEMP/openevo-candidate-core" >> "$GITHUB_ENV"
           sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-${OPENEVO_RUST_TARGET}"
@@ -232,6 +310,17 @@ jobs:
           test "${#registry_digest}" = 64
           echo "OPENEVO_REGISTRY_DIGEST=$registry_digest" >> "$GITHUB_ENV"
 
+      - name: Verify and stage controlled Daemon Tauri resources
+        run: |
+          uv run python scripts/ci/openevo_desktop_daemon_resource.py stage \
+            --bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
+            --manifest "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-bundle.json" \
+            --wheel "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl \
+            --framework-lock "$OPENEVO_CANDIDATE_CORE/framework-lock.json" \
+            --source-commit "$GITHUB_SHA" \
+            --registry-digest "$OPENEVO_REGISTRY_DIGEST" \
+            --output-dir desktop/src-tauri/release-resources/openevo-daemon
+
       - name: Check release-mode Tauri host
         working-directory: desktop/src-tauri
         run: |
@@ -244,7 +333,7 @@ jobs:
 
       - name: Build unsigned Desktop DMG for the runner architecture
         working-directory: desktop
-        run: npm run tauri:build -- --ci
+        run: npm run tauri:build -- --ci --config src-tauri/tauri.release.conf.json
 
       - name: Require native binary inspection tools
         run: |
@@ -260,6 +349,10 @@ jobs:
             "candidate-artifacts/OpenEvo-Desktop-${OPENEVO_VERSION}-${OPENEVO_ARCHITECTURE}.dmg"
           cp "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl candidate-artifacts/
           cp "$OPENEVO_CANDIDATE_CORE/framework-lock.json" candidate-artifacts/
+          cp "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
+            candidate-artifacts/
+          cp "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-bundle.json" \
+            candidate-artifacts/
           cp "$OPENEVO_MANAGED_RUNTIME_SOURCE" \
             candidate-artifacts/managed-runtime-source.json
 
@@ -300,6 +393,13 @@ jobs:
               Path(sys.argv[2]),
           )
           PY
+          uv run python scripts/ci/openevo_desktop_daemon_resource.py verify-app \
+            --app "$mounted_app" \
+            --bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
+            --manifest "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-bundle.json" \
+            --source-dmg "$dmg" \
+            --launch-origin mounted_dmg \
+            --evidence-out candidate-artifacts/daemon-mounted-resource.json
           uv run python scripts/ci/smoke_openevo_desktop_bundle.py \
             "$mounted_app" \
             --launch-origin mounted_dmg \
@@ -317,6 +417,13 @@ jobs:
             exit 1
           fi
           codesign --verify --deep --strict --verbose=2 "$copied_app"
+          uv run python scripts/ci/openevo_desktop_daemon_resource.py verify-app \
+            --app "$copied_app" \
+            --bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
+            --manifest "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-bundle.json" \
+            --source-dmg "$dmg" \
+            --launch-origin detached_copy \
+            --evidence-out candidate-artifacts/daemon-copy-resource.json
           uv run python scripts/ci/smoke_openevo_desktop_bundle.py \
             "$copied_app" \
             --launch-origin detached_copy \
@@ -378,7 +485,8 @@ jobs:
           rm -rf \
             .candidate-core \
             desktop/packaging/sidecar-build \
-            desktop/packaging/sidecar-dist
+            desktop/packaging/sidecar-dist \
+            desktop/src-tauri/release-resources
 
   linux-core-candidate:
     name: Verify exact candidate Core bytes on Linux
@@ -415,6 +523,7 @@ jobs:
           chmod 0600 \
             candidate-artifacts/openevo-*.whl \
             candidate-artifacts/framework-lock.json
+          chmod 0700 candidate-artifacts/openevo-daemon-linux-x86_64
           test "$(stat -c '%a' candidate-artifacts/framework-lock.json)" = 600
 
       - name: Verify candidate manifest and transferred manifest bytes
@@ -428,6 +537,8 @@ jobs:
             candidate-artifacts/release-candidate.json \
             --expected-source-commit "$GITHUB_SHA" \
             --expected-core-platform linux-x86_64
+          candidate-artifacts/openevo-daemon-linux-x86_64 \
+            smoke --deadline-seconds 60 > "$RUNNER_TEMP/candidate-daemon-smoke.json"
 
       - name: Redownload and bind the same managed subscription runtime source
         env:

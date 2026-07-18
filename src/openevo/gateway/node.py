@@ -83,6 +83,7 @@ from openevo.runtime.docker import (
     DockerRuntime,
     verify_managed_runtime_image_admission,
 )
+from openevo.runtime.docker_host import DockerHostPathSpec, HeldDockerSessionRoot
 from openevo.runtime.managed import (
     MANAGED_SUBSCRIPTION_ENV,
     ManagedCredentialMount,
@@ -1429,8 +1430,7 @@ async def _runtime_agent_system_target_inventory(
         or not isinstance(consumed, dict)
         or set(consumed) != {"files", "nodes", "bytes"}
         or any(
-            not isinstance(value, int) or isinstance(value, bool)
-            for value in consumed.values()
+            not isinstance(value, int) or isinstance(value, bool) for value in consumed.values()
         )
     ):
         budget.exhaust()
@@ -1472,9 +1472,8 @@ async def _runtime_agent_system_target_inventory(
                 "sha256": digest,
             }
         )
-    if (
-        consumed["files"] != len(files)
-        or consumed["bytes"] != sum(int(item["size_bytes"]) for item in files)
+    if consumed["files"] != len(files) or consumed["bytes"] != sum(
+        int(item["size_bytes"]) for item in files
     ):
         budget.exhaust()
         raise ValueError("runtime agent-system target inventory is invalid")
@@ -1585,6 +1584,7 @@ class GatewayNodeManager:
         evaluators: StrategyRegistry,
         default_runtime: RuntimeSpec | None = None,
         session_base_dir: str | None = None,
+        docker_host_path: DockerHostPathSpec | None = None,
         rollout_server_url: str | None = None,
         heartbeat_interval_seconds: int = 30,
         model_served: str | None = None,
@@ -1594,9 +1594,7 @@ class GatewayNodeManager:
         credential_authority: (
             HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
         ) = None,
-        managed_image_authority_verifier: (
-            Callable[[RuntimeSpec], Awaitable[None]] | None
-        ) = None,
+        managed_image_authority_verifier: (Callable[[RuntimeSpec], Awaitable[None]] | None) = None,
     ) -> None:
         self.node_id = node_id
         self.gateway_url = gateway_url.rstrip("/")
@@ -1608,15 +1606,24 @@ class GatewayNodeManager:
         self.builders = builders
         self.evaluators = evaluators
         self.default_runtime = default_runtime
+        self._docker_session_root: HeldDockerSessionRoot | None = None
+        if docker_host_path is not None:
+            mapped_session_base = Path(docker_host_path.runtime_container_root) / "sessions"
+            if session_base_dir is not None and Path(session_base_dir) != mapped_session_base:
+                raise ValueError(
+                    "session_base_dir must match the verified Docker runtime data root"
+                )
+            session_base_dir = os.fspath(mapped_session_base)
+            self._docker_session_root = HeldDockerSessionRoot.open(docker_host_path)
         self._session_base_dir = session_base_dir
+        self._docker_host_path = docker_host_path
         self.model_served = model_served
         self.evolution = evolution
         self.evolution_client = evolution_client
         self._internal_headers = dict(internal_headers or {})
         self._credential_authority = credential_authority
         self._managed_image_authority_verifier = (
-            managed_image_authority_verifier
-            or verify_managed_runtime_image_admission
+            managed_image_authority_verifier or verify_managed_runtime_image_admission
         )
         self._client = httpx.AsyncClient(
             timeout=30.0,
@@ -1664,6 +1671,13 @@ class GatewayNodeManager:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def close(self) -> None:
+        try:
+            await self._close()
+        finally:
+            if self._docker_session_root is not None:
+                self._docker_session_root.close()
+
+    async def _close(self) -> None:
         if self._cleanup_retry_task is not None:
             self._cleanup_retry_task.cancel()
             await asyncio.gather(self._cleanup_retry_task, return_exceptions=True)
@@ -1793,9 +1807,7 @@ class GatewayNodeManager:
         except DispatcherUnavailableError as exc:
             if prepared_credential is not None:
                 prepared_credential.close()
-            raise GatewayReadinessError(
-                "gateway dispatcher was not ready for admission"
-            ) from exc
+            raise GatewayReadinessError("gateway dispatcher was not ready for admission") from exc
 
         session_dir: Path | None = None
         session_root_identity: tuple[int, int, int] | None = None
@@ -1805,12 +1817,21 @@ class GatewayNodeManager:
         try:
             timer = StageTimer()
             timer.mark("dispatch", "started")
-            session_dir = Path(
-                mkdtemp(prefix=f"session-{session_id[:8]}-", dir=self._session_base_dir)
-            )
-            artifacts_dir = session_dir / "artifacts"
-            artifacts_dir.mkdir()
-            session_root_identity = capture_session_root_identity(session_dir)
+            if self._docker_session_root is None:
+                session_dir = Path(
+                    mkdtemp(prefix=f"session-{session_id[:8]}-", dir=self._session_base_dir)
+                )
+                artifacts_dir = session_dir / "artifacts"
+                artifacts_dir.mkdir()
+                session_root_identity = capture_session_root_identity(session_dir)
+            else:
+                session_dir, session_root_identity = (
+                    self._docker_session_root.create_private_directory(
+                        "session",
+                        child_directories=("artifacts",),
+                    )
+                )
+                artifacts_dir = session_dir / "artifacts"
             log_authority_dir, log_authority_identity = create_session_log_authority(
                 self._log_authority_root,
                 session_id,
@@ -2032,12 +2053,18 @@ class GatewayNodeManager:
                         }
                     }
                 )
+            docker_host_kwargs = (
+                {}
+                if self._docker_host_path is None
+                else {"docker_host_path": self._docker_host_path}
+            )
             if managed.credential_dir is None:
                 runtime = create_runtime(
                     runtime_spec,
                     request.session_id,
                     managed.session_dir,
                     docker_ownership_root=self._docker_ownership_root,
+                    **docker_host_kwargs,
                 )
             else:
                 runtime = create_runtime(
@@ -2046,6 +2073,7 @@ class GatewayNodeManager:
                     managed.session_dir,
                     credential_mount=managed.credential_mount,
                     docker_ownership_root=self._docker_ownership_root,
+                    **docker_host_kwargs,
                 )
             managed.runtime = runtime
             await self._await_with_budget(runtime.start(), managed)
@@ -2182,14 +2210,20 @@ class GatewayNodeManager:
         prepared_snapshot: PreparedCodexCredentialSnapshot,
     ) -> None:
         request = managed.request
-        credential_dir = Path(
-            mkdtemp(
-                prefix=f"credentials-{request.session_id[:8]}-",
-                dir=managed.session_dir.parent,
+        if self._docker_session_root is None:
+            credential_dir = Path(
+                mkdtemp(
+                    prefix=f"credentials-{request.session_id[:8]}-",
+                    dir=managed.session_dir.parent,
+                )
             )
-        )
+            credential_identity = capture_session_root_identity(credential_dir)
+        else:
+            credential_dir, credential_identity = (
+                self._docker_session_root.create_private_directory("credentials")
+            )
         managed.credential_dir = credential_dir
-        managed.credential_root_identity = capture_session_root_identity(credential_dir)
+        managed.credential_root_identity = credential_identity
         self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
 
         def persist_auth_identity(auth_identity: CredentialFileIdentity) -> None:
@@ -2801,15 +2835,30 @@ class GatewayNodeManager:
         """Create and prepare a fresh runtime for the evaluator. Returns None on failure."""
         request = managed.request
         runtime_spec = self._resolve_runtime_spec(request)
-        eval_session_dir = managed.session_dir / "eval_runtime"
+        if self._docker_session_root is None:
+            eval_session_dir = managed.session_dir / "eval_runtime"
+            eval_artifacts_dir = eval_session_dir / "artifacts"
+            eval_artifacts_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            if managed.session_root_identity is None:
+                raise RuntimeError("mapped evaluator session authority is incomplete")
+            eval_session_dir = self._docker_session_root.create_private_child_directory(
+                managed.session_dir,
+                managed.session_root_identity,
+                "eval_runtime",
+                child_directories=("artifacts",),
+            )
         eval_artifacts_dir = eval_session_dir / "artifacts"
-        eval_artifacts_dir.mkdir(parents=True, exist_ok=True)
+        docker_host_kwargs = (
+            {} if self._docker_host_path is None else {"docker_host_path": self._docker_host_path}
+        )
 
         eval_runtime = create_runtime(
             runtime_spec,
             f"{request.session_id}-eval",
             eval_session_dir,
             docker_ownership_root=self._docker_ownership_root,
+            **docker_host_kwargs,
         )
         managed.eval_runtime = eval_runtime
         try:

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import signal
 import stat
@@ -17,6 +18,12 @@ from pathlib import Path
 from typing import Final, Literal
 
 from openevo.runtime.base import BaseRuntime, RuntimeDownloadOperation
+from openevo.runtime.docker_host import (
+    DockerHostPathSpec,
+    HeldDockerSessionRoot,
+    docker_self_inspect_argv,
+    verify_docker_host_path,
+)
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     ManagedCredentialMount,
@@ -38,6 +45,7 @@ _OWNERSHIP_RECORD_LIMIT: Final[int] = 1024
 _CREDENTIAL_VIEW_NAME: Final[str] = ".openevo-codex-home"
 _IMAGE_INSPECT_MAX_BYTES: Final[int] = 1024 * 1024
 _IMAGE_INSPECT_TIMEOUT_SECONDS: Final[float] = 10.0
+_SESSION_ADOPTION_MARKER_BYTES: Final[int] = 64
 _OwnershipState = Literal[
     "none",
     "create_pending",
@@ -78,9 +86,7 @@ async def _inspect_managed_runtime_image(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env={
-            key: os.environ[key]
-            for key in ("HOME", "LANG", "LC_ALL", "PATH")
-            if key in os.environ
+            key: os.environ[key] for key in ("HOME", "LANG", "LC_ALL", "PATH") if key in os.environ
         },
         cwd="/",
         start_new_session=True,
@@ -140,6 +146,10 @@ async def _inspect_managed_runtime_image(
 
 def _object_identity(value: os.stat_result) -> tuple[int, int]:
     return (value.st_dev, value.st_ino)
+
+
+def _directory_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_mode, value.st_uid
 
 
 def _full_file_identity(
@@ -254,10 +264,26 @@ class DockerRuntime(BaseRuntime):
         *,
         credential_mount: ManagedCredentialMount | None = None,
         ownership_root: Path | None = None,
+        docker_host_path: DockerHostPathSpec | None = None,
     ) -> None:
         super().__init__(spec, session_id, session_dir)
+        self._docker_host_path = docker_host_path
+        self._docker_session_root: HeldDockerSessionRoot | None = None
+        self._session_mount_fd = -1
+        self._session_marker_name: str | None = None
+        self._session_marker_content: bytes | None = None
+        self._session_marker_identity: tuple[int, int, int, int, int, int] | None = None
+        session_docker_source = (
+            docker_host_path.translate(session_dir)
+            if docker_host_path is not None
+            else session_dir
+        )
         credential_dir = credential_mount.root if credential_mount is not None else None
-        credential_docker_source = credential_dir
+        credential_docker_source = (
+            docker_host_path.translate(credential_dir)
+            if docker_host_path is not None and credential_dir is not None
+            else credential_dir
+        )
         if credential_dir is not None:
             if not credential_dir.is_absolute():
                 raise ValueError("credential_dir must be absolute")
@@ -271,6 +297,7 @@ class DockerRuntime(BaseRuntime):
                 raise ValueError("credential_dir must be outside the session tree")
         self._credential_dir = credential_dir
         self._credential_docker_source = credential_docker_source
+        self._session_docker_source = session_docker_source
         self._credential_mount = credential_mount
         self._credential_root_fd = -1
         self._credential_view_fd = -1
@@ -602,9 +629,277 @@ class DockerRuntime(BaseRuntime):
                 raise RuntimeError("managed credential mount configuration changed")
         self._verify_credential_mount_pins()
 
+    async def _verify_docker_host_authority(self) -> None:
+        authority = self._docker_host_path
+        if authority is None:
+            return
+        if self._docker_session_root is not None:
+            self._docker_session_root.verify()
+        rc, stdout, _ = await self._run_local_command(
+            *docker_self_inspect_argv(),
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
+        )
+        if rc != 0:
+            raise RuntimeError("verified Docker release-host profile is unavailable")
+        verify_docker_host_path(
+            authority,
+            str(stdout or "").encode("utf-8"),
+        )
+        if self._docker_session_root is not None:
+            self._docker_session_root.verify()
+
+    def _pin_session_mount(self) -> None:
+        authority = self._docker_host_path
+        if authority is None:
+            return
+        if self._docker_session_root is not None or self._session_mount_fd >= 0:
+            raise RuntimeError("managed session mount is already pinned")
+        held_root = HeldDockerSessionRoot.open(authority)
+        session_fd = -1
+        opened_fds: list[int] = []
+        try:
+            sessions_path = Path(authority.runtime_container_root) / "sessions"
+            relative = self.session_dir.relative_to(sessions_path)
+            if not relative.parts:
+                raise RuntimeError("managed session mount must be below the sessions root")
+            parent_fd = held_root.sessions_fd
+            for part in relative.parts:
+                if part in {"", ".", ".."}:
+                    raise RuntimeError("managed session mount path is invalid")
+                session_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+                opened_fds.append(session_fd)
+                parent_fd = session_fd
+            opened = os.fstat(session_fd)
+            named = os.stat(self.session_dir, follow_symlinks=False)
+            expected = self._session_root_identity
+            if (
+                _directory_identity(opened) != expected
+                or _directory_identity(named) != expected
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or opened.st_nlink < 2
+            ):
+                raise RuntimeError("managed session mount identity changed")
+            self._docker_session_root = held_root
+            self._session_mount_fd = session_fd
+            opened_fds.pop()
+            session_fd = -1
+            self._verify_session_mount_pin()
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("managed session mount could not be pinned") from exc
+        finally:
+            while opened_fds:
+                os.close(opened_fds.pop())
+            if session_fd >= 0:
+                os.close(session_fd)
+            if self._docker_session_root is not held_root:
+                held_root.close()
+
+    def _verify_session_mount_pin(self) -> None:
+        held_root = self._docker_session_root
+        if held_root is None or self._session_mount_fd < 0:
+            raise RuntimeError("managed session mount authority is incomplete")
+        held_root.verify()
+        try:
+            opened = os.fstat(self._session_mount_fd)
+            named = os.stat(self.session_dir, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError("managed session mount authority is unavailable") from exc
+        if (
+            _directory_identity(opened) != self._session_root_identity
+            or _directory_identity(named) != self._session_root_identity
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or opened.st_nlink < 2
+        ):
+            raise RuntimeError("managed session mount authority changed")
+
+    def _create_session_adoption_marker(self) -> None:
+        if self._docker_host_path is None:
+            return
+        self._verify_session_mount_pin()
+        if self._session_marker_name is not None:
+            raise RuntimeError("managed session adoption marker already exists")
+        name = f".openevo-adoption-{secrets.token_hex(16)}"
+        content = secrets.token_hex(_SESSION_ADOPTION_MARKER_BYTES // 2).encode("ascii")
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=self._session_mount_fd,
+            )
+            os.fchmod(descriptor, 0o600)
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short marker write")
+                view = view[written:]
+            os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+            named = os.stat(
+                name,
+                dir_fd=self._session_mount_fd,
+                follow_symlinks=False,
+            )
+            identity = _full_file_identity(metadata)[:6]
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != len(content)
+                or _full_file_identity(named)[:6] != identity
+            ):
+                raise RuntimeError("managed session adoption marker is invalid")
+            os.fsync(self._session_mount_fd)
+            self._session_marker_name = name
+            self._session_marker_content = content
+            self._session_marker_identity = identity
+            self._verify_session_mount_pin()
+        except OSError as exc:
+            raise RuntimeError("managed session adoption marker could not be created") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    async def _verify_adopted_session_mount(self) -> None:
+        name = self._session_marker_name
+        content = self._session_marker_content
+        identity = self._session_marker_identity
+        if name is None or content is None or identity is None:
+            raise RuntimeError("managed session adoption authority is incomplete")
+        self._verify_session_mount_pin()
+        marker_path = f"{self.runtime_session_dir}/{name}"
+        rc, stdout, _ = await self._run_local_command(
+            "docker",
+            "exec",
+            self._container_ref,
+            "/usr/bin/stat",
+            "-Lc",
+            "%d %i %f %u %h %s",
+            marker_path,
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
+        )
+        fields = str(stdout or "").strip().split()
+        try:
+            observed = (
+                int(fields[0]),
+                int(fields[1]),
+                int(fields[2], 16),
+                int(fields[3]),
+                int(fields[4]),
+                int(fields[5]),
+            )
+        except (IndexError, ValueError) as exc:
+            raise RuntimeError("managed session adoption stat is invalid") from exc
+        if rc != 0 or len(fields) != 6 or observed != identity:
+            raise RuntimeError("managed session adoption identity changed")
+        rc, stdout, _ = await self._run_local_command(
+            "docker",
+            "exec",
+            self._container_ref,
+            "/usr/bin/head",
+            "-c",
+            str(len(content)),
+            marker_path,
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
+        )
+        if rc != 0 or str(stdout or "").encode("ascii", errors="strict") != content:
+            raise RuntimeError("managed session adoption proof did not match")
+        self._verify_session_mount_pin()
+
+    def _remove_session_adoption_marker(self) -> None:
+        name = self._session_marker_name
+        identity = self._session_marker_identity
+        if name is None:
+            return
+        if self._session_mount_fd < 0 or identity is None:
+            raise RuntimeError("managed session adoption cleanup authority is incomplete")
+        try:
+            named = os.stat(
+                name,
+                dir_fd=self._session_mount_fd,
+                follow_symlinks=False,
+            )
+            if _full_file_identity(named)[:6] != identity:
+                raise RuntimeError("managed session adoption marker identity changed")
+            os.unlink(name, dir_fd=self._session_mount_fd)
+            os.fsync(self._session_mount_fd)
+        except OSError as exc:
+            raise RuntimeError("managed session adoption marker could not be removed") from exc
+        self._session_marker_name = None
+        self._session_marker_content = None
+        self._session_marker_identity = None
+        self._verify_session_mount_pin()
+
+    def _release_session_mount_pin(self) -> None:
+        if self._session_mount_fd >= 0:
+            os.close(self._session_mount_fd)
+            self._session_mount_fd = -1
+        if self._docker_session_root is not None:
+            self._docker_session_root.close()
+            self._docker_session_root = None
+
+    async def _verify_created_session_mount(self) -> None:
+        if self._docker_host_path is None:
+            return
+        rc, stdout, _ = await self._run_local_command(
+            "docker",
+            "container",
+            "inspect",
+            "--format",
+            "{{json .Mounts}}",
+            self._container_ref,
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
+        )
+        try:
+            mounts = json.loads(str(stdout or ""))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("managed session mount inspect returned invalid JSON") from exc
+        matches = (
+            [
+                mount
+                for mount in mounts
+                if isinstance(mount, dict) and mount.get("Destination") == self.runtime_session_dir
+            ]
+            if isinstance(mounts, list)
+            else []
+        )
+        if (
+            rc != 0
+            or len(matches) != 1
+            or matches[0].get("Type") != "bind"
+            or matches[0].get("Source") != os.fspath(self._session_docker_source)
+            or matches[0].get("RW") is not True
+        ):
+            raise RuntimeError("managed session Docker bind configuration changed")
+
     async def start(self) -> None:
+        if self._docker_host_path is None:
+            await self._start()
+            return
+        self._pin_session_mount()
+        try:
+            self._create_session_adoption_marker()
+            await self._start()
+        except BaseException:
+            if self._session_marker_name is not None and self._session_mount_fd >= 0:
+                self._remove_session_adoption_marker()
+            if self._container_id is None and self._ownership_state == "none":
+                self._release_session_mount_pin()
+            raise
+
+    async def _start(self) -> None:
         if self._destroyed:
             raise RuntimeError("docker runtime was already destroyed")
+        await self._verify_docker_host_authority()
         create_image = await self._verified_create_image()
         if self._credential_mount is not None:
             self._pin_credential_mount()
@@ -633,7 +928,17 @@ class DockerRuntime(BaseRuntime):
             create_args.extend(["--cpus", str(self.spec.cpus)])
         if self.spec.memory_mb is not None:
             create_args.extend(["--memory", f"{self.spec.memory_mb}m"])
-        create_args.extend(["-v", f"{self.session_dir}:{self.runtime_session_dir}"])
+        if self._docker_host_path is None:
+            create_args.extend(["-v", f"{self.session_dir}:{self.runtime_session_dir}"])
+        else:
+            create_args.extend(
+                [
+                    "--mount",
+                    "type=bind,"
+                    f"source={self._session_docker_source},"
+                    f"target={self.runtime_session_dir}",
+                ]
+            )
         if self._credential_mount is not None:
             try:
                 root_source, auth_source = self._credential_mount_sources()
@@ -686,6 +991,14 @@ class DockerRuntime(BaseRuntime):
                 "docker create succeeded but container ownership could not be verified; "
                 "cleanup/recovery state was retained"
             )
+        if self._docker_host_path is not None:
+            try:
+                await self._verify_created_session_mount()
+            except Exception as exc:
+                await self.stop()
+                raise RuntimeError(
+                    "docker did not preserve the verified session bind configuration"
+                ) from exc
         if self._credential_mount is not None:
             try:
                 await self._verify_created_credential_mount()
@@ -712,6 +1025,15 @@ class DockerRuntime(BaseRuntime):
                 await self.stop()
                 raise RuntimeError(
                     "docker did not adopt the verified credential mount authority"
+                ) from exc
+        if self._docker_host_path is not None:
+            try:
+                await self._verify_adopted_session_mount()
+                self._remove_session_adoption_marker()
+            except Exception as exc:
+                await self.stop()
+                raise RuntimeError(
+                    "docker did not adopt the verified session filesystem object"
                 ) from exc
         # Skip the chmod when container and host UIDs match — recursive chmod
         # over a large session dir can be expensive and is only needed when the
@@ -923,17 +1245,31 @@ class DockerRuntime(BaseRuntime):
     async def stop(self) -> None:
         if self._destroyed:
             return
+        marker_cleanup_error: Exception | None = None
+        if self._session_marker_name is not None and self._session_mount_fd >= 0:
+            try:
+                self._remove_session_adoption_marker()
+            except Exception as exc:
+                marker_cleanup_error = exc
         if self._container_id is None:
             if self._create_succeeded or self._ownership_state != "none":
                 raise RuntimeError(
                     "docker create ownership is unresolved; cleanup/recovery state was retained"
                 )
             self._mark_no_ownership()
+            if marker_cleanup_error is not None:
+                raise RuntimeError(
+                    "managed session adoption marker cleanup failed"
+                ) from marker_cleanup_error
             return
 
         verification = await self._verify_container_id()
         if verification == "absent":
             self._mark_owned_container_absent()
+            if marker_cleanup_error is not None:
+                raise RuntimeError(
+                    "managed session adoption marker cleanup failed"
+                ) from marker_cleanup_error
             return
         if verification != "present":
             raise RuntimeError(
@@ -990,6 +1326,10 @@ class DockerRuntime(BaseRuntime):
                 f"{stderr or rc}"
             )
         self._mark_owned_container_absent()
+        if marker_cleanup_error is not None:
+            raise RuntimeError(
+                "managed session adoption marker cleanup failed"
+            ) from marker_cleanup_error
 
     def _prepare_create_ownership(self) -> None:
         self._ownership_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1305,6 +1645,7 @@ class DockerRuntime(BaseRuntime):
                 self._ownership_lock_fd = -1
             self._cidfile_identity = None
             self._release_credential_mount_pins()
+            self._release_session_mount_pin()
 
     async def _detect_chmod_needed(self) -> bool:
         """True unless the container's effective UID matches the host's."""

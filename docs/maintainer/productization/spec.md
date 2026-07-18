@@ -147,6 +147,7 @@ navigation or required user knowledge.
 | Remote harness | Codex |
 | Subscription execution | Supported; GPU is not required |
 | Self-deployed execution | Supported on a compatible NVIDIA GPU host |
+| First subscription release-host profile | `docker_user_container_v1` |
 | Evolution targets | Textual memory, skill bundle, and agent system |
 | Evolution timing | Cross-session only |
 | Desktop package | Unsigned, non-notarized DMG |
@@ -187,11 +188,27 @@ It validates the product's remote proxy/mirror behavior for users in restricted
 networks; it does not claim universal availability across every mainland China
 carrier, proxy provider, or changing third-party service policy.
 
-Both execution modes require a release-supported Docker Engine API available to
-the remote user. Self-Deployed additionally requires a compatible NVIDIA
-driver, NVIDIA Container Toolkit, sufficient VRAM, and sufficient model
-storage. Each release carries a versioned host profile with the exact Docker,
-driver/CUDA, VRAM, memory, disk, and model constraints enforced by preflight.
+The first supported Subscription host profile is
+`docker_user_container_v1`. The Daemon runs inside the remote user's Linux
+container, the container can use the host Docker Engine API, and it has a
+writable bind-mounted data root. The Daemon MUST identify its own container,
+pin the exact container and mount identity returned by Docker, keep all runtime
+session and staged credential state below the verified container-side data
+root, and translate every child-container bind source through the corresponding
+Docker-daemon-side root. It MUST verify the resulting child-container mounts
+after creation. Missing, ambiguous, changed, read-only, or non-bind mount
+evidence blocks readiness. A bare host without the supported Docker API is not
+part of this first profile, and OpenEvo never falls back to unsandboxed host
+execution. The first profile also requires Docker's default short-container-ID
+hostname (`Config.Hostname == Id[:12]`) as the Daemon's initial
+self-identification input; preflight MUST verify it rather than accepting an
+operator-selected hostname.
+
+Self-Deployed currently requires a release-supported Docker Engine API,
+compatible NVIDIA driver, NVIDIA Container Toolkit, sufficient VRAM, and
+sufficient model storage. Each release carries versioned host profiles with the
+exact container, bind-root, Docker, driver/CUDA, VRAM, memory, disk, and model
+constraints enforced by preflight.
 
 The release MUST preserve the established Core execution/evolution data path and
 validated evolution algorithms. Productization may reorganize paths, packaging,
@@ -545,8 +562,10 @@ A supported remote host provides:
 - Ubuntu and architecture from the release matrix;
 - SSH access to a writable user home;
 - enough memory and disk for the selected project execution settings;
-- a Docker Engine version and API from the release host profile, usable by the
-  remote user;
+- the exact `docker_user_container_v1` profile for the first Subscription
+  release: a Docker Engine version and API usable by the remote user plus a
+  writable bind-mounted data root whose container-side and
+  Docker-daemon-side paths can be proven by the Daemon;
 - outbound access or a configured proxy/mirror for required downloads.
 
 Self-Deployed additionally provides:
@@ -672,7 +691,7 @@ Within the supported host baseline, OpenEvo prepares:
 
 - the Daemon and user-space dependencies;
 - a pinned supported Codex CLI;
-- managed science runtime images;
+- the managed science runtime image;
 - the pinned vLLM image for Self-Deployed;
 - exact Hugging Face model snapshots;
 - user-level service configuration;
@@ -712,7 +731,7 @@ Doctor is read-only and checks:
 - release and registry identity;
 - state and bundle integrity;
 - child services and ports;
-- Docker Engine access;
+- Docker Engine capability and the verified user-container bind-root identity;
 - Codex installation and authentication;
 - GPU and NVIDIA runtime where required;
 - image and model availability;
@@ -1575,6 +1594,7 @@ feature compatibility range
 Core and verified registry identity
 Codex CLI version, source, integrity, and license identity
 managed science runtime image digest
+verified release-host profile schema and closed constraints
 vLLM image digest
 validated self-deployed model profile
 validated remote-host profile
@@ -1585,6 +1605,13 @@ retention, log-rotation, and cache-eviction policy
 gate-profile and evidence-schema digests
 artifact checksums
 ```
+
+The static release manifest does not bind an observed host path, container ID,
+mount ID, bind-root inode, or session inode. Those identities exist only after
+deployment and MUST be captured and pinned by runtime preflight and admission,
+then carried by the applicable execution receipt. The receipt binds the
+observed identities to the manifest-bound profile constraints and release
+identity.
 
 No manifest, checksum inventory, evidence index, or attestation includes its
 own digest. An outer inventory may bind an inner object; self-referential hash
@@ -1765,8 +1792,10 @@ machine identity.
 ### G3. Clean Subscription Deployment
 
 Environment: each claimed subscription-capable Linux host profile, with SSH
-and release-supported Docker Engine but no usable NVIDIA GPU, OpenEvo, Python,
-`rsync`, Codex, or managed runtime image.
+to a fresh `docker_user_container_v1` user container. The container can use the
+supported host Docker Engine and has an empty writable bind-mounted data root,
+but has no usable NVIDIA GPU, OpenEvo, Python, `rsync`, Codex, or managed
+runtime image.
 
 Pass criteria:
 
@@ -1774,7 +1803,9 @@ Pass criteria:
 - every row stays within its declared phase/overall deadlines and retry
   cardinalities, with user-login waiting accounted separately;
 - Desktop installs and attaches the exact Daemon Bundle;
-- Codex and the runtime image are prepared through Desktop;
+- the Daemon verifies and pins its Docker bind-root mapping before run
+  admission;
+- Codex and the managed runtime image are prepared through Desktop;
 - the user completes the mediated subscription login;
 - one real no-evolution task runs through Codex with transcript capture and an
   immutable matching execution receipt;

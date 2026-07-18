@@ -21,6 +21,11 @@ MANIFEST_NAME = "release-candidate.json"
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 MANAGED_RUNTIME_SOURCE_NAME = "managed-runtime-source.json"
+DAEMON_BUNDLE_NAME = "openevo-daemon-linux-x86_64"
+DAEMON_MANIFEST_NAME = "openevo-daemon-bundle.json"
+DAEMON_MOUNTED_EVIDENCE_NAME = "daemon-mounted-resource.json"
+DAEMON_COPY_EVIDENCE_NAME = "daemon-copy-resource.json"
+DAEMON_RESOURCE_ROOT = "Contents/Resources/openevo-daemon"
 MINIMUM_MACOS_VERSION = "12.0"
 TAURI_EXECUTABLE_NAME = "openevo-desktop"
 CORE_PYTHON_REQUIRES = ">=3.11"
@@ -56,6 +61,10 @@ REQUIRED_INPUT_ROLES = (
     ("desktop_dmg", None),
     ("core_wheel", None),
     ("framework_lock", "framework-lock.json"),
+    ("daemon_bundle", DAEMON_BUNDLE_NAME),
+    ("daemon_manifest", DAEMON_MANIFEST_NAME),
+    ("daemon_mounted_resource", DAEMON_MOUNTED_EVIDENCE_NAME),
+    ("daemon_copy_resource", DAEMON_COPY_EVIDENCE_NAME),
     ("release_notes", "release-notes.md"),
     ("dependency_inventory", "dependency-inventory.json"),
     ("license_inventory", "license-inventory.json"),
@@ -406,6 +415,197 @@ def _validate_framework_lock(lock_path: Path, wheel: Path, *, version: str) -> d
     ):
         raise CandidateError("framework-lock.json does not bind the exact Core wheel")
     return lock
+
+
+def validate_daemon_release_inputs(
+    *,
+    bundle: Path,
+    manifest_path: Path,
+    wheel: Path,
+    framework_lock: Path,
+    source_commit: str,
+    registry_digest: str,
+) -> dict[str, object]:
+    if not _is_regular_file(bundle) or bundle.name != DAEMON_BUNDLE_NAME:
+        raise CandidateError("Daemon bundle must be the canonical regular release binary")
+    if not _is_regular_file(manifest_path) or manifest_path.name != DAEMON_MANIFEST_NAME:
+        raise CandidateError("Daemon manifest must be the canonical regular release manifest")
+    _require_digest(registry_digest, "Daemon registry digest")
+    manifest = _load_json(manifest_path)
+    expected_keys = {
+        "artifact",
+        "build_environment_distributions",
+        "core",
+        "dependency_lock",
+        "platform",
+        "release",
+        "runtime",
+        "schema_version",
+        "smoke",
+    }
+    if type(manifest) is not dict or set(manifest) != expected_keys:
+        raise CandidateError("Daemon manifest does not use the closed release schema")
+    if manifest_path.read_bytes() != _canonical_json(manifest):
+        raise CandidateError("Daemon manifest is not canonical")
+
+    artifact = manifest.get("artifact")
+    if (
+        type(artifact) is not dict
+        or set(artifact) != {"filename", "sha256", "size"}
+        or artifact.get("filename") != DAEMON_BUNDLE_NAME
+        or artifact.get("sha256") != _sha256(bundle)
+        or artifact.get("size") != bundle.stat().st_size
+        or type(artifact.get("size")) is not int
+        or artifact["size"] < 1
+    ):
+        raise CandidateError("Daemon manifest does not bind the exact bundle")
+
+    version = _wheel_version(wheel)
+    _validate_wheel(wheel, version=version)
+    lock = _validate_framework_lock(
+        framework_lock,
+        wheel,
+        version=version,
+    )
+    core = manifest.get("core")
+    if (
+        type(core) is not dict
+        or set(core) != {"framework_lock", "registry_digest", "wheel"}
+        or core.get("framework_lock")
+        != {
+            "filename": framework_lock.name,
+            "sha256": _sha256(framework_lock),
+        }
+        or core.get("registry_digest") != registry_digest
+        or core.get("wheel")
+        != {
+            "filename": wheel.name,
+            "sha256": _sha256(wheel),
+            "size": wheel.stat().st_size,
+            "version": lock["distribution_version"],
+        }
+    ):
+        raise CandidateError("Daemon manifest does not bind the candidate Core wheel and lock")
+
+    dependency_lock = manifest.get("dependency_lock")
+    uv_lock = REPO_ROOT / "uv.lock"
+    if dependency_lock != {"filename": "uv.lock", "sha256": _sha256(uv_lock)}:
+        raise CandidateError("Daemon manifest does not bind the checkout dependency lock")
+    if manifest.get("platform") != {"architecture": "x86_64", "system": "linux"}:
+        raise CandidateError("Daemon manifest platform is not Linux x86_64")
+    release = manifest.get("release")
+    if (
+        type(release) is not dict
+        or set(release) != {"identity", "source_commit"}
+        or release.get("source_commit") != source_commit
+    ):
+        raise CandidateError("Daemon manifest does not bind the candidate source commit")
+    _require_digest(release.get("identity"), "Daemon release identity")
+    runtime = manifest.get("runtime")
+    if (
+        type(runtime) is not dict
+        or set(runtime)
+        != {"format", "python", "system_python_required", "target_pypi_required"}
+        or runtime.get("format") != "pyinstaller-onefile"
+        or runtime.get("system_python_required") is not False
+        or runtime.get("target_pypi_required") is not False
+        or type(runtime.get("python")) is not dict
+        or set(runtime["python"]) != {"implementation", "version"}
+        or runtime["python"].get("implementation") != "CPython"
+        or type(runtime["python"].get("version")) is not str
+        or not runtime["python"]["version"]
+    ):
+        raise CandidateError("Daemon runtime contract is invalid")
+    if manifest.get("schema_version") != 1 or manifest.get("smoke") != {
+        "backend_readiness": "passed",
+        "controlled_exit": "passed",
+        "identity": "passed",
+    }:
+        raise CandidateError("Daemon release smoke evidence is incomplete")
+    distributions = manifest.get("build_environment_distributions")
+    if (
+        type(distributions) is not list
+        or not distributions
+        or any(
+            type(item) is not dict
+            or set(item) != {"name", "version"}
+            or type(item["name"]) is not str
+            or not item["name"]
+            or type(item["version"]) is not str
+            or not item["version"]
+            for item in distributions
+        )
+        or distributions
+        != sorted(distributions, key=lambda item: (item["name"], item["version"]))
+        or len(distributions)
+        != len({(item["name"], item["version"]) for item in distributions})
+    ):
+        raise CandidateError("Daemon build distribution inventory is invalid")
+    return manifest
+
+
+def _wheel_version(wheel: Path) -> str:
+    try:
+        with ZipFile(wheel) as archive:
+            metadata_names = [
+                name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+            ]
+            if len(metadata_names) != 1:
+                raise CandidateError("Core wheel metadata is incomplete")
+            metadata = Parser().parsestr(archive.read(metadata_names[0]).decode("utf-8"))
+    except (BadZipFile, OSError, UnicodeDecodeError) as exc:
+        raise CandidateError("Core wheel is unreadable") from exc
+    version = metadata.get("Version")
+    if type(version) is not str or not version:
+        raise CandidateError("Core wheel version is invalid")
+    return version
+
+
+def _validate_daemon_resource_evidence(
+    path: Path,
+    *,
+    launch_origin: str,
+    dmg_path: Path,
+    bundle_entry: dict[str, object],
+    manifest_entry: dict[str, object],
+) -> None:
+    evidence = _load_json(path)
+    if type(evidence) is not dict or set(evidence) != {
+        "daemon_bundle",
+        "daemon_manifest",
+        "launch_origin",
+        "schema_version",
+        "source_dmg",
+    }:
+        raise CandidateError(f"{path.name} does not use the closed Daemon resource schema")
+    if evidence.get("schema_version") != 1 or evidence.get("launch_origin") != launch_origin:
+        raise CandidateError(f"{path.name} Daemon resource origin is invalid")
+    if evidence.get("source_dmg") != {
+        "filename": dmg_path.name,
+        "sha256": _sha256(dmg_path),
+    }:
+        raise CandidateError(f"{path.name} does not bind the exact source DMG")
+    expected_resources = {
+        "daemon_bundle": (
+            bundle_entry,
+            f"{DAEMON_RESOURCE_ROOT}/{DAEMON_BUNDLE_NAME}",
+        ),
+        "daemon_manifest": (
+            manifest_entry,
+            f"{DAEMON_RESOURCE_ROOT}/{DAEMON_MANIFEST_NAME}",
+        ),
+    }
+    for field, (entry, relative_path) in expected_resources.items():
+        value = evidence.get(field)
+        if (
+            type(value) is not dict
+            or set(value) != {"byte_size", "filename", "relative_path", "sha256"}
+            or value.get("byte_size") != entry["byte_size"]
+            or value.get("filename") != entry["filename"]
+            or value.get("relative_path") != relative_path
+            or value.get("sha256") != entry["sha256"]
+        ):
+            raise CandidateError(f"{path.name} does not bind the exact packaged {field}")
 
 
 def _validate_mach_o_observation(payload: object, *, subject: str) -> list[str]:
@@ -822,10 +1022,32 @@ def create_candidate_manifest(
     wheel = paths["core_wheel"]
     _validate_wheel(wheel, version=version)
     _validate_framework_lock(paths["framework_lock"], wheel, version=version)
+    daemon_manifest = validate_daemon_release_inputs(
+        bundle=paths["daemon_bundle"],
+        manifest_path=paths["daemon_manifest"],
+        wheel=wheel,
+        framework_lock=paths["framework_lock"],
+        source_commit=source_commit,
+        registry_digest=registry_digest,
+    )
     native_architectures = _validate_evidence(
         root,
         architecture=architecture,
         dmg_path=paths["desktop_dmg"],
+    )
+    _validate_daemon_resource_evidence(
+        paths["daemon_mounted_resource"],
+        launch_origin="mounted_dmg",
+        dmg_path=paths["desktop_dmg"],
+        bundle_entry=_file_entry("daemon_bundle", paths["daemon_bundle"]),
+        manifest_entry=_file_entry("daemon_manifest", paths["daemon_manifest"]),
+    )
+    _validate_daemon_resource_evidence(
+        paths["daemon_copy_resource"],
+        launch_origin="detached_copy",
+        dmg_path=paths["desktop_dmg"],
+        bundle_entry=_file_entry("daemon_bundle", paths["daemon_bundle"]),
+        manifest_entry=_file_entry("daemon_manifest", paths["daemon_manifest"]),
     )
     if _load_json(paths["managed_runtime_source"]) != _managed_runtime_source_evidence():
         raise CandidateError("managed runtime source evidence is invalid")
@@ -865,6 +1087,13 @@ def create_candidate_manifest(
             "descriptor_sha256": _sha256(descriptor_path),
             "registry_digest": registry_digest,
         },
+        "daemon": {
+            "artifact_filename": paths["daemon_bundle"].name,
+            "artifact_sha256": _sha256(paths["daemon_bundle"]),
+            "manifest_filename": paths["daemon_manifest"].name,
+            "manifest_sha256": _sha256(paths["daemon_manifest"]),
+            "release_identity": daemon_manifest["release"]["identity"],
+        },
         "files": files,
         "macos": {
             "architecture": architecture,
@@ -878,7 +1107,7 @@ def create_candidate_manifest(
             "notarized": False,
             "signed": False,
         },
-        "schema_version": 3,
+        "schema_version": 4,
         "source_commit": source_commit,
         "version": version,
     }
@@ -908,6 +1137,7 @@ def _validate_candidate_manifest(
         "macos",
         "managed_runtime",
         "core",
+        "daemon",
         "files",
     }
     if type(manifest) is not dict or set(manifest) != required_keys:
@@ -918,8 +1148,9 @@ def _validate_candidate_manifest(
     macos = manifest.get("macos")
     managed_runtime = manifest.get("managed_runtime")
     core = manifest.get("core")
+    daemon = manifest.get("daemon")
     files = manifest.get("files")
-    if manifest.get("schema_version") != 3:
+    if manifest.get("schema_version") != 4:
         raise CandidateError("candidate manifest schema version is invalid")
     if type(source_commit) is not str or SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise CandidateError("candidate source commit is invalid")
@@ -1000,6 +1231,22 @@ def _validate_candidate_manifest(
         or core.get("descriptor_sha256") != by_role["core_descriptor"]["sha256"]
     ):
         raise CandidateError("candidate Core descriptor identity is inconsistent")
+    if type(daemon) is not dict or set(daemon) != {
+        "artifact_filename",
+        "artifact_sha256",
+        "manifest_filename",
+        "manifest_sha256",
+        "release_identity",
+    }:
+        raise CandidateError("candidate Daemon identity is invalid")
+    if (
+        daemon.get("artifact_filename") != by_role["daemon_bundle"]["filename"]
+        or daemon.get("artifact_sha256") != by_role["daemon_bundle"]["sha256"]
+        or daemon.get("manifest_filename") != by_role["daemon_manifest"]["filename"]
+        or daemon.get("manifest_sha256") != by_role["daemon_manifest"]["sha256"]
+    ):
+        raise CandidateError("candidate Daemon file identity is inconsistent")
+    _require_digest(daemon.get("release_identity"), "candidate Daemon release identity")
 
     descriptor_path = root / str(by_role["core_descriptor"]["filename"])
     descriptor = _load_json(descriptor_path)
@@ -1031,6 +1278,16 @@ def _validate_candidate_manifest(
     lock_path = root / str(by_role["framework_lock"]["filename"])
     _validate_wheel(wheel_path, version=version)
     _validate_framework_lock(lock_path, wheel_path, version=version)
+    daemon_manifest = validate_daemon_release_inputs(
+        bundle=root / str(by_role["daemon_bundle"]["filename"]),
+        manifest_path=root / str(by_role["daemon_manifest"]["filename"]),
+        wheel=wheel_path,
+        framework_lock=lock_path,
+        source_commit=source_commit,
+        registry_digest=str(core["registry_digest"]),
+    )
+    if daemon.get("release_identity") != daemon_manifest["release"]["identity"]:
+        raise CandidateError("candidate Daemon release identity is inconsistent")
     observed_native_architectures = _validate_evidence(
         root,
         architecture=architecture,
@@ -1038,6 +1295,20 @@ def _validate_candidate_manifest(
     )
     if observed_native_architectures != native_architectures:
         raise CandidateError("candidate manifest Mach-O slices do not match native evidence")
+    _validate_daemon_resource_evidence(
+        root / str(by_role["daemon_mounted_resource"]["filename"]),
+        launch_origin="mounted_dmg",
+        dmg_path=root / str(by_role["desktop_dmg"]["filename"]),
+        bundle_entry=by_role["daemon_bundle"],
+        manifest_entry=by_role["daemon_manifest"],
+    )
+    _validate_daemon_resource_evidence(
+        root / str(by_role["daemon_copy_resource"]["filename"]),
+        launch_origin="detached_copy",
+        dmg_path=root / str(by_role["desktop_dmg"]["filename"]),
+        bundle_entry=by_role["daemon_bundle"],
+        manifest_entry=by_role["daemon_manifest"],
+    )
     if (
         _load_json(root / str(by_role["managed_runtime_source"]["filename"]))
         != _managed_runtime_source_evidence()

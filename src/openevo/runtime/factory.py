@@ -7,13 +7,16 @@ from pathlib import Path
 from openevo._imports import import_subclass
 from openevo.runtime.apptainer import ApptainerRuntime
 from openevo.runtime.base import BaseRuntime
+from openevo.runtime.bubblewrap import BubblewrapRuntime
 from openevo.runtime.docker import DockerRuntime
+from openevo.runtime.docker_host import DockerHostPathSpec
 from openevo.runtime.managed import ManagedCredentialMount
 from openevo.runtime.models import RuntimeSpec
 
 _BUILTIN_BACKENDS: dict[str, type[BaseRuntime]] = {
     "docker": DockerRuntime,
     "apptainer": ApptainerRuntime,
+    "bubblewrap": BubblewrapRuntime,
 }
 
 
@@ -24,13 +27,17 @@ def create_runtime(
     *,
     credential_mount: ManagedCredentialMount | None = None,
     docker_ownership_root: Path | None = None,
+    docker_host_path: DockerHostPathSpec | None = None,
 ) -> BaseRuntime:
     """Instantiate a runtime from a RuntimeSpec.
 
-    Uses the built-in backend map for ``docker`` and ``apptainer``.
+    Uses the built-in backend map for ``docker``, ``apptainer``, and
+    ``bubblewrap``.
     Falls back to ``spec.import_path`` for plugin runtimes.
     """
     if spec.import_path:
+        if docker_host_path is not None:
+            raise ValueError("Docker host paths cannot be passed to a plugin runtime")
         if credential_mount is not None:
             raise ValueError("managed credentials cannot be passed to a plugin runtime")
         cls = _import_runtime_class(spec.import_path)
@@ -47,8 +54,11 @@ def create_runtime(
             session_dir,
             credential_mount=credential_mount,
             ownership_root=docker_ownership_root,
+            docker_host_path=docker_host_path,
         )
     else:
+        if docker_host_path is not None:
+            raise ValueError("Docker host paths cannot be passed to a non-Docker runtime")
         if credential_mount is not None:
             raise ValueError("managed credentials require the Docker runtime")
         runtime = cls(spec, session_id, session_dir)

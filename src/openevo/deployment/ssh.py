@@ -22,10 +22,28 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, NoReturn, Protocol
+from typing import TYPE_CHECKING, BinaryIO, NoReturn, Protocol
 
 from pydantic import SecretStr
 
+from openevo.deployment.daemon_bundle_transport import (
+    DOCKER_USER_CONTAINER_V1,
+    DaemonBundleIdentity,
+    DaemonBundleServiceStatus,
+    DaemonBundleStopReceipt,
+    DaemonBundleTransportContractError,
+    OpenedDaemonBundle,
+    StagedDaemonBundle,
+    build_daemon_bundle_ensure_command,
+    build_daemon_bundle_identity_command,
+    build_daemon_bundle_inspect_command,
+    build_daemon_bundle_stage_command,
+    build_daemon_bundle_stop_command,
+    parse_daemon_bundle_identity,
+    parse_daemon_bundle_service_status,
+    parse_daemon_bundle_stop_receipt,
+    parse_staged_daemon_bundle,
+)
 from openevo.deployment.core_assets import (
     CORE_ASSET_TRANSFER_LEASE,
     CoreBootstrapAssetSnapshotError,
@@ -50,6 +68,12 @@ from openevo.deployment.managed_runtime_assets import (
     ManagedRuntimeArchiveSnapshotError,
     ManagedRuntimeLoadReceipt,
     ManagedRuntimeTransfer,
+    OpenedManagedRuntimeArchive,
+    build_daemon_managed_runtime_discard_command,
+    build_daemon_managed_runtime_finalize_command,
+    build_daemon_managed_runtime_prepare_command,
+    build_daemon_managed_runtime_probe_command,
+    build_daemon_managed_runtime_receive_command,
     build_managed_runtime_discard_command,
     build_managed_runtime_finalize_command,
     build_managed_runtime_prepare_command,
@@ -58,6 +82,7 @@ from openevo.deployment.managed_runtime_assets import (
     parse_managed_runtime_discard,
     parse_managed_runtime_prepare,
     parse_managed_runtime_probe,
+    parse_managed_runtime_receive,
     parse_managed_runtime_receipt,
     snapshot_managed_runtime_archive,
 )
@@ -72,7 +97,14 @@ from openevo.deployment.system_executables import (
     VerifiedSystemExecutable,
 )
 
+if TYPE_CHECKING:
+    from openevo.deployment.core_control import RemoteCoreControlAttachment
+
 CompletedRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
+StreamingRunner = Callable[
+    [list[str], float, int, threading.Event | None],
+    subprocess.CompletedProcess[str],
+]
 PortAllocator = Callable[[], int]
 TunnelStarter = Callable[[list[str]], "TunnelProcess"]
 CoreConnectionStarter = Callable[[list[str], int], "TunnelProcess"]
@@ -207,6 +239,7 @@ class SshTransportErrorCode(str, Enum):
     CORE_RUNTIME_UNSUPPORTED = "core_runtime_unsupported"
     CORE_RUNTIME_PREFLIGHT_FAILED = "core_runtime_preflight_failed"
     MANAGED_RUNTIME_FAILED = "managed_runtime_failed"
+    DAEMON_BUNDLE_FAILED = "daemon_bundle_failed"
     CANCELLED = "ssh_operation_cancelled"
     INVALID_REQUEST = "invalid_ssh_request"
     TIMEOUT = "ssh_timeout"
@@ -242,6 +275,9 @@ class SshTransportError(RuntimeError):
             ),
             SshTransportErrorCode.MANAGED_RUNTIME_FAILED: (
                 "Managed Science runtime preparation failed."
+            ),
+            SshTransportErrorCode.DAEMON_BUNDLE_FAILED: (
+                "OpenEvo Daemon bundle staging or control failed."
             ),
             SshTransportErrorCode.CANCELLED: "SSH operation was cancelled.",
             SshTransportErrorCode.INVALID_REQUEST: "SSH request is invalid.",
@@ -809,6 +845,7 @@ class SshRemoteExecutorTransport:
         *,
         trusted_host: TrustedKnownHostsBinding | None = None,
         runner: CompletedRunner | None = None,
+        streaming_runner: StreamingRunner | None = None,
         tunnel_starter: TunnelStarter | None = None,
         port_allocator: PortAllocator | None = None,
         core_connection_starter: CoreConnectionStarter | None = None,
@@ -834,6 +871,8 @@ class SshRemoteExecutorTransport:
         self._trusted_host = trusted_host
         self._runner = runner or _run_subprocess
         self._uses_default_runner = runner is None
+        self._streaming_runner = streaming_runner or _run_streaming_subprocess
+        self._uses_default_streaming_runner = streaming_runner is None
         self._tunnel_starter = tunnel_starter
         self._port_allocator = port_allocator or _allocate_local_port
         self._core_connection_starter = core_connection_starter
@@ -898,9 +937,7 @@ class SshRemoteExecutorTransport:
 
     def _register_tunnel(self, tunnel: SshTunnel | SshCoreTunnel) -> None:
         with self._operation_guard:
-            self._active_tunnels = {
-                active for active in self._active_tunnels if not active.closed
-            }
+            self._active_tunnels = {active for active in self._active_tunnels if not active.closed}
             if not self._closed:
                 self._active_tunnels.add(tunnel)
                 return
@@ -954,6 +991,59 @@ class SshRemoteExecutorTransport:
                 _raise_if_cancelled(cancel_event)
                 self._require_open()
                 completed = self._runner(argv, timeout_seconds)
+            _raise_if_cancelled(cancel_event)
+            self._require_open()
+            return completed, known_hosts_file
+        finally:
+            trust_ownership.release_if_caller_owned()
+
+    def _run_trusted_streaming_subprocess(
+        self,
+        argv_factory: Callable[[Path], list[str]],
+        timeout_seconds: float,
+        *,
+        stdin_fd: int,
+        cancel_event: threading.Event | None,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        _raise_if_cancelled(cancel_event)
+        self._require_open()
+        trust_lease = self._trusted_host.open_for_spawn(self._profile)
+        try:
+            known_hosts_file = trust_lease.__enter__()
+        except Exception:
+            _release_trust_lease(trust_lease)
+            raise _KnownHostsSpawnFailure from None
+        except BaseException:
+            _release_trust_lease(trust_lease)
+            raise
+        try:
+            trust_ownership = _KnownHostsLeaseOwnership(trust_lease)
+        except BaseException:
+            _release_trust_lease(trust_lease)
+            raise
+        try:
+            argv = argv_factory(known_hosts_file)
+            if self._uses_default_streaming_runner:
+                completed = _run_streaming_subprocess(
+                    argv,
+                    timeout_seconds,
+                    stdin_fd,
+                    cancel_event,
+                    trust_ownership=trust_ownership,
+                    env=self._process_environment(),
+                    agent_socket_source=self._agent_socket_source,
+                    on_start=self._register_subprocess,
+                    on_finish=self._unregister_subprocess,
+                )
+            else:
+                _raise_if_cancelled(cancel_event)
+                self._require_open()
+                completed = self._streaming_runner(
+                    argv,
+                    timeout_seconds,
+                    stdin_fd,
+                    cancel_event,
+                )
             _raise_if_cancelled(cancel_event)
             self._require_open()
             return completed, known_hosts_file
@@ -1075,6 +1165,492 @@ class SshRemoteExecutorTransport:
         if completed.returncode != 0:
             _log_transport_failure(SshTransportErrorCode.RSYNC_FAILED)
             raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
+
+    def stage_daemon_bundle(
+        self,
+        *,
+        bundle_path: str,
+        bundle_sha256: str,
+        bundle_size: int,
+        timeout_seconds: float = 300.0,
+        cancel_event: threading.Event | None = None,
+    ) -> StagedDaemonBundle:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= 300
+            or (cancel_event is not None and not isinstance(cancel_event, threading.Event))
+        ):
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        service_root = f"/home/{self._profile.user}/.openevo/daemon-bundles"
+        try:
+            snapshot = OpenedDaemonBundle.open(
+                bundle_path,
+                expected_sha256=bundle_sha256,
+                expected_size=bundle_size,
+            )
+        except (OSError, DaemonBundleTransportContractError):
+            _log_transport_failure(SshTransportErrorCode.INVALID_REQUEST)
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+
+        transfer_id = secrets.token_hex(16)
+        try:
+            command = build_daemon_bundle_stage_command(
+                service_root=service_root,
+                sha256=snapshot.sha256,
+                size=snapshot.size,
+                transfer_id=transfer_id,
+                host_profile=DOCKER_USER_CONTAINER_V1,
+            )
+            completion_marker = f"__OPENEVO_DAEMON_BUNDLE_COMPLETION_{secrets.token_hex(16)}__="
+            marked_command = _with_completion_marker(command, completion_marker)
+            completed: subprocess.CompletedProcess[str] | None = None
+            known_hosts_file: Path | None = None
+            failure_code: SshTransportErrorCode | None = None
+            try:
+                snapshot.rewind()
+                completed, known_hosts_file = self._run_trusted_streaming_subprocess(
+                    lambda known_hosts_file: self._ssh_argv(
+                        marked_command,
+                        known_hosts_file,
+                    ),
+                    float(timeout_seconds),
+                    stdin_fd=snapshot.descriptor,
+                    cancel_event=cancel_event,
+                )
+            except _SubprocessCancelled:
+                failure_code = SshTransportErrorCode.CANCELLED
+            except subprocess.TimeoutExpired:
+                failure_code = SshTransportErrorCode.TIMEOUT
+            except _KnownHostsSpawnFailure:
+                failure_code = SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+            except Exception:
+                failure_code = SshTransportErrorCode.START_FAILED
+            try:
+                snapshot.verify_unchanged()
+            except (OSError, DaemonBundleTransportContractError):
+                failure_code = SshTransportErrorCode.DAEMON_BUNDLE_FAILED
+            if failure_code is not None:
+                _log_transport_failure(failure_code)
+                raise SshTransportError(failure_code)
+            assert completed is not None
+            assert known_hosts_file is not None
+            stderr, remote_return_code = _extract_remote_completion(
+                completed.stderr or "",
+                completion_marker,
+            )
+            if remote_return_code is None or completed.returncode == 255:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+            if int(completed.returncode) != remote_return_code:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+            if remote_return_code != 0:
+                _redact_trust_paths(
+                    stderr,
+                    known_hosts_file,
+                    self._trusted_host.known_hosts_file,
+                )
+                _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+                raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+            try:
+                staged = parse_staged_daemon_bundle(completed.stdout or "")
+                if (
+                    staged.host_profile != DOCKER_USER_CONTAINER_V1.profile_id
+                    or staged._service_root != service_root
+                    or staged.sha256 != snapshot.sha256
+                    or staged.size != snapshot.size
+                ):
+                    raise DaemonBundleTransportContractError(
+                        "Daemon bundle staging receipt does not match the request."
+                    )
+                return staged
+            except DaemonBundleTransportContractError:
+                _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+                raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None
+        finally:
+            snapshot.close()
+
+    def daemon_bundle_identity(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        timeout_seconds: float = 30.0,
+        cancel_event: threading.Event | None = None,
+    ) -> DaemonBundleIdentity:
+        self._validate_daemon_bundle_control_request(
+            bundle,
+            timeout_seconds=timeout_seconds,
+            cancel_event=cancel_event,
+        )
+        try:
+            payload = self._run_secret_with_remote_failure(
+                build_daemon_bundle_identity_command(bundle),
+                timeout_seconds=float(timeout_seconds),
+                remote_failure_code=SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
+                cancel_event=cancel_event,
+            )
+            identity = parse_daemon_bundle_identity(payload)
+            if identity.bundle_sha256 != bundle.sha256 or identity.bundle_size != bundle.size:
+                raise DaemonBundleTransportContractError(
+                    "Daemon bundle identity does not match its staged receipt."
+                )
+            return identity
+        except DaemonBundleTransportContractError:
+            _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+            raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None
+
+    def ensure_daemon_bundle(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        port: int = 0,
+        timeout_seconds: float = 90.0,
+        cancel_event: threading.Event | None = None,
+    ) -> RemoteCoreControlAttachment:
+        self._validate_daemon_bundle_control_request(
+            bundle,
+            timeout_seconds=timeout_seconds,
+            cancel_event=cancel_event,
+        )
+        if type(port) is not int or not 0 <= port <= 65535:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        deadline = time.monotonic() + float(timeout_seconds)
+        identity = self.daemon_bundle_identity(
+            bundle,
+            timeout_seconds=_stage_remaining(deadline),
+            cancel_event=cancel_event,
+        )
+        try:
+            command = build_daemon_bundle_ensure_command(
+                bundle,
+                port=port,
+                deadline_seconds=_stage_remaining(deadline),
+            )
+            payload = self._run_secret_with_remote_failure(
+                command,
+                timeout_seconds=_stage_remaining(deadline),
+                remote_failure_code=SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
+                cancel_event=cancel_event,
+            )
+            from openevo.deployment.core_control import (
+                CoreControlBootstrapError,
+                parse_core_control_attachment,
+            )
+
+            try:
+                attachment = parse_core_control_attachment(payload)
+            except CoreControlBootstrapError:
+                raise DaemonBundleTransportContractError(
+                    "Daemon ensure attachment is invalid."
+                ) from None
+            if (
+                attachment.release_identity != identity.release_identity
+                or attachment.registry_digest != identity.registry_digest
+                or attachment.source_commit != identity.source_commit
+            ):
+                raise DaemonBundleTransportContractError(
+                    "Daemon attachment does not match the bundle identity."
+                )
+            return attachment
+        except DaemonBundleTransportContractError:
+            _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+            raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None
+
+    def ensure_managed_runtime_from_daemon(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        archive_path: str,
+        archive_sha256: str,
+        archive_size: int,
+        platform: str,
+        config_id: str,
+        oci_index_id: str,
+        aliases: tuple[str, ...],
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
+    ) -> ManagedRuntimeLoadReceipt:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= 900
+            or (cancel_event is not None and not isinstance(cancel_event, threading.Event))
+        ):
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        try:
+            if not isinstance(bundle, StagedDaemonBundle):
+                raise DaemonBundleTransportContractError("Daemon bundle receipt is invalid.")
+            bundle.__post_init__()
+            if (
+                bundle.host_profile != DOCKER_USER_CONTAINER_V1.profile_id
+                or bundle._service_root != f"/home/{self._profile.user}/.openevo/daemon-bundles"
+            ):
+                raise DaemonBundleTransportContractError(
+                    "Daemon bundle receipt is not authoritative for this transport."
+                )
+            probe_command = build_daemon_managed_runtime_probe_command(
+                bundle._executable_path,
+                archive_sha256=archive_sha256,
+                archive_size=archive_size,
+                platform=platform,
+                config_id=config_id,
+                oci_index_id=oci_index_id,
+                aliases=aliases,
+            )
+        except (DaemonBundleTransportContractError, TypeError, ValueError):
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+
+        deadline = time.monotonic() + float(timeout_seconds)
+        acquired = False
+        while not acquired:
+            try:
+                _raise_if_cancelled(cancel_event)
+            except _SubprocessCancelled:
+                raise SshTransportError(SshTransportErrorCode.CANCELLED) from None
+            acquired = self._managed_runtime_lock.acquire(
+                timeout=min(0.05, _stage_remaining(deadline))
+            )
+        try:
+            try:
+                probe = self._run_secret_with_remote_failure(
+                    probe_command,
+                    timeout_seconds=_stage_remaining(deadline),
+                    remote_failure_code=SshTransportErrorCode.MANAGED_RUNTIME_FAILED,
+                    cancel_event=cancel_event,
+                )
+                ready = parse_managed_runtime_probe(probe)
+                if ready is not None:
+                    return ready
+                with snapshot_managed_runtime_archive(
+                    archive_path=archive_path,
+                    archive_sha256=archive_sha256,
+                    archive_size=archive_size,
+                ) as snapshot:
+                    with OpenedManagedRuntimeArchive.open(snapshot) as opened:
+                        prepared = self._run_secret_with_remote_failure(
+                            build_daemon_managed_runtime_prepare_command(
+                                bundle._executable_path,
+                                archive_sha256=archive_sha256,
+                                archive_size=archive_size,
+                            ),
+                            timeout_seconds=_stage_remaining(deadline),
+                            remote_failure_code=SshTransportErrorCode.MANAGED_RUNTIME_FAILED,
+                            cancel_event=cancel_event,
+                        )
+                        transfer = parse_managed_runtime_prepare(prepared)
+                        try:
+                            self._stream_managed_runtime_to_daemon(
+                                bundle,
+                                opened,
+                                transfer,
+                                archive_sha256=archive_sha256,
+                                archive_size=archive_size,
+                                deadline=deadline,
+                                cancel_event=cancel_event,
+                            )
+                            remaining = _stage_remaining(deadline)
+                            finalized = self._run_secret_with_remote_failure(
+                                build_daemon_managed_runtime_finalize_command(
+                                    bundle._executable_path,
+                                    transfer,
+                                    archive_sha256=archive_sha256,
+                                    archive_size=archive_size,
+                                    platform=platform,
+                                    config_id=config_id,
+                                    oci_index_id=oci_index_id,
+                                    aliases=aliases,
+                                    load_timeout_seconds=max(
+                                        1,
+                                        min(900, int(remaining)),
+                                    ),
+                                ),
+                                timeout_seconds=remaining,
+                                remote_failure_code=SshTransportErrorCode.MANAGED_RUNTIME_FAILED,
+                                cancel_event=cancel_event,
+                            )
+                            receipt = parse_managed_runtime_receipt(finalized)
+                            if receipt.reused:
+                                raise ValueError("managed runtime load receipt is inconsistent")
+                            return receipt
+                        except BaseException:
+                            self._discard_daemon_managed_runtime_transfer(
+                                bundle,
+                                transfer,
+                                archive_sha256=archive_sha256,
+                                archive_size=archive_size,
+                            )
+                            raise
+            except ManagedRuntimeArchiveSnapshotError:
+                _log_transport_failure(SshTransportErrorCode.INVALID_REQUEST)
+                raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+            except SshTransportError:
+                raise
+            except (OSError, TypeError, ValueError):
+                _log_transport_failure(SshTransportErrorCode.MANAGED_RUNTIME_FAILED)
+                raise SshTransportError(SshTransportErrorCode.MANAGED_RUNTIME_FAILED) from None
+        finally:
+            self._managed_runtime_lock.release()
+
+    def _stream_managed_runtime_to_daemon(
+        self,
+        bundle: StagedDaemonBundle,
+        opened: OpenedManagedRuntimeArchive,
+        transfer: ManagedRuntimeTransfer,
+        *,
+        archive_sha256: str,
+        archive_size: int,
+        deadline: float,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        command = build_daemon_managed_runtime_receive_command(
+            bundle._executable_path,
+            transfer,
+            archive_sha256=archive_sha256,
+            archive_size=archive_size,
+        )
+        completion_marker = f"__OPENEVO_MANAGED_RUNTIME_COMPLETION_{secrets.token_hex(16)}__="
+        marked_command = _with_completion_marker(command, completion_marker)
+        completed: subprocess.CompletedProcess[str] | None = None
+        failure_code: SshTransportErrorCode | None = None
+        try:
+            opened.rewind()
+            completed, _known_hosts_file = self._run_trusted_streaming_subprocess(
+                lambda known_hosts_file: self._ssh_argv(marked_command, known_hosts_file),
+                _stage_remaining(deadline),
+                stdin_fd=opened.descriptor,
+                cancel_event=cancel_event,
+            )
+        except _SubprocessCancelled:
+            failure_code = SshTransportErrorCode.CANCELLED
+        except subprocess.TimeoutExpired:
+            failure_code = SshTransportErrorCode.TIMEOUT
+        except _KnownHostsSpawnFailure:
+            failure_code = SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+        except Exception:
+            failure_code = SshTransportErrorCode.START_FAILED
+        try:
+            opened.verify_unchanged()
+        except ManagedRuntimeArchiveSnapshotError:
+            failure_code = SshTransportErrorCode.MANAGED_RUNTIME_FAILED
+        if failure_code is not None:
+            _log_transport_failure(failure_code)
+            raise SshTransportError(failure_code)
+        assert completed is not None
+        _stderr, remote_return_code = _extract_remote_completion(
+            completed.stderr or "",
+            completion_marker,
+        )
+        if remote_return_code is None or completed.returncode == 255:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        if int(completed.returncode) != remote_return_code:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        if remote_return_code != 0:
+            raise SshTransportError(SshTransportErrorCode.MANAGED_RUNTIME_FAILED)
+        try:
+            parse_managed_runtime_receive(SecretStr(completed.stdout or ""))
+        except (TypeError, ValueError):
+            raise SshTransportError(SshTransportErrorCode.MANAGED_RUNTIME_FAILED) from None
+
+    def _discard_daemon_managed_runtime_transfer(
+        self,
+        bundle: StagedDaemonBundle,
+        transfer: ManagedRuntimeTransfer,
+        *,
+        archive_sha256: str,
+        archive_size: int,
+    ) -> None:
+        try:
+            response = self._run_secret_with_remote_failure(
+                build_daemon_managed_runtime_discard_command(
+                    bundle._executable_path,
+                    transfer,
+                    archive_sha256=archive_sha256,
+                    archive_size=archive_size,
+                ),
+                timeout_seconds=_CORE_ASSET_CLEANUP_SECONDS,
+                remote_failure_code=SshTransportErrorCode.MANAGED_RUNTIME_FAILED,
+            )
+            parse_managed_runtime_discard(response)
+        except Exception:
+            _log_transport_failure(SshTransportErrorCode.MANAGED_RUNTIME_FAILED)
+
+    def inspect_daemon_bundle(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        timeout_seconds: float = 30.0,
+        cancel_event: threading.Event | None = None,
+    ) -> DaemonBundleServiceStatus:
+        self._validate_daemon_bundle_control_request(
+            bundle,
+            timeout_seconds=timeout_seconds,
+            cancel_event=cancel_event,
+        )
+        try:
+            payload = self._run_secret_with_remote_failure(
+                build_daemon_bundle_inspect_command(bundle),
+                timeout_seconds=float(timeout_seconds),
+                remote_failure_code=SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
+                cancel_event=cancel_event,
+            )
+            return parse_daemon_bundle_service_status(payload)
+        except DaemonBundleTransportContractError:
+            _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+            raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None
+
+    def stop_daemon_bundle(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        timeout_seconds: float = 30.0,
+        cancel_event: threading.Event | None = None,
+    ) -> DaemonBundleStopReceipt:
+        self._validate_daemon_bundle_control_request(
+            bundle,
+            timeout_seconds=timeout_seconds,
+            cancel_event=cancel_event,
+        )
+        try:
+            command = build_daemon_bundle_stop_command(
+                bundle,
+                deadline_seconds=float(timeout_seconds),
+            )
+            payload = self._run_secret_with_remote_failure(
+                command,
+                timeout_seconds=float(timeout_seconds),
+                remote_failure_code=SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
+                cancel_event=cancel_event,
+            )
+            return parse_daemon_bundle_stop_receipt(payload)
+        except DaemonBundleTransportContractError:
+            _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+            raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None
+
+    def _validate_daemon_bundle_control_request(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        timeout_seconds: float,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        try:
+            if not isinstance(bundle, StagedDaemonBundle):
+                raise DaemonBundleTransportContractError("Daemon bundle receipt is invalid.")
+            bundle.__post_init__()
+            if (
+                bundle.host_profile != DOCKER_USER_CONTAINER_V1.profile_id
+                or bundle._service_root != f"/home/{self._profile.user}/.openevo/daemon-bundles"
+                or isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not 0 < timeout_seconds <= 300
+                or (cancel_event is not None and not isinstance(cancel_event, threading.Event))
+            ):
+                raise DaemonBundleTransportContractError(
+                    "Daemon bundle control request is invalid."
+                )
+        except DaemonBundleTransportContractError:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
 
     def stage_core_bootstrap_assets(
         self,
@@ -2279,6 +2855,7 @@ class _OwnedSubprocessAuthority:
         trust_ownership: _KnownHostsLeaseOwnership | None = None,
         env: dict[str, str] | None = None,
         agent_socket_source: SshAgentSocketSource | None = None,
+        stdin_fd: int | None = None,
     ) -> _OwnedSubprocessAuthority:
         if trust_lease is not None and trust_ownership is not None:
             raise RuntimeError("known-host lease has multiple ownership sources")
@@ -2293,6 +2870,7 @@ class _OwnedSubprocessAuthority:
                 argv,
                 env=env,
                 agent_socket_source=agent_socket_source,
+                stdin_fd=stdin_fd,
             )
             return authority
         except BaseException:
@@ -2352,6 +2930,7 @@ class _OwnedSubprocessAuthority:
         *,
         env: dict[str, str] | None,
         agent_socket_source: SshAgentSocketSource | None,
+        stdin_fd: int | None,
     ) -> None:
         birth_record = self._birth_record
         if birth_record is None:
@@ -2364,11 +2943,13 @@ class _OwnedSubprocessAuthority:
             agent_proxy = self._agent_proxy
             if agent_proxy is not None:
                 child_environment["SSH_AUTH_SOCK"] = agent_proxy.socket_path
-            descriptors = (
+            descriptors = [
                 birth_record_fd,
                 executable.descriptor,
                 *(item.descriptor for item in nested),
-            )
+            ]
+            if stdin_fd is not None:
+                descriptors.append(stdin_fd)
             executable.verify_path_binding()
             for item in nested:
                 item.verify_path_binding()
@@ -2383,13 +2964,13 @@ class _OwnedSubprocessAuthority:
                     executable.descriptor,
                 ),
                 executable=launcher,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL if stdin_fd is None else stdin_fd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=False,
                 start_new_session=True,
                 close_fds=True,
-                pass_fds=descriptors,
+                pass_fds=tuple(descriptors),
                 env=child_environment,
             )
             self.process_group_id = process.pid
@@ -2765,6 +3346,7 @@ def _run_subprocess(
     on_start: Callable[[_OwnedSubprocessAuthority], None] | None = None,
     on_finish: Callable[[_OwnedSubprocessAuthority], None] | None = None,
     cancel_event: threading.Event | None = None,
+    stdin_fd: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if trust_lease is not None and trust_ownership is not None:
         raise RuntimeError("known-host lease has multiple ownership sources")
@@ -2776,6 +3358,7 @@ def _run_subprocess(
             trust_ownership=active_ownership,
             env=env,
             agent_socket_source=agent_socket_source,
+            stdin_fd=stdin_fd,
         )
         process = authority.process
         if process is None:
@@ -2833,6 +3416,31 @@ def _run_subprocess(
     finally:
         if caller_ownership is not None:
             caller_ownership.release_if_caller_owned()
+
+
+def _run_streaming_subprocess(
+    argv: list[str],
+    timeout_seconds: float,
+    stdin_fd: int,
+    cancel_event: threading.Event | None,
+    *,
+    trust_ownership: _KnownHostsLeaseOwnership,
+    env: dict[str, str] | None,
+    agent_socket_source: SshAgentSocketSource | None,
+    on_start: Callable[[_OwnedSubprocessAuthority], None],
+    on_finish: Callable[[_OwnedSubprocessAuthority], None],
+) -> subprocess.CompletedProcess[str]:
+    return _run_subprocess(
+        argv,
+        timeout_seconds,
+        trust_ownership=trust_ownership,
+        env=env,
+        agent_socket_source=agent_socket_source,
+        on_start=on_start,
+        on_finish=on_finish,
+        cancel_event=cancel_event,
+        stdin_fd=stdin_fd,
+    )
 
 
 def _require_closed_child_environment(env: dict[str, str] | None) -> dict[str, str]:

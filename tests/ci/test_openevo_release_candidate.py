@@ -324,7 +324,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
     ) == []
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["release"] == {
         "channel": "unsigned-draft-prerelease",
         "notarized": False,
@@ -345,12 +345,21 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         paths["wheel"].read_bytes()
     ).hexdigest()
     assert by_role["framework_lock"]["filename"] == "framework-lock.json"
+    assert by_role["daemon_bundle"]["filename"] == candidate.DAEMON_BUNDLE_NAME
+    assert by_role["daemon_manifest"]["filename"] == candidate.DAEMON_MANIFEST_NAME
+    assert by_role["daemon_mounted_resource"]["filename"] == (
+        candidate.DAEMON_MOUNTED_EVIDENCE_NAME
+    )
+    assert by_role["daemon_copy_resource"]["filename"] == candidate.DAEMON_COPY_EVIDENCE_NAME
     assert by_role["core_descriptor"]["filename"] == "core-install-artifact.json"
     assert by_role["checksums"]["filename"] == "SHA256SUMS"
     assert by_role["app_bundle_smoke"]["filename"] == "app-bundle-smoke.json"
     assert by_role["dmg_copy_smoke"]["filename"] == "dmg-copy-smoke.json"
     assert by_role["managed_runtime_source"]["filename"] == "managed-runtime-source.json"
     assert payload["core"]["registry_digest"] == "a" * 64
+    assert payload["daemon"]["artifact_sha256"] == by_role["daemon_bundle"]["sha256"]
+    assert payload["daemon"]["manifest_sha256"] == by_role["daemon_manifest"]["sha256"]
+    assert payload["daemon"]["release_identity"] == "b" * 64
     assert payload["managed_runtime"] == candidate._managed_runtime_manifest()
     assert payload["managed_runtime"]["capability"] == {
         "capture_mode": "transcript",
@@ -370,6 +379,43 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         "python_requires": ">=3.11",
         "supported_platforms": ["linux-x86_64"],
     }
+
+
+def test_candidate_manifest_rejects_daemon_for_other_registry(tmp_path: Path) -> None:
+    candidate = _load_module()
+    paths = _write_candidate_inputs(tmp_path)
+    daemon = json.loads(paths["daemon_manifest"].read_text(encoding="utf-8"))
+    daemon["core"]["registry_digest"] = "f" * 64
+    _write_json(paths["daemon_manifest"], daemon)
+
+    with pytest.raises(candidate.CandidateError, match="candidate Core wheel and lock"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="a" * 64,
+        )
+
+
+def test_candidate_manifest_rejects_unverified_daemon_dmg_evidence(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    evidence_path = tmp_path / candidate.DAEMON_COPY_EVIDENCE_NAME
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["daemon_bundle"]["sha256"] = "f" * 64
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(candidate.CandidateError, match="exact packaged daemon_bundle"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="a" * 64,
+        )
 
 
 def test_managed_runtime_source_binds_prerelease_asset_and_download(
@@ -495,7 +541,7 @@ def test_candidate_manifest_rejects_post_manifest_asset_mutation(tmp_path: Path)
         version="0.1.0",
         architecture="aarch64",
         rust_target="aarch64-apple-darwin",
-        registry_digest="b" * 64,
+        registry_digest="a" * 64,
     )
 
     paths["wheel"].write_bytes(paths["wheel"].read_bytes() + b"tampered")
@@ -519,7 +565,7 @@ def test_candidate_manifest_rejects_managed_runtime_source_mutation(tmp_path: Pa
             version="0.1.0",
             architecture="aarch64",
             rust_target="aarch64-apple-darwin",
-            registry_digest="b" * 64,
+            registry_digest="a" * 64,
         )
 
 
@@ -572,7 +618,7 @@ def test_candidate_manifest_requires_passing_security_evidence(tmp_path: Path) -
             version="0.1.0",
             architecture="aarch64",
             rust_target="aarch64-apple-darwin",
-            registry_digest="f" * 64,
+            registry_digest="a" * 64,
         )
     except candidate.CandidateError as exc:
         assert "security evidence" in str(exc)
@@ -591,7 +637,7 @@ def test_candidate_manifest_rejects_mismatched_dmg_mach_o_slices(tmp_path: Path)
             version="0.1.0",
             architecture="aarch64",
             rust_target="aarch64-apple-darwin",
-            registry_digest="f" * 64,
+            registry_digest="a" * 64,
         )
     except candidate.CandidateError as exc:
         assert str(exc) == (
@@ -616,7 +662,7 @@ def test_candidate_manifest_rejects_smoke_bound_to_different_dmg(tmp_path: Path)
             version="0.1.0",
             architecture="aarch64",
             rust_target="aarch64-apple-darwin",
-            registry_digest="f" * 64,
+            registry_digest="a" * 64,
         )
 
 
@@ -635,7 +681,7 @@ def test_candidate_manifest_rejects_wrong_smoke_launch_origin(tmp_path: Path) ->
             version="0.1.0",
             architecture="aarch64",
             rust_target="aarch64-apple-darwin",
-            registry_digest="f" * 64,
+            registry_digest="a" * 64,
         )
 
 
@@ -654,7 +700,7 @@ def test_candidate_manifest_rejects_legacy_native_smoke_schema(tmp_path: Path) -
             version="0.1.0",
             architecture="aarch64",
             rust_target="aarch64-apple-darwin",
-            registry_digest="f" * 64,
+            registry_digest="a" * 64,
         )
 
 
@@ -691,7 +737,7 @@ def test_candidate_manifest_rejects_mismatched_smoke_binary_digests(
             version="0.1.0",
             architecture="aarch64",
             rust_target="aarch64-apple-darwin",
-            registry_digest="f" * 64,
+            registry_digest="a" * 64,
         )
 
 
@@ -717,7 +763,7 @@ def test_candidate_manifest_rejects_the_display_name_as_executable_identity(
             version="0.1.0",
             architecture="aarch64",
             rust_target="aarch64-apple-darwin",
-            registry_digest="f" * 64,
+            registry_digest="a" * 64,
         )
 
 
@@ -831,6 +877,58 @@ def _write_candidate_inputs(
         + "\n",
         encoding="utf-8",
     )
+    daemon_bundle = root / "openevo-daemon-linux-x86_64"
+    daemon_bundle.write_bytes(b"self-contained linux daemon")
+    daemon_bundle.chmod(0o755)
+    daemon_manifest = root / "openevo-daemon-bundle.json"
+    _write_json(
+        daemon_manifest,
+        {
+            "artifact": {
+                "filename": daemon_bundle.name,
+                "sha256": _sha256(daemon_bundle),
+                "size": daemon_bundle.stat().st_size,
+            },
+            "build_environment_distributions": [
+                {"name": "openevo", "version": "0.1.0"},
+                {"name": "pyinstaller", "version": "6.0.0"},
+            ],
+            "core": {
+                "framework_lock": {
+                    "filename": framework_lock.name,
+                    "sha256": _sha256(framework_lock),
+                },
+                "registry_digest": "a" * 64,
+                "wheel": {
+                    "filename": wheel.name,
+                    "sha256": wheel_digest,
+                    "size": wheel.stat().st_size,
+                    "version": "0.1.0",
+                },
+            },
+            "dependency_lock": {
+                "filename": "uv.lock",
+                "sha256": _sha256(Path("uv.lock")),
+            },
+            "platform": {"architecture": "x86_64", "system": "linux"},
+            "release": {
+                "identity": "b" * 64,
+                "source_commit": "8e45af371eef49a86530a849041f7dcf047620ec",
+            },
+            "runtime": {
+                "format": "pyinstaller-onefile",
+                "python": {"implementation": "CPython", "version": "3.11.13"},
+                "system_python_required": False,
+                "target_pypi_required": False,
+            },
+            "schema_version": 1,
+            "smoke": {
+                "backend_readiness": "passed",
+                "controlled_exit": "passed",
+                "identity": "passed",
+            },
+        },
+    )
     dmg = root / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
     dmg.write_bytes(b"dmg")
     (root / "release-notes.md").write_text(_release_notes_text(), encoding="utf-8")
@@ -922,12 +1020,42 @@ def _write_candidate_inputs(
         copied_smoke_evidence["mach_o"][binary]["slices"] = dmg_slices or ["arm64"]
     _write_json(root / "app-bundle-smoke.json", mounted_smoke_evidence)
     _write_json(root / "dmg-copy-smoke.json", copied_smoke_evidence)
+    daemon_resource = {
+        "daemon_bundle": {
+            "byte_size": daemon_bundle.stat().st_size,
+            "filename": daemon_bundle.name,
+            "relative_path": "Contents/Resources/openevo-daemon/openevo-daemon-linux-x86_64",
+            "sha256": _sha256(daemon_bundle),
+        },
+        "daemon_manifest": {
+            "byte_size": daemon_manifest.stat().st_size,
+            "filename": daemon_manifest.name,
+            "relative_path": "Contents/Resources/openevo-daemon/openevo-daemon-bundle.json",
+            "sha256": _sha256(daemon_manifest),
+        },
+        "launch_origin": "mounted_dmg",
+        "schema_version": 1,
+        "source_dmg": {
+            "filename": dmg.name,
+            "sha256": _sha256(dmg),
+        },
+    }
+    _write_json(root / "daemon-mounted-resource.json", daemon_resource)
+    copied_daemon_resource = json.loads(json.dumps(daemon_resource))
+    copied_daemon_resource["launch_origin"] = "detached_copy"
+    _write_json(root / "daemon-copy-resource.json", copied_daemon_resource)
     candidate = _load_module()
     _write_json(
         root / candidate.MANAGED_RUNTIME_SOURCE_NAME,
         candidate._managed_runtime_source_evidence(),
     )
-    return {"wheel": wheel, "framework_lock": framework_lock, "dmg": dmg}
+    return {
+        "wheel": wheel,
+        "framework_lock": framework_lock,
+        "dmg": dmg,
+        "daemon_bundle": daemon_bundle,
+        "daemon_manifest": daemon_manifest,
+    }
 
 
 def _write_json(path: Path, payload: object) -> None:

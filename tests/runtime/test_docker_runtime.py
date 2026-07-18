@@ -21,6 +21,10 @@ from openevo.runtime.docker import (
     _CREDENTIAL_VIEW_NAME,
     verify_managed_runtime_image_admission,
 )
+from openevo.runtime.docker_host import (
+    discover_docker_host_path,
+    docker_self_inspect_argv,
+)
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     MANAGED_RUNTIME_RELEASES,
@@ -231,6 +235,31 @@ def _credential_mount_inspect_output(authority: ManagedCredentialMount) -> str:
             },
         ]
     )
+
+
+def _docker_host_inspect_output(
+    destination: Path,
+    *,
+    hostname: str,
+    container_id: str,
+    source: str,
+) -> bytes:
+    return json.dumps(
+        {
+            "id": container_id,
+            "hostname": hostname,
+            "running": True,
+            "mounts": [
+                {
+                    "Type": "bind",
+                    "Source": source,
+                    "Destination": os.fspath(destination),
+                    "RW": True,
+                }
+            ],
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 @pytest.mark.asyncio
@@ -504,6 +533,279 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
 
     assert all("a+rwX" not in call.args for call in run_command.await_args_list)
     assert all("chmod" not in call.args for call in run_command.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_user_container_runtime_uses_and_verifies_translated_session_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hostname = "a" * 12
+    daemon_container_id = hostname + ("b" * 52)
+    runtime_container_id = "c" * 64
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    daemon_data_root = "/srv/openevo-data"
+    host_evidence = _docker_host_inspect_output(
+        data_root,
+        hostname=hostname,
+        container_id=daemon_container_id,
+        source=daemon_data_root,
+    )
+    authority = discover_docker_host_path(
+        host_evidence,
+        namespace="core-release",
+        hostname=hostname,
+        minimum_available_bytes=0,
+    )
+    session_dir = Path(authority.runtime_container_root) / "sessions" / "science-session"
+    session_dir.mkdir(mode=0o700)
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "science-session",
+        session_dir,
+        docker_host_path=authority,
+    )
+    monkeypatch.setattr(
+        "openevo.runtime.docker_host.socket.gethostname",
+        lambda: hostname,
+    )
+    present = False
+
+    async def run_command_impl(*args, **kwargs):
+        nonlocal present
+        del kwargs
+        if args == docker_self_inspect_argv(hostname):
+            return 0, host_evidence.decode("utf-8"), None
+        if args[1] == "create":
+            _write_mock_cidfile(args, runtime_container_id)
+            present = True
+            return 0, runtime_container_id + "\n", None
+        if args[1:3] == ("container", "inspect"):
+            if any("json .Mounts" in str(value) for value in args):
+                return (
+                    0,
+                    json.dumps(
+                        [
+                            {
+                                "Type": "bind",
+                                "Source": os.fspath(authority.translate(session_dir)),
+                                "Destination": runtime.runtime_session_dir,
+                                "RW": True,
+                            }
+                        ]
+                    ),
+                    None,
+                )
+            if present:
+                return 0, runtime_container_id + "\n", None
+            return 1, None, f"Error: No such object: {runtime_container_id}"
+        if args[1] == "exec" and args[3] == "/usr/bin/stat":
+            marker_identity = runtime._session_marker_identity
+            assert marker_identity is not None
+            return (
+                0,
+                " ".join(
+                    [
+                        str(marker_identity[0]),
+                        str(marker_identity[1]),
+                        f"{marker_identity[2]:x}",
+                        str(marker_identity[3]),
+                        str(marker_identity[4]),
+                        str(marker_identity[5]),
+                    ]
+                ),
+                None,
+            )
+        if args[1] == "exec" and args[3] == "/usr/bin/head":
+            marker_content = runtime._session_marker_content
+            assert marker_content is not None
+            return 0, marker_content.decode("ascii"), None
+        if args[1] == "rm":
+            present = False
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    await runtime.start()
+
+    create = next(call.args for call in run_command.await_args_list if call.args[1] == "create")
+    session_mount = create[create.index("--mount") + 1]
+    assert session_mount == (
+        f"type=bind,source={authority.translate(session_dir)},target={runtime.runtime_session_dir}"
+    )
+    assert "-v" not in create
+    assert not any(session_dir.glob(".openevo-adoption-*"))
+
+    await runtime.stop()
+    assert runtime.absence_proven is True
+
+
+@pytest.mark.asyncio
+async def test_user_container_runtime_rejects_daemon_source_path_aba_wrong_object(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hostname = "6" * 12
+    daemon_container_id = hostname + ("7" * 52)
+    runtime_container_id = "8" * 64
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    host_evidence = _docker_host_inspect_output(
+        data_root,
+        hostname=hostname,
+        container_id=daemon_container_id,
+        source="/srv/openevo-data",
+    )
+    authority = discover_docker_host_path(
+        host_evidence,
+        namespace="core-release",
+        hostname=hostname,
+        minimum_available_bytes=0,
+    )
+    session_dir = Path(authority.runtime_container_root) / "sessions" / "science-session"
+    session_dir.mkdir(mode=0o700)
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "science-session",
+        session_dir,
+        docker_host_path=authority,
+    )
+    monkeypatch.setattr(
+        "openevo.runtime.docker_host.socket.gethostname",
+        lambda: hostname,
+    )
+    present = False
+
+    async def run_command_impl(*args, **kwargs):
+        nonlocal present
+        del kwargs
+        if args == docker_self_inspect_argv(hostname):
+            return 0, host_evidence.decode("utf-8"), None
+        if args[1] == "create":
+            _write_mock_cidfile(args, runtime_container_id)
+            present = True
+            return 0, runtime_container_id + "\n", None
+        if args[1:3] == ("container", "inspect"):
+            if any("json .Mounts" in str(value) for value in args):
+                return (
+                    0,
+                    json.dumps(
+                        [
+                            {
+                                "Type": "bind",
+                                "Source": os.fspath(authority.translate(session_dir)),
+                                "Destination": runtime.runtime_session_dir,
+                                "RW": True,
+                            }
+                        ]
+                    ),
+                    None,
+                )
+            if present:
+                return 0, runtime_container_id + "\n", None
+            return 1, None, f"Error: No such object: {runtime_container_id}"
+        if args[1] == "exec" and args[3] == "/usr/bin/stat":
+            marker_identity = runtime._session_marker_identity
+            assert marker_identity is not None
+            # Inspect still reports the expected Source string, but the child
+            # has adopted a different filesystem object at that pathname.
+            wrong_identity = (
+                marker_identity[0],
+                marker_identity[1] + 1,
+                *marker_identity[2:],
+            )
+            return (
+                0,
+                " ".join(
+                    [
+                        str(wrong_identity[0]),
+                        str(wrong_identity[1]),
+                        f"{wrong_identity[2]:x}",
+                        str(wrong_identity[3]),
+                        str(wrong_identity[4]),
+                        str(wrong_identity[5]),
+                    ]
+                ),
+                None,
+            )
+        if args[1] == "rm":
+            present = False
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    with pytest.raises(RuntimeError, match="session filesystem object"):
+        await runtime.start()
+
+    assert runtime.absence_proven is True
+    assert not any(session_dir.glob(".openevo-adoption-*"))
+    assert any(
+        call.args[:4] == ("docker", "kill", runtime_container_id)
+        for call in run_command.await_args_list
+    )
+    assert any(
+        call.args[:4] == ("docker", "rm", "-f", runtime_container_id)
+        for call in run_command.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_user_container_runtime_rejects_changed_session_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hostname = "d" * 12
+    daemon_container_id = hostname + ("e" * 52)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    host_evidence = _docker_host_inspect_output(
+        data_root,
+        hostname=hostname,
+        container_id=daemon_container_id,
+        source="/srv/openevo-data",
+    )
+    authority = discover_docker_host_path(
+        host_evidence,
+        namespace="core-release",
+        hostname=hostname,
+        minimum_available_bytes=0,
+    )
+    session_dir = Path(authority.runtime_container_root) / "sessions" / "science-session"
+    session_dir.mkdir(mode=0o700)
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "science-session",
+        session_dir,
+        docker_host_path=authority,
+    )
+    runtime._container_id = "f" * 64
+    runtime._ownership_state = "verified"
+    monkeypatch.setattr(
+        runtime,
+        "_run_local_command",
+        AsyncMock(
+            return_value=(
+                0,
+                json.dumps(
+                    [
+                        {
+                            "Type": "bind",
+                            "Source": "/srv/replaced/session",
+                            "Destination": runtime.runtime_session_dir,
+                            "RW": True,
+                        }
+                    ]
+                ),
+                None,
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="session Docker bind"):
+        await runtime._verify_created_session_mount()
 
 
 @pytest.mark.asyncio
@@ -787,9 +1089,7 @@ async def test_managed_image_admission_checks_only_exact_immutable_reference(
         inspected.append(args[-1])
         return _InspectProcess(
             returncode=0,
-            stdout=json.dumps(
-                [_managed_image_record(release.trusted_digest)]
-            ).encode("utf-8"),
+            stdout=json.dumps([_managed_image_record(release.trusted_digest)]).encode("utf-8"),
         )
 
     monkeypatch.setattr(docker_module.shutil, "which", lambda *_args, **_kwargs: "/docker")
@@ -819,17 +1119,13 @@ async def test_managed_image_tag_mutation_does_not_affect_synchronous_admission(
         if args[-1] == release.trusted_digest:
             return _InspectProcess(
                 returncode=0,
-                stdout=json.dumps(
-                    [_managed_image_record(release.trusted_digest)]
-                ).encode("utf-8"),
+                stdout=json.dumps([_managed_image_record(release.trusted_digest)]).encode("utf-8"),
             )
         if failure == "deleted":
             return _InspectProcess(returncode=1, stdout=b"", stderr=b"missing")
         return _InspectProcess(
             returncode=0,
-            stdout=json.dumps(
-                [_managed_image_record("sha256:" + "1" * 64)]
-            ).encode("utf-8"),
+            stdout=json.dumps([_managed_image_record("sha256:" + "1" * 64)]).encode("utf-8"),
         )
 
     monkeypatch.setattr(docker_module.shutil, "which", lambda *_args, **_kwargs: "/docker")

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import stat
 import sys
 import time
 
@@ -231,6 +232,65 @@ def test_prepare_transfer_rejects_path_or_inode_replacement() -> None:
         )
 
 
+def test_daemon_runtime_commands_require_no_remote_python_or_rsync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = _release(b"runtime")
+    monkeypatch.setattr(assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    transfer = assets.ManagedRuntimeTransfer(
+        service_root="/home/alice/.openevo/core",
+        incoming_root=("/home/alice/.openevo/core/managed-runtime-staging/incoming-" + "a" * 32),
+        transfer_id="a" * 32,
+        staging_device=1,
+        staging_inode=2,
+        incoming_device=1,
+        incoming_inode=3,
+    )
+    daemon = "/home/alice/.openevo/daemon/openevo-daemon-linux-x86_64"
+    commands = (
+        assets.build_daemon_managed_runtime_probe_command(
+            daemon,
+            archive_sha256=release.sha256,
+            archive_size=release.byte_size,
+            platform=release.platform,
+            config_id=release.config_id,
+            oci_index_id=release.oci_index_id,
+            aliases=release.aliases,
+        ),
+        assets.build_daemon_managed_runtime_prepare_command(
+            daemon,
+            archive_sha256=release.sha256,
+            archive_size=release.byte_size,
+        ),
+        assets.build_daemon_managed_runtime_receive_command(
+            daemon,
+            transfer,
+            archive_sha256=release.sha256,
+            archive_size=release.byte_size,
+        ),
+        assets.build_daemon_managed_runtime_finalize_command(
+            daemon,
+            transfer,
+            archive_sha256=release.sha256,
+            archive_size=release.byte_size,
+            platform=release.platform,
+            config_id=release.config_id,
+            oci_index_id=release.oci_index_id,
+            aliases=release.aliases,
+            load_timeout_seconds=30,
+        ),
+        assets.build_daemon_managed_runtime_discard_command(
+            daemon,
+            transfer,
+            archive_sha256=release.sha256,
+            archive_size=release.byte_size,
+        ),
+    )
+    assert all(command.startswith(daemon + " managed-runtime ") for command in commands)
+    assert all("python" not in command and "rsync" not in command for command in commands)
+    assert " receive " in commands[2]
+
+
 def test_remote_rsync_lease_rejects_intermediate_service_symlink(tmp_path: Path) -> None:
     if not Path("/usr/bin/rsync").is_file():
         pytest.skip("system rsync is unavailable")
@@ -275,18 +335,28 @@ def _remote_run(
     fake_bin: Path,
     *arguments: str,
     check: bool = True,
+    input_payload: bytes | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["HOME"] = str(home)
     environment["PATH"] = str(fake_bin) + os.pathsep + environment["PATH"]
     environment["OPENEVO_FAKE_DOCKER_STATE"] = str(home / "docker-state.json")
-    return subprocess.run(
+    completed = subprocess.run(
         [sys.executable, "-I", "-c", assets._REMOTE_MANAGED_RUNTIME_SCRIPT, *arguments],
         check=check,
         capture_output=True,
-        text=True,
+        input=input_payload,
+        text=input_payload is None,
         env=environment,
         timeout=10,
+    )
+    if input_payload is None:
+        return completed
+    return subprocess.CompletedProcess(
+        args=completed.args,
+        returncode=completed.returncode,
+        stdout=completed.stdout.decode("utf-8"),
+        stderr=completed.stderr.decode("utf-8"),
     )
 
 
@@ -403,6 +473,69 @@ def _finalize_arguments(
         "5",
         *release.aliases,
     )
+
+
+def _receive_arguments(
+    prepared: dict[str, object],
+    release: ManagedRuntimeArchiveRelease,
+) -> tuple[str, ...]:
+    return (
+        "receive",
+        str(prepared["service_root"]),
+        str(prepared["transfer_id"]),
+        str(prepared["staging_device"]),
+        str(prepared["staging_inode"]),
+        str(prepared["incoming_device"]),
+        str(prepared["incoming_inode"]),
+        release.sha256,
+        str(release.byte_size),
+    )
+
+
+def test_remote_receive_streams_exact_archive_without_rsync(tmp_path: Path) -> None:
+    payload = b"runtime"
+    release = _release(payload)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    fake_bin = tmp_path / "bin"
+    _fake_docker(fake_bin)
+    prepared = _prepare_remote(home, fake_bin, release)
+
+    result = _remote_run(
+        home,
+        fake_bin,
+        *_receive_arguments(prepared, release),
+        input_payload=payload,
+    )
+
+    assets.parse_managed_runtime_receive(SecretStr(result.stdout))
+    archive = Path(str(prepared["incoming_root"])) / release.filename
+    assert archive.read_bytes() == payload
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("payload", [b"short", b"runtime-extra"])
+def test_remote_receive_rejects_partial_or_oversize_stream(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    release = _release(b"runtime")
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    fake_bin = tmp_path / "bin"
+    _fake_docker(fake_bin)
+    prepared = _prepare_remote(home, fake_bin, release)
+
+    result = _remote_run(
+        home,
+        fake_bin,
+        *_receive_arguments(prepared, release),
+        input_payload=payload,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert not (Path(str(prepared["incoming_root"])) / release.filename).exists()
 
 
 def test_remote_finalize_loads_exact_image_publishes_aliases_and_cleans_stage(

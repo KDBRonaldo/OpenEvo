@@ -11,11 +11,17 @@ on:
       - "uv.lock"
       - "desktop/**"
       - "src/openevo/deployment/**"
+      - "scripts/ci/build_openevo_daemon_bundle.py"
+      - "scripts/ci/openevo_desktop_daemon_resource.py"
+      - "scripts/ci/openevo_release_candidate.py"
       - "scripts/ci/smoke_openevo_desktop_bundle.py"
       - "scripts/ci/smoke_openevo_desktop_sidecar.py"
       - "scripts/ci/write_sha256.py"
       - "tests/ci/test_build_sidecar.py"
+      - "tests/ci/test_build_openevo_daemon_bundle.py"
       - "tests/ci/test_check_openevo_release.py"
+      - "tests/ci/test_openevo_desktop_daemon_resource.py"
+      - "tests/ci/test_openevo_release_candidate.py"
       - "tests/ci/test_openevo_python_workflow.py"
       - "tests/ci/test_sidecar_startup_diagnostics.py"
       - "tests/openevo/remote/**"
@@ -53,7 +59,14 @@ jobs:
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Test packaged sidecar builder
-        run: uv run python -m pytest tests/ci/test_build_sidecar.py -q
+        run: |
+          uv run python -m pytest \
+            tests/ci/test_build_sidecar.py \
+            tests/ci/test_build_openevo_daemon_bundle.py \
+            tests/ci/test_openevo_desktop_daemon_resource.py \
+            tests/ci/test_openevo_release_candidate.py \
+            tests/ci/test_check_openevo_release.py \
+            -q
 
       - name: Install Linux Tauri dependencies
         run: |
