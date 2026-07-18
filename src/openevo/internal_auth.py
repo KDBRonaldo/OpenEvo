@@ -453,7 +453,7 @@ def verified_private_file_sha256(path: os.PathLike[str], *, max_bytes: int) -> s
             not stat.S_ISREG(before.st_mode)
             or before.st_nlink != 1
             or before.st_uid != os.getuid()
-            or stat.S_IMODE(before.st_mode) != 0o600
+            or stat.S_IMODE(before.st_mode) not in {0o400, 0o600}
             or before.st_size > max_bytes
         ):
             raise InternalAuthError("internal identity file is outside private-file policy")

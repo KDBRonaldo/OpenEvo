@@ -24,10 +24,12 @@ from openevo.internal_auth import (
     GenerationBoundRunAdmissionCheck,
     CoreRunAdmissionHttpVerifier,
     INTERNAL_CREDENTIAL_FD_ENV,
+    InternalAuthError,
     InternalServiceIdentity,
     RunAdmissionError,
     RunAdmissionOperation,
     read_internal_service_identity,
+    verified_private_file_sha256,
 )
 from openevo.backend.run_admission import install_core_run_admission_endpoint
 from openevo.rollout.models import SessionDispatchRequest, canonicalize_task_request
@@ -56,6 +58,38 @@ def _credential_authority(tmp_path: Path) -> HeldCodexCredentialAuthority:
     auth.write_text('{"tokens":{"access_token":"test-secret"}}', encoding="utf-8")
     auth.chmod(0o600)
     return HeldCodexCredentialAuthority.open(auth)
+
+
+@pytest.mark.parametrize("mode", [0o400, 0o600])
+def test_verified_private_file_sha256_accepts_owner_only_modes(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    payload = b'{"registry":"verified"}'
+    identity_file = tmp_path / "framework-lock.json"
+    identity_file.write_bytes(payload)
+    identity_file.chmod(mode)
+
+    assert verified_private_file_sha256(
+        identity_file,
+        max_bytes=4096,
+    ) == hashlib.sha256(payload).hexdigest()
+
+
+@pytest.mark.parametrize("mode", [0o000, 0o200, 0o440, 0o640, 0o700])
+def test_verified_private_file_sha256_rejects_other_modes(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    identity_file = tmp_path / "framework-lock.json"
+    identity_file.write_text('{"registry":"unverified"}', encoding="utf-8")
+    identity_file.chmod(mode)
+
+    with pytest.raises(
+        InternalAuthError,
+        match="internal identity file is outside private-file policy",
+    ):
+        verified_private_file_sha256(identity_file, max_bytes=4096)
 
 
 def test_internal_identity_is_consumed_from_fd_and_never_repr_visible(monkeypatch) -> None:
