@@ -46,10 +46,15 @@ from openevo.evolution.artifact_payloads import ArtifactPayloadService
 from openevo.backend.run_control import RUN_OPERATION_IDS, CoreRunControlError
 from openevo.backend.service_supervisor import (
     ServiceComponent,
+    ServiceExecutionMode,
+    ServiceGroupSnapshot,
+    ServiceRunReadinessCode,
     ServiceStatus,
     SupervisorError,
     SupervisorServiceSummary,
 )
+from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 import openevo.backend.contracts.v1.workspace as workspace_module
 from openevo.backend.contracts.v1.workspace import (
     WorkspaceArchiveError,
@@ -2392,6 +2397,337 @@ def test_capabilities_and_project_validation_use_verified_registry(tmp_path: Pat
         )
         assert unavailable.status_code == 503
         assert unavailable.json()["code"] == "evolution_registry_unavailable"
+
+
+def test_release_channel_rejects_self_deployed_while_test_channel_allows_it(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    self_deployed = _project_create(
+        execution_mode="self-deployed",
+        capture_mode="token_level",
+        harness_id="openhands",
+    )
+    supervisor = _ActivationServiceSupervisor()
+    with TestClient(
+        _app(
+            tmp_path / "release",
+            registry=registry,
+            service_supervisor=supervisor,
+            build_channel="release",
+        )
+    ) as client:
+        capabilities = client.get(
+            "/v1/capabilities",
+            headers=AUTH,
+            params={"execution_mode": "self-deployed"},
+        )
+        created = client.post(
+            "/v1/projects",
+            headers={**AUTH, "Idempotency-Key": "release-self-deployed-create"},
+            json=self_deployed,
+        )
+        project, etag = _create_project(
+            client,
+            _project_create(),
+            idempotency_key="release-subscription-create",
+        )
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "release-self-deployed-patch",
+                "If-Match": etag,
+            },
+            json={"schema_version": "1", "spec": self_deployed["spec"]},
+        )
+        unchanged = client.get(f"/v1/projects/{project['id']}", headers=AUTH)
+
+    assert capabilities.status_code == 422
+    assert capabilities.json()["code"] == "release_execution_mode_unsupported"
+    assert "Codex subscription transcript" in capabilities.json()["next_action"]
+    assert created.status_code == 422
+    assert created.json()["code"] == "release_execution_mode_unsupported"
+    assert patched.status_code == 422
+    assert patched.json()["code"] == "release_execution_mode_unsupported"
+    assert unchanged.json() == project
+    assert len(supervisor.ensure_calls) == 1
+
+    with TestClient(_app(tmp_path / "test", registry=registry)) as client:
+        capabilities = client.get(
+            "/v1/capabilities",
+            headers=AUTH,
+            params={"execution_mode": "self-deployed"},
+        )
+        project, etag = _create_project(client, self_deployed)
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "test-self-deployed-patch",
+                "If-Match": etag,
+            },
+            json={"schema_version": "1", "name": "Self-deployed remains available"},
+        )
+
+    assert capabilities.status_code == 200
+    assert project["execution_mode"] == "self-deployed"
+    assert patched.status_code == 200
+    assert patched.json()["name"] == "Self-deployed remains available"
+
+
+def test_release_subscription_create_and_patch_bind_managed_service_readiness(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    supervisor = _ActivationServiceSupervisor()
+    with TestClient(
+        _app(
+            tmp_path / "state",
+            registry=registry,
+            service_supervisor=supervisor,
+            build_channel="release",
+        )
+    ) as client:
+        project, etag = _create_project(client, _project_create())
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "release-ready-patch",
+                "If-Match": etag,
+            },
+            json={"schema_version": "1", "name": "Ready subscription"},
+        )
+
+    assert patched.status_code == 200
+    assert [call["execution_mode"] for call in supervisor.ensure_calls] == [
+        ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+        ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+    ]
+    assert [call["codex_model"] for call in supervisor.ensure_calls] == [
+        "gpt-5.1-codex-mini",
+        "gpt-5.1-codex-mini",
+    ]
+    assert [call["runtime_image"] for call in supervisor.ensure_calls] == [
+        MANAGED_RUNTIME_IMAGES["managed_science"],
+        MANAGED_RUNTIME_IMAGES["managed_science"],
+    ]
+    assert all(call["model_ref"] is None for call in supervisor.ensure_calls)
+
+
+def test_release_patch_checks_the_persisted_effective_spec(tmp_path: Path) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    state_root = tmp_path / "state"
+    self_deployed = _project_create(
+        execution_mode="self-deployed",
+        capture_mode="token_level",
+        harness_id="openhands",
+    )
+    with TestClient(_app(state_root, registry=registry)) as client:
+        project, etag = _create_project(client, self_deployed)
+
+    supervisor = _ActivationServiceSupervisor()
+    with TestClient(
+        _app(
+            state_root,
+            registry=registry,
+            service_supervisor=supervisor,
+            build_channel="release",
+        )
+    ) as client:
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "release-effective-spec-patch",
+                "If-Match": etag,
+            },
+            json={"schema_version": "1", "name": "Must remain unchanged"},
+        )
+        unchanged = client.get(f"/v1/projects/{project['id']}", headers=AUTH)
+
+    assert patched.status_code == 422
+    assert patched.json()["code"] == "release_execution_mode_unsupported"
+    assert unchanged.json() == project
+    assert supervisor.ensure_calls == []
+
+
+@pytest.mark.parametrize(
+    ("readiness_code", "expected_code", "expected_repair_action", "next_action_fragment"),
+    [
+        (
+            ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
+            "project_activation_codex_cli_unavailable",
+            "user_action_required",
+            "current remote SSH user",
+        ),
+        (
+            ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
+            "project_activation_codex_subscription_auth_unavailable",
+            "user_action_required",
+            "current remote SSH user",
+        ),
+        (
+            ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
+            "project_activation_runtime_executable_unavailable",
+            "openevo_can_reconfigure",
+            "container runtime for the SSH user",
+        ),
+        (
+            ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
+            "project_activation_runtime_image_unavailable",
+            "openevo_can_install",
+            "managed Science runtime installation",
+        ),
+        (
+            ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE,
+            "project_activation_service_group_unavailable",
+            "openevo_can_retry",
+            "Restart managed Core services",
+        ),
+    ],
+)
+def test_release_readiness_failure_does_not_create_project(
+    tmp_path: Path,
+    readiness_code: ServiceRunReadinessCode,
+    expected_code: str,
+    expected_repair_action: str,
+    next_action_fragment: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / readiness_code.value / "registry")
+    supervisor = _ActivationServiceSupervisor(readiness_code)
+    with TestClient(
+        _app(
+            tmp_path / readiness_code.value / "state",
+            registry=registry,
+            service_supervisor=supervisor,
+            build_channel="release",
+        )
+    ) as client:
+        response = client.post(
+            "/v1/projects",
+            headers={**AUTH, "Idempotency-Key": f"release-{readiness_code.value}"},
+            json=_project_create(),
+        )
+        projects = client.get("/v1/projects", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json()["code"] == expected_code
+    assert response.json()["retryable"] is True
+    assert response.json()["repair_action"] == expected_repair_action
+    assert next_action_fragment in response.json()["next_action"]
+    assert "private-runtime-probe-detail" not in response.text
+    assert projects.json()["items"] == []
+
+
+def test_release_patch_readiness_failure_is_not_persisted_and_can_retry(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    supervisor = _ActivationServiceSupervisor()
+    app = _app(
+        tmp_path / "state",
+        registry=registry,
+        service_supervisor=supervisor,
+        build_channel="release",
+    )
+    with TestClient(app) as client:
+        project, etag = _create_project(client, _project_create())
+        supervisor.readiness_code = ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE
+        failed = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "release-readiness-retry",
+                "If-Match": etag,
+            },
+            json={"schema_version": "1", "name": "Activated after login"},
+        )
+        unchanged = client.get(f"/v1/projects/{project['id']}", headers=AUTH)
+        supervisor.readiness_code = ServiceRunReadinessCode.READY
+        retried = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "release-readiness-retry",
+                "If-Match": etag,
+            },
+            json={"schema_version": "1", "name": "Activated after login"},
+        )
+
+    assert failed.status_code == 503
+    assert failed.json()["code"] == "project_activation_codex_subscription_auth_unavailable"
+    assert unchanged.json() == project
+    assert unchanged.headers["etag"] == etag
+    assert retried.status_code == 200
+    assert retried.json()["name"] == "Activated after login"
+
+
+def test_release_success_replay_recovers_after_transient_readiness_failure(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    supervisor = _ActivationServiceSupervisor()
+    with TestClient(
+        _app(
+            tmp_path / "state",
+            registry=registry,
+            service_supervisor=supervisor,
+            build_channel="release",
+        )
+    ) as client:
+        request = _project_create()
+        headers = {**AUTH, "Idempotency-Key": "release-success-replay"}
+        created = client.post("/v1/projects", headers=headers, json=request)
+        supervisor.readiness_code = ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE
+        temporarily_blocked = client.post("/v1/projects", headers=headers, json=request)
+        supervisor.readiness_code = ServiceRunReadinessCode.READY
+        replayed = client.post("/v1/projects", headers=headers, json=request)
+
+    assert created.status_code == 201
+    assert temporarily_blocked.status_code == 503
+    assert temporarily_blocked.json()["code"] == "project_activation_service_group_unavailable"
+    assert replayed.status_code == 201
+    assert replayed.json() == created.json()
+    assert replayed.headers["etag"] == created.headers["etag"]
+
+
+@pytest.mark.parametrize("supervisor_state", ["missing", "missing_ensure", "failed"])
+def test_release_missing_or_failed_supervisor_is_typed_without_private_detail(
+    tmp_path: Path,
+    supervisor_state: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    if supervisor_state == "missing":
+        supervisor = None
+    elif supervisor_state == "missing_ensure":
+        supervisor = _RecordingServiceSupervisor()
+    else:
+        supervisor = _ActivationServiceSupervisor(failure=True)
+    with TestClient(
+        _app(
+            tmp_path / "state",
+            registry=registry,
+            service_supervisor=supervisor,
+            build_channel="release",
+        )
+    ) as client:
+        response = client.post(
+            "/v1/projects",
+            headers={**AUTH, "Idempotency-Key": "release-supervisor-unavailable"},
+            json=_project_create(),
+        )
+        projects = client.get("/v1/projects", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json()["code"] in {
+        "project_activation_service_supervisor_unavailable",
+        "project_activation_service_supervisor_failed",
+    }
+    assert response.json()["next_action"]
+    assert "private-supervisor-probe-detail" not in response.text
+    assert projects.json()["items"] == []
 
 
 def test_verified_subscription_project_publishes_durable_initial_revision(
@@ -4887,6 +5223,57 @@ class _RecordingServiceSupervisor:
 class _FailingServiceSupervisor(_RecordingServiceSupervisor):
     def list(self) -> tuple[SupervisorServiceSummary, ...]:
         raise SupervisorError("managed service state is unavailable")
+
+
+class _ActivationServiceSupervisor(_RecordingServiceSupervisor):
+    def __init__(
+        self,
+        readiness_code: ServiceRunReadinessCode = ServiceRunReadinessCode.READY,
+        *,
+        failure: bool = False,
+    ) -> None:
+        super().__init__()
+        self.readiness_code = readiness_code
+        self.failure = failure
+        self.ensure_calls: list[dict[str, object]] = []
+
+    def ensure(
+        self,
+        execution_mode: ServiceExecutionMode,
+        *,
+        model_ref: str | None = None,
+        codex_model: str | None = None,
+        runtime_image: str | None = None,
+        total_timeout: float | None = None,
+    ) -> ServiceGroupSnapshot:
+        self.ensure_calls.append(
+            {
+                "execution_mode": execution_mode,
+                "model_ref": model_ref,
+                "codex_model": codex_model,
+                "runtime_image": runtime_image,
+                "total_timeout": total_timeout,
+            }
+        )
+        if self.failure:
+            raise SupervisorError("private-supervisor-probe-detail")
+        ready = self.readiness_code is ServiceRunReadinessCode.READY
+        return ServiceGroupSnapshot(
+            execution_mode=execution_mode,
+            services_available=(
+                self.readiness_code is not ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE
+            ),
+            run_ready=ready,
+            run_readiness_code=self.readiness_code,
+            generation_digest="c" * 64,
+            services=self._services,
+            runtime_image=runtime_image,
+            runtime_image_immutable_reference=(
+                MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest if ready else None
+            ),
+            runtime_identity_digest="d" * 64 if ready else None,
+            status_message="private-runtime-probe-detail",
+        )
 
 
 class _RecordingRunControl:

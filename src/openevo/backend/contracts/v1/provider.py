@@ -11,7 +11,7 @@ import hashlib
 import hmac
 from pathlib import Path, PurePosixPath
 import threading
-from typing import Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -50,6 +50,7 @@ from openevo.evolution.models import (
     ArtifactResponse as EvolutionArtifactResponse,
     ArtifactState as EvolutionArtifactState,
 )
+from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
 
 from . import models as m
 from .app import CoreControlHTTPError, _iter_api_routes, create_core_control_contract_app
@@ -72,6 +73,9 @@ from .store import (
     ArtifactReachability,
     _failed_idempotency_identity,
 )
+
+if TYPE_CHECKING:
+    from openevo.backend.service_supervisor import ServiceRunReadinessCode
 
 
 _FEATURES = [
@@ -179,6 +183,10 @@ class _RunControlHTTPError(CoreControlHTTPError):
     """Preserve run-owner error provenance through the frozen HTTP contract."""
 
 
+class _ReleaseActivationReadinessHTTPError(CoreControlHTTPError):
+    """A repairable release activation prerequisite failed before persistence."""
+
+
 def _run_control_http_error(exc: CoreRunControlError) -> _RunControlHTTPError:
     return _RunControlHTTPError(
         exc.http_status,
@@ -208,6 +216,100 @@ def _service_control_http_error(exc: CoreServiceControlError) -> CoreControlHTTP
         retryable=True,
         repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
         next_action="Retry after Core service ownership is restored.",
+    )
+
+
+def _release_activation_error(
+    *,
+    code: str,
+    message: str,
+    category: m.ErrorCategory,
+    repair_action: m.RepairAction,
+    next_action: str,
+) -> _ReleaseActivationReadinessHTTPError:
+    return _ReleaseActivationReadinessHTTPError(
+        503,
+        code=code,
+        message=message,
+        category=category,
+        retryable=True,
+        repair_action=repair_action,
+        next_action=next_action,
+    )
+
+
+def _release_readiness_error(
+    code: ServiceRunReadinessCode,
+) -> _ReleaseActivationReadinessHTTPError:
+    errors = {
+        "codex_cli_unavailable": (
+            "Codex CLI is unavailable on the remote Core host.",
+            m.ErrorCategory.ENVIRONMENT,
+            m.RepairAction.USER_ACTION_REQUIRED,
+            (
+                "Install the supported Codex CLI as the current remote SSH user, "
+                "then retry activation."
+            ),
+        ),
+        "codex_subscription_auth_unavailable": (
+            "Codex subscription login is unavailable for the remote SSH user.",
+            m.ErrorCategory.AUTHENTICATION,
+            m.RepairAction.USER_ACTION_REQUIRED,
+            "Sign in with Codex CLI as the current remote SSH user, then retry activation.",
+        ),
+        "runtime_executable_unavailable": (
+            "The managed Science runtime executable is unavailable.",
+            m.ErrorCategory.ENVIRONMENT,
+            m.RepairAction.OPENEVO_CAN_RECONFIGURE,
+            "Restore the supported container runtime for the SSH user, then retry activation.",
+        ),
+        "runtime_image_unavailable": (
+            "The managed Science runtime image is unavailable.",
+            m.ErrorCategory.ENVIRONMENT,
+            m.RepairAction.OPENEVO_CAN_INSTALL,
+            "Repair the managed Science runtime installation, then retry activation.",
+        ),
+        "runtime_evidence_invalid": (
+            "Managed Science runtime readiness evidence is invalid.",
+            m.ErrorCategory.ENVIRONMENT,
+            m.RepairAction.OPENEVO_CAN_RECONFIGURE,
+            "Repair the managed Science runtime installation, then retry activation.",
+        ),
+        "service_group_unavailable": (
+            "Required managed Core services are unavailable.",
+            m.ErrorCategory.SERVICE,
+            m.RepairAction.OPENEVO_CAN_RETRY,
+            "Restart managed Core services, then retry project activation.",
+        ),
+        "run_admission_unavailable": (
+            "The managed science run admission owner is unavailable.",
+            m.ErrorCategory.SERVICE,
+            m.RepairAction.OPENEVO_CAN_RETRY,
+            "Restart OpenEvo Daemon, then retry project activation.",
+        ),
+        "self_deployed_unavailable": (
+            "The managed service group does not support this release project.",
+            m.ErrorCategory.PROJECT,
+            m.RepairAction.UNSUPPORTED,
+            "Select Codex subscription transcript for this Preview release.",
+        ),
+    }
+    readiness_code = code.value
+    message, category, repair_action, next_action = errors.get(
+        readiness_code,
+        (
+            "Managed Science readiness is unavailable.",
+            m.ErrorCategory.SERVICE,
+            m.RepairAction.OPENEVO_CAN_RETRY,
+            "Restart managed Core services, then retry project activation.",
+        ),
+    )
+    return _release_activation_error(
+        code=f"project_activation_{readiness_code}",
+        message=message,
+        category=category,
+        repair_action=repair_action,
+        next_action=next_action,
     )
 
 
@@ -398,15 +500,16 @@ class CoreControlProviderV1:
         self._artifact_loader = artifact_loader
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._started_at = self._timestamp()
+        self._build_channel = (
+            m.BuildChannel(build_channel) if isinstance(build_channel, str) else build_channel
+        )
         self._version = m.VersionResponseV1(
             preferred_major=1,
             supported_majors=[1],
             openapi_sha256=openapi_sha256(),
             build_version=build_version,
             source_commit=source_commit,
-            build_channel=(
-                m.BuildChannel(build_channel) if isinstance(build_channel, str) else build_channel
-            ),
+            build_channel=self._build_channel,
             provider_kind=m.ProviderKind.OPENEVO_CORE,
             features=_FEATURES,
         )
@@ -506,7 +609,10 @@ class CoreControlProviderV1:
         except _PostCommitHTTPError:
             raise
         except CoreControlHTTPError as exc:
-            if not (isinstance(exc, _RunControlHTTPError) and exc.error.retryable):
+            if not (
+                (isinstance(exc, _RunControlHTTPError) and exc.error.retryable)
+                or isinstance(exc, _ReleaseActivationReadinessHTTPError)
+            ):
                 self.store.record_failed_idempotency(operation_id, arguments, exc.error)
             raise
 
@@ -672,8 +778,9 @@ class CoreControlProviderV1:
         )
 
     def _capabilities(self, arguments: Mapping[str, object]) -> object:
-        registry = self._require_registry("capabilities")
         execution_mode = cast(m.ExecutionMode, arguments["execution_mode"])
+        self._require_release_execution_mode(execution_mode)
+        registry = self._require_registry("capabilities")
         return build_evolution_capabilities(
             registry.snapshot,
             profile=execution_profile_for_release_mode(execution_mode),
@@ -690,8 +797,10 @@ class CoreControlProviderV1:
         )
 
     def _create_project(self, arguments: Mapping[str, object]) -> Response:
+        request = cast(m.ProjectCreateV1, arguments["request"])
+        self._preflight_release_project_spec(request.spec)
         result = self.store.create_project(
-            cast(m.ProjectCreateV1, arguments["request"]),
+            request,
             idempotency_key=cast(str, arguments["idempotency_key"]),
             registry_digest=self._registry_digest(),
         )
@@ -702,14 +811,110 @@ class CoreControlProviderV1:
         return _model_response(project, etag=project.etag)
 
     def _patch_project(self, arguments: Mapping[str, object]) -> Response:
+        project_id = cast(str, arguments["project_id"])
+        request = cast(m.ProjectPatchV1, arguments["request"])
+        if self._build_channel is m.BuildChannel.RELEASE:
+            spec = request.spec
+            if spec is None:
+                spec = self.store.get_project(project_id).spec
+            self._preflight_release_project_spec(spec)
         result = self.store.patch_project(
-            cast(str, arguments["project_id"]),
-            cast(m.ProjectPatchV1, arguments["request"]),
+            project_id,
+            request,
             if_match=cast(str, arguments["if_match"]),
             idempotency_key=cast(str, arguments["idempotency_key"]),
             registry_digest=self._registry_digest(),
         )
         return _stored_response(result)
+
+    def _require_release_execution_mode(self, execution_mode: m.ExecutionMode) -> None:
+        if (
+            self._build_channel is m.BuildChannel.RELEASE
+            and execution_mode is not m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+        ):
+            raise _error(
+                422,
+                code="release_execution_mode_unsupported",
+                message="This OpenEvo release supports Codex subscription transcript only.",
+                category=m.ErrorCategory.PROJECT,
+                retryable=False,
+                repair_action=m.RepairAction.UNSUPPORTED,
+                next_action="Select Codex subscription transcript for this Preview release.",
+            )
+
+    def _preflight_release_project_spec(self, spec: m.ProjectSpecV1) -> None:
+        if self._build_channel is not m.BuildChannel.RELEASE:
+            return
+        self._require_release_execution_mode(spec.execution_mode)
+        if spec.capture_mode is not m.CaptureMode.TRANSCRIPT or spec.harness_id != "codex":
+            raise _error(
+                422,
+                code="release_project_spec_unsupported",
+                message="This OpenEvo release requires the Codex transcript project profile.",
+                category=m.ErrorCategory.PROJECT,
+                retryable=False,
+                repair_action=m.RepairAction.UNSUPPORTED,
+                next_action="Use the Codex harness with transcript capture for this project.",
+            )
+        from openevo.backend.service_supervisor import (
+            ServiceExecutionMode,
+            ServiceGroupSnapshot,
+            ServiceRunReadinessCode,
+        )
+
+        supervisor = self._service_supervisor
+        ensure = None if supervisor is None else getattr(supervisor, "ensure", None)
+        if not callable(ensure):
+            raise _release_activation_error(
+                code="project_activation_service_supervisor_unavailable",
+                message="Managed service readiness cannot be verified by this Core daemon.",
+                category=m.ErrorCategory.SERVICE,
+                repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+                next_action="Restart or update OpenEvo Daemon, then retry project activation.",
+            )
+        image = MANAGED_RUNTIME_IMAGES["managed_science"]
+        try:
+            snapshot = ensure(
+                ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                codex_model=spec.agent_model_ref,
+                runtime_image=image,
+            )
+        except CoreServiceControlError as exc:
+            raise _release_activation_error(
+                code="project_activation_service_supervisor_failed",
+                message="Core could not verify managed service readiness.",
+                category=m.ErrorCategory.SERVICE,
+                repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+                next_action="Retry after OpenEvo Daemon service ownership is restored.",
+            ) from exc
+        if not isinstance(snapshot, ServiceGroupSnapshot):
+            raise _release_activation_error(
+                code="project_activation_service_snapshot_invalid",
+                message="Core received invalid managed service readiness evidence.",
+                category=m.ErrorCategory.SERVICE,
+                repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+                next_action="Restart or update OpenEvo Daemon, then retry project activation.",
+            )
+        if snapshot.execution_mode is not ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
+            raise _release_activation_error(
+                code="project_activation_service_mode_mismatch",
+                message="Managed services do not match the Codex subscription project mode.",
+                category=m.ErrorCategory.SERVICE,
+                repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+                next_action="Restart managed Core services, then retry project activation.",
+            )
+        if not snapshot.run_ready:
+            raise _release_readiness_error(snapshot.run_readiness_code)
+        if not snapshot.services_available:
+            raise _release_readiness_error(ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE)
+        if snapshot.runtime_image != image:
+            raise _release_activation_error(
+                code="project_activation_runtime_image_mismatch",
+                message="Managed services do not use the required Science runtime image.",
+                category=m.ErrorCategory.ENVIRONMENT,
+                repair_action=m.RepairAction.OPENEVO_CAN_INSTALL,
+                next_action="Repair the managed Science runtime, then retry project activation.",
+            )
 
     def _delete_project(self, arguments: Mapping[str, object]) -> Response:
         return _stored_response(
