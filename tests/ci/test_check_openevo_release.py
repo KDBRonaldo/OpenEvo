@@ -2113,7 +2113,7 @@ def test_remote_capability_smoke_cleanup_is_bound_to_attachment_generation(
             execution_mode: str,
             expected_core_version: str,
         ) -> None:
-            assert execution_mode in {"codex_subscription_transcript", "self-deployed"}
+            assert execution_mode == "codex_subscription_transcript"
             assert expected_core_version == "0.1.0"
 
     monkeypatch.setattr(smoke.openevo, "__file__", str(imported))

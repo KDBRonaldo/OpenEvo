@@ -2959,14 +2959,23 @@ def _ensure_project_create_response(
     request: v1.ProjectCreateV1,
     project: v1.ProjectV1,
 ) -> None:
+    draft_state = (
+        project.status is v1.ProjectStatus.DRAFT and project.active_revision is None
+    )
+    ready_scratch_state = (
+        project.status is v1.ProjectStatus.READY
+        and isinstance(request.workspace, v1.ScratchWorkspaceSpecV1)
+        and project.active_revision is not None
+        and project.active_revision.project_id == project.id
+        and project.active_revision.generation == 0
+    )
     if (
         project.name != request.name
         or project.description != request.description
         or project.spec != request.spec
         or project.task != request.task
         or project.workspace != request.workspace
-        or project.status is not v1.ProjectStatus.DRAFT
-        or project.active_revision is not None
+        or not (draft_state or ready_scratch_state)
         or project.workspace_publication is not None
         or (
             isinstance(request.workspace, v1.ScratchWorkspaceSpecV1)

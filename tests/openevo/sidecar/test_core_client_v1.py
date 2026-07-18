@@ -853,6 +853,55 @@ def test_project_bootstrap_rejects_cross_wired_response_and_can_retry() -> None:
     client.close()
 
 
+def test_project_bootstrap_accepts_ready_scratch_generation_zero_response() -> None:
+    base = _project()
+    spec = v1.ProjectSpecV1(
+        execution_mode=v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+        capture_mode=v1.CaptureMode.TRANSCRIPT,
+        harness_id="codex",
+        agent_model_ref="gpt-5",
+        evolution=v1.EvolutionConfigV1(targets={}),
+    )
+    workspace = v1.ScratchWorkspaceSpecV1(
+        kind=v1.WorkspaceSourceKind.SCRATCH,
+        display_name="Scratch workspace",
+    )
+    request = v1.ProjectCreateV1(
+        name=base.name,
+        description=base.description,
+        spec=spec,
+        task=base.task,
+        workspace=workspace,
+    )
+    ready = base.model_copy(
+        update={
+            "spec": spec,
+            "workspace": workspace,
+            "execution_mode": v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+            "workspace_kind": v1.WorkspaceSourceKind.SCRATCH,
+            "current_workspace_snapshot": _snapshot(
+                "workspace-snapshot-ready",
+                v1.SnapshotKind.WORKSPACE,
+                "8",
+            ),
+            "status": v1.ProjectStatus.READY,
+            "active_revision": v1.RevisionRefV1(
+                id="revision-generation-zero",
+                project_id=base.id,
+                generation=0,
+                manifest_sha256="9" * 64,
+            ),
+            "model_preparation": v1.ModelPreparationV1(
+                model_ref="gpt-5",
+                status=v1.ModelPreparationStatus.READY,
+                updated_at="2026-07-14T12:00:00Z",
+            ),
+        }
+    )
+
+    _ensure_project_create_response(request, ready)
+
+
 def test_project_bootstrap_retries_unknown_transport_outcome_with_same_identity() -> None:
     connection = _bootstrap_connection()
     request = _project_create_request()

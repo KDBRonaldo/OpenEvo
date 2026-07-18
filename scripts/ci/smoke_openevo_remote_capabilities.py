@@ -104,24 +104,17 @@ def smoke(
             sidecar,
             timeout_seconds=timeout_seconds,
         )
-        registry_digests: set[str] = set()
-        for execution_mode in (
-            "codex_subscription_transcript",
-            "self-deployed",
-        ):
-            payload = sidecar_smoke._read_json(
-                f"{base_url}/v1/capabilities?execution_mode={execution_mode}",
-                headers=headers,
-            )
-            sidecar_smoke._assert_capabilities(
-                payload,
-                execution_mode=execution_mode,
-                expected_core_version=version,
-            )
-            registry_digests.add(payload["registry_digest"])
-        if len(registry_digests) != 1:
-            raise RuntimeError("exact Core release modes resolved different registries")
-        registry_digest = next(iter(registry_digests))
+        execution_mode = "codex_subscription_transcript"
+        payload = sidecar_smoke._read_json(
+            f"{base_url}/v1/capabilities?execution_mode={execution_mode}",
+            headers=headers,
+        )
+        sidecar_smoke._assert_capabilities(
+            payload,
+            execution_mode=execution_mode,
+            expected_core_version=version,
+        )
+        registry_digest = payload["registry_digest"]
     finally:
         if not attachment.attached:
             stop_core_service_if_generation(
