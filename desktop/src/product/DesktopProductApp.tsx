@@ -2008,6 +2008,10 @@ function SettingsDrawer({
   const saveActionId = useRef(newActionId());
   const activeModel = mode === "self-deployed" ? hfModel : codexModel;
   const activeModeCapability = executionModeCapability(executionModeCapabilities, mode);
+  const visibleModeCapabilities = executionModeCapabilities.modes.filter(
+    (capability) => capability.support_state === "supported"
+      || (project !== null && capability.mode === project.execution.mode),
+  );
   const focusMode = activeModeCapability.support_state === "supported"
     ? mode
     : firstSupportedExecutionMode(executionModeCapabilities)?.mode;
@@ -2154,7 +2158,7 @@ function SettingsDrawer({
           </section>
           <section className="form-section">
             <h3>Model mode</h3>
-            <div className="segmented-control wide" role="radiogroup" aria-label="Model mode" onKeyDown={handleTablistKeyDown}>{executionModeCapabilities.modes.map((capability) => (
+            <div className="segmented-control wide" role="radiogroup" aria-label="Model mode" onKeyDown={handleTablistKeyDown}>{visibleModeCapabilities.map((capability) => (
               <button
                 type="button"
                 role="radio"

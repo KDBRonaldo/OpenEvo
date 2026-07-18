@@ -1521,6 +1521,9 @@ class DesktopReleaseProvider:
         project_id = cast(str, arguments["project_id"])
         with self._project_session_lock:
             project = self._store.get_project(project_id)
+            self._require_supported_execution_mode(
+                "getProjectCapabilities", project.execution.mode
+            )
             capabilities = self._require_bridge("getProjectCapabilities").capabilities(project)
         return local_v1.CapabilitiesEnvelopeV1(
             project_id=project.project_id,
@@ -1536,6 +1539,7 @@ class DesktopReleaseProvider:
                 project_id,
                 cast(str, arguments["if_match"]),
             )
+            self._require_supported_execution_mode("validateProject", project.execution.mode)
             validation = self._require_bridge("validateProject").validate_project(
                 project,
                 idempotency_key=cast(str, arguments["idempotency_key"]),

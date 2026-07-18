@@ -277,9 +277,7 @@ def test_release_local_api_allows_only_packaged_tauri_cors_origins(tmp_path: Pat
     assert discovery.status_code == 200
     assert discovery.headers["access-control-allow-origin"] == "tauri://localhost"
     assert discovery_preflight.status_code == 200
-    assert discovery_preflight.headers["access-control-allow-origin"] == (
-        "tauri://localhost"
-    )
+    assert discovery_preflight.headers["access-control-allow-origin"] == ("tauri://localhost")
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == "http://tauri.localhost"
     assert {
@@ -298,8 +296,7 @@ def test_release_local_api_allows_only_packaged_tauri_cors_origins(tmp_path: Pat
         "x-openevo-desktop-session",
     }
     assert {
-        value.strip()
-        for value in preflight.headers["access-control-allow-methods"].split(",")
+        value.strip() for value in preflight.headers["access-control-allow-methods"].split(",")
     } == {"GET", "POST", "PATCH", "DELETE"}
     assert forbidden_method.status_code == 400
     assert forbidden_header.status_code == 400
@@ -475,6 +472,23 @@ def test_release_execution_mode_gate_rejects_create_update_activate_and_run(
             local_v1.ProjectCreateV1.model_validate(request),
             idempotency_key="seed-existing-release-mode-0001",
         )
+        rejected_capabilities = client.get(
+            f"/desktop/v1/projects/{project.project_id}/capabilities",
+            headers=SESSION_HEADERS,
+        )
+        rejected_validation = client.post(
+            f"/desktop/v1/projects/{project.project_id}/validate",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": project.etag,
+                "Idempotency-Key": "validate-project-release-mode-0001",
+            },
+        )
+        for rejected_bridge_action in (rejected_capabilities, rejected_validation):
+            assert rejected_bridge_action.status_code == 409
+            assert rejected_bridge_action.json()["code"] == "self_deployed_release_unavailable"
+        assert bridge.method_calls == []
+
         rejected_update = client.patch(
             f"/desktop/v1/projects/{project.project_id}",
             headers={**SESSION_HEADERS, "If-Match": project.etag},
@@ -526,6 +540,7 @@ def test_release_execution_mode_gate_rejects_create_update_activate_and_run(
 
         bridge.activate_project.assert_not_called()
         bridge.create_run.assert_not_called()
+        assert bridge.method_calls == []
 
 
 def test_create_run_gates_active_self_deployed_mode_before_request_project_identity(
