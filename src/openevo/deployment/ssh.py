@@ -2004,7 +2004,7 @@ class SshRemoteExecutorTransport:
                     "-o",
                     "IdentityFile=none",
                     "-o",
-                    "IdentitiesOnly=yes",
+                    "IdentitiesOnly=no",
                     "-o",
                     "IdentityAgent=SSH_AUTH_SOCK",
                 ]

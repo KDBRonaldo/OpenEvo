@@ -347,7 +347,7 @@ def _expected_ssh_base(
                 "-o",
                 "IdentityFile=none",
                 "-o",
-                "IdentitiesOnly=yes",
+                "IdentitiesOnly=no",
                 "-o",
                 "IdentityAgent=SSH_AUTH_SOCK",
             ]
@@ -805,7 +805,7 @@ def test_ssh_agent_final_openssh_config_has_no_authentication_fallback(
         name, _, value = line.partition(" ")
         effective.setdefault(name, []).append(value)
     assert effective["identityfile"] == ["none"]
-    assert effective["identitiesonly"] == ["yes"]
+    assert effective["identitiesonly"] == ["no"]
     assert effective["identityagent"] == ["SSH_AUTH_SOCK"]
     assert effective["passwordauthentication"] == ["no"]
     assert effective["kbdinteractiveauthentication"] == ["no"]
