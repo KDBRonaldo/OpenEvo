@@ -252,7 +252,7 @@ class BlockingManagedScienceRuntimeProbe(FakeManagedScienceRuntimeProbe):
 class FakeProbeCommandRunner:
     def __init__(
         self,
-        image_id: str = MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest.removeprefix(
+        image_id: str = MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id.removeprefix(
             "sha256:"
         ),
         *,
@@ -308,7 +308,9 @@ class FakeProbeCommandRunner:
         payload = [
             {
                 "Id": f"sha256:{self.image_id}",
-                "RepoDigests": [],
+                "RepoDigests": [
+                    f"openevo/science-runtime@sha256:{self.image_id}"
+                ],
                 "Config": {"Labels": {"io.openevo.managed-runtime": "true"}},
             }
         ]

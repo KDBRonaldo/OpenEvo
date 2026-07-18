@@ -60,6 +60,18 @@ def test_offline_image_authority_is_distinct_from_registry_authority() -> None:
         )
         == release.loaded_image_id
     )
+    for image in (release.image, release.loaded_image_id):
+        for repository in (release.repository, f"docker.io/{release.repository}"):
+            assert (
+                verified_managed_runtime_image_reference(
+                    profile="managed_science",
+                    image=image,
+                    image_id=release.loaded_image_id,
+                    repo_digests=[f"{repository}@{release.loaded_image_id}"],
+                    labels=labels,
+                )
+                == release.loaded_image_id
+            )
     with pytest.raises(ValueError, match="digest mismatch"):
         verified_managed_runtime_image_reference(
             profile="managed_science",
@@ -83,6 +95,53 @@ def test_offline_image_authority_is_distinct_from_registry_authority() -> None:
             image_id=release.loaded_image_id,
             repo_digests=[],
             labels=labels,
+        )
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        MANAGED_RUNTIME_RELEASES["managed_science"].image,
+        MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
+    ],
+)
+@pytest.mark.parametrize(
+    "repo_digests",
+    [
+        ["other/science-runtime@" + MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id],
+        [
+            MANAGED_RUNTIME_RELEASES["managed_science"].repository
+            + "@"
+            + MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+        ],
+        [
+            MANAGED_RUNTIME_RELEASES["managed_science"].repository
+            + "@"
+            + MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
+            "other/science-runtime@"
+            + MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
+        ],
+        [
+            MANAGED_RUNTIME_RELEASES["managed_science"].repository
+            + "@"
+            + MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
+        ]
+        * 2,
+    ],
+)
+def test_offline_image_authority_rejects_unrelated_or_ambiguous_repository_digests(
+    image: str,
+    repo_digests: list[str],
+) -> None:
+    release = MANAGED_RUNTIME_RELEASES["managed_science"]
+
+    with pytest.raises(ValueError):
+        verified_managed_runtime_image_reference(
+            profile="managed_science",
+            image=image,
+            image_id=release.loaded_image_id,
+            repo_digests=repo_digests,
+            labels={"io.openevo.managed-runtime": "true"},
         )
 
 

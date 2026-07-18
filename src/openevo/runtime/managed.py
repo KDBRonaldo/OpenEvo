@@ -660,25 +660,36 @@ def verified_managed_runtime_image_reference(
     repository_authority = (
         isinstance(repo_digests, list) and release.immutable_reference in repo_digests
     )
+    offline_repository_digests = {
+        f"{release.repository}@{release.loaded_image_id}",
+        f"docker.io/{release.repository}@{release.loaded_image_id}",
+    }
+    offline_repository_authority = (
+        isinstance(repo_digests, list)
+        and 0 < len(repo_digests) <= len(offline_repository_digests)
+        and len(repo_digests) == len(set(repo_digests))
+        and all(item in offline_repository_digests for item in repo_digests)
+    )
     if image == release.loaded_image_id:
         if profile != "managed_science":
             raise ValueError("managed runtime offline image is unavailable for this profile")
-        if repo_digests:
+        if repo_digests and not offline_repository_authority:
             raise ValueError("managed runtime offline image has registry authority")
         if image_id == release.loaded_image_id:
+            return release.loaded_image_id
+        raise ValueError("managed runtime image digest mismatch")
+    if (
+        profile == "managed_science"
+        and image == release.image
+        and image_id == release.loaded_image_id
+    ):
+        if not repo_digests or offline_repository_authority:
             return release.loaded_image_id
         raise ValueError("managed runtime image digest mismatch")
     if image_id == release.trusted_digest:
         return release.trusted_digest
     if repository_authority:
         return release.immutable_reference
-    if (
-        profile == "managed_science"
-        and image == release.image
-        and not repo_digests
-        and image_id == release.loaded_image_id
-    ):
-        return release.loaded_image_id
     raise ValueError("managed runtime image digest mismatch")
 
 
