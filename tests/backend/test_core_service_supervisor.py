@@ -2781,6 +2781,23 @@ def test_local_managed_runtime_probe_rejects_missing_auth_evidence(tmp_path: Pat
     assert runner.calls == [("codex", "--version")]
 
 
+def test_probe_executable_size_bound_accepts_current_codex_binary_scale() -> None:
+    def executable_stat(size: int) -> os.stat_result:
+        return os.stat_result(
+            (0o100755, 2, 1, 1, os.geteuid(), os.getegid(), size, 0, 0, 0)
+        )
+
+    identity = supervisor_module._probe_executable_identity(
+        executable_stat(300 * 1024 * 1024)
+    )
+
+    assert identity[5] == 300 * 1024 * 1024
+    with pytest.raises(OSError, match="identity is invalid"):
+        supervisor_module._probe_executable_identity(
+            executable_stat((512 * 1024 * 1024) + 1)
+        )
+
+
 def test_real_probe_command_is_cancelled_and_reaped_within_bound() -> None:
     runner = BoundedProbeCommandRunner()
     cancellation = threading.Event()
