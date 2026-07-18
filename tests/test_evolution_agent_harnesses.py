@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import tomllib
+import os
 from pathlib import Path
+import subprocess
+import tomllib
 
 import pytest
 
@@ -104,9 +106,62 @@ async def test_codex_setup_installs_static_and_evolution_skills(tmp_path):
 
     copy_commands = [command for command in runtime.commands if ".agents/skills" in command]
     joined = "\n".join(copy_commands)
-    assert "cp -r /openevo/static-skills/* $HOME/.agents/skills/" in joined
-    assert "cp -r /openevo/session/evolution/skills/* $HOME/.agents/skills/" in joined
+    assert 'cp -R -- /openevo/static-skills/. "$HOME/.agents/skills/"' in joined
+    assert (
+        'cp -R -- /openevo/session/evolution/skills/. "$HOME/.agents/skills/"'
+        in joined
+    )
+    assert "*" not in joined
     assert "|| true" not in joined
+
+
+@pytest.mark.asyncio
+async def test_codex_setup_accepts_empty_skill_directory(tmp_path):
+    skills = tmp_path / "empty skills"
+    skills.mkdir()
+    home = tmp_path / "runtime-home"
+    home.mkdir()
+
+    class ShellSkillRuntime(RecordingRuntime):
+        async def exec(
+            self,
+            command: str,
+            *,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: float | None = None,
+        ) -> ExecResult:
+            del cwd, env, timeout_sec
+            self.commands.append(command)
+            if ".agents/skills" not in command:
+                return ExecResult(return_code=0)
+            completed = subprocess.run(
+                command,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "HOME": str(home)},
+            )
+            return ExecResult(
+                return_code=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            env={"OPENEVO_SKILLS_DIR": str(skills)},
+        )
+    )
+    runtime = ShellSkillRuntime(tmp_path)
+
+    await harness.setup(runtime)
+
+    installed = home / ".agents" / "skills"
+    assert installed.is_dir()
+    assert list(installed.iterdir()) == []
 
 
 @pytest.mark.asyncio
