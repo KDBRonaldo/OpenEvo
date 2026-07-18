@@ -577,6 +577,13 @@ class CoreProjectMappingV1:
             raise ValueError("only the first mapping has no predecessor")
 
 
+@dataclass(frozen=True, slots=True)
+class CoreProjectHeadSuccessorProofV1:
+    project: core_v1.ProjectV1
+    head: core_v1.RevisionHeadV1
+    revision: core_v1.RevisionV1
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class _CoreActivationAuthorityV1:
     """Process-local capability proving one bridge-produced activation."""
@@ -653,6 +660,7 @@ class DesktopCoreBridgePersistence(Protocol):
         *,
         expected_previous: CoreProjectMappingV1 | None,
         completed_patch: CoreProjectPatchOperationV1 | None,
+        project_head_successor: CoreProjectHeadSuccessorProofV1 | None = None,
     ) -> None: ...
 
 
@@ -679,6 +687,7 @@ class DesktopCoreActiveSessionV1:
     local_project_etag: str
     local_project_intent_sha256: str
     mapping: CoreProjectMappingV1
+    create_operation: CoreProjectCreateOperationV1
     attachment: CoreHostAttachmentV1
     tunnel: CoreTunnelHandleV1
     client: CoreControlClientV1
@@ -963,6 +972,44 @@ class DesktopCoreBridgeV1:
                 lambda: self._persistence.load_patch(project.project_id),
                 label="project patch operation read",
             )
+            if (
+                mapping is not None
+                and pending_patch is None
+                and core_project.active_revision != mapping.active_revision
+            ):
+                _ensure_mapped_project_head_transition(mapping, core_project)
+                successor_proof = self._load_project_head_successor_proof(
+                    token=token,
+                    deadline=deadline,
+                    client=client,
+                    previous_mapping=mapping,
+                    project=core_project,
+                    capabilities=capabilities,
+                )
+                successor_mapping = _mapping_from_request(
+                    local_project_id=mapping.local_project_id,
+                    profile_id=mapping.profile_id,
+                    request=mapping.project_create,
+                    request_sha256=mapping.request_sha256,
+                    project=core_project,
+                    capabilities=capabilities,
+                    core_host_identity=mapping.core_host_identity,
+                    previous_mapping=mapping,
+                )
+                previous_mapping = mapping
+                self._adapter_external(
+                    token,
+                    deadline,
+                    lambda: self._persistence.commit_mapping(
+                        operation,
+                        successor_mapping,
+                        expected_previous=previous_mapping,
+                        completed_patch=None,
+                        project_head_successor=successor_proof,
+                    ),
+                    label="activation successor mapping commit",
+                )
+                mapping = successor_mapping
             pending_finalize = operation.workspace_upload_finalize
             if (
                 pending_finalize is not None
@@ -1184,6 +1231,7 @@ class DesktopCoreBridgeV1:
                 local_project_etag=project.etag,
                 local_project_intent_sha256=request_sha256,
                 mapping=completed_mapping,
+                create_operation=operation,
                 attachment=attachment,
                 tunnel=tunnel,
                 client=client,
@@ -2119,27 +2167,9 @@ class DesktopCoreBridgeV1:
         request_sha256: str,
         core_host_identity: str,
     ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1 | None]:
-        _ensure_immutable_authority_transition(
-            _mapping_immutable_authority(mapping),
-            _patch_immutable_authority(current),
-            mismatch_code="core_project_mapping_mismatch",
-            mismatch_message=(
-                "Core immutable authority does not match the durable project mapping."
-            ),
-        )
-        _ensure_mutable_authority_transition(
-            _mapping_mutable_authority(mapping),
-            _patch_mutable_authority(current),
-            project_id=mapping.core_project_id,
-            label="durable project mapping",
-            mismatch_code="core_project_mapping_mismatch",
-            mismatch_message=(
-                "Core mutable authority does not descend from the durable project mapping."
-            ),
-        )
+        _ensure_mapped_project_head_transition(mapping, current)
         if mapping.request_sha256 == request_sha256:
             _ensure_project_identity(current, requested)
-            _ensure_mapping_content_snapshots(mapping, current)
             return current, None
 
         if _project_identity_matches(current, requested):
@@ -2149,7 +2179,6 @@ class DesktopCoreBridgeV1:
                 status=409,
             )
 
-        _ensure_mapping_content_snapshots(mapping, current)
         _ensure_project_identity(current, mapping.project_create)
         return self._patch_current_project(
             token=token,
@@ -2890,9 +2919,83 @@ class DesktopCoreBridgeV1:
         )
         self._ensure_refreshed_project_authority(session, project)
         self._ensure_project_ready(project, capabilities)
+        project_head_successor: CoreProjectHeadSuccessorProofV1 | None = None
+        if project.active_revision != session.mapping.active_revision:
+            project_head_successor = self._load_project_head_successor_proof(
+                token=session.token,
+                deadline=deadline,
+                client=session.client,
+                previous_mapping=session.mapping,
+                project=project,
+                capabilities=capabilities,
+            )
+        refreshed_mapping = _mapping_from_request(
+            local_project_id=session.local_project_id,
+            profile_id=session.profile_id,
+            request=session.mapping.project_create,
+            request_sha256=session.local_project_intent_sha256,
+            project=project,
+            capabilities=capabilities,
+            core_host_identity=session.attachment.bearer_identity,
+            previous_mapping=session.mapping,
+        )
+        if refreshed_mapping != session.mapping:
+            previous_mapping = session.mapping
+            self._adapter_external(
+                session.token,
+                deadline,
+                lambda: self._persistence.commit_mapping(
+                    session.create_operation,
+                    refreshed_mapping,
+                    expected_previous=previous_mapping,
+                    completed_patch=None,
+                    project_head_successor=project_head_successor,
+                ),
+                label="project successor mapping commit",
+            )
+            session.mapping = refreshed_mapping
+            assert project_head_successor is not None
+            session.revision_head = project_head_successor.head
         session.project = project
         session.capabilities = capabilities
         return project, capabilities
+
+    def _load_project_head_successor_proof(
+        self,
+        *,
+        token: _GenerationToken,
+        deadline: float,
+        client: CoreControlClientV1,
+        previous_mapping: CoreProjectMappingV1,
+        project: core_v1.ProjectV1,
+        capabilities: core_v1.CapabilitiesResponseV1,
+    ) -> CoreProjectHeadSuccessorProofV1:
+        if project.active_revision is None:
+            raise _bridge_error(
+                "core_project_not_ready",
+                "Core has not published an active project revision.",
+                retryable=True,
+            )
+        observed_head = self._core_external(token, deadline, client.revision_head)
+        revision = self._core_external(
+            token,
+            deadline,
+            lambda: client.get_revision(
+                project.active_revision.id,
+                project_id=project.id,
+            ),
+        )
+        proof = CoreProjectHeadSuccessorProofV1(
+            project=project,
+            head=observed_head,
+            revision=revision,
+        )
+        _ensure_project_head_successor_proof(
+            previous_mapping,
+            proof,
+            capabilities=capabilities,
+        )
+        return proof
 
     @staticmethod
     def _ensure_refreshed_project_authority(
@@ -2901,6 +3004,26 @@ class DesktopCoreBridgeV1:
     ) -> None:
         previous = session.project
         mapping = session.mapping
+        _ensure_project_identity(previous, mapping.project_create)
+        _ensure_immutable_authority_transition(
+            _mapping_immutable_authority(mapping),
+            _patch_immutable_authority(previous),
+            mismatch_code="core_project_mapping_mismatch",
+            mismatch_message=(
+                "The active Core project no longer matches its durable mapping authority."
+            ),
+        )
+        _ensure_mapping_content_snapshots(mapping, previous)
+        _ensure_mutable_authority_transition(
+            _mapping_mutable_authority(mapping),
+            _patch_mutable_authority(previous),
+            project_id=mapping.core_project_id,
+            label="active project durable mapping",
+            mismatch_code="core_project_mapping_mismatch",
+            mismatch_message=(
+                "The active Core project no longer matches its durable mapping authority."
+            ),
+        )
         _ensure_project_identity(project, mapping.project_create)
         _ensure_immutable_authority_transition(
             _patch_immutable_authority(previous),
@@ -2908,8 +3031,7 @@ class DesktopCoreBridgeV1:
             mismatch_code="core_project_identity_mismatch",
             mismatch_message=("The refreshed Core project changed immutable project authority."),
         )
-        _ensure_mapping_content_snapshots(mapping, project)
-        _ensure_mutable_authority_transition(
+        _ensure_project_head_authority_transition(
             _patch_mutable_authority(previous),
             _patch_mutable_authority(project),
             project_id=mapping.core_project_id,
@@ -3201,6 +3323,42 @@ def _workspace_archive_policy() -> core_v1.WorkspaceArchivePolicyV1:
 def _model_digest(model: core_v1.ContractModel) -> str:
     encoded = json.dumps(
         model.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def revision_manifest_sha256_v1(
+    *,
+    project_id: str,
+    generation: int,
+    predecessor_revision: core_v1.RevisionRefV1 | None,
+    project_snapshot: core_v1.ImmutableSnapshotRefV1,
+    task_snapshot: core_v1.ImmutableSnapshotRefV1 | None,
+    workspace_snapshot: core_v1.ImmutableSnapshotRefV1,
+    registry_digest: str,
+) -> str:
+    payload = {
+        "schema_version": "1",
+        "project_id": project_id,
+        "generation": generation,
+        "predecessor_revision": (
+            None
+            if predecessor_revision is None
+            else predecessor_revision.model_dump(mode="json")
+        ),
+        "project_snapshot": project_snapshot.model_dump(mode="json"),
+        "task_snapshot": (
+            None if task_snapshot is None else task_snapshot.model_dump(mode="json")
+        ),
+        "workspace_snapshot": workspace_snapshot.model_dump(mode="json"),
+        "registry_digest": registry_digest,
+    }
+    encoded = json.dumps(
+        payload,
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
@@ -3920,6 +4078,30 @@ def _ensure_mapping_content_snapshots(
         )
 
 
+def _ensure_mapped_project_head_transition(
+    mapping: CoreProjectMappingV1,
+    project: core_v1.ProjectV1,
+) -> None:
+    _ensure_immutable_authority_transition(
+        _mapping_immutable_authority(mapping),
+        _patch_immutable_authority(project),
+        mismatch_code="core_project_mapping_mismatch",
+        mismatch_message=(
+            "Core immutable authority does not match the durable project mapping."
+        ),
+    )
+    _ensure_project_head_authority_transition(
+        _mapping_mutable_authority(mapping),
+        _patch_mutable_authority(project),
+        project_id=mapping.core_project_id,
+        label="durable project mapping",
+        mismatch_code="core_project_mapping_mismatch",
+        mismatch_message=(
+            "Core mutable authority does not descend from the durable project mapping."
+        ),
+    )
+
+
 def _ensure_revision_authority_successor(
     authority: core_v1.RevisionRefV1 | None,
     current: core_v1.RevisionRefV1 | None,
@@ -4007,6 +4189,120 @@ def _ensure_mutable_authority_transition(
         raise _bridge_error(
             mismatch_code,
             mismatch_message,
+            status=409,
+        )
+
+
+def _ensure_project_head_authority_transition(
+    authority: CoreProjectPatchMutableAuthorityV1,
+    current: CoreProjectPatchMutableAuthorityV1,
+    *,
+    project_id: str,
+    label: str,
+    mismatch_code: str,
+    mismatch_message: str,
+) -> None:
+    """Accept only the same head or one Core-published cross-session successor."""
+
+    _ensure_revision_authority_successor(
+        authority.active_revision,
+        current.active_revision,
+        project_id=project_id,
+        label=label,
+    )
+    if current.active_revision == authority.active_revision:
+        valid_transition = current == authority
+    else:
+        expected_successor = replace(
+            authority,
+            project_snapshot=current.project_snapshot,
+            workspace_snapshot=current.workspace_snapshot,
+            active_revision=current.active_revision,
+            registry_digest=current.registry_digest,
+            updated_at=current.updated_at,
+            etag=current.etag,
+        )
+        valid_transition = (
+            current == expected_successor
+            and current.etag != authority.etag
+            and _utc_timestamp(current.updated_at) > _utc_timestamp(authority.updated_at)
+        )
+    if not valid_transition:
+        raise _bridge_error(
+            mismatch_code,
+            mismatch_message,
+            status=409,
+        )
+
+
+def _ensure_project_head_successor_proof(
+    previous: CoreProjectMappingV1,
+    proof: CoreProjectHeadSuccessorProofV1,
+    *,
+    capabilities: core_v1.CapabilitiesResponseV1,
+) -> None:
+    project = proof.project
+    head = proof.head
+    revision = proof.revision
+    transition = revision.transition
+    _ensure_project_identity(project, previous.project_create)
+    _ensure_immutable_authority_transition(
+        _mapping_immutable_authority(previous),
+        _patch_immutable_authority(project),
+        mismatch_code="core_project_successor_proof_mismatch",
+        mismatch_message="Core successor changed immutable project authority.",
+    )
+    _ensure_project_head_authority_transition(
+        _mapping_mutable_authority(previous),
+        _patch_mutable_authority(project),
+        project_id=previous.core_project_id,
+        label="durable project mapping",
+        mismatch_code="core_project_successor_proof_mismatch",
+        mismatch_message="Core successor does not directly descend from the durable mapping.",
+    )
+    if (
+        project.id != previous.core_project_id
+        or project.active_revision is None
+        or project.current_workspace_snapshot is None
+        or project.registry_digest is None
+        or head.project_id != project.id
+        or head.active_revision != project.active_revision
+        or revision.revision != project.active_revision
+        or revision.status is not core_v1.RevisionStatus.ACTIVE
+        or revision.predecessor_revision != previous.active_revision
+        or revision.revision.manifest_sha256
+        != revision_manifest_sha256_v1(
+            project_id=revision.revision.project_id,
+            generation=revision.revision.generation,
+            predecessor_revision=revision.predecessor_revision,
+            project_snapshot=revision.project_snapshot,
+            task_snapshot=revision.task_snapshot,
+            workspace_snapshot=revision.workspace_snapshot,
+            registry_digest=revision.registry_digest,
+        )
+        or transition is None
+        or transition.state is not core_v1.RevisionTransitionState.ACTIVE
+        or transition.predecessor_revision != previous.active_revision
+        or transition.successor_revision != revision.revision
+        or transition.progress_completed != 1
+        or transition.progress_total != 1
+        or transition.message != "Project revision activated."
+        or transition.error is not None
+        or revision.error is not None
+        or revision.created_at != revision.updated_at
+        or revision.activated_at != revision.updated_at
+        or transition.updated_at != revision.updated_at
+        or head.updated_at != revision.updated_at
+        or project.updated_at != revision.updated_at
+        or revision.project_snapshot != project.current_project_snapshot
+        or revision.task_snapshot != project.current_task_snapshot
+        or revision.workspace_snapshot != project.current_workspace_snapshot
+        or revision.registry_digest != project.registry_digest
+        or revision.registry_digest != capabilities.registry_digest
+    ):
+        raise _bridge_error(
+            "core_project_successor_proof_mismatch",
+            "Core project, active head, and revision do not form one verified successor closure.",
             status=409,
         )
 
@@ -4157,20 +4453,17 @@ def _select_required_revision(
 ) -> core_v1.ReachableRequiredRevisionRefV1:
     successor = head.successor_revision
     transition = head.transition
-    if (
-        successor is not None
-        and transition is not None
-        and transition.state
-        not in {
+    if successor is not None and transition is not None:
+        retryable = transition.state not in {
             core_v1.RevisionTransitionState.FAILED,
             core_v1.RevisionTransitionState.CANCELLED,
             core_v1.RevisionTransitionState.UNAVAILABLE,
         }
-    ):
-        return core_v1.ReachableRequiredRevisionRefV1(
-            revision=successor,
-            reachable_from_revision_id=head.active_revision.id,
-            relation=core_v1.RequiredRevisionRelation.SUCCESSOR,
+        raise _bridge_error(
+            "core_project_successor_not_ready",
+            "Core has not resolved the successor project head.",
+            status=409,
+            retryable=retryable,
         )
     return core_v1.ReachableRequiredRevisionRefV1(
         revision=head.active_revision,

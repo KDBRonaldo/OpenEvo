@@ -1143,6 +1143,19 @@ class CoreScienceRunOwner:
                 409,
                 True,
             )
+        if head.successor_revision is not None or head.transition is not None:
+            transition = head.transition
+            retryable = transition is None or transition.state not in {
+                m.RevisionTransitionState.FAILED,
+                m.RevisionTransitionState.CANCELLED,
+                m.RevisionTransitionState.UNAVAILABLE,
+            }
+            raise _owner_error(
+                "run_project_successor_not_ready",
+                "The successor project head must be resolved before another run starts.",
+                409,
+                retryable,
+            )
         return project
 
     def _recover_interrupted_runs(self) -> None:

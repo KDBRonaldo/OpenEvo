@@ -18,6 +18,7 @@ from desktop.sidecar.core_bridge_v1 import (
     CoreHostAttachmentV1,
     CoreProjectCreateOperationV1,
     CoreProjectCreateStateV1,
+    CoreProjectHeadSuccessorProofV1,
     CoreProjectMappingV1,
     CoreProjectPatchOperationV1,
     CoreProjectPatchStateV1,
@@ -68,6 +69,32 @@ REVISION = core_v1.RevisionRefV1(
     generation=0,
     manifest_sha256="6" * 64,
 )
+
+
+def _successor_revision(
+    previous: core_v1.RevisionRefV1,
+    *,
+    project_snapshot: core_v1.ImmutableSnapshotRefV1,
+    task_snapshot: core_v1.ImmutableSnapshotRefV1 | None,
+    workspace_snapshot: core_v1.ImmutableSnapshotRefV1,
+    registry_digest: str = REGISTRY_DIGEST,
+    revision_id: str | None = None,
+) -> core_v1.RevisionRefV1:
+    generation = previous.generation + 1
+    return core_v1.RevisionRefV1(
+        id=revision_id or f"revision-{generation}",
+        project_id=previous.project_id,
+        generation=generation,
+        manifest_sha256=bridge_module.revision_manifest_sha256_v1(
+            project_id=previous.project_id,
+            generation=generation,
+            predecessor_revision=previous,
+            project_snapshot=project_snapshot,
+            task_snapshot=task_snapshot,
+            workspace_snapshot=workspace_snapshot,
+            registry_digest=registry_digest,
+        ),
+    )
 
 
 def _version() -> dict[str, object]:
@@ -396,6 +423,7 @@ class FakePersistence:
         *,
         expected_previous: CoreProjectMappingV1 | None,
         completed_patch: CoreProjectPatchOperationV1 | None,
+        project_head_successor: CoreProjectHeadSuccessorProofV1 | None = None,
     ) -> None:
         self.events.append("commit_mapping")
         if self.block_commit:
@@ -410,6 +438,11 @@ class FakePersistence:
             assert self.patch_operation == completed_patch
             assert completed_patch.state is CoreProjectPatchStateV1.APPLIED
             self.patch_operation = None
+        if project_head_successor is not None:
+            assert expected_previous is not None
+            assert project_head_successor.project.active_revision == mapping.active_revision
+            assert project_head_successor.head.active_revision == mapping.active_revision
+            assert project_head_successor.revision.revision == mapping.active_revision
         self.operation = operation
         self.mapping = mapping
         self.mapping_history.append(mapping)
@@ -489,13 +522,29 @@ class FakeCore:
         self.task_snapshot = TASK_SNAPSHOT
         self.workspace_snapshot = WORKSPACE_SNAPSHOT
         self.project_etag = ETAG_C
-        self.active_revision = REVISION
+        self._active_revision = REVISION
+        self.revision_predecessors: dict[str, core_v1.RevisionRefV1] = {}
         self.registry_digest = REGISTRY_DIGEST
         self.project_created_at = NOW
         self.project_updated_at = NOW
         self.create_created_at: str | None = None
         self.finalize_created_at: str | None = None
         self.patch_created_at: str | None = None
+
+    @property
+    def active_revision(self) -> core_v1.RevisionRefV1:
+        return self._active_revision
+
+    @active_revision.setter
+    def active_revision(self, revision: core_v1.RevisionRefV1) -> None:
+        previous = self._active_revision
+        if (
+            revision != previous
+            and revision.project_id == previous.project_id
+            and revision.generation == previous.generation + 1
+        ):
+            self.revision_predecessors[revision.id] = previous
+        self._active_revision = revision
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request)
@@ -760,6 +809,38 @@ class FakeCore:
             return httpx.Response(200, json=aborted.model_dump(mode="json"))
         if path.endswith("/revisions/head"):
             return httpx.Response(200, json=self.head.model_dump(mode="json"))
+        if "/revisions/" in path and request.method == "GET":
+            revision_id = path.rsplit("/", 1)[-1]
+            assert revision_id == self.active_revision.id
+            predecessor = self.revision_predecessors.get(revision_id)
+            transition = (
+                None
+                if predecessor is None
+                else core_v1.RevisionTransitionV1(
+                    state=core_v1.RevisionTransitionState.ACTIVE,
+                    predecessor_revision=predecessor,
+                    successor_revision=self.active_revision,
+                    progress_completed=1,
+                    progress_total=1,
+                    message="Project revision activated.",
+                    updated_at=self.project_updated_at,
+                )
+            )
+            revision = core_v1.RevisionV1(
+                revision=self.active_revision,
+                status=core_v1.RevisionStatus.ACTIVE,
+                predecessor_revision=predecessor,
+                project_snapshot=self.project_snapshot,
+                task_snapshot=self.task_snapshot,
+                workspace_snapshot=self.workspace_snapshot,
+                registry_digest=self.registry_digest,
+                transition=transition,
+                created_at=self.project_updated_at,
+                updated_at=self.project_updated_at,
+                activated_at=self.project_updated_at,
+                etag=self.project_etag,
+            )
+            return httpx.Response(200, json=revision.model_dump(mode="json"))
         if path.endswith("/validate"):
             return httpx.Response(
                 200,
@@ -784,11 +865,12 @@ def _head(
     *,
     active_revision: core_v1.RevisionRefV1 = REVISION,
     etag: str = ETAG_A,
+    updated_at: str = NOW,
 ) -> core_v1.RevisionHeadV1:
     return core_v1.RevisionHeadV1(
         project_id=CORE_PROJECT_ID,
         active_revision=active_revision,
-        updated_at=NOW,
+        updated_at=updated_at,
         etag=etag,
     )
 
@@ -1233,14 +1315,15 @@ def test_reactivation_versions_mutable_successor_authority_and_patches_current_e
     original_mapping = persistence.mapping
     assert original_mapping is not None
 
-    successor = core_v1.RevisionRefV1(
-        id="revision-1",
-        project_id=CORE_PROJECT_ID,
-        generation=1,
-        manifest_sha256="7" * 64,
-    )
     successor_etag = '"' + "7" * 64 + '"'
     successor_registry = "8" * 64
+    successor = _successor_revision(
+        REVISION,
+        project_snapshot=fake_core.project_snapshot,
+        task_snapshot=fake_core.task_snapshot,
+        workspace_snapshot=fake_core.workspace_snapshot,
+        registry_digest=successor_registry,
+    )
     fake_core.active_revision = successor
     fake_core.project_etag = successor_etag
     fake_core.registry_digest = successor_registry
@@ -1339,11 +1422,11 @@ def test_mapping_recovery_rejects_successor_reusing_project_etag_before_mutation
     mapping = persistence.mapping
     assert mapping is not None
 
-    successor = core_v1.RevisionRefV1(
-        id="revision-1",
-        project_id=CORE_PROJECT_ID,
-        generation=1,
-        manifest_sha256="7" * 64,
+    successor = _successor_revision(
+        REVISION,
+        project_snapshot=fake_core.project_snapshot,
+        task_snapshot=fake_core.task_snapshot,
+        workspace_snapshot=fake_core.workspace_snapshot,
     )
     fake_core.active_revision = successor
     fake_core.project_etag = mapping.project_etag
@@ -1467,17 +1550,21 @@ def test_mapped_revision_authority_rejects_nonmonotonic_core_head(
     first.activate_project(local_project, idempotency_key="mapped-revision-base-0001")
     first.close()
 
-    successor = core_v1.RevisionRefV1(
-        id="revision-1",
-        project_id=CORE_PROJECT_ID,
-        generation=1,
-        manifest_sha256="7" * 64,
+    successor = _successor_revision(
+        REVISION,
+        project_snapshot=fake_core.project_snapshot,
+        task_snapshot=fake_core.task_snapshot,
+        workspace_snapshot=fake_core.workspace_snapshot,
     )
     successor_etag = '"' + "7" * 64 + '"'
     fake_core.active_revision = successor
     fake_core.project_etag = successor_etag
     fake_core.project_updated_at = "2026-07-14T12:10:00Z"
-    fake_core.head = _head(active_revision=successor, etag=successor_etag)
+    fake_core.head = _head(
+        active_revision=successor,
+        etag=successor_etag,
+        updated_at="2026-07-14T12:10:00Z",
+    )
     second, _, _, _ = _bridge(
         local_project,
         persistence=persistence,
@@ -1666,7 +1753,7 @@ def test_unknown_project_create_outcome_rejects_a_different_retry_key() -> None:
     assert len(fake_core.calls) == calls_before
 
 
-def test_create_run_requires_reachable_nonterminal_successor() -> None:
+def test_create_run_waits_for_nonterminal_successor_to_become_active() -> None:
     local_project = _local_project()
     bridge, _, fake_core, _ = _bridge(local_project)
     bridge.activate_project(local_project, idempotency_key="activate-local-project-0001")
@@ -1694,18 +1781,71 @@ def test_create_run_requires_reachable_nonterminal_successor() -> None:
         etag=ETAG_B,
     )
 
-    bridge.create_run(
-        local_project,
-        idempotency_key="create-run-successor-0001",
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.create_run(
+            local_project,
+            idempotency_key="create-run-successor-0001",
+        )
+
+    assert exc_info.value.error.code == "core_project_successor_not_ready"
+    assert exc_info.value.error.http_status == 409
+    assert exc_info.value.error.retryable is True
+    assert fake_core.run_requests == []
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        core_v1.RevisionTransitionState.FAILED,
+        core_v1.RevisionTransitionState.CANCELLED,
+        core_v1.RevisionTransitionState.UNAVAILABLE,
+    ],
+)
+def test_create_run_rejects_terminal_successor(
+    state: core_v1.RevisionTransitionState,
+) -> None:
+    local_project = _local_project()
+    bridge, _, fake_core, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-local-project-0001")
+    successor = core_v1.RevisionRefV1(
+        id="revision-1",
+        project_id=CORE_PROJECT_ID,
+        generation=1,
+        manifest_sha256="7" * 64,
+    )
+    transition = core_v1.RevisionTransitionV1(
+        state=state,
+        predecessor_revision=REVISION,
+        successor_revision=successor,
+        progress_completed=1,
+        progress_total=1,
+        message="The successor project head did not become active.",
+        error=(
+            core_v1.ApiErrorV1.model_validate_json(json.dumps(_core_error()))
+            if state is core_v1.RevisionTransitionState.FAILED
+            else None
+        ),
+        updated_at=NOW,
+    )
+    fake_core.head = core_v1.RevisionHeadV1(
+        project_id=CORE_PROJECT_ID,
+        active_revision=REVISION,
+        successor_revision=successor,
+        transition=transition,
+        updated_at=NOW,
+        etag=ETAG_B,
     )
 
-    assert fake_core.run_requests[-1].required_revision == (
-        core_v1.ReachableRequiredRevisionRefV1(
-            revision=successor,
-            reachable_from_revision_id=REVISION.id,
-            relation=core_v1.RequiredRevisionRelation.SUCCESSOR,
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.create_run(
+            local_project,
+            idempotency_key=f"create-run-terminal-successor-{state.value}",
         )
-    )
+
+    assert exc_info.value.error.code == "core_project_successor_not_ready"
+    assert exc_info.value.error.http_status == 409
+    assert exc_info.value.error.retryable is False
+    assert fake_core.run_requests == []
 
 
 def test_cross_project_proxy_fails_before_transport() -> None:
@@ -1936,19 +2076,37 @@ def test_same_revision_mutable_authority_drift_is_not_a_successor() -> None:
 
 def test_authority_only_revision_successor_keeps_local_project_binding_valid() -> None:
     local_project = _local_project()
-    bridge, _, fake_core, _ = _bridge(local_project)
+    bridge, persistence, fake_core, _ = _bridge(local_project)
     bridge.activate_project(local_project, idempotency_key="activate-authority-a-0001")
-    successor = core_v1.RevisionRefV1(
-        id="revision-1",
-        project_id=CORE_PROJECT_ID,
-        generation=1,
-        manifest_sha256="7" * 64,
+    assert persistence.mapping is not None
+    initial_mapping = persistence.mapping
+    successor_project_snapshot = _snapshot(
+        "project-snapshot-successor-1",
+        core_v1.SnapshotKind.PROJECT,
+        "7",
+    )
+    successor_workspace_snapshot = _snapshot(
+        "workspace-snapshot-successor-1",
+        core_v1.SnapshotKind.WORKSPACE,
+        "8",
+    )
+    successor = _successor_revision(
+        REVISION,
+        project_snapshot=successor_project_snapshot,
+        task_snapshot=fake_core.task_snapshot,
+        workspace_snapshot=successor_workspace_snapshot,
     )
     successor_etag = '"' + "7" * 64 + '"'
     fake_core.active_revision = successor
+    fake_core.project_snapshot = successor_project_snapshot
+    fake_core.workspace_snapshot = successor_workspace_snapshot
     fake_core.project_etag = successor_etag
     fake_core.project_updated_at = "2026-07-14T12:02:00Z"
-    fake_core.head = _head(active_revision=successor, etag=successor_etag)
+    fake_core.head = _head(
+        active_revision=successor,
+        etag=successor_etag,
+        updated_at="2026-07-14T12:02:00Z",
+    )
 
     run = bridge.create_run(
         local_project,
@@ -1956,19 +2114,43 @@ def test_authority_only_revision_successor_keeps_local_project_binding_valid() -
     )
 
     assert run.required_revision.revision == successor
-    assert fake_core.run_requests[-1].project_snapshot == READY_PROJECT_SNAPSHOT
+    assert fake_core.run_requests[-1].project_snapshot == successor_project_snapshot
+    assert fake_core.run_requests[-1].workspace_snapshot == successor_workspace_snapshot
+    assert persistence.mapping is not None
+    assert persistence.mapping.active_revision == successor
+    assert persistence.mapping.project_snapshot == successor_project_snapshot
+    assert persistence.mapping.workspace_snapshot == successor_workspace_snapshot
+    assert persistence.mapping.mapping_generation == initial_mapping.mapping_generation + 1
 
-    next_successor = core_v1.RevisionRefV1(
-        id="revision-2",
-        project_id=CORE_PROJECT_ID,
-        generation=2,
-        manifest_sha256="8" * 64,
+    bridge.close()
+    bridge, persistence, fake_core, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+    bridge.activate_project(local_project, idempotency_key="activate-authority-a-0002")
+
+    next_project_snapshot = _snapshot(
+        "project-snapshot-successor-2",
+        core_v1.SnapshotKind.PROJECT,
+        "9",
+    )
+    next_successor = _successor_revision(
+        successor,
+        project_snapshot=next_project_snapshot,
+        task_snapshot=fake_core.task_snapshot,
+        workspace_snapshot=successor_workspace_snapshot,
     )
     next_etag = '"' + "8" * 64 + '"'
     fake_core.active_revision = next_successor
+    fake_core.project_snapshot = next_project_snapshot
     fake_core.project_etag = next_etag
     fake_core.project_updated_at = "2026-07-14T12:03:00Z"
-    fake_core.head = _head(active_revision=next_successor, etag=next_etag)
+    fake_core.head = _head(
+        active_revision=next_successor,
+        etag=next_etag,
+        updated_at="2026-07-14T12:03:00Z",
+    )
 
     validation = bridge.validate_project(
         local_project,
@@ -1978,6 +2160,40 @@ def test_authority_only_revision_successor_keeps_local_project_binding_valid() -
     assert validation.valid is True
     assert bridge._active is not None
     assert bridge._active.project.active_revision == next_successor
+    assert persistence.mapping is not None
+    assert persistence.mapping.active_revision == next_successor
+    assert persistence.mapping.project_snapshot == next_project_snapshot
+    assert persistence.mapping.mapping_generation == initial_mapping.mapping_generation + 2
+
+
+def test_project_head_successor_rejects_consistent_false_manifest_digest() -> None:
+    local_project = _local_project()
+    bridge, persistence, fake_core, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-authority-a-0001")
+    initial_mapping = persistence.mapping
+    assert initial_mapping is not None
+    valid_successor = _successor_revision(
+        REVISION,
+        project_snapshot=fake_core.project_snapshot,
+        task_snapshot=fake_core.task_snapshot,
+        workspace_snapshot=fake_core.workspace_snapshot,
+    )
+    false_successor = valid_successor.model_copy(update={"manifest_sha256": "f" * 64})
+    successor_etag = '"' + "7" * 64 + '"'
+    fake_core.active_revision = false_successor
+    fake_core.project_etag = successor_etag
+    fake_core.project_updated_at = "2026-07-14T12:02:00Z"
+    fake_core.head = _head(
+        active_revision=false_successor,
+        etag=successor_etag,
+        updated_at=fake_core.project_updated_at,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.capabilities(local_project)
+
+    assert exc_info.value.error.code == "core_project_successor_proof_mismatch"
+    assert persistence.mapping == initial_mapping
 
 
 def test_project_binding_and_core_transport_share_one_generation_lease(
@@ -2537,7 +2753,22 @@ def _prepare_finalized_import_patch_crash(
     fake_core.head = _head(
         active_revision=finalize_revision,
         etag=fake_core.project_etag,
+        updated_at=fake_core.project_updated_at,
     )
+    if finalize_revision != mapping_o.active_revision:
+        sync, _, _, _ = _bridge(
+            original,
+            persistence=persistence,
+            fake_core=fake_core,
+        )
+        sync.activate_project(
+            original,
+            idempotency_key="finalize-revision-successor-sync-0002",
+        )
+        sync.close()
+        mapping_o = persistence.mapping
+        assert mapping_o is not None
+        assert mapping_o.active_revision == finalize_revision
     archive = b"\1" * 1024
     edited = original.model_copy(
         update={
@@ -2577,11 +2808,11 @@ def _prepare_finalized_import_patch_crash(
     return edited, archive, persistence, fake_core, mapping_o
 
 
-REVISION_1 = core_v1.RevisionRefV1(
-    id="revision-1",
-    project_id=CORE_PROJECT_ID,
-    generation=1,
-    manifest_sha256="7" * 64,
+REVISION_1 = _successor_revision(
+    REVISION,
+    project_snapshot=READY_PROJECT_SNAPSHOT,
+    task_snapshot=TASK_SNAPSHOT,
+    workspace_snapshot=WORKSPACE_SNAPSHOT,
 )
 
 
@@ -2722,7 +2953,11 @@ def _set_current_revision(
     fake_core.active_revision = revision
     fake_core.project_etag = etag
     fake_core.project_updated_at = "2026-07-14T12:43:00Z"
-    fake_core.head = _head(active_revision=revision, etag=etag)
+    fake_core.head = _head(
+        active_revision=revision,
+        etag=etag,
+        updated_at=fake_core.project_updated_at,
+    )
 
 
 @pytest.mark.parametrize("changed_intent", [False, True], ids=["unchanged", "changed"])
@@ -3234,12 +3469,7 @@ def test_empty_revision_authority_rejects_non_genesis_or_foreign_identity(
     ("finalize_revision", "reported_revision"),
     [
         (
-            core_v1.RevisionRefV1(
-                id="revision-1",
-                project_id=CORE_PROJECT_ID,
-                generation=1,
-                manifest_sha256="7" * 64,
-            ),
+            REVISION_1,
             REVISION,
         ),
         (
@@ -3301,7 +3531,11 @@ def test_finalize_after_crash_accepts_direct_revision_successor() -> None:
     fake_core.active_revision = successor
     fake_core.project_etag = successor_etag
     fake_core.project_updated_at = "2026-07-14T12:46:00Z"
-    fake_core.head = _head(active_revision=successor, etag=successor_etag)
+    fake_core.head = _head(
+        active_revision=successor,
+        etag=successor_etag,
+        updated_at="2026-07-14T12:10:00Z",
+    )
     recovered, _, _, _ = _bridge(
         edited,
         persistence=persistence,

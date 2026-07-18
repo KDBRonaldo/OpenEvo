@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
@@ -941,6 +942,65 @@ def test_revision_activation_during_readiness_leaves_zero_persisted_runs(
     finally:
         services.ensure_allowed.set()
         thread.join(5)
+        owner.close()
+        store.close()
+
+
+def test_atomic_core_admission_rejects_an_advertised_successor(
+    tmp_path: Path,
+    registry: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    request = _run_request(project)
+    head = store.get_revision_head(project.id)
+    successor = m.RevisionRefV1(
+        id="pending-revision-1",
+        project_id=project.id,
+        generation=head.active_revision.generation + 1,
+        manifest_sha256="f" * 64,
+    )
+    pending_head = head.model_copy(
+        update={
+            "successor_revision": successor,
+            "transition": m.RevisionTransitionV1(
+                state=m.RevisionTransitionState.MATERIALIZING,
+                predecessor_revision=head.active_revision,
+                successor_revision=successor,
+                progress_completed=1,
+                progress_total=2,
+                message="Materializing the successor project head.",
+                updated_at=head.updated_at,
+            ),
+        }
+    )
+    original_pin = store.pin_science_run_authority
+
+    @contextmanager
+    def pin_with_pending_successor(
+        project_id: str,
+        revision_id: str,
+    ):
+        with original_pin(project_id, revision_id) as (current, revision, _head):
+            yield current, revision, pending_head
+
+    monkeypatch.setattr(store, "pin_science_run_authority", pin_with_pending_successor)
+    services = _FakeServiceOwner(_binding(registry))
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        lambda *_args, **_kwargs: _completed_result(),
+    )
+    try:
+        with pytest.raises(CoreRunControlError) as error:
+            _invoke_create(owner, request, "pending-successor-create")
+
+        assert error.value.code == "run_project_successor_not_ready"
+        assert owner._ledger.list_runs() == []
+    finally:
         owner.close()
         store.close()
 

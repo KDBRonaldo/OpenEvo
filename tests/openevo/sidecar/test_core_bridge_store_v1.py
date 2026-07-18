@@ -26,12 +26,14 @@ from desktop.sidecar.core_bridge_store_v1 import (
 )
 from desktop.sidecar.core_bridge_v1 import (
     CoreProjectCreateOperationV1,
+    CoreProjectHeadSuccessorProofV1,
     CoreProjectMappingV1,
     CoreProjectPatchOperationV1,
     DesktopCoreBridgePersistence,
     map_project_create_v1,
 )
 from openevo.backend.contracts.v1 import models as core_v1
+from openevo.backend.contracts.v1.store import CoreControlStoreV1
 
 
 NOW = "2026-07-14T12:00:00Z"
@@ -136,12 +138,43 @@ PROJECT_SNAPSHOT_B = _snapshot("project-snapshot-b", core_v1.SnapshotKind.PROJEC
 TASK_SNAPSHOT_A = _snapshot("task-snapshot-a", core_v1.SnapshotKind.TASK, "3")
 TASK_SNAPSHOT_B = _snapshot("task-snapshot-b", core_v1.SnapshotKind.TASK, "4")
 WORKSPACE_SNAPSHOT = _snapshot("workspace-snapshot-a", core_v1.SnapshotKind.WORKSPACE, "5")
+WORKSPACE_SNAPSHOT_B = _snapshot(
+    "workspace-snapshot-b",
+    core_v1.SnapshotKind.WORKSPACE,
+    "9",
+)
 REVISION = core_v1.RevisionRefV1(
     id="revision-0",
     project_id=CORE_PROJECT_ID,
     generation=0,
     manifest_sha256="6" * 64,
 )
+
+
+def _successor_revision(
+    previous: core_v1.RevisionRefV1,
+    *,
+    project_snapshot: core_v1.ImmutableSnapshotRefV1,
+    task_snapshot: core_v1.ImmutableSnapshotRefV1 | None,
+    workspace_snapshot: core_v1.ImmutableSnapshotRefV1,
+    registry_digest: str = REGISTRY_DIGEST,
+    revision_id: str | None = None,
+) -> core_v1.RevisionRefV1:
+    generation = previous.generation + 1
+    return core_v1.RevisionRefV1(
+        id=revision_id or f"revision-{generation}",
+        project_id=previous.project_id,
+        generation=generation,
+        manifest_sha256=bridge_module.revision_manifest_sha256_v1(
+            project_id=previous.project_id,
+            generation=generation,
+            predecessor_revision=previous,
+            project_snapshot=project_snapshot,
+            task_snapshot=task_snapshot,
+            workspace_snapshot=workspace_snapshot,
+            registry_digest=registry_digest,
+        ),
+    )
 
 
 def _local_project(*, title: str = "Design") -> local_v1.ProjectV1:
@@ -255,6 +288,61 @@ def _mapping(
         mutable_authority=bridge_module._patch_mutable_authority(project),
         mapping_generation=generation,
         predecessor_request_sha256=predecessor,
+    )
+
+
+def _project_head_successor_proof(
+    previous: CoreProjectMappingV1,
+    current: CoreProjectMappingV1,
+) -> CoreProjectHeadSuccessorProofV1:
+    project = _project(
+        current.project_create,
+        project_snapshot=current.project_snapshot,
+        task_snapshot=current.task_snapshot,
+        etag=current.project_etag,
+    ).model_copy(
+        update={
+            "status": current.mutable_authority.status,
+            "current_workspace_snapshot": current.workspace_snapshot,
+            "workspace_publication": current.mutable_authority.workspace_publication,
+            "active_revision": current.active_revision,
+            "registry_digest": current.registry_digest,
+            "model_preparation": current.mutable_authority.model_preparation,
+            "updated_at": current.project_updated_at,
+        }
+    )
+    transition = core_v1.RevisionTransitionV1(
+        state=core_v1.RevisionTransitionState.ACTIVE,
+        predecessor_revision=previous.active_revision,
+        successor_revision=current.active_revision,
+        progress_completed=1,
+        progress_total=1,
+        message="Project revision activated.",
+        updated_at=current.project_updated_at,
+    )
+    revision = core_v1.RevisionV1(
+        revision=current.active_revision,
+        status=core_v1.RevisionStatus.ACTIVE,
+        predecessor_revision=previous.active_revision,
+        project_snapshot=current.project_snapshot,
+        task_snapshot=current.task_snapshot,
+        workspace_snapshot=current.workspace_snapshot,
+        registry_digest=current.registry_digest,
+        transition=transition,
+        created_at=current.project_updated_at,
+        updated_at=current.project_updated_at,
+        activated_at=current.project_updated_at,
+        etag=current.project_etag,
+    )
+    return CoreProjectHeadSuccessorProofV1(
+        project=project,
+        head=core_v1.RevisionHeadV1(
+            project_id=current.core_project_id,
+            active_revision=current.active_revision,
+            updated_at=current.project_updated_at,
+            etag=current.project_etag,
+        ),
+        revision=revision,
     )
 
 
@@ -802,6 +890,569 @@ def test_exact_mapping_commit_retry_recovers_commit_ambiguity(tmp_path: Path) ->
     assert store.load_mapping_history(LOCAL_PROJECT_ID) == (mapping,)
 
 
+def test_mapping_commit_persists_adjacent_cross_session_project_head(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopCoreBridgeStoreV1(root)
+    operation = _bound_create(store)
+    mapping_a = _mapping(
+        operation.project_create,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    successor = _successor_revision(
+        REVISION,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        task_snapshot=TASK_SNAPSHOT_A,
+        workspace_snapshot=WORKSPACE_SNAPSHOT_B,
+    )
+    mapping_b = replace(
+        mapping_a,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        workspace_snapshot=WORKSPACE_SNAPSHOT_B,
+        active_revision=successor,
+        project_etag=ETAG_B,
+        project_updated_at=LATER,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            project_snapshot=PROJECT_SNAPSHOT_B,
+            workspace_snapshot=WORKSPACE_SNAPSHOT_B,
+            active_revision=successor,
+            etag=ETAG_B,
+            updated_at=LATER,
+        ),
+        mapping_generation=2,
+        predecessor_request_sha256=mapping_a.request_sha256,
+    )
+
+    store.commit_mapping(
+        operation,
+        mapping_b,
+        expected_previous=mapping_a,
+        completed_patch=None,
+        project_head_successor=_project_head_successor_proof(mapping_a, mapping_b),
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        raw = connection.execute(
+            "SELECT document_json FROM mapping_history WHERE mapping_generation = 2"
+        ).fetchone()[0]
+    assert b'"record_type":"CoreProjectHeadMappingTransitionV1"' in raw
+    assert b'"predecessor_mapping_sha256"' in raw
+    assert b'"completed_patch"' not in raw
+    store.close()
+
+    reopened = DesktopCoreBridgeStoreV1(root)
+    assert reopened.load_mapping(LOCAL_PROJECT_ID) == mapping_b
+    assert reopened.load_mapping_history(LOCAL_PROJECT_ID) == (mapping_a, mapping_b)
+    reopened.close()
+
+
+def test_real_core_successor_round_trips_through_desktop_mapping_store(
+    tmp_path: Path,
+) -> None:
+    from tests.openevo.sidecar import test_core_bridge_v1 as bridge_tests
+
+    core_state = tmp_path / "core-state"
+    core_state.mkdir(mode=0o700)
+    os.chmod(core_state, 0o700)
+    core_store = CoreControlStoreV1(core_state)
+    local_project = bridge_tests._local_project().model_copy(
+        update={
+            "execution": local_v1.ExecutionSettingsV1(
+                mode="codex_subscription_transcript",
+                codex_model="gpt-5.1-codex-mini",
+            )
+        }
+    )
+    request = map_project_create_v1(local_project)
+    created = core_store.create_project(
+        request,
+        idempotency_key="create-real-core-project",
+        registry_digest=REGISTRY_DIGEST,
+    )
+    project_a = created.model
+    assert isinstance(project_a, core_v1.ProjectV1)
+    assert project_a.active_revision is not None
+    capabilities = bridge_tests._capabilities(
+        request.spec.execution_mode,
+        registry_digest=REGISTRY_DIGEST,
+    )
+    desktop_store = DesktopCoreBridgeStoreV1(tmp_path / "desktop-state")
+    operation = desktop_store.mark_create_unknown(
+        desktop_store.reserve_create(_create_operation(request=request))
+    )
+    operation = desktop_store.bind_created_project(
+        operation,
+        project_a.id,
+        immutable_authority=bridge_module._patch_immutable_authority(project_a),
+    )
+    mapping_a = bridge_module._mapping_from_request(
+        local_project_id=LOCAL_PROJECT_ID,
+        profile_id=PROFILE_ID,
+        request=request,
+        request_sha256=bridge_module._model_digest(request),
+        project=project_a,
+        capabilities=capabilities,
+        core_host_identity=HOST_IDENTITY,
+        previous_mapping=None,
+    )
+    desktop_store.commit_mapping(
+        operation,
+        mapping_a,
+        expected_previous=None,
+        completed_patch=None,
+    )
+
+    revision_b = core_store.activate_evolution_revision(
+        project_a.id,
+        predecessor=project_a.active_revision,
+        run_id="real-core-successor-run",
+        context_artifact_ids={},
+    )
+    project_b = core_store.get_project(project_a.id)
+    head_b = core_store.get_revision_head(project_a.id)
+    mapping_b = bridge_module._mapping_from_request(
+        local_project_id=LOCAL_PROJECT_ID,
+        profile_id=PROFILE_ID,
+        request=request,
+        request_sha256=bridge_module._model_digest(request),
+        project=project_b,
+        capabilities=capabilities,
+        core_host_identity=HOST_IDENTITY,
+        previous_mapping=mapping_a,
+    )
+    desktop_store.commit_mapping(
+        operation,
+        mapping_b,
+        expected_previous=mapping_a,
+        completed_patch=None,
+        project_head_successor=CoreProjectHeadSuccessorProofV1(
+            project=project_b,
+            head=head_b,
+            revision=revision_b,
+        ),
+    )
+    desktop_store.close()
+    core_store.close()
+
+    reopened = DesktopCoreBridgeStoreV1(tmp_path / "desktop-state")
+    assert reopened.load_mapping(LOCAL_PROJECT_ID) == mapping_b
+    assert reopened.load_mapping_history(LOCAL_PROJECT_ID) == (mapping_a, mapping_b)
+    reopened.close()
+
+
+def test_mapping_commit_rejects_snapshot_change_without_revision_successor(
+    tmp_path: Path,
+) -> None:
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    operation = _bound_create(store)
+    mapping_a = _mapping(
+        operation.project_create,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    mapping_b = replace(
+        mapping_a,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        project_etag=ETAG_B,
+        project_updated_at=LATER,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            project_snapshot=PROJECT_SNAPSHOT_B,
+            etag=ETAG_B,
+            updated_at=LATER,
+        ),
+        mapping_generation=2,
+        predecessor_request_sha256=mapping_a.request_sha256,
+    )
+
+    with pytest.raises(CoreBridgeStoreContractError, match="project-head successor"):
+        store.commit_mapping(
+            operation,
+            mapping_b,
+            expected_previous=mapping_a,
+            completed_patch=None,
+        )
+
+    assert store.load_mapping(LOCAL_PROJECT_ID) == mapping_a
+    assert store.load_mapping_history(LOCAL_PROJECT_ID) == (mapping_a,)
+
+
+def test_mapping_commit_rejects_inconsistent_project_head_proof(tmp_path: Path) -> None:
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    operation = _bound_create(store)
+    mapping_a = _mapping(
+        operation.project_create,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    successor = _successor_revision(
+        REVISION,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        task_snapshot=TASK_SNAPSHOT_A,
+        workspace_snapshot=WORKSPACE_SNAPSHOT,
+    )
+    mapping_b = replace(
+        mapping_a,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        active_revision=successor,
+        project_etag=ETAG_B,
+        project_updated_at=LATER,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            project_snapshot=PROJECT_SNAPSHOT_B,
+            active_revision=successor,
+            etag=ETAG_B,
+            updated_at=LATER,
+        ),
+        mapping_generation=2,
+        predecessor_request_sha256=mapping_a.request_sha256,
+    )
+    proof = _project_head_successor_proof(mapping_a, mapping_b)
+    inconsistent = replace(
+        proof,
+        revision=proof.revision.model_copy(
+            update={"project_snapshot": PROJECT_SNAPSHOT_A}
+        ),
+    )
+
+    with pytest.raises(CoreBridgeStoreContractError, match="active revision closure"):
+        store.commit_mapping(
+            operation,
+            mapping_b,
+            expected_previous=mapping_a,
+            completed_patch=None,
+            project_head_successor=inconsistent,
+        )
+
+    assert store.load_mapping(LOCAL_PROJECT_ID) == mapping_a
+    assert store.load_mapping_history(LOCAL_PROJECT_ID) == (mapping_a,)
+
+
+def test_mapping_commit_rejects_consistent_false_revision_manifest_digest(
+    tmp_path: Path,
+) -> None:
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    operation = _bound_create(store)
+    mapping_a = _mapping(
+        operation.project_create,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    valid_successor = _successor_revision(
+        REVISION,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        task_snapshot=TASK_SNAPSHOT_A,
+        workspace_snapshot=WORKSPACE_SNAPSHOT_B,
+    )
+    false_successor = valid_successor.model_copy(update={"manifest_sha256": "f" * 64})
+    mapping_b = replace(
+        mapping_a,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        workspace_snapshot=WORKSPACE_SNAPSHOT_B,
+        active_revision=false_successor,
+        project_etag=ETAG_B,
+        project_updated_at=LATER,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            project_snapshot=PROJECT_SNAPSHOT_B,
+            workspace_snapshot=WORKSPACE_SNAPSHOT_B,
+            active_revision=false_successor,
+            etag=ETAG_B,
+            updated_at=LATER,
+        ),
+        mapping_generation=2,
+        predecessor_request_sha256=mapping_a.request_sha256,
+    )
+
+    with pytest.raises(CoreBridgeStoreContractError, match="active revision closure"):
+        store.commit_mapping(
+            operation,
+            mapping_b,
+            expected_previous=mapping_a,
+            completed_patch=None,
+            project_head_successor=_project_head_successor_proof(mapping_a, mapping_b),
+        )
+
+    assert store.load_mapping(LOCAL_PROJECT_ID) == mapping_a
+    store.close()
+
+
+def test_mapping_commit_rejects_inconsistent_successor_activation_timestamps(
+    tmp_path: Path,
+) -> None:
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    operation = _bound_create(store)
+    mapping_a = _mapping(
+        operation.project_create,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    successor = _successor_revision(
+        REVISION,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        task_snapshot=TASK_SNAPSHOT_A,
+        workspace_snapshot=WORKSPACE_SNAPSHOT_B,
+    )
+    mapping_b = replace(
+        mapping_a,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        workspace_snapshot=WORKSPACE_SNAPSHOT_B,
+        active_revision=successor,
+        project_etag=ETAG_B,
+        project_updated_at=LATER,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            project_snapshot=PROJECT_SNAPSHOT_B,
+            workspace_snapshot=WORKSPACE_SNAPSHOT_B,
+            active_revision=successor,
+            etag=ETAG_B,
+            updated_at=LATER,
+        ),
+        mapping_generation=2,
+        predecessor_request_sha256=mapping_a.request_sha256,
+    )
+    proof = _project_head_successor_proof(mapping_a, mapping_b)
+    assert proof.revision.transition is not None
+    inconsistent_proofs = (
+        replace(proof, project=proof.project.model_copy(update={"updated_at": LATEST})),
+        replace(proof, head=proof.head.model_copy(update={"updated_at": LATEST})),
+        replace(
+            proof,
+            revision=proof.revision.model_copy(update={"created_at": LATEST}),
+        ),
+        replace(
+            proof,
+            revision=proof.revision.model_copy(update={"updated_at": LATEST}),
+        ),
+        replace(
+            proof,
+            revision=proof.revision.model_copy(update={"activated_at": LATEST}),
+        ),
+        replace(
+            proof,
+            revision=proof.revision.model_copy(
+                update={
+                    "transition": proof.revision.transition.model_copy(
+                        update={"updated_at": LATEST}
+                    )
+                }
+            ),
+        ),
+    )
+
+    for inconsistent in inconsistent_proofs:
+        with pytest.raises(CoreBridgeStoreContractError, match="active revision closure"):
+            store.commit_mapping(
+                operation,
+                mapping_b,
+                expected_previous=mapping_a,
+                completed_patch=None,
+                project_head_successor=inconsistent,
+            )
+
+    assert store.load_mapping(LOCAL_PROJECT_ID) == mapping_a
+    store.close()
+
+
+def test_applied_workspace_finalize_does_not_authorize_later_head_successor(
+    tmp_path: Path,
+) -> None:
+    from tests.openevo.sidecar import test_core_bridge_v1 as bridge_tests
+
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    project = bridge_tests._local_project(imported=True)
+    bridge, _, _, _ = bridge_tests._bridge(project, persistence=store)
+    bridge.activate_project(project, idempotency_key="activate-imported-project-0001")
+    bridge.close()
+    operation = store.load_create(LOCAL_PROJECT_ID)
+    mapping_a = store.load_mapping(LOCAL_PROJECT_ID)
+    assert operation is not None
+    assert operation.workspace_upload_finalize is not None
+    assert operation.workspace_upload_finalize.state.value == "applied"
+    assert mapping_a is not None
+    successor = mapping_a.active_revision.model_copy(
+        update={
+            "id": "revision-after-finalize",
+            "generation": mapping_a.active_revision.generation + 1,
+            "manifest_sha256": "7" * 64,
+        }
+    )
+    successor_etag = '"' + "7" * 64 + '"'
+    mapping_b = replace(
+        mapping_a,
+        active_revision=successor,
+        project_etag=successor_etag,
+        project_updated_at=LATEST,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            active_revision=successor,
+            etag=successor_etag,
+            updated_at=LATEST,
+        ),
+        mapping_generation=mapping_a.mapping_generation + 1,
+        predecessor_request_sha256=mapping_a.request_sha256,
+    )
+
+    with pytest.raises(CoreBridgeStoreContractError, match="verified project-head successor"):
+        store.commit_mapping(
+            operation,
+            mapping_b,
+            expected_previous=mapping_a,
+            completed_patch=None,
+        )
+
+    assert store.load_mapping(LOCAL_PROJECT_ID) == mapping_a
+    store.close()
+
+
+def test_bridge_catches_up_active_head_before_blocking_pending_successor(
+    tmp_path: Path,
+) -> None:
+    from tests.openevo.sidecar import test_core_bridge_v1 as bridge_tests
+
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    project = bridge_tests._local_project()
+    bridge, _, fake_core, _ = bridge_tests._bridge(project, persistence=store)
+    bridge.activate_project(project, idempotency_key="activate-project-0001")
+    mapping_a = store.load_mapping(LOCAL_PROJECT_ID)
+    assert mapping_a is not None
+    successor_project_snapshot = bridge_tests._snapshot(
+        "project-snapshot-successor",
+        core_v1.SnapshotKind.PROJECT,
+        "7",
+    )
+    successor_workspace_snapshot = bridge_tests._snapshot(
+        "workspace-snapshot-successor",
+        core_v1.SnapshotKind.WORKSPACE,
+        "8",
+    )
+    active_successor = _successor_revision(
+        mapping_a.active_revision,
+        project_snapshot=successor_project_snapshot,
+        task_snapshot=fake_core.task_snapshot,
+        workspace_snapshot=successor_workspace_snapshot,
+    )
+    pending_successor = core_v1.RevisionRefV1(
+        id="revision-2",
+        project_id=CORE_PROJECT_ID,
+        generation=2,
+        manifest_sha256="8" * 64,
+    )
+    successor_etag = '"' + "7" * 64 + '"'
+    fake_core.active_revision = active_successor
+    fake_core.project_snapshot = successor_project_snapshot
+    fake_core.workspace_snapshot = successor_workspace_snapshot
+    fake_core.project_etag = successor_etag
+    fake_core.project_updated_at = LATEST
+    fake_core.head = core_v1.RevisionHeadV1(
+        project_id=CORE_PROJECT_ID,
+        active_revision=active_successor,
+        successor_revision=pending_successor,
+        transition=core_v1.RevisionTransitionV1(
+            state=core_v1.RevisionTransitionState.MATERIALIZING,
+            predecessor_revision=active_successor,
+            successor_revision=pending_successor,
+            progress_completed=1,
+            progress_total=2,
+            message="Materializing the next revision.",
+            updated_at=LATEST,
+        ),
+        updated_at=LATEST,
+        etag=successor_etag,
+    )
+
+    with pytest.raises(bridge_module.DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.create_run(
+            project,
+            idempotency_key="create-run-while-next-head-pending-0001",
+        )
+
+    mapping_b = store.load_mapping(LOCAL_PROJECT_ID)
+    assert mapping_b is not None
+    assert mapping_b.active_revision == active_successor
+    assert mapping_b.project_snapshot == fake_core.project_snapshot
+    assert mapping_b.workspace_snapshot == fake_core.workspace_snapshot
+    assert mapping_b.mapping_generation == mapping_a.mapping_generation + 1
+    assert exc_info.value.error.code == "core_project_successor_not_ready"
+    assert fake_core.run_requests == []
+    bridge.close()
+    store.close()
+
+
+def test_project_head_successor_does_not_bypass_pending_desktop_patch(
+    tmp_path: Path,
+) -> None:
+    store = DesktopCoreBridgeStoreV1(tmp_path / "state")
+    operation = _bound_create(store)
+    mapping_a = _mapping(
+        operation.project_create,
+        generation=1,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        etag=ETAG_A,
+        predecessor=None,
+    )
+    store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    request_b = _request(title="Pending edit")
+    pending, _outcome = _patch_operation(operation.project_create, request_b)
+    store.reserve_patch(pending)
+    successor = _successor_revision(
+        REVISION,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        workspace_snapshot=WORKSPACE_SNAPSHOT,
+    )
+    mapping_b = replace(
+        mapping_a,
+        active_revision=successor,
+        project_etag=ETAG_B,
+        project_updated_at=LATER,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            active_revision=successor,
+            etag=ETAG_B,
+            updated_at=LATER,
+        ),
+        mapping_generation=2,
+        predecessor_request_sha256=mapping_a.request_sha256,
+    )
+
+    with pytest.raises(CoreBridgeStoreConflictError, match="pending patch"):
+        store.commit_mapping(
+            operation,
+            mapping_b,
+            expected_previous=mapping_a,
+            completed_patch=None,
+            project_head_successor=_project_head_successor_proof(mapping_a, mapping_b),
+        )
+
+    assert store.load_mapping(LOCAL_PROJECT_ID) == mapping_a
+    assert store.load_patch(LOCAL_PROJECT_ID) == pending
+    assert store.load_mapping_history(LOCAL_PROJECT_ID) == (mapping_a,)
+
+
 def test_mapping_history_is_ordered_and_capacity_is_fail_closed(tmp_path: Path) -> None:
     store = DesktopCoreBridgeStoreV1(tmp_path / "state", max_mapping_history_rows=1)
     operation = _bound_create(store)
@@ -814,8 +1465,11 @@ def test_mapping_history_is_ordered_and_capacity_is_fail_closed(tmp_path: Path) 
         predecessor=None,
     )
     store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
-    successor = REVISION.model_copy(
-        update={"id": "revision-1", "generation": 1, "manifest_sha256": "7" * 64}
+    successor = _successor_revision(
+        REVISION,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        workspace_snapshot=WORKSPACE_SNAPSHOT,
     )
     mapping_b = replace(
         mapping_a,
@@ -834,7 +1488,11 @@ def test_mapping_history_is_ordered_and_capacity_is_fail_closed(tmp_path: Path) 
 
     with pytest.raises(CoreBridgeStoreCapacityError):
         store.commit_mapping(
-            operation, mapping_b, expected_previous=mapping_a, completed_patch=None
+            operation,
+            mapping_b,
+            expected_previous=mapping_a,
+            completed_patch=None,
+            project_head_successor=_project_head_successor_proof(mapping_a, mapping_b),
         )
 
     assert store.load_mapping(LOCAL_PROJECT_ID) == mapping_a
@@ -885,8 +1543,11 @@ def test_mapping_history_rejects_nonadjacent_etag_reuse(tmp_path: Path) -> None:
         predecessor=None,
     )
     store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
-    successor_b = REVISION.model_copy(
-        update={"id": "revision-1", "generation": 1, "manifest_sha256": "7" * 64}
+    successor_b = _successor_revision(
+        REVISION,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        workspace_snapshot=WORKSPACE_SNAPSHOT,
     )
     mapping_b = replace(
         mapping_a,
@@ -907,9 +1568,13 @@ def test_mapping_history_rejects_nonadjacent_etag_reuse(tmp_path: Path) -> None:
         mapping_b,
         expected_previous=mapping_a,
         completed_patch=None,
+        project_head_successor=_project_head_successor_proof(mapping_a, mapping_b),
     )
-    successor_c = REVISION.model_copy(
-        update={"id": "revision-2", "generation": 2, "manifest_sha256": "8" * 64}
+    successor_c = _successor_revision(
+        successor_b,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        task_snapshot=TASK_SNAPSHOT_A,
+        workspace_snapshot=WORKSPACE_SNAPSHOT,
     )
     mapping_rollback = replace(
         mapping_b,
@@ -932,6 +1597,10 @@ def test_mapping_history_rejects_nonadjacent_etag_reuse(tmp_path: Path) -> None:
             mapping_rollback,
             expected_previous=mapping_b,
             completed_patch=None,
+            project_head_successor=_project_head_successor_proof(
+                mapping_b,
+                mapping_rollback,
+            ),
         )
 
 

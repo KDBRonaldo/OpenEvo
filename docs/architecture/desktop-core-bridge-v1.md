@@ -347,11 +347,14 @@ immutable projection, including exact `created_at`. The mapping's complete
 mutable authority must be identical when the active revision is unchanged.
 Cross-session activation may accept one direct revision successor without
 changing Local intent: it must issue a new project ETag, strictly increase
-`updated_at`, preserve status, snapshots, publication, model preparation, and
-the complete immutable projection, and may update only active revision and
-registry alongside that ETag/time pair. Desktop accepts and CAS versions that
-authority only after capabilities, project readiness, revision-head agreement,
-and Core validation all succeed.
+`updated_at`, preserve status, publication, model preparation, task snapshot,
+and the complete immutable projection, and may update the active revision,
+project/workspace snapshots, and registry as one successor publication.
+Desktop persists the complete Project/Head/Revision closure, including the
+canonical revision-manifest digest and activation timestamps, before replacing
+the durable mapping. A head that already advertises another successor does not
+invalidate that active-revision proof, but it blocks run admission until Core
+resolves the advertised successor.
 
 Changed name, task, model/execution, evolution config, or workspace is sent
 through frozen Core `patch_project` with the freshly read Core ETag and a
@@ -376,12 +379,15 @@ idempotency key. The release provider atomically loads the saved `ProjectV1`
 selected by the route's Local ETag and passes that complete object to the
 bridge. The bridge verifies its activation binding, then rereads
 the Core project, pinned capabilities, validation, and revision head. A
-reachable successor whose transition is not failed, cancelled, or unavailable
-is required; otherwise the active head is required. The bridge then constructs
-Core `RunCreateV1` from the authoritative project/task/workspace snapshot refs
-and registry digest. A Core-only direct revision successor may change Core ETag
-and revision authority without requiring a new Local ETag because it does not
-change the saved Local binding.
+revision head with any successor state, including failed, cancelled, or
+unavailable, blocks a new run. Otherwise the active head is required. The
+bridge then constructs Core `RunCreateV1` from the authoritative
+project/task/workspace snapshot refs and registry digest. Core repeats the
+no-successor check while atomically pinning project/revision authority through
+run persistence, so a Desktop read cannot race successor publication. A
+Core-only direct revision successor may change Core ETag, revision authority,
+and Core-owned project/workspace snapshots without requiring a new Local ETag
+because it does not change the saved Local intent.
 
 Run list/get/cancel/retry/timeline/log/context, artifacts, services, Core
 operations and referenced logs, diagnostics, maintenance, and events have
